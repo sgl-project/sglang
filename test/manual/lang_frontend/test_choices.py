@@ -53,7 +53,6 @@ MOCK_CHOICES_INPUT_DATA = {
 
 
 class TestChoices(CustomTestCase):
-
     def test_token_length_normalized(self):
         """Confirm 'antidisestablishmentarianism' is selected due to high confidences for
         its later tokens resulting in highest token length normalized prompt logprob."""

@@ -14,7 +14,7 @@ from PIL import Image
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
+from sglang.multimodal_gen.runtime.realtime.video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CHANNELS,
     RAW_RGB_CONTENT_TYPE,

@@ -100,14 +100,13 @@ class TestAllocationFailureIsolation(CustomTestCase):
         sentinel = object()
         for ret, failed_session in ((sentinel, False), (-1, True), (-5, True)):
             with self.subTest(ret=ret):
-                failures = []
+                conclusions = []
                 manager = SimpleNamespace(
                     session_lock=threading.Lock(),
                     session_failures=defaultdict(int),
                     failed_sessions=set(),
-                    record_failure=lambda *args: failures.append(args),
-                    update_status=lambda *args: None,
-                    sync_status_to_decode_endpoint=lambda *args: None,
+                    _poison_unsettled_send=lambda *args: None,
+                    conclude_failure=lambda **kwargs: conclusions.append(kwargs),
                 )
                 env = dict(
                     self=manager,
@@ -134,7 +133,8 @@ class TestAllocationFailureIsolation(CustomTestCase):
                 )
                 self.assertEqual("s" in manager.failed_sessions, failed_session)
                 self.assertEqual(manager.session_failures["s"], int(failed_session))
-                self.assertEqual(len(failures), 1)
+                # The room itself is always concluded as failed exactly once.
+                self.assertEqual(len(conclusions), 1)
 
     def test_oversized_allocation_has_distinct_failure_result(self):
         from types import SimpleNamespace as NS

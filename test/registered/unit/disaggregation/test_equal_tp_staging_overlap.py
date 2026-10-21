@@ -107,7 +107,7 @@ class SchedulerBoundary(CustomTestCase):
         n = next(
             x
             for x in ast.walk(tree)
-            if isinstance(x, ast.FunctionDef) and x.name == "send_kv_chunk"
+            if isinstance(x, ast.FunctionDef) and x.name == "_send_kv_chunk"
         )
         cut = next(
             i
@@ -142,7 +142,7 @@ class SchedulerBoundary(CustomTestCase):
                 disagg_decode_prefix_len=0,
                 disagg_kv_sender=NS(requires_staging_grid_alignment=lambda: aligned),
             )
-            self.assertEqual(env["send_kv_chunk"](s, req, end_idx=49088), expected)
+            self.assertEqual(env["_send_kv_chunk"](s, req, end_idx=49088), expected)
 
 
 class TestForceStaging(CustomTestCase):
@@ -181,7 +181,7 @@ class TestSchedulerSendRange(CustomTestCase):
         node = next(
             n
             for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "send_kv_chunk"
+            if isinstance(n, ast.FunctionDef) and n.name == "_send_kv_chunk"
         )
         node.decorator_list = []
         node.returns = None
@@ -231,6 +231,7 @@ class TestSchedulerSendRange(CustomTestCase):
             bootstrap_room=7,
             requires_staging_grid_alignment=lambda: False,
             should_send_kv_chunk=lambda *args: True,
+            get_max_transfer_tokens=lambda: None,
         )
         sender.should_split_staging = lambda *args: split(sender, *args)
 
@@ -241,7 +242,7 @@ class TestSchedulerSendRange(CustomTestCase):
         sender.send = send
         translate = Mock(side_effect=lambda x: x)
         req = NS(
-            req_pool_idx=0,
+            kv=NS(req_pool_idx=0),
             start_send_idx=0,
             origin_input_ids=list(range(32)),
             disagg_decode_prefix_len=0,
@@ -256,11 +257,11 @@ class TestSchedulerSendRange(CustomTestCase):
             req_to_token_pool=NS(req_to_token=np.arange(32).reshape(1, 32)),
             disagg_prefill_pending_chunk_rids=set(),
         )
-        env["send_kv_chunk"](scheduler, req, end_idx=31)
+        env["_send_kv_chunk"](scheduler, req, end_idx=31)
         self.assertEqual([len(x[1]) for x in sends], [16, 15])
         self.assertEqual(translate.call_count, 1)
         self.assertEqual(req.start_send_idx, 31)
-        env["send_kv_chunk"](scheduler, req, end_idx=32)
+        env["_send_kv_chunk"](scheduler, req, end_idx=32)
         self.assertEqual([len(x[1]) for x in sends], [16, 15, 1])
         self.assertEqual(req.start_send_idx, 32)
         self.assertEqual(

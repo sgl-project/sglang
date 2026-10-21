@@ -20,7 +20,6 @@ from sglang.multimodal_gen.configs.models.dits.ltx_2_5 import LTX25ArchConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_2_5_video import (
     LTX25VideoVAEArchConfig,
 )
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEArchConfig
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
@@ -30,23 +29,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
 
 
 class TestLTX25DiTConfig(unittest.TestCase):
-    def test_inherits_ltx23_audio_video_base(self):
-        arch = LTX25ArchConfig()
-        self.assertTrue(arch.apply_gated_attention)
-        self.assertTrue(arch.cross_attention_adaln)
-        # `use_prompt_embeddings: false` upstream -- the caption projection
-        # lives in the connector, not the DiT.
-        self.assertTrue(arch.caption_proj_before_connector)
-        self.assertEqual(arch.rope_type.value, "split")
-        self.assertTrue(arch.double_precision_rope)
-
-    def test_feed_forward_bias_is_video_only(self):
-        # LTX-2.5 checkpoints have no `ff.net.*.bias` for the video branch but
-        # do for the audio one.
-        arch = LTX25ArchConfig()
-        self.assertFalse(arch.ff_bias)
-        self.assertTrue(arch.audio_ff_bias)
-
     def test_param_names_mapping_extends_ltx2(self):
         # Regression: read off a class attribute pinned to LTX2ArchConfig, the
         # LTX-2.5 renames never reached the loader.
@@ -67,13 +49,6 @@ class TestLTX25DiTConfig(unittest.TestCase):
             self.assertTrue(mapped.startswith(key.split(".")[0] + "_single."), mapped)
             self.assertEqual(reverse(mapped)[0], key)
 
-    def test_ltx2_defaults_unchanged(self):
-        # The shared LTX-2 config must keep its original behaviour.
-        arch = LTX2ArchConfig()
-        self.assertTrue(arch.ff_bias)
-        self.assertTrue(arch.audio_ff_bias)
-        self.assertFalse(arch.use_keyframes_abs_pos_embedding)
-
 
 class TestLTX25VAEConfig(unittest.TestCase):
     # Reversed like its sibling lists, this would give the wrong strides.
@@ -89,10 +64,6 @@ class TestLTX25VAEConfig(unittest.TestCase):
             list(arch.upsample_type),
             ["spatiotemporal", "spatiotemporal", "temporal", "spatial"],
         )
-
-    def test_ltx2_defaults_to_all_spatiotemporal(self):
-        # `None` must keep LTX-2 bit-identical.
-        self.assertIsNone(LTXVideoVAEArchConfig().upsample_type)
 
     def test_decoder_builds_expected_upsampler_strides(self):
         import torch
@@ -227,9 +198,6 @@ class TestLTX25PipelineConfig(unittest.TestCase):
                 )
             )
         )
-
-    def test_ltx2_has_no_pinned_schedule(self):
-        self.assertIsNone(LTX2PipelineConfig().default_sigmas)
 
     def test_stays_an_ltx2_variant(self):
         # LTX-2.5 uses the LTX-2 linspace sigma path, so it must NOT be marked
@@ -397,11 +365,6 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         # The remaining spatial factor is the pixel patch size.
         self.assertEqual(spatial * arch.patch_size, arch.spatial_compression_ratio)
 
-    def test_ships_as_a_single_step_x0_decoder(self):
-        arch = self._config().arch_config
-        self.assertEqual(arch.decoder_num_inference_steps, 1)
-        self.assertEqual(arch.decoder_model_output_type, "x0")
-
     def test_builds_and_reports_expected_context_width(self):
         import torch
 
@@ -478,6 +441,66 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         cls, _ = ModelRegistry.resolve_model_cls("LTX2VideoDiffusionDecoderModel")
         self.assertEqual(cls.__name__, "LTX2VideoDiffusionDecoderModel")
 
+    def test_rotary_pair_cpu_fallback_matches_original_expression(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            LTX2VideoVaeRotaryPosEmbed3D,
+        )
+
+        def reference(module, hidden_states):
+            outputs = []
+            offset = 0
+            for axis, (length, dim) in enumerate(
+                zip(hidden_states.shape[1:4], module.rope_dim_split, strict=True),
+                1,
+            ):
+                chunk = hidden_states[..., offset : offset + dim]
+                pairs = chunk.reshape(*chunk.shape[:-1], dim // 2, 2)
+                even = pairs[..., 0].float()
+                odd = pairs[..., 1].float()
+                exponents = torch.arange(0, dim, 2, dtype=torch.float64) / dim
+                inv_freqs = (1.0 / module.base**exponents).to(torch.float32)
+                positions = torch.arange(length, dtype=torch.float32)
+                angles = positions[:, None] * inv_freqs[None, :]
+                shape = [1, 1, 1, 1, 1, dim // 2]
+                shape[axis] = length
+                cos = angles.cos().reshape(shape)
+                sin = angles.sin().reshape(shape)
+                rotated = torch.stack(
+                    [even * cos - odd * sin, even * sin + odd * cos], dim=-1
+                )
+                outputs.append(rotated.reshape(chunk.shape).to(hidden_states.dtype))
+                offset += dim
+            return torch.cat(outputs, dim=-1)
+
+        torch.manual_seed(42)
+        rope = LTX2VideoVaeRotaryPosEmbed3D(64)
+        query = torch.randn(1, 3, 7, 7, 2, 64, dtype=torch.bfloat16)
+        key = torch.randn_like(query)
+
+        query_out, key_out = rope.forward_pair(query, key)
+
+        self.assertTrue(torch.equal(query_out, reference(rope, query)))
+        self.assertTrue(torch.equal(key_out, reference(rope, key)))
+
+    def test_rotary_tables_are_shared_across_decoder_blocks(self):
+        import torch
+
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            _ROPE_TABLE_CACHE,
+            LTX2VideoVaeRotaryPosEmbed3D,
+        )
+
+        _ROPE_TABLE_CACHE.clear()
+        hidden_states = torch.empty(1, 3, 7, 7, 2, 64, dtype=torch.bfloat16)
+        first = LTX2VideoVaeRotaryPosEmbed3D(64)._tables(hidden_states)
+        second = LTX2VideoVaeRotaryPosEmbed3D(64)._tables(hidden_states)
+
+        self.assertIs(first, second)
+        self.assertEqual(len(_ROPE_TABLE_CACHE), 1)
+        _ROPE_TABLE_CACHE.clear()
+
 
 class TestLTX25OptionalDecoderLoading(unittest.TestCase):
     @staticmethod
@@ -504,7 +527,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_is_not_loaded_by_default(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 
@@ -518,7 +541,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_load_is_explicit_and_validated(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

@@ -20,7 +20,6 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
-    mamba_extra_buffer_enabled,
 )
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
@@ -199,7 +198,7 @@ class ShortConvolution(nn.Module):
             activation=self.activation,
             use_residual=self.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=self._conv_state(forward_batch).track_cache_indices,
         )
 
     def _prepare_extend_sconv_cache(
@@ -217,7 +216,7 @@ class ShortConvolution(nn.Module):
                 sconv_cache=sconv_cache,
                 track_conv_indices=track_conv_indices,
                 mask=forward_batch.mamba_track_mask,
-                dst_indices=forward_batch.mamba_track_indices,
+                dst_indices=self._conv_state(forward_batch).track_cache_indices,
             )
 
     def _save_intermediate_conv_windows(
@@ -270,8 +269,11 @@ class ShortConvolution(nn.Module):
         else:
             draft_token_num = hidden_states.shape[1]
 
-        mamba_track_indices = getattr(forward_batch, "mamba_track_indices", None)
-        do_tracking = mamba_track_indices is not None and mamba_extra_buffer_enabled()
+        mamba_track_indices = self._conv_state(forward_batch).track_cache_indices
+        do_tracking = (
+            mamba_track_indices is not None
+            and get_exec().mamba.enable_mamba_extra_buffer
+        )
 
         crossed = track_step = None
         if do_tracking:
@@ -347,7 +349,7 @@ class ShortConvolution(nn.Module):
         if meta.track_conv_indices is not None:
             track_rows = meta.track_conv_indices
             track_mask = forward_batch.mamba_track_mask
-            track_dst = forward_batch.mamba_track_indices
+            track_dst = meta.track_cache_indices
         else:
             w1 = self.kernel_size[0] - 1
             track_rows = torch.empty((0, w1), dtype=torch.int64, device=dev)

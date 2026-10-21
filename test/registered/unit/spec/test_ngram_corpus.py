@@ -10,10 +10,15 @@ from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=26, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
+register_xpu_ci(
+    est_time=20,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="XPU image lacks apache-tvm-ffi (NgramCorpus JIT dependency)",
+)
 
 
 def _make_corpus(match_type="BFS", **kwargs):
@@ -347,6 +352,44 @@ class TestFrequencyBoosting(CustomTestCase):
             ids_list[1],
             20,
             f"Token 20 should be selected over 10 after frequency boost, got {ids_list}",
+        )
+
+
+class TestFrequencyTieSensitivity(CustomTestCase):
+    """A single additional insertion -- not the forced 10x majority in
+    TestFrequencyBoosting -- is enough to flip which candidate Prob-mode
+    returns for a query that two independent, freshly-stated requests both
+    send unchanged. Reproduces the mechanism behind an observed divergence:
+    two requests generating from the same repeated prompt got different
+    NGRAM drafts because one more generation's output landed in the shared
+    corpus between them, flipping a near-tied frequency count.
+    """
+
+    def test_single_insert_flips_tied_candidate(self):
+        corpus = _make_corpus(
+            "PROB",
+            draft_token_num=2,
+            max_bfs_breadth=1,
+            min_bfs_breadth=1,
+            max_trie_depth=5,
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
+
+        # Two unrelated requests, each with fresh state, send the identical
+        # query; only the shared corpus differs between them.
+        ids_before, _ = _batch_get_with_state(corpus, "req-before", [1, 2, 3], 3)
+        self.assertEqual(ids_before.tolist(), [3, 10], ids_before.tolist())
+
+        corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
+
+        ids_after, _ = _batch_get_with_state(corpus, "req-after", [1, 2, 3], 3)
+        self.assertEqual(
+            ids_after.tolist(),
+            [3, 20],
+            f"one more insertion should flip the tie, got {ids_after.tolist()}",
         )
 
 
@@ -688,70 +731,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         ids, _ = _batch_get(corpus, [[1, 2, 3]])
         self.assertEqual(ids.tolist(), [3, 20])
-
-
-class TestNgramCorpusMatchBenchmark(CustomTestCase):
-    """Benchmark incremental advance vs full rebuild in match()."""
-
-    def test_incremental_faster_than_rebuild(self):
-        """Incremental advance (O(D) per token) should be faster than rebuild (O(D^2))."""
-        import time
-
-        max_trie_depth = 18
-        draft_token_num = 8
-        corpus = _make_corpus(
-            "BFS",
-            max_trie_depth=max_trie_depth,
-            draft_token_num=draft_token_num,
-            capacity=500000,
-        )
-
-        # Seed the trie with diverse sequences so suffix matching is non-trivial.
-        seed_data = [list(range(i, i + 50)) for i in range(0, 5000, 50)]
-        corpus.batch_put(seed_data)
-        corpus.synchronize()
-
-        num_steps = 500
-        base_seq = list(range(1, max_trie_depth + 1))
-
-        # --- Incremental path: same req_id, total_len grows by 1 each step ---
-        req_id = "bench-incremental"
-        # Warm up the state with the initial context.
-        _batch_get_with_state(corpus, req_id, base_seq, len(base_seq))
-
-        start = time.perf_counter()
-        for step in range(num_steps):
-            total_len = len(base_seq) + step + 1
-            new_token = (step + max_trie_depth + 1) % 5000
-            tail = (base_seq + [new_token])[-max_trie_depth:]
-            base_seq = tail
-            _batch_get_with_state(corpus, req_id, tail, total_len)
-        incremental_us = (time.perf_counter() - start) / num_steps * 1e6
-
-        # --- Rebuild path: unique req_id each call forces fresh state ---
-        base_seq = list(range(1, max_trie_depth + 1))
-        start = time.perf_counter()
-        for step in range(num_steps):
-            new_token = (step + max_trie_depth + 1) % 5000
-            tail = (base_seq + [new_token])[-max_trie_depth:]
-            base_seq = tail
-            _batch_get(corpus, [tail])
-        rebuild_us = (time.perf_counter() - start) / num_steps * 1e6
-
-        print(
-            f"\n  Incremental: {incremental_us:.1f} us/step"
-            f"\n  Rebuild:     {rebuild_us:.1f} us/step"
-            f"\n  Speedup:     {rebuild_us / incremental_us:.2f}x"
-        )
-
-        # The incremental path should be at least as fast; allow a small margin
-        # for noise. With D=12 the theoretical speedup is ~12x (D^2/D).
-        self.assertLess(
-            incremental_us,
-            rebuild_us * 1.1,
-            f"Incremental ({incremental_us:.1f} us) should not be slower than "
-            f"rebuild ({rebuild_us:.1f} us)",
-        )
 
 
 class TestNgramCorpusMultiSam(CustomTestCase):

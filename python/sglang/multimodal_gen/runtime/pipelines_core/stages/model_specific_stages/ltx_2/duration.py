@@ -84,7 +84,7 @@ class LTX2DurationStage(PipelineStage):
                 max_seconds=float(batch.auto_duration_max_seconds),
             )
 
-        logger.info(
+        logger.debug(
             "Auto-duration: %d frames (requested %d) @ %.2f fps",
             num_frames,
             int(batch.num_frames),

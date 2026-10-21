@@ -53,6 +53,37 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp, {"status": "ok"})
 
 
+class TestRouteModelPrebuild(unittest.TestCase):
+    def _app(self):
+        from fastapi import APIRouter, FastAPI
+        from pydantic import BaseModel
+
+        class Body(BaseModel):
+            value: int
+
+        router = APIRouter()
+
+        @router.post("/thing")
+        async def thing(body: Body) -> Body:
+            return body
+
+        app = FastAPI()
+        app.include_router(router)
+        return app
+
+    def test_prebuild_resolves_route_models_before_the_first_request(self):
+        app = self._app()
+        self.assertIsNone(app.openapi_schema)
+        http_server.build_route_request_models(app)
+        self.assertIn("/thing", app.openapi_schema["paths"])
+
+    def test_prebuild_failure_does_not_break_startup(self):
+        app = self._app()
+        with mock.patch.object(app, "openapi", side_effect=RuntimeError("bad schema")):
+            http_server.build_route_request_models(app)
+        self.assertIsNone(app.openapi_schema)
+
+
 class _FakeResponse:
     def __init__(self, status_code: int):
         self.status_code = status_code
@@ -133,6 +164,38 @@ class TestServerManagerReadiness(unittest.TestCase):
             [call.args[0] for call in health_request.call_args_list],
             ["http://127.0.0.1:11000/health"] * 2,
         )
+
+    def test_start_cleans_up_process_when_readiness_fails(self):
+        manager = ServerManager("test-model", port=11000, wait_deadline=1)
+        process = SimpleNamespace(pid=123, stdout=None)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            with (
+                mock.patch(
+                    "sglang.multimodal_gen.test.server.test_server_utils.prepare_perf_log",
+                    return_value=(log_dir, log_dir / "perf.jsonl"),
+                ),
+                mock.patch(
+                    "sglang.multimodal_gen.test.server.test_server_utils.subprocess.Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(
+                    manager,
+                    "_wait_for_ready",
+                    side_effect=TimeoutError("startup timed out"),
+                ),
+                mock.patch(
+                    "sglang.multimodal_gen.test.server.test_server_utils.kill_process_tree"
+                ) as kill_process,
+                mock.patch(
+                    "sglang.multimodal_gen.test.server.test_server_utils.time.sleep"
+                ),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "startup timed out"):
+                    manager.start()
+
+        kill_process.assert_called_once_with(123)
 
 
 if __name__ == "__main__":

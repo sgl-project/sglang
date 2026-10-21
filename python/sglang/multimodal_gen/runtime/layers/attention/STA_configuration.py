@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.layers.attention.mask_strategy import dict_to_3d_list
 
 
 def configure_sta(
@@ -138,7 +138,9 @@ def configure_sta(
         print("\nStrategy usage counts:")
         total_heads = time_step_num * layer_num * head_num  # Fixed dimensions
         for strategy, count in strategy_counts.items():
-            print(f"Strategy {strategy}: {count} heads ({count/total_heads*100:.2f}%)")
+            print(
+                f"Strategy {strategy}: {count} heads ({count / total_heads * 100:.2f}%)"
+            )
 
         # Convert dictionary to 3D list with fixed dimensions
         mask_strategy_3d = dict_to_3d_list(
@@ -221,7 +223,9 @@ def configure_sta(
         print("\nStrategy usage counts:")
         total_heads = time_step_num * layer_num * head_num  # Fixed dimensions
         for strategy, count in strategy_counts.items():
-            print(f"Strategy {strategy}: {count} heads ({count/total_heads*100:.2f}%)")
+            print(
+                f"Strategy {strategy}: {count} heads ({count / total_heads * 100:.2f}%)"
+            )
 
         # Convert dictionary to 3D list with fixed dimensions
         mask_strategy_3d = dict_to_3d_list(

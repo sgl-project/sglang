@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import DispatchMoeRunnerCore, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ if _is_cuda:
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
-class MarlinLoraRunnerCore:
+class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
 
@@ -53,6 +54,10 @@ class MarlinLoraRunnerCore:
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.MARLIN
+
     def run_from_dispatch(
         self,
         dispatch_output: StandardDispatchOutput,
@@ -66,13 +71,13 @@ class MarlinLoraRunnerCore:
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
-        assert (
-            torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-        ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
+        assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
+            "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
+        )
         routed_scaling_factor = runner_config.routed_scaling_factor
 
         M, K = hidden_states.shape
@@ -114,9 +119,13 @@ class MarlinLoraRunnerCore:
         )
 
         # Stage 1: Gate/Up (Marlin)
-        intermediate_cache1 = torch.empty(
-            (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+        projection_cache = torch.zeros(
+            (M * topk * (2 * N + K),),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
+        intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
+        intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
             intermediate_cache1,
@@ -160,11 +169,6 @@ class MarlinLoraRunnerCore:
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
         # Stage 3: Down (Marlin)
-        intermediate_cache3 = torch.empty(
-            (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        if quant_info.expert_map is not None:
-            intermediate_cache3.zero_()
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             intermediate_cache2,

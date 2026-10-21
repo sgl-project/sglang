@@ -10,6 +10,9 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -28,6 +31,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -42,8 +49,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
-    build_torch_compile_kwargs,
-    resolve_torch_compile_mode,
+    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -94,6 +100,10 @@ def _ensure_tensor_decode_output(decode_output):
     if hasattr(decode_output, "sample"):
         return decode_output.sample
     return decode_output
+
+
+def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
+    return (image / 2 + 0.5).clamp(0, 1)
 
 
 class DecodingStage(PipelineStage):
@@ -182,17 +192,16 @@ class DecodingStage(PipelineStage):
             compiled_callable.target_id != id(vae)
             or compiled_callable.compiled_module is None
         )
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_VAE_TORCH_COMPILE_MODE",
+            "SGLANG_TORCH_COMPILE_MODE",
+            default="default",
+            module=vae,
+        )
         if current_platform.is_npu():
-            compile_kwargs = build_torch_compile_kwargs(mode=None)
             if will_compile:
                 logger.info("Compiling VAE decode with torchair backend on NPU")
         else:
-            mode = resolve_torch_compile_mode(
-                "SGLANG_VAE_TORCH_COMPILE_MODE",
-                "SGLANG_TORCH_COMPILE_MODE",
-                default="default",
-            )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
@@ -207,6 +216,7 @@ class DecodingStage(PipelineStage):
         server_args: ServerArgs,
         *,
         vae_dtype: torch.dtype,
+        on_frames=None,
     ) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
@@ -219,11 +229,46 @@ class DecodingStage(PipelineStage):
                   VAE precision ("fp32", "fp16", "bf16")
                 - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
+            on_frames: Receives finished video frames in order. VAEs without a
+                frame callback hand over the complete decoded clip once.
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
-            normalized to [0, 1] range and moved to CPU as float32
+            normalized to [0, 1] on the decode device.
         """
+        normalized_on_frames = (
+            (lambda frames: on_frames(_to_unit_range(frames)))
+            if on_frames is not None
+            and isinstance(self.vae, ParallelTiledVAE)
+            and self.vae.supports_decode_on_frames
+            else None
+        )
+        image = self.decode_raw(
+            latents,
+            server_args,
+            vae_dtype=vae_dtype,
+            on_frames=normalized_on_frames,
+        )
+        image = _to_unit_range(image)
+        if (
+            on_frames is not None
+            and normalized_on_frames is None
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+        return image
+
+    @torch.no_grad()
+    def decode_raw(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+        on_frames=None,
+    ) -> torch.Tensor:
+        """Decode without pixel normalization, including for inter-clip conditioning."""
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.
@@ -241,38 +286,67 @@ class DecodingStage(PipelineStage):
 
         # Decode latents
         with autocast_context(vae_dtype, server_args.disable_autocast):
-            try:
-                # TODO: make it more specific
-                if server_args.pipeline_config.vae_tiling:
+            # not every VAE supports toggling tiling at runtime; say so instead
+            # of dropping the request, since the OOM advice below points here
+            if server_args.pipeline_config.vae_tiling:
+                try:
                     self.vae.enable_tiling()
-            except Exception:
-                pass
+                except AttributeError:
+                    logger.warning(
+                        "--vae-tiling has no effect: %s does not support "
+                        "enabling tiling at runtime. Whether it tiles is fixed "
+                        "by its VAE config.",
+                        type(self.vae).__name__,
+                    )
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
+            decode_kwargs = {}
+            streams_frames = (
+                isinstance(self.vae, ParallelTiledVAE)
+                and self.vae.supports_decode_on_frames
+            )
+            if on_frames is not None and streams_frames:
+                decode_kwargs["on_frames"] = on_frames
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
                 try:
-                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(
+                        latents, **decode_kwargs
+                    )
                 except Exception as error:
                     if "out of memory" in str(error).lower():
+                        # decode runs after denoising, so the DiT and encoders
+                        # are idle but may still hold VRAM; freeing them is the
+                        # lever here. --vae-cpu-offload is not: it moves VAE
+                        # weights, not the activations that overflow.
                         if not server_args.pipeline_config.vae_tiling:
                             logger.warning(
-                                "OOM detected during VAE decoding. Please enable "
-                                "--vae-tiling to reduce peak memory usage."
+                                "OOM detected during VAE decoding. Enable "
+                                "--vae-tiling to bound the decode working set, "
+                                "and free the components that finished earlier "
+                                "with --cpu-offload-components dit,text_encoder."
                             )
                         else:
                             logger.warning(
                                 "OOM detected during VAE decoding with tiling enabled. "
-                                "Please reduce the resolution or enable "
-                                "--vae-cpu-offload."
+                                "Free the components that finished earlier with "
+                                "--cpu-offload-components dit,text_encoder, then "
+                                "lower the tile size in the model's VAE config, "
+                                "then reduce resolution or frame count."
                             )
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
 
-        # De-normalize image to [0, 1] range
-        image = (image / 2 + 0.5).clamp(0, 1)
+        if (
+            on_frames is not None
+            and not streams_frames
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+
         return image
 
     def load_model(self):
@@ -289,6 +363,26 @@ class DecodingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module(self.component_name, self.vae)
             self.server_args.model_loaded[self.component_name] = True
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder to feed during the decode, if the frames go to the file as decoded."""
+        if (
+            type(self).forward is not DecodingStage.forward
+            or type(self).decode is not DecodingStage.decode
+            or not isinstance(self.vae, ParallelTiledVAE)
+            or not self.vae.supports_decode_on_frames
+            or batch.return_trajectory_decoded
+            or not isinstance(batch.latents, torch.Tensor)
+        ):
+            return None
+        save_file_path = streamed_video_output_path(
+            batch, server_args, int(batch.latents.shape[0])
+        )
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(save_file_path, batch)
 
     @torch.no_grad()
     def forward(
@@ -307,7 +401,13 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        vae_dtype = resolve_decode_precision(server_args, self.component_name)
+        vae_dtype = resolve_decode_precision(
+            server_args,
+            self.component_name,
+            quality=batch.sampling_params.quality,
+        )
+        stream = self._encode_while_decoding(batch, server_args)
+        output_file_paths = None
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,
@@ -315,14 +415,36 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
-                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+            # The decoder fast paths re-associate the reference operators
+            # without lowering any precision, so they belong to "lossless".
+            with use_vae_fast_path(
+                vae,
+                quality_allows(batch.sampling_params.quality, "lossless"),
+            ):
+                try:
+                    if stream is None:
+                        # Model-specific decode overrides need not support streaming.
+                        frames = self.decode(
+                            batch.latents, server_args, vae_dtype=vae_dtype
+                        )
+                    else:
+                        frames = self.decode(
+                            batch.latents,
+                            server_args,
+                            vae_dtype=vae_dtype,
+                            on_frames=stream,
+                        )
+                        output_file_paths = stream.finish()
+                except BaseException:
+                    if stream is not None:
+                        stream.abort()
+                    raise
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
-                    assert (
-                        batch.trajectory_latents is not None
-                    ), "batch should have trajectory latents"
+                    assert batch.trajectory_latents is not None, (
+                        "batch should have trajectory latents"
+                    )
 
                     # 1. Batch trajectory decoding to improve GPU utilization
                     # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
@@ -345,11 +467,15 @@ class DecodingStage(PipelineStage):
                 else:
                     trajectory_decoded = None
 
-        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        if output_file_paths is None:
+            frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        else:
+            frames = None
 
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
+            output_file_paths=output_file_paths,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,
