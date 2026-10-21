@@ -793,7 +793,9 @@ class EngramEmbedding(nn.Module):
     columns where they divide evenly (`shard_range`); with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range.
+    in every layout: a rank writes only its own row range. With
+    SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE, supported single-node NVLink groups
+    map each immutable HBM shard and fetch locally requested rows from its owner.
     """
 
     def __init__(
@@ -812,7 +814,27 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self.peer_table = None
+        if (
+            envs.SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE.get()
+            and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+        ):
+            from sglang.srt.layers.engram_peer import (
+                EngramPeerTable,
+                peer_table_supported,
+            )
+
+            group = get_parallel().tp_group
+            if peer_table_supported(group):
+                ranges = [
+                    shard_range(num_embeddings, column_bounds, rank, self.tp_size)
+                    for rank in range(self.tp_size)
+                ]
+                self.peer_table = EngramPeerTable(ranges, dim, FP8_BLOCK_SIZE, group)
+        if self.peer_table is not None:
+            self.weight = nn.Parameter(self.peer_table.weight, requires_grad=False)
+            self.scale = nn.Parameter(self.peer_table.scale, requires_grad=False)
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -869,6 +891,10 @@ class EngramEmbedding(nn.Module):
         """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if self.peer_table is not None:
+            assert self.weight.data_ptr() == self.peer_table.weight.data_ptr()
+            assert self.scale.data_ptr() == self.peer_table.scale.data_ptr()
+            self.peer_table.finish_load()
 
     def forward(
         self,
@@ -877,6 +903,10 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self.peer_table is not None:
+            out = self._empty(indices)
+            self.peer_table.lookup(indices.reshape(-1), out.view(-1, self.dim))
+            return out
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
