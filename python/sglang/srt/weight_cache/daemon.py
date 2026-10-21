@@ -425,11 +425,7 @@ class WeightCacheDaemon:
         through torch's _share_cuda_ handle, which would make the export fail
         partway with an opaque error. Detect it up front and fail loud.
 
-        This only affects CUDA's caching allocator; other platforms (e.g. NPU /
-        Ascend) are not gated by ``expandable_segments`` and are skipped.
         """
-        if is_npu():
-            return
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
             conf = os.environ.get(var, "")
             for field in conf.split(","):
