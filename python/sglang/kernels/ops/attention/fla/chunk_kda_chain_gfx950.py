@@ -8,7 +8,6 @@ from sglang.kernels.ops.attention.fla.op import exp2
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
-
 CHUNK_SIZE = 64
 
 
@@ -70,9 +69,9 @@ def chunk_kda_chain_fwd_kernel(
 
     if TRACK_STATE:
         i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
-        track_base = track_state + (
-            i_n * stride_track_state + i_h * 128 * 128
-        ).to(tl.int64)
+        track_base = track_state + (i_n * stride_track_state + i_h * 128 * 128).to(
+            tl.int64
+        )
     else:
         i_track = -1
         track_base = track_state
@@ -191,10 +190,18 @@ def can_use_kda_chain_prefill(
     cu_seqlens: Optional[torch.Tensor],
     output_intermediate_states: bool,
 ) -> bool:
+    if cu_seqlens is None:
+        return False
+    num_sequences = len(cu_seqlens) - 1
+    measured_cell = q.shape[1] == 16384 and (
+        (q.shape[-2] == 16 and num_sequences in (3, 4))
+        or (q.shape[-2] == 8 and num_sequences in (2, 3, 4))
+    )
     return (
         envs.SGLANG_OPT_KDA_CHAIN_PREFILL.get()
         and is_gfx95_supported()
         and not output_intermediate_states
+        and measured_cell
         and q.dtype == torch.bfloat16
         and k.dtype == torch.bfloat16
         and v.dtype == torch.bfloat16
@@ -208,7 +215,6 @@ def can_use_kda_chain_prefill(
         and gk.is_contiguous()
         and A.is_contiguous()
         and initial_state is not None
-        and cu_seqlens is not None
         and q.shape[0] == 1
         and q.shape[-2] in (8, 16)
         and q.shape[-1] == 128
@@ -235,15 +241,21 @@ def chunk_kda_chain_fwd(
     cu_seqlens: torch.Tensor,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
-    bv: int = 16,
-    num_warps: int = 4,
-    num_stages: int = 2,
+    bv: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     assert (track_state is None) == (track_chunk_idx is None)
     if track_state is not None:
         assert track_state.dtype == torch.float32
     T, H = q.shape[1:3]
     N = len(cu_seqlens) - 1
+    if bv is None:
+        if H == 8 and N in (2, 3):
+            bv, num_warps, num_stages = 16, 4, 3
+        else:
+            bv, num_warps, num_stages = 64, 4, 2
+    assert num_warps is not None and num_stages is not None
     output = v
     grid = (triton.cdiv(128, bv), N * H)
     chunk_kda_chain_fwd_kernel[grid](
