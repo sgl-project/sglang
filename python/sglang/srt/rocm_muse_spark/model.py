@@ -13,6 +13,8 @@ in ``sglang_meta_common/ops`` (with a torch fallback).
 
 from __future__ import annotations
 
+import csv
+import functools
 import logging
 import os
 import re
@@ -22,10 +24,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.gemm.bf16_gemm_hipblaslt_tuned import (
-    bf16_gemm_hipblaslt,
-    hipblaslt_tuned_solution,
-)
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import LAYOUT as TILED_GEMM_LAYOUT
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     prepare_tiled_weight,
@@ -318,8 +316,9 @@ _USE_AITER_DENSE = (
 _tgemm = None
 
 # MI355X AgentX fast paths (switches in sglang.srt.environ, all on by default).
-# Pooler / unpooler at verify widths (M > 64) on searched hipBLASLt solutions and
-# the FP32 router on a tuned split-K GEMM (exact-M tables in kernels/ops/gemm/configs).
+# Pooler / unpooler at the verify widths aiter patch 06 tunes go through aiter's
+# tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
+# split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
@@ -338,32 +337,81 @@ def _log_dense_tuned(kind: str, key) -> None:
         logger.info("Muse dense tuned: %s %s", kind, key)
 
 
-def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
+def _get_tgemm():
     global _tgemm
+    if _tgemm is None:
+        try:
+            from aiter.tuned_gemm import tgemm as _t
+
+            _tgemm = _t
+        except Exception:  # aiter without tuned_gemm: stay on torch
+            _tgemm = False
+    return _tgemm
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_tuned_moe_projections() -> frozenset:
+    """(N, K, M) of the pooler / unpooler GEMMs that aiter patch 06 tunes for this GPU.
+
+    Read from aiter's own table (model_configs/muse_spark_bf16_tuned_gemm.csv), so it
+    is the single source of the solutions; only these exact M leave nn.Linear (any
+    other M would hit aiter's padded-M lookup of other models' rows).
+    """
+    try:
+        import aiter
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+    except Exception:
+        return frozenset()
+    path = os.path.join(
+        os.path.dirname(aiter.__file__),
+        "configs",
+        "model_configs",
+        "muse_spark_bf16_tuned_gemm.csv",
+    )
+    if not os.path.exists(path):
+        return frozenset()
+    gfx, cu_num = get_gfx(), get_cu_num()
+    shapes = set()
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            n, k = int(row["N"]), int(row["K"])
+            if (
+                (n, k) in ((4096, 8192), (8192, 4096))
+                and row["gfx"] == gfx
+                and int(row["cu_num"]) == cu_num
+                and row["bias"] == "False"
+                and row["outdtype"] == "torch.bfloat16"
+            ):
+                shapes.add((n, k, int(row["M"])))
+    return frozenset(shapes)
+
+
+def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
     tiled = getattr(linear, "small_m_tiled_weight", None)
     if tiled is not None and linear.bias is None and tiled_gemm_applies(x, tiled):
         return tiled_gemm(x, tiled, *linear.weight.shape)
-    if _DENSE_TUNED and linear.bias is None:
-        solution = hipblaslt_tuned_solution(x, linear.weight)
-        if solution is not None:
-            _log_dense_tuned("gemm", (*linear.weight.shape, x.shape[0], solution))
-            return bf16_gemm_hipblaslt(x, linear.weight, solution)
+    if (
+        _DENSE_TUNED
+        and linear.bias is None
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and linear.weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and linear.weight.is_contiguous()
+        and (*linear.weight.shape, x.shape[0]) in _aiter_tuned_moe_projections()
+        and _get_tgemm()
+    ):
+        _log_dense_tuned("gemm", (*linear.weight.shape, x.shape[0]))
+        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
     if (
         _USE_AITER_DENSE
         and linear.bias is None
         and x.dtype == torch.bfloat16
         and linear.weight.dtype == torch.bfloat16
         and 0 < x.shape[0] <= max_m
+        and _get_tgemm()
     ):
-        if _tgemm is None:
-            try:
-                from aiter.tuned_gemm import tgemm as _t
-
-                _tgemm = _t
-            except Exception:  # aiter without tuned_gemm: stay on torch
-                _tgemm = False
-        if _tgemm:
-            return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
+        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
     return linear(x)
 
 

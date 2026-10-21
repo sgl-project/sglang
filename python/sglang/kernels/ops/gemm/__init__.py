@@ -665,11 +665,6 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "bf16 x fp32 router logits, tuned split-K at verify widths",
     ),
     (
-        "bf16_gemm_hipblaslt_tuned",
-        "bf16_gemm_hipblaslt",
-        "BF16 GEMM on a fixed hipBLASLt solution (tuned table)",
-    ),
-    (
         "unpool_gemm_norm_residual",
         "unpool_gemm_norm_residual",
         "MoE unpooler GEMM + boundary norms + gated residual",

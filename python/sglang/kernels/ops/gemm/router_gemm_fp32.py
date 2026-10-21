@@ -6,19 +6,27 @@ order, so they differ from the eager path only in the K summation order.
 
 * ``router_gemv_fp32``: decode sizes, M <= ROUTER_GEMV_MAX_M, one MI355X-tuned config (K=8192, N=256:
   12.4 us vs 17.7 us torch at M=1); 3 launches -> 2.
-* ``router_gemm_tuned``: verify widths, exact-M table ``configs/muse_spark_router_fp32_mi355x.json``
-  (Muse Spark TP8, HIP-graph timed on MI355X); returns None for any M not in the table.
+* ``router_gemm_tuned``: verify widths, tile configs per M from
+  ``configs/N={N},K={K},device_name={device},dtype=bf16_fp32.json`` (the gemm-group config naming; the
+  MI355X file holds the Muse Spark TP8 router, HIP-graph timed). The grid is the exact verify widths that
+  were tuned: any other M (or a device / shape without a file) returns None and keeps the caller's path.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from functools import lru_cache
+from typing import Dict, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import get_device_name, log_info_on_rank0
+
+logger = logging.getLogger(__name__)
 
 ROUTER_GEMV_MAX_M = 64
 
@@ -195,32 +203,42 @@ def _router_reduce(
     tl.store(OUT + i, acc, mask=mask)
 
 
-_TUNED_ROUTER_CONFIG = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "configs",
-    "muse_spark_router_fp32_mi355x.json",
-)
-
-
-@lru_cache(maxsize=1)
-def _tuned_router_table() -> dict:
-    with open(_TUNED_ROUTER_CONFIG) as f:
-        return {int(m): tuple(int(v) for v in cfg) for m, cfg in json.load(f).items()}
+@lru_cache
+def get_router_gemm_fp32_configs(N: int, K: int) -> Optional[Dict[int, Dict[str, int]]]:
+    """Tuned ``router_gemm_tuned`` configs for a [K, N] FP32 router weight on this device, keyed by M."""
+    device_name = get_device_name().replace(" ", "_")
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype=bf16_fp32.json"
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if not os.path.exists(config_file_path):
+        return None
+    with open(config_file_path) as f:
+        log_info_on_rank0(
+            logger,
+            f"Using configuration from {config_file_path} for the FP32 router GEMM.",
+        )
+        return {int(key): val for key, val in json.load(f).items()}
 
 
 def router_gemm_tuned(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
-    """Tuned split-K router GEMM for the table's exact M; None (caller keeps its path) otherwise.
-
-    Table entries are ``M -> [BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages]``.
-    """
+    """Tuned split-K router GEMM at a tuned M; None (the caller keeps its path) otherwise."""
     if x.dim() != 2 or x.dtype != torch.bfloat16 or w.dtype != torch.float32:
         return None
-    cfg = _tuned_router_table().get(x.shape[0])
     m, k = x.shape
-    if cfg is None or w.shape[0] != k or not x.is_contiguous() or not w.is_contiguous():
+    if w.shape[0] != k or not x.is_contiguous() or not w.is_contiguous():
         return None
     n = w.shape[1]
-    bm, bn, bk, sk, warps, stages = cfg
+    cfg = (get_router_gemm_fp32_configs(n, k) or {}).get(m)
+    if cfg is None:
+        return None
+    bm, bn, bk, sk = (
+        cfg["BLOCK_SIZE_M"],
+        cfg["BLOCK_SIZE_N"],
+        cfg["BLOCK_SIZE_K"],
+        cfg["SPLIT_K"],
+    )
+    warps, stages = cfg["num_warps"], cfg["num_stages"]
     if n % bn or k % (sk * bk):
         return None
     part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device)
