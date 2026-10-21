@@ -20,7 +20,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_attn_backend,
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -120,7 +125,14 @@ class RowBucketGraphRunner:
         # The eager breaks read the step's real row count off this view.
         step_batch = copy.copy(forward_batch)
         step_batch.global_num_token_non_padded_cpu = num_rows
-        with context(step_batch):
+        with (
+            (
+                forward_context(get_forward_context(), forward_batch=step_batch)
+                if has_forward_context()
+                else nullcontext()
+            ),
+            context(step_batch),
+        ):
             if (rows, graph_key) not in self._graphs:
                 # Largest first, so smaller buckets reuse the pool memory the
                 # larger ones took; a bucket below this step's rows cannot be
@@ -168,7 +180,14 @@ class RowBucketGraphRunner:
                 forward_batch.num_token_non_padded, num_rows
             )
             capture_batch.num_token_non_padded = num_token_non_padded
-        with batch_scope(capture_batch, inputs):
+        with (
+            (
+                forward_context(get_forward_context(), forward_batch=capture_batch)
+                if has_forward_context()
+                else nullcontext()
+            ),
+            batch_scope(capture_batch, inputs),
+        ):
             graph = self._record(
                 lambda: body(inputs, capture_batch),
                 rows,
