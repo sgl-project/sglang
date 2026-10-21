@@ -18,8 +18,13 @@ AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
 point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
+from types import SimpleNamespace
+from typing import Optional
+
 import torch
 from torch import nn
+
+from sglang.srt.environ import envs
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
@@ -43,3 +48,93 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
         torch.bfloat16
     )
+
+
+def k3_kv_b_for_absorb(
+    *, module: nn.Module, weight: torch.Tensor
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """kv_b for the MLA absorb BMMs from a per-channel FP8 weight.
+
+    By default, requantize to per-tensor FP8 and return its scalar scale, so the
+    absorb runs AITER's a8w8 BMM; with SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 off,
+    return dense BF16 and no scale. Must run before the kv_b head split.
+    """
+    if not envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.get():
+        return _k3_channel_fp8_to_bf16(module, weight), None
+
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.srt.layers.quantization.fp8_utils import (
+        channel_quant_to_tensor_quant,
+        normalize_e4m3fn_to_e4m3fnuz,
+    )
+
+    weight_scale = module.weight_scale
+    if is_fp8_fnuz():
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=None
+        )
+    if weight_scale.dim() == 1:
+        weight_scale = weight_scale.view(-1, 1)
+    return channel_quant_to_tensor_quant(weight, weight_scale)
+
+
+def _is_quark_channel_fp8(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, before post-processing."""
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    if not (
+        isinstance(module.quant_method, QuarkLinearMethod)
+        and isinstance(module.scheme, QuarkW8A8Fp8)
+    ):
+        return False
+    weight, scale = module.weight, module.weight_scale
+    return (
+        module.scheme.weight_qscheme == "per_channel"
+        and not module.scheme.is_static_input_scheme
+        and weight.dim() == 2
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(scale, torch.Tensor)
+        and scale.numel() == weight.shape[0]
+    )
+
+
+def k3_merge_kda_inproj_fp8(
+    *,
+    qkvg_proj: nn.Module,
+    qkvg_sizes: list[int],
+    f_a_proj: nn.Module,
+    b_proj: nn.Module,
+    f_b_proj: nn.Module,
+) -> Optional[tuple[SimpleNamespace, list[int], torch.Tensor]]:
+    """Merge Quark FP8 [q,k,v,g | f_a | b] into one per-channel FP8 linear.
+
+    Returns (merged layer, its split sizes, BF16 f_b for the tiny GEMM), or None
+    when the fusion does not apply. The original linears keep serving batches
+    above the token limit. Must run before ``process_weights_after_loading``,
+    while weights are [out, in] and scales [out].
+    """
+    if not envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get():
+        return None
+    mods = (qkvg_proj, f_a_proj, b_proj)
+    if not all(_is_quark_channel_fp8(m) for m in (*mods, f_b_proj)):
+        return None
+    weights = [m.weight.data for m in mods]
+    if len({w.shape[1] for w in weights}) != 1:
+        return None
+    scales = [m.weight_scale.data.reshape(-1).float() for m in mods]
+    # N % 64 == 0 keeps AITER's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
+    pad = (-sum(w.shape[0] for w in weights)) % 64
+    if pad:
+        weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+        scales.append(scales[0].new_ones(pad))
+    layer = SimpleNamespace(
+        weight=torch.cat(weights).contiguous(),
+        weight_scale=torch.cat(scales),
+        input_scale=None,
+        scheme=qkvg_proj.scheme,
+    )
+    qkvg_proj.scheme.process_weights_after_loading(layer)
+    sizes = [*qkvg_sizes, weights[1].shape[0], weights[2].shape[0], pad]
+    f_b = _k3_channel_fp8_to_bf16(f_b_proj, f_b_proj.weight.data).contiguous()
+    return layer, sizes, f_b
