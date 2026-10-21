@@ -133,8 +133,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
         mla_backend = get_mla_dcp_backend(self.attn_backend)
-        use_mla_dcp = getattr(mla_backend, "_use_dense_mla_dcp_target", None)
-        self.mla_dcp_graph = use_mla_dcp is not None and use_mla_dcp()
+        self.mla_dcp_graph = getattr(mla_backend, "dense_mla_dcp_target", False)
         self.use_fias_v2_bsnd = (
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()

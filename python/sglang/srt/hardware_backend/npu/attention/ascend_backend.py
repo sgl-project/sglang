@@ -350,6 +350,10 @@ class AscendAttnBackend(AttentionBackend):
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
+        dense_mla = self.use_mla and not self.use_dsa
+        self.dense_mla_dcp_deployment = dense_mla and parallel.dcp_enabled
+        self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
+        self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -441,8 +445,8 @@ class AscendAttnBackend(AttentionBackend):
 
         if (
             not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
-            and not self._dense_mla_dcp_enabled()
-            and not self._use_dsa_dcp()
+            and not self.dense_mla_dcp_deployment
+            and not self.dsa_dcp_target
         ):
             assert not self.is_hybrid_swa, (
                 "Hybrid swa is not supply with `needs_cpu_seq_lens=False`."
@@ -484,18 +488,6 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
-
-    def _dense_mla_dcp_enabled(self) -> bool:
-        """Dense MLA in a DCP deployment, including replicated draft workers."""
-        return self.use_mla and not self.use_dsa and get_parallel().dcp_enabled
-
-    def _use_dense_mla_dcp_target(self) -> bool:
-        """Only target workers read sharded KV and need local DCP metadata."""
-        return self.use_mla and not self.use_dsa and self.dcp_size > 1
-
-    def _use_dsa_dcp(self) -> bool:
-        """DSA target attention uses page-interleaved KV and a replicated indexer."""
-        return self.use_dsa and self.dcp_size > 1
 
     def uses_dcp_partial_attention(self, forward_batch: ForwardBatch) -> bool:
         """Whether this worker returns partial MLA attention for a DCP merge."""
@@ -579,9 +571,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self._use_dense_mla_dcp_target() and self.uses_dcp_partial_attention(
-            forward_batch
-        ):
+        if self.dense_mla_dcp_target and self.uses_dcp_partial_attention(forward_batch):
             init_mla_dcp_metadata(
                 self.forward_metadata,
                 forward_batch,
@@ -717,7 +707,7 @@ class AscendAttnBackend(AttentionBackend):
 
         # Draft workers retain allocator-global cache slots and use the non-DCP
         # attention path, so only target workers need DCP-specific metadata.
-        if self._use_dsa_dcp():
+        if self.dsa_dcp_target:
             metadata = self.forward_metadata
             metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
             is_spec = forward_batch.forward_mode.is_target_verify()
@@ -778,7 +768,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.speculative_num_draft_tokens is not None:
             graph_context_len += self.speculative_num_draft_tokens
         total_context_len = graph_context_len + self.page_size - 1
-        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
+        dense_mla_dcp_graph = self.dense_mla_dcp_target
         if dense_mla_dcp_graph:
             cycle_size = self.page_size * self.dcp_size
             max_local_context_len = (
@@ -827,7 +817,7 @@ class AscendAttnBackend(AttentionBackend):
                 ),
             }
         # DCP decode needs its own block_table (different stride: dcp_page_size).
-        if self._use_dsa_dcp():
+        if self.dsa_dcp_target:
             dcp_page_size = self.page_size * self.dcp_size
             max_dcp_seq_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
             # The captured DSA indexer cache-write operation reads from this fixed
@@ -915,7 +905,7 @@ class AscendAttnBackend(AttentionBackend):
                 torch.npu.current_stream(self.device), self.device
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
+        dense_mla_dcp_graph = self.dense_mla_dcp_target
         if dense_mla_dcp_graph:
             metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
             if forward_mode.is_target_verify():
@@ -926,7 +916,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
                     :bs
                 ]
-        elif self._use_dsa_dcp():
+        elif self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 metadata.dcp_origin_out_cache_loc = self.graph_metadata[
                     "dcp_origin_out_cache_loc"
@@ -1025,7 +1015,7 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
-        dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
+        dense_mla_dcp_graph = self.dense_mla_dcp_target
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1144,7 +1134,7 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens = seq_lens + self.speculative_step_offset_npu
             metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
-        if self._use_dsa_dcp():
+        if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
                 if origin_out_cache_loc is None:
@@ -1652,7 +1642,7 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if self._use_dsa_dcp():
+            if self.dsa_dcp_target:
                 return forward_dcp_sparse_attention(
                     q_nope=q_nope,
                     q_rope=q_pe,
@@ -2709,8 +2699,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         dense_mla_dcp_target_verify = (
-            self._use_dense_mla_dcp_target()
-            and forward_batch.forward_mode.is_target_verify()
+            self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify()
         )
         if dense_mla_dcp_target_verify:
             # Keep the full query shape, including graph padding rows.
@@ -3408,7 +3397,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             is_mla_preprocess_enabled()
             and self.use_mla
-            and not self._dense_mla_dcp_enabled()
+            and not self.dense_mla_dcp_deployment
         ):
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
@@ -3447,7 +3436,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.graph_mode
             and not self.enable_torch_compile
-            and not self._dense_mla_dcp_enabled()
+            and not self.dense_mla_dcp_deployment
         ):
             return self.forward_decode_graph(
                 q,
