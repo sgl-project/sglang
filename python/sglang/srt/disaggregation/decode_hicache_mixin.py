@@ -85,6 +85,7 @@ class DecodeHiCachePreallocMixin:
                 last_hash = self.tree_cache.get_last_hash_value(last_host_node)
                 prefix_keys = (
                     self.tree_cache.get_prefix_hash_values(last_host_node)
+                    + self.tree_cache.get_hash_values(last_host_node)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
@@ -126,8 +127,10 @@ class DecodeHiCachePreallocMixin:
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
             ]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
+            anchor = prefix_match.last_host_node
             prefix_keys = (
-                self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
+                self.tree_cache.get_prefix_hash_values(anchor)
+                + self.tree_cache.get_hash_values(anchor)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
