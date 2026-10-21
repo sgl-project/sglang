@@ -14,9 +14,9 @@ prefix-cache replay below are here to catch.
 `cutedsl_mla` stands in for the family: it is the DCP-native MLA decode kernel
 on Blackwell (the only backend flashinfer accepts `enable_dcp=True` for) and
 what the B300 hosts run, and prefill resolves to `trtllm_mla`, so one server
-covers both halves of the page-table contract. `trtllm_mla` and
-`tokenspeed_mla` share that builder and were checked by hand against the
-static pool (see below) rather than given a CI server each.
+covers both halves of the page-table contract. `trtllm_mla` shares that
+builder and was checked by hand against the static pool (see below) rather
+than given a CI server.
 
 Blackwell-only, hence its own module: the Hopper suite next door cannot host
 it. In extra-b rather than nightly because what it guards is a per-PR argument
@@ -29,13 +29,11 @@ pools agree:
                                     unified / static
     TP2 DCP2  cutedsl_mla           0.905 / 0.905
     TP2 DCP2  trtllm_mla            0.895 / 0.895
-    TP2 DCP2  tokenspeed_mla        0.890 / 0.895, repeat 0.890 / 0.885
     TP4 DCP4  cutedsl_mla           0.910 / 0.900
 
-The cutedsl_mla and trtllm_mla pairs reproduced exactly. tokenspeed_mla moved
-on a repeat of the same questions on BOTH pools, so its spread is the backend,
-not the pool. The TP4 DCP4 row is there because it widens the virtual page to
-4 x 64 = 256, past what this file exercises.
+The cutedsl_mla and trtllm_mla pairs reproduced exactly. The TP4 DCP4 row is
+there because it widens the virtual page to 4 x 64 = 256, past what this file
+exercises.
 
     python -m pytest test/registered/models_e2e/test_kimi_linear_unified_memory_dcp_blackwell.py -v
 """
