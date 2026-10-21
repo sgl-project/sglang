@@ -1340,6 +1340,9 @@ class Envs:
     # device only, matching how the nvcc path pins -gencode to this GPU.
     SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
+    # Per-file overrides for dense LoRA plan tables.
+    SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
+
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================
