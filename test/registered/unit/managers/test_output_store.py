@@ -1,9 +1,10 @@
 """Unit tests for srt/managers/output_store.py and the detokenizer side of it."""
 
 import concurrent.futures
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import msgspec
 import numpy as np
@@ -29,7 +30,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     TokenizerManager,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _chunk(lengths, token_ids, logprobs):
@@ -205,16 +206,17 @@ class TestMaybeCreateOutputStore(CustomTestCase):
                 backend="mooncake", extra_config="{}", disaggregation_mode="prefill"
             )
 
-    def test_backend_comes_from_the_package_registry(self):
-        backend = _MemoryBackend()
-        with patch(
-            "sglang.srt.managers.output_store.create_backend", return_value=backend
-        ) as create:
-            writer = maybe_create_output_store(
-                backend="mooncake", extra_config='{"a": 1}', disaggregation_mode="null"
-            )
-        create.assert_called_once_with("mooncake", '{"a": 1}')
-        self.assertIsInstance(writer, OutputStoreWriter)
+    def test_servers_without_a_backend_do_not_need_the_package(self):
+        """Importing the server must not require radix_transfer_plugins."""
+        code = (
+            "import sys\n"
+            "sys.modules['radix_transfer_plugins'] = None\n"
+            "from sglang.test.test_utils import maybe_stub_sgl_kernel\n"
+            "maybe_stub_sgl_kernel()\n"
+            "import sglang.srt.managers.tokenizer_manager\n"
+            "import sglang.srt.entrypoints.openai.serving_chat\n"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
 
     def test_unknown_backend_names_fail_at_startup(self):
         with self.assertRaisesRegex(ValueError, "available"):

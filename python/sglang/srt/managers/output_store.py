@@ -19,15 +19,19 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
 import msgspec
 import numpy as np
 import torch
 
-from radix_transfer_plugins import OutputStore, StoreRef, create_backend
-from radix_transfer_plugins.stashes.token_output import TokenOutputStash
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+
+# radix_transfer_plugins is imported where it is used: a server without
+# --output-store-backend must not need the package installed.
+if TYPE_CHECKING:
+    from radix_transfer_plugins import OutputStore, StoreRef
+    from radix_transfer_plugins.stashes.token_output import TokenOutputStash
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,8 @@ class TokenOutputCollector(msgspec.Struct):
 
     def to_stash(self) -> TokenOutputStash:
         """Runs on a writer thread; the tensors are on the CPU, so .numpy() copies nothing."""
+        from radix_transfer_plugins.stashes.token_output import TokenOutputStash
+
         chunks = self.sampling_mask_chunks
         mask = {}
         if chunks is not None:
@@ -114,6 +120,8 @@ class OutputStoreWriter:
 
     def cleanup_refs(self, refs: Iterable[Dict]) -> None:
         """Delete the objects behind refs that were built but will never be sent."""
+        from radix_transfer_plugins import StoreRef
+
         for ref in refs:
             self._executor.submit(self._delete, StoreRef.from_builtins(ref))
 
@@ -149,6 +157,8 @@ def maybe_create_output_store(
         raise ValueError(
             "--output-store-backend is not supported with PD disaggregation yet"
         )
+    from radix_transfer_plugins import OutputStore, create_backend
+
     return OutputStoreWriter(OutputStore(backend=create_backend(backend, extra_config)))
 
 

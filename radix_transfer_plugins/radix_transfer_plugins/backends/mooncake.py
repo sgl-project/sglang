@@ -2,7 +2,7 @@
 
 The client only uses store memory other processes provide (``global_segment_size=0``);
 the deployment runs the master and the processes holding segments. Behaviors of
-Mooncake 0.3.13 this relies on (probed in doc/mooncake-data-transfer/evidence/s0-20261017):
+Mooncake 0.3.13 this relies on (probed against a live master):
 
 - ``put_batch`` returns one status for the whole call, and a failed call can leave some
   of its keys stored.
@@ -161,37 +161,39 @@ class MooncakeBackend(StorageBackend):
 
 
 class _LocalBufferGate:
-    """Retries a put that found the local buffer full once another put frees room.
+    """Retries a put that found the local buffer full once, with no other put running.
 
-    A put that fails that way while no other put is in flight and none finished since
-    it started cannot fit at all, so its status is returned as is.
+    A waiting put holds no buffer, so concurrent puts that all fail cannot wait on each
+    other; a put that fails while running alone cannot fit, and its status is returned.
     """
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
-        self._in_flight = 0
-        self._finished = 0
+        self._running = 0
+        self._exclusive = False
 
     def run(self, *, put: Callable[[], int], undo: Callable[[], object]) -> int:
+        status = self._attempt(put=put, exclusive=False)
+        if status != _LOCAL_BUFFER_FULL:
+            return status
+        # A failed batch can leave some keys stored; a retry must start clean.
+        undo()
+        return self._attempt(put=put, exclusive=True)
+
+    def _attempt(self, *, put: Callable[[], int], exclusive: bool) -> int:
         with self._cond:
-            self._in_flight += 1
+            self._cond.wait_for(lambda: not self._exclusive)
+            if exclusive:
+                self._exclusive = True
+                self._cond.wait_for(lambda: self._running == 0)
+            self._running += 1
         try:
-            while True:
-                with self._cond:
-                    finished_before = self._finished
-                status = put()
-                if status != _LOCAL_BUFFER_FULL:
-                    return status
-                # A failed batch can leave some keys stored; a retry must start clean.
-                undo()
-                with self._cond:
-                    if self._in_flight == 1 and self._finished == finished_before:
-                        return status
-                    self._cond.wait_for(lambda: self._finished != finished_before)
+            return put()
         finally:
             with self._cond:
-                self._in_flight -= 1
-                self._finished += 1
+                self._running -= 1
+                if exclusive:
+                    self._exclusive = False
                 self._cond.notify_all()
 
 

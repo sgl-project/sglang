@@ -69,7 +69,11 @@ class OutputStore:
         stash_type: type[S],
         fields: Optional[Sequence[str]] = None,
     ) -> list[S]:
-        """Read the stashes back; ``fields`` limits which fields are read."""
+        """Read the stashes back; ``fields`` limits which fields are read.
+
+        The arrays are backend views: for Mooncake they hold the client's read buffer
+        while they live, so a reader that keeps them should use ``read_many``.
+        """
         self._check_backend(refs)
         wanted = [
             tuple(s for s in ref.fields if fields is None or s.name in fields)

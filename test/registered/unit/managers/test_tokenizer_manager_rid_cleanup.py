@@ -12,6 +12,7 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - Output store puts on finish, and cleanup of refs that are never sent
 """
 
 import asyncio

@@ -2054,7 +2054,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         chunk: SamplingMaskChunk,
         output_ids: Sequence[int],
     ) -> None:
-        """Add one output batch of sampling mask rows to the request's outputs."""
         support_logprobs = state.obj.sampling_logprobs_mode == "support"
         # The sampled tokens' logprobs, one per token, always stay in meta_info;
         # only the support-sized rows move to the output store.
@@ -2088,7 +2087,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _store_token_outputs(
         self, *, out: dict, state: ReqState, request: Optional[fastapi.Request]
     ) -> None:
-        """Store a finished request's per-token outputs and put the ref in meta_info."""
         collector = state.token_output_collector
         state.token_output_collector = None
         if collector.is_empty():
@@ -2116,7 +2114,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.output_store.cleanup_after(future)
             raise ValueError(
                 "Request is disconnected from the client side after its output store "
-                f"put; deleted the stored outputs of {state.obj.rid=}"
+                f"put; scheduled deletion of the stored outputs of {state.obj.rid=}"
             )
         meta_info = out["meta_info"]
         meta_info[OUTPUT_STORE_REF_KEY] = ref.to_builtins()

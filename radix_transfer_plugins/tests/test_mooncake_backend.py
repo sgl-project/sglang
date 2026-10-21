@@ -151,6 +151,31 @@ def test_full_local_buffer_waits_for_another_put():
     assert undo_calls == [1]
 
 
+def test_concurrent_puts_that_all_find_the_buffer_full_do_not_wait_on_each_other():
+    """Two puts that each fit alone but fail together must both retry and succeed."""
+    gate = _LocalBufferGate()
+    both_running = threading.Barrier(2)
+    results = {}
+
+    def writer(name):
+        statuses = iter([-600, 0])
+
+        def put():
+            status = next(statuses)
+            if status == -600:
+                both_running.wait(5)
+            return status
+
+        results[name] = gate.run(put=put, undo=lambda: None)
+
+    threads = [threading.Thread(target=writer, args=(n,), daemon=True) for n in "ab"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert results == {"a": 0, "b": 0}
+
+
 def test_full_local_buffer_with_nothing_in_flight_fails_at_once():
     gate = _LocalBufferGate()
     assert gate.run(put=lambda: -600, undo=lambda: None) == -600
