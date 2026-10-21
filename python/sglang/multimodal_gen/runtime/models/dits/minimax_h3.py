@@ -23,6 +23,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    MINIMAX_H3_NORM_MODULATE,
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
@@ -36,8 +37,6 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
-    mark_minimax_h3_norm_modulate_site,
-    minimax_h3_norm_modulate_active,
     rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
 )
@@ -1019,6 +1018,8 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
+        # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
+        # are torch nn.RMSNorm, so the fused kernel is called directly.
         self._use_fused_qknorm_rope = (
             current_platform.is_cuda()
             and can_use_fused_inplace_qknorm_rope(
@@ -1634,7 +1635,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
-        mark_minimax_h3_norm_modulate_site(self)
+        MINIMAX_H3_NORM_MODULATE.mark(self)
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -1707,7 +1708,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_msa,
                 combined_indices,
                 dtype=_BF16_DTYPE,
-                fused=minimax_h3_norm_modulate_active(self),
+                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
         h = self.attn(
             h,
@@ -1750,7 +1751,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_mlp,
                 combined_indices,
                 dtype=_BF16_DTYPE,
-                fused=minimax_h3_norm_modulate_active(self),
+                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
             h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place

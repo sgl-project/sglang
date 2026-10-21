@@ -677,6 +677,10 @@ class TboForwardBatchPreparer:
         assert end_token_index >= start_token_index, (
             f"{end_token_index=}, {start_token_index=}, batch={batch}"
         )
+        assert batch.logical_forward_mode == batch.forward_mode, (
+            "Two-batch overlap does not support hybrid-SSM decode batches "
+            "relabeled as extend for DP padding."
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -1151,12 +1155,13 @@ def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
 
 
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
-    def __init__(self, **kwargs):
+    def __init__(self, runner_backend=None, **kwargs):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
-                DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                DeepEPDispatcher(runner_backend=runner_backend, **kwargs)
+                for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
@@ -1173,7 +1178,8 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             ]
         elif get_moe_a2a_backend().is_pplx():
             self._inners = [
-                PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                PplxDispatcher(runner_backend=runner_backend, **kwargs)
+                for _ in range(num_inner_dispatchers)
             ]
 
     @property

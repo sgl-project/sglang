@@ -64,7 +64,7 @@ metatags:
   <Card
     title="DeepReinforce"
     mode="card"
-    href="/cookbook/autoregressive/DeepReinforce/Ornith-1.0"
+    href="/cookbook/autoregressive/DeepReinforce/Ornith-1.5"
     img="/cards/logos/deepreinforce.png"
   />
   <Card

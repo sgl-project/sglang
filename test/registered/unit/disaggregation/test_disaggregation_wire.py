@@ -2310,9 +2310,10 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.swa_valid_from = swa_valid_from
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.swa_page_size = 256
@@ -2354,6 +2355,23 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 [[11], [12]],
             ),
         ]
+        mark = torch.zeros(3, dtype=torch.int64)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping, swa_valid_from=mark)
+        expected_infos = draft.get_state_buf_infos()
+        kv_args = KVArgs()
+
+        setup_state_kv_args(
+            kv_args, _make_dsv4_target(unified=False, mapping=mapping), draft
+        )
+
+        # The draft's SWA valid-from follows its SWA as one item per request slot.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1], expected_infos[0])
+        self.assertEqual(kv_args.state_data_ptrs[2], [mark.data_ptr()])
+        self.assertEqual(kv_args.state_item_lens[2], [mark[0].nbytes])
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):

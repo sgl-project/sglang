@@ -8,7 +8,7 @@ import unittest
 import torch
 import triton
 
-from sglang.kernels.ops.attention.utils import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
     kv_indices_num_token_blocks,
 )

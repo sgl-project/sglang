@@ -30,6 +30,10 @@ pub struct ProxyConfig {
     pub initial_backoff_ms: u64,
     /// Upper bound on any one backoff.
     pub max_backoff_ms: u64,
+    /// PD: requests per prefill DP rank sent to decode before their first token.
+    pub decode_dispatch_limit: Option<NonZeroU32>,
+    /// PD: return decode's response only once prefill completes.
+    pub stream_after_prefill: bool,
 }
 
 impl ProxyConfig {
@@ -61,6 +65,8 @@ impl Default for ProxyConfig {
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
+            decode_dispatch_limit: None,
+            stream_after_prefill: false,
         }
     }
 }
@@ -652,6 +658,12 @@ pub struct AffinityConfig {
     /// size chooses the exact minimum with random ties; 1 draws uniformly without
     /// a backup for admission or pressure guards. Separate from cache-owner limits.
     pub min_load_choices: usize,
+    /// Match prefill buckets on uncached tokens E instead of the input length. A
+    /// request with a reusable prefix uses E's buckets, and spills to a worker
+    /// with an idle DP rank when every rank in them has pending prefill; a
+    /// request without one uses every prefill worker whose bucket admits its
+    /// context.
+    pub route_by_uncached_tokens: bool,
 }
 
 impl Default for AffinityConfig {
@@ -680,6 +692,7 @@ impl Default for AffinityConfig {
             worker_queue_limit: None,
             saturation_queue_floor: None,
             min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
+            route_by_uncached_tokens: false,
         }
     }
 }

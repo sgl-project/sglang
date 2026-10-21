@@ -632,6 +632,11 @@ def mm_projection_auto(
     return projected.reshape(-1, projected.shape[-1])
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    return None if hf_config.encoder_only else hf_config.text_config
+
+
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -646,11 +651,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        if hf_config.encoder_only:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config.text_config, quant_config
+            text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV3ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self,

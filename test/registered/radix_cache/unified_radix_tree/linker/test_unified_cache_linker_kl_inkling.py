@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=300,
-    stage="extra-a",
+    stage="extra-b",
     # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
     runner_config="4-gpu-h100",
 )

@@ -171,7 +171,6 @@ class DSparkVerifyPlanner:
                 and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
-                and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()

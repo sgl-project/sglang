@@ -2,7 +2,6 @@
 through L2 alongside the fp8 payload."""
 
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -56,7 +55,7 @@ def _make_host(k_rows, v_rows):
     host.page_num = 4
     host.k_sf_page_bytes = SF_PAGE_BYTES
     host.v_sf_page_bytes = SF_PAGE_BYTES
-    host.device_pool = SimpleNamespace(layer_shard_enabled=False, layer_num=LAYER_NUM)
+    host.target_layer_num = LAYER_NUM
     host.k_scale_host = torch.zeros(
         host.page_num, LAYER_NUM, SF_PAGE_BYTES, dtype=torch.uint8
     )
@@ -80,9 +79,26 @@ def _make_host(k_rows, v_rows):
 
 class TestMXFP8MHATokenToKVPoolHost(CustomTestCase):
     def test_factory_selects_mxfp8_host_pool(self):
-        mxfp8_pool = MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8)
-        mxfp8_pool.head_dim = mxfp8_pool.v_head_dim = 128
-        plain_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        def info(pool_type):
+            return (
+                pool_type(
+                    size=128,
+                    page_size=128,
+                    dtype=torch.float16,
+                    head_num=1,
+                    head_dim=32,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                )
+                .get_device_pool_infos()[0]
+                .buffer_info
+            )
+
+        mxfp8_pool = info(MHATokenToKVPoolMXFP8)
+        plain_pool = info(MHATokenToKVPool)
 
         self.assertIs(get_mha_host_pool_cls(mxfp8_pool), MHATokenToKVPoolMXFP8Host)
         self.assertIs(get_mha_host_pool_cls(plain_pool), MHATokenToKVPoolHost)
@@ -153,7 +169,7 @@ class TestMXFP8MHATokenToKVPoolHost(CustomTestCase):
             ) as one_layer,
         ):
             host.backup_from_device_all_layer(
-                host.device_pool, host_indices, device_indices, io_backend="kernel"
+                object(), host_indices, device_indices, io_backend="kernel"
             )
             self.assertEqual(staged.call_count, 2)
             # Device page 2 landed in host page 1, device page 3 in host page 0.
@@ -168,7 +184,7 @@ class TestMXFP8MHATokenToKVPoolHost(CustomTestCase):
                 rows.zero_()
             for layer_id in range(LAYER_NUM):
                 host.load_to_device_per_layer(
-                    host.device_pool,
+                    object(),
                     host_indices,
                     device_indices,
                     layer_id,

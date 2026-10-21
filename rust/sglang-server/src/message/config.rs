@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -156,6 +156,9 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// Native-generation launch policy normally applied by Python ingress.
+    pub lora_ids: BTreeMap<String, String>,
+    pub enable_strict_thinking: bool,
     /// Per-modality media-count limits from `--limit-mm-data-per-request`.
     pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
@@ -178,6 +181,8 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Resolved deployment metadata used by out-of-process orchestrators.
+    pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
     /// `/server_info` reports beneath its runtime fields.
     pub launch_server_info: LaunchServerInfo,
@@ -224,6 +229,8 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        lora_ids,
+        enable_strict_thinking,
         limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
@@ -231,6 +238,7 @@ impl ServerArgs {
         tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        deployment_info,
         launch_server_info,
         load_snapshot_path,
         load_snapshot_dp_size,
@@ -268,6 +276,8 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        lora_ids: BTreeMap<String, String>,
+        enable_strict_thinking: bool,
         limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
@@ -275,6 +285,7 @@ impl ServerArgs {
         tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        deployment_info: DeploymentInfo,
         launch_server_info: LaunchServerInfo,
         load_snapshot_path: Option<String>,
         load_snapshot_dp_size: usize,
@@ -310,6 +321,8 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            lora_ids,
+            enable_strict_thinking,
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
@@ -317,6 +330,7 @@ impl ServerArgs {
             tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            deployment_info,
             launch_server_info,
             load_snapshot_path,
             load_snapshot_dp_size,
@@ -360,6 +374,8 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            lora_ids: BTreeMap::new(),
+            enable_strict_thinking: false,
             limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
@@ -367,6 +383,7 @@ impl Default for ServerArgs {
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            deployment_info: DeploymentInfo::default(),
             launch_server_info: LaunchServerInfo::default(),
             load_snapshot_path: None,
             load_snapshot_dp_size: 0,
@@ -375,6 +392,51 @@ impl Default for ServerArgs {
             num_accelerators: 0,
             metrics: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeploymentInfo {
+    pub disaggregation_bootstrap_port: Option<u16>,
+    pub node_rank: u32,
+    pub nnodes: u32,
+    pub dp_size: u32,
+    pub dp_rank: Option<u32>,
+    pub dist_init_addr: Option<String>,
+    pub base_gpu_id: u32,
+    pub page_size: Option<u32>,
+    pub dcp_size: u32,
+    pub max_running_requests: Option<u64>,
+    pub max_prefill_tokens: u64,
+    pub enable_dp_attention: bool,
+    pub speculative_algorithm: Option<String>,
+    pub enable_hierarchical_cache: bool,
+    pub hicache_ratio: Option<f64>,
+    pub hicache_size: u64,
+    pub hicache_write_policy: Option<String>,
+    pub hicache_host_total_tokens: Option<u64>,
+    pub kv_event_sources: Vec<KvEventSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KvEventSource {
+    pub dp_rank: u32,
+    pub endpoint: String,
+    pub topic: String,
+    pub block_size: u32,
+}
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "deployment_info is not valid JSON: {e}"
+            ))
+        })
     }
 }
 
