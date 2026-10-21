@@ -79,9 +79,12 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
             self.assertTrue(kwargs["return_lse"])
             return torch.ones(2, 1, 8, 512), expected_lse
 
-        with self._mock_flashinfer(fake_op), patch(
-            "sglang.kernels.ops.attention.fixup_zero_kv.fixup_zero_kv_rows"
-        ) as fixup:
+        with (
+            self._mock_flashinfer(fake_op),
+            patch(
+                "sglang.kernels.ops.attention.fixup_zero_kv.fixup_zero_kv_rows"
+            ) as fixup,
+        ):
             output, lse = flashinfer_sparse_mla_forward(
                 q=torch.zeros((2, 8, 576), dtype=torch.bfloat16),
                 kv_cache=torch.zeros((128, 1, 656), dtype=torch.uint8),
@@ -200,20 +203,28 @@ class TestSM120DcpDefaults(unittest.TestCase):
         )
 
         cfg = SimpleNamespace(
-            dcp_size=4, enable_hisparse=False, enable_hierarchical_cache=False,
-            disaggregation_mode="null", speculative_eagle_topk=1,
-            dsa_prefill_backend=None, dsa_decode_backend=None,
-            dcp_replicate_q_proj=None, dcp_comm_backend="ag_rs",
+            dcp_size=4,
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            disaggregation_mode="null",
+            speculative_eagle_topk=1,
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            dcp_replicate_q_proj=None,
+            dcp_comm_backend="ag_rs",
         )
         with patch(
             "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
             return_value=SimpleNamespace(is_sm120=True),
         ):
             result = _dsa_dcp_overrides(cfg)
-            self.assertEqual(result, dict(
-                dsa_prefill_backend="flashinfer_sparse_mla",
-                dsa_decode_backend="flashinfer_sparse_mla",
-            ))
+            self.assertEqual(
+                result,
+                dict(
+                    dsa_prefill_backend="flashinfer_sparse_mla",
+                    dsa_decode_backend="flashinfer_sparse_mla",
+                ),
+            )
             cfg.dsa_prefill_backend = "triton_sparse_mla"
             with self.assertRaisesRegex(ValueError, "partial output and LSE"):
                 _dsa_dcp_overrides(cfg)

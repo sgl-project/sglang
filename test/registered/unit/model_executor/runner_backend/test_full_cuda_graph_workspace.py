@@ -110,7 +110,8 @@ class TestFullCudaGraphWorkspace(CustomTestCase):
                 captured, executables = registry.stats()
                 self.assertEqual(captured, 4)
                 self.assertLess(
-                    executables, captured,
+                    executables,
+                    captured,
                     "No executable reuse: this run does not cover dedup updates",
                 )
                 registry.seal()
@@ -134,10 +135,14 @@ class TestFullCudaGraphWorkspace(CustomTestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(first, expected, atol=0, rtol=0)
             torch.testing.assert_close(last, expected + expected, atol=0, rtol=0)
-        print({"dedup": dedup,
-               "registry_stats": registry.stats() if registry is not None else None,
-               "bcg_capture_seconds": capture_seconds,
-               "note": "Capture timing only; not a matched overhead comparison"})
+        print(
+            {
+                "dedup": dedup,
+                "registry_stats": registry.stats() if registry is not None else None,
+                "bcg_capture_seconds": capture_seconds,
+                "note": "Capture timing only; not a matched overhead comparison",
+            }
+        )
         cleanup_bcg()
         full.cleanup()
 
@@ -202,9 +207,18 @@ class TestFullCudaGraphWorkspace(CustomTestCase):
         q.mul_(0.5)
         x.mul_(0.5)
         for backend, n in (
-            (decode, 6), (prefill, 64), (decode, 48), (decode, 12),
-            (prefill, 128), (decode, 36), (decode, 6), (decode, 24),
-            (decode, 42), (decode, 18), (decode, 30), (decode, 6),
+            (decode, 6),
+            (prefill, 64),
+            (decode, 48),
+            (decode, 12),
+            (prefill, 128),
+            (decode, 36),
+            (decode, 6),
+            (decode, 24),
+            (decode, 42),
+            (decode, 18),
+            (decode, 30),
+            (decode, 6),
         ):
             actual = backend.replay(ShapeKey(size=n), static_forward_batch=None)
             torch.cuda.synchronize()

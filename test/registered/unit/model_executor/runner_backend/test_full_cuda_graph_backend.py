@@ -259,7 +259,9 @@ class TestCaptureWorkspaceLifetime(CustomTestCase):
             mock.patch("torch.version.cuda", "13.0"),
             mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
             mock.patch.object(
-                torch._C, "_cuda_clearCublasWorkspaces", create=True,
+                torch._C,
+                "_cuda_clearCublasWorkspaces",
+                create=True,
                 side_effect=lambda: events.append("clear"),
             ) as clear,
         ):
@@ -275,7 +277,9 @@ class TestCaptureWorkspaceLifetime(CustomTestCase):
         with (
             mock.patch("torch.version.cuda", None),
             mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
-            mock.patch.object(torch._C, "_cuda_clearCublasWorkspaces", create=True) as clear,
+            mock.patch.object(
+                torch._C, "_cuda_clearCublasWorkspaces", create=True
+            ) as clear,
         ):
             backend.capture_one(ShapeKey(size=1), lambda: None)
         clear.assert_not_called()
