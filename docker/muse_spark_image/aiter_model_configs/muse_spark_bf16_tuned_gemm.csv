@@ -1,0 +1,17 @@
+gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+gfx950,256,176,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438566,0,21.31,,0.0,311.77,0.0
+gfx950,256,208,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438628,0,21.93,,0.0,358.04,0.0
+gfx950,256,224,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438773,0,22.35,,0.0,378.33,0.0
+gfx950,256,256,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438837,0,22.88,,0.0,422.36,0.0
+gfx950,256,320,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,440085,0,24.66,,0.0,489.85,0.0
+gfx950,256,352,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,439119,0,26.91,,0.0,493.78,0.0
+gfx950,256,384,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,439119,0,27.39,,0.0,529.23,0.0
+gfx950,256,80,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438488,0,8.27,,0.0,162.29,0.0
+gfx950,256,96,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438488,0,8.37,,0.0,192.43,0.0
+gfx950,256,320,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438833,0,10.72,,0.0,500.81,0.0
+gfx950,256,352,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,439389,0,11.84,,0.0,498.78,0.0
+gfx950,256,384,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,438828,0,11.86,,0.0,543.21,0.0
+gfx950,256,144,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,0.0,native,0.0,0.0,0.0
+gfx950,256,160,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,0.0,native,0.0,0.0,0.0
+gfx950,256,192,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,0.0,native,0.0,0.0,0.0
+gfx950,256,240,2304,8192,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,0.0,native,0.0,0.0,0.0
