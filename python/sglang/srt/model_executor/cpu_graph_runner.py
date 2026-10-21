@@ -419,10 +419,11 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("fused_moe_router_cpu")
     def _(
+        moe_softcapping,
         hidden_states,
         gating_output,
         topk,
-        moe_softcapping,
+        renormalize,
         correction_bias=None,
     ):
         shape = (hidden_states.shape[0], topk)

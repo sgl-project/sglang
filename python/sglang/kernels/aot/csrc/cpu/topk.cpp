@@ -699,11 +699,13 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
 }
 
 std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+    double moe_softcapping,
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
-    double moe_softcapping,
+    bool renormalize,
     const std::optional<at::Tensor>& correction_bias) {
+  TORCH_CHECK(!renormalize, "fused_moe_router_cpu: renormalize is not supported");
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(gating_output);
 

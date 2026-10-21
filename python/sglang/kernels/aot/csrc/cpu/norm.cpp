@@ -337,6 +337,7 @@ struct NormReduceGeneric {
       }
       bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
       if constexpr (has_post_residual) {
+        // Round-trip through scalar_t to match cuda behavior
         auto [t_fvec0, t_fvec1] = at::vec::convert_to_float(out_bvec);
         auto [r_fvec0, r_fvec1] = load_float_vec2(post_residual + d);
         out_bvec = convert_from_float_ext<scalar_t>(r_fvec0 + t_fvec0, r_fvec1 + t_fvec1);

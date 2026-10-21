@@ -447,10 +447,11 @@ class TestCustomTopK(CustomTestCase):
             )
 
             out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_cpu(
+                moe_softcapping=softcap,
                 hidden_states=hidden_states,
                 gating_output=router_weight,
                 topk=topk,
-                moe_softcapping=softcap,
+                renormalize=False,
                 correction_bias=correction_bias,
             )
 

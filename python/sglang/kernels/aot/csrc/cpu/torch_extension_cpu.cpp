@@ -225,10 +225,11 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
     bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
 std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+    double moe_softcapping,
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
-    double moe_softcapping,
+    bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
 
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
@@ -800,7 +801,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
-      "fused_moe_router_cpu(Tensor hidden_states, Tensor gating_output, int topk, float moe_softcapping, "
+      "fused_moe_router_cpu(float moe_softcapping, Tensor hidden_states, Tensor gating_output, int topk, bool "
+      "renormalize, "
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("fused_moe_router_cpu", torch::kCPU, &fused_moe_router_cpu);
   m.def(

@@ -67,6 +67,12 @@ _is_cpu = is_cpu()
 logger = logging.getLogger(__name__)
 
 
+if _is_cpu:
+    fused_moe_router_shim = torch.ops.sgl_kernel.fused_moe_router_cpu
+    fused_rmsnorm = torch.ops.sgl_kernel.rmsnorm_cpu
+    fused_dual_residual_rmsnorm = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu
+
+
 class Grok1MLP(nn.Module):
     def __init__(
         self,
@@ -140,20 +146,17 @@ class Grok1MoE(nn.Module):
         )
 
         self.router_logit_softcapping = 30.0
-        if _is_npu:
-            custom_routing_function = None
-        elif _is_cpu:
-            custom_routing_function = self._custom_routing_function_cpu
-        else:
-            custom_routing_function = functools.partial(
-                fused_moe_router_shim, self.router_logit_softcapping
-            )
+
+        custom_routing_function = functools.partial(
+            fused_moe_router_shim,
+            self.router_logit_softcapping,
+        )
 
         self.topk = TopK(
             top_k=top_k,
             renormalize=False,
             layer_id=layer_id,
-            custom_routing_function=custom_routing_function,
+            custom_routing_function=None if _is_npu else custom_routing_function,
         )
 
         self.experts = FusedMoE(
@@ -171,17 +174,6 @@ class Grok1MoE(nn.Module):
             no_combine=no_combine,
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
-
-    def _custom_routing_function_cpu(
-        self, hidden_states, gating_output, topk, renormalize
-    ):
-        assert not renormalize  # same with `fused_moe_router` triton behavior
-        return torch.ops.sgl_kernel.fused_moe_router_cpu(
-            hidden_states,
-            gating_output,
-            topk,
-            self.router_logit_softcapping,
-        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
@@ -583,39 +575,23 @@ class Grok1DecoderLayer(nn.Module):
         if deferred_norm is not None:
             assert residual is not None
             # here hidden_states is output of ffn, residual is residual from after previous attn layer
-            if _is_cpu:
-                hidden_states, residual = (
-                    torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
-                        hidden_states,
-                        residual,
-                        deferred_norm.weight,
-                        self.pre_attn_norm.weight,
-                        deferred_norm.variance_epsilon,
-                    )
-                )
-            else:
-                hidden_states, residual = fused_dual_residual_rmsnorm(
-                    hidden_states,
-                    residual,
-                    deferred_norm.weight,
-                    self.pre_attn_norm.weight,
-                    deferred_norm.variance_epsilon,
-                )
+            hidden_states, residual = fused_dual_residual_rmsnorm(
+                hidden_states,
+                residual,
+                deferred_norm.weight,
+                self.pre_attn_norm.weight,
+                deferred_norm.variance_epsilon,
+            )
         else:
             # here hidden_states is the residual
-            residual = hidden_states
-            if _is_cpu:
-                hidden_states = torch.ops.sgl_kernel.rmsnorm_cpu(
+            hidden_states, residual = (
+                fused_rmsnorm(
                     hidden_states,
                     self.pre_attn_norm.weight,
                     self.pre_attn_norm.variance_epsilon,
-                )
-            else:
-                hidden_states = fused_rmsnorm(
-                    hidden_states,
-                    self.pre_attn_norm.weight,
-                    self.pre_attn_norm.variance_epsilon,
-                )
+                ),
+                hidden_states,
+            )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -626,24 +602,13 @@ class Grok1DecoderLayer(nn.Module):
         if get_parallel().tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        if _is_cpu:
-            hidden_states, residual = (
-                torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
-                    hidden_states,
-                    residual,
-                    self.post_attn_norm.weight,
-                    self.pre_moe_norm.weight,
-                    self.post_attn_norm.variance_epsilon,
-                )
-            )
-        else:
-            hidden_states, residual = fused_dual_residual_rmsnorm(
-                hidden_states,
-                residual,
-                self.post_attn_norm.weight,
-                self.pre_moe_norm.weight,
-                self.post_attn_norm.variance_epsilon,
-            )
+        hidden_states, residual = fused_dual_residual_rmsnorm(
+            hidden_states,
+            residual,
+            self.post_attn_norm.weight,
+            self.pre_moe_norm.weight,
+            self.post_attn_norm.variance_epsilon,
+        )
 
         # Fully Connected
         hidden_states = self.ffn(hidden_states)
@@ -724,22 +689,13 @@ class Grok1Model(nn.Module):
                 positions, hidden_states, forward_batch, residual, deferred_norm
             )
 
-        if _is_cpu:
-            hidden_states, _ = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
-                hidden_states,
-                residual,
-                deferred_norm.weight,
-                self.norm.weight,
-                deferred_norm.variance_epsilon,
-            )
-        else:
-            hidden_states, _ = fused_dual_residual_rmsnorm(
-                hidden_states,
-                residual,
-                deferred_norm.weight,
-                self.norm.weight,
-                deferred_norm.variance_epsilon,
-            )
+        hidden_states, _ = fused_dual_residual_rmsnorm(
+            hidden_states,
+            residual,
+            deferred_norm.weight,
+            self.norm.weight,
+            deferred_norm.variance_epsilon,
+        )
 
         return hidden_states
 
