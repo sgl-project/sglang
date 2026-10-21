@@ -5,7 +5,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH, TestNpuPerformanceTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -143,6 +143,54 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
     def test_npu_deepseek_v4_flash_fp8_4p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
         self.run_accuracy()
+
+class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
+
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
+    other_args = DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS
+    envs = DEEPSEEK_V4_FLASH_FP8_4P_ENVS
+    dataset_name = "random"
+    input_len = 8000
+    output_len = 1000
+    num_prompts = 160
+    max_concurrency = 160
+    random_range_ratio = 1
+    warmup_requests = 32
+    request_rate = float("inf")
+    max_attempts = 3
+    accept_rate = 0.5
+
+    # @classmethod
+    # def setUpClass(cls):
+    #     """Launch server via `python3 -m sglang.launch_server` instead of `sglang serve`."""
+    #     cls._setup_per_case_output()
+    #     cls.base_url = DEFAULT_URL_FOR_TEST
+    #     env = os.environ.copy()
+    #     if cls.envs:
+    #         env.update(cls.envs)
+    #
+    #     _, host, port = cls.base_url.split(":")
+    #     command = [
+    #         "python3",
+    #         "-m",
+    #         "sglang.launch_server",
+    #         "--model-path",
+    #         cls.model,
+    #         *[str(x) for x in cls.other_args],
+    #         "--host",
+    #         host[2:],
+    #         "--port",
+    #         port,
+    #     ]
+    #     cls.process = subprocess.Popen(command, env=env)
+    #     wait_for_server(cls.base_url, timeout=cls.timeout, process=cls.process)
+
+    def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms(self):
+        """Run NPU performance test for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
+        self.run_throughput()
 
 
 if __name__ == "__main__":
