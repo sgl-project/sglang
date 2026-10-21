@@ -24,7 +24,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -166,11 +166,9 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
-    parallel = get_parallel()
-    # The fused MLA preprocess writes cache rows using the global virtual loc.
-    # Keep DCP on the explicit path until that operator accepts owner-filtered
-    # physical locations.
-    if is_mla_preprocess_enabled() and not parallel.dcp_enabled:
+    # The fused implementations require RoPE; DCP write slots are already local.
+    mla_preprocess_used = is_mla_preprocess_enabled() and m.rotary_emb is not None
+    if mla_preprocess_used:
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
@@ -183,19 +181,50 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.v_head_dim,
                 m.quant_config,
             )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
+        use_mlaprolog = m.mla_preprocess.uses_mlaprolog()
+        quant_config = getattr(
+            m.fused_qkv_a_proj_with_mqa.quant_method, "quantization_config", None
         )
+        # MLAProlog requires BF16; legacy MLAPO does not support FP16 NZ.
+        if hidden_states.dtype == torch.float16 and (
+            use_mlaprolog
+            or (
+                is_fia_nz()
+                and quant_config is not None
+                and quant_config.get_name() == "modelslim"
+            )
+        ):
+            mla_preprocess_used = False
+
+    if mla_preprocess_used:
+        if use_mlaprolog:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                _,
+                forward_batch,
+                positions,
+                _,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        else:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         topk_indices = None
     else:
         q_lora = None
@@ -296,6 +325,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        mla_preprocess_used,
     )
 
 
@@ -309,6 +339,7 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    mla_preprocess_used: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
@@ -323,6 +354,7 @@ def forward_mla_core_npu(
         k_nope,
         q_pe,
         k_pe,
+        save_kv_cache=not mla_preprocess_used,
         **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
     )
 

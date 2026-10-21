@@ -6,10 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35, npu_format_cast
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import get_bool_env_var
 
@@ -450,17 +447,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )  # (B*S,N,1,D)
 
         cache_mode = "PA_NZ" if is_fia_nz() else "PA_BNSD"
+        page_size = get_token_to_kv_pool().page_size
         self.kvCache = self.kvCache.view(
             -1,
-            get_attn_backend().page_size,
+            page_size,
             1,
-            get_attn_backend().kv_lora_rank,
+            self.kv_lora_rank,
         )
         self.kvCacheRope = self.kvCacheRope.view(
             -1,
-            get_attn_backend().page_size,
+            page_size,
             1,
-            get_attn_backend().qk_rope_head_dim,
+            self.qk_rope_head_dim,
         )
         k_rope, k_nope, _, _ = torch.ops.npu.npu_kv_rmsnorm_rope_cache(
             latent_cache,
