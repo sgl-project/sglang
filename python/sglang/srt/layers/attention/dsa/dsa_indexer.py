@@ -1107,16 +1107,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # on the GEMMs it consumes, not on the other side's fused kernel.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.alt_stream):
-            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
-            if num_tokens is not None:
-                q = q[:num_tokens]
 
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
         if num_tokens is not None:
             key = key[:num_tokens]
             weights_raw = weights_raw[:num_tokens]
+
+        # Issued after the main GEMM so the join stays on the main lane at graph replay.
+        with torch.cuda.stream(self.alt_stream):
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+            if num_tokens is not None:
+                q = q[:num_tokens]
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
