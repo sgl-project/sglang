@@ -408,8 +408,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def dequantize_to_bf16(self, layer: torch.nn.Module) -> None:
         """Switch the linear to a dense BF16 weight and GEMM. Idempotent: the
-        model and the loader may each request it, in either order."""
-        if layer.dequantized_bf16:
+        model and the loader may each request it, in either order. A linear the
+        loader already re-laid out for the AITER ASM GEMM no longer holds the
+        checkpoint layout, so it keeps that GEMM."""
+        if getattr(layer, "dequantized_bf16", False) or getattr(
+            layer, "use_aiter_asm_fp4_gemm", False
+        ):
             return
         w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
         layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
@@ -419,7 +423,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # A model may already have densified this linear before the loader pass.
-        if layer.dequantized_bf16:
+        if getattr(layer, "dequantized_bf16", False):
             return
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
@@ -877,7 +881,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         # (The fused tuple-input paths below are only used by MLA attention
         # projections, which are excluded from quantization for this checkpoint,
         # so a plain-tensor activation is what reaches here.)
-        if layer.dequantized_bf16:
+        if getattr(layer, "dequantized_bf16", False):
             if isinstance(x, tuple):
                 x = x[0]
             return torch.nn.functional.linear(x, layer.weight, bias)

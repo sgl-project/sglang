@@ -150,6 +150,32 @@ class TestDensifyQuarkMxfp4SharedExperts(CustomTestCase):
                     _is_unquantized_mergeable([linear.weight for linear in linears])
                 )
 
+    def test_asm_relaid_linear_is_left_alone(self):
+        """A loader pass that already shuffled the weight and swizzled the scale
+        for the AITER ASM GEMM leaves nothing in the checkpoint layout to decode."""
+        linear = _quark_mxfp4_linear(256, 256)
+        with (
+            patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),
+            patch.object(quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True),
+            patch.object(
+                quark_w4a4_mxfp4,
+                "shuffle_weight",
+                side_effect=lambda weight, layout: weight.clone(),
+                create=True,
+            ),
+        ):
+            linear.quant_method.process_weights_after_loading(linear)
+        self.assertTrue(linear.use_aiter_asm_fp4_gemm)
+        weight, weight_scale = linear.weight, linear.weight_scale
+
+        densify_quark_mxfp4_shared_experts(
+            SimpleNamespace(gate_up_proj=linear, down_proj=linear)
+        )
+
+        self.assertFalse(linear.dequantized_bf16)
+        self.assertIs(linear.weight, weight)
+        self.assertIs(linear.weight_scale, weight_scale)
+
 
 if __name__ == "__main__":
     unittest.main()
