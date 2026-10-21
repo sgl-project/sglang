@@ -2010,7 +2010,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
         """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
-        and its speculative verify path is not; AITER prefill attention never is."""
+        and its speculative verify path is not."""
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _deterministic_attention_backend,
@@ -2021,7 +2021,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (True, False, "triton", None, True),
             (False, False, "triton", None, False),
             (True, True, "triton", None, False),
-            (True, False, "aiter", None, False),
+            (True, False, "aiter", None, True),
             (True, False, "triton", "EAGLE", False),
         ]
         for gfx950, mla, prefill, spec, accepted in cases:
@@ -2042,6 +2042,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         prefill_attention_backend=prefill,
                         decode_attention_backend="aiter",
                         speculative_algorithm=spec,
+                        kv_cache_dtype="auto",
                     )
                 )
                 if accepted:
@@ -2049,6 +2050,93 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 else:
                     with self.assertRaises(ValueError):
                         _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_prefill_only_on_gfx950_without_mla(self):
+        """AITER prefill attention is accepted in deterministic mode only on gfx950,
+        for non-MLA models, without speculative decoding and with a bf16 KV cache."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        cases = [
+            # (gfx950, MLA model, speculative algorithm, KV cache dtype, accepted)
+            (True, False, None, "auto", True),
+            (True, False, None, "bf16", True),
+            (False, False, None, "auto", False),
+            (True, True, None, "auto", False),
+            (True, False, "EAGLE", "auto", False),
+            (True, False, None, "fp8_e4m3", False),
+        ]
+        for gfx950, mla, spec, kv_dtype, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, spec=spec, kv_dtype=kv_dtype),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend="aiter",
+                        decode_attention_backend="triton",
+                        speculative_algorithm=spec,
+                        kv_cache_dtype=kv_dtype,
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaisesRegex(ValueError, "aiter prefill"):
+                        _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_prefill_page_size(self):
+        """Deterministic AITER prefill puts prompt splits on its 128-row query tile:
+        page size becomes 128 unless it is already a multiple, and a chunked-prefill
+        size that is not a multiple of 128 is refused."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_aiter_prefill_page_size,
+        )
+
+        def view(det=True, prefill="aiter", page_size=1, chunk=8192):
+            return ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=det,
+                    prefill_attention_backend=prefill,
+                    page_size=page_size,
+                    chunked_prefill_size=chunk,
+                )
+            )
+
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view()), {"page_size": 128}
+        )
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view(page_size=None)),
+            {"page_size": 128},
+        )
+        for page_size in (128, 256):
+            self.assertEqual(
+                _deterministic_aiter_prefill_page_size(view(page_size=page_size)), {}
+            )
+        for chunk in (None, -1):
+            self.assertEqual(
+                _deterministic_aiter_prefill_page_size(view(chunk=chunk)),
+                {"page_size": 128},
+            )
+        with self.assertRaisesRegex(ValueError, "chunked-prefill-size"):
+            _deterministic_aiter_prefill_page_size(view(chunk=1000))
+        # Unchanged without deterministic mode or with another prefill backend.
+        self.assertEqual(_deterministic_aiter_prefill_page_size(view(det=False)), {})
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view(prefill="triton")), {}
+        )
 
     def test_deterministic_compatible_phase_backends_are_accepted(self):
         from sglang.srt.arg_groups.overrides import (
