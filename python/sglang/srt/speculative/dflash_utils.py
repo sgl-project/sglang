@@ -16,11 +16,12 @@ from sglang.kernels.ops.speculative.verify_sampling import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
+    top_k_top_p_normalize_probs_torch,
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_hip, is_npu
 
@@ -1066,6 +1067,21 @@ def build_speculative_verify_target_probs(
         sampling_info.temperatures, draft_token_num, dim=0
     )
     scaled_logits = next_token_logits / expanded_temperature
+    if (need_top_k or need_top_p) and get_exec().kernel.sampling_backend == "pytorch":
+        # Rejection sampling is lossless only against the distribution the
+        # non-speculative sampler draws from, so filter with the same kernel.
+        # The renorm kernels keep every tie at the top-p pivot instead.
+        target_probs = top_k_top_p_normalize_probs_torch(
+            F.softmax(scaled_logits, dim=-1),
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            max_top_k=(
+                getattr(sampling_info, "max_top_k", None)
+                if getattr(sampling_info, "sampling_seed", None) is None
+                else None
+            ),
+        )
+        return target_probs.view(bs, draft_token_num, -1).contiguous()
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:

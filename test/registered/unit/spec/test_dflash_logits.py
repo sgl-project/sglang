@@ -471,3 +471,72 @@ def test_grouped_conv_supports_runtime_block_sizes():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# The renorm kernels the fix replaces only run on GPU.
+_VERIFY_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _sampler_target_probs(logits, top_ks, top_ps):
+    from sglang.srt.layers.sampler import top_k_top_p_filter_probs_torch
+
+    n = logits.shape[0]
+    sorted_probs, sorted_idx = top_k_top_p_filter_probs_torch(
+        torch.softmax(logits.to(_VERIFY_DEVICE), -1),
+        top_ks.repeat(n).to(_VERIFY_DEVICE),
+        top_ps.repeat(n).to(_VERIFY_DEVICE),
+    )
+    expected = torch.zeros_like(sorted_probs).scatter_(-1, sorted_idx, sorted_probs)
+    return (expected / expected.sum(-1, keepdim=True)).cpu()
+
+
+def _verify_target_probs(backend, logits, top_ks, top_ps):
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.speculative.dflash_utils import (
+        build_speculative_verify_target_probs,
+    )
+
+    device = _VERIFY_DEVICE
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones(1, 1, device=device),
+        top_ks=top_ks.to(device),
+        top_ps=top_ps.to(device),
+        need_top_k_sampling=bool((top_ks < logits.shape[-1]).any()),
+        need_top_p_sampling=bool((top_ps < 1.0).any()),
+    )
+    with get_context().override_server_args(sampling_backend=backend):
+        return (
+            build_speculative_verify_target_probs(
+                next_token_logits=logits.to(device),
+                sampling_info=sampling_info,
+                draft_token_num=logits.shape[0],
+                bs=1,
+            )
+            .view(logits.shape)
+            .cpu()
+        )
+
+
+def test_verify_target_probs_match_the_pytorch_sampler_at_a_top_p_tie():
+    # Tokens 1 and 2 tie and the cutoff falls between them: the sampler keeps
+    # exactly one, while a pivot threshold would keep both.
+    probs = torch.tensor([[0.6, 0.2, 0.2, 0.0]]).clamp_min(1e-9)
+    logits = probs.log().repeat(2, 1)
+    top_ks = torch.tensor([1 << 30], dtype=torch.int32)
+    top_ps = torch.tensor([0.7])
+
+    target = _verify_target_probs("pytorch", logits, top_ks, top_ps)
+
+    assert torch.equal(target, _sampler_target_probs(logits, top_ks, top_ps))
+    assert (target > 0).sum(-1).tolist() == [2, 2]
+
+
+def test_verify_target_probs_match_the_pytorch_sampler_under_top_k():
+    torch.manual_seed(0)
+    logits = torch.randn(3, 64) * 3
+    top_ks = torch.tensor([5], dtype=torch.int32)
+    top_ps = torch.tensor([0.9])
+
+    target = _verify_target_probs("pytorch", logits, top_ks, top_ps)
+
+    assert torch.equal(target, _sampler_target_probs(logits, top_ks, top_ps))
