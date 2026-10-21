@@ -13,7 +13,14 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _get_config,
 )
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+try:
+    from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+        pid_grid,
+        remap_xcd,
+    )
+except ImportError:  # AITER before ROCm/aiter#6505
+    from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
     batched_gemm_afp4wfp4_pre_quant,
@@ -34,8 +41,10 @@ _MXFP4_QUANT_BLOCK_SIZE_TL = tl.constexpr(_MXFP4_QUANT_BLOCK_SIZE)
             args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0
             and args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0
         ),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: (
+            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        ),
     }
 )
 @triton.jit
