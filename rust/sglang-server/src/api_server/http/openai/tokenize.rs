@@ -108,12 +108,34 @@ async fn tokenize(
         (Some(prompt), None) => (prompt, body.add_special_tokens),
         // The rendered template owns its special tokens, as on the chat path
         // (Python encodes it with `add_special_tokens=False`).
-        (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
-            Err((error_type, message)) => {
-                return error_body(StatusCode::BAD_REQUEST, error_type, message);
+        (None, Some(messages)) => {
+            let rendered = match render_chat_prompt(&state, messages, body.rest) {
+                Ok(rendered) => rendered,
+                Err((error_type, message)) => {
+                    return error_body(StatusCode::BAD_REQUEST, error_type, message);
+                }
+            };
+            match &state.prompt_encoder {
+                // Encoded as the chat path does, keeping segments and the continuation apart.
+                Some(encoder) => {
+                    return match encoder.encode_blocking(rendered).await {
+                        Ok(tokens) => Json(json!({
+                            "tokens": tokens,
+                            "count": tokens.len(),
+                            "max_model_len": state.server_args.tokenizer_model_max_length,
+                        }))
+                        .into_response(),
+                        Err(message) => {
+                            error_body(StatusCode::BAD_REQUEST, "BadRequestError", message)
+                        }
+                    };
+                }
+                None => (
+                    OneOrMany::One(rendered.into_text()),
+                    false, /* add_special_tokens */
+                ),
             }
-        },
+        }
         _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
     };
     let max_model_len = state.server_args.tokenizer_model_max_length;
@@ -150,7 +172,7 @@ fn render_chat_prompt(
     state: &AppState,
     messages: Value,
     mut fields: Map<String, Value>,
-) -> Result<String, (&'static str, String)> {
+) -> Result<RenderedChat, (&'static str, String)> {
     const INVALID_BODY: &str = "Bad Request";
     const BAD_REQUEST: &str = "BadRequestError";
     fields.insert("messages".into(), messages);
@@ -181,7 +203,6 @@ fn render_chat_prompt(
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
     render_chat(formatter, &body, &request, chat_template_kwargs.as_ref())
-        .map(RenderedChat::into_text)
         .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
@@ -290,6 +311,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            prompt_encoder: None,
         })
     }
 

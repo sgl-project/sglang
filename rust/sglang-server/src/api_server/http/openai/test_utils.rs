@@ -112,6 +112,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
         chat_formatter: None,
+        prompt_encoder: None,
     })
 }
 
@@ -174,6 +175,7 @@ pub(super) fn answering_app_state_with(
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
         chat_formatter: Some(formatter),
+        prompt_encoder: None,
     })
 }
 

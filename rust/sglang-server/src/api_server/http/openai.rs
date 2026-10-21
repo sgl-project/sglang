@@ -17,7 +17,7 @@ mod template;
 mod tokenize;
 mod tools;
 
-pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs, PromptEncoder};
 
 use super::app::AppState;
 use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
