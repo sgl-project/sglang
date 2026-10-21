@@ -30,11 +30,11 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
     get_context,
