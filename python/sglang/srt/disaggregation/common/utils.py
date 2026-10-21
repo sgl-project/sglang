@@ -44,13 +44,36 @@ def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     return header + b"".join(buffers)
 
 
-def unpack_list_of_buffers(buf: bytes) -> List[bytes]:
+def _unpack_buffer_lengths(
+    buf: bytes, max_buffers: Optional[int]
+) -> Tuple[Tuple[int, ...], int]:
+    if max_buffers is not None and max_buffers < 0:
+        raise ValueError("max_buffers must be non-negative")
     if buf == b"":
-        return []
-    (n,) = struct.unpack("<I", buf[:4])
-    lens = struct.unpack(f"<{n}I", buf[4 : 4 + 4 * n])
+        return (), 0
+    if len(buf) < 4:
+        raise ValueError("buffer-list header is truncated")
+
+    (n,) = struct.unpack_from("<I", buf)
+    if max_buffers is not None and n > max_buffers:
+        raise ValueError(f"buffer-list count {n} exceeds limit {max_buffers}")
+
+    header_size = 4 + 4 * n
+    if header_size > len(buf):
+        raise ValueError("buffer-list length table is truncated")
+    lens = struct.unpack_from(f"<{n}I", buf, 4)
+    payload_size = sum(lens)
+    if header_size + payload_size != len(buf):
+        raise ValueError("buffer-list payload size does not match its declared lengths")
+    return lens, header_size
+
+
+def unpack_list_of_buffers(
+    buf: bytes, *, max_buffers: Optional[int] = None
+) -> List[bytes]:
+    lens, offset = _unpack_buffer_lengths(buf, max_buffers)
+
     out = []
-    offset = 4 + 4 * n
     for length in lens:
         out.append(buf[offset : offset + length])
         offset += length
@@ -61,12 +84,24 @@ def pack_int_lists(lists, fmt: str) -> bytes:
     return pack_list_of_buffers([struct.pack(f"<{len(a)}{fmt}", *a) for a in lists])
 
 
-def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
+def unpack_int_lists(
+    buf: bytes, fmt: str, *, max_lists: Optional[int] = None
+) -> List[List[int]]:
     width = struct.calcsize(fmt)
-    return [
-        list(struct.unpack(f"<{len(b) // width}{fmt}", b))
-        for b in unpack_list_of_buffers(buf)
-    ]
+    lens, offset = _unpack_buffer_lengths(buf, max_lists)
+    for length in lens:
+        if length % width != 0:
+            raise ValueError(
+                f"integer-list payload length {length} is not divisible by {width}"
+            )
+
+    out = []
+    for length in lens:
+        out.append(
+            list(struct.unpack_from(f"<{length // width}{fmt}", buf, offset=offset))
+        )
+        offset += length
+    return out
 
 
 class FastQueue:
