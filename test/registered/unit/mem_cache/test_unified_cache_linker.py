@@ -1,3 +1,4 @@
+import queue
 import sys
 import threading
 import unittest
@@ -5,7 +6,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -24,6 +25,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
 )
@@ -1569,6 +1573,54 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestOffloadReadyEvents(CustomTestCase):
+    def _record(self, forward_stream):
+        device = MagicMock(name="device_module")
+        device.Event.side_effect = lambda: MagicMock(name="event")
+        linker = _FakeLinker()
+        linker.forward_stream = forward_stream
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.device_module",
+            device,
+        ):
+            return linker.record_offload_ready()
+
+    def test_offload_waits_on_the_forward_writing_the_pages(self):
+        forward_stream = MagicMock(name="forward_stream")
+        indices_ready, kv_written = self._record(forward_stream)
+        indices_ready.record.assert_called_once_with()
+        kv_written.record.assert_called_once_with(forward_stream)
+        # The offload thread waits; the forward stream's own order is untouched.
+        self.assertEqual(forward_stream.mock_calls, [])
+
+    def test_offload_without_a_forward_stream_waits_on_the_current_one(self):
+        (indices_ready,) = self._record(None)
+        indices_ready.record.assert_called_once_with()
+
+    def test_mooncake_offload_thread_waits_on_every_event(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.storage = order.storage
+        order.storage.batch_set_v2.return_value = {}
+        linker.stats = {"offload": 1}
+        linker.offload_results = queue.Queue()
+        linker.offload_queue = queue.Queue()
+        linker.offload_queue.put(
+            (["transfer"], 1, [order.indices_ready, order.kv_written])
+        )
+        linker.offload_queue.put(None)
+        linker.offload_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.indices_ready.synchronize(),
+                call.kv_written.synchronize(),
+                call.storage.batch_set_v2(["transfer"]),
+            ],
+        )
+        self.assertTrue(linker.offload_results.get_nowait())
 
 
 if __name__ == "__main__":
