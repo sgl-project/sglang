@@ -992,6 +992,10 @@ class ReqKvInfo:
         default_factory=dict
     )
 
+    # CP folded replay owns its fresh suffix until its consumers finish. It
+    # must not adopt a numerically different, un-restored cache snapshot.
+    encoder_swa_replayed: bool = False
+
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
 
@@ -2086,6 +2090,7 @@ class Req(ReqDllmMixin):
         self.extend_end = None
         self.dllm_initialized = False
         self.is_retracted = True
+        self.kv.encoder_swa_replayed = False
         self.retracted_stain = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
