@@ -22,19 +22,19 @@ import torch
 from torch import nn
 
 from sglang.kernels.fused_op import get_fused_op_backend
-from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
 from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
-from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.kernels.ops.elementwise.beam_fused import BeamAttentionGateOp
+from sglang.kernels.ops.elementwise.row_scale import apply_log_scaling_tau
 from sglang.kernels.ops.gemm.router_gemv import (
     router_gemm_bf16x3_cublas,
     router_gemv,
     router_gemv_supported,
 )
 from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
-from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
+from sglang.kernels.ops.layernorm.beam_fused import BeamSandwichResidualRMSNormOp
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
@@ -498,8 +498,7 @@ class BeamAttention(nn.Module):
         # does not replicate KV heads. Keep the existing quantized/replicated
         # paths until their loading and backend contracts are validated.
         self.use_packed_projection = (
-            quant_config is None
-            and config.num_key_value_heads >= self.tp_size
+            quant_config is None and config.num_key_value_heads >= self.tp_size
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -1102,7 +1101,7 @@ class BeamModel(nn.Module):
                 return None
             required_bytes = max_tokens * hidden_states.shape[1] * 2
             if not comm.supports_push(nbytes=required_bytes, num_blocks=max_tokens):
-                from sglang.kernels.ops.communication.mp import register_comm_cleanup
+                from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 
                 comm = CustomAllReduceV2(
                     comm.group,
