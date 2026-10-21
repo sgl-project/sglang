@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import spec as spe
 _MARKER = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
 
 
-def _load(monkeypatch, spec, h3_markers=None):
+def _load(monkeypatch, spec, h3_markers=None, model_path="/models/dit.safetensors"):
     """Run load_comfyui_transformer with a dummy spec; return the load kwargs."""
     seen = {}
 
@@ -55,10 +55,11 @@ def _load(monkeypatch, spec, h3_markers=None):
     )
     pipeline = SimpleNamespace(
         pipeline_name="DummyPipeline",
-        model_path="/models/dit.safetensors",
+        model_path=model_path,
         get_module=lambda name: "scheduler",
     )
     spec_mod.load_comfyui_transformer(pipeline, server_args)
+    seen["server_args"] = server_args
     return seen
 
 
@@ -108,8 +109,8 @@ def _write_gguf(path, names):
     import numpy as np
 
     writer = gguf.GGUFWriter(str(path), "flux")
-    for name in names:
-        writer.add_tensor(name, np.zeros((2, 4), dtype=np.float32))
+    for i, name in enumerate(names):
+        writer.add_tensor(name, np.full((2, 4), i, dtype=np.float32))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -125,41 +126,60 @@ def test_worker_routes_a_gguf_unet_to_the_comfyui_loader(tmp_path):
     assert not spec_mod.is_comfyui_single_file(str(tmp_path))
 
 
-def test_gguf_model_path_loads_through_the_gguf_branch(monkeypatch, tmp_path):
-    gguf_path = str(tmp_path / "minimax_h3_fl2va-Q8_0.gguf")
-    seen = {}
+def test_gguf_unet_loads_with_runtime_names(monkeypatch, tmp_path):
+    """A GGUF unet loads as the DiT, keyed by runtime layer names for both quant
+    lookup and loading: Z-Image's qkv is to_qkv and its w1/w3 fuse into w13."""
+    from dataclasses import replace
 
-    def gguf_load(**kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(parameters=lambda: [])
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 
-    def no_safetensors(*args, **kwargs):
-        raise AssertionError("a GGUF model path must not be read as safetensors")
-
-    monkeypatch.setattr(spec_mod, "_load_comfyui_gguf_transformer", gguf_load)
-    monkeypatch.setattr(spec_mod, "inspect_minimax_h3_safetensors", no_safetensors)
-    monkeypatch.setattr(spec_mod, "safetensors_weights_iterator", no_safetensors)
-    monkeypatch.setattr(spec_mod, "get_comfyui_checkpoint_spec", lambda name: _spec())
-    monkeypatch.setattr(
-        spec_mod.ModelRegistry,
-        "resolve_model_cls",
-        lambda name: (SimpleNamespace(param_names_mapping={}), None),
+    gguf_path = tmp_path / "z-image-turbo-Q4_K_M.gguf"
+    _write_gguf(
+        gguf_path,
+        [
+            "layers.0.attention.qkv.weight",
+            "layers.0.feed_forward.w1.weight",
+            "layers.0.feed_forward.w2.weight",
+            "layers.0.feed_forward.w3.weight",
+        ],
     )
-    monkeypatch.setattr(spec_mod, "resolve_precision", lambda *a, **k: "bf16")
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils."
-        "resolve_transformer_gguf_to_load",
-        lambda server_args, component: None,
+        "_validate_gguf_runtime_support",
+        lambda *args: None,
     )
-    server_args = SimpleNamespace(model_paths={})
-    pipeline = SimpleNamespace(
-        pipeline_name="DummyPipeline",
-        model_path=gguf_path,
-        get_module=lambda name: "scheduler",
+    zimage = spec_mod.get_comfyui_checkpoint_spec("ZImagePipeline")
+    seen = _load(
+        monkeypatch,
+        replace(zimage, build_dit_config=lambda server_args: ZImageDitConfig()),
+        model_path=str(gguf_path),
     )
-    spec_mod.load_comfyui_transformer(pipeline, server_args)
-    assert seen["gguf_file"] == gguf_path
-    assert server_args.model_paths["transformer"] == str(tmp_path)
+    meta = seen["init_params"]["quant_config"].tensor_meta
+    weights = dict(seen["weights_iterator"])
+    assert seen["server_args"].model_paths["transformer"] == str(tmp_path)
+    assert meta["layers.0.attention.to_qkv.weight"].logical_shape == (2, 4)
+    assert meta["layers.0.feed_forward.w13.weight"].logical_shape == (4, 4)
+    assert list(weights) == [
+        "layers.0.attention.to_qkv.weight",
+        "layers.0.feed_forward.w2.weight",
+        "layers.0.feed_forward.w13.weight",
+    ]
+    assert weights["layers.0.feed_forward.w13.weight"][:, 0].tolist() == [1, 1, 3, 3]
+
+
+def test_gguf_unet_architecture_is_detected_from_its_header(tmp_path):
+    """Detection rejected every GGUF, so only MiniMax-H3 with a BF16 companion
+    file could load one."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _load_state_dict_for_detection,
+    )
+
+    path = tmp_path / "flux1-dev-Q4_K_M.gguf"
+    _write_gguf(path, ["img_in.weight"])
+    state_dict = _load_state_dict_for_detection(str(path))
+    assert {k: tuple(v.shape) for k, v in state_dict.items()} == {
+        "img_in.weight": (2, 4)
+    }
 
 
 def test_flux_guidance_probe_reads_gguf_tensor_names(tmp_path):
