@@ -40,6 +40,16 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 <Qwen3Deployment />
 
+### Experimental Apple Silicon decode
+
+Qwen3-0.6B supports experimental compiled MLX decode with
+`--device mps --dtype bfloat16 --mps-execution-backend mlx-compiled`.
+Build the Metal extension first and keep the default page size 1.
+Torch retains model loading, KV ownership and sampling; prefill remains eager
+MPS. Native MLX is unchanged and remains faster for the measured batch-1 workload.
+See the [Apple Silicon guide](/docs/hardware-platforms/apple_metal#experimental-direct-compiled-mlx-decode)
+for setup and limitations.
+
 ### 3.2 Configuration Tips
 
 - **Memory Management:** Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
