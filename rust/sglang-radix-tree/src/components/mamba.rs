@@ -166,14 +166,17 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             .mamba_value
             .as_ref()
             .expect("mamba insert requires a donated mamba_value");
-        let slot_len = mamba_value.size()[0] as usize;
 
         if is_new_leaf {
             tree_core
                 .arena
                 .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-            tree_core.inc_evictable_size(MAMBA, slot_len);
+            let tokens = tree_core
+                .arena
+                .node(node_id)
+                .device_reclaimable_value_len(MAMBA);
+            tree_core.inc_evictable_size(MAMBA, tokens);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
@@ -288,7 +291,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 
         // Device layer
         if target.contains(EvictLayer::Device) && node.has_device_value(MAMBA) {
-            freed = node.device_value_len(MAMBA);
+            freed = node.device_reclaimable_value_len(MAMBA);
             device_frees
                 .entry(ct)
                 .or_default()
@@ -449,8 +452,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             tree_core.arena.inc_host_lock_ref(node_id, MAMBA);
         } else {
-            let value_len = node.device_value_len(MAMBA);
-            if node.device_lock_ref(MAMBA) == 0 && has_value {
+            let value_len = node.device_reclaimable_value_len(MAMBA);
+            if node.device_lock_ref(MAMBA) == 0 {
                 tree_core.dec_evictable_size(MAMBA, value_len);
                 tree_core.inc_protected_size(MAMBA, value_len);
             }
@@ -494,8 +497,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             device_lock_ref > 0,
             "Mamba release hit lock_ref=0 on node {node_id}"
         );
-        if device_lock_ref == 1 && node.has_device_value(MAMBA) {
-            let value_len = node.device_value_len(MAMBA);
+        if device_lock_ref == 1 {
+            let value_len = node.device_reclaimable_value_len(MAMBA);
             tree_core.inc_evictable_size(MAMBA, value_len);
             tree_core.dec_protected_size(MAMBA, value_len);
         }
@@ -594,6 +597,24 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     ..Default::default()
                 }])
             }
+        })
+    }
+
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hash_value = node.hash_value.as_ref().filter(|h| !h.is_empty())?;
+        let device_indices = node.try_device_value(MAMBA)?;
+        // One state per node, valid only at the node's end boundary.
+        Some(PoolTransfer {
+            name: PoolName::Mamba,
+            device_indices: Some(device_indices.shallow_clone()),
+            keys: Some(vec![hash_value[hash_value.len() - 1].clone()]),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
         })
     }
 

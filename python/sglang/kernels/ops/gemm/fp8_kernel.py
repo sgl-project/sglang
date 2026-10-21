@@ -880,24 +880,6 @@ def w8a8_block_fp8_matmul_triton(
     return C
 
 
-def w8a8_block_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return w8a8_block_fp8_matmul_deepgemm(
-            A, B, As, Bs, block_size, output_dtype=output_dtype
-        )
-
-    return w8a8_block_fp8_matmul_triton(
-        A, B, As, Bs, block_size, output_dtype=output_dtype
-    )
-
-
 def is_weak_contiguous(x: torch.Tensor):
     strides = x.stride()
     sizes = x.shape

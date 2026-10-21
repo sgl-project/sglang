@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -29,7 +29,10 @@ _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 if is_flashinfer_available():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
@@ -39,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.topk import TopKConfig
 
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -115,9 +119,25 @@ class Mxfp8RoutedInputPreQuant(NamedTuple):
 class Mxfp4FlashinferTrtllmMoEMethod:
     fuse_routed_scaling_factor_in_topk = True
 
+    def configure_bypassed_topk(self, config: TopKConfig) -> bool:
+        """Select the FlashInfer routing contract before Top-K can be bypassed."""
+        supported = (
+            config.use_grouped_topk
+            and config.scoring_func == "sigmoid"
+            and config.correction_bias is not None
+            and config.custom_routing_function is None
+            and config.num_shared_topk_slots == 0
+            and not config.torch_native
+        )
+        self._bypassed_routing_method = (
+            RoutingMethodType.DeepSeekV3 if supported else None
+        )
+        return supported
+
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self._bypassed_routing_method = None
         # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
         # already runs MXFP8 activations, so the flag is inert here rather than
         # an error -- one config can move across hardware.
@@ -143,6 +163,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
 
     def create_weights(
         self,
@@ -370,15 +393,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if w2_scale.dim() == 2:
             w2_scale = w2_scale.reshape(num_local_experts, hidden_size, -1)
 
-        if TopKOutputChecker.format_is_bypassed(topk_output):
-            raise NotImplementedError(
-                "the old code in this branch is WRONG. e.g. it does not consider HashTopK, and may miss args"
+        bypassed = TopKOutputChecker.format_is_bypassed(topk_output)
+        if TopKOutputChecker.format_is_standard(topk_output):
+            top_k = topk_output.topk_ids.shape[1]
+            moe_call = trtllm_fp4_block_scale_routed_moe
+            routing = dict(
+                topk_ids=(topk_output.topk_ids, topk_output.topk_weights),
+                routing_bias=None,
+                routing_method_type=int(RoutingMethodType.TopK),
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=1.0,
             )
-        if not TopKOutputChecker.format_is_standard(topk_output):
+        elif bypassed:
+            if self._bypassed_routing_method is None:
+                raise NotImplementedError("MxFP4 bypassed routing is not configured")
+            config = topk_output.topk_config
+            top_k = config.top_k
+            moe_call = trtllm_fp4_block_scale_moe
+            routing = dict(
+                routing_logits=topk_output.router_logits,
+                routing_bias=config.correction_bias,
+                routing_method_type=int(self._bypassed_routing_method),
+                norm_topk_prob=config.renormalize,
+                n_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                routed_scaling_factor=(
+                    config.routed_scaling_factor
+                    if config.apply_routed_scaling_factor_on_output
+                    and config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+            )
+        else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
-
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
 
         precision = self.flashinfer_mxfp4_moe_precision
         input_ready: Optional[torch.cuda.Event] = None
@@ -439,9 +487,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
 
-        result = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(topk_ids, topk_weights),
-            routing_bias=None,
+        result = moe_call(
+            **routing,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
             gemm1_weights=w13,
@@ -457,21 +504,17 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=topk_ids.shape[1],
-            n_group=1,
-            topk_group=1,
+            top_k=top_k,
             intermediate_size=intermediate_size,
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=num_local_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=int(RoutingMethodType.TopK),
             do_finalize=not defer_finalize,
             tune_max_num_tokens=next_power_of_2(num_tokens),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )
         if defer_finalize:
-            output = _make_deferred_finalize_output(result, top_k=topk_ids.shape[1])
+            output = _make_deferred_finalize_output(result, top_k=top_k)
         else:
             output = result[0]
 

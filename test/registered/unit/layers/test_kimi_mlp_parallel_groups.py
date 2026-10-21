@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.models import kimi_k3
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -32,6 +33,8 @@ def build_mlp(group=None, *, width=16, quant_config=None):
 
 
 class _RoutedExperts(torch.nn.Module):
+    routing_method_type = None
+    runner_backend = MoeRunnerBackend.TRITON
     should_fuse_routed_scaling_factor_in_topk = False
 
     def __init__(self, **kwargs):
@@ -49,6 +52,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
     # test. The real MoE constructor still builds its real shared MLP.
     backend = SimpleNamespace(
         is_megamoe=lambda: False,
+        is_flashinfer_megamoe=lambda: False,
         is_deepep=lambda: ep_a2a,
         is_mooncake=lambda: False,
         is_ascend_fuseep=lambda: False,

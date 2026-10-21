@@ -4,6 +4,7 @@ pub mod environ;
 pub mod error;
 pub mod fsm;
 pub mod logging;
+pub mod prometheus;
 pub mod regex;
 pub mod response;
 pub mod runtime;

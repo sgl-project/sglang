@@ -231,6 +231,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Decode pulls from every shard-group rank when this is set.
+            "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
@@ -238,6 +240,24 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_cp_tp_group_sharing_registers_cp_rank_as_tp_rank(
+        self, mock_put, mock_time
+    ):
+        # A sharing prefill CP rank holds every KV head and its own
+        # linear-attention shard: decode pairs with it as a CP-1 TP rank.
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+        mgr = self._make_manager()
+        mgr.attn_cp_size, mgr.attn_cp_rank = 4, 2
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual([payload[k] for k in ("attn_tp_size", "attn_tp_rank")], [4, 2])
+        self.assertEqual([payload[k] for k in ("attn_cp_size", "attn_cp_rank")], [1, 0])
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
