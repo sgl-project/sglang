@@ -307,9 +307,9 @@ class BaseSpecWorker(ABC):
                 device_pools=draft_pools,
             )
 
-        if get_memory().enable_unified_cache_external_linker:
+        if get_memory().enable_unified_cache_external_linker and len(draft_pools) > 1:
             raise NotImplementedError(
-                "The external linker only supports packed draft KV caches."
+                "The external linker supports one non-packed draft KV pool."
             )
 
         return HiCacheDraftPlan(
