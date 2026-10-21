@@ -2410,12 +2410,15 @@ class ObserveElasticEPMembershipReqInput(BaseReq, kw_only=True):
     rank: int
     failed_allocation_incarnation: str
     membership_epoch: int
+    submission_id: Optional[str] = None
 
 
 class ObserveElasticEPMembershipReqOutput(BaseReq, kw_only=True):
     accepted: bool
     message: str
     observation_key: Optional[str] = None
+    submission_id: Optional[str] = None
+    responder_rank: Optional[int] = None
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):

@@ -147,7 +147,12 @@ _COMMUNICATOR_SPECS = [
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput, "queueing", "submission_id"),
     ("recover_elastic_ep", RecoverElasticEPReqOutput, "queueing", "submission_id"),
-    ("observe_elastic_ep_membership", ObserveElasticEPMembershipReqOutput),
+    (
+        "observe_elastic_ep_membership",
+        ObserveElasticEPMembershipReqOutput,
+        "queueing",
+        "submission_id",
+    ),
 ]
 
 

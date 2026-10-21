@@ -3889,27 +3889,75 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: ObserveElasticEPMembershipReqInput
     ) -> ObserveElasticEPMembershipReqOutput:
         """Fan out a CPU-only membership observation to schedulers."""
-        if not any(self.elastic_active_rank_status):
+        if self.attn_replica_size != 1:
             return ObserveElasticEPMembershipReqOutput(
                 accepted=False,
-                message="Membership observation requires at least one active rank.",
+                message=(
+                    "Fixed-slot membership observation requires one physical EP "
+                    "rank per DP slot."
+                ),
             )
+        if not 0 <= obj.rank < len(self.elastic_active_rank_status):
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Membership observation rank is outside the active topology.",
+            )
+        survivor_ranks = {
+            rank
+            for rank, active in enumerate(self.elastic_active_rank_status)
+            if active and rank != obj.rank
+        }
+        if not survivor_ranks:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Membership observation requires at least one survivor.",
+            )
+        submission_id = uuid.uuid4().hex
         scheduler_obj = ObserveElasticEPMembershipReqInput(
             runtime_instance_id=obj.runtime_instance_id,
             topology_generation=obj.topology_generation,
             rank=obj.rank,
             failed_allocation_incarnation=(obj.failed_allocation_incarnation),
             membership_epoch=obj.membership_epoch,
+            submission_id=submission_id,
         )
         self.auto_create_handle_loop()
-        responses = await self.observe_elastic_ep_membership_communicator(scheduler_obj)
+        responses: List[ObserveElasticEPMembershipReqOutput] = await asyncio.wait_for(
+            self.observe_elastic_ep_membership_communicator(
+                scheduler_obj, fan_out=len(survivor_ranks)
+            ),
+            timeout=self.elastic_scheduler_response_timeout,
+        )
         if not responses:
             raise RuntimeError(
                 "Membership observation returned no scheduler responses."
             )
-        accepted = next((response for response in responses if response.accepted), None)
-        if accepted is not None:
-            return accepted
+        responder_ranks = [response.responder_rank for response in responses]
+        if (
+            len(set(responder_ranks)) != len(responder_ranks)
+            or set(responder_ranks) != survivor_ranks
+        ):
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=(
+                    "Membership observation responses did not match the survivor "
+                    f"quorum: expected={sorted(survivor_ranks)}, "
+                    f"received={responder_ranks}."
+                ),
+                submission_id=submission_id,
+            )
+        rejected = next(
+            (response for response in responses if not response.accepted), None
+        )
+        if rejected is not None:
+            return rejected
+        observation_keys = {response.observation_key for response in responses}
+        if None in observation_keys or len(observation_keys) != 1:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Survivors did not accept the same membership observation key.",
+                submission_id=submission_id,
+            )
         return responses[0]
 
     def _current_elastic_recovery_output(
