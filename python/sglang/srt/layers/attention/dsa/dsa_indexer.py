@@ -1531,6 +1531,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = torch.full(
                 (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
             )
+        pool = get_token_to_kv_pool()
+        if getattr(pool, "prefill_page_plan_active", False):
+            # The owner has stored the globally gathered keys before this call.
+            # Transfer before any rank-local consumer can skip its work.
+            pool.index_key_cache.prepare_prefill_buffer(layer_id)
         if batch_size == 0:
             return topk_result
 

@@ -5,11 +5,15 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     dequantize_nvfp4_k_cache_paged_reference,
 )
-from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
+from sglang.srt.mem_cache.dsa_cache_layer_split import (
+    PREFILL_TRANSFER_MAX_PAGES,
+    LayerSplitDSATokenToKVPool,
+    _collect_prefill_page_ids,
+    get_dsa_prefill_transfer_workspace_bytes,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,21 +27,25 @@ ROW_BYTES = 416
 INDEX_ROW_BYTES = 132
 
 
-def _make_pool(rank=None, world=1):
-    kwargs = dict(
-        size=SIZE,
-        page_size=PAGE_SIZE,
-        kv_lora_rank=512,
-        dtype=torch.float4_e2m1fn_x2,
-        qk_rope_head_dim=64,
-        layer_num=LAYER_NUM,
-        device="cpu",
-        index_head_dim=128,
-        enable_memory_saver=False,
-        kv_cache_dim=ROW_BYTES,
-    )
+def _make_pool(rank=None, world=1, *, size=SIZE, unified_decode=False):
+    kwargs = {
+        "size": size,
+        "page_size": PAGE_SIZE,
+        "kv_lora_rank": 512,
+        "dtype": torch.float4_e2m1fn_x2,
+        "qk_rope_head_dim": 64,
+        "layer_num": LAYER_NUM,
+        "device": "cpu",
+        "index_head_dim": 128,
+        "enable_memory_saver": False,
+        "kv_cache_dim": ROW_BYTES,
+    }
     if rank is not None:
-        kwargs.update(layer_shard_rank=rank, layer_shard_size=world)
+        kwargs.update(
+            layer_shard_rank=rank,
+            layer_shard_size=world,
+            unified_decode=unified_decode,
+        )
     cls = DSATokenToKVPool if rank is None else LayerSplitDSATokenToKVPool
     with (
         get_parallel().override(attn_dcp_size=1),
@@ -243,3 +251,191 @@ def test_move_and_restore_refresh_remote_kv_and_page_packed_indexer(world):
         keys, scales = read_index(pool)
         assert torch.equal(keys, expected_keys)
         assert torch.equal(scales, expected_scales)
+
+
+def test_prefill_plan_masks_padding_deduplicates_and_keeps_large_page_ids():
+    # Two real requests share a prefix. The third is an empty padded request.
+    # Tiny staging forces both column and row chunking without allocating a
+    # multi-GB KV pool just to exercise IDs beyond uint16.
+    table = torch.zeros((3, 193), dtype=torch.int32)
+    table[0, ::64] = torch.tensor([65537, 3, 7, 99999]) * PAGE_SIZE
+    table[1, ::64] = torch.tensor([65537, 9, 99999, 99999]) * PAGE_SIZE
+    table[2].fill_(-1)
+    result = _collect_prefill_page_ids(
+        table,
+        torch.tensor([129, 65, 0]),
+        [2, 1, 0],
+        torch.tensor([7 * 64 + 1, 11 * 64 + 2, 9 * 64, 0]),
+        torch.empty(8, dtype=torch.uint8),
+        PAGE_SIZE,
+        70000,
+    )
+    assert result.dtype == torch.int64
+    assert result.tolist() == [3, 7, 9, 11, 65537]
+
+    # Page zero is permitted as padding only. It cannot be a valid read/write.
+    for bad_slot in (0, -64, 70000 * 64):
+        with pytest.raises(ValueError, match="invalid physical page"):
+            _collect_prefill_page_ids(
+                torch.tensor([[bad_slot]], dtype=torch.int32),
+                torch.tensor([1]),
+                [1],
+                torch.tensor([64]),
+                torch.empty(8, dtype=torch.uint8),
+                PAGE_SIZE,
+                70000,
+            )
+    empty = _collect_prefill_page_ids(
+        table[2:],
+        torch.tensor([0]),
+        [0],
+        torch.tensor([0]),
+        torch.empty(8, dtype=torch.uint8),
+        PAGE_SIZE,
+        70000,
+    )
+    assert empty.numel() == 0
+
+
+def _owner_prefill_pool(size):
+    pool = _make_pool(0, 2, size=size, unified_decode=True)
+    transfers = []
+
+    def plan_transport(page_ids, error):
+        if error is not None:
+            raise ValueError(error)
+        pool.prefill_page_ids[: page_ids.numel()].copy_(page_ids)
+        return page_ids.numel()
+
+    def owner_transport(tensor, layer_id, *, src_tensor=None, **kwargs):
+        assert pool._is_layer_owned(layer_id)
+        assert src_tensor is not None
+        transfers.append(tensor.nbytes)
+        tensor.copy_(src_tensor)
+        return tensor
+
+    pool._broadcast_prefill_plan = plan_transport
+    pool._broadcast_tensor_from_owner = owner_transport
+    return pool, transfers
+
+
+@pytest.mark.parametrize("required_pages", [1023, 1024, 1025])
+def test_prefill_transfer_is_bounded_and_full_getters_upgrade_partial(required_pages):
+    # Keep one physical page outside the plan. Its poison must survive partial
+    # transfers, while the explicitly full getter must refresh it.
+    pool, transfers = _owner_prefill_pool((required_pages + 1) * PAGE_SIZE)
+    table = torch.arange(64, (required_pages + 1) * 64).view(1, -1)
+    scale_ptr = pool.mla_kv_global_scale.data_ptr()
+    for layer_id in (0, 1):
+        pool.kv_buffer[layer_id].fill_(31 + layer_id)
+        pool.index_k_with_scale_buffer[layer_id].fill_(61 + layer_id)
+        pool.remote_kv_buffer.fill_(197)
+        pool.index_key_cache.remote_buffer.fill_(211)
+        pool.begin_prefill_page_plan(
+            table, torch.tensor([table.numel()]), [1], table[:, -1:].flatten()
+        )
+        ids = pool.prefill_page_ids[: pool.prefill_num_pages]
+        assert ids.tolist() == list(range(1, required_pages + 1))
+        epoch = pool.prefill_plan_epoch
+        transfers.clear()
+        pool.prefetch_prefill_kv_buffer(layer_id)
+        kv = pool.get_prefill_key_buffer(layer_id).view(-1, 64, ROW_BYTES)
+        pool.index_key_cache.prepare_prefill_buffer(layer_id)
+        idx = pool.index_key_cache.get_prefill_buffer(layer_id)
+        assert torch.all(kv[ids] == 31 + layer_id)
+        assert torch.all(idx[ids] == 61 + layer_id)
+        assert torch.all(kv[[0, required_pages + 1]] == 197)
+        assert torch.all(idx[[0, required_pages + 1]] == 211)
+        assert sum(transfers) == required_pages * 64 * (ROW_BYTES + INDEX_ROW_BYTES)
+        assert max(transfers) <= PREFILL_TRANSFER_MAX_PAGES * 64 * ROW_BYTES
+        assert pool.remote_kv_scope == epoch
+        assert pool.index_key_cache.remote_scope == epoch
+        assert (
+            pool.prefill_main_staging.data_ptr()
+            != pool.index_key_cache.prefill_staging.data_ptr()
+        )
+
+        # An ordinary getter is an explicit full-cache read, even with a live
+        # partial plan for the same layer. No test consumer relies on poison.
+        assert torch.equal(pool.get_key_buffer(layer_id), pool.kv_buffer[layer_id])
+        assert torch.equal(
+            pool.index_key_cache.get_buffer(layer_id),
+            pool.index_k_with_scale_buffer[layer_id],
+        )
+        assert pool.remote_kv_scope is None
+        assert pool.index_key_cache.remote_scope is None
+    assert pool.mla_kv_global_scale.data_ptr() == scale_ptr
+    workspace = sum(
+        t.nbytes
+        for t in (
+            pool.prefill_main_staging,
+            pool.index_key_cache.prefill_staging,
+            pool.prefill_page_ids,
+        )
+    )
+    assert workspace == get_dsa_prefill_transfer_workspace_bytes(pool.size)
+    actual = sum(
+        t.nbytes
+        for t in (
+            *pool.kv_buffer,
+            *pool.index_k_with_scale_buffer,
+            pool.remote_kv_buffer,
+            pool.index_key_cache.remote_buffer,
+            pool.mla_kv_global_scale,
+            pool.prefill_main_staging,
+            pool.index_key_cache.prefill_staging,
+            pool.prefill_page_ids,
+        )
+    )
+    assert pool.get_kv_size_bytes() == actual
+
+
+def test_prefill_plan_cannot_outlive_owner_decode_move_or_restore():
+    pool, _ = _owner_prefill_pool(SIZE)
+    layer = SimpleNamespace(layer_id=0)
+    table = torch.arange(64, 128).view(1, -1)
+
+    def begin():
+        pool.begin_prefill_page_plan(
+            table, torch.tensor([64]), [1], torch.tensor([127])
+        )
+        pool.prefetch_prefill_kv_buffer(0)
+        pool.index_key_cache.prepare_prefill_buffer(0)
+
+    begin()
+    epoch = pool.prefill_plan_epoch
+    # A write after prefetch must update the packed scratch, using this layer's
+    # non-default scale. Compare only requested rows before any full getter.
+    nope, rope = _inputs(0, 1)
+    with get_parallel().override(attn_dcp_size=1):
+        pool.set_mla_kv_buffer(layer, torch.tensor([127]), nope, rope)
+    assert torch.equal(pool.get_prefill_key_buffer(0)[127], pool.kv_buffer[0][127])
+    pool.prepare_owner_compute()
+    assert not pool.prefill_page_plan_active
+    assert pool.remote_kv_layer_id is None
+    assert pool.index_key_cache.remote_layer_id is None
+    begin()
+    assert pool.prefill_plan_epoch > epoch
+    pool.move_kv_cache(torch.tensor([126]), torch.tensor([127]))
+    assert not pool.prefill_page_plan_active
+    begin()
+    with patch("torch.cuda.synchronize"), patch(
+        "sglang.srt.utils.current_platform.synchronize"
+    ):
+        snapshot = pool.get_cpu_copy(table.flatten())
+        pool.load_cpu_copy(snapshot, table.flatten())
+    assert not pool.prefill_page_plan_active
+    with pytest.raises(AssertionError):
+        pool.get_prefill_key_buffer(0)
+    begin()
+    scale_ptr = pool.mla_kv_global_scale.data_ptr()
+    scales = pool.mla_kv_global_scale.clone()
+    pool._clear_buffers()
+    with patch.object(LayerSplitDSATokenToKVPool, "_init_layer_broadcast_comm"):
+        pool._create_buffers()
+    pool.index_key_cache = pool._create_index_key_cache()
+    assert not pool.prefill_page_plan_active
+    assert pool.mla_kv_global_scale.data_ptr() == scale_ptr
+    assert torch.equal(pool.mla_kv_global_scale, scales)
+    pool.kv_buffer[0].fill_(71)
+    assert torch.equal(pool.get_key_buffer(0), pool.kv_buffer[0])

@@ -40,6 +40,7 @@ def _run(
     nvfp4: bool = False,
     fp8: bool = False,
     owner_graph: bool = False,
+    prefill_pages: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -64,6 +65,9 @@ def _run(
     publish_build_topology(tp_size=world, attn_cp_size=world, world_rank=rank)
     initialize_model_parallel()
 
+    if prefill_pages:
+        _run_nvfp4_prefill_pages(rank, world)
+        return
     if owner_graph:
         _run_nvfp4_owner_graph(rank, world)
         return
@@ -474,13 +478,22 @@ def _run_nvfp4_owner_graph_case(rank: int, world: int, query_count: int, mode):
                 )
         # Leave the eager scratch tagged layer 0, unlike the graph's final
         # layer 4. The production forward boundary must invalidate it.
-        pool.prefetch_kv_buffer(0)
+        # Enter the real partial-plan boundary after an owner graph replay.
+        # Page zero used by the legacy codec fixture is not a request page.
+        table = torch.arange(64, 128, device=device).view(1, -1)
+        pool.begin_prefill_page_plan(
+            table, torch.tensor([64]), [1], table[:, -1:].flatten()
+        )
+        pool.prefetch_prefill_kv_buffer(0)
         torch.testing.assert_close(
-            pool.get_key_buffer(0), reference.get_key_buffer(0), rtol=0, atol=0
+            pool.get_prefill_key_buffer(0)[64:128],
+            reference.get_key_buffer(0)[64:128],
+            rtol=0,
+            atol=0,
         )
         torch.testing.assert_close(
-            pool.index_key_cache.get_buffer(0),
-            reference.index_key_cache.get_buffer(0),
+            pool.index_key_cache.get_prefill_buffer(0)[1],
+            reference.index_key_cache.get_buffer(0)[1],
             rtol=0,
             atol=0,
         )
@@ -652,6 +665,407 @@ def _run_nvfp4_owner_graph(rank: int, world: int):
         _run_nvfp4_owner_graph_case(rank, world, query_count, mode)
 
 
+def _run_nvfp4_prefill_pages(rank: int, world: int):
+    """Actual metadata, FP8 indexer and BF16 FlashMLA over partial NVFP4 pages.
+
+    The fixture supplies final projected/rotated Q and globally gathered K.
+    It does not test model projections, RoPE/rotation or the CP key gather.
+    Cache writes, page-plan construction, CP request filtering, quantization,
+    logits/topk, dequantization and attention use production entry points and
+    kernels.
+    """
+    from unittest.mock import patch
+
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.cp import get_cp_strategy, init_cp_strategy
+    from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+    )
+    from sglang.srt.runtime_context import get_context, get_parallel
+
+    device = torch.device("cuda", rank)
+    size, layer_num = 64 * 64, 5
+    skip = [False, True, False, True, False]
+    kwargs = {
+        "size": size,
+        "page_size": 64,
+        "kv_lora_rank": 512,
+        "dtype": torch.float4_e2m1fn_x2,
+        "qk_rope_head_dim": 64,
+        "layer_num": layer_num,
+        "device": str(device),
+        "index_head_dim": 128,
+        "enable_memory_saver": False,
+        "kv_cache_dim": 416,
+        "skip_topk_layers": skip,
+    }
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        ),
+        context_len=2304,
+        num_attention_heads=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    with (
+        get_context().override_server_args(
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_kv",
+            speculative_num_draft_tokens=6,
+            speculative_eagle_topk=1,
+        ),
+        get_parallel().override(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=world,
+            attn_tp_size=1,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+        ),
+        # The fixture has no checkpoint. Publish its architecture at the model
+        # config boundary; leave every CP eligibility and metadata check live.
+        patch(
+            "sglang.srt.arg_groups.model_override_base.model_config_of",
+            return_value=model_config,
+        ),
+        patch(
+            "sglang.srt.arg_groups.overrides.model_config_of", return_value=model_config
+        ),
+    ):
+        init_cp_strategy(
+            enable_prefill_cp=True, cp_size=world, cp_strategy="interleave"
+        )
+        strategy = get_cp_strategy()
+        reference = DSATokenToKVPool(**kwargs)
+        pool = LayerSplitDSATokenToKVPool(
+            **kwargs, layer_shard_rank=rank, layer_shard_size=world, unified_decode=True
+        )
+        req_table = torch.zeros((4, 2304), dtype=torch.int32, device=device)
+
+        def backend_for(current):
+            return DeepseekSparseAttnBackend(
+                SimpleNamespace(
+                    device=str(device),
+                    page_size=64,
+                    model_config=model_config,
+                    token_to_kv_pool=current,
+                    req_to_token_pool=SimpleNamespace(size=4, req_to_token=req_table),
+                    hisparse_coordinator=None,
+                    is_draft_worker=False,
+                    kv_cache_dtype=torch.float4_e2m1fn_x2,
+                    max_running_requests=4,
+                )
+            )
+
+        backends = [backend_for(reference), backend_for(pool)]
+        layers = [
+            SimpleNamespace(
+                layer_id=i,
+                head_dim=576,
+                v_head_dim=512,
+                tp_q_head_num=64,
+                is_cross_attention=False,
+                scaling=576**-0.5,
+            )
+            for i in range(layer_num)
+        ]
+        indexer = object.__new__(Indexer)
+        indexer.index_topk = 2048
+        indexer.alt_stream = None
+        indexer.dsa_enable_prefill_cp = True
+        indexer.use_gfx950_fused_indexer = False
+        indexer.use_dsa_indexer_fusion = False
+        indexer.use_aiter_fused_fp8_writer = False
+        indexer.weights_proj = SimpleNamespace()
+        indexer.block_size = 128
+        indexer.scale_fmt = None
+        indexer.n_heads = 32
+        indexer.softmax_scale = 128**-0.5
+        indexer.logits_with_pp_recv = False
+        indexer.num_init_tokens = indexer.num_local_tokens = 0
+        indexer._mqa_logits_budget_bytes = {}
+        indexer._aiter_fused_fp8_active = lambda batch: False
+        generator = torch.Generator(device=device).manual_seed(1207)
+        physical = torch.arange(64, size + 64, device=device)
+        # Seed all allocated valid pages, including pages never in a plan. A
+        # same-size ordinary pool is an independent persistent-byte oracle.
+        for layer in layers:
+            nope = torch.randn(
+                size, 1, 512, device=device, generator=generator
+            ).bfloat16()
+            rope = torch.randn(
+                size, 1, 64, device=device, generator=generator
+            ).bfloat16()
+            index_key = torch.randn(
+                size, 128, device=device, generator=generator
+            ).bfloat16()
+            for backend in backends:
+                current = backend.token_to_kv_pool
+                current.set_mla_kv_global_scale(
+                    layer.layer_id, 0.5 + layer.layer_id * 0.375
+                )
+                current.set_mla_kv_buffer(layer, physical, nope, rope)
+                if not skip[layer.layer_id]:
+                    with forward_context(ForwardContext(attn_backend=backend)):
+                        indexer._store_index_k_cache(
+                            SimpleNamespace(out_cache_loc=physical),
+                            layer.layer_id,
+                            index_key,
+                        )
+
+        # A shared prefix >2048 makes topk depend on index bytes. Short requests
+        # assign different request subsets to CP ranks; no rank invents its own
+        # plan from those filtered tables. The last step extends existing pages.
+        cases = [(0, [1, 2, 5, 8]), (2112, [1, 2, 5, 8]), (2112, [4, 3, 13, 12])]
+        for case_id, (prefix, lengths) in enumerate(cases):
+            previous = [0] * 4 if case_id < 2 else [1, 2, 5, 8]
+            extend = [n - old for n, old in zip(lengths, previous)]
+            req_table.zero_()
+            for request, tail_page in enumerate((40, 42, 44, 46)):
+                if prefix:
+                    req_table[request, :prefix] = torch.arange(
+                        64, prefix + 64, device=device
+                    )
+                req_table[request, prefix : prefix + 64] = torch.arange(
+                    tail_page * 64, (tail_page + 1) * 64, device=device
+                )
+            seq_cpu = torch.tensor([prefix + n for n in lengths])
+            out_loc = torch.cat(
+                [
+                    req_table[i, prefix + old : prefix + n]
+                    for i, (old, n) in enumerate(zip(previous, lengths))
+                ]
+            ).long()
+            total = sum(extend)
+            batch = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=4,
+                input_ids=torch.zeros(total, device=device, dtype=torch.int64),
+                req_pool_indices=torch.arange(4, device=device),
+                seq_lens=seq_cpu.to(device),
+                out_cache_loc=out_loc,
+                seq_lens_sum=int(seq_cpu.sum()),
+            )
+            batch.seq_lens_cpu = seq_cpu
+            batch.extend_seq_lens_cpu = extend
+            batch.extend_seq_lens = torch.tensor(
+                extend, device=device, dtype=torch.int32
+            )
+            batch.extend_prefix_lens_cpu = [prefix + old for old in previous]
+            batch.extend_num_tokens = total
+            batch.attn_cp_metadata = strategy.build_metadata(
+                total, seq_cpu.tolist(), extend
+            )
+            for backend in backends:
+                backend.init_forward_metadata(batch)
+            expected_pages = list(range(1, 34)) if prefix else []
+            expected_pages += [40, 42, 44, 46]
+            assert (
+                pool.prefill_page_ids[: pool.prefill_num_pages].cpu().tolist()
+                == expected_pages
+            )
+            assert pool.prefill_page_plan_active
+            ids = pool.prefill_page_ids[: pool.prefill_num_pages]
+            # Explicitly prove at least one request is absent on some rank.
+            local_requests = backends[1].forward_metadata.page_table_1.shape[0]
+            if case_id == 0:
+                counts = [None] * world
+                torch.distributed.all_gather_object(counts, local_requests)
+                assert min(counts) < 4
+            previous_topk = [None, None]
+            for layer in layers:
+                layer_id = layer.layer_id
+                nope = torch.randn(
+                    total, 1, 512, device=device, generator=generator
+                ).bfloat16()
+                rope = torch.randn(
+                    total, 1, 64, device=device, generator=generator
+                ).bfloat16()
+                key = torch.randn(
+                    total, 128, device=device, generator=generator
+                ).bfloat16()
+                q = strategy.shard_local_tokens(
+                    torch.randn(
+                        total, 64, 576, device=device, generator=generator
+                    ).bfloat16()
+                )
+                index_q = strategy.shard_local_tokens(
+                    torch.randn(
+                        total, 32, 128, device=device, generator=generator
+                    ).bfloat16()
+                )
+                indexer._get_q_k_bf16 = lambda *args, query=index_q, keys=key, **kw: (
+                    query,
+                    keys,
+                    None,
+                )
+                # Substitute the learned head projection only. Quantization of
+                # Q and the real FP8 logits/topk kernels still run below.
+                indexer._get_logits_head_gate = (
+                    lambda x, scale: scale * indexer.softmax_scale
+                )
+                x = torch.zeros(q.shape[0], 4, device=device, dtype=torch.bfloat16)
+                pool.remote_kv_buffer.fill_(197)
+                pool.index_key_cache.remote_buffer.fill_(211)
+                outputs, topks = [], []
+                for which, backend in enumerate(backends):
+                    with forward_context(ForwardContext(attn_backend=backend)):
+                        topk = (
+                            previous_topk[which]
+                            if skip[layer_id]
+                            else indexer.forward_cuda(
+                                x,
+                                x,
+                                torch.arange(x.shape[0], device=device),
+                                batch,
+                                layer_id,
+                            )
+                        )
+                        previous_topk[which] = topk
+                        topks.append(topk)
+                        outputs.append(
+                            backend.forward_extend(
+                                q,
+                                nope,
+                                nope,
+                                layer,
+                                batch,
+                                k_rope=rope,
+                                topk_indices=topk,
+                            )
+                        )
+                torch.testing.assert_close(topks[0], topks[1], rtol=0, atol=0)
+                torch.testing.assert_close(
+                    outputs[0], outputs[1], atol=8e-4, rtol=2.01 / 128
+                )
+                actual = pool.get_prefill_key_buffer(layer_id).view(-1, 64, 416)
+                expected = reference.get_key_buffer(layer_id).view(-1, 64, 416)
+                assert torch.equal(actual[ids], expected[ids])
+                assert torch.all(actual[63] == 197)
+                if pool._is_layer_owned(layer_id):
+                    assert torch.equal(
+                        pool.get_owned_key_buffer(layer_id),
+                        reference.get_key_buffer(layer_id),
+                    )
+                if not skip[layer_id]:
+                    idx = pool.index_key_cache.get_prefill_buffer(layer_id)
+                    assert torch.equal(
+                        idx[ids], reference.index_key_cache.get_buffer(layer_id)[ids]
+                    )
+                    assert torch.all(idx[63] == 211)
+                # Full public reads must still work after partial materialization.
+                assert torch.equal(
+                    pool.get_key_buffer(layer_id), reference.get_key_buffer(layer_id)
+                )
+                if not skip[layer_id]:
+                    assert torch.equal(
+                        pool.index_key_cache.get_buffer(layer_id),
+                        reference.index_key_cache.get_buffer(layer_id),
+                    )
+        # Move and restore after a partial prefetch. Ordinary reads below are
+        # deliberate full-cache checks, after verifying that each mutation
+        # ended the plan rather than retaining stale scope tags.
+        backends[1].init_forward_metadata(batch)
+        pool.prefetch_prefill_kv_buffer(4)
+        source = torch.tensor([64, 65, 40 * 64], device=device)
+        target = torch.tensor([65, 66, 42 * 64], device=device)
+        for current in (reference, pool):
+            current.move_kv_cache(target, source)
+        assert not pool.prefill_page_plan_active
+        saved_loc = torch.arange(64, 192, device=device)
+        snapshots = [current.get_cpu_copy(saved_loc) for current in (reference, pool)]
+        backends[1].init_forward_metadata(batch)
+        pool.prefetch_prefill_kv_buffer(4)
+        for current, snapshot in zip((reference, pool), snapshots):
+            for raw in current.kv_buffer:
+                if raw.numel():
+                    raw[saved_loc] = 0
+            for raw in current.index_k_with_scale_buffer:
+                if raw.numel():
+                    raw[1:3] = 0
+            current.load_cpu_copy(snapshot, saved_loc)
+        assert not pool.prefill_page_plan_active
+        for layer in layers:
+            assert torch.equal(
+                pool.get_key_buffer(layer.layer_id),
+                reference.get_key_buffer(layer.layer_id),
+            )
+            if not skip[layer.layer_id]:
+                assert torch.equal(
+                    pool.index_key_cache.get_buffer(layer.layer_id),
+                    reference.index_key_cache.get_buffer(layer.layer_id),
+                )
+
+        # Exercise the real two-chunk NCCL transfer and both stream workspaces.
+        # CPU tests cover C-1/C/C+1; this C+1 case also reuses the main staging
+        # buffer for a new plan while the previous prefetch is still pending.
+        chunked = LayerSplitDSATokenToKVPool(
+            **{**kwargs, "size": 1026 * 64},
+            layer_shard_rank=rank,
+            layer_shard_size=world,
+            unified_decode=True,
+        )
+        for layer in layers:
+            layer_id = layer.layer_id
+            if chunked._is_layer_owned(layer_id):
+                chunked.kv_buffer[layer_id].fill_(layer_id + 19)
+                if not skip[layer_id]:
+                    chunked.index_k_with_scale_buffer[layer_id].fill_(layer_id + 39)
+        large_table = torch.arange(64, 1026 * 64, device=device).view(1, -1)
+        for layer_id in (0, 2, 4):
+            chunked.begin_prefill_page_plan(
+                large_table,
+                torch.tensor([large_table.numel()]),
+                [1],
+                large_table[:, -1:].flatten(),
+            )
+            chunked.remote_kv_buffer.fill_(197)
+            chunked.index_key_cache.remote_buffer.fill_(211)
+            chunked.prefetch_prefill_kv_buffer(layer_id)
+            chunked.index_key_cache.prepare_prefill_buffer(layer_id)
+            kv = chunked.get_prefill_key_buffer(layer_id).view(-1, 64, 416)
+            idx = chunked.index_key_cache.get_prefill_buffer(layer_id)
+            assert torch.all(kv[1:1026] == layer_id + 19)
+            assert torch.all(idx[1:1026] == layer_id + 39)
+            assert torch.all(kv[[0, 1026]] == 197)
+            assert torch.all(idx[[0, 1026]] == 211)
+        chunked.begin_prefill_page_plan(
+            large_table,
+            torch.tensor([large_table.numel()]),
+            [1],
+            large_table[:, -1:].flatten(),
+        )
+        chunked.prefetch_prefill_kv_buffer(0)
+        small_table = large_table[:, :64]
+        chunked.begin_prefill_page_plan(
+            small_table, torch.tensor([64]), [1], small_table[:, -1:].flatten()
+        )
+        assert chunked.prefill_num_pages == 1
+        assert torch.all(chunked.get_prefill_key_buffer(4)[64:128] == 23)
+        chunked.prefetch_prefill_kv_buffer(0)
+        scales = chunked.mla_kv_global_scale.clone()
+        scale_ptr = chunked.mla_kv_global_scale.data_ptr()
+        chunked._clear_buffers()
+        chunked._create_buffers()
+        chunked.index_key_cache = chunked._create_index_key_cache()
+        assert not chunked.prefill_page_plan_active
+        assert chunked.mla_kv_global_scale.data_ptr() == scale_ptr
+        assert torch.equal(chunked.mla_kv_global_scale, scales)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        print(
+            f"[rank {rank}] NVFP4 prefill pages CP={world}: metadata, indexer, FlashMLA and lifecycle OK",
+            flush=True,
+        )
+
+
 class TestLayerSplitDSABroadcast(CustomTestCase):
     def test_owner_broadcast(self):
         world = min(4, torch.cuda.device_count())
@@ -695,6 +1109,21 @@ class TestLayerSplitDSABroadcast(CustomTestCase):
                     mp.spawn(
                         _run,
                         args=(world, PORT + 20 + world, False, False, True),
+                        nprocs=world,
+                        join=True,
+                    )
+
+    def test_nvfp4_prefill_page_plan_and_real_consumers(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("NVFP4 prefill page test needs >= 2 GPUs")
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("NVFP4 DSA requires SM100")
+        for world in (2, 4):
+            if torch.cuda.device_count() >= world:
+                with self.subTest(world=world):
+                    mp.spawn(
+                        _run,
+                        args=(world, PORT + 30 + world, False, False, False, True),
                         nprocs=world,
                         join=True,
                     )

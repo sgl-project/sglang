@@ -5517,6 +5517,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     else 0
                 ),
                 "global_scale_bytes": self.mla_kv_global_scale.nbytes,
+                **(
+                    self.get_prefill_transfer_allocation_bytes()
+                    if self.layer_shard_enabled
+                    else {
+                        "prefill_main_staging_bytes": 0,
+                        "prefill_index_staging_bytes": 0,
+                        "prefill_page_ids_bytes": 0,
+                    }
+                ),
                 "total_bytes": int(self.get_kv_size_bytes()),
             }
             logger.info(

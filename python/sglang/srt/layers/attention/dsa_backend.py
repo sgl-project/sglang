@@ -1174,6 +1174,26 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        pool = self.token_to_kv_pool
+        if (
+            getattr(pool, "unified_decode", False)
+            and self.dsa_kv_cache_store_nvfp4
+            and self.physical_page_size == 64
+            and self.dsa_index_kpool == 1
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and can_dsa_prefill_cp_interleave(forward_batch)
+            and self.dsa_prefill_impl == "flashmla_sparse"
+            and not self._is_in_breakable_cuda_graph()
+            and not self._is_in_tc_piecewise_cuda_graph()
+        ):
+            # Plan before CP drops requests with no queries on this rank. All
+            # peers must use the same page list and collective chunk sizes.
+            pool.begin_prefill_page_plan(
+                page_table,
+                forward_batch.seq_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.out_cache_loc,
+            )
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -2328,11 +2348,12 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = (
-            pool.get_owned_key_buffer(layer.layer_id)
-            if _layer_owner_only
-            else pool.get_key_buffer(layer.layer_id)
-        )
+        if _layer_owner_only:
+            kv_cache = pool.get_owned_key_buffer(layer.layer_id)
+        elif getattr(pool, "prefill_page_plan_active", False):
+            kv_cache = pool.get_prefill_key_buffer(layer.layer_id)
+        else:
+            kv_cache = pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)

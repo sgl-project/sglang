@@ -336,6 +336,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+        from sglang.srt.layers.cp.utils import is_glm_dsa_cache_layer_split_enabled
+
+        self._layer_split_prefill_workspace = (
+            self.kv_cache_dtype_str == "nvfp4"
+            and get_disagg().disaggregation_mode == "null"
+            and get_parallel().attn_cp_size > 1
+            and is_glm_dsa_cache_layer_split_enabled(kvc)
+        )
+        self._layer_split_scale_bytes = 0
+        if self._layer_split_prefill_workspace:
+            # Global scales exist for every target layer, including remote
+            # layers. Draft scales and its full KV cell are charged once.
+            scale_layers = num_layers
+            if kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone():
+                scale_layers += kvc.spec_aux_config.eagle_draft_num_layers or 0
+            self._layer_split_scale_bytes = int(scale_layers) * 4
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         # args to config cell size
@@ -633,6 +650,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        if self._layer_split_prefill_workspace:
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                get_dsa_prefill_transfer_workspace_bytes,
+            )
+
+            # The page-id tensor adds eight bytes per physical page. Solve in
+            # integer pages rather than truncating its fractional token cost.
+            low, high = 0, available_bytes // (self._cell_size * page_size)
+            while low < high:
+                pages = (low + high + 1) // 2
+                tokens = pages * page_size
+                needed = (
+                    (tokens + page_size) * self._cell_size
+                    + self._layer_split_scale_bytes
+                    + get_dsa_prefill_transfer_workspace_bytes(tokens, page_size)
+                )
+                if needed <= available_bytes:
+                    low = pages
+                else:
+                    high = pages - 1
+            return MemoryPoolConfig(max_total_num_tokens=low * page_size)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
