@@ -158,7 +158,8 @@ def test_recurrent_dummy_skips_inputs_and_short_metadata(is_kda, tree, real_requ
     torch.testing.assert_close(scratch, reference_scratch, atol=0, rtol=0)
 
 
-def test_fused_kda_dummy_output_and_state():
+@pytest.mark.parametrize("padding_slot", [-1, 0])
+def test_fused_kda_dummy_output_and_state(padding_slot):
     torch.manual_seed(29)
     # TP8 / verify width 6 pads one real request to four complete groups.
     requests, steps, heads, dim = 4, 6, 2, 128
@@ -169,14 +170,20 @@ def test_fused_kda_dummy_output_and_state():
     a = torch.randn(tokens, heads * dim, **kwargs) * 0.2
     b = torch.randn(tokens, heads, **kwargs)
     for tensor in (mixed, a, b):
-        tensor[steps:].fill_(float("nan"))
+        tensor[steps:].fill_(float("nan") if padding_slot < 0 else 0)
     conv = torch.randn(5, 3, channels, **kwargs)
     state = torch.randn(5, heads, dim, dim, device="cuda") * 0.2
     before = state.clone()
     window = torch.full((5, steps, 3, channels), 73.0, **kwargs)
     scratch = torch.full((5, steps, heads, dim, dim), 73.0, device="cuda")
-    indices = torch.tensor([2, -1, -1, -1], device="cuda", dtype=torch.int32)
-    intermediate_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    indices = torch.tensor(
+        [2, padding_slot, padding_slot, padding_slot], device="cuda", dtype=torch.int32
+    )
+    # Eager padding uses reserved slot 0 and a full positional scratch table.
+    # Negative-slot kernel routes can skip absent scratch metadata altogether.
+    intermediate_indices = torch.arange(
+        1 if padding_slot < 0 else requests, device="cuda", dtype=torch.int32
+    )
     weight = torch.randn(channels, 4, **kwargs) * 0.2
     a_log = torch.randn(heads, device="cuda") * 0.2
     dt_bias = torch.randn(heads * dim, device="cuda") * 0.2
@@ -220,13 +227,28 @@ def test_fused_kda_dummy_output_and_state():
     with patch.object(torch.Tensor, "new_empty", new=poison_allocation):
         output = run(requests, conv, window, scratch)
     torch.testing.assert_close(output[:, :steps], reference, atol=0, rtol=0)
-    torch.testing.assert_close(
-        output[:, steps:], torch.zeros_like(output[:, steps:]), atol=0, rtol=0
-    )
-    torch.testing.assert_close(conv, reference_conv, atol=0, rtol=0)
-    torch.testing.assert_close(state, before, atol=0, rtol=0)
-    torch.testing.assert_close(window, reference_window, atol=0, rtol=0)
-    torch.testing.assert_close(scratch, reference_scratch, atol=0, rtol=0)
+    if padding_slot < 0:
+        torch.testing.assert_close(
+            output[:, steps:], torch.zeros_like(output[:, steps:]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(conv, reference_conv, atol=0, rtol=0)
+        torch.testing.assert_close(state, before, atol=0, rtol=0)
+        torch.testing.assert_close(window, reference_window, atol=0, rtol=0)
+        torch.testing.assert_close(scratch, reference_scratch, atol=0, rtol=0)
+    else:
+        # Slot 0 and padding scratch rows are discard sinks. No real request's
+        # state or output may depend on their updates.
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(conv[1:], reference_conv[1:], atol=0, rtol=0)
+        torch.testing.assert_close(state[1:], before[1:], atol=0, rtol=0)
+        torch.testing.assert_close(window[:1], reference_window[:1], atol=0, rtol=0)
+        torch.testing.assert_close(scratch[:1], reference_scratch[:1], atol=0, rtol=0)
+        torch.testing.assert_close(
+            window[requests:], reference_window[requests:], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            scratch[requests:], reference_scratch[requests:], atol=0, rtol=0
+        )
 
 
 if __name__ == "__main__":

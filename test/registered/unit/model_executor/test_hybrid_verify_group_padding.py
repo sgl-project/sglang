@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor import forward_batch_info as fbi
@@ -21,6 +24,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def _spec(width: int = 6, *, ragged=False, draft=False):
     return SimpleNamespace(
         num_tokens_per_req=width,
+        draft_token_num=width,
         ragged_verify_layout=object() if ragged else None,
         is_draft_input=lambda: draft,
     )
@@ -32,8 +36,10 @@ def _model_runner(*, hybrid=True):
     runner.is_draft_worker = False
     runner.enable_elastic_ep = False
     runner.attn_tp_sequence_sharded.return_value = False
+    runner.decode_num_tokens_per_req.return_value = 6
     runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
     runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = 1
+    runner.attn_backend.late_layer_num_tokens.return_value = None
     runner._hybrid_config = object() if hybrid else None
     return runner
 
@@ -54,7 +60,7 @@ def _batch(
         forward_mode=mode,
         batch_size=batch_size,
         input_ids=torch.arange(num_tokens),
-        req_pool_indices=torch.arange(batch_size),
+        req_pool_indices=torch.arange(1, batch_size + 1),
         seq_lens=torch.arange(10, 10 + batch_size, dtype=torch.int64),
         out_cache_loc=torch.arange(num_tokens),
         seq_lens_sum=int(torch.arange(10, 10 + batch_size).sum()),
@@ -129,6 +135,71 @@ def _prepare(
 
 
 class TestHybridVerifyGroupPadding(CustomTestCase):
+    def test_eager_padding_uses_reserved_mamba_slot_zero(self):
+        fb = _batch(batch_size=38, spec=_spec())
+        _prepare(fb, _model_runner())
+        backend = object.__new__(MambaAttnBackendBase)
+        backend.device = torch.device("cpu")
+        backend.topk = 1
+        backend.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: rows,
+            translate_mamba_indices=lambda rows: rows,
+        )
+
+        metadata = backend._forward_metadata(fb)
+
+        torch.testing.assert_close(
+            metadata.mamba_cache_indices[:38], torch.arange(1, 39)
+        )
+        torch.testing.assert_close(
+            metadata.mamba_cache_indices[38:], torch.zeros(2, dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            metadata.query_start_loc, torch.arange(0, 241, 6, dtype=torch.int32)
+        )
+
+    def test_coordinated_prefill_and_verify_agree_on_padded_counts(self):
+        global_tokens = [25, 38 * 6]
+        prefill = _batch(
+            mode=ForwardMode.EXTEND,
+            batch_size=1,
+            global_num_tokens=global_tokens,
+            is_extend_in_batch=True,
+        )
+        prefill.input_ids = torch.arange(25)
+        prefill.positions = torch.arange(25)
+        prefill.out_cache_loc = torch.arange(25)
+        prefill.seq_lens = torch.tensor([25], dtype=torch.int64)
+        prefill.seq_lens_cpu = prefill.seq_lens.clone()
+        prefill.seq_lens_sum = 25
+        prefill.global_num_token_non_padded_cpu = 25
+        prefill.extend_seq_lens = torch.tensor([25])
+        prefill.extend_prefix_lens = torch.tensor([0])
+        prefill.extend_start_loc = torch.tensor([0])
+        prefill.extend_seq_lens_cpu = [25]
+        prefill.extend_prefix_lens_cpu = [0]
+        verify = _batch(
+            batch_size=38,
+            spec=_spec(),
+            global_num_tokens=global_tokens,
+            is_extend_in_batch=True,
+        )
+        for fb in (prefill, verify):
+            fb.dp_spec_prefill_coordination_applied = True
+
+        prefill_dp = _prepare(prefill, _model_runner(), attn_dp_rank=0, attn_dp_size=2)
+        verify_dp = _prepare(verify, _model_runner(), attn_dp_rank=1, attn_dp_size=2)
+
+        self.assertEqual(prefill.global_num_tokens_cpu, [48, 240])
+        self.assertEqual(verify.global_num_tokens_cpu, [48, 240])
+        self.assertEqual(prefill_dp[0], 288)
+        self.assertEqual(verify_dp[0], 288)
+        self.assertEqual(prefill_dp[1], 48)
+        self.assertEqual(verify_dp[1], 240)
+        self.assertEqual(prefill.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(verify.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertEqual(verify.batch_size, 40)
+
     def test_hybrid_target_verify_aligns_to_complete_request_groups(self):
         for batch_size, expected_tokens, expected_bs in [
             (33, 216, 36),

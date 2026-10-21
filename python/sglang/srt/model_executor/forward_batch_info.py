@@ -1747,6 +1747,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # so active and synchronized idle ranks retain the same collective domain.
         token_alignment = attn_tp_size
         if (
+            self.dp_spec_prefill_coordination_applied
+            and not model_runner.is_draft_worker
+            and mambaish_config(model_runner.model_config) is not None
+        ):
+            # Coordinated target steps can be EXTEND on one DP rank and VERIFY
+            # on another. Use the shared target width on both, so every rank
+            # derives the same padded counts for the collective.
+            token_alignment = math.lcm(
+                token_alignment, model_runner.decode_num_tokens_per_req()
+            )
+        elif (
             self.spec_info is not None
             and not self.spec_info.is_draft_input()
             and self.spec_info.ragged_verify_layout is None

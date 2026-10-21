@@ -16,7 +16,9 @@ NUM_TOKENS_PER_REQ = 4
 
 def _verify_spec_info():
     return SimpleNamespace(
-        num_tokens_per_req=NUM_TOKENS_PER_REQ, is_draft_input=lambda: False
+        num_tokens_per_req=NUM_TOKENS_PER_REQ,
+        ragged_verify_layout=None,
+        is_draft_input=lambda: False,
     )
 
 
