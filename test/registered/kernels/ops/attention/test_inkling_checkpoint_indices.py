@@ -684,6 +684,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         model_runner = SimpleNamespace(
             device="cuda",
             tp_size=1,
+            model=SimpleNamespace(),
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16, vocab_size=8, hf_config=SimpleNamespace()
             ),
