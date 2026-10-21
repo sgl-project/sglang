@@ -12,6 +12,18 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestQueueingCall(CustomTestCase):
+    def test_call_can_override_fan_out_without_changing_default(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(send=sent.append, fan_out=2)
+            task = asyncio.create_task(comm("request", fan_out=1))
+            await asyncio.sleep(0)
+            comm.handle_recv("response")
+            self.assertEqual(await task, ["response"])
+            self.assertEqual(comm._fan_out, 2)
+
+        asyncio.run(scenario())
+
     def test_concurrent_caller_cannot_bypass_queue(self):
         """A new caller arriving in the wakeup window must not overtake a
         queued caller (this interleaving used to raise AssertionError and

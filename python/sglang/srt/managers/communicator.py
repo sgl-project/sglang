@@ -45,7 +45,7 @@ class FanOutCommunicator(Generic[T]):
         assert mode in ["queueing", "watching"]
         assert correlation_attr is None or mode == "queueing"
 
-    async def queueing_call(self, obj: T):
+    async def queueing_call(self, obj: T, fan_out: Optional[int] = None):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
         # callers are still waiting, so requests are strictly serialized in
         # arrival order. It also releases on exception/cancellation, so a
@@ -54,7 +54,7 @@ class FanOutCommunicator(Generic[T]):
             event = asyncio.Event()
             self._result_event = event
             self._result_values = []
-            self._result_fan_out = self._fan_out
+            self._result_fan_out = self._fan_out if fan_out is None else fan_out
             self._result_correlation = (
                 getattr(obj, self._correlation_attr)
                 if obj is not None and self._correlation_attr is not None
@@ -93,10 +93,12 @@ class FanOutCommunicator(Generic[T]):
             self._result_fan_out = None
         return result_values
 
-    async def __call__(self, obj):
+    async def __call__(self, obj, fan_out: Optional[int] = None):
         if self._mode == "queueing":
-            return await self.queueing_call(obj)
+            return await self.queueing_call(obj, fan_out=fan_out)
         else:
+            if fan_out is not None:
+                raise ValueError("Per-call fan-out requires queueing mode.")
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):

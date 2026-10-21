@@ -182,7 +182,7 @@ class _MembershipStore:
         return self.values[key]
 
 
-def test_membership_observation_rejects_duplicate_stale_and_aba_epochs():
+def test_membership_observation_accepts_replay_and_rejects_stale_aba_epochs():
     store = _MembershipStore()
     topology = RuntimeTopology(
         runtime_instance_id="runtime/1",
@@ -213,9 +213,8 @@ def test_membership_observation_rejects_duplicate_stale_and_aba_epochs():
             return_value=topology,
         ),
     ):
-        publish_membership_observation(observation)
-        with pytest.raises(ValueError, match="Duplicate"):
-            publish_membership_observation(observation)
+        observation_key = publish_membership_observation(observation)
+        assert publish_membership_observation(observation) == observation_key
         with pytest.raises(ValueError, match="stale|ABA"):
             publish_membership_observation(replace(observation, membership_epoch=8))
         publish_membership_observation(
@@ -225,6 +224,8 @@ def test_membership_observation_rejects_duplicate_stale_and_aba_epochs():
                 membership_epoch=10,
             )
         )
+        with pytest.raises(ValueError, match="stale|ABA"):
+            publish_membership_observation(observation)
         with pytest.raises(ValueError, match="stale|ABA"):
             publish_membership_observation(
                 replace(
@@ -277,11 +278,8 @@ def test_membership_publication_serializes_duplicate_interleavings():
                 )
             ]
 
-    assert [result[0] for result in results].count("accepted") == 1
-    assert [result[0] for result in results].count("rejected") == 1
-    assert "Duplicate" in next(
-        result[1] for result in results if result[0] == "rejected"
-    )
+    assert [result[0] for result in results].count("accepted") == 2
+    assert results[0][1] == results[1][1]
 
 
 def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
@@ -291,6 +289,7 @@ def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
         rank=1,
         failed_allocation_incarnation="allocation-a",
         membership_epoch=1,
+        submission_id="submission-1",
     )
     with (
         patch(
@@ -298,11 +297,17 @@ def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
             return_value="observation-key",
         ),
         patch("sglang.srt.elastic_ep.elastic_ep.poll_recovery_control_plane") as poll,
+        patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(dp_rank=0),
+        ),
     ):
         result = Scheduler.handle_observe_elastic_ep_membership(object(), request)
 
     assert result.accepted
     assert result.observation_key == "observation-key"
+    assert result.submission_id == "submission-1"
+    assert result.responder_rank == 0
     poll.assert_not_called()
 
 
@@ -359,14 +364,13 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         )
         assert state.recovery_phase == "idle"
         assert state.active_ranks_cpu[1].item() == 0
-        with pytest.raises(ValueError, match="Duplicate"):
-            observe_recovery_membership(
-                runtime_instance_id="runtime-1",
-                topology_generation=0,
-                rank=1,
-                failed_allocation_incarnation="inc-1",
-                membership_epoch=1,
-            )
+        observe_recovery_membership(
+            runtime_instance_id="runtime-1",
+            topology_generation=0,
+            rank=1,
+            failed_allocation_incarnation="inc-1",
+            membership_epoch=1,
+        )
         with pytest.raises(ValueError, match="stale|ABA"):
             observe_recovery_membership(
                 runtime_instance_id="runtime-1",
@@ -378,6 +382,13 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         assert poll_recovery_control_plane()
         assert state.recovery_phase == "awaiting_recovery"
         assert state.active_ranks_cpu[1].item() == 0
+        observe_recovery_membership(
+            runtime_instance_id="runtime-1",
+            topology_generation=0,
+            rank=1,
+            failed_allocation_incarnation="inc-1",
+            membership_epoch=1,
+        )
         with pytest.raises(ValueError, match="awaiting"):
             observe_recovery_membership(
                 runtime_instance_id="runtime-1",

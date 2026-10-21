@@ -505,26 +505,27 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         manager._dispatch_to_scheduler.assert_called_once_with(ranks)
 
     async def test_membership_observation_uses_active_survivor_quorum(self):
-        """Membership observations must not wait for the fenced rank."""
+        """The observation itself must exclude the newly failed rank."""
         manager = _manager()
+        manager.elastic_worker_count = 2
+        manager.elastic_active_rank_status = [True, True]
         sent = []
         manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
             send=sent.append,
-            fan_out=4,
+            fan_out=2,
+            correlation_attr="submission_id",
         )
         recovery_sent = []
         manager.recover_elastic_ep_communicator = FanOutCommunicator(
             send=recovery_sent.append,
             fan_out=4,
         )
-        manager.update_active_ranks(ActiveRanksOutput(status=[True, True, False, True]))
-
         task = asyncio.create_task(
             manager.observe_elastic_ep_membership(
                 ObserveElasticEPMembershipReqInput(
                     runtime_instance_id="runtime-1",
                     topology_generation=3,
-                    rank=2,
+                    rank=1,
                     failed_allocation_incarnation="pod-uid-5",
                     membership_epoch=4,
                 )
@@ -532,18 +533,20 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0)
         self.assertEqual(len(sent), 1)
-        for _ in range(3):
-            manager.observe_elastic_ep_membership_communicator.handle_recv(
-                ObserveElasticEPMembershipReqOutput(
-                    accepted=True,
-                    message="accepted",
-                    observation_key="observation-key",
-                )
+        manager.observe_elastic_ep_membership_communicator.handle_recv(
+            ObserveElasticEPMembershipReqOutput(
+                accepted=True,
+                message="accepted",
+                observation_key="observation-key",
+                submission_id=sent[0].submission_id,
+                responder_rank=0,
             )
+        )
 
         result = await task
         self.assertTrue(result.accepted)
         self.assertEqual(result.observation_key, "observation-key")
+        self.assertEqual(manager.elastic_active_rank_status, [True, True])
         self.assertEqual(recovery_sent, [])
 
     async def test_membership_observation_rejects_without_active_ranks(self):
@@ -569,9 +572,126 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(
             result.message,
-            "Membership observation requires at least one active rank.",
+            "Membership observation requires at least one survivor.",
         )
         manager._dispatch_to_scheduler.assert_called_once()
+
+    async def test_membership_observation_rejects_out_of_range_rank(self):
+        for rank in (-1, 4):
+            with self.subTest(rank=rank):
+                manager = _manager()
+
+                result = await manager.observe_elastic_ep_membership(
+                    ObserveElasticEPMembershipReqInput(
+                        runtime_instance_id="runtime-1",
+                        topology_generation=3,
+                        rank=rank,
+                        failed_allocation_incarnation="pod-uid-5",
+                        membership_epoch=4,
+                    )
+                )
+
+                self.assertFalse(result.accepted)
+                self.assertEqual(
+                    result.message,
+                    "Membership observation rank is outside the active topology.",
+                )
+                manager._dispatch_to_scheduler.assert_not_called()
+
+    async def test_membership_observation_requires_identical_survivor_keys(self):
+        manager = _manager()
+        manager.elastic_active_rank_status = [True, True, True, True]
+        sent = []
+        manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=4,
+            correlation_attr="submission_id",
+        )
+        task = asyncio.create_task(
+            manager.observe_elastic_ep_membership(
+                ObserveElasticEPMembershipReqInput(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    rank=2,
+                    failed_allocation_incarnation="pod-uid-5",
+                    membership_epoch=4,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        for responder_rank, observation_key in ((0, "key"), (1, "key"), (3, "other")):
+            manager.observe_elastic_ep_membership_communicator.handle_recv(
+                ObserveElasticEPMembershipReqOutput(
+                    accepted=True,
+                    message="accepted",
+                    observation_key=observation_key,
+                    submission_id=sent[0].submission_id,
+                    responder_rank=responder_rank,
+                )
+            )
+
+        result = await task
+        self.assertFalse(result.accepted)
+        self.assertIn("same membership observation key", result.message)
+
+    async def test_membership_observation_accepts_all_survivors(self):
+        manager = _manager()
+        sent = []
+        manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=4,
+            correlation_attr="submission_id",
+        )
+        task = asyncio.create_task(
+            manager.observe_elastic_ep_membership(
+                ObserveElasticEPMembershipReqInput(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    rank=2,
+                    failed_allocation_incarnation="pod-uid-5",
+                    membership_epoch=4,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        for responder_rank in (0, 1, 3):
+            manager.observe_elastic_ep_membership_communicator.handle_recv(
+                ObserveElasticEPMembershipReqOutput(
+                    accepted=True,
+                    message="accepted",
+                    observation_key="observation-key",
+                    submission_id=sent[0].submission_id,
+                    responder_rank=responder_rank,
+                )
+            )
+
+        result = await task
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.observation_key, "observation-key")
+
+    async def test_membership_observation_times_out_without_survivor_reply(self):
+        manager = _manager()
+        manager.elastic_active_rank_status = [True, True]
+        manager.elastic_scheduler_response_timeout = 0.001
+        manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
+            send=MagicMock(),
+            fan_out=2,
+            correlation_attr="submission_id",
+        )
+
+        with self.assertRaises(TimeoutError):
+            await manager.observe_elastic_ep_membership(
+                ObserveElasticEPMembershipReqInput(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    rank=1,
+                    failed_allocation_incarnation="pod-uid-5",
+                    membership_epoch=4,
+                )
+            )
+        self.assertIsNone(
+            manager.observe_elastic_ep_membership_communicator._result_event
+        )
 
     async def test_unknown_recovery_submission_is_reconciled(self):
         """A timed-out admission must be resubmitted with the same identity."""

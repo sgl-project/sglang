@@ -983,18 +983,26 @@ def observe_recovery_membership(
     """Publish a CPU-only membership observation without touching device state."""
     if not _fixed_slot_recovery_enabled():
         raise RuntimeError("Fixed-slot Elastic EP recovery is not enabled.")
+    observation = MembershipObservation(
+        runtime_instance_id=runtime_instance_id,
+        topology_generation=topology_generation,
+        rank=rank,
+        failed_allocation_incarnation=failed_allocation_incarnation,
+        membership_epoch=membership_epoch,
+    )
     state = ElasticEPStateManager.instance()
     if state is not None and state.recovery_phase == "awaiting_recovery":
-        raise ValueError("Recovery membership observation is awaiting recovery.")
-    return publish_membership_observation(
-        MembershipObservation(
-            runtime_instance_id=runtime_instance_id,
-            topology_generation=topology_generation,
-            rank=rank,
-            failed_allocation_incarnation=failed_allocation_incarnation,
-            membership_epoch=membership_epoch,
+        is_replay = (
+            state.runtime_instance_id == observation.runtime_instance_id
+            and state.recovery_topology_generation == observation.topology_generation
+            and state.recovery_rank_offset == observation.rank
+            and state.recovery_failed_allocation_incarnation
+            == observation.failed_allocation_incarnation
+            and state.recovery_membership_epoch == observation.membership_epoch
         )
-    )
+        if not is_replay:
+            raise ValueError("Recovery membership observation is awaiting recovery.")
+    return publish_membership_observation(observation)
 
 
 def consume_recovery_membership_observation(

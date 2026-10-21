@@ -6161,6 +6161,10 @@ class Scheduler(
     ) -> ObserveElasticEPMembershipReqOutput:
         from sglang.srt.elastic_ep.elastic_ep import observe_recovery_membership
 
+        responder_rank = get_parallel().dp_rank
+        if responder_rank is None:
+            responder_rank = 0
+
         try:
             key = observe_recovery_membership(
                 runtime_instance_id=recv_req.runtime_instance_id,
@@ -6173,11 +6177,15 @@ class Scheduler(
             return ObserveElasticEPMembershipReqOutput(
                 accepted=False,
                 message=str(exc),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
             )
         return ObserveElasticEPMembershipReqOutput(
             accepted=True,
             message="Elastic EP membership observation accepted.",
             observation_key=key,
+            submission_id=recv_req.submission_id,
+            responder_rank=responder_rank,
         )
 
     def _maybe_schedule_recovery_warmup(self) -> None:

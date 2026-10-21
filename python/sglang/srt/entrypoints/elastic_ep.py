@@ -259,17 +259,28 @@ async def observe_elastic_ep_membership(raw_request: Request):
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import ObserveElasticEPMembershipReqInput
 
-    result = await _global_state.tokenizer_manager.observe_elastic_ep_membership(
-        ObserveElasticEPMembershipReqInput(
-            **{field: body[field] for field in (*string_fields, *numeric_fields)}
+    try:
+        result = await _global_state.tokenizer_manager.observe_elastic_ep_membership(
+            ObserveElasticEPMembershipReqInput(
+                **{field: body[field] for field in (*string_fields, *numeric_fields)}
+            )
         )
-    )
+    except TimeoutError:
+        return ORJSONResponse(
+            {"error": "Timed out waiting for the membership survivor quorum."},
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+        )
     if not result.accepted:
         return ORJSONResponse(
-            {"error": result.message}, status_code=HTTPStatus.CONFLICT
+            {"error": result.message, "submission_id": result.submission_id},
+            status_code=HTTPStatus.CONFLICT,
         )
     return ORJSONResponse(
-        {"message": result.message, "observation_key": result.observation_key}
+        {
+            "message": result.message,
+            "observation_key": result.observation_key,
+            "submission_id": result.submission_id,
+        }
     )
 
 

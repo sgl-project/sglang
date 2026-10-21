@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    ObserveElasticEPMembershipReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -274,6 +275,17 @@ class DataParallelController:
             if worker is not None:
                 sock_send(worker, obj)
 
+    def send_membership_observation_to_survivors(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ):
+        """Route one observation without committing the proposed membership."""
+        for i in self._active_workers[:: self.control_message_step]:
+            if i == obj.rank:
+                continue
+            worker = self.workers[i]
+            if worker is not None:
+                sock_send(worker, obj)
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if get_exec().moe.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
@@ -404,6 +416,10 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ObserveElasticEPMembershipReqInput,
+                    self.send_membership_observation_to_survivors,
+                ),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: (

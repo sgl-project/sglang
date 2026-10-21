@@ -134,8 +134,10 @@ def publish_membership_observation(
     """Publish one CPU-only, monotonic membership observation.
 
     Publication is serialized so the per-slot incarnation and latest snapshot
-    cannot be observed halfway through an update. Compare-set keys reject
-    duplicates, while the epoch watermark rejects stale and ABA observations.
+    cannot be observed halfway through an update. Replaying the exact same
+    observation is idempotent so every surviving scheduler can acknowledge a
+    shared publication. The epoch watermark still rejects stale and ABA
+    observations.
     """
     topology = get_runtime_topology()
     if topology is None:
@@ -149,7 +151,8 @@ def publish_membership_observation(
         observation_key = _membership_observation_key(observation)
         encoded = json.dumps(asdict(observation), sort_keys=True).encode()
         if store.check([observation_key]):
-            raise ValueError("Duplicate Elastic EP membership observation.")
+            if store.get(observation_key) != encoded:
+                raise ValueError("Conflicting Elastic EP membership observation.")
         epoch_key = _membership_epoch_key(observation)
         slot_key = _membership_slot_key(observation)
         incarnation_key = _membership_incarnation_key(observation)
@@ -161,12 +164,18 @@ def publish_membership_observation(
                 raise ValueError("Stale or ABA Elastic EP membership observation.")
         if store.check([epoch_key]):
             previous_epoch = int(store.get(epoch_key).decode())
-            if observation.membership_epoch <= previous_epoch:
+            if observation.membership_epoch < previous_epoch:
                 raise ValueError("Stale or ABA Elastic EP membership observation.")
+            if (
+                observation.membership_epoch == previous_epoch
+                and store.check([slot_key])
+                and store.get(slot_key) == encoded
+            ):
+                return observation_key
         if hasattr(store, "compare_set"):
             existing = store.compare_set(observation_key, b"", encoded)
             if existing != encoded:
-                raise ValueError("Duplicate Elastic EP membership observation.")
+                raise ValueError("Conflicting Elastic EP membership observation.")
             store.set(epoch_key, str(observation.membership_epoch).encode())
         else:
             store.set(observation_key, encoded)
