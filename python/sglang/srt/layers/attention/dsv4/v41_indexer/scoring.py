@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -297,7 +298,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    scores: torch.Tensor  # [rows, lc] fp32, -inf past each row's length
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -306,6 +307,21 @@ class DecodeScores(msgspec.Struct, frozen=True):
     lens: torch.Tensor  # [bs]
     slots: torch.Tensor  # [bs, lmax]
     scores: torch.Tensor  # [bs, lmax]
+
+
+def _use_fp8_prefill(q: torch.Tensor, weights: torch.Tensor) -> bool:
+    return (
+        envs.SGLANG_DSV41_FP8_PREFILL_INDEXER.get()
+        and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+        and q.is_cuda
+        and torch.version.cuda is not None
+        and get_platform().is_sm90
+        and q.ndim == 3
+        and q.shape[1:] == (32, 128)
+        and q.dtype == weights.dtype == torch.bfloat16
+        and weights.shape == q.shape[:2]
+        and weights.device == q.device
+    )
 
 
 def prefill_requests(
@@ -323,6 +339,7 @@ def prefill_requests(
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
+    use_fp8 = _use_fp8_prefill(q, weights)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
@@ -335,7 +352,10 @@ def prefill_requests(
         j = torch.arange(lc, device=pos.device)
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
-        index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        if use_fp8:
+            index_k = pool.get_low_ratio_index_k_fp8(inputs.layer_id, slots)
+        else:
+            index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
@@ -356,13 +376,25 @@ def _score_chunks(
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    use_fp8 = index_k.dtype == torch.float8_e4m3fn
+    if use_fp8:
+        from sglang.kernels.ops.attention.dsv4.prefill_fp8 import prefill_fp8_scores
+
+    # FP8 reduces heads inside the kernel, materializing [rows, lc] FP32.
+    # Budget four times that output for overlapping chunks and selection scratch
+    # (padding, candidate scores and top-k), rather than a BF16 tensor per head.
+    bytes_per_position = 16 if use_fp8 else q.shape[1] * 2
+    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (lc * bytes_per_position))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        if use_fp8:
+            s = prefill_fp8_scores(
+                q[tok_c].to(torch.float8_e4m3fn), index_k, weights[tok_c], lens_c
+            )
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
 
