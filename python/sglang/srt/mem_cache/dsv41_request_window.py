@@ -270,7 +270,13 @@ class RequestWindow:
         layout = self._idle_layout
         if layout is None or layout.pos.numel() != num_rows:
             zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
-            layout = window_layout(zeros, zeros, capacity=self.capacity, num_groups=1)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
             self._idle_layout = layout
         self.activate(layout)
         return layout.write_loc
