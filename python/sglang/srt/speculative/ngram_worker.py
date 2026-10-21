@@ -252,14 +252,17 @@ class NGRAMWorker(BaseSpecWorker):
         req_ids = [req.rid for req in batch.reqs]
         # Only the last max_trie_depth tokens can match; the ids are
         # array.array, so list() the tails for list concat below.
+        # multimodal cache padding contains identities, not vocabulary token IDs
         input_tails = [
-            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+            list(req.origin_input_ids_unpadded[-self.max_trie_depth :])
+            for req in batch.reqs
         ]
         output_tails = [
             list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
         ]
         base_lens = [
-            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+            len(req.origin_input_ids_unpadded) + len(req.output_ids)
+            for req in batch.reqs
         ]
 
         if use_prev_tokens:
@@ -414,7 +417,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids[-self.max_trie_depth :]),
+                list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )

@@ -24,6 +24,9 @@ from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
     get_src_tgt_cache_loc as get_src_tgt_cache_loc,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -820,23 +823,29 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    # The targets lead each request's verify window. Read them from that window,
+    # not req_to_token: after verify's read-done the scheduler may hand a finished
+    # request's row to a new request.
+    window = batch.out_cache_loc.view(bs, -1)
+    window_rows = torch.arange(bs, device=device)
+    window_starts = torch.zeros_like(num_correct_drafts)
     if _is_cpu:
         assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
+            window_rows,
+            window.int(),
+            window_starts,
+            num_correct_drafts + 1,
             tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            window.shape[1],
         )
     else:
         assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
+            window_rows,
+            window,
+            window_starts,
+            num_correct_drafts + 1,
             tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            window.shape[1],
             next_power_of_2(bs),
         )
     fill_accept_out_cache_loc_func(
@@ -990,7 +999,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
 
@@ -1026,7 +1035,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
         )
@@ -1111,7 +1120,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 
