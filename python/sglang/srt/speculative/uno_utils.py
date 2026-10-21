@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
 from sglang.srt.speculative.dflash_utils import (
+    _adjust_top_p_for_top_k,
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
@@ -30,11 +31,9 @@ def _normalize_sparse_topk_probs(
     scaled = scaled.masked_fill(~valid, float("-inf"))
     probs = torch.softmax(scaled, dim=-1)
     if top_ps is not None:
-        topk_mass = torch.exp(
-            torch.logsumexp(scaled, dim=-1, keepdim=True)
-            - torch.logsumexp(full_logits.float() / temperatures, dim=-1, keepdim=True)
+        adjusted_top_ps = _adjust_top_p_for_top_k(
+            scaled, full_logits, top_ps, temperatures
         )
-        adjusted_top_ps = torch.clamp(top_ps / topk_mass, max=1.0)
         cdf = torch.cumsum(probs, dim=-1)
         probs = probs.masked_fill((cdf - probs) > adjusted_top_ps, 0.0)
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)

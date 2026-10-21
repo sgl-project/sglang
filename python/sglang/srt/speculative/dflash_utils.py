@@ -1147,6 +1147,25 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+@torch.compile(dynamic=True)
+def _adjust_top_p_for_top_k(
+    scaled_topk_logits: torch.Tensor,
+    full_logits: torch.Tensor,
+    top_ps: torch.Tensor,
+    temperatures: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Rescale top-p to retained top-k mass for unseeded sampling."""
+    if temperatures is not None:
+        full_logits = full_logits.float() / temperatures
+    # Retained top-k contains the global maximum, saving a full-vocabulary max pass.
+    # Fusing the shifted sums avoids a full-size exponential intermediate.
+    # FP32 rounding differs from logsumexp and can change top-p boundary membership.
+    max_logits = scaled_topk_logits.amax(dim=-1, keepdim=True)
+    topk_sum = (scaled_topk_logits - max_logits).exp().sum(dim=-1, keepdim=True)
+    full_sum = (full_logits - max_logits).exp().sum(dim=-1, keepdim=True)
+    return torch.clamp(top_ps * (full_sum / topk_sum), max=1.0)
+
+
 def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1196,13 +1215,17 @@ def build_speculative_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                # Divide top-p by the original top-k mass so the compact distribution
-                # preserves the full-distribution nucleus.
-                topk_mass = torch.exp(
-                    torch.logsumexp(topk_logits, dim=-1)
-                    - torch.logsumexp(scaled_logits, dim=-1)
-                )
-                adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
+                if is_cuda() and getattr(sampling_info, "sampling_seed", None) is None:
+                    adjusted_top_ps = _adjust_top_p_for_top_k(
+                        topk_logits, scaled_logits, repeated_top_ps[:, None]
+                    ).squeeze(-1)
+                else:
+                    # Preserve the existing rounding for seeded sampling and other backends.
+                    topk_mass = torch.exp(
+                        torch.logsumexp(topk_logits, dim=-1)
+                        - torch.logsumexp(scaled_logits, dim=-1)
+                    )
+                    adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
