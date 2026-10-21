@@ -110,8 +110,8 @@ impl ToSchedulerRx {
 }
 
 /// Scheduler output (`Server.push_decode_result_batch` / `push_control_result`
-/// / `push_error`) → Rust response dispatcher. The single producer is the
-/// Python thread; the consumer is the dispatcher.
+/// / `push_error` / `push_health_ack`) → Rust response dispatcher. The single
+/// producer is the Python thread; the consumer is the dispatcher.
 #[derive(Clone)]
 pub struct FromSchedulerTx {
     tx: flume::Sender<Bytes>,
