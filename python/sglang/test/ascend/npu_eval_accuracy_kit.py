@@ -45,35 +45,6 @@ def run_npu_pr_smoke(base_url):
     assert "Paris" in response.text
 
 
-def honor_hf_endpoint_for_sgl_eval():
-    """Route sgl-eval dataset archive downloads through HF_ENDPOINT.
-
-    sgl-eval pins its archive URLs to https://huggingface.co and never consults
-    HF_ENDPOINT, so the NPU runners (whose egress only allows the mirror) fail
-    every prepare-backed benchmark with "ConnectError: [Errno 101] Network is
-    unreachable". Rewrite the host at download time; sgl-eval still verifies the
-    archive digest. No-op when HF_ENDPOINT is unset, and inert once sgl-eval
-    honors it upstream.
-    """
-    endpoint = os.environ.get("HF_ENDPOINT", "").rstrip("/")
-    if not endpoint or endpoint == "https://huggingface.co":
-        return
-
-    from sgl_eval.evals import _loader
-
-    original = getattr(_loader, "_download_verified_archive", None)
-    if original is None or getattr(original, "_sglang_hf_endpoint_shim", False):
-        return
-
-    def _download_verified_archive(url, expected_sha256, directory):
-        if url.startswith("https://huggingface.co/"):
-            url = endpoint + url[len("https://huggingface.co") :]
-        return original(url, expected_sha256, directory)
-
-    _download_verified_archive._sglang_hf_endpoint_shim = True
-    _loader._download_verified_archive = _download_verified_archive
-
-
 class NPUGSM8KMixin(GSM8KMixin):
     """NPU GSM8K accuracy mixin — 1% tolerance + up to 3 retries."""
 

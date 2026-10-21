@@ -4,11 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.npu_eval_accuracy_kit import (
-    _is_pr_pipeline,
-    honor_hf_endpoint_for_sgl_eval,
-    run_npu_pr_smoke,
-)
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -58,7 +54,6 @@ class TestAscendSamplingBackend(CustomTestCase):
             temperature=0.1,
         )
 
-        honor_hf_endpoint_for_sgl_eval()
         metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
