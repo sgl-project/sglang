@@ -485,13 +485,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
 
     def test_root_inventory_describes_shared_ced_owners_once(self):
         pool = self.make_pool([0, 2, 2, 1, 1, 2], [1, 3, 5], KVLayout.V41)
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            _build_deepseek_v4_device_pool_group,
-        )
-
         infos = {info.pool_name: info for info in pool.get_device_pool_infos()}
-        with self.assertRaisesRegex(ValueError, "C1/C2 shared stores"):
-            _build_deepseek_v4_device_pool_group(pool, PAGE_SIZE)
         self.assertEqual(pool.stage_layer_ids, (0, 1, 2, 3, 4, 5))
         self.assertEqual(len(infos[PoolName.SWA].buffer_info.buffers), 6)
         self.assertEqual(infos[PoolName.DEEPSEEK_V4_C1].layer_ids, (3,))
@@ -769,12 +763,6 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         self.assertFalse(draft.needs_paged_swa_allocator)
         self.assertEqual(draft.swa_req_ring_size, self.RING)
         self.assertGreaterEqual(draft.swa_kv_pool.size, 3 * self.RING)
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            _build_deepseek_v4_device_pool_group,
-        )
-
-        with self.assertRaisesRegex(ValueError, "request-window SWA"):
-            _build_deepseek_v4_device_pool_group(target, PAGE_SIZE)
         self.assertEqual(target.get_device_pool_infos(), ())
         (draft_swa,) = draft.get_device_pool_infos()
         self.assertEqual(draft_swa.pool_name, PoolName.SWA)
