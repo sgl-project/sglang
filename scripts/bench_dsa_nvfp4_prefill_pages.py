@@ -440,7 +440,25 @@ def _worker(rank: int, world: int, args, path: str, port: int) -> None:
     if rank == 0:
         _write_json(Path(path), document)
     layers = world + 1
-    with get_parallel().override(attn_cp_size=world):
+    # A later config scope can re-project default widths without rebuilding the
+    # process groups. State the complete TP/attention/MoE factorization here,
+    # then check the live ranks instead of overriding or masking them.
+    with get_parallel().override(
+        tp_size=world,
+        attn_tp_size=1,
+        attn_dp_size=1,
+        attn_cp_size=world,
+        attn_dcp_size=1,
+        moe_tp_size=world,
+        moe_ep_size=1,
+        moe_dp_size=1,
+    ):
+        parallel = get_parallel()
+        assert parallel.tp_rank == parallel.attn_cp_rank == rank
+        assert parallel.attn_tp_rank == parallel.attn_dp_rank == 0
+        assert (
+            parallel.tp_group.world_size == parallel.attn_cp_group.world_size == world
+        )
         for pool_pages in args.pool_pages:
             active_counts = [
                 ("sparse", args.active_pages),

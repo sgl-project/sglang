@@ -716,16 +716,32 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
     )
     with (
         get_context().override_server_args(
+            # This publishes a fresh config, while initialized rank/group
+            # handles survive. Preserve their topology instead of publishing
+            # the dummy config's default TP=1 underneath the live CP group.
+            tp_size=world,
+            attn_cp_size=world,
+            dp_size=1,
+            pp_size=1,
+            ep_size=1,
+            moe_dp_size=1,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
             dsa_prefill_backend="flashmla_sparse",
             dsa_decode_backend="flashmla_kv",
             speculative_num_draft_tokens=6,
             speculative_eagle_topk=1,
         ),
         get_parallel().override(
+            tp_size=world,
             enable_prefill_cp=True,
             cp_strategy="interleave",
             attn_cp_size=world,
             attn_tp_size=1,
+            attn_dp_size=1,
+            moe_tp_size=world,
+            moe_ep_size=1,
+            moe_dp_size=1,
             attn_dcp_size=1,
             attn_dcp_rank=0,
         ),
