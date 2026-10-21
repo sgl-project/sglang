@@ -72,9 +72,9 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="moe.prepare_cutlass_w4a8_moe_routes_and_scale",
+        op="moe.compute_cutlass_w4a8_moe_input_scale",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.moe.ep_moe_kernels:prepare_cutlass_w4a8_moe_routes_and_scale",
+        target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
         capabilities=CUDA_ONLY,
     )
 )

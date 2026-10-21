@@ -22,6 +22,7 @@ else:
     from sgl_kernel import silu_and_mul
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
+    compute_cutlass_w4a8_moe_input_scale,
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -30,7 +31,6 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     fp8_per_token_to_per_tensor_quant_triton,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
-    prepare_cutlass_w4a8_moe_routes_and_scale,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
@@ -126,26 +126,18 @@ def cutlass_w4a8_moe(
 
     device = a.device
     if a1_scale is None:
-        prepared_topk_ids = torch.empty(
-            topk_ids.shape, dtype=topk_ids.dtype, device=device
-        )
         a1_scale = torch.full(
             (1,),
             1e-10 / torch.finfo(torch.float8_e4m3fn).max,
             dtype=torch.float32,
             device=device,
         )
-        prepare_cutlass_w4a8_moe_routes_and_scale(
+        compute_cutlass_w4a8_moe_input_scale(
             input=a,
             topk_ids=topk_ids,
-            output_topk_ids=prepared_topk_ids,
             output_s=a1_scale,
             num_local_experts=num_local_experts,
         )
-        topk_ids = prepared_topk_ids
-    else:
-        # Both graph padding and nonlocal routes use -1, including without EP.
-        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,

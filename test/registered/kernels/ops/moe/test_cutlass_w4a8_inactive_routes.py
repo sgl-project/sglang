@@ -1,4 +1,4 @@
-"""W4A8 routing must pack inactive routes after live experts, including at EP1."""
+"""W4A8 packs only local routes, preserving raw dropped-route IDs at EP1 and EP2."""
 
 import unittest
 from unittest.mock import patch
@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
-    prepare_cutlass_w4a8_moe_routes_and_scale,
+    compute_cutlass_w4a8_moe_input_scale,
 )
 from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8
 from sglang.srt.runtime_context import get_parallel
@@ -23,8 +23,8 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
-    def test_route_preparation_excludes_inactive_rows(self):
-        """Prepare sentinel IDs and a live-row scale without changing strided inputs."""
+    def test_input_scale_excludes_inactive_rows(self):
+        """Only local-route rows affect the scale, without changing strided inputs."""
         experts, rows, width = 2, 11, 257
         floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
@@ -61,19 +61,13 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
 
             def prepare(value, route_ids, expected_scale, *, rtol=0):
                 source_values, source_ids = value.clone(), route_ids.clone()
-                canonical = source_ids.masked_fill(source_ids == -1, experts)
-                prepared_ids = torch.full(
-                    route_ids.shape, -99, device="cuda", dtype=route_ids.dtype
-                )
                 scale.fill_(floor)
-                prepare_cutlass_w4a8_moe_routes_and_scale(
+                compute_cutlass_w4a8_moe_input_scale(
                     input=value,
                     topk_ids=route_ids,
-                    output_topk_ids=prepared_ids,
                     output_s=scale,
                     num_local_experts=experts,
                 )
-                torch.testing.assert_close(prepared_ids, canonical, rtol=0, atol=0)
                 torch.testing.assert_close(route_ids, source_ids, rtol=0, atol=0)
                 torch.testing.assert_close(
                     value, source_values, rtol=0, atol=0, equal_nan=True
@@ -113,24 +107,24 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                         value = values[:, :0]
                     prepare(value, route_ids, floor)
 
-    def test_route_preparation_graph_replay_updates_ids_and_scale(self):
-        """A replay resets the scale and rewrites IDs as live routes change."""
+    def test_input_scale_and_raw_route_packing_graph_replay(self):
+        """Replays compact only live routes and reset the scale as routes change."""
         experts, rows, width = 2, 13, 257
         floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
         values = torch.ones((rows, width), device="cuda", dtype=torch.bfloat16)
         ids = torch.zeros((rows, 2), device="cuda", dtype=torch.int32)
-        prepared_ids = torch.full_like(ids, -99)
+        permutation = [None]
         scale = torch.full((1,), floor, device="cuda", dtype=torch.float32)
 
         def run():
             scale.fill_(floor)
-            prepare_cutlass_w4a8_moe_routes_and_scale(
+            compute_cutlass_w4a8_moe_input_scale(
                 input=values,
                 topk_ids=ids,
-                output_topk_ids=prepared_ids,
                 output_s=scale,
                 num_local_experts=experts,
             )
+            permutation[0] = w4a8.cutlass_w4_run_moe_ep_preproess(ids)
 
         run()
         torch.cuda.synchronize()
@@ -158,9 +152,16 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                     values[-1, -1] = 3.0
                 source_values, source_ids = values.clone(), ids.clone()
                 graph.replay()
+                flat_ids = source_ids.cpu().flatten()
+                local_indices = torch.nonzero(
+                    (flat_ids >= 0) & (flat_ids < experts), as_tuple=True
+                )[0]
+                packed_indices = local_indices[
+                    torch.argsort(flat_ids[local_indices], stable=True)
+                ]
                 torch.testing.assert_close(
-                    prepared_ids,
-                    source_ids.masked_fill(source_ids == -1, experts),
+                    permutation[0].cpu()[packed_indices],
+                    torch.arange(local_indices.numel(), dtype=torch.int32),
                     rtol=0,
                     atol=0,
                 )
@@ -180,7 +181,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         """
         experts, hidden, intermediate = 2, 128, 128
         ids = torch.tensor(
-            [[1, 0], [0, -1], [-1, -1], [1, 0]], device="cuda", dtype=torch.int32
+            [[1, 0], [0, -1], [2, 5], [1, -3]], device="cuda", dtype=torch.int32
         )
         weights = torch.tensor(
             [[0.25, 0.75], [0.6, 0.4], [0.3, 0.7], [0.8, 0.2]], device="cuda"
@@ -200,9 +201,11 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         ]
         dense_w2 = [eye * ((e + 1) / 2) for e in range(experts)]
 
+        local_routes = (ids >= 0) & (ids < experts)
+
         def dense_reference(dynamic):
             scale1 = (
-                inputs[(ids >= 0).any(dim=-1)].float().abs().amax() / 448.0
+                inputs[local_routes.any(dim=-1)].float().abs().amax() / 448.0
                 if dynamic
                 else 1.0
             )
@@ -210,7 +213,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
             for token in range(ids.shape[0]):
                 for slot in range(ids.shape[1]):
                     expert = int(ids[token, slot])
-                    if expert < 0:
+                    if not 0 <= expert < experts:
                         continue
                     quantized = (inputs[token].float() / scale1).to(torch.float8_e4m3fn)
                     gate_up = F.linear(
@@ -301,14 +304,16 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                         ):
                             value = inputs.clone()
                             value[2].fill_(poison)
-                            route_weights = weights.masked_fill(ids < 0, float("nan"))
+                            route_weights = weights.masked_fill(
+                                ~local_routes, float("nan")
+                            )
                             actual = run(
                                 value, dynamic=dynamic, route_weights=route_weights
                             )
                             torch.testing.assert_close(
                                 offsets,
                                 torch.tensor(
-                                    [0, 3, 5], device="cuda", dtype=torch.int32
+                                    [0, 2, 4], device="cuda", dtype=torch.int32
                                 ),
                             )
                             self.assertTrue(torch.isfinite(actual).all().item())
@@ -319,7 +324,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                 actual = run(
                     torch.zeros_like(inputs),
                     dynamic=True,
-                    route_weights=weights.masked_fill(ids < 0, float("nan")),
+                    route_weights=weights.masked_fill(~local_routes, float("nan")),
                 )
                 self.assertTrue(torch.isfinite(actual).all().item())
                 self.assertEqual(torch.count_nonzero(actual).item(), 0)
@@ -335,7 +340,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                 torch.testing.assert_close(
                     ids,
                     torch.tensor(
-                        [[1, 0], [0, -1], [-1, -1], [1, 0]],
+                        [[1, 0], [0, -1], [2, 5], [1, -3]],
                         device="cuda",
                         dtype=torch.int32,
                     ),
