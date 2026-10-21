@@ -394,6 +394,33 @@ class TestBatchSizeRouting(CustomTestCase):
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
 
+    def test_stale_inflight_result_does_not_update_new_step(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "warmup_batches": 0,
+                    "update_interval": 1,
+                    "ema_alpha": 1.0,
+                    "1": {"candidate_steps": [1, 3]},
+                },
+                f,
+            )
+            f.flush()
+            params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+
+        self.assertEqual(
+            params.on_verify_complete([0], batch_size=1, executed_steps=3), 1
+        )
+        slot = params._route(1)
+        batch_count = slot._batch_count
+        ema = slot.ema_accept_len
+
+        self.assertIsNone(
+            params.on_verify_complete([3], batch_size=1, executed_steps=3)
+        )
+        self.assertEqual(slot._batch_count, batch_count)
+        self.assertEqual(slot.ema_accept_len, ema)
+
 
 class TestResolveCandidateSteps(CustomTestCase):
     def test_default_config(self):
