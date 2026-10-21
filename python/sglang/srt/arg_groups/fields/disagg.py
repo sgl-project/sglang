@@ -83,9 +83,10 @@ class Disagg(msgspec.Struct):
         Arg(
             help=(
                 "JSON list of Prefill bootstrap endpoints (host:port) that a "
-                "Decode server may query. Configure every Prefill endpoint "
-                "used by the router; unlisted request endpoints are rejected. "
-                "Defaults to empty, which rejects all request endpoints."
+                "Decode server may query. When set, configure every Prefill "
+                "endpoint used by the router; unlisted request endpoints are "
+                "rejected. Defaults to empty, which disables validation. "
+                "Set this in production to restrict bootstrap lookups."
             ),
             type_parser=json_list_type,
         ),

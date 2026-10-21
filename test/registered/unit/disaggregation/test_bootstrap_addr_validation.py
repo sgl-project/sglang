@@ -66,18 +66,36 @@ class TestBootstrapAddrValidation(CustomTestCase):
         self.assertEqual(manager.prefill_info_table, {})
 
     @patch("sglang.srt.disaggregation.common.conn.requests.get")
-    def test_empty_allowlist_logs_flag_guidance_once(self, get):
+    def test_malformed_bootstrap_address_is_rejected_without_http(self, get):
+        manager = self._manager({"prefill-a:8998"})
+
+        self.assertFalse(manager.try_ensure_parallel_info("not-an-address"))
+
+        get.assert_not_called()
+        self.assertEqual(manager.prefill_info_table, {})
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_empty_allowlist_allows_lookup_and_logs_recommendation_once(self, get):
         manager = self._manager(set())
+        get.return_value = self._response()
 
         with self.assertLogs(
-            "sglang.srt.disaggregation.common.conn", level="ERROR"
+            "sglang.srt.disaggregation.common.conn", level="WARNING"
         ) as captured:
-            self.assertFalse(manager.try_ensure_parallel_info("prefill-a:8998"))
-            self.assertFalse(manager.try_ensure_parallel_info("prefill-b:8998"))
+            self.assertTrue(manager.try_ensure_parallel_info("prefill-a:8998"))
+            self.assertTrue(manager.try_ensure_parallel_info("prefill-a:8998"))
 
         self.assertEqual(len(captured.output), 1)
         self.assertIn("--disaggregation-bootstrap-allowlist", captured.output[0])
-        get.assert_not_called()
+        get.assert_called_once_with(
+            "http://prefill-a:8998/route?"
+            "prefill_dp_rank=-1&prefill_cp_rank=-1&"
+            "target_tp_rank=-1&target_pp_rank=-1",
+            timeout=(2, 2),
+            allow_redirects=False,
+            stream=True,
+        )
+        self.assertIn("prefill-a:8998", manager.prefill_info_table)
 
     @patch("sglang.srt.disaggregation.common.conn.requests.get")
     def test_registered_bootstrap_address_is_queried_with_timeout(self, get):

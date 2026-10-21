@@ -3071,7 +3071,7 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-bootstrap-allowlist`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON list of Prefill bootstrap endpoints (`host:port`) that Decode may query. Configure every endpoint the router may select. An empty list rejects all Decode bootstrap endpoints with HTTP 400.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Optional JSON list of Prefill bootstrap endpoints (`host:port`) that Decode may query. When set, every endpoint the router may select must be listed; other endpoints are rejected with HTTP 400. An empty list disables validation. Set this in production to restrict bootstrap lookups.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`[]`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON list of strings</td>
     </tr>

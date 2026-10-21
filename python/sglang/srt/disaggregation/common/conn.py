@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 _PREFILL_INFO_HTTP_TIMEOUT = (2, 2)
 _PREFILL_INFO_TOTAL_TIMEOUT = 2.0
 _PREFILL_INFO_MAX_RESPONSE_BYTES = 64 * 1024
+_PREFILL_INFO_MAX_CACHE_ENTRIES = 1024
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
@@ -1358,6 +1359,11 @@ class CommonKVManager(BaseKVManager):
                 )
 
         self._resolve_rank_mapping(info)
+        if (
+            bootstrap_addr not in self.prefill_info_table
+            and len(self.prefill_info_table) >= _PREFILL_INFO_MAX_CACHE_ENTRIES
+        ):
+            self.prefill_info_table.pop(next(iter(self.prefill_info_table)))
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
@@ -1368,13 +1374,18 @@ class CommonKVManager(BaseKVManager):
                 should_log = not self._empty_bootstrap_allowlist_error_logged
                 self._empty_bootstrap_allowlist_error_logged = True
             if should_log:
-                logger.error(
-                    "Rejecting Decode bootstrap requests because no Prefill "
-                    "bootstrap endpoints are configured. Set "
-                    "--disaggregation-bootstrap-allowlist to a JSON list of "
-                    "every router-selectable Prefill host:port endpoint."
+                logger.warning(
+                    "Decode bootstrap endpoint validation is disabled because "
+                    "--disaggregation-bootstrap-allowlist is empty. For "
+                    "production deployments, set it to a JSON list of every "
+                    "router-selectable Prefill host:port endpoint."
                 )
-            return None
+            try:
+                return _normalize_bootstrap_addr(bootstrap_addr)
+            except (TypeError, ValueError):
+                # Preserve legacy behavior when validation is opt-in: let the
+                # lookup fail normally rather than rejecting the request with 400.
+                return bootstrap_addr
         try:
             normalized_addr = _normalize_bootstrap_addr(bootstrap_addr)
         except (TypeError, ValueError):
