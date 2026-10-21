@@ -1,4 +1,4 @@
-"""Auth utilities for HTTP servers.
+"""Auth utilities for ASGI servers.
 
 This module is intentionally lightweight (no torch import) so it can be used in unit tests.
 """
@@ -160,6 +160,7 @@ def add_api_key_middleware(
     """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
+    from starlette.datastructures import Headers
     from starlette.requests import Request
 
     class _ApiKeyASGIMiddleware:
@@ -172,16 +173,24 @@ def add_api_key_middleware(
             self.fastapi_app = fastapi_app
 
         async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
+            scope_type = scope["type"]
+            if scope_type not in ("http", "websocket"):
                 await self.app(scope, receive, send)
                 return
 
-            request = Request(scope, receive=receive)
-            path = request.url.path
-            authz = request.headers.get("Authorization")
+            if scope_type == "http":
+                request = Request(scope, receive=receive)
+                method = request.method
+                path = request.url.path
+                authz = request.headers.get("Authorization")
+            else:
+                method = "GET"
+                path = scope.get("path", "")
+                authz = Headers(scope=scope).get("Authorization")
+
             level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
             decision = decide_request_auth(
-                method=request.method,
+                method=method,
                 path=path,
                 authorization_header=authz,
                 api_key=self.api_key,
@@ -190,6 +199,20 @@ def add_api_key_middleware(
             )
 
             if not decision.allowed:
+                if scope_type == "websocket":
+                    await send(
+                        {
+                            "type": "websocket.close",
+                            "code": 1008,
+                            "reason": (
+                                "Unauthorized"
+                                if decision.error_status_code == 401
+                                else "Forbidden"
+                            ),
+                        }
+                    )
+                    return
+
                 response = ORJSONResponse(
                     content={
                         "error": (

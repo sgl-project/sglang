@@ -7,11 +7,53 @@ Usage:
 
 import unittest
 
-from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+from fastapi import FastAPI, WebSocket
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from sglang.srt.utils.auth import (
+    AuthLevel,
+    add_api_key_middleware,
+    decide_request_auth,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
+
+
+class TestApiKeyMiddleware(unittest.TestCase):
+    @staticmethod
+    def _create_app():
+        app = FastAPI()
+
+        @app.websocket("/v1/realtime")
+        async def realtime(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("authorized")
+            await websocket.close()
+
+        add_api_key_middleware(app, api_key="secret", admin_api_key=None)
+        return app
+
+    def test_websocket_rejects_missing_and_invalid_api_keys(self):
+        with TestClient(self._create_app()) as client:
+            for headers in ({}, {"Authorization": "Bearer wrong"}):
+                with self.subTest(headers=headers):
+                    with self.assertRaises(WebSocketDisconnect) as context:
+                        with client.websocket_connect("/v1/realtime", headers=headers):
+                            pass
+
+                    self.assertEqual(context.exception.code, 1008)
+                    self.assertEqual(context.exception.reason, "Unauthorized")
+
+    def test_websocket_accepts_valid_api_key(self):
+        with TestClient(self._create_app()) as client:
+            with client.websocket_connect(
+                "/v1/realtime",
+                headers={"Authorization": "Bearer secret"},
+            ) as websocket:
+                self.assertEqual(websocket.receive_text(), "authorized")
 
 
 class TestHttpServerAdminAuth(unittest.TestCase):
