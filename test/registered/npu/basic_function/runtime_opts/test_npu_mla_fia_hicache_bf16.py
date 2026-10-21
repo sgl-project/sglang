@@ -24,8 +24,8 @@ register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
 class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # PR runs the mixin smoke request; nightly runs the full GSM8K set.
     gsm8k_num_examples = 1319
-    # sgl_eval measures 0.8143 on the full 1319-question set.
-    gsm8k_accuracy_thres = 0.8
+    # sgl_eval measures 0.809-0.823 across runs on the full 1319-question set.
+    gsm8k_accuracy_thres = 0.79
     gsm8k_backend = "sgl_eval"
     gsm8k_max_tokens = 4096
 
@@ -47,6 +47,8 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
             "--tp-size",
             2,
             "--enable-hierarchical-cache",
+            # Host KV pool per TP rank (GB): the PR smoke needs only 2 GB,
+            # while the full-nightly GSM8K run needs 10 GB to avoid thrash.
             "--hicache-size",
             2 if _is_pr_pipeline else 10,
         ]

@@ -65,8 +65,9 @@ concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 jobs:
-  # PR-triggered runs only validate the GSM8K suites (nightly-2 / nightly-4);
-  # every other job is gated on non-PR events to save NPU resources.
+  # PR-triggered runs only validate the GSM8K suites (nightly-2 / nightly-4) and
+  # the nightly-1 sampler suite; every other job is gated on non-PR events to
+  # save NPU resources.
   set-image-config:
     runs-on: ubuntu-latest
     outputs:
@@ -126,7 +127,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
