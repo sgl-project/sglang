@@ -710,6 +710,7 @@ class DeepseekV2MoE(nn.Module):
         self.is_deepseek_v4 = is_deepseek_v4
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
+        self._mega_gate_supported = None
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(

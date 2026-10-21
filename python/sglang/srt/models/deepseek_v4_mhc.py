@@ -203,6 +203,7 @@ class HcNextBoundary(NamedTuple):
     accepts_mxfp8: bool
     norm_fusable: bool
     hc: Optional[HcSubLayer] = None
+    mega_moe: Optional[Any] = None
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -214,8 +215,19 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
+def mega_moe_of(layer) -> Optional[Any]:
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MHC_MOE_INPUT.get():
+        return None
+    mlp = getattr(layer, "mlp", None)
+    return mlp if hasattr(mlp, "mega_shared_l1_weights") else None
+
+
 def make_boundary(
-    norm: RMSNorm, *, accepts_mxfp8: bool, hc: Optional[HcSubLayer] = None
+    norm: RMSNorm,
+    *,
+    accepts_mxfp8: bool,
+    hc: Optional[HcSubLayer] = None,
+    mega_moe: Optional[Any] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -231,6 +243,7 @@ def make_boundary(
             and norm.weight.is_contiguous()
         ),
         hc=hc,
+        mega_moe=mega_moe,
     )
 
 
@@ -617,6 +630,11 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
+        moe_target = None
+        if next.mega_moe is not None:
+            from sglang.srt.layers.moe.mega_moe import mega_moe_input_target
+
+            moe_target = mega_moe_input_target(next.mega_moe, y.shape[0])
         updated, normalized, stats = mhc_mega_boundary(
             y,
             residual,
@@ -631,7 +649,12 @@ def _post_fusion(
             next_hc.cfg.eps,
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
+            moe_input=None if moe_target is None else moe_target[1],
         )
+        if moe_target is not None:
+            from sglang.srt.layers.moe.mega_moe import MEGA_MOE_INPUT_TAG
+
+            setattr(normalized, MEGA_MOE_INPUT_TAG, moe_target[0])
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

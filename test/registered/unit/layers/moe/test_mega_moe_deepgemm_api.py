@@ -9,12 +9,16 @@ from unittest.mock import MagicMock, call, patch
 import torch
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe import mega_gate as mega_gate_runtime
+from sglang.srt.layers.moe import mega_moe
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.topk import TopK
@@ -449,6 +453,235 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             )
         self.assertEqual(out.shape, (0, 4))
         moe.gate.assert_not_called()
+
+    @staticmethod
+    def _mega_gate_reference(x, weight, top_k, **kwargs):
+        if not torch.isfinite(x).all():
+            raise ValueError("MegaGate rejects nonfinite GEMM inputs")
+        scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
+        if kwargs["unmapped_topk_idx"] is not None:
+            ids = kwargs["unmapped_topk_idx"]
+        else:
+            bias = kwargs["bias"]
+            if kwargs["image_bias"] is not None:
+                bias = torch.where(
+                    kwargs["image_token_mask"][:, None], kwargs["image_bias"], bias
+                )
+            ids = (scores + bias).topk(top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+        weights = weights * kwargs["routed_scaling_factor"]
+        if kwargs["mask"] is not None:
+            weights = weights.masked_fill(~kwargs["mask"][:, None], 0)
+            ids = ids.masked_fill(~kwargs["mask"][:, None], -1)
+        kwargs["out"][0].copy_(ids)
+        kwargs["out"][1].copy_(weights)
+
+    def _mega_gate_moe(self, scale_in_topk=False, hash_routing=False):
+        moe = self._v41_moe(0, scale_in_topk)
+        moe.config.model_type = "deepseek_v41"
+        moe.config.hidden_size = 256
+        moe.gate.weight = torch.zeros((8, 256), dtype=torch.bfloat16)
+        moe.gate.e_score_correction_bias = torch.tensor(
+            [4.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        moe.gate.e_score_correction_bias_vl = torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]
+        )
+        moe.topk.topk_config.sqrtsoftplus_log1p = True
+        moe.topk.enable_waterfill = False
+        moe._mega_gate_supported = None
+        if hash_routing:
+            moe.is_hash = True
+            moe.gate.e_score_correction_bias = None
+            moe.topk = SimpleNamespace(
+                enable_waterfill=False,
+                topk=2,
+                num_shared_topk_slots=0,
+                routed_scaling_factor=2.0,
+                apply_routed_scaling_factor_on_output=scale_in_topk,
+                score_func="sqrtsoftplus",
+                tid2eid=torch.tensor([[6, 7]] * 100, dtype=torch.int32),
+            )
+        return moe
+
+    def test_mega_gate_admission_falls_back_for_unsupported_routers(self):
+        moe = self._mega_gate_moe()
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        supported = mega_gate_runtime.mega_gate_supported
+        with (
+            get_context().override_server_args(
+                model_path="dummy", enable_deterministic_inference=False
+            ),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_gate_runtime, "_device_sm", 100),
+        ):
+            self.assertTrue(supported(moe))
+            self.assertTrue(supported(self._mega_gate_moe(hash_routing=True)))
+            for name, value in (
+                ("renormalize", False),
+                ("use_grouped_topk", True),
+                ("scoring_func", "sigmoid"),
+                ("sqrtsoftplus_log1p", False),
+                ("custom_routing_function", object()),
+                ("torch_native", True),
+            ):
+                with patch.object(moe.topk.topk_config, name, value):
+                    self.assertFalse(supported(moe), name)
+            with patch.object(moe.topk, "enable_waterfill", True):
+                self.assertFalse(supported(moe))
+            with patch.object(moe, "num_fused_shared_experts", 1):
+                self.assertFalse(supported(moe))
+            with patch.object(moe.gate, "weight", moe.gate.weight.float()):
+                self.assertFalse(supported(moe))
+            with patch.object(mega_gate_runtime, "_device_sm", 90):
+                self.assertFalse(supported(moe))
+            with get_exec().deterministic.override(enable_deterministic_inference=True):
+                self.assertFalse(supported(moe))
+
+            hidden = torch.zeros((32, 256), dtype=torch.bfloat16)
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
+                self.assertFalse(mega_gate_runtime.should_use_mega_gate(moe, hidden))
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
+                self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden))
+                self.assertTrue(moe._mega_gate_supported)
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden.float())
+                )
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(
+                        moe, torch.zeros((4096, 256), dtype=torch.bfloat16)
+                    )
+                )
+
+    def test_mega_gate_routes_vision_hash_and_padding(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        for is_hash in (False, True):
+            for scale_in_topk in (False, True):
+                for in_buffer in (False, True):
+                    with self.subTest(
+                        is_hash=is_hash,
+                        scale_in_topk=scale_in_topk,
+                        in_buffer=in_buffer,
+                    ):
+                        moe = self._mega_gate_moe(scale_in_topk, is_hash)
+                        hidden = torch.ones((4, 256), dtype=torch.bfloat16)
+                        hidden[3:] = float("nan")
+                        input_ids = torch.tensor([7, 99, 7, 1000])
+                        bound = torch.tensor([3])
+                        buf = SimpleNamespace(
+                            topk_idx=torch.full((8, 2), 5, dtype=torch.int64),
+                            topk_weights=torch.full((8, 2), 9.0),
+                        )
+                        with (
+                            get_parallel().override(moe_ep_rank=0),
+                            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                            patch.object(topk_module, "_is_cuda", True),
+                            patch.object(
+                                topk_module,
+                                "_can_fuse_padded_region",
+                                return_value=False,
+                            ),
+                            patch.object(
+                                moe.topk,
+                                "routing_inputs",
+                                return_value=(bound, None),
+                                create=True,
+                            ),
+                        ):
+                            routing = mega_gate_runtime.run_mega_gate(
+                                moe,
+                                hidden,
+                                input_ids,
+                                None,
+                                buf if in_buffer else None,
+                            )
+                        self.assertEqual(routing.in_buffer, in_buffer)
+                        if in_buffer:
+                            ids, weights = buf.topk_idx[:4], buf.topk_weights[:4]
+                            self.assertEqual(routing.routed_scaling_factor, 1.0)
+                            self.assertTrue((buf.topk_idx[4:] == 5).all())
+                            scale = 2.0
+                        else:
+                            ids, weights = routing.topk_ids, routing.topk_weights
+                            self.assertEqual(
+                                routing.routed_scaling_factor,
+                                1.0 if scale_in_topk else 2.0,
+                            )
+                            scale = 2.0 if scale_in_topk else 1.0
+                        image = [6, 7] if is_hash else [7, 6]
+                        text = [6, 7] if is_hash else [0, 1]
+                        torch.testing.assert_close(
+                            ids,
+                            torch.tensor([text, image, text, [-1, -1]]),
+                        )
+                        torch.testing.assert_close(
+                            weights,
+                            torch.tensor([[0.5 * scale] * 2] * 3 + [[0.0, 0.0]]),
+                        )
+
+    def test_mega_gate_maps_eplb_and_records_routed_ids(self):
+        moe = self._mega_gate_moe()
+        hidden = torch.ones((4, 256), dtype=torch.bfloat16)
+        hidden[2:] = float("nan")
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        dispatch_info = ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=torch.tensor(
+                [9, 8, 7, 6, 5, 4, 3, 2], dtype=torch.int32
+            ),
+            partial_logical_to_all_physical_map=None,
+            partial_logical_to_all_physical_map_num_valid=None,
+            num_physical_experts=10,
+        )
+        recorded = []
+        recorder = SimpleNamespace(
+            on_select_experts=lambda **kw: recorded.append(kw["topk_ids"].clone())
+        )
+        buf = SimpleNamespace(
+            topk_idx=torch.zeros((8, 2), dtype=torch.int64),
+            topk_weights=torch.zeros((8, 2)),
+        )
+        with (
+            get_parallel().override(moe_ep_rank=0),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "_can_fuse_padded_region", return_value=False),
+            patch.object(
+                mega_gate_runtime,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+            patch.object(
+                moe.topk,
+                "routing_inputs",
+                return_value=(torch.tensor([2]), dispatch_info),
+            ),
+        ):
+            routing = mega_gate_runtime.run_mega_gate(
+                moe, hidden, torch.tensor([7, 99, 1000, 1000]), None, buf
+            )
+        self.assertFalse(routing.in_buffer)
+        torch.testing.assert_close(
+            routing.topk_ids,
+            torch.tensor([[9, 8], [2, 3], [-1, -1], [-1, -1]]),
+        )
+        self.assertTrue((routing.topk_weights[2:] == 0).all())
+        self.assertEqual(len(recorded), 1)
+        torch.testing.assert_close(recorded[0], routing.topk_ids)
+        self.assertTrue((buf.topk_idx == 0).all())
+        for algorithm in ("lp", "fake"):
+            with patch.object(
+                moe.topk,
+                "routing_inputs",
+                return_value=(None, SimpleNamespace(ep_dispatch_algorithm=algorithm)),
+            ):
+                self.assertIsNone(
+                    mega_gate_runtime.run_mega_gate(moe, hidden, None, None, buf)
+                )
 
     @staticmethod
     def _v41_moe(fused_shared, scale_in_topk):

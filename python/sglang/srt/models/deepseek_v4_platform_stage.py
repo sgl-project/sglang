@@ -217,6 +217,7 @@ class NonCudaDecoderMixin:
             self.post_attention_layernorm,
             accepts_mxfp8=False,
             hc=self.ffn_hc,
+            mega_moe=mhc.mega_moe_of(self),
         )
         # MOE[i] -> ATTN[i+1]
         if self._next_layer is not None:
