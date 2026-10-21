@@ -41,7 +41,7 @@ _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
 # CI prefetches the archive through HF_ENDPOINT into this directory, and the shim
 # below hands the local copy to sgl_eval after re-checking the sha256 it pins --
 # a stale copy falls back to the original download instead of grading other data.
-_SGL_EVAL_ARCHIVE_DIR_ENV = "SGL_EVAL_ARCHIVE_DIR"
+_SGL_EVAL_ARCHIVE_DIR_ENV = "SGLANG_EVAL_ARCHIVE_DIR"
 _SGL_EVAL_ARCHIVE_DIR_DEFAULT = Path.home() / ".cache" / "sgl_eval" / "archives"
 
 
