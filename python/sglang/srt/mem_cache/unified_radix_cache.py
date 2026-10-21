@@ -3817,6 +3817,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    self.storage_metrics_collector.observe_backup_storage_duration(
+                        time.perf_counter() - operation.enqueue_time
+                    )
             return drained
 
         def _drain_release():
