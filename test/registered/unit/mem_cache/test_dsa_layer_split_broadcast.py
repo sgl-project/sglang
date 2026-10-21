@@ -674,8 +674,11 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
     logits/topk, dequantization and attention use production entry points and
     kernels.
     """
+    import json
     from unittest.mock import patch
 
+    import sgl_kernel
+    from sglang.srt.layers.attention.dsa import dsa_indexer, dsa_topk_backend
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
     from sglang.srt.layers.cp import get_cp_strategy, init_cp_strategy
@@ -714,6 +717,53 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
+    logits_calls, topk_routes = [], []
+    resolve_logits = dsa_indexer.resolve_fp8_mqa_logits_fn
+    v2_topk = dsa_topk_backend._topk_transform_v2_ragged
+    legacy_topk = sgl_kernel.fast_topk_transform_ragged_fused
+
+    def traced_logits_resolver():
+        kernel = resolve_logits()
+
+        def call(query, cache, weights, starts, ends, **kwargs):
+            logits = kernel(query, cache, weights, starts, ends, **kwargs)
+            # DeepGEMM leaves columns outside [ks, ke) uninitialized. Snapshot
+            # only valid windows, before top-k masks alignment padding in-place.
+            windows = list(zip(starts.cpu().tolist(), ends.cpu().tolist()))
+            logits_calls.append(
+                {
+                    "kernel": kernel,
+                    "query": query.clone(),
+                    "key": cache[0].clone(),
+                    "scale": cache[1].clone(),
+                    "weights": weights.clone(),
+                    "starts": starts.clone(),
+                    "ends": ends.clone(),
+                    "windows": windows,
+                    "logits": [
+                        logits[row, start:end].clone()
+                        for row, (start, end) in enumerate(windows)
+                    ],
+                    "kwargs": kwargs,
+                }
+            )
+            return logits
+
+        return call
+
+    def traced_v2_topk(*args, **kwargs):
+        topk_routes.append("v2_ragged")
+        return v2_topk(*args, **kwargs)
+
+    def traced_legacy_topk(*args, **kwargs):
+        topk_routes.append("legacy_ragged_fused")
+        return legacy_topk(*args, **kwargs)
+
+    def same_bytes(left, right):
+        return torch.equal(
+            left.contiguous().view(torch.uint8), right.contiguous().view(torch.uint8)
+        )
+
     with (
         get_context().override_server_args(
             # This publishes a fresh config, while initialized rank/group
@@ -753,6 +803,11 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
         ),
         patch(
             "sglang.srt.arg_groups.overrides.model_config_of", return_value=model_config
+        ),
+        patch.object(dsa_indexer, "resolve_fp8_mqa_logits_fn", traced_logits_resolver),
+        patch.object(dsa_topk_backend, "_topk_transform_v2_ragged", traced_v2_topk),
+        patch.object(
+            sgl_kernel, "fast_topk_transform_ragged_fused", traced_legacy_topk
         ),
     ):
         init_cp_strategy(
@@ -931,6 +986,8 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
                 pool.remote_kv_buffer.fill_(197)
                 pool.index_key_cache.remote_buffer.fill_(211)
                 outputs, topks = [], []
+                logits_calls.clear()
+                topk_routes.clear()
                 for which, backend in enumerate(backends):
                     with forward_context(ForwardContext(attn_backend=backend)):
                         topk = (
@@ -957,25 +1014,122 @@ def _run_nvfp4_prefill_pages(rank: int, world: int):
                                 topk_indices=topk,
                             )
                         )
-                torch.testing.assert_close(topks[0], topks[1], rtol=0, atol=0)
-                torch.testing.assert_close(
-                    outputs[0], outputs[1], atol=8e-4, rtol=2.01 / 128
-                )
+                context = f"case={case_id} prefix={prefix} layer={layer_id} CP={world} rank={rank}"
+                evidence = {
+                    "context": context,
+                    "topk_backend": backends[0].dsa_topk_backend.value,
+                    "topk_routes": list(topk_routes),
+                    "logits_call_count": len(logits_calls),
+                    "shared_topk": skip[layer_id],
+                }
                 actual = pool.get_prefill_key_buffer(layer_id).view(-1, 64, 416)
                 expected = reference.get_key_buffer(layer_id).view(-1, 64, 416)
-                assert torch.equal(actual[ids], expected[ids])
-                assert torch.all(actual[63] == 197)
+                evidence["kv_pages_exact"] = torch.equal(actual[ids], expected[ids])
+                evidence["untransferred_kv_untouched"] = bool(
+                    torch.all(actual[63] == 197)
+                )
                 if pool._is_layer_owned(layer_id):
-                    assert torch.equal(
+                    evidence["owned_kv_exact"] = torch.equal(
                         pool.get_owned_key_buffer(layer_id),
                         reference.get_key_buffer(layer_id),
                     )
                 if not skip[layer_id]:
                     idx = pool.index_key_cache.get_prefill_buffer(layer_id)
-                    assert torch.equal(
+                    evidence["index_pages_exact"] = torch.equal(
                         idx[ids], reference.index_key_cache.get_buffer(layer_id)[ids]
                     )
-                    assert torch.all(idx[63] == 211)
+                    evidence["untransferred_index_untouched"] = bool(
+                        torch.all(idx[63] == 211)
+                    )
+                    if pool._is_layer_owned(layer_id):
+                        evidence["owned_index_exact"] = torch.equal(
+                            pool.get_owned_index_buffer(layer_id),
+                            reference.index_key_cache.get_buffer(layer_id),
+                        )
+                    assert len(logits_calls) == 2, (context, len(logits_calls))
+                    left, right = logits_calls
+                    # These K/scale tensors are the real GetKAndS results fed
+                    # to the same logits kernel, not independent reconstruction.
+                    for field in ("query", "key", "scale", "weights", "starts", "ends"):
+                        evidence[f"logits_{field}_exact"] = same_bytes(
+                            left[field], right[field]
+                        )
+                    kernel_type = type(left["kernel"])
+                    evidence["logits_kernel"] = (
+                        f"{getattr(left['kernel'], '__module__', kernel_type.__module__)}.{getattr(left['kernel'], '__name__', kernel_type.__name__)}"
+                    )
+                    evidence["valid_logits_exact"] = all(
+                        torch.equal(a, b)
+                        for a, b in zip(left["logits"], right["logits"])
+                    )
+                    evidence["valid_logits_max_abs"] = max(
+                        (
+                            float((a - b).abs().max())
+                            for a, b in zip(left["logits"], right["logits"])
+                            if a.numel()
+                        ),
+                        default=0.0,
+                    )
+                    if not evidence["valid_logits_exact"]:
+                        # Do not invent a DeepGEMM determinism requirement. Give
+                        # the reviewer a same-input repeat to localize any drift.
+                        repeat = left["kernel"](
+                            left["query"],
+                            (left["key"], left["scale"]),
+                            left["weights"],
+                            left["starts"],
+                            left["ends"],
+                            **left["kwargs"],
+                        )
+                        repeated_windows = [
+                            repeat[row, start:end]
+                            for row, (start, end) in enumerate(left["windows"])
+                        ]
+                        evidence["ordinary_repeat_valid_logits_exact"] = all(
+                            torch.equal(a, b)
+                            for a, b in zip(left["logits"], repeated_windows)
+                        )
+                        evidence["ordinary_repeat_valid_logits_max_abs"] = max(
+                            (
+                                float((a - b).abs().max())
+                                for a, b in zip(left["logits"], repeated_windows)
+                                if a.numel()
+                            ),
+                            default=0.0,
+                        )
+                ordered = [topk.sort(dim=-1).values for topk in topks]
+                evidence["topk_raw_order_diff_count"] = int(
+                    torch.count_nonzero(topks[0] != topks[1])
+                )
+                evidence["topk_sorted_multiset_exact"] = torch.equal(*ordered)
+                print(
+                    f"[rank {rank}] NVFP4 prefill evidence {json.dumps(evidence, sort_keys=True)}",
+                    flush=True,
+                )
+                for name, value in evidence.items():
+                    if (
+                        name
+                        in (
+                            "kv_pages_exact",
+                            "owned_kv_exact",
+                            "index_pages_exact",
+                            "owned_index_exact",
+                            "untransferred_kv_untouched",
+                            "untransferred_index_untouched",
+                        )
+                        or name.startswith("logits_")
+                        and name.endswith("_exact")
+                    ):
+                        assert value, (context, name)
+                # SGL top-k emits an unordered collection. Sort only the oracle
+                # comparison, preserving duplicate entries and -1 padding.
+                # Attention above receives each kernel's original order.
+                torch.testing.assert_close(
+                    ordered[0], ordered[1], rtol=0, atol=0, msg=context
+                )
+                torch.testing.assert_close(
+                    outputs[0], outputs[1], atol=8e-4, rtol=2.01 / 128, msg=context
+                )
                 # Full public reads must still work after partial materialization.
                 assert torch.equal(
                     pool.get_key_buffer(layer_id), reference.get_key_buffer(layer_id)
