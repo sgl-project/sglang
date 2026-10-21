@@ -988,18 +988,7 @@ class AscendAttnBackend(AttentionBackend):
                 torch.npu.current_stream(self.device), self.device
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        dense_mla_dcp_graph = self.dense_mla_dcp_target
-        if dense_mla_dcp_graph:
-            metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
-            if forward_mode.is_target_verify():
-                num_spec_rows = bs * self.speculative_num_draft_tokens
-                metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
-                    :num_spec_rows
-                ]
-                metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
-                    :bs
-                ]
-        elif self.dsa_dcp_target:
+        if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 metadata.dcp_origin_out_cache_loc = self.graph_metadata[
                     "dcp_origin_out_cache_loc"
@@ -1025,8 +1014,17 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if not dense_mla_dcp_graph:
-            metadata.seq_lens = seq_lens
+        metadata.seq_lens = seq_lens
+        if self.dense_mla_dcp_target:
+            metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
+            if forward_mode.is_target_verify():
+                num_spec_rows = bs * self.speculative_num_draft_tokens
+                metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
+                    :num_spec_rows
+                ]
+                metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
+                    :bs
+                ]
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
