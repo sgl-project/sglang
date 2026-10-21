@@ -14,11 +14,16 @@ from array import array
 
 import torch
 
-from sglang.srt.managers.kv_control.contracts import Location, Status, TokensTarget
+from sglang.srt.managers.kv_control.contracts import (
+    CopyTo,
+    Location,
+    Status,
+    TokensTarget,
+)
 from sglang.srt.managers.kv_control.service import KVControlService, ServiceConfig
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -29,6 +34,11 @@ from sglang.srt.runtime_context import get_context, get_parallel, get_server_arg
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Verify the internal reference handoff to a request lock",
+    )
     parser.add_argument(
         "--storage",
         action="store_true",
@@ -83,6 +93,7 @@ def main():
         cache = UnifiedRadixCache(params)
         cache.init_hicache(get_server_args(), params)
         atexit.unregister(cache.shutdown)
+        preparation = None
         try:
             service = KVControlService(cache, config)
             tokens = [1, 2, 3, 4]
@@ -171,9 +182,23 @@ def main():
             pool.v_buffer[0].fill_(-18)
             if args.storage:
                 assert cache.evict_host(4) == 4
-            restore = submit(
-                "copy_to", "storage" if args.storage else "host", "gpu", "restore"
-            )
+            if args.prepare:
+                payload = CopyTo(
+                    target=TokensTarget(
+                        namespace=config.namespace, token_ids=tuple(tokens)
+                    ),
+                    src=Location(tier="storage" if args.storage else "host"),
+                    dst=Location(tier="gpu"),
+                )
+                (restore_ref,) = service.control._reserve_policy_operations(
+                    (("restore", payload),)
+                )
+                preparation = service.control.executor.prepare_prefix(restore_ref)
+                restore = service.control._start_policy_operation(restore_ref)
+            else:
+                restore = submit(
+                    "copy_to", "storage" if args.storage else "host", "gpu", "restore"
+                )
             if not args.storage:
                 assert service.blocks_prefill
             loaded = wait(restore)
@@ -190,6 +215,20 @@ def main():
             assert torch.all(pool.k_buffer[0][restored] == 17).item()
             assert torch.all(pool.v_buffer[0][restored] == 18).item()
             assert allocator.available_size() == 60
+            if preparation is not None:
+                assert preparation.ready and preparation.locked_tokens == 4
+                cache.evict(EvictParams(num_tokens=4))
+                assert node.component_data[ComponentType.FULL].value is not None
+                request_lock = cache.lock(node.id)
+                try:
+                    preparation.release()
+                    cache.evict(EvictParams(num_tokens=4))
+                    assert node.component_data[ComponentType.FULL].value is not None
+                finally:
+                    cache.unlock(request_lock)
+                cache.evict(EvictParams(num_tokens=4))
+                assert allocator.available_size() == 64
+                assert not service.has_pending
             assert (
                 node.component_data[ComponentType.FULL].lock_ref
                 == node.component_data[ComponentType.FULL].host_lock_ref
@@ -215,10 +254,13 @@ def main():
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                         "io_backend": "direct",
                         "file_storage_bytes_verified": args.storage,
+                        "preparation_handoff_verified": args.prepare,
                     }
                 )
             )
         finally:
+            if preparation is not None:
+                preparation.release()
             if args.storage:
                 cache._storage_attachment.shutdown()
             cache.release_host_resources()

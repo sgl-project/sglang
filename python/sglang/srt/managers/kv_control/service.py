@@ -39,6 +39,7 @@ class CacheLimits(Value):
     max_policy_claims_per_copy: int = 4
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
+    max_prepared_prefixes: int = 128
 
 
 class ServiceConfig(Value):
@@ -349,7 +350,9 @@ class KVControlService:
 
     @property
     def has_pending(self):
-        return self.control.registry.capacity()["active"] != 0
+        return self.control.registry.capacity()["active"] != 0 or bool(
+            getattr(self.control.executor, "preparations", ())
+        )
 
     @property
     def blocks_prefill(self):
@@ -361,6 +364,10 @@ class KVControlService:
             self.control.progress()
 
     def reset_after_cache_flush(self):
+        if getattr(self.control.executor, "preparations", None):
+            raise ControlError(
+                "busy", "Release admission preparation before cache reset"
+            )
         capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(self.config.namespace)
         self.control.executor = self._bind_executor(capacity)
@@ -379,17 +386,11 @@ class KVControlService:
         )
         unsupported |= getattr(req, "lora_id", None) is not None
         unsupported |= getattr(req, "multimodal_inputs", None) is not None
-        if unsupported:
-            # Preserve ordinary inference, but give every native sibling an
-            # inspectable unsupported result. Opaque consumers retain ownership.
-            executor = self.control.executor
-            self.control.executor = None
-            try:
-                submission = self.control.submit(envelope, context)
-            finally:
-                self.control.executor = executor
-        else:
-            submission = self.control.submit(envelope, context)
+        # Refuse this request's physical work without removing the owner that
+        # must still cancel/drain existing transfers on logical task cleanup.
+        submission = self.control.submit(
+            envelope, context, execute_primitives=not unsupported
+        )
         req.kv_control_context = context
         req.kv_hints = msgspec.structs.replace(
             envelope, actions=list(submission.unhandled_actions)

@@ -310,6 +310,16 @@ class StorageCacheReads:
                 # after the previous drain's release-count snapshot.
                 self.cache.drain_storage_control_queues()
             length = self._length(job, job.work.payload.dst.tier)
+            if (
+                length == len(job.tokens)
+                and job.work.payload.dst.tier == "gpu"
+                and job.failure is None
+                and status in (None, Status.COMPLETED)
+            ):
+                for identity in job.interests:
+                    interest = self.interests[identity]
+                    if not interest.cancelled:
+                        self.executor._capture_preparation(interest.work)
             outcomes = []
             for start, end in ((0, length), (length, len(job.tokens))):
                 if start == end:

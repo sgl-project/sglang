@@ -656,3 +656,50 @@ regressions pass in /tmp/sglang-kv-growth-budget-regressions.log. Scheduler has
 no added Ruff findings; changed small files, isort/format and whitespace checks
 pass. Parent reviewed this budget boundary before implementing preparation
 handoff. No GPU/model/performance result is inferred from the CPU boundary test.
+
+## Unit 7e — Private publication-to-admission reference handoff
+
+Added bounded owner-only PreparedPrefix registration for unstarted private GPU
+COPYs. Registration validates current ownership/provenance and scope without
+allocating or pinning. Host/file completion captures a fully ready GPU scope
+before dropping the physical job's refs. Capture rechecks signed headroom after
+whole-prefix locks, rejects partial/pending scope, rolls back failed holds and
+records bounded diagnostic causes. Shared interests keep independent leases but
+use one actual allocation/protected-token count. Leases release idempotently;
+released objects cannot re-acquire. Service pending/reset guards cover the
+separate scheduling obligation after raw COPY completion. Finish-task cleanup
+matches immutable task incarnations and preserves peers.
+
+Read PrefillAdder._commit_prefill_admission: in the supported enabled-cache
+causal path it takes req.lock before appending to can_run_list. That is the
+future scheduler handoff boundary; cache-disabled ignore-EOS and unsupported
+model paths cannot be assumed to hold that reference. This unit supplies the
+cache-owner mechanism, not a configured preparation producer or expiry policy.
+
+Review found the serving unsupported-profile path temporarily cleared the whole
+executor. A same-envelope logical finish could then fail to cancel an existing
+MOVE and let source reclamation happen after cancellation. Added a validated
+owner-side execute_primitives refusal flag on submit instead; opaque/logical
+handling keeps the real executor for draining. A real-cache regression proves
+the MOVE becomes CANCELLED and keeps its GPU source while the unsupported new
+priority is refused. No public protocol flag grants authority.
+
+Nine new actual CPU-cache tests cover forced eviction on every unlock (no
+handoff gap), admitted-request locks, shared copies/independent leases, registration
+bounds, abort/DMA drain, namespaced file restoration, headroom loss after DMA,
+radix splits, rejection of public provenance, unsupported-profile finish and
+shared task cleanup. Combined core/service/retention proof: 106 passed,
+/tmp/sglang-kv-preparation-final-cpu-proof.log. Earlier preparation + movement
++ retention proof: 52 passed before the final two lifecycle tests. New small
+files and all changed files pass strict Ruff, isort/format and whitespace checks.
+Parent reviewed the complete implementation and diff.
+
+Real GPU 1 A100 FP16 direct-I/O proof passed:
+/tmp/sglang-kv-gpu-preparation-handoff-smoke.log. File-backed nonzero 17/18 KV is
+restored into poisoned GPU rows; preparation holds block eviction after COPY,
+request locks continue protection after preparation release, and final unlock
+allows reclaim to 64 free rows. Peak small-fixture allocation 9,728 bytes.
+Optional JIT row warning remains outside the explicitly selected direct backend.
+No model-quality/performance claim. Approve private handoff mechanism. Actual
+configured request selection, timers/abort release and tool/quota policy remain
+pending implementation.

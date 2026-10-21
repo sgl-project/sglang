@@ -810,3 +810,39 @@ running-decode headroom, even when H2D needs zero new GPU rows. Such H2D waits
 without holds. A GPU→host copy that requires DMA also waits when its source holds
 would consume that headroom. This check uses the same fresh scheduler budget;
 it does not carry an additional reservation into request admission.
+
+## Internal preparation handoff
+
+The cache owner can register `PreparedPrefix` for an unstarted private GPU COPY.
+This internal mechanism requires the live owner, private registered provenance,
+FULL persistent HiCache, and a complete token-backed prefix; public control
+operations cannot acquire it. `max_prepared_prefixes` (default 128) bounds active
+registrations. Registration itself takes no references or memory reservation.
+
+At actual GPU publication, native host/file adapters capture the complete ready
+scope before dropping their transfer references. Every member must be ready and
+the fresh signed scheduler GPU budget must still cover running growth. Partial
+publication or lost headroom does not confer a preparation reference. Identical
+copies can have separate preparation owners while allocating one physical copy;
+shared prefixes count once in the actual cache ledger. Ordinary radix splits
+preserve release correctness.
+
+After capture, a scheduling owner can keep the prefix until the selected request
+has acquired its own cache lock, then release the preparation. Abort, expiry,
+deferral and cleanup must also release it. Task finish automatically releases
+preparations whose frozen scope belongs to that task incarnation, preserving
+other owners. Registrations participate in service pending-state/reset guards;
+they remain separate obligations after the raw COPY completes. Released leases
+cannot acquire references again. This mechanism adds no public Pin action and
+does not, by itself, activate an admission policy.
+
+Unsupported inference profiles now refuse only that request's primitives and
+consumed physical-policy signals. The real executor remains installed so a
+logical task finish can cancel and drain earlier transfers safely.
+
+On the same Linux/CUDA one-GPU fixture, adding `--prepare` to
+`programmable_kv_hicache_smoke.py --storage` verifies file bytes and the handoff
+from copy references to preparation and then to a real cache request lock,
+including pressure eviction before and after release. The small fixture checks
+physical references; configured scheduler selection/expiry integration remains
+a separate unit.

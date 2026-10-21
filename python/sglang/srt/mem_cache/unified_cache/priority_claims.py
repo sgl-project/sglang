@@ -24,6 +24,7 @@ class CacheControlConfig:
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
     max_policy_claims_per_copy: int = 4
+    max_prepared_prefixes: int = 128
 
     def __post_init__(self):
         validated(self.namespace, Identifier)
@@ -31,6 +32,7 @@ class CacheControlConfig:
             "max_copy_units",
             "max_claims_per_copy",
             "max_policy_claims_per_copy",
+            "max_prepared_prefixes",
             "max_query_nodes",
             "max_result_targets",
         ):

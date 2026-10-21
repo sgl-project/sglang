@@ -473,6 +473,9 @@ class HostCacheTransfers:
         active = [
             self.interests[i] for i in job.interests if not self.interests[i].cancelled
         ]
+        if job.started and job.failure is None and job.work.payload.dst.tier == "gpu":
+            for interest in active:
+                self.executor._capture_preparation(interest.work)
         self._release_gpu(job)
         if (
             job.started

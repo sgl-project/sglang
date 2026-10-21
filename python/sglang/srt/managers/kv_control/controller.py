@@ -217,7 +217,15 @@ class KVControl:
                 self._error(ref, error)
         return self.registry.get(ref)
 
-    def submit(self, envelope: KvHintsEnvelope, context: ControlContext) -> Submission:
+    def submit(
+        self,
+        envelope: KvHintsEnvelope,
+        context: ControlContext,
+        *,
+        execute_primitives: bool = True,
+    ) -> Submission:
+        if type(execute_primitives) is not bool:
+            raise ControlError("invalid_payload", "Execution support must be a bool")
         batch, unhandled = snapshot_envelope(envelope, self.limits)
         if not batch.actions:
             return Submission(replayed=False, unhandled_actions=unhandled)
@@ -247,6 +255,16 @@ class KVControl:
                         raise ControlError(
                             "incompatible_namespace", "Target namespace differs"
                         )
+                if not execute_primitives and (
+                    isinstance(payload, (SetPriority, CopyTo, MoveTo))
+                    or isinstance(payload, Signal)
+                    and self.policy_runtime is not None
+                    and self.policy_runtime.consumes(payload.signal)
+                ):
+                    raise ControlError(
+                        "unsupported",
+                        "This request profile cannot execute native cache operations",
+                    )
                 if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
                     locations = (
                         (payload.location,)
@@ -376,6 +394,9 @@ class KVControl:
                 # Content equality alone establishes no task ownership. cancel
                 # retires queued work or asks the executor to drain started work.
                 self.cancel(pending.ref)
+        release = getattr(self.executor, "release_task_preparations", None)
+        if release is not None:
+            release(removed_tasks)
 
     def request_event(
         self,
