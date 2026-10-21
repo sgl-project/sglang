@@ -10,7 +10,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
@@ -233,7 +233,7 @@ def _can_batch_cross_request_image_misses(
     ``supports_batched_image_encoding`` — archs whose ``get_image_feature``
     has been validated to accept multiple items as one packed visual batch —
     and stays opt-in via the patch budget plus the conservative guards on
-    unvalidated dimensions (cuda graph, encoder DP, quantization, TP > 1).
+    unvalidated dimensions (cuda graph, encoder DP, quantization).
     """
     if _is_hip or _is_xpu:
         return False
@@ -249,7 +249,6 @@ def _can_batch_cross_request_image_misses(
         and not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
         and not getattr(owner, "use_data_parallel", False)
         and getattr(owner, "quant_config", None) is None
-        and get_parallel().tp_size == 1
     )
 
 

@@ -449,7 +449,7 @@ def test_npu_batching_mode_guards(monkeypatch):
         m.delenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES")
         assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
     with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
-        assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
+        assert mm_schedule._can_batch_cross_request_image_misses(encoder)
     for attr, value in (("use_data_parallel", True), ("quant_config", object())):
         setattr(owner, attr, value)
         assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
