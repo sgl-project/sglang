@@ -15,9 +15,9 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
-from sglang.srt.layers.cp.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
     pad_local_rows,

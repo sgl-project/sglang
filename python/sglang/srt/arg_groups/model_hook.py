@@ -305,7 +305,7 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+                    from sglang.srt.layers.cp.bcg.bcg import supports_prefill_cp_bcg
 
                     if not (
                         cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE

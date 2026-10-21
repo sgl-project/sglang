@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.utils import cp_interleave_input_ids
 from sglang.srt.runtime_context import get_parallel
 

@@ -83,7 +83,7 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         ContextParallelStrategyKind.INTERLEAVE,
         CPAttentionBackendKind.DSA,
     ):
-        from sglang.srt.layers.cp.interleave_bcg import supports_interleave_bcg
+        from sglang.srt.layers.cp.bcg.interleave_bcg import supports_interleave_bcg
 
         return supports_interleave_bcg(server_args)
     return True
@@ -134,7 +134,7 @@ class PrefillCPBCGInput:
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
         if cls is PrefillCPBCGInput and get_cp_strategy().name == "interleave":
-            from sglang.srt.layers.cp.interleave_bcg import InterleaveCPBCGInput
+            from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 
             return InterleaveCPBCGInput.create(runner)
         with torch.device(runner.device):

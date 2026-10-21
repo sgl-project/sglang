@@ -56,13 +56,13 @@ from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.bcg import (
+from sglang.srt.layers.cp.bcg.bcg import (
     PrefillCPBCGInput,
 )
-from sglang.srt.layers.cp.bcg import (
+from sglang.srt.layers.cp.bcg.bcg import (
     enable_cp_bcg_capture as should_enable_cp_bcg_capture,
 )
-from sglang.srt.layers.cp.bcg import (
+from sglang.srt.layers.cp.bcg.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )

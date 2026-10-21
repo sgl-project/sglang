@@ -25,7 +25,7 @@ def _kpool_indexer_prefill_with_output(
     n = forward_batch.extend_num_tokens
     num_logical = sum(forward_batch.extend_seq_lens_cpu)
     if is_interleave_extend(forward_batch):
-        from sglang.srt.layers.cp.interleave_bcg import cp_interleave_indexer_rows
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
 
         n, num_logical = cp_interleave_indexer_rows(forward_batch)
     if n is None or not 0 <= n <= x.shape[0]:
