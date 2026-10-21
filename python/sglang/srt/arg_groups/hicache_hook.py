@@ -154,7 +154,10 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
 
 def _dsa_mtp_packs_into_dcp_host(server_args: Any) -> bool:
     """A ROCm DSA MTP draft shards its KV like the DCP target, so it packs into
-    the target's host rows and shares their DCP translation."""
+    the target's host rows and shares their DCP translation.
+
+    Only an argument-level screen: `_build_hicache_draft_plan` picks packed or
+    sidecar from the draft runners and checks the draft pool's real layout."""
     from sglang.srt.arg_groups.model_override_base import model_config_of
     from sglang.srt.configs.model_config import dsa_draft_shards_under_dcp
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

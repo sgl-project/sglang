@@ -13,7 +13,7 @@ from sglang.test.kl_multiturn_utils import (
 )
 from sglang.test.server_fixtures.dsa_mtp_fixture import DsaMtpServerBase
 
-register_amd_ci(est_time=1800, suite="stage-c-test-large-4-gpu-amd-mi35x")
+register_amd_ci(est_time=1800, suite="nightly-amd-8-gpu-mi35x", nightly=True)
 
 GLM52_MODEL_PATH = os.environ.get("GLM52_MODEL_PATH", "amd/GLM-5.2-MXFP4")
 DCP_SIZE = 4
@@ -91,8 +91,10 @@ class TestGLM52MXFP4DCP4MTPHiCacheEvicted(TestGLM52MXFP4DCP4MTPHiCache):
     def test_evicted_prefix_reloads_from_host(self):
         rng = random.Random(7)
         prompt_len = 3000
-        # Eight prompts overflow the 16k-token device pool, so the first one
-        # leaves the device and survives only in the write-through host copy.
+        # --max-total-tokens caps each rank's rows, so DCP4 widens 4096 rows
+        # into 16384 logical slots. Eight 3000-token prompts (24000 tokens)
+        # overflow them, so the first one leaves the device and survives only
+        # in the write-through host copy.
         prompts = [[rng.randint(1, 30000) for _ in range(prompt_len)] for _ in range(8)]
         for input_ids in prompts:
             self._generate(input_ids)
