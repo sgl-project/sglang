@@ -1,14 +1,18 @@
 import functools
 import types
 import unittest
+import unittest.mock
+from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -17,8 +21,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
+    build_uninitialized_sps_table,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -223,6 +229,82 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestVerifyBudgetTpSync(CustomTestCase):
+    class _FakeTpSync:
+        def __init__(self, rank0_budget):
+            self.rank0_budget = rank0_budget
+            self.site = None
+
+        def sync_cpu(self, site, values):
+            self.site = site
+            values.fill_(-1 if self.rank0_budget is None else self.rank0_budget)
+            return values
+
+    def test_uses_rank0_budget_for_graph_tier_selection(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=7)
+
+        self.assertEqual(planner._sync_verify_token_budget(3), 7)
+        self.assertEqual(planner._tp_sync.site, SpecTpSyncSite.DSPARK_PLAN)
+
+    def test_preserves_none_with_wire_sentinel(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._tp_sync = self._FakeTpSync(rank0_budget=None)
+
+        self.assertIsNone(planner._sync_verify_token_budget(3))
+
+    def test_resolve_synchronizes_overlap_and_non_overlap_budgets(self):
+        for disable_overlap in (False, True):
+            for rank0_budget in (None, 0, 7):
+                with self.subTest(overlap=not disable_overlap, budget=rank0_budget):
+                    planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+                    planner._budget_planner = object()
+                    planner._tp_sync = self._FakeTpSync(rank0_budget)
+                    draft = types.SimpleNamespace(verify_token_budget=3)
+                    with (
+                        mock.patch(
+                            "sglang.srt.speculative.dspark_components.dspark_planner.get_schedule",
+                            return_value=types.SimpleNamespace(
+                                disable_overlap_schedule=disable_overlap
+                            ),
+                        ),
+                        mock.patch.object(
+                            planner, "compute_budget_sync", return_value=5
+                        ),
+                    ):
+                        budget = planner.resolve_verify_token_budget(
+                            draft_input=draft,
+                            confidence=torch.ones((2, 5)),
+                            prefix_lens=torch.tensor([3, 4]),
+                            req_pool_indices=torch.tensor([0, 1]),
+                        )
+                    self.assertEqual(budget, rank0_budget)
+                    self.assertEqual(draft.verify_token_budget, rank0_budget)
+
+    def test_cpu_sync_uses_the_tp_subgroup_global_source_rank(self):
+        sync = SpecTpSync.__new__(SpecTpSync)
+        sync._sites = {SpecTpSyncSite.DSPARK_PLAN}
+        sync._tp_group = types.SimpleNamespace(ranks=[4, 5], cpu_group=object())
+        values = torch.tensor([3], dtype=torch.int64)
+        with mock.patch(
+            "torch.distributed.broadcast",
+            side_effect=lambda values, **kw: values.fill_(7),
+        ) as broadcast:
+            result = sync.sync_cpu(SpecTpSyncSite.DSPARK_PLAN, values)
+        self.assertIs(result, values)
+        self.assertEqual(values.item(), 7)
+        broadcast.assert_called_once_with(values, src=4, group=sync._tp_group.cpu_group)
+
+    def test_disabled_cpu_sync_preserves_the_local_budget(self):
+        sync = SpecTpSync.__new__(SpecTpSync)
+        sync._sites = frozenset()
+        values = torch.tensor([3], dtype=torch.int64)
+        with mock.patch("torch.distributed.broadcast") as broadcast:
+            self.assertIs(sync.sync_cpu(SpecTpSyncSite.DSPARK_PLAN, values), values)
+        self.assertEqual(values.item(), 3)
+        broadcast.assert_not_called()
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
@@ -470,6 +552,101 @@ class TestGraphTierFillBudget(CustomTestCase):
             self.assertEqual(total, min(graph_num_tokens, bs * cap))
 
 
+class TestForcedBudgetRejectsSimulatedAcceptLength(CustomTestCase):
+    """A pinned budget now trims verify under verify-all, so it must not combine
+    with a constant simulated accept length above 1, which can exceed it."""
+
+    def _set(self, frac):
+        from pydantic import TypeAdapter
+
+        from sglang.srt.managers.io_struct import (
+            SetInternalStateReq,
+            msgpack_decode,
+            msgpack_encode,
+        )
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        draft_worker = types.SimpleNamespace(
+            set_dspark_forced_budget_frac=unittest.mock.Mock()
+        )
+        scheduler = types.SimpleNamespace(
+            spec_algorithm=types.SimpleNamespace(is_dspark=lambda: True),
+            draft_worker=draft_worker,
+        )
+        controller = SchedulerInternalStateController(scheduler, False)
+        # Exercise HTTP validation and the tokenizer -> scheduler IPC contract:
+        # constructing the struct directly would miss a rejected JSON null.
+        request = TypeAdapter(SetInternalStateReq).validate_python(
+            {"server_args": {"dspark_force_budget_frac": frac}}
+        )
+        output = controller.set_internal_state(msgpack_decode(msgpack_encode(request)))
+        return output.updated, draft_worker.set_dspark_forced_budget_frac
+
+    def test_null_for_other_knob_rejects_entire_update(self):
+        from sglang.srt.managers.io_struct import SetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        worker = types.SimpleNamespace(set_dspark_forced_budget_frac=mock.Mock())
+        scheduler = types.SimpleNamespace(
+            spec_algorithm=types.SimpleNamespace(is_dspark=lambda: True),
+            draft_worker=worker,
+        )
+        controller = SchedulerInternalStateController(scheduler, False)
+        output = controller.set_internal_state(
+            SetInternalStateReq(
+                server_args={
+                    "dspark_force_budget_frac": None,
+                    "pp_max_micro_batch_size": None,
+                }
+            )
+        )
+        self.assertFalse(output.updated)
+        worker.set_dspark_forced_budget_frac.assert_not_called()
+
+    def test_pin_rejected_with_simulated_accept_length(self):
+        with envs.SGLANG_SIMULATE_ACC_LEN.override(3.0):
+            updated, apply = self._set(0.4)
+            self.assertFalse(updated)
+            apply.assert_not_called()
+            # Clearing the pin stays allowed.
+            updated, apply = self._set(None)
+            self.assertTrue(updated)
+            apply.assert_called_once_with(None)
+
+    def test_pin_rejected_with_multinomial_unit_accept_length(self):
+        # multinomial draws from N(1, 1), so it can accept past the trimmed
+        # verify window even though the configured length is 1.
+        with (
+            envs.SGLANG_SIMULATE_ACC_LEN.override(1.0),
+            envs.SGLANG_SIMULATE_ACC_METHOD.override("multinomial"),
+        ):
+            updated, apply = self._set(0.4)
+            self.assertFalse(updated)
+            apply.assert_not_called()
+            updated, apply = self._set(None)
+            self.assertTrue(updated)
+            apply.assert_called_once_with(None)
+
+    def test_pin_allowed_without_or_with_unit_simulated_accept_length(self):
+        for simulate_acc_len, method in (
+            (-1.0, "match-expected"),
+            (-1.0, "multinomial"),
+            (1.0, "match-expected"),
+        ):
+            with self.subTest(simulate_acc_len=simulate_acc_len, method=method):
+                with (
+                    envs.SGLANG_SIMULATE_ACC_LEN.override(simulate_acc_len),
+                    envs.SGLANG_SIMULATE_ACC_METHOD.override(method),
+                ):
+                    updated, apply = self._set(0.4)
+                self.assertTrue(updated)
+                apply.assert_called_once_with(0.4)
+
+
 class _FakeRaggedRunner(types.SimpleNamespace):
     pass
 
@@ -551,6 +728,117 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+
+class TestForcedBudgetUnderVerifyAll(CustomTestCase):
+    """dspark_sps_profiler --fracs pins a budget fraction on a compact server whose
+    SPS table is still uninitialized (verify-all); the pinned budget must shape
+    the layout instead of the cached full-width one."""
+
+    BS = 4
+    GAMMA = 5
+
+    def _planner(self):
+        num_draft_tokens = self.GAMMA + 1
+        model_runner = _fake_model_runner(
+            [num_draft_tokens * n for n in range(1, 9)], max_bs=8
+        )
+        model_runner.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.zeros((16, 1), dtype=torch.int32)
+        )
+        cfg = DSparkScheduleConfig(gamma=self.GAMMA)
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner.model_runner = model_runner
+        planner.verify_num_draft_tokens = num_draft_tokens
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._schedule_cfg = cfg
+        planner._is_verify_all = True
+        planner._uniform_layout_cache = {}
+        planner._dynamic_graph_tier = True
+        planner._align_verify_tokens_to_graph_tier = False
+        planner._tp_sync = types.SimpleNamespace(sync=lambda *args: None)
+        planner._budget_planner = HostConfidenceBudgetPlanner(
+            sps_table=build_uninitialized_sps_table(max_batch_tokens=8 * 6),
+            cfg=cfg,
+            model_runner=model_runner,
+        )
+        return planner
+
+    def _schedule(self, planner):
+        req_pool_indices = torch.arange(self.BS)
+        generation = torch.ones(self.BS, dtype=torch.int64)
+        confidence = torch.full((self.BS, self.GAMMA), 0.9)
+        budget = planner._budget_planner.compute_budget(
+            confidence=confidence,
+            generation=generation,
+            current_generation=generation,
+            req_pool_indices_cpu=req_pool_indices,
+        )
+        layout = planner.schedule_layout(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=torch.zeros(self.BS, dtype=torch.int64),
+            device=torch.device("cpu"),
+            confidence=confidence,
+            budget=budget,
+        )
+        return budget, layout
+
+    def test_pinned_budget_shapes_the_layout(self):
+        planner = self._planner()
+        full_width = self.BS * (self.GAMMA + 1)
+
+        _, uniform = self._schedule(planner)
+        self.assertEqual(uniform.verify_lens.tolist(), [self.GAMMA + 1] * self.BS)
+        self.assertEqual(uniform.graph_num_tokens, full_width)
+
+        planner.set_forced_budget_frac(0.4)
+        budget, pinned = self._schedule(planner)
+        total = int(pinned.verify_lens.sum())
+        self.assertEqual(budget, int(0.4 * self.BS * self.GAMMA))
+        self.assertEqual(total, self.BS + budget)
+        self.assertLess(pinned.graph_num_tokens, full_width)
+        self.assertEqual(pinned.graph_num_tokens, 12)
+
+        planner.set_forced_budget_frac(None)
+        _, cleared = self._schedule(planner)
+        self.assertIs(cleared, uniform)
+
+    def test_pinned_budget_includes_low_survival_candidates(self):
+        # Real PD profiling hit logical M=47 at B=8/full budget because a
+        # candidate fell below survival_eps. Exercise both kernel backends,
+        # including exact zeros from confidence underflow.
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for confidence_value in (0.0, 1e-8):
+                with self.subTest(device=device, confidence=confidence_value):
+                    planner = self._planner()
+                    confidence = torch.full(
+                        (self.BS, self.GAMMA), confidence_value, device=device
+                    )
+
+                    def schedule(budget):
+                        return planner._schedule_verify_lens(
+                            req_pool_indices=torch.arange(self.BS, device=device),
+                            prefix_lens=torch.zeros(
+                                self.BS, dtype=torch.int64, device=device
+                            ),
+                            device=torch.device(device),
+                            confidence=confidence,
+                            budget=budget,
+                        )
+
+                    full_budget = self.BS * self.GAMMA
+                    self.assertEqual(schedule(full_budget).tolist(), [1] * self.BS)
+                    for frac in (0.0, 0.05, 0.4, 1.0):
+                        planner.set_forced_budget_frac(frac)
+                        budget = int(frac * full_budget)
+                        lens = schedule(budget)
+                        self.assertEqual(int(lens.sum()), self.BS + budget)
+                        self.assertTrue(bool((lens >= 1).all()))
+                        self.assertTrue(bool((lens <= self.GAMMA + 1).all()))
+                    planner.set_forced_budget_frac(None)
+                    self.assertEqual(schedule(full_budget).tolist(), [1] * self.BS)
+                    self.assertEqual(planner._schedule_cfg.survival_eps, 1e-6)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    ragged_verify_token_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -94,6 +95,17 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
+
+
+class TestRaggedVerifyTokenRows(CustomTestCase):
+    def test_empty_rows_and_padding_tail(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([2, 0, 3, 1, 0], dtype=torch.int32),
+            graph_num_tokens=9,
+        )
+        self.assertEqual(
+            ragged_verify_token_rows(layout, 9).tolist(), [0, 0, 2, 2, 2, 3, 5, 5, 5]
+        )
 
 
 class TestCaptureVerifyLens(CustomTestCase):

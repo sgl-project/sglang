@@ -225,6 +225,19 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     return spec_info.ragged_verify_layout
 
 
+def ragged_verify_token_rows(
+    layout: RaggedVerifyLayout, num_tokens: int
+) -> torch.Tensor:
+    """Request row of each of ``num_tokens`` packed verify tokens.
+
+    Fixed-size, so it is CUDA-graph safe. Empty rows own no tokens, and graph
+    padding past ``qo_indptr[-1]`` maps to row ``bs``.
+    """
+    qo_indptr = layout.qo_indptr_device
+    tokens = torch.arange(num_tokens, dtype=qo_indptr.dtype, device=qo_indptr.device)
+    return torch.searchsorted(qo_indptr[1:], tokens, right=True)
+
+
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor

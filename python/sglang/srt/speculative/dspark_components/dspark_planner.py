@@ -328,16 +328,28 @@ class DSparkVerifyPlanner:
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not get_schedule().disable_overlap_schedule:
-            return draft_input.verify_token_budget
+            budget = draft_input.verify_token_budget
+        else:
+            budget = self.compute_budget_sync(
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+            )
+        budget = self._sync_verify_token_budget(budget)
+        draft_input.verify_token_budget = budget
+        return budget
 
-        # No collective: the budget derives only from the broadcast draft tokens
-        # (via confidence), replicated req_generation, and the static sps table.
-        draft_input.verify_token_budget = self.compute_budget_sync(
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=req_pool_indices,
+    def _sync_verify_token_budget(self, budget: Optional[int]) -> Optional[int]:
+        """Use TP0's budget to keep compact verify graph tiers identical."""
+        budget_tensor = torch.tensor(
+            [-1 if budget is None else budget], dtype=torch.int64, device="cpu"
         )
-        return draft_input.verify_token_budget
+        self._tp_sync.sync_cpu(
+            SpecTpSyncSite.DSPARK_PLAN,
+            budget_tensor,
+        )
+        synced_budget = int(budget_tensor.item())
+        return None if synced_budget < 0 else synced_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
@@ -378,10 +390,15 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and self._budget_planner.forced_budget_frac is None
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
+            # the per-step schedule and its host<->device round-trips. A pinned
+            # budget (dspark_sps_profiler --fracs) must still be scheduled.
             key = (int(req_pool_indices.shape[0]), global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
@@ -534,10 +551,17 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        cfg = self._schedule_cfg
+        if self._budget_planner.forced_budget_frac is not None:
+            # A profiling pin requests an exact number of candidates. The
+            # normal survival cutoff may otherwise leave the budget unfilled
+            # (including at full width), so the measured T(B, M) is mislabeled.
+            # Retain confidence ordering, including zero-probability prefixes.
+            cfg = msgspec.structs.replace(cfg, survival_eps=0.0)
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
-            cfg=self._schedule_cfg,
+            cfg=cfg,
         ).to(device=device, dtype=torch.int32)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
