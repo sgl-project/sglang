@@ -37,6 +37,11 @@ from sglang.srt.runtime_context import get_memory, get_model, get_parallel, get_
 
 logger = logging.getLogger(__name__)
 
+# Bound admission work and DMA per native deposit, independently of model page
+# geometry. A key's complete set of pieces must stay in one deposit.
+_MAX_DEPOSIT_BYTES = 512 << 20
+_MAX_DEPOSIT_DESCRIPTORS = 4096
+
 
 @dataclass
 class _Load:
@@ -104,7 +109,6 @@ def _offset_source_ports(hints, offset):
 
 
 class KVCRDirectLinker(UnifiedCacheLinker):
-    loaded_path_is_stored = False
     local_storage_medium = StorageMedium.CPU
     local_storage_ownership = "kvcr"
 
@@ -534,7 +538,29 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         with context:
             prepared = self.layout.prepare(list(transfers), allow_partial=True)
-        return self.layout.mappings(prepared)
+        sizes = {region.label: region.size for region in self.layout.registrations}
+        batches = []
+        for blocks in self.layout.mappings(prepared):
+            batch, size, descriptors = {}, 0, 0
+            for key, refs in blocks.items():
+                key_bytes = sum(sizes[ref.label] for ref in refs)
+                if key_bytes > _MAX_DEPOSIT_BYTES or len(refs) > _MAX_DEPOSIT_DESCRIPTORS:
+                    raise ValueError("KVCR page exceeds native deposit limits")
+                if batch and (
+                    size + key_bytes > _MAX_DEPOSIT_BYTES
+                    or descriptors + len(refs) > _MAX_DEPOSIT_DESCRIPTORS
+                ):
+                    batches.append(batch)
+                    batch, size, descriptors = {}, 0, 0
+                batch[key] = refs
+                size += key_bytes
+                descriptors += len(refs)
+            if batch:
+                batches.append(batch)
+        # Prepare before submitting: invalid pages cannot leave partial work.
+        # _progress serializes chunks and acknowledges the whole offload only
+        # after terminal completion, retaining all keys while DMA is uncertain.
+        return batches
 
     def _fail_batch(self, batch, error, *, fatal=False):
         batch.error = error

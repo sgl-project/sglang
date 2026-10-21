@@ -384,6 +384,80 @@ class TestKVCRDirectLinker(CustomTestCase):
         eventually(lambda: self.linker.num_completed_offloads() == 1)
         self.assertTrue(self.linker.pop_completed_offload())
 
+    def test_large_backup_is_bounded_and_acknowledges_only_after_all_copies(self):
+        """A restored prefix must not become one deadline-sized native copy."""
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker"
+        for limit in ("bytes", "descriptors"):
+            with self.subTest(limit=limit), patch.multiple(
+                module,
+                _MAX_DEPOSIT_BYTES=96 if limit == "bytes" else 512 << 20,
+                _MAX_DEPOSIT_DESCRIPTORS=6 if limit == "descriptors" else 4096,
+                create=True,
+            ):
+                # Each real fixture page has three 16-byte registered pieces.
+                first = len(self.client.calls)
+                keys = [f"{limit}-{i}" for i in range(5)]
+                self.linker.offload(self.transfer(keys))
+                seen = []
+                for count in (2, 2, 1):
+                    eventually(lambda: len(self.client.calls) == first + len(seen) + 1)
+                    handle, kind, blocks, *_ = self.client.calls[-1]
+                    self.assertEqual(kind, "deposit")
+                    self.assertEqual(len(blocks), count)
+                    self.assertTrue(all(len(refs) == 3 for refs in blocks.values()))
+                    self.assertEqual(self.linker.num_completed_offloads(), 0)
+                    seen.append(blocks)
+                    self.client.complete(handle)
+                eventually(lambda: self.linker.num_completed_offloads() == 1)
+                self.assertTrue(self.linker.pop_completed_offload())
+                flattened = [key for blocks in seen for key in blocks]
+                self.assertEqual(len(flattened), len(set(flattened)))
+                self.assertEqual(
+                    set(flattened),
+                    self.linker.layout.encoded_keys(self.transfer(keys)),
+                )
+
+    def test_batched_backup_failure_retains_uncertain_copy_and_fails_whole_ack(self):
+        """An earlier successful chunk cannot publish a partially failed backup."""
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker"
+        with patch.multiple(
+            module,
+            _MAX_DEPOSIT_BYTES=96,
+            _MAX_DEPOSIT_DESCRIPTORS=4096,
+            create=True,
+        ):
+            self.linker.offload(self.transfer(["a", "b", "c", "d", "e"]))
+            eventually(lambda: len(self.client.calls) == 1)
+            self.assertEqual(len(self.client.calls[0][2]), 2)
+            self.client.complete(1)
+            eventually(lambda: len(self.client.calls) == 2)
+            self.runtime.events.append(SimpleNamespace(state="uncertain", op_handle=2))
+            self.client.complete(2, success=False)
+            eventually(lambda: self.linker._hazards == {2})
+            self.linker._call(lambda: None)
+            self.assertEqual(self.linker.num_completed_offloads(), 0)
+            self.assertEqual(len(self.client.calls), 2)
+            self.runtime.events.append(SimpleNamespace(state="quiesced", op_handle=2))
+            eventually(lambda: self.linker.num_completed_offloads() == 1)
+            self.assertFalse(self.linker.pop_completed_offload())
+            self.assertEqual(len(self.client.calls), 2)
+            self.assertFalse(self.linker._unacknowledged_keys)
+
+    def test_oversized_page_is_rejected_without_partial_piece_deposit(self):
+        """An indivisible multi-piece page must never be silently split."""
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker"
+        with patch.multiple(
+            module,
+            _MAX_DEPOSIT_BYTES=47,
+            _MAX_DEPOSIT_DESCRIPTORS=4096,
+            create=True,
+        ):
+            self.linker.offload(self.transfer(["a"]))
+            eventually(lambda: self.linker.num_completed_offloads() == 1)
+            self.assertFalse(self.linker.pop_completed_offload())
+            self.assertEqual(self.client.calls, [])
+            self.assertIsNone(self.linker._fatal)
+
     def test_offload_waits_for_producer_and_earlier_queued_load(self):
         self.linker.load("a", self.transfer(["a"]))
         first_ready, second_ready, load_ready = Event(), Event(), Event()
