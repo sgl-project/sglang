@@ -1041,8 +1041,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         if (
             self.dcp_size > 1
-            and self.index_head_dim is None
             and not self.is_draft_worker
+            and self.dtype in (torch.float16, torch.bfloat16)
         ):
             # KVLocPlan has already localized page-interleaved slots. This
             # fixed-shape store only skips -1 rows; it does not shard again.
@@ -1051,6 +1051,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 (self.k_buffer[layer_id - self.start_layer], cache_k),
                 (self.v_buffer[layer_id - self.start_layer], cache_v),
             ):
+                if src.shape[-1] == 0:
+                    continue
                 src = src.reshape(-1, src.shape[-1])
                 if src.stride(-1) != 1:
                     src = src.contiguous()
