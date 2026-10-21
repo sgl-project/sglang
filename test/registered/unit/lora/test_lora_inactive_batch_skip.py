@@ -1,4 +1,6 @@
-"""Skip dense LoRA for adapter-free batches, except when capturing adapter graphs."""
+"""Skip dense LoRA for adapter-free batches, except when capturing adapter graphs.
+Decode uses the separate nolora graph variant for adapter-free batches.
+"""
 
 from types import SimpleNamespace
 

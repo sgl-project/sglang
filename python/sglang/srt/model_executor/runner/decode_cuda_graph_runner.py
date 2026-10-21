@@ -216,6 +216,11 @@ def build_replay_fb_view(
     )
 
 
+def _lora_backend_skips_inactive(model_runner) -> bool:
+    manager = model_runner.lora_manager
+    return manager is not None and manager.lora_backend.skip_inactive_dense_lora
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -237,7 +242,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        # Inactive dense LoRA batches replay a separate base-only graph.
+        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
+            model_runner
+        )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -1187,11 +1195,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
-        lora_variants = (
-            [("lora", True), ("nolora", False)]
-            if self.record_nolora_graph
-            else [(None, None)]
-        )
+        lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
         variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
@@ -1207,7 +1211,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
+            for variant_label in lora_variants:
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
