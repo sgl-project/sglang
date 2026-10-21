@@ -423,6 +423,20 @@ def register_fake_ops(tp_size: int):
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
+    @register_cpu_compile_fake("fused_moe_router_cpu")
+    def _(
+        hidden_states,
+        gating_output,
+        topk,
+        moe_softcapping,
+        correction_bias=None,
+    ):
+        shape = (hidden_states.shape[0], topk)
+        return (
+            torch.empty(shape, device=hidden_states.device, dtype=torch.float32),
+            torch.empty(shape, device=hidden_states.device, dtype=torch.int32),
+        )
+
     @register_cpu_compile_fake("topk_softmax_cpu")
     def _(
         hidden_states,
