@@ -1,20 +1,18 @@
-"""PPU nightly serving performance entries for Kimi-K2.6 (ZW-M890P, eight devices).
+"""PPU nightly serving performance entry for Kimi-K2.6 (ZW-M890P, eight devices).
 
-Two reviewed configs share this file, one per checkpoint the btv1.5 prefill plan
-measures on a single board at tp 8:
+  configs/kimi2.6/mxfp4-fp8-144g-prefill.json   the only config
 
-  configs/kimi2.6/mxfp4-fp8-144g-prefill.json   the default below
-  configs/kimi2.6/w4a8-int8-144g-prefill.json
+Earlier revisions also carried a W4A8-INT8 config, ported from the plan's INT4
+cases.  It is removed rather than kept red: the format's W-INT4 kernels route
+through ACEXT, which the ZW-M890P stack does not support, so the entry could
+not serve on this board line at all.
 
-Their server arguments are identical -- the plan's INT4 and MXFP4 cases differ in
-nothing but the weights they read -- and each config carries two measurements, a
-4k-token and a 64k-token prefill of ten prompts at concurrency one, which share
-one launch with the KV cache flushed between them.
+The config carries two measurements, a 4k-token and a 64k-token prefill of ten
+prompts at concurrency one, which share one launch with the KV cache flushed
+between them.
 
-Only one of the two runs per job: the workflow names the config in
-`SGLANG_PPU_PERF_TEST_CONFIG` and the class falls back to the default when it is
-unset.  They are configs rather than two files because they claim the same eight
-devices and differ only in the weights being read.
+The workflow names the config in `SGLANG_PPU_PERF_TEST_CONFIG` and the class
+falls back to the default when it is unset.
 
 Nothing here judges a number.  The suite is red only when a measurement produced
 no numbers at all, never for being slow.

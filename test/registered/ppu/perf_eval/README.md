@@ -72,8 +72,11 @@ failure — the number is still recorded. A slow server is never red.
 The first batch is the intersection of `144G/Daily/Prefill` with the five
 checkpoint families the Answer line has already stood up on this board:
 GLM-5.2, Kimi-K2.6, MiniMax-M2.7, Qwen3.5-397B-A17B and Qwen3.8-2.4T-A95B. That
-intersection is 21 source cases; see [Provenance](#provenance-and-dedup) for the
-one that was a duplicate, leaving 20 measurements in 12 configs and 7 suites.
+intersection is 21 source cases; the two Kimi-K2.6 INT4 cases are not ported —
+their W4A8-INT8 checkpoint's kernels route through ACEXT, which this board line
+does not support — and one more was a duplicate (see
+[Provenance](#provenance-and-dedup)), leaving 18 measurements in 11 configs and
+7 suites.
 
 | Suite | Test file | Model | Configs | Measurements | Devices |
 | --- | --- | --- | --- | --- | --- |
@@ -81,7 +84,7 @@ one that was a duplicate, leaving 20 measurements in 12 configs and 7 suites.
 | `nightly-perf-4-glm52-ppu` | `test_ppu_glm52_mxfp4_prefill_perf.py` | GLM-5.2 MXFP4-FP8 | 2 | 2 | 4 |
 | `nightly-perf-4-qwen35-ppu` | `test_ppu_qwen35_prefill_perf.py` | Qwen3.5-397B-A17B | 2 | 4 | 4 |
 | `nightly-perf-8-glm52-ppu` | `test_ppu_glm52_prefill_perf.py` | GLM-5.2 FP8-channelwise | 2 | 2 | 8 |
-| `nightly-perf-8-kimi26-ppu` | `test_ppu_kimi_k26_prefill_perf.py` | Kimi-K2.6 | 2 | 4 | 8 |
+| `nightly-perf-8-kimi26-ppu` | `test_ppu_kimi_k26_prefill_perf.py` | Kimi-K2.6 | 1 | 2 | 8 |
 | `nightly-perf-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_prefill_perf.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 2 | 16, over 2 nodes |
 | `nightly-perf-32-ppu` | `test_ppu_qwen38_a95b_prefill_perf.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 2 | 32, over 4 nodes |
 
@@ -129,15 +132,20 @@ with the two prefill lengths as the measurements inside it:
 | `qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json` | `qwen3_5-397b-a17b_mxfp4-fp8_{4000,64000}_1_0001.json` |
 | `qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json` | `qwen3_5-397b-a17b_fp8-channel_{4000,64000}_1_0001.json` |
 | `kimi2.6/mxfp4-fp8-144g-prefill.json` | `kimi-k2_6_mxfp4-fp8_{4000,64000}_1_0001.json` |
-| `kimi2.6/w4a8-int8-144g-prefill.json` | `kimi-k2_6_int4_{4000,64000}_1_0001.json` |
 | `qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json` | `qwen3_8_mxfp4-fp8_2node_{4000,64000}_1_0001.json` |
 | `qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json` | `qwen3_8_2_4t-a95b_fp8_4node_{4000,64000}_1_0001.json` |
 
-The one dropped case is `glm_5_2_mxfp4-fp8_tp4_64000_1_0001.json`. It is
-byte-identical in every reviewed parameter to `glm_5_2_mxfp4-fp8_64000_1_0001.json`
-— tp 4, `dsa`, 64k prefill, the same `TC_name` — so it is the same measurement
-under a second file name, and porting it a second time would only produce a
-duplicate annotation. That is what takes the 21 source cases to 20 measurements.
+The two Kimi-K2.6 INT4 source cases, `kimi-k2_6_int4_{4000,64000}_1_0001.json`,
+are not ported at all: their W4A8-INT8 checkpoint's W-INT4 kernels route through
+ACEXT, which the ZW-M890P stack does not support, so the entry could not serve
+on this board line.
+
+Of the remainder, one is a duplicate rather than ported:
+`glm_5_2_mxfp4-fp8_tp4_64000_1_0001.json` is byte-identical in every reviewed
+parameter to `glm_5_2_mxfp4-fp8_64000_1_0001.json` — tp 4, `dsa`, 64k prefill,
+the same `TC_name` — so it is the same measurement under a second file name, and
+porting it a second time would only produce a duplicate annotation. That is what
+takes the 19 remaining source cases to 18 measurements.
 
 ### Where the case files are not the whole parameter set
 
@@ -285,12 +293,13 @@ composite action is not available to this runner group's container-hooked jobs;
 and two checkouts per job, because the github.com egress is the least reliable
 step in the run and a self-clearing fault there must not judge a model.
 
-Its ten entries run in eight lanes, so no more than eight boards are held at
-once: the two tp-8 families (GLM-5.2 channelwise, Kimi-K2.6) each run their two
-configs back to back on one lane, and the six lighter tp-2 and tp-4 entries each
-take a board of their own and free it first. Entries in a lane are ordered by
-`needs` plus `if: ${{ !cancelled() }}`, so a lane's second entry runs on its
-predecessor's verdict, good or bad, while a cancelled run stops claiming boards.
+Its nine entries run in seven lanes, so no more than seven boards are held at
+once: the GLM-5.2 channelwise family runs its two tp-8 configs back to back on
+one lane, and the other seven entries — the Kimi-K2.6 tp-8 one and the six
+lighter tp-2 and tp-4 ones — each take a board of their own and free it first.
+Entries in a lane are ordered by `needs` plus `if: ${{ !cancelled() }}`, so a
+lane's second entry runs on its predecessor's verdict, good or bad, while a
+cancelled run stops claiming boards.
 Each job holds a whole board regardless of its tp: `nproc_per_node` is a resource
 request, not device isolation, so the board script narrows
 `CUDA_VISIBLE_DEVICES` to the config's `visible_devices`, which is what makes a
@@ -321,8 +330,8 @@ that file would have measured nothing a reader can see.
 ## Capacity and time budget
 
 Each single-board entry asks for one ZW-M890P board (144 GiB × 8) and the two
-multi-node lines ask for two and four. At its eight-wide peak the single-board
-workflow holds eight boards; the 2- and 4-node workflows are dispatched on their
+multi-node lines ask for two and four. At its seven-wide peak the single-board
+workflow holds seven boards; the 2- and 4-node workflows are dispatched on their
 own and add to that only when run at the same time.
 
 The `PERF_TIMEOUT_PER_FILE` each entry is given covers a cold checkpoint load off

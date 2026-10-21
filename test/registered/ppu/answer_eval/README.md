@@ -26,14 +26,14 @@ it at all. Configs that agree on both do share a suite — Qwen3.5's four, GLM-5
 three and MiniMax-M2.7's three do — and the caller picks which one by naming its
 config. Two models appear twice for the same reason: the 2.4T checkpoint's two
 quantisations need 2 nodes and 4, and Kimi-K2.6's W8A8-INT8 needs 2 where its
-other two formats need 1.
+other format needs 1.
 
 | Suite | Test file | Model | Configs | Devices |
 | --- | --- | --- | --- | --- |
 | `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 2 | 1 |
 | `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B | 4 | 8 |
 | `nightly-answer-8-glm52-ppu` | `test_ppu_glm52_answer.py` | GLM-5.2 | 3 | 8 |
-| `nightly-answer-8-kimi26-ppu` | `test_ppu_kimi_k26_answer.py` | Kimi-K2.6 | 2 | 8 |
+| `nightly-answer-8-kimi26-ppu` | `test_ppu_kimi_k26_answer.py` | Kimi-K2.6 | 1 | 8 |
 | `nightly-answer-8-minimax27-ppu` | `test_ppu_minimax_m27_answer.py` | MiniMax-M2.7 | 3 | 8 |
 | `nightly-answer-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_answer.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 16, over 2 nodes |
 | `nightly-answer-16-kimi26-ppu` | `test_ppu_kimi_k26_w8a8_answer.py` | Kimi-K2.6-W8A8-INT8 | 1 | 16, over 2 nodes |
@@ -241,9 +241,9 @@ everything around the test differs, while the test itself does not:
   PPUs so that no second pod can land on the board and contend for a device with
   a server that has already claimed most of its memory. The internal btv1.5 plan
   schedules its answer cases as `1node8ppu` for the same reason.
-- **Lanes, not a matrix.** Twelve entries, one job id each, arranged into eight
-  lanes so at most eight boards are held at once: four lanes carry two entries,
-  the second declaring `needs` on the first, and four carry one. A matrix would
+- **Lanes, not a matrix.** Eleven entries, one job id each, arranged into eight
+  lanes so at most eight boards are held at once: three lanes carry two entries,
+  the second declaring `needs` on the first, and five carry one. A matrix would
   have been the obvious shape and was the first one tried, and it does not work
   above `max-parallel: 1`. `flytiger-eco/ppu-distributed-action` builds both the
   NAS directory it stages the source to and the name of the K8s job it submits
@@ -263,11 +263,11 @@ everything around the test differs, while the test itself does not:
   `nightly-answer-8-glm52-ppu`: the slug is what names the NAS results directory
   and the artifact, and `upload-artifact@v4` fails outright on a repeated name.
   `--suite` still receives the registered name.
-- **One body, twelve jobs.** The two long shell bodies each entry runs — the
+- **One body, eleven jobs.** The two long shell bodies each entry runs — the
   board-side one that installs, warms and calls `run_suite.py`, and the
   orchestration-side one that carries the report off the NAS — are
   `scripts/ci/ppu/run_answer_suite_board.sh` and
-  `scripts/ci/ppu/collect_answer_evidence.sh`, so twelve jobs do not carry twelve
+  `scripts/ci/ppu/collect_answer_evidence.sh`, so eleven jobs do not carry eleven
   copies of them; what the workflow still states per entry is the K8s action's
   inputs. A local composite action would have been the tidier shape and does not
   work on this runner group: it drives the job through a container hook, so
@@ -279,7 +279,7 @@ everything around the test differs, while the test itself does not:
   because the runner downloads that itself, which is why the K8s action works at
   all — and it is the same split filesystem that silently drops
   `GITHUB_STEP_SUMMARY` here. Everything the pod needs that does not vary between
-  entries is exported by the board script rather than repeated in twelve
+  entries is exported by the board script rather than repeated in eleven
   `extra_env` strings; the secrets, the provenance of the run and the four values
   that do vary are passed.
 - **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
@@ -642,7 +642,9 @@ the executed set is what `register_ppu_ci` declares.
 ## The ported 144GiB entries
 
 Twelve configs were added from the internal btv1.5 `answer_144g` plan, against
-checkpoints already staged on this NAS. Each row names the internal
+checkpoints already staged on this NAS; eleven remain, the `kimi2.6-w4a8-int8`
+entry having been removed when its format proved unservable on this board line
+(see the departures below). Each row names the internal
 `llm_infer_sglang_evalscope` case its server parameters came from, and the
 checkpoint as measured on `na131t-ppu810e-test001`, which mounts the same NAS the
 cluster does. Every one of them holds exactly the number of shards its own
@@ -655,7 +657,6 @@ index, not from the `-of-NNNNN` suffix the filenames carry, which on
 | `glm5.2-w8a8-int8` | `-8-glm52-` | `glm-5.1-w8a8-int8_3001` | `v5.2/GLM-5.2-W8A8-INT8` | 704.4 GiB, 282 shards |
 | `glm5.2-mxfp4-fp8` | `-8-glm52-` | `glm-5.2-fp8_3001` | `v5.2/GLM-5.2-MXFP4-FP8` | 383.0 GiB, 282 |
 | `glm5.2-fp8-channelwise` | `-8-glm52-` | `glm-5.2-fp8_channel_cp_3001` | `v5.2/GLM-5.2-FP8-Channelwise` | 704.4 GiB, 282 |
-| `kimi2.6-w4a8-int8` | `-8-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-MoE-Quant-W-INT4-PerChannel-A-INT8-PerToken` | 495.7 GiB, 64 |
 | `kimi2.6-mxfp4-fp8` | `-8-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-MXFP4-FP8` | 516.2 GiB, 64 |
 | `kimi2.6-w8a8-int8` | `-16-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-Quant-W-INT8-PerChannel-A-INT8-PerToken` | 968.3 GiB, 64 |
 | `minimax2.7-fp8-channelwise` | `-8-minimax27-` | `minimax-m3-bf16_3001` | `M2.7/MiniMax-M2.7-FP8-Channelwise` | 214.7 GiB, 86 |
@@ -665,7 +666,7 @@ index, not from the `-of-NNNNN` suffix the filenames carry, which on
 | `qwen3.5-397b-mxfp4-fp8` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-MXFP4-FP8` | 215.6 GiB, 94 |
 | `qwen3.8-2.4t-a95b-mxfp4-fp8` | `-16-` | `qwen3.7-mxfp4-fp8_3001` | `v3.8/Qwen3.8-2.4T-A95B-...-MXFP4-...` | 1272.1 GiB, 213 |
 
-Seven of the twelve entries name a source case that does not carry their
+Six of the eleven entries name a source case that does not carry their
 checkpoint, in four groups. That is the plan's own situation rather than a
 substitution:
 
@@ -676,12 +677,13 @@ substitution:
   `glm-5-w8a8-int8_3001`, so the W8A8 serving line is stable across those
   revisions and is what this entry carries, with `quantization` named for the
   reason given under the departures below.
-- **Kimi-K2.6, the W4A8 and MXFP4 formats.** `kimi-k2.6-w8a8-int8_3001` is the
-  only Kimi answer case, and its own format is the third entry below, so for
-  these two what carries over is everything that is not format-specific — TP=8,
-  `fa3` prefill against `flashmla` decode, memory fraction 0.8. The MXFP4 entry
-  leaves the quantization flag off, which its checkpoint's own declaration
-  covers; the W4A8 one is the open gap recorded under the departures below.
+- **Kimi-K2.6, the MXFP4 format.** `kimi-k2.6-w8a8-int8_3001` is the only Kimi
+  answer case, and its own format is the W8A8 entry below, so what carries over
+  here is everything that is not format-specific — TP=8, `fa3` prefill against
+  `flashmla` decode, memory fraction 0.8. The entry leaves the quantization flag
+  off, which its checkpoint's own declaration covers; the W4A8 sibling that once
+  shared this derivation is removed, the gap recorded under the departures
+  below.
 - **MiniMax-M2.7, all three formats.** `minimax-m3-bf16_3001` is the only MiniMax
   case on the sglang side; `minimax-m3-mxfp4-fp8_3001` exists on the vllm side
   only. Its parameters are TP=8, `fa3`, 0.8, and `watchdog_timeout` 600, none of
@@ -723,14 +725,16 @@ deterministic generation line already described in
   entries failed before the flag was added (run 34085800820). Naming the format
   routes the MoE layers to the `w8a8_int8` implementation the Qwen3.5 entry has
   been serving this suite with.
-- `kimi2.6-w4a8-int8` has no equivalent escape and is an open gap. Its checkpoint
-  is W-INT4-per-channel against A-INT8-per-token, `BASE_QUANTIZATION_METHODS`
-  offers no `w4a8_int8`, and `w4afp8` is a different activation type, so the
-  loader's own choice of `mixed_precision_w4` is the only route available. That
-  route reached the board and failed inside the kernel — `[ACEXT][ERROR] CUDA
+- `kimi2.6-w4a8-int8` had no equivalent escape, and the gap is why the entry is
+  gone. Its checkpoint was W-INT4-per-channel against A-INT8-per-token,
+  `BASE_QUANTIZATION_METHODS` offers no `w4a8_int8`, and `w4afp8` is a different
+  activation type, so the loader's own choice of `mixed_precision_w4` was the
+  only route available. That route reached the board and failed inside the
+  kernel — `[ACEXT][ERROR] CUDA
   runtime error: invalid argument` from `compute_occupancy.h:59`, under
   `acext.fusedmoe_wrapper` — which no server parameter this schema carries can
-  redirect.
+  redirect. The entry reddened on `server_start_failed` on every run and was
+  dropped from the suite.
 - `dist_timeout` is carried although the plan's cases pass none, taking the value
   the btv1.5 `server_cmds` set uses for each model; the reasoning, and the reason
   it is not paired with `watchdog_timeout` the way those commands pair it, is under
@@ -792,8 +796,8 @@ each node loads roughly its own half, so warming the whole tree on both nodes
 would read twice what the group needs and double the run's NAS traffic. Whether
 the halves are clean enough for that to matter is not measured.
 
-**What was not ported.** The NAS stages 25 checkpoints; 15 are covered, the twelve
-ported here plus the three that already had entries. The remaining ten fall into
+**What was not ported.** The NAS stages 25 checkpoints; 14 are covered, the eleven
+ported here plus the three that already had entries. The remaining eleven fall into
 two classes. Each architecture below was read from the checkpoint's own
 `config.json` on `na131t-ppu810e-test001`, and each claim of a missing registration
 is that the name appears nowhere under `python/sglang/`.
@@ -835,8 +839,7 @@ quantization intent, and deliberately departs in two places:
   0, top-p 1) instead of the sampling values the internal cases carry, because a
   rule-based verdict must be reproducible;
 - serving parameters that the reviewed schema does not model — `page_size`,
-  `stream_interval`, `max_running_requests`, `cuda_graph_max_bs_decode`,
-  `dist_timeout`, and the `disable_*` flags — are
+  `stream_interval`, and `cuda_graph_max_bs_decode` — are
   left at SGLang defaults. `validate_test_config` accepts exactly the reviewed
   parameter set, so adding one of them is a schema change with its own review
   rather than a silent config edit.
@@ -1079,7 +1082,7 @@ the passing count. Never add a case to `known_failures` to silence a `critical`
 finding — severity keeps that impossible by construction, and doing so would
 hide a real regression.
 
-Fifteen of the seventeen configs carry a baseline. Fourteen are seeded from the
+Fifteen of the sixteen configs carry a baseline. Fourteen are seeded from the
 temperature-0 verdicts of the v0.5.13 Answer PR-stack. The twelve M890P entries
 take their `known_failures` and `min_score` from the reference grading — run
 `34100574370` for the ten single-board `-144g` entries, run `34944181107` for
@@ -1100,16 +1103,23 @@ miss, `henan-bordering-provinces`, is a model-severity `fact_rule_failed` with
 a known model-capability miss on `qwen3.8/27b-bf16-144g`. See the cross-version
 comparison below.
 
-The remaining two configs stay unseeded and therefore strict, because no run has
-yet produced a clean, stable model verdict for them.
-`kimi2.6/w4a8-int8-144g.json` reddens on `server_start_failed` — the open ACEXT
-W4A8 kernel gap, infrastructure that is never eligible for `known_failures`.
+One baseline has moved since that seeding. `glm5.2/mxfp4-fp8-144g.json` drops
+from a strict 10 to `min_score` 9 with `red-ball-probability` allowlisted: on
+the current stack the checkpoint misses that probability probe in the
+non-thinking direct-answer mode, a model-severity `fact_rule_failed` rather
+than a serving fault.
+
+The remaining config stays unseeded and therefore strict, because no run has
+yet produced a clean, stable model verdict for it.
 `kimi2.6/w8a8-int8-144g-2n.json` is not stable across v0.5.18 runs: it graded
 10/10 on run `34961981320` but 6/10 on the probe run `35315230192`, where
 `spring-dawn-poem` exhausted its whole 8192-token budget in reasoning and
 returned an empty answer at `finish_reason=length` — a `critical` finding, never
-eligible for `known_failures`. Each earns its first baseline only from a clean,
-repeatable M890P probe, not by silencing a critical.
+eligible for `known_failures`. It earns its first baseline only from a clean,
+repeatable M890P probe, not by silencing a critical. The other formerly unseeded
+config, `kimi2.6/w4a8-int8-144g.json`, reddened on `server_start_failed` through
+the open ACEXT W4A8 kernel gap — infrastructure that was never eligible for
+`known_failures` — and is removed with the entry itself.
 
 ## v0.5.18 cross-version regression comparison
 
@@ -1172,7 +1182,7 @@ The remaining four probe entries had no comparable v0.5.13 verdict in this set:
   critical, and is seeded from this run (above).
 - `kimi2.6-w4a8-int8` reddened on `server_start_failed` (ACEXT W4A8 kernel gap)
   and `kimi2.6-w8a8-int8-2n` carried a `critical` token-exhaustion finding; both
-  stay unseeded (above).
+  were unseeded at the time, and the w4a8 entry has since been removed.
 
 The two retired ZW810E (`-96g`) configs are not part of this fifteen-entry M890P
 probe; they keep their own measured baselines and are excluded from the probe's

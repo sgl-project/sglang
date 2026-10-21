@@ -857,92 +857,12 @@ jobs:
           overwrite: true
           retention-days: 30
 
-  # Lane G: both single-board Kimi formats, one after the other.
-  ans-kimi26-w4a8:
-    name: kimi2.6-w4a8-int8 (btv1.5)
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 240
-    steps:
-      - name: Checkout code
-        id: checkout
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 2
-      - name: Wait out the git egress congestion
-        if: steps.checkout.outcome == 'failure'
-        shell: bash
-        run: sleep 90
-      - name: Checkout code (second attempt)
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 2
-      - name: Observe compute Pod environment
-        continue-on-error: true
-        shell: bash
-        env:
-          PPU_ENV_JOB: ${{ github.job }}
-          PPU_ENV_EXPECTED_PODS: "1"
-          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-w4a8-int8/environment-pods.tsv
-        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
-      - name: Run kimi2.6-w4a8-int8 via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
-        with:
-          image: ${{ env.PPU_BASE_IMAGE }}
-          nnodes: 0
-          nproc_per_node: 8
-          node_selector: "board-type=ZW-M890P"
-          command: bash /workspace/source/scripts/ci/ppu/run_answer_suite_board.sh
-          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-w4a8-int8/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com,GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ANSWER_SUITE=nightly-answer-8-kimi26-ppu,ANSWER_TIMEOUT_PER_FILE=10800,SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json,SGLANG_PPU_ANSWER_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-w4a8-int8"
-          container_options: |
-            privileged: true
-            host_ipc: true
-            host_network: true
-            shm_size: 8Gi
-          timeout_minutes: 210
-      - name: Collect Answer evidence
-        if: always()
-        shell: bash
-        env:
-          ENTRY: kimi2.6-w4a8-int8
-          ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-w4a8-int8
-        run: bash scripts/ci/ppu/collect_answer_evidence.sh
-      - name: Upload Answer evidence
-        id: upload_evidence
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-answer-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ppu-answer-artifacts/
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Wait out the artifact egress congestion
-        if: always() && steps.upload_evidence.outcome == 'failure'
-        shell: bash
-        run: sleep 30
-      - name: Upload Answer evidence (second attempt)
-        if: always() && steps.upload_evidence.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-answer-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ppu-answer-artifacts/
-          if-no-files-found: warn
-          # The first attempt can be reset after it has created the
-          # artifact, and v4 refuses a name it already holds.
-          overwrite: true
-          retention-days: 30
-
+  # Lane G: the single-board Kimi format, alone. Its W4A8-INT8 sibling is gone
+  # rather than kept red: that format's kernels route through ACEXT, which the
+  # ZW-M890P stack does not support, so the entry never got past
+  # server_start_failed.
   ans-kimi26-mxfp4:
     name: kimi2.6-mxfp4-fp8 (btv1.5)
-    needs: ans-kimi26-w4a8
     if: ${{ !cancelled() }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1110,7 +1030,7 @@ jobs:
 
   publish-trend-rows:
     name: 归档趋势原始行（CPU）
-    needs: [qwen38-27b-bf16, ans-minimax27-mxfp4, qwen35-397b-w8a8, glm52-w8a8, glm52-fp8-chan, qwen35-397b-mxfp4, qwen35-397b-fp8-chan, glm52-mxfp4, minimax27-fp8-chan, ans-kimi26-w4a8, ans-kimi26-mxfp4, minimax27-w8a8]
+    needs: [qwen38-27b-bf16, ans-minimax27-mxfp4, qwen35-397b-w8a8, glm52-w8a8, glm52-fp8-chan, qwen35-397b-mxfp4, qwen35-397b-fp8-chan, glm52-mxfp4, minimax27-fp8-chan, ans-kimi26-mxfp4, minimax27-w8a8]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
