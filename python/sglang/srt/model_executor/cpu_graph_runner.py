@@ -2269,38 +2269,25 @@ class CPUGraphRunner:
             padded_num_tokens = self._get_prefill_padding_bucket(raw_num_tokens)
 
             if padded_num_tokens is not None and padded_num_tokens in graph_map:
-                if self.prefill_dynamic_graph is not None:
-                    using_dynamic_fallback = True
-                    if (
-                        use_batch_one_graph
-                        and self.prefill_dynamic_graph_bs1 is not None
-                    ):
-                        compiled_fn = self.prefill_dynamic_graph_bs1
-                    else:
-                        compiled_fn = self.prefill_dynamic_graph
-                        forward_batch = self._prepare_dynamic_prefill_batch(
-                            forward_batch
-                        )
-                else:
-                    compiled_fn = graph_map[padded_num_tokens]
-                    pad_len = padded_num_tokens - raw_num_tokens
-                    padded_fb = copy.copy(forward_batch)
-                    padded_fb.input_ids = F.pad(
-                        forward_batch.input_ids, (0, pad_len), value=0
+                compiled_fn = graph_map[padded_num_tokens]
+                pad_len = padded_num_tokens - raw_num_tokens
+                padded_fb = copy.copy(forward_batch)
+                padded_fb.input_ids = F.pad(
+                    forward_batch.input_ids, (0, pad_len), value=0
+                )
+                padded_fb.positions = F.pad(
+                    forward_batch.positions, (0, pad_len), value=0
+                )
+                if forward_batch.mrope_positions is not None:
+                    padded_fb.mrope_positions = F.pad(
+                        forward_batch.mrope_positions, (0, pad_len), value=0
                     )
-                    padded_fb.positions = F.pad(
-                        forward_batch.positions, (0, pad_len), value=0
+                if forward_batch.out_cache_loc is not None:
+                    padded_fb.out_cache_loc = F.pad(
+                        forward_batch.out_cache_loc, (0, pad_len), value=0
                     )
-                    if forward_batch.mrope_positions is not None:
-                        padded_fb.mrope_positions = F.pad(
-                            forward_batch.mrope_positions, (0, pad_len), value=0
-                        )
-                    if forward_batch.out_cache_loc is not None:
-                        padded_fb.out_cache_loc = F.pad(
-                            forward_batch.out_cache_loc, (0, pad_len), value=0
-                        )
-                    forward_batch = padded_fb
-            else:
+                forward_batch = padded_fb
+            elif self.prefill_dynamic_graph is not None:
                 using_dynamic_fallback = True
                 if use_batch_one_graph and self.prefill_dynamic_graph_bs1 is not None:
                     compiled_fn = self.prefill_dynamic_graph_bs1

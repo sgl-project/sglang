@@ -551,6 +551,30 @@ class TestCPUGraph(CustomTestCase):
         self.assertIs(selected[0][0], runner.prefill_dynamic_graph)
         self.assertIs(selected[0][1], forward_batch)
 
+    def test_prefill_padding_bucket_is_preferred_over_dynamic_fallback(self):
+        runner = _make_cpu_graph_runner()
+        padded_graph = object()
+        dynamic_graph = object()
+        runner.prefill_graphs = {256: padded_graph}
+        runner.prefill_dynamic_graph = dynamic_graph
+        runner.prefill_dynamic_batch_template = None
+        runner.enable_torch_compile = False
+
+        # 240 tokens can be padded to 256 (diff 16 <= 64 and <= 0.20)
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=240)
+        selected = []
+
+        def run_prefill_once(compiled_fn, batch):
+            selected.append((compiled_fn, batch))
+            return object()
+
+        with patch.object(runner, "_run_prefill_once", side_effect=run_prefill_once):
+            runner._execute_prefill_graph(forward_batch)
+
+        # Should select the padded static bucket, NOT dynamic_graph
+        self.assertIs(selected[0][0], padded_graph)
+        self.assertEqual(selected[0][1].input_ids.shape[0], 256)
+
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",
