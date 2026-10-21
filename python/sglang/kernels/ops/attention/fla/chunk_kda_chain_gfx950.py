@@ -194,7 +194,7 @@ def can_use_kda_chain_prefill(
         return False
     num_sequences = len(cu_seqlens) - 1
     measured_cell = q.shape[1] == 16384 and (
-        (q.shape[-2] == 16 and num_sequences in (3, 4))
+        (q.shape[-2] == 16 and num_sequences == 3)
         or (q.shape[-2] == 8 and num_sequences in (2, 3, 4))
     )
     return (

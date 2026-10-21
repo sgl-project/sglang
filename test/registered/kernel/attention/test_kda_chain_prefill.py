@@ -217,9 +217,7 @@ def test_graph_replay():
     assert torch.equal(args["initial_state"], first_state)
 
 
-@pytest.mark.parametrize(
-    "heads,num_sequences", [(8, 2), (8, 3), (8, 4), (16, 3), (16, 4)]
-)
+@pytest.mark.parametrize("heads,num_sequences", [(8, 2), (8, 3), (8, 4), (16, 3)])
 def test_dispatch_supported_cells(heads, num_sequences):
     lengths = [16384 // num_sequences] * num_sequences
     lengths[-1] += 16384 - sum(lengths)
@@ -247,7 +245,14 @@ def test_dispatch_supported_cells(heads, num_sequences):
 
 @pytest.mark.parametrize(
     "mutation",
-    ["disabled", "wrong_dtype", "wrong_heads", "fixed", "intermediate"],
+    [
+        "disabled",
+        "wrong_dtype",
+        "wrong_heads",
+        "fixed",
+        "intermediate",
+        "unmeasured_cell",
+    ],
 )
 def test_dispatch_fallback(mutation):
     inputs = _inputs([8192, 8192], heads=8)
@@ -261,6 +266,8 @@ def test_dispatch_fallback(mutation):
         args["cu_seqlens"] = None
     elif mutation == "intermediate":
         output_intermediate_states = True
+    elif mutation == "unmeasured_cell":
+        args = _clone_inputs(_inputs([4096] * 4, heads=16))
     with ExitStack() as stack:
         stack.enter_context(
             envs.SGLANG_OPT_KDA_CHAIN_PREFILL.override(mutation != "disabled")
