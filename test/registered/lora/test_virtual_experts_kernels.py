@@ -25,6 +25,8 @@ Usage:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -181,6 +183,134 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                     torch.testing.assert_close(
                         mapping, original_mapping, rtol=0, atol=0
                     )
+
+    @unittest.skipUnless(is_cuda(), "Stock virtual LoRA hook fixture requires CUDA")
+    def test_gate_up_hook_uses_each_stacked_a_projection(self):
+        """Independent gate/up A matrices reach their matching B and output views."""
+        from sglang.kernels.ops.lora.moe import virtual_experts
+        from sglang.srt.layers.moe.moe_runner.triton_utils import override_config
+        from sglang.srt.lora.lora_moe_runners import build_lora_hooks
+
+        tokens, topk, experts, rank, hidden, intermediate = 3, 2, 2, 16, 64, 32
+        dtype = torch.float16
+        x = torch.zeros((tokens, hidden), device=self.device, dtype=dtype)
+        x[:, 0] = torch.arange(1, tokens + 1, device=self.device, dtype=dtype)
+        ids = torch.tensor(
+            [[-1, 1], [0, 1], [-1, -1]], device=self.device, dtype=torch.int32
+        )
+        weights = torch.tensor(
+            [[float("nan"), 0.5], [0.25, 0.75], [float("nan"), float("nan")]],
+            device=self.device,
+        )
+        mapping = torch.tensor([0, 1, 0], device=self.device, dtype=torch.int32)
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        real_add = virtual_experts.merged_experts_fused_moe_lora_add
+        # The common-A and non-gated layouts must retain one full-width call.
+        for a_parts, b_parts in ((2, 2), (1, 2), (1, 1)):
+            for shared_outer in (False, True):
+                with self.subTest(
+                    a_parts=a_parts, b_parts=b_parts, shared_outer=shared_outer
+                ):
+                    a = torch.zeros(
+                        (2, 1 if shared_outer else experts, a_parts * rank, hidden),
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                    b = torch.zeros(
+                        (2, experts, b_parts * intermediate, rank),
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                    for slot in range(2):
+                        for expert in range(a.shape[1]):
+                            a[slot, expert, 0, 0] = 2 + slot + expert
+                            if a_parts == 2:
+                                a[slot, expert, rank, 0] = 4 + slot + expert
+                        for expert in range(experts):
+                            b[slot, expert, :intermediate, 0] = 5 + slot + expert
+                            if b_parts == 2:
+                                b[slot, expert, intermediate:, 0] = 7 + slot + expert
+                    output = torch.full(
+                        (tokens, topk, b_parts * intermediate),
+                        0.5,
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                    safe_ids = ids.clamp_min(0)
+                    a_ids = torch.zeros_like(ids) if shared_outer else safe_ids
+                    selected_a = a[mapping[:, None], a_ids]
+                    selected_b = b[mapping[:, None], safe_ids]
+                    shrunk = torch.einsum(
+                        "mh,mkrh->mkr", x.float(), selected_a.float()
+                    ).to(dtype)
+                    if a_parts == 2:
+                        delta = torch.einsum(
+                            "mkpr,mkpir->mkpi",
+                            shrunk.view(tokens, topk, 2, rank).float(),
+                            selected_b.view(
+                                tokens, topk, 2, intermediate, rank
+                            ).float(),
+                        ).flatten(2)
+                    else:
+                        delta = torch.einsum(
+                            "mkr,mkir->mki", shrunk.float(), selected_b.float()
+                        )
+                    delta = delta.to(dtype).masked_fill((ids < 0).unsqueeze(-1), 0)
+                    expected = output + delta
+                    info = SimpleNamespace(
+                        max_lora_rank=rank,
+                        has_active_lora=True,
+                        lora_use_virtual_experts=True,
+                        experts_shared_outer_loras=shared_outer,
+                        gate_up_lora_a_weights=a,
+                        gate_up_lora_b_weights=b,
+                        token_lora_mapping=mapping,
+                    )
+                    calls = []
+
+                    def observed_add(**kwargs):
+                        projected = kwargs["output"]
+                        self.assertEqual(projected.stride(-2), output.shape[-1])
+                        self.assertEqual(
+                            projected.untyped_storage().data_ptr(),
+                            output.untyped_storage().data_ptr(),
+                        )
+                        calls.append((projected.data_ptr(), kwargs["lora_a"].shape[2]))
+                        return real_add(**kwargs)
+
+                    with (
+                        override_config(config),
+                        patch(
+                            "sglang.srt.lora.lora_moe_runners.get_is_capture_mode",
+                            return_value=False,
+                        ),
+                        patch.object(
+                            virtual_experts,
+                            "merged_experts_fused_moe_lora_add",
+                            observed_add,
+                        ),
+                    ):
+                        hooks = build_lora_hooks(x, info, ids)
+                        hooks.after_gate_up(x, output, weights, ids)
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    self.assertEqual(len(calls), a_parts)
+                    self.assertEqual(calls[0], (output.data_ptr(), rank))
+                    if a_parts == 2:
+                        self.assertEqual(
+                            calls[1],
+                            (
+                                output.data_ptr()
+                                + intermediate * output.element_size(),
+                                rank,
+                            ),
+                        )
 
     def test_positive_topk_remapped_correctly(self):
         """Sanity: valid (non-negative) IDs follow the

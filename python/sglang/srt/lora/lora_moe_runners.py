@@ -350,19 +350,25 @@ def _add_lora_gate_up_delta(
         lora_b_stacked = [gate_up_b]
 
     if lora_info.lora_use_virtual_experts:
-        merged_experts_fused_moe_lora_add(
-            output=intermediate_cache,
-            hidden_states=hidden_states,
-            lora_a=gate_up_a,
-            lora_b=gate_up_b,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=False,
-            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-            experts_shared_outer_loras_b=False,
-            routing_cache=routing_cache,
+        outputs = (
+            intermediate_cache.split(inter_size, dim=-1)
+            if is_gated
+            else (intermediate_cache,)
         )
+        for output, lora_a, lora_b in zip(outputs, lora_a_stacked, lora_b_stacked):
+            merged_experts_fused_moe_lora_add(
+                output=output,
+                hidden_states=hidden_states,
+                lora_a=lora_a,
+                lora_b=lora_b,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                token_lora_mapping=token_lora_mapping,
+                mul_routed_weight=False,
+                experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+                experts_shared_outer_loras_b=False,
+                routing_cache=routing_cache,
+            )
     else:
         blk = _get_moe_lora_block_config(r)
         fused_moe_lora(
