@@ -20,7 +20,7 @@ Commit `b709e9b5ef7d38913653048f27960e65617da04b` moves `supports_prefill_cp_bcg
 After downloading this branch as above, run from a SGLang checkout:
 
 ```bash
-python3 /tmp/pr43182-move-proof/b709e9b5ef7d38913653048f27960e65617da04b.py
+python3 /tmp/pr43182-move-proof/b709e9b5e.py
 ```
 
 The recipe uses the relocation primitives, the package import path (rather than importing `.__init__`), and an explicit blank-line normalization. See `support-api-output.log` for its byte-for-byte PASS result.
