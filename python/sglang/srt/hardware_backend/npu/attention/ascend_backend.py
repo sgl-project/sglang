@@ -416,17 +416,6 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
-            # FIA host IntArrays consume the CPU mirror; keep it on instead of
-            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia:
-                logger.warning(
-                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
-                    "host-bound attention paths present; keeping the mirror."
-                )
-            else:
-                self.needs_cpu_seq_lens = False
-
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
@@ -448,6 +437,34 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = get_parallel().attn_cp_size
+
+        # Static gate for the scheduler's per-step pinned-D2H seq_lens_cpu
+        # mirror. Under False this backend sources the host lengths itself;
+        # paths that cannot run mirrorless force the mirror back on.
+        _env_opt_out = not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
+        # DSA models dispatch every forward mode to forward_sparse (device
+        # lengths), so the MLA host-bound check does not apply to them.
+        self.is_dsa_model = is_deepseek_dsa(model_runner.model_config.hf_config)
+        _host_bound = bool(
+            (self.use_mla and not self.is_dsa_model)  # atb MLA: SymInt[] host-only
+            or self.use_fia  # Preserve the upstream FIA host-length guard
+            or self.use_fias_v2_bsnd  # FIA v2 actual_seq_kvlen host-only
+            or self.is_hybrid_swa  # SWA table/mask paths read host max_len
+            or getattr(self, "use_alibi", False)  # attn_alibi consumes host lengths
+            or get_parallel().dcp_enabled  # DCP local-KV metadata is host-built
+            or get_parallel().attn_cp_size > 1  # CP attention is FIA-host-only
+            or model_runner.server_args.enable_mixed_chunk  # forward_mixed = FIA TND
+            or (
+                model_runner.spec_algorithm is not None
+                and model_runner.spec_algorithm.is_dflash_family()
+            )  # DFlash/DSpark publish the verify KV boundary on CPU
+        )
+        self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
+        if _env_opt_out and _host_bound:
+            logger.warning(
+                "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+                "host-bound attention paths present; keeping the mirror."
+            )
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -515,15 +532,26 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
+        if in_capture:
+            seq_lens_cpu = forward_batch.seq_lens.cpu()
+        elif forward_batch.seq_lens_cpu is None and not self.needs_cpu_seq_lens:
+            if self.is_dsa_model:
+                # DSA replay has no host-mirror consumer: attention reads
+                # device lengths and the gather width comes from
+                # max_seq_len_host or the static capture width.
+                seq_lens_cpu = None
+            else:
+                # Plain MHA opt-out: publish the mirror from the device
+                # seq_lens; graph rebind paths may still bind host IntArrays.
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+                forward_batch.seq_lens_cpu = seq_lens_cpu
+        else:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            seq_lens_cpu=(
-                forward_batch.seq_lens.cpu()
-                if in_capture
-                else forward_batch.seq_lens_cpu
-            ),
+            seq_lens_cpu=seq_lens_cpu,
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
@@ -585,6 +613,16 @@ class AscendAttnBackend(AttentionBackend):
                     .contiguous()
                 )
         else:
+            if (
+                forward_batch.seq_lens is not None
+                and forward_batch.seq_lens_cpu is None
+                and not forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                # Mirrorless opt-out (non-decode only): derive the mirror from
+                # the device seq_lens and publish it back so host consumers
+                # (FIA host arrays, block-table width) keep working; decode
+                # batches skip the D2H entirely (device lengths only).
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :: self.page_size
@@ -605,6 +643,10 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.seq_lens_cpu is not None:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        else:
+            # Mirrorless decode: leave unset so consumers fall back to the
+            # device seq_lens (per-step draft offset applied below).
+            self.forward_metadata.seq_lens_cpu_int = None
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
         # only rebind the Host-side IntArray when captured as a Python list.
@@ -945,10 +987,12 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
+        # Compute the host-side KV lengths visible to this attention step. Target
+        # verify adds the draft block except for DFlash, whose seq_lens_cpu already
+        # includes it; speculative decode adds tokens through the current draft step.
+        attention_kv_lens_cpu = None
+        max_len = None
         if seq_lens_cpu is not None:
-            # Compute the host-side KV lengths visible to this attention step. Target
-            # verify adds the draft block except for DFlash, whose seq_lens_cpu already
-            # includes it; speculative decode adds tokens through the current draft step.
             attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
             if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
                 attention_kv_lens_cpu = (
@@ -959,47 +1003,66 @@ class AscendAttnBackend(AttentionBackend):
                     attention_kv_lens_cpu + self.speculative_step_id + 1
                 )
             max_len = attention_kv_lens_cpu.max().item()
+        elif max_seq_len_host is not None:
+            # Mirrorless DSA replay: the scheduler publishes the max of the
+            # page-aligned kv_allocated_len (>= committed + alloc reserve,
+            # so it upper-bounds every readable length). Apply the same
+            # speculative offsets as the mirror branch above.
+            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                max_len = max_seq_len_host + self.speculative_step_id + 1
+            else:
+                # draft-extend (and any other spec mode) sees base + draft block
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+        if max_len is not None:
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        else:
+            # No mirror and no bound: static full capture width. Device
+            # consumers bound page reads by the per-request seq_lens, so
+            # stale tail entries are never read.
+            max_seq_pages = metadata.block_tables.shape[1]
 
-            if self.is_hybrid_swa:
-                full_page_locs = self.req_to_token[
-                    req_pool_indices[:bs],
-                    0 : max_len : self.page_size,
-                ]
-                swa_page_table = (
-                    self.full_to_swa_index_mapping[full_page_locs] // self.page_size
-                )
+        if self.is_hybrid_swa:
+            full_page_locs = self.req_to_token[
+                req_pool_indices[:bs],
+                0 : max_len : self.page_size,
+            ]
+            swa_page_table = (
+                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+            )
 
-                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
-                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-                metadata.block_tables_swa[bs:, :].fill_(0)
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
 
-                # Update SWA mask: True = masked out (don't attend), False = attend.
-                # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
-                # (= prefix + block_size) to keep draft KV inside the mask window.
-                if (
-                    forward_mode.is_target_verify()
-                    and _is_dflash_verify(spec_info)
-                    and seq_lens_cpu is not None
-                ):
-                    # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
-                    seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
-                else:
-                    seq_lens_int = seq_lens[:bs].int()
-                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-                indices = self.graph_metadata["swa_indices"]
-                start_exp = starts.unsqueeze(1)
-                seq_exp = seq_lens_int.unsqueeze(1)
-                mask = (indices.unsqueeze(0) < start_exp) | (
-                    indices.unsqueeze(0) >= seq_exp
-                )
-                metadata.swa_mask[:bs, 0, :].copy_(mask)
-                metadata.swa_mask[bs:, :, :].fill_(True)
+            # Update SWA mask: True = masked out (don't attend), False = attend.
+            # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
+            # (= prefix + block_size) to keep draft KV inside the mask window.
+            if (
+                forward_mode.is_target_verify()
+                and _is_dflash_verify(spec_info)
+                and seq_lens_cpu is not None
+            ):
+                # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
+                seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
+            else:
+                seq_lens_int = seq_lens[:bs].int()
+            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+            indices = self.graph_metadata["swa_indices"]
+            start_exp = starts.unsqueeze(1)
+            seq_exp = seq_lens_int.unsqueeze(1)
+            mask = (indices.unsqueeze(0) < start_exp) | (
+                indices.unsqueeze(0) >= seq_exp
+            )
+            metadata.swa_mask[:bs, 0, :].copy_(mask)
+            metadata.swa_mask[bs:, :, :].fill_(True)
+        if max_len is not None:
+            # Dynamic-width gather: copy the reachable page range, zero the tail.
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
                 // self.page_size
             )
-
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif max_seq_len_host is not None:
             # Mirrorless replay (e.g. DSA models): the scheduler publishes the
@@ -1020,18 +1083,14 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
-            total_pages = min(
-                metadata.block_tables.shape[1],
-                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
-            )
-            metadata.block_tables[:bs, :total_pages].copy_(
-                self.req_to_token[
-                    req_pool_indices[:bs],
-                    0 : total_pages * self.page_size : self.page_size,
-                ]
-                // self.page_size
-            )
-            metadata.block_tables[:bs, total_pages:].fill_(0)
+            # Static full-width gather: clamp the source slice to the
+            # req_to_token row width; the squeezed tail columns stay unread.
+            src = self.req_to_token[
+                req_pool_indices[:bs],
+                0 : max_seq_pages * self.page_size : self.page_size,
+            ]
+            metadata.block_tables[:bs, : src.shape[1]].copy_(src // self.page_size)
+
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -3170,7 +3229,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia:
+                if self.use_fia and self.needs_cpu_seq_lens:
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -3232,7 +3291,9 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_out
 
-            if self.use_fia:
+            if self.use_fia and self.needs_cpu_seq_lens:
+                # Mirrorless decode falls through to _npu_paged_attention,
+                # whose context_lens reads the device seq_lens.
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
