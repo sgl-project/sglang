@@ -181,10 +181,6 @@ def build_kv_host_pool(
         kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
             kv_pool, mtp_draft_device_pools
         )
-    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
-        # Striped like the device pool: each shard rank backs up and loads
-        # back only its own pages.
-        kv_host_pool_cls = page_interleave_host_pool_cls(kv_host_pool_cls)
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
         # device pool already resolved the row width.
@@ -194,6 +190,11 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
+    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+        # Transfer descriptors retain the rank's physical buffers; placement
+        # separately narrows logical transfers to that rank's owned rows.
+        kv_host_pool_cls = page_interleave_host_pool_cls(kv_host_pool_cls)
+        kwargs["placement"] = kv_pool.placement
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -2499,6 +2500,13 @@ def _apply_stack_result(
         cache.register_sidecar_pool(sidecar)
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
+    if isinstance(kvcache, PageInterleaveKVPoolMixin):
+        # Packed draft KV and indexer loads finish before target layer zero is
+        # ready. Their independent gather streams must consume that same event.
+        for draft_pool in params.mtp_draft_device_pools:
+            draft_pool.register_layer_transfer_counter(
+                result.cache_controller.layer_done_counter
+            )
     if result.register_req_to_token_counter:
         params.req_to_token_pool.register_layer_transfer_counter(
             result.cache_controller.layer_done_counter
