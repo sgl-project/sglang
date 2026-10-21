@@ -3008,6 +3008,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and not getattr(config, "language_model_only", False),
         )
 
+        if _use_aiter:
+            # V4.1 runs its FP4 routed experts on MXFP8 activations
+            self.mlp.experts.fp8_activations = config.model_type == "deepseek_v41"
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
