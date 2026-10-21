@@ -20,6 +20,13 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.utils.common import json_list_type
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 class Observability(msgspec.Struct):
     """Namespace ``observability``."""
 
@@ -54,6 +61,13 @@ class Observability(msgspec.Struct):
     log_requests_target: A[
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+    ] = None
+    log_requests_retention_days: A[
+        Optional[int],
+        Arg(
+            help="Delete rotated request log files older than this many days. If unset, keep all request log files.",
+            type_parser=_positive_int,
+        ),
     ] = None
     uvicorn_access_log_exclude_prefixes: A[
         List[str],

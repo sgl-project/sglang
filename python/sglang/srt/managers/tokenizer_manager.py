@@ -740,6 +740,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests_level=get_observability().log_requests_level,
             log_requests_format=get_observability().log_requests_format,
             log_requests_target=get_observability().log_requests_target,
+            log_requests_retention_days=get_observability().log_requests_retention_days,
         )
 
         # Dumping
