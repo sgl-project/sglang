@@ -104,8 +104,8 @@ void apply_gguf_moe_weights(torch::Tensor& outputs, const torch::Tensor& weights
     return;
   }
 #ifdef USE_MUSA
-  const at::musa::OptionalMUSAGuard device_guard(device_of(outputs));
-  const musaStream_t stream = at::musa::getCurrentMUSAStream();
+  const c10::musa::OptionalMUSAGuard device_guard(device_of(outputs));
+  const musaStream_t stream = c10::musa::getCurrentMUSAStream();
 #else
   const at::cuda::OptionalCUDAGuard device_guard(device_of(outputs));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
