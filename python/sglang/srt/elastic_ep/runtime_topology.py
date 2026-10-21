@@ -130,6 +130,8 @@ def _membership_incarnation_key(observation: MembershipObservation) -> str:
 
 def publish_membership_observation(
     observation: MembershipObservation,
+    *,
+    deadline_unix_seconds: Optional[float] = None,
 ) -> str:
     """Publish one CPU-only, monotonic membership observation.
 
@@ -148,6 +150,11 @@ def publish_membership_observation(
         raise RuntimeError("Elastic EP requires the global TCPStore.")
 
     with _MEMBERSHIP_PUBLICATION_LOCK:
+        if deadline_unix_seconds is not None and time.time() >= deadline_unix_seconds:
+            raise TimeoutError(
+                "Membership observation expired before publication; "
+                "no state was changed."
+            )
         observation_key = _membership_observation_key(observation)
         encoded = json.dumps(asdict(observation), sort_keys=True).encode()
         if store.check([observation_key]):

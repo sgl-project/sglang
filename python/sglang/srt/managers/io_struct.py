@@ -2391,6 +2391,7 @@ class ObserveElasticEPMembershipReqInput(BaseReq, kw_only=True):
     failed_allocation_incarnation: str
     membership_epoch: int
     submission_id: Optional[str] = None
+    deadline_unix_seconds: Optional[float] = None
 
 
 class ObserveElasticEPMembershipReqOutput(BaseReq, kw_only=True):

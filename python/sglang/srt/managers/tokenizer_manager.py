@@ -213,12 +213,18 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS = 30
+# Mooncake's default reconciliation window can occupy the scheduler for 30
+# seconds. Keep the mutation cutoff beyond that window and reserve the final
+# five seconds for a correlated acknowledgement or rejection to return.
+_ELASTIC_EP_MEMBERSHIP_RESPONSE_TIMEOUT_SECS = 60
+_ELASTIC_EP_MEMBERSHIP_REPLY_GRACE_SECS = 5
 _MEMBERSHIP_OBSERVATION_STAGE_ORDER = {
     stage: index
     for index, stage in enumerate(
         (
             "tokenizer_dispatched",
             "scheduler_handler_entered",
+            "scheduler_deadline_rejected",
             "scheduler_store_started",
             "scheduler_store_completed",
             "tokenizer_acknowledgement_received",
@@ -599,6 +605,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_scheduler_response_timeout = min(
             _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS,
             get_exec().moe.elastic_ep_scale_timeout,
+        )
+        self.elastic_membership_observation_timeout = (
+            _ELASTIC_EP_MEMBERSHIP_RESPONSE_TIMEOUT_SECS
+        )
+        self.elastic_membership_observation_reply_grace = min(
+            _ELASTIC_EP_MEMBERSHIP_REPLY_GRACE_SECS,
+            self.elastic_membership_observation_timeout / 2,
         )
         self.elastic_joining_rank_offset = None
         self.elastic_joining_rank_count = 0
@@ -3981,6 +3994,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 message="Membership observation requires at least one survivor.",
             )
         submission_id = uuid.uuid4().hex
+        response_timeout = self.elastic_membership_observation_timeout
+        mutation_timeout = (
+            response_timeout - self.elastic_membership_observation_reply_grace
+        )
+        deadline_unix_seconds = time.time() + mutation_timeout
         scheduler_obj = ObserveElasticEPMembershipReqInput(
             runtime_instance_id=obj.runtime_instance_id,
             topology_generation=obj.topology_generation,
@@ -3988,14 +4006,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             failed_allocation_incarnation=(obj.failed_allocation_incarnation),
             membership_epoch=obj.membership_epoch,
             submission_id=submission_id,
+            deadline_unix_seconds=deadline_unix_seconds,
         )
         expected_ranks = sorted(survivor_ranks)
         started_at = time.monotonic()
         logger.info(
             "[Elastic EP][membership] submission_started submission_id=%s "
-            "expected_ranks=%s",
+            "expected_ranks=%s mutation_timeout_seconds=%.3f "
+            "response_timeout_seconds=%.3f",
             submission_id,
             expected_ranks,
+            mutation_timeout,
+            response_timeout,
         )
         if not hasattr(self, "_membership_observation_progress"):
             self._membership_observation_progress = {}
@@ -4009,7 +4031,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ] = await self.observe_elastic_ep_membership_communicator(
                 scheduler_obj,
                 fan_out=len(survivor_ranks),
-                timeout=self.elastic_scheduler_response_timeout,
+                timeout=response_timeout,
             )
         except FanOutTimeoutError as exc:
             received_ranks = sorted(

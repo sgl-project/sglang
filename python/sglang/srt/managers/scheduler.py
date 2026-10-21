@@ -6183,6 +6183,28 @@ class Scheduler(
             recv_req.submission_id,
             responder_rank,
         )
+        if (
+            recv_req.deadline_unix_seconds is not None
+            and time.time() >= recv_req.deadline_unix_seconds
+        ):
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_deadline_rejected"
+            )
+            logger.warning(
+                "[Elastic EP][membership] deadline_rejected submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=(
+                    "Membership observation expired before scheduler processing; "
+                    "no state was changed."
+                ),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+            )
         try:
             self._send_membership_observation_progress(
                 recv_req, responder_rank, "scheduler_store_started"
@@ -6199,6 +6221,7 @@ class Scheduler(
                 rank=recv_req.rank,
                 failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
                 membership_epoch=recv_req.membership_epoch,
+                deadline_unix_seconds=recv_req.deadline_unix_seconds,
             )
             self._send_membership_observation_progress(
                 recv_req, responder_rank, "scheduler_store_completed"
@@ -6208,6 +6231,22 @@ class Scheduler(
                 "responder_rank=%s",
                 recv_req.submission_id,
                 responder_rank,
+            )
+        except TimeoutError as exc:
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_deadline_rejected"
+            )
+            logger.warning(
+                "[Elastic EP][membership] deadline_rejected submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=str(exc),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
             )
         except (RuntimeError, ValueError) as exc:
             logger.warning(
