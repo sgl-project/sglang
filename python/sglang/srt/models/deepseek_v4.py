@@ -1036,6 +1036,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
@@ -3007,6 +3008,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and not getattr(config, "language_model_only", False),
         )
 
+        if _use_aiter:
+            # V4.1 runs its FP4 routed experts on MXFP8 activations
+            self.mlp.experts.fp8_activations = config.model_type == "deepseek_v41"
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -4573,8 +4578,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             if backend is None or not backend.is_flashinfer_cutedsl():
                 continue
             if method.block_fp8_as_mxfp8:
-                # Small shapes and deterministic execution keep their pinned tactic.
-                method.mxfp8_prefill_autotune_min_tokens = 4096
+                # Deterministic execution keeps its pinned tactic.
+                method.mxfp8_prefill_autotune_min_tokens = 1
             weight = layer.weight
             scale = layer.weight_scale_inv_swizzled
             key = (

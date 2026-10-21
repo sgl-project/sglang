@@ -8,16 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     _wait_for_gpu_idle_in_ci,
     is_in_ci,
-    try_cached_model,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
@@ -29,12 +29,12 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
 
     @classmethod
     def setUpClass(cls):
-        # Use the gated-model credential only in this test and its server children.
-        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+        cls.model = try_cached_muse_spark_model(MODEL_PATH)
+        # A complete local checkpoint needs no gated-model credential.
+        if cls.model == MODEL_PATH and (token := os.environ.get("HF_MUSE_SPARK_TOKEN")):
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
-        cls.model = try_cached_model(MODEL_PATH)
         cls.other_args = [
             "--tp-size",
             "4",
@@ -57,7 +57,7 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
             "--speculative-algorithm",
             "DFLASH",
             "--speculative-draft-model-path",
-            try_cached_model(DRAFT_MODEL_PATH),
+            try_cached_muse_spark_model(DRAFT_MODEL_PATH, draft=True),
             "--speculative-draft-attention-backend",
             "fa4",
             "--speculative-num-draft-tokens",
