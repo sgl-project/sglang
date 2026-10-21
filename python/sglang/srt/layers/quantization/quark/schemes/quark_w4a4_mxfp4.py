@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import logging
 import threading
 from typing import Any, Callable, Optional
@@ -971,6 +972,15 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y
 
 
+def _block_hadamard32(x: torch.Tensor) -> torch.Tensor:
+    """Each 32-wide block of the last dimension of ``x`` times the orthonormal
+    Sylvester Hadamard matrix ``scipy.linalg.hadamard(32) / sqrt(32)``, in fp32."""
+    h = torch.ones(1, 1, dtype=torch.float32, device=x.device)
+    while h.shape[0] < 32:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)])
+    return (x.float().unflatten(-1, (-1, 32)) @ (h / 32**0.5)).flatten(-2).to(x.dtype)
+
+
 class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
     """MXFP4 GEMM for a loaded BF16 linear that ``quantize_`` converts once.
 
@@ -979,12 +989,33 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
     ``quantize_`` stores the weight and its E8M0 scales preshuffled. Batches of
     at most ``PRESHUFFLE_MAX_M`` rows run the Triton preshuffled GEMM if AITER
     has a tuned config for (N, K). All other batches run the ASM ``gemm_a4w4``.
+
+    With ``hadamard``, both operands are rotated by ``_block_hadamard32`` before
+    they are quantized: the weight once in ``quantize_``, the activation inside
+    the AITER quant (aiter#6734). ``(x H)(w H)^T = x w^T``, and the rotation
+    spreads outliers across each MXFP4 block.
     """
 
     PRESHUFFLE_MAX_M = 64
 
+    def __init__(self, hadamard: bool = False):
+        self.hadamard = hadamard
+        self.quant_kwargs = {}
+        if hadamard:
+            from aiter import per_1x32_f4_quant_hip
+
+            if (
+                "hadamard_rotate"
+                not in inspect.signature(per_1x32_f4_quant_hip).parameters
+            ):
+                raise RuntimeError(
+                    "the Hadamard rotation needs AITER with aiter#6734; "
+                    "set SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0 to run without it"
+                )
+            self.quant_kwargs = {"hadamard_rotate": True}
+
     @classmethod
-    def quantize_(cls, layer: torch.nn.Module) -> None:
+    def quantize_(cls, layer: torch.nn.Module, hadamard: bool = False) -> None:
         from aiter.ops.shuffle import shuffle_scale, shuffle_weight
         from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
             _get_config,
@@ -996,7 +1027,7 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         assert w.dtype == torch.bfloat16 and n % 256 == 0 and k % 256 == 0, (
             f"online MXFP4 needs a BF16 weight with N, K % 256 == 0, got {w.dtype} {n}x{k}"
         )
-        w_q, w_s = _dynamic_mxfp4_quant_orig(w)
+        w_q, w_s = _dynamic_mxfp4_quant_orig(_block_hadamard32(w) if hadamard else w)
         layer.weight = torch.nn.Parameter(
             shuffle_weight(w_q.view(torch.uint8), layout=(16, 16)),
             requires_grad=False,
@@ -1007,14 +1038,14 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         layer.mxfp4_preshuffle_tuned = _get_config(
             cls.PRESHUFFLE_MAX_M, n, k // 2, True
         )[1]
-        layer.quant_method = cls()
+        layer.quant_method = cls(hadamard)
 
     def create_weights(self, *args, **kwargs):
         raise NotImplementedError("use quantize_() on a loaded BF16 linear")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if layer.weight.dtype == torch.bfloat16:
-            self.quantize_(layer)
+            self.quantize_(layer, self.hadamard)
 
     def apply(
         self,
@@ -1029,7 +1060,7 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         w_s = layer.weight_scale
         if m <= self.PRESHUFFLE_MAX_M and layer.mxfp4_preshuffle_tuned:
             # Below 32 rows the kernel takes un-shuffled activation scales.
-            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=m >= 32)
+            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=m >= 32, **self.quant_kwargs)
             x_s = x_s.view(torch.uint8)
             x_s = x_s.view(x_s.shape[0] // 32, -1) if m >= 32 else x_s[:m]
             y = torch.empty(m, n, dtype=x.dtype, device=x.device)
@@ -1042,7 +1073,7 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
                 y,
             )
         else:
-            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True, **self.quant_kwargs)
             y = gemm_a4w4(
                 x_q,
                 layer.weight.view(x_q.dtype),
