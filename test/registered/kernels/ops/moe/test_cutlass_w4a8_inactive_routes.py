@@ -203,19 +203,22 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
 
         local_routes = (ids >= 0) & (ids < experts)
 
-        def dense_reference(dynamic):
+        def dense_reference(
+            dynamic, *, value=inputs, route_ids=ids, route_weights=weights
+        ):
+            local_routes = (route_ids >= 0) & (route_ids < experts)
             scale1 = (
-                inputs[local_routes.any(dim=-1)].float().abs().amax() / 448.0
+                value[local_routes.any(dim=-1)].float().abs().amax() / 448.0
                 if dynamic
                 else 1.0
             )
             activated = {}
-            for token in range(ids.shape[0]):
-                for slot in range(ids.shape[1]):
-                    expert = int(ids[token, slot])
+            for token in range(route_ids.shape[0]):
+                for slot in range(route_ids.shape[1]):
+                    expert = int(route_ids[token, slot])
                     if not 0 <= expert < experts:
                         continue
-                    quantized = (inputs[token].float() / scale1).to(torch.float8_e4m3fn)
+                    quantized = (value[token].float() / scale1).to(torch.float8_e4m3fn)
                     gate_up = F.linear(
                         quantized.float() * scale1, dense_w13[expert]
                     ).to(torch.bfloat16)
@@ -227,14 +230,14 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                 if dynamic
                 else 1.0
             )
-            result = torch.zeros_like(inputs, dtype=torch.float32)
+            result = torch.zeros_like(value, dtype=torch.float32)
             for (token, slot), value in activated.items():
-                expert = int(ids[token, slot])
+                expert = int(route_ids[token, slot])
                 quantized = (value / scale2).to(torch.float8_e4m3fn)
                 down = F.linear(quantized.float() * scale2, dense_w2[expert]).to(
                     torch.bfloat16
                 )
-                result[token] += down.float() * weights[token, slot]
+                result[token] += down.float() * route_weights[token, slot]
             return result
 
         w13_q = torch.zeros(
@@ -321,6 +324,44 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                                 actual, reference.to(actual.dtype), rtol=1e-2, atol=1e-3
                             )
                             self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
+                if ep_size == 2:
+                    backing = torch.tensor(
+                        [[0, 0, 1, 0], [1, 0, 0, 0]],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    sliced_ids = backing[:, ::2]
+                    sliced_weights = weights[:2].contiguous()
+                    original_backing = backing.clone()
+                    self.assertEqual(sliced_ids.stride(), (4, 2))
+                    self.assertTrue(sliced_weights.is_contiguous())
+                    for dynamic in (False, True):
+                        with self.subTest(
+                            ep_size=ep_size, dynamic=dynamic, sliced_ids=True
+                        ):
+                            actual = run(
+                                inputs[:2],
+                                dynamic=dynamic,
+                                route_ids=sliced_ids,
+                                route_weights=sliced_weights,
+                            )
+                            torch.testing.assert_close(
+                                offsets,
+                                torch.tensor(
+                                    [0, 2, 4], device="cuda", dtype=torch.int32
+                                ),
+                            )
+                            reference = dense_reference(
+                                dynamic,
+                                value=inputs[:2],
+                                route_ids=sliced_ids,
+                                route_weights=sliced_weights,
+                            )
+                            torch.testing.assert_close(
+                                actual, reference.to(actual.dtype), rtol=1e-2, atol=1e-3
+                            )
+                    torch.testing.assert_close(backing, original_backing)
+
                 actual = run(
                     torch.zeros_like(inputs),
                     dynamic=True,
