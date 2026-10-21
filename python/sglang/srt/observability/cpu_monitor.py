@@ -6,9 +6,10 @@ import psutil
 
 def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading.Thread:
     from prometheus_client import Counter
+    from sglang.srt.observability.metrics_collector import format_metric_name
 
     cpu_seconds_total = Counter(
-        name="sglang:process_cpu_seconds_total",
+        name=format_metric_name("sglang:process_cpu_seconds_total"),
         documentation="Total CPU time consumed by this process (user + system)",
         labelnames=["component"],
     )
