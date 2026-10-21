@@ -139,11 +139,21 @@ pub(super) fn frontend_closed() -> CoreHandle {
 /// App state whose core intake answers every generation with one finished
 /// `ok` chunk, with the ChatML template so chat can render.
 fn answering_app_state() -> Arc<super::AppState> {
+    let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
+    answering_app_state_with(server_args(), formatter.unwrap(), "ok")
+}
+
+/// App state whose core intake answers every generation with one finished `text` chunk.
+pub(super) fn answering_app_state_with(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    text: &'static str,
+) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            let done = chunk(request.rid.as_str(), "ok", true);
+            let done = chunk(request.rid.as_str(), text, true);
             request.sink.try_send(done).unwrap();
         }
     });
@@ -156,17 +166,14 @@ fn answering_app_state() -> Arc<super::AppState> {
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metadata: crate::api_server::core::CoreMetadata::from(server_args.as_ref()),
         },
     );
-    let server_args = server_args();
     Arc::new(super::AppState {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
-        chat_formatter: Some(
-            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap(),
-        ),
+        chat_formatter: Some(formatter),
     })
 }
 

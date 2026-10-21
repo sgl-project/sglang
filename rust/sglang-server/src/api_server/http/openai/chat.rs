@@ -60,23 +60,38 @@ pub(super) struct ChatRequest {
     routing: PDRoutingFields,
 }
 
+/// A chat request with its raw JSON, which SGLang's renderers read for fields
+/// the typed request drops (`continue_final_message`, `task`, ...).
+pub(super) struct ChatBody {
+    pub(super) request: ChatRequest,
+    pub(super) raw: Value,
+}
+
+impl<'de> Deserialize<'de> for ChatBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        let request = ChatRequest::deserialize(&raw).map_err(serde::de::Error::custom)?;
+        Ok(Self { request, raw })
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<Value>, JsonRejection>,
+    body: Result<Json<ChatBody>, JsonRejection>,
 ) -> Response {
-    let body = match body {
+    let ChatBody {
+        request:
+            ChatRequest {
+                request,
+                chat_template_kwargs,
+                routing,
+            },
+        raw: body,
+    } = match body {
         Ok(Json(body)) => body,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
-    };
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        routing,
-    } = match serde_json::from_value(body.clone()) {
-        Ok(request) => request,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
@@ -197,8 +212,13 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // A continuation inside an open think block is still reasoning.
-    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &rendered.prompt);
+    // As Python, the continued text decides whether generation starts in reasoning.
+    let reasoning_options = ReasoningOptions {
+        force_reasoning: starts_in_reasoning(reasoning_parser.as_deref(), &rendered.prompt)
+            .then_some(true),
+        previous_content: Some(rendered.continuation.clone()),
+        ..Default::default()
+    };
     let mut prompt = Some(rendered.into_text());
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -246,7 +266,7 @@ async fn chat_completions(
             include_usage,
             parser,
             reasoning_parser,
-            starts_in_reasoning,
+            reasoning_options,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -264,7 +284,7 @@ async fn chat_completions(
             want_logprobs,
             parser,
             reasoning_parser,
-            starts_in_reasoning,
+            reasoning_options,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -458,15 +478,11 @@ pub(super) async fn unary_chat(
     want_logprobs: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
-    starts_in_reasoning: bool,
+    reasoning_options: ReasoningOptions,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
-    let reasoning_options = ReasoningOptions {
-        force_reasoning: starts_in_reasoning.then_some(true),
-        ..Default::default()
-    };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
@@ -551,7 +567,7 @@ pub(super) fn chat_event_stream(
     include_usage: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
-    starts_in_reasoning: bool,
+    reasoning_options: ReasoningOptions,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -569,10 +585,7 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), ReasoningOptions {
-                        force_reasoning: starts_in_reasoning.then_some(true),
-                        ..Default::default()
-                    }))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), reasoning_options.clone()))
                     .collect()
             } else {
                 vec![]
@@ -875,6 +888,7 @@ mod tests {
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
+    use sglang_processor::ReasoningOptions;
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -1116,7 +1130,7 @@ mod tests {
             false,
             None,
             None,
-            false,
+            ReasoningOptions::default(),
             None,
             true,
             None,
@@ -1132,6 +1146,38 @@ mod tests {
         assert_eq!(value["choices"][1]["index"], 1);
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 2);
+    }
+
+    /// A continuation that already closed its think block generates content.
+    #[tokio::test]
+    async fn continuation_after_think_end_is_content() {
+        let args = crate::message::config::ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("deepseek-v4".into()),
+            ..Default::default()
+        };
+        let state = super::super::test_utils::answering_app_state_with(
+            std::sync::Arc::new(args),
+            super::super::ChatFormatter::DeepSeekV41,
+            " 391.",
+        );
+        let response = super::super::test_utils::post_json(
+            super::routes().with_state(state),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "model",
+                "messages": [
+                    {"role": "user", "content": "What is 17*23?"},
+                    {"role": "assistant", "content": "17*23</think>The answer is"}
+                ],
+                "continue_final_message": true,
+                "chat_template_kwargs": {"thinking": true}
+            }),
+        )
+        .await;
+        let value = super::super::test_utils::body_json(response).await;
+        assert_eq!(value["choices"][0]["message"]["content"], " 391.");
+        assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
     }
 
     #[tokio::test]
@@ -1153,7 +1199,7 @@ mod tests {
             false,
             None,
             Some("deepseek-r1".into()),
-            false,
+            ReasoningOptions::default(),
             None,
             true,
             None,
@@ -1192,7 +1238,7 @@ mod tests {
             true,
             None,
             Some("deepseek-r1".into()),
-            false,
+            ReasoningOptions::default(),
             None,
             None,
             false,
@@ -1238,7 +1284,7 @@ mod tests {
             true,
             None,
             None,
-            false,
+            ReasoningOptions::default(),
             None,
             None,
             false,
