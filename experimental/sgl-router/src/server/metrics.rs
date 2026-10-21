@@ -88,6 +88,8 @@
 //!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
+//! - `idle_spill` — `--route-by-uncached-tokens` sent the request to an idle DP
+//!   rank in another bucket, skipping the cache-aware selection.
 //!
 //! `sgl_router_input_ids_forwarding_total` records one outcome per dispatched
 //! `/v1/chat/completions` request, so `outcome!="forwarded"` over the sum is
@@ -384,6 +386,7 @@ pub enum CacheAwareDecision {
     CacheMiss,
     CacheWorkerQueued,
     AllQueued,
+    IdleSpill,
 }
 
 impl CacheAwareDecision {
@@ -393,6 +396,7 @@ impl CacheAwareDecision {
             Self::CacheMiss => "cache_miss",
             Self::CacheWorkerQueued => "cache_worker_queued",
             Self::AllQueued => "all_queued",
+            Self::IdleSpill => "idle_spill",
         }
     }
 }
@@ -1334,7 +1338,7 @@ impl MetricsRegistry {
 
         // cache_aware_decisions_total
         out.push_str(
-            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit).\n",
+            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit); idle_spill = --route-by-uncached-tokens sent a warm request off its busy buckets to an idle DP rank.\n",
         );
         out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
         let guard = self.cache_aware_decisions_total.lock();
