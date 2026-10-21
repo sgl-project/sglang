@@ -1416,6 +1416,11 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
+                if get_parallel().pp_size > 1:
+                    # Under PP this chunk's forward may still be running here and
+                    # nothing orders the KV read after it (e.g. with
+                    # SGLANG_PP_COMM_OVERLAP), so make the transfer wait for it.
+                    self._set_kv_send_wait_event(req)
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1459,15 +1464,21 @@ class SchedulerDisaggregationPrefillMixin:
             # the full range; only skip this optional early-send optimization.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
-        # but under overlap scheduling the PRIOR step's prefill forward may still
-        # be writing these prefix pages on forward_stream. Record a completion
-        # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
-        if self.enable_overlap:
-            ev = torch.cuda.Event()
-            ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+        # but under overlap scheduling or pipeline parallelism an earlier prefill
+        # forward may still be writing these prefix pages on forward_stream.
+        # Record a completion event now so the transfer worker can wait on those
+        # writes before the RDMA read, instead of racing them.
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            self._set_kv_send_wait_event(req)
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def _set_kv_send_wait_event(self: Scheduler, req: Req) -> None:
+        """Make the next KV send of ``req`` wait for the work already enqueued
+        on forward_stream. The transfer worker synchronizes on the event before
+        reading the pages, so the scheduler thread is never blocked."""
+        ev = self.device_module.Event()
+        ev.record(self.forward_stream)
+        req.disagg_kv_sender._early_send_wait_event = ev
 
     def send_kv_chunk(
         self,
