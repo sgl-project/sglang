@@ -34,10 +34,8 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     quant_config = getattr(hf_config, "quantization_config", None) or {}
     if quantization == "modelopt":
         quantization = quant_config.get("quant_algo")
-    elif quantization in ("compressed-tensors", "compressed_tensors"):
-        quantization = quant_config.get("format")
     if (
-        quantization in ("modelopt_fp4", "NVFP4", "nvfp4-pack-quantized")
+        quantization in ("modelopt_fp4", "NVFP4")
         and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"

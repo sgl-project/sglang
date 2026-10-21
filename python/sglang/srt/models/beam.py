@@ -1222,8 +1222,6 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
     if quant_config is None:
         return "bf16"
     if quant_config.get_name() == "compressed_tensors":
-        if quant_config.quant_format == "nvfp4-pack-quantized":
-            return "nvfp4"
         if (
             quant_config.quant_format != "float-quantized"
             or quant_config.linear_fp8_config is not None
@@ -1282,8 +1280,8 @@ class BeamForCausalLM(nn.Module):
         if get_beam_quantization(quant_config) is None:
             raise NotImplementedError(
                 "Beam supports BF16, compressed-tensors FP8 (per-channel "
-                "weights and dynamic per-token activations), or serialized W4A4 "
-                "NVFP4 from compressed-tensors or ModelOpt"
+                "weights and dynamic per-token activations), or ModelOpt "
+                "serialized W4A4 NVFP4"
             )
         if get_parallel().moe_dense_tp_size == 1:
             raise NotImplementedError(
