@@ -1421,7 +1421,9 @@ class CPUGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
+            num_token_non_padded=(
+                self.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=self.capture_forward_mode,
         )
         # Wrap all forward calls with capture_with_skip_cross_attention so that
@@ -1434,7 +1436,8 @@ class CPUGraphRunner:
         )
         with skip_ctx:
             with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ):
                 self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
                     bs,
@@ -1742,19 +1745,27 @@ class CPUGraphRunner:
                         self.model_runner.attn_backend.init_forward_metadata(
                             dynamic_forward_batch
                         )
-                        return dynamic_graph(
-                            dynamic_forward_batch.input_ids,
-                            dynamic_forward_batch.positions,
-                            dynamic_forward_batch,
-                        )
+                        with forward_context(
+                            ForwardContext(attn_backend=self.model_runner.attn_backend),
+                            forward_batch=dynamic_forward_batch,
+                        ):
+                            return dynamic_graph(
+                                dynamic_forward_batch.input_ids,
+                                dynamic_forward_batch.positions,
+                                dynamic_forward_batch,
+                            )
                     prepared_forward_batch = self.prepare_replay(
                         forward_batch, skip=skip
                     )
-                    output = graphs[prepared_forward_batch.batch_size](
-                        prepared_forward_batch.input_ids,
-                        prepared_forward_batch.positions,
-                        prepared_forward_batch,
-                    )
+                    with forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend),
+                        forward_batch=prepared_forward_batch,
+                    ):
+                        output = graphs[prepared_forward_batch.batch_size](
+                            prepared_forward_batch.input_ids,
+                            prepared_forward_batch.positions,
+                            prepared_forward_batch,
+                        )
             if forward_batch.batch_size in graphs:
                 return output
 
@@ -1941,7 +1952,8 @@ class CPUGraphRunner:
         # it populated makes linear attention guard on a varying Python int.
         forward_batch.global_num_token_non_padded_cpu = None
         with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ForwardContext(attn_backend=self.model_runner.attn_backend),
+            forward_batch=forward_batch,
         ):
             try:
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)

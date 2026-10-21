@@ -72,6 +72,13 @@ def is_musa_runtime() -> bool:
     return getattr(torch.version, "musa", None) is not None
 
 
+@cache_once
+def is_sail_runtime() -> bool:
+    # T-HEAD SAIL device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_sail so all layers agree on what "running on SAIL" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
+
+
 _REGISTERED_CLASSES: Dict[type, type] = {}
 
 
