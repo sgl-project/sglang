@@ -8,7 +8,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +18,12 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 class TestFusedMOE(CustomTestCase):
     NUM_EXPERTS = [8, 64]
     TOP_KS = [2, 4]
+
+    def setUp(self):
+        super().setUp()
+        context_override = get_context().override_server_args()
+        context_override.install()
+        self.addCleanup(context_override.restore)
 
     @staticmethod
     def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
@@ -59,8 +65,6 @@ class TestFusedMOE(CustomTestCase):
         topk,
         return_per_expert: bool = False,
     ):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
         out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -106,6 +110,7 @@ class TestFusedMOE(CustomTestCase):
 
         topk_op = TopK(
             top_k=topk,
+            layer_id=0,
             renormalize=False,
             use_grouped_topk=False,
         )

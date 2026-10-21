@@ -11,9 +11,14 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     has_realtime_model_adapter,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    BYTES_PER_GB,
+    dit_parameter_count,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
@@ -25,11 +30,28 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay import resolve_model_overlay
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 logger = init_logger(__name__)
+
+# Picked, not measured; what stays free holds activations and the other components.
+AUTO_DIT_MAX_DEVICE_FRACTION = 0.8
+
+
+def _uses_svdquant(nunchaku_config) -> bool:
+    # still the unresolved CLI args here; _adjust_quant_config resolves them later
+    if nunchaku_config is None:
+        return False
+    if isinstance(nunchaku_config, NunchakuSVDQuantArgs):
+        return (
+            nunchaku_config.enable_svdquant
+            or nunchaku_config.transformer_weights_path is not None
+        )
+    return True
 
 
 def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
@@ -117,6 +139,7 @@ class ServerArgsAutoTuner:
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         self._explicit_dit_residency = self._has_explicit_dit_residency()
+        self._dit_fit_checked = False
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -403,6 +426,8 @@ class ServerArgsAutoTuner:
         ):
             return
         if args.performance_mode in deployment_config.dit_layerwise_offload_modes:
+            return
+        if self._dit_fit_checked:
             return
         available_gb = self._get_min_available_device_memory_gb()
         if available_gb is None or available_gb >= threshold_gb:
@@ -717,10 +742,6 @@ class ServerArgsAutoTuner:
 
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
         args = self.server_args
-        deployment_config = self._deployment_config()
-        if args.performance_mode not in deployment_config.dit_layerwise_offload_modes:
-            return False
-
         if (
             args.pipeline_config.dmd_denoising_steps is not None
             or not current_platform.enable_dit_layerwise_offload_by_default()
@@ -730,7 +751,67 @@ class ServerArgsAutoTuner:
         ):
             return False
 
-        return True
+        deployment_config = self._deployment_config()
+        if args.performance_mode in deployment_config.dit_layerwise_offload_modes:
+            return True
+        return self._dit_overflows_device_in_auto(deployment_config)
+
+    def _dit_overflows_device_in_auto(
+        self, deployment_config: ModelDeploymentConfig
+    ) -> bool:
+        args = self.server_args
+        if (
+            args.performance_mode != "auto"
+            or "memory" not in deployment_config.dit_layerwise_offload_modes
+            or args.transformer_weights_path is not None
+            or args.quantization is not None
+            or _uses_svdquant(args.nunchaku_config)
+            or "transformer" in args.component_paths
+            or "transformer" in args.component_weights_paths
+            or "transformer" in args.component_quantizations
+            # an overlay's source repo is not in the Diffusers layout
+            or resolve_model_overlay(args.model_path) is not None
+        ):
+            return False
+        available_gb = self._get_min_available_device_memory_gb()
+        if (
+            available_gb is None
+            or available_gb
+            >= self._resolve_keep_resident_min_available_gb(deployment_config)
+        ):
+            return False
+        self._dit_fit_checked = True
+        num_params = dit_parameter_count(
+            args.model_path, subfolder=args.model_subfolder, revision=args.revision
+        )
+        if num_params is None:
+            logger.info(
+                "Auto memory policy for %s could not size the DiT, so it keeps its "
+                "declared placement; if it does not fit, pass "
+                "--layerwise-offload-components dit,... or --performance-mode memory.",
+                args.pipeline_config.__class__.__name__,
+            )
+            return False
+        dtype = resolve_precision(args, "dit", precision_attr="dit_precision")
+        # tensor parallelism shards the DiT's linear layers across the ranks
+        dit_gb = num_params * dtype.itemsize / (args.tp_size or 1) / BYTES_PER_GB
+        overflows = dit_gb > available_gb * AUTO_DIT_MAX_DEVICE_FRACTION
+        logger.info(
+            "Auto memory policy for %s: the DiT needs %.1f GiB per GPU in %s, %s "
+            "%d%% of the %.1f GiB free on the least-free selected GPU, so it %s.",
+            args.pipeline_config.__class__.__name__,
+            dit_gb,
+            str(dtype).removeprefix("torch."),
+            "more than" if overflows else "within",
+            round(AUTO_DIT_MAX_DEVICE_FRACTION * 100),
+            available_gb,
+            (
+                "streams layer by layer (as with --layerwise-offload-components dit)"
+                if overflows
+                else "keeps its declared placement"
+            ),
+        )
+        return overflows
 
     def _set_default_dit_offload_prefetch_size(self) -> None:
         args = self.server_args

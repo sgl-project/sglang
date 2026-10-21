@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_xpu
 
+from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
 
 
@@ -29,38 +30,42 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
 
     args = make_cpp_args(is_arch_support_pdl())
-    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
-    # defaults, and a 0 would size the persistent pool to an empty grid.
+    # Enable each cluster path only when its occupancy probe reports capacity.
     extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
-        try:
-            occ_8_2 = get_max_active_clusters(8, occupancy=2)
-        except Exception:
-            pass
-        else:
-            if occ_8_2 > 0:
-                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}")
-        try:
-            occ_16_1 = get_max_active_clusters(16, occupancy=1)
-        except Exception:
-            pass
-        else:
-            if occ_16_1 > 0:
-                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
+        for cluster_size, occupancy in ((8, 2), (16, 1)):
+            try:
+                max_active_clusters = get_max_active_clusters(
+                    cluster_size, occupancy=occupancy
+                )
+            except NoSchedulableClustersError:
+                max_active_clusters = 0
+            extra_cuda_cflags.append(
+                f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
+            )
     kernel = f"TopKKernel<{args}>"
+    wrappers = [
+        ("topk_transform_paged", f"{kernel}::transform_paged"),
+        ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_plan", f"{kernel}::plan"),
+        ("topk_transform_kpool", f"{kernel}::transform_kpool"),
+        ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
+    ]
+    if is_hip_runtime():
+        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
+        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
-        cuda_wrappers=[
-            ("topk_transform_paged", f"{kernel}::transform_paged"),
-            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
-            ("topk_plan", f"{kernel}::plan"),
-        ],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -121,12 +126,41 @@ def topk_transform_paged(
         )
 
 
+def topk_transform_paged_torch(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """The torch ``topk_transform_paged``: top-``k`` (``k = out_page_indices.shape[1]``)
+    of each row within its first ``seq_lens[b]`` columns, ascending, as pool slots
+    through ``page_tables`` and as positions when given; ``-1`` padded."""
+    topk = out_page_indices.shape[1]
+    columns = torch.arange(scores.shape[1], device=seq_lens.device)
+    lens_c = seq_lens.unsqueeze(-1)
+    # Columns past a row's length hold garbage.
+    s = scores.masked_fill(columns[None, :] >= lens_c, -torch.inf)
+    idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+    reach = idx < lens_c
+    slots = page_tables.gather(-1, idx // page_size) * page_size + (idx % page_size)
+    out_page_indices.copy_(torch.where(reach, slots, -1).to(torch.int32))
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
+
+
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
 # rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Tensor:
+def plan_topk_v2(
+    seq_lens: torch.Tensor,
+    static_threshold: int = -1,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
     NOTE: every entry of ``seq_lens`` must be NON-NEGATIVE.
@@ -137,7 +171,11 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    metadata = (
+        seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+        if out is None
+        else out
+    )
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 
@@ -214,6 +252,9 @@ def topk_transform_paged_v2(
     * Both outputs given -- ``out_page_indices`` receives the page-table
       transform and ``out_raw_indices`` receives the selected raw indices.
 
+    For the packed (DSA extend prefill) layout see
+    :func:`topk_transform_packed_v2`.
+
     NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
     A length of 0 is the valid way to express "no tokens": the row takes the
@@ -248,4 +289,130 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+    )
+
+
+def topk_transform_kpool_v2(
+    scores: torch.Tensor,
+    pool_lens: torch.Tensor,
+    out: torch.Tensor,
+    pool_size: int,
+    metadata: torch.Tensor,
+    *,
+    token_seq_lens: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    """GLM k-pool top-k over per-pool scores, fused with pool expansion, the
+    ``token_seq_lens % pool_size`` tail and the page-table or offset transform.
+
+    ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``. The kernel reads it
+    before its PDL wait, so plan before launching the kernel that writes ``scores``.
+    """
+    _jit_topk_v2_module().topk_transform_kpool(
+        scores,
+        pool_lens,
+        token_seq_lens,
+        page_table,
+        out_offsets,
+        out,
+        page_size,
+        pool_size,
+        metadata,
+    )
+
+
+def topk_transform_kpool_ragged_v2(
+    scores: torch.Tensor,
+    pool_lens: torch.Tensor,
+    out: torch.Tensor,
+    pool_size: int,
+    *,
+    row_starts: Optional[torch.Tensor] = None,
+    token_seq_lens: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_table_row_index: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    """Ragged (prefill) :func:`topk_transform_kpool_v2`: row ``i`` selects among
+    ``scores[i, ks : ks + pool_lens[i]]`` (``ks = row_starts[i]``, 0 when omitted);
+    no plan is needed.
+
+    NOTE: ``scores`` is written in place, as in :func:`topk_transform_ragged_v2`.
+    """
+    _jit_topk_v2_module().topk_transform_kpool_ragged(
+        scores,
+        pool_lens,
+        row_starts,
+        token_seq_lens,
+        page_table,
+        page_table_row_index,
+        out_offsets,
+        out,
+        page_size,
+        pool_size,
+    )
+
+
+def topk_transform_packed_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    *,
+    row_starts: torch.Tensor,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> None:
+    """Packed (DSA extend prefill) fused top-k + page-table transform.
+
+    Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]``
+    (``ks = row_starts[i]``) and writes the page-table transform of the selected
+    row-local positions into ``out_page_indices``, ``-1`` padded. Prefill expands
+    one request into many query-token rows, so ``row_to_batch[i]`` (optional,
+    ``(rows,)`` int32) names the ``page_tables`` row of the request row ``i``
+    belongs to; omitting it indexes the table by score row. ``row_to_batch`` is
+    not range-checked.
+
+    This is :func:`topk_transform_ragged_v2` with a page-table output instead of
+    an additive offset. Like ragged, it dispatches the implementation per row at
+    runtime, so it needs no plan and no :func:`plan_topk_v2` metadata.
+
+    NOTE: ``scores`` is MODIFIED IN PLACE -- the <= 3 columns ahead of each row's
+    window that the 16-byte-aligned read base pulls in are masked out. They are
+    invalid for that row and the buffer must have no other consumer, so do not
+    pass a view with overlapping rows.
+    ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
+
+    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
+    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
+    produces this layout today.
+    """
+    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
+    module = _jit_topk_v2_module()
+    module.topk_transform_packed(
+        scores,
+        seq_lens,
+        row_starts,
+        page_tables,
+        out_page_indices,
+        page_size,
+        row_to_batch,
+    )
+
+
+def topk_transform_sparse(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
+    ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
+    column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
+    published blocks as pool slots / 8, compressed positions for logical ids."""
+    topk_transform_bf16_small(
+        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

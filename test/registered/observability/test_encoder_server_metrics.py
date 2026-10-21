@@ -2,6 +2,7 @@
 
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 from urllib.parse import urlparse
 
@@ -61,26 +62,39 @@ class TestEncoderServerMetrics(CustomTestCase):
             self.assertEqual(health.status_code, 200)
 
             req_id = f"metrics-probe-{uuid.uuid4().hex}"
-            requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/scheduler_receive_url",
-                json={
-                    "req_id": req_id,
-                    "receive_url": f"{base_host}:{recv_port}",
-                    "receive_count": 1,
-                },
-            )
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/encode",
-                json={
-                    "req_id": req_id,
-                    "modality": "IMAGE",
-                    "mm_items": [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"],
-                    "num_parts": 1,
-                    "part_idx": 0,
-                    "embedding_port": None,
-                },
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            )
+            # A scheduler registers concurrently with /encode, never before
+            # it: the request state only exists once /encode dispatches.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                registration = pool.submit(
+                    requests.post,
+                    f"{DEFAULT_URL_FOR_TEST}/scheduler_receive_url",
+                    json={
+                        "req_id": req_id,
+                        "receive_url": f"{base_host}:{recv_port}",
+                        "receive_count": 1,
+                    },
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                )
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/encode",
+                    json={
+                        "req_id": req_id,
+                        "modality": "IMAGE",
+                        "mm_items": [
+                            f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                        ],
+                        "num_parts": 1,
+                        "part_idx": 0,
+                        "embedding_port": None,
+                    },
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                )
+                registration_response = registration.result(
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                )
+            # A 200 from /encode alone does not prove the embedding reached
+            # anyone; the registration is the other half of that contract.
+            self.assertEqual(registration_response.status_code, 200)
             self.assertEqual(response.status_code, 200)
 
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")

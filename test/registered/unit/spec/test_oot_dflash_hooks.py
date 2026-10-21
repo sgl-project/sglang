@@ -2,7 +2,10 @@ import unittest
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_dflash_draft_attention_backend,
+)
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,8 +57,11 @@ class TestOOTDFlashHooks(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(f"{HOOK_MODULE}.attention_backends_of", return_value=(None, None)),
         ):
-            handle_speculative_decoding(args)
-        return args.speculative_draft_attention_backend
+            # Call the resolver directly: the full hook also resolves the
+            # algorithm alias, which loads the draft HF config over the network.
+            _resolve_dflash_draft_attention_backend(args)
+        # Resolvers declare into the stash; they never write the field.
+        return resolution_result(args, "speculative_draft_attention_backend")
 
     def test_explicit_backends_follow_platform_capabilities(self):
         cases = (

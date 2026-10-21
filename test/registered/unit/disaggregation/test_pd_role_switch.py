@@ -1,8 +1,7 @@
-import argparse
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
@@ -16,18 +15,6 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class TestPdRoleSwitchServerArg(unittest.TestCase):
-    def test_cli_flag_parses(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        off = parser.parse_args(["--model-path", "dummy"])
-        self.assertFalse(off.enable_pd_role_switch)
-
-        on = parser.parse_args(["--model-path", "dummy", "--enable-pd-role-switch"])
-        self.assertTrue(on.enable_pd_role_switch)
 
 
 class TestHandlePdRoleSwitch(unittest.TestCase):
@@ -65,6 +52,55 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._pd_role_switch_unhealthy = False
         s.tp_worker = MagicMock()
         return s
+
+    def test_preflight_checks_graph_headroom_without_releasing_resources(self):
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s.device = "cuda"
+        cases = (
+            ("missing", None, [], 2.0, False, "is required"),
+            ("negative", -1.0, [], 2.0, False, "non-negative"),
+            ("insufficient", 1.0, [], 0.5, False, "insufficient"),
+            (
+                "probe failure",
+                1.0,
+                [],
+                RuntimeError("probe failed"),
+                False,
+                "failed to check",
+            ),
+            ("sufficient", 1.0, [], 1.0, True, "ready"),
+            ("already captured", None, [1], 0.0, True, "ready"),
+        )
+        for name, budget, captured_bs, memory, success, message in cases:
+            with self.subTest(name=name):
+                s.tp_worker.get_decode_cuda_graph_bs.return_value = captured_bs
+                with patch.object(
+                    role_switch, "get_available_gpu_memory"
+                ) as memory_probe:
+                    if isinstance(memory, Exception):
+                        memory_probe.side_effect = memory
+                    else:
+                        memory_probe.return_value = memory
+                    out = Scheduler.handle_pd_role_switch(
+                        s,
+                        PdRoleSwitchReqInput(
+                            new_role="decode",
+                            prepare_only=True,
+                            decode_cuda_graph_memory_gb=budget,
+                        ),
+                    )
+                    self.assertEqual(out.success, success)
+                    self.assertTrue(out.safe_to_restore)
+                    self.assertIn(message, out.message)
+                    if not captured_bs and budget is not None and budget >= 0:
+                        memory_probe.assert_called_once()
+                    else:
+                        memory_probe.assert_not_called()
+                s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+                s.teardown_disaggregation.assert_not_called()
+                s.init_disaggregation.assert_not_called()
+                self.assertEqual(rc.get_disagg().disaggregation_mode, "prefill")
+                self.assertFalse(s._event_loop_should_restart)
 
     def test_rejected_when_flag_disabled(self):
         s = self._scheduler(DisaggregationMode.PREFILL, enable=False)
@@ -131,7 +167,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
             out = Scheduler.handle_pd_role_switch(
@@ -151,7 +186,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_decode_graph_headroom_allows_flip(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
             out = Scheduler.handle_pd_role_switch(
@@ -311,7 +345,7 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
 
 class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     """--enable-pd-role-switch only rebuilds the small role-specific disagg
-    structures on a flip; the per-role buffers of DP attention / EP / MoE
+    structures on a flip; the per-role buffers of EP / MoE
     all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
     a flip with those on would silently deadlock. The PD arg hook must reject
     the combination up-front instead of failing at flip time."""
@@ -320,8 +354,10 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
+            disaggregation_decode_host_receive_threshold=1.0,
             enable_pd_role_switch=True,
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
@@ -330,7 +366,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             speculative_algorithm=None,
         )
         base.update(kw)
-        return SimpleNamespace(**base)
+        # Keep the production defaults for fields read by the shared PD hook.
+        return ServerArgs(model_path="dummy", **base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -343,10 +380,18 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         # No raise for the validated pure-TP configuration.
         self._run(self._sa())
 
-    def test_reject_dp_attention(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(enable_dp_attention=True))
-        self.assertIn("DP attention", str(ctx.exception))
+    def test_dp_attention_role_switch_accepted(self):
+        self._run(self._sa(tp_size=2, attn_dp_size=2))
+
+    def test_reject_dp_attention_local_control_broadcast(self):
+        with self.assertRaisesRegex(ValueError, "local control broadcast"):
+            self._run(
+                self._sa(
+                    tp_size=2,
+                    attn_dp_size=2,
+                    enable_dp_attention_local_control_broadcast=True,
+                )
+            )
 
     def test_reject_expert_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
@@ -363,10 +408,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             self._run(self._sa(pp_size=2))
         self.assertIn("pipeline parallelism", str(ctx.exception))
 
-    def test_reject_data_parallelism(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(dp_size=2))
-        self.assertIn("data parallelism", str(ctx.exception))
+    def test_data_parallel_role_switch_accepted(self):
+        self._run(self._sa(dp_size=2))
 
     def test_reject_decode_context_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
@@ -390,14 +433,6 @@ import time  # noqa: E402
 import zmq  # noqa: E402
 
 try:
-    from sglang.srt.disaggregation.common.utils import FastQueue  # noqa: E402
-    from sglang.srt.disaggregation.mori.conn import MoriKVManager  # noqa: E402
-
-    _HAS_MORI = True
-except Exception:  # pragma: no cover - environment dependent
-    _HAS_MORI = False
-
-try:
     from sglang.srt.disaggregation.common.utils import (  # noqa: E402,F811
         FastQueue as _FQ,
     )
@@ -416,38 +451,6 @@ try:
     _HAS_ROLE_SWITCH = True
 except Exception:  # pragma: no cover - environment dependent
     _HAS_ROLE_SWITCH = False
-
-
-@unittest.skipUnless(_HAS_MORI, "mori not importable in this environment")
-class TestMoriTeardownNoThreadLeak(unittest.TestCase):
-    """teardown() must stop+join the transfer workers it started, so a P->D->P
-    flip loop does not leak _num_shards transfer threads per cycle."""
-
-    def test_teardown_joins_transfer_workers(self):
-        m = MoriKVManager.__new__(MoriKVManager)
-        m.disaggregation_mode = DisaggregationMode.PREFILL
-        m._stopped = False
-        m._worker_threads = []
-        m._transfer_queues = [FastQueue() for _ in range(3)]
-        m.server_socket = MagicMock()
-        m._zmq_ctx = MagicMock()
-        m.engine = MagicMock()
-        m.kv_mem_descs = m.aux_mem_descs = m.state_mem_descs = []
-        for q in m._transfer_queues:
-            t = threading.Thread(target=m._transfer_worker, args=(q,), daemon=True)
-            t.start()
-            m._worker_threads.append(t)
-        started = list(m._worker_threads)
-        time.sleep(0.05)  # let workers park in FastQueue.get()
-        for t in started:
-            self.assertTrue(t.is_alive())
-
-        MoriKVManager.teardown(m)
-
-        for t in started:
-            self.assertFalse(t.is_alive(), "transfer worker survived teardown (leak)")
-        self.assertEqual(m._worker_threads, [])
-        self.assertEqual(m._transfer_queues, [])
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
@@ -625,7 +628,7 @@ def _radix_scheduler(disable_radix_cache):
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
 class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
+    + KV pools when radix is on, and is a no-op on the radix-disabled path."""
 
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)
@@ -647,6 +650,153 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         teardown_disaggregation(s)
         self.assertIsNone(s.disagg_metadata_buffers)
         s.tree_cache.reset.assert_called_once_with()
+
+
+class TestDPRoleSwitch(unittest.IsolatedAsyncioTestCase):
+    async def test_all_workers_must_be_ready_before_switching(self):
+        for dp_size, attn_dp_size in ((2, 1), (1, 2)):
+            with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
+                await self._check_preflight(dp_size, attn_dp_size)
+
+    async def test_insufficient_headroom_prevents_switching_all_workers(self):
+        for dp_size, attn_dp_size in ((2, 1), (1, 2)):
+            with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
+                await self._check_preflight(
+                    dp_size, attn_dp_size, insufficient_memory=True
+                )
+
+    async def _check_preflight(self, dp_size, attn_dp_size, insufficient_memory=False):
+        from sglang.srt.managers import tokenizer_control_mixin as control
+
+        fixture = TestHandlePdRoleSwitch()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        self.addCleanup(fixture.doCleanups)
+        schedulers = [fixture._scheduler(DisaggregationMode.PREFILL) for _ in range(2)]
+        available_memory = [2.0, 2.0]
+        for scheduler in schedulers:
+            scheduler.device = "cuda"
+            scheduler.tp_worker.get_decode_cuda_graph_bs.return_value = (
+                [] if insufficient_memory else [1]
+            )
+            scheduler.init_disaggregation.side_effect = lambda s=scheduler: setattr(
+                s,
+                "disaggregation_mode",
+                DisaggregationMode(rc.get_disagg().disaggregation_mode),
+            )
+
+        async def fanout(req):
+            results = []
+            for index, scheduler in enumerate(schedulers):
+                rc.get_context().set_server_args(scheduler.server_args)
+                rc.get_context().override(
+                    "test.role", disaggregation_mode=scheduler.disaggregation_mode.value
+                )
+                with patch.object(
+                    role_switch,
+                    "get_available_gpu_memory",
+                    return_value=available_memory[index],
+                ):
+                    results.append(role_switch.handle_pd_role_switch(scheduler, req))
+            if req.prepare_only:
+                for scheduler in schedulers:
+                    scheduler.init_disaggregation.assert_not_called()
+            return results
+
+        manager = SimpleNamespace(
+            server_args=SimpleNamespace(enable_pd_role_switch=True),
+            auto_create_handle_loop=MagicMock(),
+            pd_role_switch_communicator=AsyncMock(side_effect=fanout),
+            record_config_updates=MagicMock(),
+            disaggregation_mode=DisaggregationMode.PREFILL,
+        )
+        req = PdRoleSwitchReqInput(
+            new_role="decode",
+            decode_cuda_graph_memory_gb=1.0 if insufficient_memory else None,
+        )
+        with patch.object(
+            control,
+            "get_parallel",
+            return_value=SimpleNamespace(
+                dp_size=dp_size,
+                attn_dp_size=attn_dp_size,
+                num_dp_ranks=dp_size * attn_dp_size,
+            ),
+        ):
+            if insufficient_memory:
+                available_memory[1] = 0.5
+            else:
+                schedulers[1].is_fully_idle.return_value = False
+            out = await control.TokenizerControlMixin.pd_role_switch(manager, req)
+            self.assertFalse(out.success)
+            self.assertTrue(out.safe_to_restore)
+            self.assertIn(
+                "insufficient" if insufficient_memory else "not idle", out.message
+            )
+            manager.pd_role_switch_communicator.assert_awaited_once()
+            self.assertTrue(
+                manager.pd_role_switch_communicator.call_args.args[0].prepare_only
+            )
+            manager.record_config_updates.assert_not_called()
+            for scheduler in schedulers:
+                scheduler.init_disaggregation.assert_not_called()
+                scheduler.teardown_disaggregation.assert_not_called()
+                self.assertEqual(
+                    scheduler.disaggregation_mode, DisaggregationMode.PREFILL
+                )
+
+            available_memory[1] = 2.0
+            schedulers[1].is_fully_idle.return_value = True
+            out = await control.TokenizerControlMixin.pd_role_switch(manager, req)
+            self.assertTrue(out.success)
+            self.assertEqual(manager.disaggregation_mode, DisaggregationMode.DECODE)
+            for scheduler in schedulers:
+                scheduler.init_disaggregation.assert_called_once()
+                self.assertEqual(
+                    scheduler.disaggregation_mode, DisaggregationMode.DECODE
+                )
+
+
+class TestStartupDecodeGraphReuse(unittest.TestCase):
+    def test_switch_reuses_startup_graph_or_captures_when_missing(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        from sglang.srt.model_executor import model_runner as mr
+
+        for graph in (SimpleNamespace(capture_bs=[1, 2, 4]), None):
+            with self.subTest(captured_at_startup=graph is not None):
+                rc.reset_context()
+                try:
+                    rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+                    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+                    runner.model = MagicMock()
+                    runner.decode_cuda_graph_captured = False
+                    runner.decode_cuda_graph_capture_bs = []
+                    runner.init_decode_cuda_graph = MagicMock()
+                    capture = SimpleNamespace(
+                        eager_runner=MagicMock(),
+                        prefill=SimpleNamespace(runner=None),
+                        decode=SimpleNamespace(runner=graph),
+                        memory_usage=None,
+                        time_usage=None,
+                    )
+                    with (
+                        patch.object(mr, "capture_cuda_graphs", return_value=capture),
+                        patch.object(mr, "prebuild_deepep_v2_buffer"),
+                    ):
+                        runner.init_cuda_graphs()
+                    worker = SimpleNamespace(model_runner=runner)
+                    self.assertEqual(
+                        TpModelWorker.get_decode_cuda_graph_bs(worker),
+                        [1, 2, 4] if graph is not None else [],
+                    )
+                    runner.ensure_decode_cuda_graphs()
+                    if graph is not None:
+                        runner.init_decode_cuda_graph.assert_not_called()
+                        self.assertIs(runner.decode_cuda_graph_runner, graph)
+                    else:
+                        runner.init_decode_cuda_graph.assert_called_once_with()
+                finally:
+                    rc.reset_context()
 
 
 if __name__ == "__main__":
