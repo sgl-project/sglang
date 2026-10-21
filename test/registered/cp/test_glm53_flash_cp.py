@@ -50,7 +50,10 @@ class TestGLM53FlashB200ContextParallel(
         "--speculative-draft-attention-backend",
         "fa4",
         "--cuda-graph-max-bs-prefill",
-        "8192",
+        "16384",
+        # Leave room for the larger prefill graph capture.
+        "--mem-fraction-static",
+        "0.75",
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",
