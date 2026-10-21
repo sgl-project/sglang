@@ -54,13 +54,13 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8", showWhen: (s) => !config.isNpuHw(s) },
     { id: "fp4", label: "FP4", showWhen: (s) => !config.isNpuHw(s) },
-    // Ascend set — kimi-k3's three. Only Modelslim has a recipe so far, so the
+    // Ascend set — kimi-k3's three. Only Modelslim (W8A8) has a recipe so far, so the
     // other two render greyed (cell availability) rather than hidden.
     // TODO(NPU): MXFP4 is the 950PR/DT checkpoint and NVFP4 is kimi-k3's
     // Blackwell-only entry; confirm both for DeepSeek-V4 before wiring cells.
     { id: "mxfp4", label: "MXFP4", subtitle: "NPU checkpoint",
       showWhen: (s) => config.isNpuHw(s) },
-    { id: "modelslim", label: "Modelslim (W4A8)", subtitle: "ModelScope NPU checkpoint",
+    { id: "modelslim", label: "Modelslim (W8A8)", subtitle: "ModelScope NPU checkpoint",
       showWhen: (s) => config.isNpuHw(s) },
     // Shared by both: a real NVIDIA checkpoint and kimi-k3's third NPU value.
     { id: "nvfp4", label: "NVFP4" },
@@ -194,10 +194,7 @@ export const config = {
   },
 
   modelNames: {
-    // NPU cells serve the ModelSlim W4A8 build of the Flash checkpoint.
-    // TODO(NPU): swap in the published W4A8 repo once it exists (kimi-k3 uses
-    // "sgl-npu/Kimi-K3-W4A8"); the base Flash repo is what the runs used.
-    "flash|modelslim": "deepseek-ai/DeepSeek-V4-Flash",
+    "flash-official|modelslim": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
@@ -4127,10 +4124,13 @@ sgl-eval run mmmu_pro \\
     // TODO(NPU): images + checkpoint slugs; keep `in-progress` until re-run on a
     // release build.
     {
-      match: { hw: "a3", variant: "flash", quant: "modelslim", strategy: "balanced", nodes: "single" },
+      match: { hw: "a3", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
       verified: false,
       verificationStatus: "in-progress",
-      env: [],
+      env: [
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FAST_KERNEL=0",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -4140,7 +4140,7 @@ sgl-eval run mmmu_pro \\
         "--watchdog-timeout 9000",
         "--mem-fraction-static 0.7",
         "--prefill-max-requests 160",
-        "--max-prefill-tokens 80000",
+        "--max-prefill-tokens 65536",
         "--chunked-prefill-size 131072",
         "--max-running-requests 160",
         "--dp-size 16",
@@ -4150,17 +4150,19 @@ sgl-eval run mmmu_pro \\
         "--quantization modelslim",
         "--enable-dp-lm-head",
         "--kv-cache-dtype bfloat16",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 2",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 3",
-        "--cuda-graph-bs 1 2 4 8 10",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-attention-backend ascend",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-bs-decode 1 2 4 8 10",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "a5", variant: "flash", quant: "modelslim", strategy: "balanced", nodes: "single" },
+      match: { hw: "a5", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
       verified: false,
       verificationStatus: "in-progress",
       env: [
