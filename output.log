@@ -1,0 +1,19 @@
+  $ git rev-parse --show-toplevel
+[1/4] Creating worktree at 68c42ba6...
+  $ git worktree add -b verify-mechanical-68c42ba6 /var/folders/8s/l6jxm5w16z1206c4btcd8ky00000gp/T/verify-mechanical-mq8lgoi7 68c42ba6e389c1d2b6387615f227c5720ff635cb
+[2/4] Running transformation...
+[3/4] Running pre-commit...
+  $ git add -A
+  $ git diff --cached --name-only --diff-filter=ACMR 68c42ba6e389c1d2b6387615f227c5720ff635cb
+  $ pre-commit run --files python/sglang/srt/arg_groups/cuda_graph_hook.py python/sglang/srt/arg_groups/model_hook.py python/sglang/srt/layers/attention/dsa/kpool_prefill_cuda_graph.py python/sglang/srt/layers/cp/bcg/__init__.py python/sglang/srt/layers/cp/bcg/bcg.py python/sglang/srt/layers/cp/bcg/interleave_bcg.py python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py test/registered/cp/test_cp_strategy_unit.py
+  $ git status --porcelain
+  $ git add -A && git commit -m 'pre-commit fixes'
+[4/4] Diffing against a3d9fac6...
+  $ git diff a3d9fac64feae6e8cde40a99b4835ccebe0a0d44 -- .
+
+PASS: transform reproduces the commit exactly.
+
+Worktree left at: /var/folders/8s/l6jxm5w16z1206c4btcd8ky00000gp/T/verify-mechanical-mq8lgoi7
+Branch: verify-mechanical-68c42ba6
+To clean up manually:
+  git worktree remove /var/folders/8s/l6jxm5w16z1206c4btcd8ky00000gp/T/verify-mechanical-mq8lgoi7 && git branch -D verify-mechanical-68c42ba6
