@@ -1,5 +1,5 @@
 # Pytest configuration for sgl-router tests/e2e/.
-# Lives next to conftest.py so `pytest experimental/sgl-router/tests/e2e/`
+# Lives next to conftest.py so `pytest sgl-router/tests/e2e/`
 # picks it up automatically.
 
 [tool.pytest.ini_options]

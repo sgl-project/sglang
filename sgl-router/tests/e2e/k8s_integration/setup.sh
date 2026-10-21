@@ -10,8 +10,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"  # repo root (above experimental/)
-SGL_ROUTER_DIR="${REPO_ROOT}/experimental/sgl-router"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"  # repo root (above sgl-router/)
+SGL_ROUTER_DIR="${REPO_ROOT}/sgl-router"
 CLUSTER_NAME="${CLUSTER:-sgl-router-kind}"
 NAMESPACE="${NAMESPACE:-sgl-router-test}"
 CONTEXT="kind-${CLUSTER_NAME}"
