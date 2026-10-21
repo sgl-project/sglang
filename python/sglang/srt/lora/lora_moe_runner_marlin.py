@@ -119,13 +119,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         )
 
         # Stage 1: Gate/Up (Marlin)
-        projection_cache = torch.empty(
-            (M * topk * (2 * N + K),),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        intermediate_cache1 = torch.empty(
+            (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
-        intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
             intermediate_cache1,
@@ -170,6 +166,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
         # Stage 3: Down (Marlin)
+        intermediate_cache3 = torch.empty(
+            (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             intermediate_cache2,
