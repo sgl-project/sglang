@@ -359,7 +359,7 @@ class WeightCacheDaemon:
         )
 
         current_platform.empty_cache()
-        memory_before_load = self._reserved_memory_bytes(self.gpu_id)
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -393,7 +393,7 @@ class WeightCacheDaemon:
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
-            0, self._reserved_memory_bytes(self.gpu_id) - memory_before_load
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
 
         # Export all parameters and buffers as IPC handles
@@ -403,19 +403,6 @@ class WeightCacheDaemon:
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Exported {len(self.state_entries)} tensors as IPC handles."
         )
-
-    @staticmethod
-    def _reserved_memory_bytes(gpu_id: int) -> int:
-        """Bytes of resident (reserved) device memory for ``gpu_id``.
-
-        CUDA uses ``torch.cuda.memory_reserved``; NPU uses the torch_npu
-        equivalent so preloaded-weight accounting stays platform-agnostic.
-        """
-        if is_npu():
-            import torch_npu  # noqa: F401
-
-            return int(torch.npu.memory_reserved(gpu_id))
-        return int(torch.cuda.memory_reserved(gpu_id))
 
     @staticmethod
     def _assert_ipc_compatible_allocator() -> None:
