@@ -45,6 +45,14 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
+_FUSED_MHC_TP_SIZES = (2, 4)
+
+
+def fused_mhc_tp_ok(tp_size: int) -> bool:
+    return tp_size in _FUSED_MHC_TP_SIZES
+
+
 # ---------------------------------------------------------------------------
 # What a layer hands this module
 # ---------------------------------------------------------------------------
@@ -278,7 +286,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
     if (
         x.is_cuda
-        and (x_flat.shape[0] >= 128 or hopper_medium)
+        and x_flat.shape[0] >= 32
         and x_flat.is_contiguous()
         and (get_platform().is_sm100 or get_platform().is_sm90)
         and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
