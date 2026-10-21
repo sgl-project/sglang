@@ -535,3 +535,31 @@ existing REJECTED metadata-capacity semantics. No production behavior was
 changed to satisfy those incorrect expectations. Ruff/isort/format/whitespace
 checks pass. Parent reviewed the complete diff; approve this local feature unit.
 Composable runtime, observations and scheduler admission holds remain ongoing.
+
+## Unit 7b — Read-only policy values and bounded plan composition
+
+Added a callable policy extension contract using immutable value observations,
+unknown demand/cost markers, frozen owner snapshots, proposals/dependencies and
+request guidance. No live scheduler/allocator/request objects cross this API.
+The composer checks native primitive schemas, action/snapshot/dependency bounds,
+IDs/generations and finite timings/scores. Configured order resolves policy
+placement competition after accepted explicit intent. Compatible copy interests
+remain independent and use the existing physical job coalescing boundary.
+
+GPU priority after new COPY is an explicit dependency independent of action
+order. Unknown/cyclic dependencies fail before execution; rejected predecessors
+reject dependents transitively. Shared token prefixes conflict even when branch
+tails differ; unequal descriptor hashes cannot prove disjoint earlier prefixes,
+so such placement advice is conservative. Guidance combines scores and admission
+conditions without approving physical memory.
+
+Review corrected the initial overlap predicate, which compared complete token
+prefixes and missed different branches sharing their first pages; a regression
+covers that physical sharing. Per-plan payload bytes and dependency fanout are
+bounded separately from frozen scope entries. Immutable snapshots are validated
+once when shared across proposals. The owner runtime must supply authoritative
+snapshots and perform fresh approval/execution; no serving policy is enabled by
+this module alone. Fifteen new CPU contract cases and 78 existing control cases
+pass together (93), /tmp/sglang-kv-policy-composer-final-cpu-proof.log. Strict
+Ruff/isort/format/whitespace checks pass. Parent reviewed the whole module;
+approve this composition feature unit. Runtime/admission integration is pending.

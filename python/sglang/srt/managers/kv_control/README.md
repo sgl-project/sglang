@@ -702,3 +702,29 @@ claim bound remains `max_claims_per_copy`; `max_policy_claims_per_copy` (default
 4) separately bounds policy revisions so policies cannot consume explicit
 revision slots. The total copy-unit metadata budget remains shared and bounded.
 This authority seam does not activate any policy by default.
+
+## Read-only policy composition contract
+
+The callable `kv_control.policy` module defines immutable pool/request
+observations, frozen policy signals and proposals, dependency references and
+scheduler guidance. Unknown demand and unmeasured transfer costs use `None`;
+an absent/truncated request view is not a zero-demand certificate. Policy
+extensions receive these values and return advice. Allocators, live requests,
+queues and transfer handles do not enter this interface.
+
+`KVPlanComposer` validates primitive payloads, owner generations, snapshot/action
+budgets and dependency references before execution. Configured policy order
+resolves competing placement advice; accepted explicit intent precedes advice.
+Different branches can conflict through a shared token prefix. Descriptor-only
+scopes without enough information to prove disjointness compete conservatively.
+Compatible copies retain separate plan entries for independent cancellation;
+the physical adapters coalesce their actual jobs after resource approval.
+
+A live priority proposal waits for an overlapping new GPU COPY to publish,
+regardless of offer ordering. Cycles and unknown dependencies fail the plan;
+rejected dependencies propagate to their dependents. Guidance combines finite
+scores and requires every participating admission condition to pass. The plan
+is advisory: the scheduling/cache owner must resolve snapshots, check current
+resources, execute dependencies only after successful publication, and transfer
+preparation holds to actual admission. This module alone does not enable a
+serving policy or certify capacity/readiness.
