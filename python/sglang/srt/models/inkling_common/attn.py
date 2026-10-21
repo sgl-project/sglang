@@ -9,11 +9,11 @@ from torch import nn
 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
     is_batch_invariant,
 )
-from sglang.kernels.ops.attention.log_scaling_tau import (
-    apply_log_scaling_tau as _apply_log_scaling_tau,
-)
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
+)
+from sglang.kernels.ops.elementwise.row_scale import (
+    apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.gemm.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.memory.row_compact import row_compact_bf16
@@ -481,12 +481,8 @@ class InklingAttention(nn.Module):
         do_store = do_bf16_store or do_mxfp8_store
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
-            # SWA sub-pool + the backend's full->SWA translated write location.
+            # SWA sub-pool + the plan's sliding-window write ids (backend buffer).
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         es = q.element_size()
@@ -584,10 +580,6 @@ class InklingAttention(nn.Module):
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         is_v2 = forward_batch.forward_mode.is_draft_extend_v2()
@@ -691,10 +683,6 @@ class InklingAttention(nn.Module):
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         es = q.element_size()

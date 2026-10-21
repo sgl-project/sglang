@@ -9,6 +9,7 @@ import torch
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -17,25 +18,26 @@ from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReadStream:
     reads_are_translated = False
+    window_kv_kind = IdSpaceKind.FULL
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
 
-    def fill_packed_read_stream(
+    def pack_read_stream(
         self,
+        plan,
         *,
         req_pool_indices,
         seq_lens,
         indptr,
-        total_tokens,
         out,
         kv_start_idx=None,
-        sliding_window=False,
+        kind=IdSpaceKind.FULL,
         token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
@@ -91,6 +93,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         requests = torch.tensor([1, 2, 0])
         # Prefixes 3, 11, and an empty padded request; each has a four-token canvas.
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=requests,
             seq_lens=torch.tensor([7, 15, 4]),
@@ -126,6 +129,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             metadata.window_kv_indices.data_ptr(),
         )
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=torch.tensor([3, 1, 0]),
             seq_lens=torch.tensor([4, 9, 4]),
@@ -162,6 +166,7 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             input_ids=torch.zeros(16, dtype=torch.long),
             positions=torch.zeros(16, dtype=torch.long),
             input_embeds=torch.full((16, 7), -1.0),
+            num_token_non_padded=None,
         )
         batch = SimpleNamespace(
             needs_forward_metadata_init=lambda: False,

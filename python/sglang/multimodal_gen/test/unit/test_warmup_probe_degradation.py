@@ -204,6 +204,39 @@ class TestFitAutoResidencyProbe:
         assert fitted.width * fitted.height <= 832 * 480
 
 
+class TestProbeFitTerminates:
+    def test_pinned_frame_count_ends_the_shrink_ladder(self):
+        """A model whose sampling params pin num_frames must not hang the probe fit.
+
+        The lightened request comes back at the same size, so the fit must stop
+        instead of retrying the same shape forever. The request is larger than the
+        bounded warmup, so the measured-shape floor does not end the ladder first.
+        """
+        from dataclasses import dataclass
+
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            fit_auto_residency_probe,
+        )
+
+        @dataclass
+        class _PinnedFrames(SamplingParams):
+            def __post_init__(self) -> None:
+                self.num_frames = 37
+                super().__post_init__()
+
+        req = Req(sampling_params=_PinnedFrames(width=576, height=1024))
+        fitted, estimate, steps = fit_auto_residency_probe(
+            req,
+            records=[_record(640, 800, 37, peak_gib=54.0)],
+            free_bytes=20 << 30,
+            total_bytes=80 << 30,
+            server_args=_server_args(),
+        )
+        assert steps == 0
+        assert (fitted.width, fitted.height, fitted.num_frames) == (576, 1024, 37)
+        assert estimate is not None and estimate > 20 << 30
+
+
 class TestOutOfMemoryClassification:
     def test_allocation_failures_from_libraries_count_as_out_of_memory(self):
         from sglang.multimodal_gen.runtime.server_warmup import _is_out_of_memory
