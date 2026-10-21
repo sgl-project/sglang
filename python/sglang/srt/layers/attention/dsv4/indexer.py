@@ -519,11 +519,7 @@ def topk_transform_paged_from_metadata(
 def group_verify_rows(
     q, lens: torch.Tensor, table: torch.Tensor, rows_per_request: int
 ):
-    """``(q, lens, table)`` for the paged logits kernel with ``rows_per_request``
-    consecutive rows per request scored as one next_n query, so the kernel reads
-    a request's index keys once rather than once per row: ``q`` (or each tensor
-    of an FP4 ``(values, scales)`` pair) viewed ``[requests, n, ...]``, the
-    per-row lengths ``[requests, n]``, and one page-table row per request."""
+    """View rows_per_request consecutive rows as one next_n request for DeepGEMM."""
     n = rows_per_request
     if n == 1:
         return q, lens, table

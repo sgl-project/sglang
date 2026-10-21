@@ -160,10 +160,8 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
-# Fewest requests at which the C4 indexer scores a static verify per request.
-# On B200 with a cold L2 the grouped launch is never slower from 16 requests on
-# and up to 2.2x faster at long context; below that, at short context, it forms
-# too few blocks to fill the GPU and runs up to 1.2x slower than per row.
+# Measured on B200: below 16 requests, the grouped C4 verify call is up to 1.2x
+# slower at short context.
 C4_GROUPED_VERIFY_MIN_REQUESTS = 16
 
 
@@ -1480,9 +1478,6 @@ class DeepseekV4AttnBackend(
         )
 
     def _c4_indexer_groups_verify_rows(self, bs: int) -> bool:
-        """Whether the C4 indexer scores a static verify's draft rows per request,
-        reading each request's index keys once instead of once per row. Only the
-        SM100 DeepGEMM path takes it; the other indexer kernels score rows alone."""
         return (
             bs >= C4_GROUPED_VERIFY_MIN_REQUESTS
             and get_platform().is_sm100
