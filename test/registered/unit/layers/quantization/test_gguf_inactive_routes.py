@@ -387,8 +387,13 @@ class TestGgufInactiveRoutes(CustomTestCase):
                             device="cuda",
                         ).repeat(repeats, 1)[:tokens]
                         inactive = ids < 0
-                        inputs = torch.full(
-                            (tokens, 256), 0.25, device="cuda", dtype=torch.float16
+                        inputs = (
+                            torch.linspace(
+                                0.125, 2.0, tokens, device="cuda", dtype=torch.float16
+                            )
+                            .unsqueeze(1)
+                            .expand(tokens, 256)
+                            .contiguous()
                         )
                         inputs[inactive.all(dim=-1)] = float("nan")
                         provider_name = (
