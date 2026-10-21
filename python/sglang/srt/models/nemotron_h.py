@@ -29,7 +29,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -290,6 +289,10 @@ class NemotronHMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
                 config,
@@ -345,7 +348,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
         forward_batch: ForwardBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if (
@@ -360,21 +362,16 @@ class NemotronHMoE(nn.Module):
             and is_in_breakable_cuda_graph()
             and is_sm120()
         ):
-            return self._forward_core_prefill_overlap(
-                hidden_states, num_token_non_padded
-            )
+            return self._forward_core_prefill_overlap(hidden_states)
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            return self._forward_core_shared_routed_overlap(
-                hidden_states, num_token_non_padded
-            )
-        return self._forward_core_normal(hidden_states, num_token_non_padded)
+            return self._forward_core_shared_routed_overlap(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
         # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
@@ -388,12 +385,6 @@ class NemotronHMoE(nn.Module):
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            ),
         )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -403,7 +394,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core_shared_routed_overlap(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
@@ -423,12 +413,6 @@ class NemotronHMoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if not self.is_nextn
-                    else None
-                ),
             )
             if self.use_latent_moe:
                 hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -440,7 +424,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core_prefill_overlap(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # A multi-stream graph per hybrid segment creates one internal stream
         # per executable. Keep each graph linear and launch shared experts on
@@ -456,12 +439,6 @@ class NemotronHMoE(nn.Module):
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            ),
         )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
@@ -505,11 +482,6 @@ class NemotronHMoE(nn.Module):
         # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(
             hidden_states,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
             forward_batch=forward_batch,
         )
 
