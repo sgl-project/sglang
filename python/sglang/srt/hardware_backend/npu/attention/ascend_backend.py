@@ -1381,6 +1381,7 @@ class AscendAttnBackend(AttentionBackend):
         ``CPAttentionBackendKind.FLASH_ATTENTION`` because FIA uses the same
         two-call (prev + next) dispatch convention.
         """
+
         def _fia_cp_attn(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
             # The strategy passes cu_seqlens_q (with a leading 0) and plain KV
             # lengths as int32 tensors; FIA wants cumulative query lengths
