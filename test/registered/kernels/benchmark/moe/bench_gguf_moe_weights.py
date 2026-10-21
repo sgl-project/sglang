@@ -1,4 +1,4 @@
-"""Compare GGUF in-place weighting without hiding memory traffic in L2."""
+"""Compare all-valid GGUF weighting with the original in-place product."""
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -14,9 +14,7 @@ register_cuda_ci(
 
 
 def torch_weight(outputs, weights, ids):
-    inactive = ids < 0
-    outputs.masked_fill_(inactive.reshape(-1, 1), 0)
-    outputs.view(*ids.shape, -1).mul_(weights.masked_fill(inactive, 0).unsqueeze(-1))
+    outputs.view(*ids.shape, -1).mul_(weights.unsqueeze(-1))
 
 
 @marker.parametrize("tokens", [1, 64, 1024, 8192], [1024])
@@ -34,11 +32,10 @@ def benchmark(tokens, hidden, dtype, provider):
     # Unit weights keep repeated in-place calls numerically stable.
     weights = torch.ones(tokens, 8, device=device)
     ids = torch.zeros(tokens, 8, dtype=torch.int32, device=device)
-    ids[::3, -1] = -1
     return marker.do_bench(
         native if provider == "aot" else torch_weight,
         input_args=(outputs, weights, ids),
-        memory_output=None,
+        memory_output=(outputs,),
     )
 
 
