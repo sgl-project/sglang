@@ -181,6 +181,14 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         # Native compilation can remove the required intermediate rounding.
         return None
 
+    def forward_torch_compile(self, *args, **kwargs):
+        if self._compiled_native is None:
+            # Without emulated casts, Inductor drops eager's intermediate rounding.
+            self._compiled_native = torch.compile(
+                self.forward_native, options={"emulate_precision_casts": True}
+            )
+        return self._compiled_native(*args, **kwargs)
+
     def forward_native(
         self,
         branch: torch.Tensor,
