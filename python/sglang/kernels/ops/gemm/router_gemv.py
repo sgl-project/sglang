@@ -32,7 +32,8 @@ _CONFIGS = (
     (32, (16, 32, 512, 8, 4)),
     (_MAX_M, (32, 32, 512, 8, 4)),
 )
-# FP32 weights on CUDA (FP32 router gates) use the FP32 row path only, up to 8 rows.
+# FP32 weights on CUDA (FP32 router gates) use the FP32 row path only, up to 8 rows,
+# a conservative cap: for N=256, K=5120 on GB300 it beats bf16x3 through 14 rows.
 _CUDA_FP32_CONFIGS = ((8, (1, 16, 128, 8, 8)),)
 
 
