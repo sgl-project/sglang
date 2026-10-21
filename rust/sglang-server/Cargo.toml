@@ -34,6 +34,8 @@ uuid = { workspace = true }
 
 arc-swap = "1"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
+# Already in the tree via dynamo-renderer; `/v1/loads` timestamps.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 core_affinity = "0.8"
@@ -44,7 +46,7 @@ dynamo-tokenizers = "3.1.0"
 # small service helpers.
 dynamo-parsers = "=9.2.8"
 dynamo-protocols = "7.0.0"
-dynamo-renderer = "7.0.1"
+dynamo-renderer = "7.1.1"
 sglang-processor = { path = "../sglang-processor", default-features = false, features = ["parser"] }
 minijinja = "2.24"
 flume = "0.12.0"
@@ -62,6 +64,8 @@ numpy = "0.29.0"
 regex-syntax = "=0.8.11"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+# Already in the tree; `/weights_checker`'s `per_engine_checksum`.
+sha2 = "0.10"
 # The pure-Rust core of the MM pipeline. `default-features = false` drops the
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.

@@ -252,14 +252,17 @@ class NGRAMWorker(BaseSpecWorker):
         req_ids = [req.rid for req in batch.reqs]
         # Only the last max_trie_depth tokens can match; the ids are
         # array.array, so list() the tails for list concat below.
+        # multimodal cache padding contains identities, not vocabulary token IDs
         input_tails = [
-            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+            list(req.origin_input_ids_unpadded[-self.max_trie_depth :])
+            for req in batch.reqs
         ]
         output_tails = [
             list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
         ]
         base_lens = [
-            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+            len(req.origin_input_ids_unpadded) + len(req.output_ids)
+            for req in batch.reqs
         ]
 
         if use_prev_tokens:
@@ -414,7 +417,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids[-self.max_trie_depth :]),
+                list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
@@ -479,7 +482,13 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                watermark_state=self.model_runner.watermark_state,
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -488,7 +497,17 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index].flatten()
+            accept_tokens = predict[accept_index]
+            if (
+                self.model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+            ):
+                self.model_runner.watermark_state.append_speculative(
+                    batch.req_pool_indices,
+                    accept_tokens,
+                    accept_lens,
+                )
+            accept_tokens = accept_tokens.flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's

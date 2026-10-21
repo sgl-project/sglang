@@ -45,6 +45,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1028,8 +1029,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1227,6 +1231,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return ffn_exit.finish(hidden_states)
 
 
+def _refreshes_rope_cos_sin(
+    config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
+) -> bool:
+    """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+    once, at the first full-attention layer this PP stage owns.
+
+    layer_id must be a full-attention layer; linear-attention layers near the
+    stage start would also pass the check below. Only Qwen3_5AttentionDecoderLayer
+    calls this, and it is built only for "attention" entries of layers_block_type.
+    """
+    # Drafts keep the unsplit numbering.
+    stage_start = 0
+    if not is_nextn:
+        stage_start, _ = get_pp_indices(
+            config.num_hidden_layers,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+        )
+    owned_by_stage = layer_id >= stage_start
+    # Full-attention layers are interval apart, so only the stage's first one
+    # lies within interval of its start.
+    first_in_stage = layer_id < stage_start + config.full_attention_interval
+    return owned_by_stage and first_in_stage
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1247,6 +1276,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(
+            config, layer_id, is_nextn
+        )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
@@ -1511,8 +1543,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+        if self.refreshes_rope_cos_sin:
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(

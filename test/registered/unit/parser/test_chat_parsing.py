@@ -29,6 +29,7 @@ from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -955,7 +956,7 @@ def _chunk_random(text: str, rng: random.Random):
     yield text[prev:]
 
 
-class ResponseEventStreamTest(unittest.TestCase):
+class ResponseEventStreamTest(CustomTestCase):
     def test_stream_matches_whole_string_all_templates_fixed_chunking(self):
         """For every fixed chunking step we try, the streamed finalize()
         output must equal the whole-string parse. Regression coverage for

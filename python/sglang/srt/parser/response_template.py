@@ -534,6 +534,9 @@ class ResponseTemplateReasoningDetector:
         adapter.parse(text, self._tools)
         return adapter._verbatim
 
+    def get_answer_frame(self) -> None:
+        return None
+
     def detect_and_parse(self, text: str) -> _ReasoningResult:
         adapter = self._new_adapter()
         result = adapter.route_reasoning_events(

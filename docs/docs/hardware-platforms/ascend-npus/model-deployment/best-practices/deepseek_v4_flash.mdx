@@ -5,7 +5,7 @@ metatags:
 ---
 
 <Note>
-This page focuses on optimal configuration and benchmark results for DeepSeek-V4-Flash on the Ascend NPU.
+This page focuses on optimal configuration and benchmark results for DeepSeek-V4-Flash on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [DeepSeek-V4-Flash Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash).
 
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
@@ -15,7 +15,6 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | DeepSeek-V4-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-1p1d-16p-in8k-out1k-50ms) |
-| DeepSeek-V4-Flash | Ascend A3 Series Products | 8 | PD Mixed | 32k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in32k-out1k-50ms) |
 | DeepSeek-V4-Flash | Ascend A3 Series Products | 8 | PD Mixed | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in8k-out1k-50ms) |
 
 ## Optimal Configuration
@@ -75,6 +74,7 @@ export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_FP8_WO_A_GEMM=0
@@ -103,22 +103,19 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
+        export DEEPEP_HCCL_BUFFSIZE=2048
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=8
         export HCCL_SOCKET_IFNAME=<network-interface>
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35
         export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=60
-        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-        export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-        export SGLANG_ZBAL_LOCAL_MEM_SIZE=62084
-        export ZBAL_ENABLE_GRAPH=1
-        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+        export SGLANG_ENABLE_WAR_BARRIER=1
+        export SGLANG_FORCE_COARSE_WAR_BARRIER=1
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port 8998 \
         --page-size 128 \
         --tp-size 16 \
         --trust-remote-code \
@@ -126,12 +123,14 @@ do
         --attention-backend dsv4 \
         --watchdog-timeout 9000 \
         --disaggregation-transfer-backend ascend \
-        --mem-fraction-static 0.62 \
+        --disaggregation-bootstrap-port 8998 \
+        --mem-fraction-static 0.68 \
         --prefill-max-requests 6 \
-        --max-prefill-tokens 70000 \
-        --chunked-prefill-size -1 \
+        --max-prefill-tokens 80000 \
+        --chunked-prefill-size 131072 \
         --max-running-requests 112 \
-        --attn-dp-size 16 \
+        --dp-size 16 \
+        --enable-dp-attention \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --quantization modelslim \
@@ -158,6 +157,7 @@ do
         export HCCL_BUFFSIZE=1200
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+        export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -173,16 +173,17 @@ do
         --mem-fraction-static 0.75 \
         --prefill-max-requests 1 \
         --disable-radix-cache \
-        --chunked-prefill-size 32768 \
+        --chunked-prefill-size -1 \
         --disaggregation-transfer-backend ascend \
         --max-running-requests 896 \
-        --attn-dp-size 16 \
+        --dp-size 16 \
+        --enable-dp-attention \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --quantization modelslim \
         --enable-dp-lm-head \
         --kv-cache-dtype bfloat16 \
-        --cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56 \
+        --cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 2 \
         --speculative-eagle-topk 1 \
@@ -220,139 +221,15 @@ python -m sglang.bench_serving \
     --port 6688 \
     --random-input-len 8000 \
     --random-output-len 1000 \
-    --num-prompts 1600 \
+    --num-prompts 2400 \
     --max-concurrency 800 \
     --random-range-ratio 1 \
-    --warmup-requests 0 \
+    --warmup-requests 16 \
     --request-rate inf \
     --seed 1
 ```
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
-
-### DeepSeek-V4-Flash W8A8 8P IN32K OUT1K 50ms
-
-**Model**: DeepSeek-V4-Flash
-
-**Hardware**: Ascend A3 Series Products
-
-**Cards**: 8
-
-**Deploy Mode**: PD Mixed
-
-**Quantization**: W8A8 INT8
-
-**Dataset**: 32k+1k
-
-**TPOT**: 50ms
-
-#### Model Deployment
-
-```bash Command
-# ============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
-# ============================================================
-
-MODEL_PATH=/path/to/model-weights
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
-
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-export FORCE_DRAFT_MODEL_NON_QUANT=1
-export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=8
-export HCCL_SOCKET_IFNAME=<network-interface>
-export INF_NAN_MODE_FORCE_DISABLE=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
-export SGLANG_DISABLE_DRAFT_EXTEND_GRAPH=1
-export SGLANG_DSV4_FP4_EXPERTS=False
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=0
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_NPU_USE_MULTI_STREAM=1
-export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
-export SGLANG_OPT_FP8_WO_A_GEMM=0
-export SGLANG_OPT_FUSE_WQA_WKV=0
-export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
-export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
-export SGLANG_OPT_USE_TILELANG_MHC_POST=False
-export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=61000
-export STREAMS_PER_DEVICE=32
-export USE_FUSED_HC_PRE_ASCENDC=1
-export USE_NPU_MOE_GATING_TOP_K=1
-export ZBAL_ENABLE_GRAPH=1
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
-
-python3 -m sglang.launch_server \
-    --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 6688 \
-    --page-size 128 \
-    --tp-size 16 \
-    --trust-remote-code \
-    --device npu \
-    --prefill-max-requests 32 \
-    --attention-backend dsv4 \
-    --watchdog-timeout 9000 \
-    --mem-fraction-static 0.7 \
-    --chunked-prefill-size 131072 \
-    --max-running-requests 64 \
-    --attn-dp-size 16 \
-    --moe-a2a-backend deepep \
-    --deepep-mode auto \
-    --quantization modelslim \
-    --enable-dp-lm-head \
-    --kv-cache-dtype auto \
-    --skip-server-warmup \
-    --cuda-graph-bs-decode 1 2 4 8 \
-    --speculative-algorithm EAGLE \
-    --speculative-num-steps 2 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 3 \
-    --ep-size 16 \
-    --disable-radix-cache
-```
-
-#### Benchmark
-
-We tested it based on the `RANDOM` dataset.
-
-```bash Command
-python -m sglang.bench_serving \
-    --dataset-name random \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --random-input-len 32000 \
-    --random-output-len 1000 \
-    --num-prompts 64 \
-    --max-concurrency 64 \
-    --random-range-ratio 1 \
-    --warmup-requests 0 \
-    --request-rate inf \
-    --seed 1 \
-    --max-attempts 3
-```
 
 ### DeepSeek-V4-Flash W8A8 8P IN8K OUT1K 50ms
 
@@ -376,11 +253,12 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -397,21 +275,23 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 
+export DEEPEP_HCCL_BUFFSIZE=2500
+export DEEPEP_HYBRID_DEPLOYMENT=1
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export FORCE_DRAFT_MODEL_NON_QUANT=1
-export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=8
-export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
-export SGLANG_DISABLE_DRAFT_EXTEND_GRAPH=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export SGLANG_DSPARK_FAST_KERNEL=0
 export SGLANG_DSV4_FP4_EXPERTS=False
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_ENABLE_WAR_BARRIER=1
+export SGLANG_FORCE_COARSE_WAR_BARRIER=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_FP8_WO_A_GEMM=0
@@ -420,11 +300,11 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
 export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:14699
 export SGLANG_ZBAL_LOCAL_MEM_SIZE=61000
 export STREAMS_PER_DEVICE=32
-export USE_FUSED_HC_PRE_ASCENDC=1
-export USE_NPU_MOE_GATING_TOP_K=1
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
@@ -435,25 +315,28 @@ python3 -m sglang.launch_server \
     --tp-size 16 \
     --trust-remote-code \
     --device npu \
-    --prefill-max-requests 160 \
+    --prefill-max-requests 192 \
+    --max-prefill-tokens 80000 \
     --attention-backend dsv4 \
     --watchdog-timeout 9000 \
-    --mem-fraction-static 0.7 \
+    --mem-fraction-static 0.68 \
     --chunked-prefill-size 131072 \
-    --max-running-requests 160 \
-    --attn-dp-size 16 \
+    --max-running-requests 192 \
+    --dp-size 16 \
+    --enable-dp-attention \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --quantization modelslim \
     --enable-dp-lm-head \
-    --kv-cache-dtype auto \
-    --skip-server-warmup \
-    --cuda-graph-bs-decode 1 2 4 8 10 \
-    --speculative-algorithm EAGLE \
-    --speculative-num-steps 2 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 3 \
-    --ep-size 16 \
+    --kv-cache-dtype bfloat16 \
+    --load-balance-method round_robin \
+    --cuda-graph-bs-decode 1 2 4 6 8 10 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-draft-model-quantization modelslim \
+    --speculative-draft-attention-backend ascend \
+    --speculative-num-draft-tokens 7 \
+    --speculative-dspark-block-size 6 \
     --disable-radix-cache
 ```
 
@@ -469,11 +352,10 @@ python -m sglang.bench_serving \
     --port 6688 \
     --random-input-len 8000 \
     --random-output-len 1000 \
-    --num-prompts 320 \
+    --num-prompts 160 \
     --max-concurrency 160 \
     --random-range-ratio 1 \
     --warmup-requests 0 \
     --request-rate inf \
-    --seed 1 \
-    --max-attempts 3
+    --seed 1
 ```

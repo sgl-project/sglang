@@ -63,7 +63,7 @@ The [XPU image tags](https://hub.docker.com/r/lmsysorg/sglang/tags?name=xpu) end
 The image pulling command is like:
 
 ```bash Command
-docker pull lmsysorg/sglang:v0.5.20-xpu
+docker pull lmsysorg/sglang:v0.5.22-xpu
 ```
 
 #### Build from Dockerfile
@@ -283,7 +283,7 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Feature | Status |
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Not yet implemented |
+| Speculative decoding | Supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
 

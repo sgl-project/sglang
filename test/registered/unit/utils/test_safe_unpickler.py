@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils.common import MultiprocessingSerializer, safe_pickle_loads
+from sglang.srt.utils.common import (
+    MultiprocessingSerializer,
+    SafeUnpickler,
+    safe_pickle_loads,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +60,29 @@ class TestSafeUnpickler(CustomTestCase):
         self.assertEqual(restored.factory, value.factory)
         self.assertEqual(restored.index, value.index)
         self.assertEqual(restored.parser("11"), 11)
+
+    def test_allowlist_covers_torch_dtypes_and_tensor_classes(self):
+        # A pickled tensor carries its dtype and tensor class as GLOBAL
+        # opcodes, so every dtype the installed torch exposes must be listed
+        # or a payload using it is refused.
+        torch_globals = {
+            ("torch", name)
+            for name in dir(torch)
+            if isinstance(getattr(torch, name), torch.dtype)
+        }
+        torch_globals.update(
+            (cls.__module__, cls.__name__)
+            for cls in (*torch._storage_classes, *torch._tensor_classes)
+        )
+
+        missing = sorted(torch_globals - SafeUnpickler.ALLOWED_GLOBALS)
+
+        self.assertEqual(
+            missing,
+            [],
+            f"torch {torch.__version__} globals missing from "
+            f"SafeUnpickler.ALLOWED_GLOBALS: {missing}",
+        )
 
     def test_round_trips_tensor_payload(self):
         value = [("weight", torch.arange(6).reshape(2, 3))]
