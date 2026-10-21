@@ -607,7 +607,6 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
-        cache.tree_core.full_evictable_size.return_value = 10
         cache.req_to_token_pool = MagicMock()
 
         walk = {"component": None, "quota": 0}
