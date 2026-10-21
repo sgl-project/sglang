@@ -397,71 +397,81 @@ def _is_numa_available() -> bool:
     return True
 
 
-def _query_numa_node_for_npu(device_id: int) -> list:
-    """Get the NUMA node affinity for a logical Ascend NPU device id.
+def _npu_visible_physical_device_id(device_id: int) -> int | None:
+    """Map a logical NPU device id to its physical NPU id.
 
-    The logical -> physical NPU mapping follows ASCEND_RT_VISIBLE_DEVICES.
-    The driver accepts an ordered subset (verified on Atlas 910B3 / CANN 8.x:
-    "1,3" maps logical 0 -> physical NPU 1; reordering such as "5,0" is
-    rejected), so the logical id indexes the visible list in order. When the
-    variable is unset, the logical id is the physical NPU id.
-
-    The physical NPU's NUMA node is resolved through its PCI BDF:
-    `npu-smi info` prints the BDF per NPU ("0000:C1:00.0"), and
-    /sys/bus/pci/devices/<bdf>/numa_node carries the owning node. Degrades
-    safely (returns []) when npu-smi or sysfs is unavailable.
+    ASCEND_RT_VISIBLE_DEVICES holds an ordered subset of physical NPU ids
+    (verified on Atlas 910B3 / CANN 8.x: "1,3" maps logical 0 -> physical 1;
+    reordering such as "5,0" is rejected by the driver), so the logical id
+    indexes the list in order. Unset or unparsable values fall back to the
+    identity mapping.
     """
-    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-    if visible.strip():
-        try:
-            ids = [int(x) for x in re.split(r"[ ,]", visible.strip()) if x.strip()]
-        except ValueError:
-            logger.warning(
-                f"Unparsable ASCEND_RT_VISIBLE_DEVICES={visible!r}; "
-                f"treating device_id={device_id} as the physical NPU id."
-            )
-            physical = device_id
-        else:
-            if not 0 <= device_id < len(ids):
-                logger.warning(
-                    f"ASCEND_RT_VISIBLE_DEVICES={visible!r} has no entry for "
-                    f"logical device {device_id}; skipping NPU NUMA binding."
-                )
-                return []
-            physical = ids[device_id]
-    else:
-        physical = device_id
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return device_id
+    try:
+        ids = [int(x) for x in re.split(r"[ ,]", visible) if x]
+    except ValueError:
+        logger.warning(
+            f"Unparsable ASCEND_RT_VISIBLE_DEVICES={visible!r}; "
+            f"treating device_id={device_id} as the physical NPU id."
+        )
+        return device_id
+    if not 0 <= device_id < len(ids):
+        logger.warning(
+            f"ASCEND_RT_VISIBLE_DEVICES={visible!r} has no entry for "
+            f"logical device {device_id}; skipping NPU NUMA binding."
+        )
+        return None
+    return ids[device_id]
 
+
+def _npu_pci_bdf(physical_id: int) -> str | None:
+    """Return the PCI BDF of a physical NPU from ``npu-smi info`` output.
+
+    The npu-smi table lists each NPU over two rows; the Bus-Id appears on
+    the second row as e.g. ``0000:C1:00.0``.
+    """
     if shutil.which("npu-smi") is None:
         logger.debug("npu-smi not found, skipping NUMA node configuration for NPU")
-        return []
+        return None
     try:
         out = subprocess.run(
             ["npu-smi", "info"], capture_output=True, text=True, timeout=10
         ).stdout
     except Exception as e:
         logger.warning(f"npu-smi info failed ({e}); skipping NPU NUMA binding")
-        return []
-
-    # The table lists each NPU over two rows; the BDF is on the second row.
-    bdf = None
+        return None
     lines = out.splitlines()
     for i, line in enumerate(lines):
         m = re.match(r"\|\s+(\d+)\s+\S+\s+\|", line)
-        if m and int(m.group(1)) == physical:
+        if m and int(m.group(1)) == physical_id:
             for j in range(i + 1, min(i + 3, len(lines))):
                 m2 = re.search(
                     r"\|\s+([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s*\|",
                     lines[j],
                 )
                 if m2:
-                    bdf = m2.group(1).lower()
-                    break
-            break
+                    return m2.group(1).lower()
+    logger.warning(
+        f"NPU {physical_id} not found in npu-smi output; skipping NPU NUMA binding"
+    )
+    return None
+
+
+def _query_numa_node_for_npu(device_id: int) -> list:
+    """Get the NUMA node affinity for a logical Ascend NPU device id.
+
+    Resolution chain: logical -> physical NPU via ASCEND_RT_VISIBLE_DEVICES,
+    physical NPU -> PCI BDF via ``npu-smi info``, BDF -> NUMA node via
+    sysfs (``/sys/bus/pci/devices/<bdf>/numa_node``). Degrades safely to no
+    binding (returns []) at every step.
+    """
+    physical = _npu_visible_physical_device_id(device_id)
+    if physical is None:
+        return []
+    bdf = _npu_pci_bdf(physical)
     if bdf is None:
-        logger.warning(
-            f"NPU {physical} not found in npu-smi output; skipping NPU NUMA binding"
-        )
         return []
     try:
         with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
