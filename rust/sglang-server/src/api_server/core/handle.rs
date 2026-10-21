@@ -1373,15 +1373,7 @@ mod tests {
             shutdown_rx,
         );
         let dispatcher = std::thread::spawn(move || dispatcher.run());
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
-            activity,
-            true,
-            false,
-            Vec::new(),
-        );
+        let handle = configured_handle(intake_tx, abort_tx, 8, activity, true, false, Vec::new());
         let probe_handle = handle.clone();
         let probe =
             tokio::spawn(async move { probe_handle.probe_health(Duration::from_secs(1)).await });
