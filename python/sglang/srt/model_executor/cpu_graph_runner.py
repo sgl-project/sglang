@@ -835,7 +835,9 @@ class CPUGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
+            num_token_non_padded=(
+                self.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=self.capture_forward_mode,
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
@@ -849,7 +851,8 @@ class CPUGraphRunner:
         )
         with skip_ctx:
             with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ):
                 self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
                     bs,
@@ -991,11 +994,15 @@ class CPUGraphRunner:
         with replay_context():
             with skip_ctx:
                 prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                output = graphs[prepared_forward_batch.batch_size](
-                    prepared_forward_batch.input_ids,
-                    prepared_forward_batch.positions,
-                    prepared_forward_batch,
-                )
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend),
+                    forward_batch=prepared_forward_batch,
+                ):
+                    output = graphs[prepared_forward_batch.batch_size](
+                        prepared_forward_batch.input_ids,
+                        prepared_forward_batch.positions,
+                        prepared_forward_batch,
+                    )
         if forward_batch.batch_size in graphs:
             return output
 

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     _WorkspaceNamespace,
@@ -30,6 +31,7 @@ class _RecordingMoeAlltoAll:
 
 def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
     dispatcher = object.__new__(FlashinferDispatcher)
+    dispatcher.runner_backend = None
     dispatcher.dispatch_type = dispatch_type
     dispatcher.hidden_size = 128
     dispatcher.max_num_tokens = max_num_tokens
@@ -125,10 +127,20 @@ class TestFlashinferDispatcher(CustomTestCase):
         router_logits = torch.tensor(
             [[0.1, 3.0, 0.2, 2.0], [5.0, 0.0, 4.0, 0.1], [0.0, 0.1, 0.2, 9.0]]
         )
+        logical_to_physical = torch.tensor([2, 0, 3, 1])
         topk_output = BypassedTopKOutput(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            raw_router_logits=router_logits,
             topk_config=TopKConfig(top_k=2, torch_native=True),
+            expert_location_dispatch_info=ExpertLocationDispatchInfo(
+                ep_dispatch_algorithm="static",
+                partial_logical_to_rank_dispatch_physical_map=logical_to_physical,
+                partial_logical_to_all_physical_map=logical_to_physical[:, None],
+                partial_logical_to_all_physical_map_num_valid=torch.ones(
+                    4, dtype=torch.int64
+                ),
+                num_physical_experts=4,
+            ),
         )
 
         _dispatch_without_dp(
@@ -141,7 +153,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         expert_ids = moe_a2a.token_selected_experts
         self.assertEqual(expert_ids.dtype, torch.int32)
         self.assertEqual(
-            expert_ids.sort(dim=-1).values.tolist(), [[1, 3], [0, 2], [2, 3]]
+            expert_ids.sort(dim=-1).values.tolist(), [[0, 1], [2, 3], [1, 3]]
         )
         topk_weights = moe_a2a.payloads[moe_a2a.expert_id_payload_index + 1]
         self.assertEqual(topk_weights.shape, (3, 2))
@@ -160,7 +172,7 @@ class TestFlashinferRunnerDispatchFormats(CustomTestCase):
             StandardCombineInput,
             StandardDispatchOutput,
         )
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_context, get_parallel
 
         layer = SimpleNamespace(
             moe_tp_size=1, moe_tp_rank=0, moe_ep_size=4, moe_ep_rank=0
@@ -190,6 +202,7 @@ class TestFlashinferRunnerDispatchFormats(CustomTestCase):
                     return (kwargs["output"],)
 
                 with (
+                    get_context().override_server_args(model_path="dummy"),
                     get_parallel().override(tp_group=None),
                     patch.object(
                         runner,
