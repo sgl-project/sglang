@@ -1,0 +1,69 @@
+# Runs only the per-commit CPU unit suite (base-a-test-cpu) against a PR head,
+# dispatched by the `/run-cpu-ci` slash command. A cheap check for small PRs:
+# pair it with `/rerun-group <module>` instead of a full `run-ci` round.
+#
+# Always dispatched on main, so the workflow definition and every reusable
+# workflow it calls are trusted; only the code under test comes from the PR.
+# That code runs on hosted runners with a read-only token and no secrets
+# (nothing here inherits them), the same exposure as `/rerun-test` cpu mode.
+name: Run CPU CI
+run-name: "[run-cpu-ci] ${{ inputs.git_ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "PR head SHA to test"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number (informational)"
+        required: false
+        type: string
+        default: ""
+      # Read by _pr-test-stage-cpu.yml via caller_inputs. Its fail-fast health
+      # check inspects sibling jobs of a pull_request run, which this is not.
+      skip_pr_test_health_check:
+        description: "Skip the PR test health check fail-fast"
+        required: false
+        type: boolean
+        default: true
+      # Also read via caller_inputs. This run is on main's ref, so a cache it
+      # saved would be restored by main and every PR, yet hold PR-written files.
+      skip_cache_save:
+        description: "Do not save the HF / Rust caches"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: run-cpu-ci-${{ inputs.git_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # pr_test_yml stays pr-test.yml: compute_partitions.py reads it from the PR
+  # checkout, which may predate this file, and sizing shards off the per-commit
+  # stage's run_timeout_minutes keeps the split identical to PR CI.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      git_ref: ${{ inputs.git_ref }}
+      run_all_tests: true
+
+  # self_name must be the suite name: the stage passes it to run_suite.py.
+  # No rust_ext_artifact: its compile job runs on a self-hosted build node, so
+  # the stage falls back to its cache and compiles on a miss.
+  base-a-test-cpu:
+    needs: check-changes
+    uses: ./.github/workflows/_pr-test-stage-cpu.yml
+    with:
+      self_name: base-a-test-cpu
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '15'
