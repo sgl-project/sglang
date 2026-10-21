@@ -6,6 +6,7 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import builtins
 import contextlib
 import unittest
 from types import SimpleNamespace
@@ -264,6 +265,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertEqual(worker.draft_forward.called, not expect_graph)
 
     def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
+        """Non-QSA initialization must work without optional QSA dependencies."""
         worker = object.__new__(EagleDraftWorker)
         existing_backend = object()
         decode_backend = object()
@@ -276,10 +278,19 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
+        real_import = builtins.__import__
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(decode_backend, None),
+        def import_without_qsa(name, *args, **kwargs):
+            if name == "sglang.srt.layers.attention.qsa.qsa_indexer":
+                raise OSError("Optional QSA dependency is unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", new=import_without_qsa),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+                _make_backend_factory(decode_backend, None),
+            ),
         ):
             worker.init_attention_backend()
 

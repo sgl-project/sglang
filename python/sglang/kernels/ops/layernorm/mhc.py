@@ -2155,7 +2155,7 @@ def npu_hc_pre(
 
 
 @triton.jit
-def _hc_combine_kernel(
+def _mhc_combine_kernel(
     x_ptr,
     pre_ptr,
     y_ptr,
@@ -2710,7 +2710,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
-def hc_combine(
+def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
@@ -2718,7 +2718,7 @@ def hc_combine(
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
-    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+    _mhc_combine_kernel[(m, triton.cdiv(h, block_h))](
         x_flat,
         pre,
         y,

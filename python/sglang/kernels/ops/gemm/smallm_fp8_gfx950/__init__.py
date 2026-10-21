@@ -12,12 +12,12 @@ import tempfile
 
 import torch
 
-from sglang.kernels.ops.moe.smallm_moe_gfx950 import (
-    _check,
-    _hip_lib,
-    _hip_version,
-    _hipcc,
-    _Kernel,
+from sglang.kernels.jit.utils.hipcc import (
+    HipKernel,
+    check_hip,
+    hip_lib,
+    hip_version,
+    hipcc_path,
 )
 from sglang.srt.environ import envs
 
@@ -53,13 +53,23 @@ def smallm_fp8_gemm_enabled() -> bool:
     if _mod is None:
         _mod = False
         arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        if arch == "gfx950" and _hip_version() >= (7, 2, 0):
+        if arch == "gfx950" and hip_version() >= (7, 2, 0):
             co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_fp8_"), "k.co")
-            cmd = [_hipcc(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
+            cmd = [
+                hipcc_path(),
+                "--genco",
+                "--offload-arch=gfx950",
+                "-O3",
+                "-o",
+                co,
+                _SRC,
+            ]
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
                 mod = ctypes.c_void_p()
-                _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+                check_hip(
+                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load"
+                )
                 _mod = mod
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
                 logger.warning("smallm_fp8_gemm disabled: %s", e)
@@ -98,7 +108,7 @@ def smallm_fp8_gemm(XQ, WQ, x_scale, w_scale, dtype):
     kernel = _kernels.get((mt, *cfg))
     if kernel is None:
         name = f"smallm_fp8_gemm_m{mt}_n{nt}_s{steps}_w{waves}_x{xlds}"
-        kernel = _kernels[(mt, *cfg)] = _Kernel(_mod, name)
+        kernel = _kernels[(mt, *cfg)] = HipKernel(_mod, name)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=XQ.device)
     xs = x_scale.view(M, -1)[:, 0]
     ptrs = (XQ, WQ, xs, w_scale.contiguous(), out)
