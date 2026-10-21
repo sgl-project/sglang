@@ -127,12 +127,13 @@ TRANSFORM_EACH_RESPONSE_TEMPLATE = {
     "fields": {
         "content": {"content": "text"},
         "tool_calls": {
-            "open": "<calls>",
+            "open_pattern": r"<calls id=(?P<id>\w+)>",
             "close": "</calls>",
             "content": "json",
             "repeats": True,
             "transform_each": True,
             "transform": {
+                "id": "{id}",
                 "type": "function",
                 "function": {
                     "name": "{name}",
@@ -704,11 +705,14 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(detector.reasoning_default, "always")
 
     def test_transform_each_tool_region_emits_all_calls(self):
+        """Each member is transformed with the opener's captures, and its
+        arguments are cast to the tool schema."""
         template = TRANSFORM_EACH_RESPONSE_TEMPLATE
         tools = [_tool(), _tool("get_forecast")]
+        opener = "<calls id=1>"
         text = (
-            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
-            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+            opener + '[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"get_forecast","arguments":{"days":"3"}}]</calls>'
         )
         detector = ResponseTemplateToolDetector(
             response_template=template,
@@ -730,9 +734,9 @@ class TestResponseTemplateAdapters(CustomTestCase):
             response_template=template,
             prefix="<assistant>",
         )
-        opened = streaming.parse_streaming_increment("<calls>", tools)
+        opened = streaming.parse_streaming_increment(opener, tools)
         closed = streaming.parse_streaming_increment(
-            text.removeprefix("<calls>"),
+            text.removeprefix(opener),
             tools,
         )
         self.assertEqual(opened.calls, [])
@@ -745,14 +749,15 @@ class TestResponseTemplateAdapters(CustomTestCase):
         )
 
     def test_unknown_function_in_array_keeps_valid_siblings(self):
-        """An undefined function in a parallel-call array drops only itself;
-        its valid siblings and later calls keep consecutive indices."""
+        """An undefined or malformed member of a parallel-call array drops only
+        itself; its valid siblings and later calls keep consecutive indices."""
         tools = [_tool(), _tool("get_forecast")]
         text = (
-            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '<calls id=1>[{"name":"get_weather","arguments":{"location":"Paris"}},'
             '{"name":"unknown","arguments":{}},'
+            '{"name":"get_weather"},{"arguments":{}},null,'
             '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
-            '<calls>[{"name":"get_weather","arguments":{"location":"Rome"}}]</calls>'
+            '<calls id=2>[{"name":"get_weather","arguments":{"location":"Rome"}}]</calls>'
         )
         expected = [
             (0, "get_weather", {"location": "Paris"}),

@@ -187,6 +187,11 @@ def _reasoning_only_template(template: dict[str, Any]) -> ResponseTemplate:
 def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
     tool_field["optional"] = True
+    # The tool detector transforms each member itself, so one malformed member
+    # does not discard the whole region. The pass-through transform keeps the
+    # parsed list and keeps named groups in the delimiters valid.
+    if tool_field.pop("transform_each", False):
+        tool_field["transform"] = "{content}"
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
@@ -219,6 +224,7 @@ class ResponseTemplateStreamAdapter:
         *,
         prefix: str = "",
         grammar_start: str | None = None,
+        each_transform: Any = None,
     ):
         self._template = template
         self._prefix = prefix
@@ -227,8 +233,10 @@ class ResponseTemplateStreamAdapter:
         self._finalized = False
         tool_field = template.fields.get(_TOOL_FIELD)
         self._tool_close_re = None if tool_field is None else tool_field.close_re
+        self._each_transform = each_transform
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
+        self._open_tool_captures: dict = {}
         self._grammar_start = grammar_start
         # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
@@ -366,6 +374,7 @@ class ResponseTemplateStreamAdapter:
             elif field != _TOOL_FIELD or etype == "region_chunk":
                 continue
             elif etype == "region_open":
+                self._open_tool_captures = event.get("captures") or {}
                 name = self._open_tool_name(event.get("captures"))
                 self._pending_tool_streamed = bool(
                     index not in unusable_opens
@@ -380,11 +389,32 @@ class ResponseTemplateStreamAdapter:
                     )
                     accepted = False
                 else:
-                    accepted = on_tool_close(event["value"])
+                    accepted = on_tool_close(self._transform_members(event["value"]))
                 if not accepted and self._pending_tool_streamed and on_tool_dropped:
                     on_tool_dropped()
                 self._pending_tool_streamed = False
         return "".join(normal_parts)
+
+    def _transform_members(self, value: Any) -> Any:
+        """Apply a `transform_each` template to each member of a tool region,
+        dropping the members it cannot transform, and cast their arguments to
+        the tool schemas as the parser does for transformed regions."""
+        if self._each_transform is None:
+            return value
+        if not isinstance(value, list):
+            logger.warning("response_template: malformed tool call value: %r", value)
+            return []
+        members = []
+        for member in value:
+            try:
+                scope = {**self._open_tool_captures, **member}
+                call = _apply_transform(self._each_transform, scope)
+                members.append(self._parser._coerce_tool_calls(call))
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "response_template: malformed tool call value: %r", member
+                )
+        return members
 
     def _is_unusable_tool_end(self, event: dict) -> bool:
         """Whether a tool region ended malformed, or at end of stream without its
@@ -526,10 +556,14 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
         self._template = templates.tool_extraction
         self._prefix = prefix
-        self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
-        self.tool_close_literals = (
-            templates.source.fields[_TOOL_FIELD].close_literals or []
+        tool_field = templates.source.fields[_TOOL_FIELD]
+        self._each_transform = (
+            tool_field.transform if tool_field.transform_each else None
         )
+        self._adapter = ResponseTemplateStreamAdapter(
+            self._template, prefix=prefix, each_transform=self._each_transform
+        )
+        self.tool_close_literals = tool_field.close_literals or []
         if self.tool_close_literals:
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
@@ -634,7 +668,9 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     def detect_and_parse(
         self, text: str, tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        adapter = ResponseTemplateStreamAdapter(
+            self._template, prefix=self._prefix, each_transform=self._each_transform
+        )
         tool_indices = self._get_tool_indices(tools)
         calls: list[ToolCallItem] = []
 
