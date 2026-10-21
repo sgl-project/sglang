@@ -586,7 +586,6 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
-            prompt_encoder: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -627,7 +626,6 @@ mod tests {
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
-            prompt_encoder: None,
         });
         // Each probe that reaches intake counts as scheduler output.
         tokio::spawn(async move {
@@ -667,7 +665,6 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
-            prompt_encoder: None,
         });
 
         let responder = tokio::spawn(async move {

@@ -19,6 +19,7 @@ use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 use sglang_api_types::api::v1 as api_v1;
+use sglang_processor::dynamo_renderer::RenderedPrompt;
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -425,6 +426,7 @@ pub fn into_requests(
             GenerateRequest {
                 rid,
                 text,
+                chat_prompt: None,
                 input_ids,
                 // Plain text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
@@ -537,10 +539,30 @@ pub enum RequestKind {
     /// Walks the same FSM to `Queued`, then the tokenizer pool answers it
     /// through the request's own sink with one `TokenIds` payload. It never
     /// reaches a detok shard, so it is not registered with one.
-    Tokenize {
+    Tokenize(TokenizeInput),
+}
+
+#[derive(Debug)]
+pub enum TokenizeInput {
+    Text {
         text: String,
         add_special_tokens: bool,
     },
+    Chat(Box<RenderedChat>),
+}
+
+/// A rendered chat prompt and the `continue_final_message` text after it.
+#[derive(Debug, Clone)]
+pub struct RenderedChat {
+    pub prompt: RenderedPrompt,
+    pub continuation: String,
+}
+
+impl RenderedChat {
+    #[cfg(test)]
+    pub fn into_text(self) -> String {
+        self.prompt.into_text() + &self.continuation
+    }
 }
 
 /// A single in-flight generation request (one item after adapter fan-out),
@@ -566,6 +588,8 @@ pub struct GenerateRequest {
     /// detok sink, which is now unrepresentable.
     pub rid: Rid,
     pub text: Option<String>,
+    /// A rendered chat prompt the Tokenizer stage encodes in place of `text`.
+    pub chat_prompt: Option<Box<RenderedChat>>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
     /// Template-rendered prompts (chat) already contain their role/special

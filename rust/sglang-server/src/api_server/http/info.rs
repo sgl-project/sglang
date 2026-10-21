@@ -313,7 +313,6 @@ mod tests {
                 ),
                 server_args,
                 chat_formatter: None,
-                prompt_encoder: None,
             }),
             intake_rx,
             abort_rx,

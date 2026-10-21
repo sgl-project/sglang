@@ -167,7 +167,7 @@ async fn chat_completions(
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, rendered) =
-        match prepare_chat_request(&state, &body, request, chat_template_kwargs.as_ref()).await {
+        match prepare_chat_request(&state, body, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -229,15 +229,7 @@ async fn chat_completions(
         previous_content: Some(rendered.continuation.clone()),
         ..Default::default()
     };
-    // Without a loaded tokenizer (tests), the pool encodes the joined text.
-    let (text, input_ids) = match &state.prompt_encoder {
-        Some(encoder) => match encoder.encode_blocking(rendered).await {
-            Ok(ids) => (None, Some(ids.into_iter().map(i64::from).collect())),
-            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-        },
-        None => (Some(rendered.into_text()), None),
-    };
-    let mut prompt = Some((text, input_ids));
+    let mut prompt = Some(Box::new(rendered));
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
         let choice_prompt = if index + 1 == choices_per_prompt {
@@ -248,14 +240,9 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let (text, input_ids) = choice_prompt;
         let native = GenerateRequest {
             rid: rid.clone(),
-            text,
-            input_ids,
-            // Rendered templates own their special tokens — the pool must not
-            // add another BOS/EOS (Python's `add_special_tokens=False`).
-            skip_special_tokens: true,
+            chat_prompt: Some(choice_prompt),
             sampling_params: sampling.clone(),
             stream,
             return_logprob: want_logprobs,
@@ -317,7 +304,7 @@ async fn chat_completions(
 /// formatter or a render failure to the standard 400.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
-    body: &Value,
+    body: Value,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
@@ -944,7 +931,7 @@ mod tests {
         let request = serde_json::from_value(body.clone()).unwrap();
         super::super::template::render_chat(
             &super::super::ChatFormatter::DeepSeekV41,
-            &body,
+            body,
             &request,
             None,
         )
@@ -1392,7 +1379,6 @@ mod tests {
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::KimiK3),
-                prompt_encoder: None,
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1403,7 +1389,8 @@ mod tests {
                 let RequestKind::Generate(generate) = &request.kind else {
                     panic!("expected generation");
                 };
-                assert!(generate.text.as_ref().unwrap().contains("lookup"));
+                let prompt = generate.chat_prompt.as_ref().unwrap();
+                assert!(prompt.prompt.as_str().contains("lookup"));
                 assert!(
                     generate
                         .sampling_params
