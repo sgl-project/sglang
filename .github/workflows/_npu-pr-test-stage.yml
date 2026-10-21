@@ -234,18 +234,26 @@ jobs:
             # ignores HF_ENDPOINT, has no progress output and no retries, so a
             # blocked or slow mirror looks like a hang. Stage the pinned archive
             # here through HF_ENDPOINT instead; the tests read it from
-            # SGL_EVAL_ARCHIVE_DIR, re-check the sha256 sgl_eval expects, and
+            # SGLANG_EVAL_ARCHIVE_DIR, re-check the sha256 sgl_eval expects, and
             # fall back to sgl_eval's own download when it is missing or stale.
-            SGL_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
-            mkdir -p "${SGL_EVAL_ARCHIVE_DIR}"
+            #
+            # Large files come from Xet storage by default and the mirror does not
+            # serve it (401 from cas-server.xethub.hf.co), so force the classic
+            # HTTP path; plain curl is the last resort.
+            SGLANG_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
+            mkdir -p "${SGLANG_EVAL_ARCHIVE_DIR}"
+            export HF_HUB_DISABLE_XET=1
             if hf download cais/mmlu --repo-type dataset --include data.tar \
-                 --local-dir "${SGL_EVAL_ARCHIVE_DIR}"; then
-              ls -lh "${SGL_EVAL_ARCHIVE_DIR}/data.tar"
-              sha256sum "${SGL_EVAL_ARCHIVE_DIR}/data.tar"
+                 --local-dir "${SGLANG_EVAL_ARCHIVE_DIR}" \
+               || curl -fL --retry 5 --retry-delay 5 --connect-timeout 10 \
+                    -o "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar" \
+                    "${HF_ENDPOINT}/datasets/cais/mmlu/resolve/main/data.tar"; then
+              ls -lh "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
+              sha256sum "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
             else
               echo "::warning::MMLU archive prefetch failed; sgl_eval will download it itself"
             fi
-            echo "SGL_EVAL_ARCHIVE_DIR=${SGL_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
+            echo "SGLANG_EVAL_ARCHIVE_DIR=${SGLANG_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
 
             hf download MMMU/MMMU --repo-type dataset
           fi
