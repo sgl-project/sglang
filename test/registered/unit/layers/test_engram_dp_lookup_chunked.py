@@ -109,7 +109,7 @@ def _run_rank(rank, port, counts, max_len, results):
             torch.tensor(counts[rank]),
         ),
     ):
-        for budget in (1 << 30, DIM * HEADS * 2 * 5):  # one slice; 5-row slices
+        for budget in (1 << 30, DIM * HEADS * 2 * 5):
             with mock.patch.object(engram, "_DP_LOOKUP_CHUNK_BYTES", budget):
                 outs[budget] = emb._dp_sharded_lookup(ids, batch)[: counts[rank]]
     expected = _reference(all_ids[rank], weight, scale)

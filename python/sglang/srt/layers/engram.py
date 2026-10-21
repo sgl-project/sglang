@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
-# Bound on the bf16 values one DP Engram lookup holds at once (see _dp_sharded_lookup).
 _DP_LOOKUP_CHUNK_BYTES = 256 << 20
 
 
@@ -979,9 +978,6 @@ class EngramEmbedding(nn.Module):
             and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
         )
-        # Every rank holds a bf16 row for every gathered token, so the buffer
-        # grows with the DP size; above the budget, look up and reduce it in
-        # slices so the peak stays bounded.
         chunk_rows = max(1, _DP_LOOKUP_CHUNK_BYTES // (width * 2))
         if rows > chunk_rows and get_parallel().attn_cp_size == 1:
             if reduce_scatter and not is_dp_gatherv_active():
@@ -1007,8 +1003,6 @@ class EngramEmbedding(nn.Module):
     def _dp_lookup_reduce_scatter_chunked(
         self, ids_global: torch.Tensor, local: torch.Tensor, chunk_rows: int
     ):
-        """MAX_LEN layout: the global rows are tp_size equal slots, so slice
-        every slot at the same offsets and reduce-scatter each slice."""
         slot = local.shape[0]
         ids = ids_global.view(self.tp_size, slot, *ids_global.shape[1:])
         step = max(1, chunk_rows // self.tp_size)
@@ -1025,9 +1019,6 @@ class EngramEmbedding(nn.Module):
         chunk_rows: int,
         forward_batch: ForwardBatch,
     ):
-        """Any layout: reduce each slice of the global rows and keep the part
-        that falls in this rank's slot. Rows outside it land in a spare row,
-        so no host sync is needed to find the overlap."""
         local_start, local_num = get_dp_local_info(forward_batch)
         out = local.new_zeros((local.shape[0] + 1, local.shape[1]))
         spare = local.shape[0]
