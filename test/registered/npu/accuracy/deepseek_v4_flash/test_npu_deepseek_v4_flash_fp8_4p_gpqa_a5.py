@@ -144,8 +144,8 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
         """Run NPU accuracy test for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
         self.run_accuracy()
 
-class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
-    """Test NPU performance for DeepSeek-V4-Flash W8A8 8p in8k out1k."""
+class TestNPUDeepSeekV4FlashDSPARK(TestNpuPerformanceTestCaseBase):
+    """Test DSPARK for Deepseek-V4 in the 950 environment, acceptance rate greater than 0.5"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
