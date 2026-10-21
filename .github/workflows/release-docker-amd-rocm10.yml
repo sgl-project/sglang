@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly ROCm 10 (AMD)
+name: Release Docker Images Nightly ROCm 10 (AMD) (PR 45498 build only)
 on:
   workflow_dispatch:
     inputs:
@@ -21,8 +21,12 @@ on:
           - 'all'
           - gfx942-rocm1000
           - gfx950-rocm1000
-  schedule:
-    - cron: '0 12 * * *'
+
+permissions:
+  contents: read
+
+env:
+  PR_HEAD_SHA: 4bc44179dbf0c1dd449348edfe297ebe21e3c2e4
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
@@ -32,7 +36,6 @@ jobs:
   publish:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
-    environment: 'prod'
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +45,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: 4bc44179dbf0c1dd449348edfe297ebe21e3c2e4
           fetch-depth: 0
+
+      - name: Verify exact PR source
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          echo "Building PR #45498 at $PR_HEAD_SHA; registry publishing is disabled."
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -70,13 +79,7 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Build and push to rocm/sgl-dev
+      - name: Build only (no registry push)
         env:
           BUILD_TYPE: ${{ matrix.build_type }}
           GPU_ARCH: ${{ matrix.gpu_arch }}
@@ -97,37 +100,30 @@ jobs:
 
           docker build . \
             -f docker/rocm.Dockerfile \
-            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "SGL_BRANCH=4bc44179dbf0c1dd449348edfe297ebe21e3c2e4" \
             --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
             --build-arg "GPU_ARCH=${GPU_ARCH}" \
             --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}" \
+            -t "sglang-pr45498:${image_tag}" \
             --no-cache
-          docker push "rocm/sgl-dev:${image_tag}"
-
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
   publish-gfx1250-rocm101:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250-rocm101')
     runs-on: amd-docker-scale
-    environment: 'prod'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: 4bc44179dbf0c1dd449348edfe297ebe21e3c2e4
           fetch-depth: 0
+
+      - name: Verify exact PR source
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          echo "Building PR #45498 at $PR_HEAD_SHA; registry publishing is disabled."
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -153,13 +149,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Build and push to rocm/sgl-dev
+      - name: Build only (no registry push)
         env:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -169,40 +159,30 @@ jobs:
 
           docker build . \
             -f docker/rocm.Dockerfile \
-            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "SGL_BRANCH=4bc44179dbf0c1dd449348edfe297ebe21e3c2e4" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1010 \
             --build-arg ENABLE_MORI=0 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}" \
+            -t "sglang-pr45498:${image_tag}" \
             --no-cache
-          docker push "rocm/sgl-dev:${image_tag}"
 
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-
-  # gfx1250 (MI45x) runs on the same schedule as the pair above but stays a
-  # separate job: no MI450 runner pool consumes the image, so a bring-up build
-  # failure must not gate the released gfx942/gfx950 images.
   publish-gfx1250:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
     runs-on: amd-docker-scale
-    environment: 'prod'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: 4bc44179dbf0c1dd449348edfe297ebe21e3c2e4
           fetch-depth: 0
+
+      - name: Verify exact PR source
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          echo "Building PR #45498 at $PR_HEAD_SHA; registry publishing is disabled."
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -228,13 +208,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Build and push to rocm/sgl-dev
+      - name: Build only (no registry push)
         env:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -244,24 +218,12 @@ jobs:
 
           docker build . \
             -f docker/rocm.Dockerfile \
-            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "SGL_BRANCH=4bc44179dbf0c1dd449348edfe297ebe21e3c2e4" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1000 \
             --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}" \
+            -t "sglang-pr45498:${image_tag}" \
             --no-cache
-          docker push "rocm/sgl-dev:${image_tag}"
-
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
