@@ -344,6 +344,7 @@ fn host_of(worker_url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerSpec};
+    use crate::workers::WireProtocol;
 
     fn spec(id: &str, mode: WorkerMode, model: &str) -> WorkerSpec {
         WorkerSpec {
@@ -359,7 +360,7 @@ mod tests {
     fn registry(specs: &[WorkerSpec]) -> Arc<WorkerRegistry> {
         let r = Arc::new(WorkerRegistry::default());
         for s in specs {
-            let _ = r.add(s.clone());
+            let _ = r.add_with_cb(s.clone(), Some(Default::default()), WireProtocol::default());
         }
         r
     }

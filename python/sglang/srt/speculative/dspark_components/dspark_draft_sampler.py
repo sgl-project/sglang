@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_draft_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -14,8 +16,11 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
 
 
 class DsparkDraftSampler:
@@ -32,6 +37,7 @@ class DsparkDraftSampler:
         tp_sync: SpecTpSync,
         greedy_draft: bool,
         out=None,
+        megakernel_sampler: Optional[Callable] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -73,11 +79,46 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        self._megakernel_steps = None
+        if megakernel_sampler is not None:
+            self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
+
+    def _build_megakernel_steps(self, megakernel_sampler: Callable):
+        if not self.greedy_draft:
+            # The megakernel leaves temperature-0 rows' logits unwritten; a mixed accept
+            # still reads them.
+            self.step_logits = torch.zeros(
+                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
+                device=self.out.device,
+            )
+        steps = megakernel_sampler(
+            gamma=self.gamma,
+            max_bs=self.max_bs,
+            greedy_draft=self.greedy_draft,
+            noise=self._noise,
+            draft_tokens=self.out,
+            step_logits=self.step_logits,
+            step_temperatures=self.params.step_temperatures,
+        )
+        # A rank on SGLang's block would wait in its per-step token sync (this group),
+        # which the megakernel's step skips.
+        served = tuple(bs for bs in range(1, self.max_bs + 1) if steps(bs) is not None)
+        megakernel_agree(
+            served, what="draft sampler batch sizes", group=get_dp_tp_group()
+        )
+        return steps
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
-            assert not torch.cuda.is_current_stream_capturing()
+            # torch.cuda's capture query raises on XPU builds.
+            capturing = (
+                torch.xpu.is_current_stream_capturing()
+                if _is_xpu
+                else torch.cuda.is_current_stream_capturing()
+            )
+            assert not capturing
             self.step_logits = torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(self.model)),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
@@ -100,10 +141,26 @@ class DsparkDraftSampler:
                 bs=bs,
                 gamma=self.gamma,
             )
+        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+        step = None if self._megakernel_steps is None else self._megakernel_steps(bs)
+        if step is not None:
+            draft_tokens, confidence_features = step(model_hidden, anchor)
+        else:
+            draft_tokens, confidence_features = self._markov_block(
+                model_hidden, sample_hidden, anchor, bs
+            )
+        if self.confidence_out is not None:
+            confidence, confidence_raw = self.model.compute_confidence(
+                anchor_tokens=anchor,
+                draft_tokens=draft_tokens,
+                confidence_features=confidence_features,
+            )
+            self.confidence_out[:bs].copy_(confidence)
+            self.confidence_raw_out[:bs].copy_(confidence_raw)
+
+    def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
-
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -118,14 +175,7 @@ class DsparkDraftSampler:
             greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence, confidence_raw = self.model.compute_confidence(
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_features=confidence_features,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-            self.confidence_raw_out[:bs].copy_(confidence_raw)
+        return draft_tokens, confidence_features
 
 
 def _step_logits_width(model) -> int:
@@ -157,10 +207,12 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
+    megakernel_sampler = megakernel_draft_sampler(draft_model)
     if tp_rank == 0:
         logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "DSpark draft proposal (%s) folded into the draft cuda graph%s.",
             "greedy draft" if greedy_draft else "sampling",
+            "; the NVIDIA megakernel may run it" if megakernel_sampler else "",
         )
     return DsparkDraftSampler(
         model=draft_model,
@@ -171,4 +223,5 @@ def maybe_build_draft_sampler(
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
         out=out,
+        megakernel_sampler=megakernel_sampler,
     )

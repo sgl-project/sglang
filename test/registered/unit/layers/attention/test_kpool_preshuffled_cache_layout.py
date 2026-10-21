@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.index_buf_accessor import SetKAndS, _is_fp8_fnuz
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import SetKAndS, _is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     gather_index_k_scale_prefix_into,
