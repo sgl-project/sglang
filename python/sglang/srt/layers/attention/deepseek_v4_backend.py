@@ -2747,10 +2747,10 @@ class DeepseekV4AttnBackend(
             and forward_batch.attn_cp_metadata.local_index is None
             and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
         )
-        
+
         return (
-            not self.trtllm_attn and
-            forward_batch.forward_mode.is_extend_without_speculative()
+            not self.trtllm_attn
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and (not cp_active or cp_sparse_prefill)
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
