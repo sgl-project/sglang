@@ -1738,6 +1738,9 @@ class KVCacheConfigurator:
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
+        # MTP drafts sharing the target's sharded allocator need the same shard
+        # layout with separate KV storage. Handle them before the normal pool
+        # dispatch; targets and drafts without that allocator fall through.
         mtp_pool = self._build_mtp_kv_shard_pool(
             sizes=sizes, is_dsa_model=is_dsa_model, is_dsv4_model=is_dsv4_model
         )
