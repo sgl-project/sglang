@@ -37,7 +37,8 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.speculative.spec_info import can_run_dummy_draft_extend
+from sglang.srt.utils import cdiv, ceil_align, empty_context, log_info_on_rank0
 from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
@@ -332,7 +333,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             and "flashinfer_megamoe" not in skip_ops
         ):
             # The chunk size is already per DP rank. Prepare one prefill profile
-            # independently of the optional full-model EXTEND autotune pass.
+            # independently of the full-model EXTEND autotune pass.
             prefill_num_tokens = (
                 max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
             )
@@ -422,50 +423,40 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
-    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
-    wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
-    if wants_prefill_autotune is not None and not wants_prefill_autotune():
-        # Entering the autotune context loads / saves the tactic cache and syncs
-        # ranks, so a model that has nothing to tune must decline before it.
-        prefill_autotune = None
-    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
-        with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
-        if tuned:
-            return
-
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+    if not mr.is_generation or get_disagg().disaggregation_mode == "decode":
         return
-    is_pd_prefill_target = (
-        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
+    if mr.is_draft_worker and not can_run_dummy_draft_extend(mr.spec_algorithm):
+        return
+
+    # Backends may size per-seq extend metadata to the req pool;
+    # a real extend batch never exceeds it, so neither does the dummy.
+    batch_size, per_req = _extend_dummy_shape(
+        num_tokens=num_tokens,
+        max_seqs=mr.req_to_token_pool.size,
+        max_tokens_per_req=mr.req_to_token_pool.max_context_len,
+        token_alignment=get_parallel().attn_tp_size,
     )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
-        return
-    # Multimodal generation wrappers can still run this text-only EXTEND dummy;
-    # an incompatible model should fail the explicit opt-in visibly.
-
-    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
-        pool_size = mr.req_to_token_pool.size
-        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
-    else:
-        # Packed dummies tune measurably worse tactics for the same token
-        # bucket, so pack only where the backend would otherwise crash. None
-        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
-        num_tokens_per_req = None
-    per_req = num_tokens_per_req or 1
-    batch_size = (num_tokens + per_req - 1) // per_req
     num_tokens = batch_size * per_req
 
-    buffers = runner._alloc_dummy_decode_buffers(
-        batch_size,
-        num_tokens_per_req=per_req,
-        allocate_logits_buffer=False,
-    )
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    try:
+        buffers = runner._alloc_dummy_decode_buffers(
+            batch_size,
+            num_tokens_per_req=per_req,
+            allocate_logits_buffer=False,
+            allocate_input_embeds=False,
+        )
+    except torch.OutOfMemoryError:
+        buffers = None
+    if not _all_ranks_agree(ok=buffers is not None, group=sync_group):
+        del buffers
+        torch.cuda.empty_cache()
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for {num_tokens}-token dummy buffers.",
+        )
+        return
     canary_run_ctx = (
         c.with_active_single_forward_manager(0)
         if (c := mr.canary_manager) is not None
@@ -478,7 +469,7 @@ def maybe_flashinfer_autotune_extend(
         buffers=buffers,
         run_ctx=canary_run_ctx,
         forward_mode_override=ForwardMode.EXTEND,
-        extend_num_tokens_per_req=num_tokens_per_req,
+        extend_num_tokens_per_req=per_req,
     )
 
     log_info_on_rank0(
@@ -488,12 +479,16 @@ def maybe_flashinfer_autotune_extend(
     )
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
-    except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
-            # Tuning is collective: this rank has stopped reducing while its
-            # peers wait on the next tactic, so skipping the pass would hang
-            # them. Fail instead of degrading alone.
-            raise
+    except torch.OutOfMemoryError as e:
+        if sync_group is not None:
+            # Peers that did not OOM stay blocked in this forward's collectives,
+            # so skipping the pass on this rank alone would hang them; fail instead.
+            raise torch.OutOfMemoryError(
+                f"FlashInfer extend autotune ran out of memory on a {num_tokens}-token "
+                "dummy forward; a real prefill of this size likely would too. Lower "
+                "--chunked-prefill-size (or --max-prefill-tokens) or "
+                "--mem-fraction-static, or pass --disable-flashinfer-autotune."
+            ) from e
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
         log_info_on_rank0(
@@ -505,3 +500,54 @@ def maybe_flashinfer_autotune_extend(
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
         torch.cuda.empty_cache()
+
+
+def _extend_dummy_shape(
+    *,
+    num_tokens: int,
+    max_seqs: int,
+    max_tokens_per_req: int,
+    token_alignment: int,
+) -> tuple[int, int]:
+    num_tokens = min(num_tokens, max_seqs * max_tokens_per_req)
+    # Real batches are padded to a multiple of attn_tp_size;
+    # Kimi-K3 SP-MoE skips its MoE reduce-scatter for unaligned rows.
+    num_tokens = max(num_tokens // token_alignment, 1) * token_alignment
+    pow2_tokens = 1 << (num_tokens.bit_length() - 1)
+    for target in (num_tokens, pow2_tokens):
+        if target % token_alignment:
+            continue
+        per_req = _even_split(
+            num_tokens=target,
+            max_seqs=max_seqs,
+            max_tokens_per_req=max_tokens_per_req,
+        )
+        if per_req is not None:
+            return target // per_req, per_req
+    aligned_max_per_req = max_tokens_per_req // token_alignment * token_alignment
+    per_req = min(
+        ceil_align(cdiv(num_tokens, max_seqs), token_alignment),
+        aligned_max_per_req or max_tokens_per_req,
+    )
+    return min(num_tokens // per_req, max_seqs), per_req
+
+
+def _even_split(
+    *, num_tokens: int, max_seqs: int, max_tokens_per_req: int
+) -> Optional[int]:
+    min_per_req = cdiv(num_tokens, max_seqs)
+    upper = min(2 * min_per_req, max_tokens_per_req + 1, num_tokens + 1)
+    return next(
+        (d for d in range(min_per_req, upper) if num_tokens % d == 0),
+        None,
+    )
+
+
+def _all_ranks_agree(
+    *, ok: bool, group: Optional[torch.distributed.ProcessGroup]
+) -> bool:
+    if group is None:
+        return ok
+    flag = torch.tensor([int(ok)], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=group)
+    return bool(flag.item())
