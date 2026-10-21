@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
+from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
@@ -125,6 +126,61 @@ _mock_device = patch(
     "sglang.srt.arg_groups.serving_hook.get_device", return_value="cuda"
 )
 _mock_device.start()
+
+
+class TestServerArgsPositionalOrder(CustomTestCase):
+    def test_new_parallel_flag_preserves_existing_positional_slots(self):
+        """New options must not reinterpret existing positional constructor calls."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (95, "disable_attn_tp_gather"),
+            (96, "enable_p2p_check"),
+            (97, "device"),
+            (535, "grpc_response_timeout_secs"),
+            (536, "enable_paged_experts"),
+            (537, "paged_experts_num_resident"),
+            (538, "enable_nvidia_megakernel"),
+            (539, "enable_megamoe_for_layernorm_sp"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        # Surviving legacy inputs retain their slots after an intentional removal.
+        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional[95] = True
+        positional[96] = False
+        positional[97] = "cpu"
+        positional[535] = 123.0
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.disable_attn_tp_gather)
+        self.assertFalse(args.enable_p2p_check)
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.grpc_response_timeout_secs, 123.0)
+        self.assertFalse(args.enable_megamoe_for_layernorm_sp)
+
+    def test_builtin_fields_have_explicit_positional_slots(self):
+        """New namespace fields cannot shift previously appended built-in options."""
+        self.assertEqual(
+            tuple(field.name for field in msgspec.structs.fields(ServerArgs)),
+            POSITIONAL_FIELD_ORDER,
+        )
+
+    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                keyword_args = ServerArgs(
+                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
+                )
+                argv = ["--model-path", "dummy"]
+                if enabled:
+                    argv.append("--enable-megamoe-for-layernorm-sp")
+                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
+                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
+                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
 
 
 class TestPrepareServerArgs(CustomTestCase):

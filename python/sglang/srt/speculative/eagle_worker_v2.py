@@ -800,7 +800,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_context(
                         ForwardContext(
                             attn_backend=self.draft_attn_backend.attn_backends[i]
-                        )
+                        ),
+                        forward_batch=forward_batch,
                     ),
                     canary_index_ctx,
                 ):
@@ -903,7 +904,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_context(
                     ForwardContext(
                         attn_backend=self.draft_attn_backend.attn_backends[i]
-                    )
+                    ),
+                    forward_batch=forward_batch,
                 ),
                 canary_index_ctx,
             ):

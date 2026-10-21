@@ -176,6 +176,7 @@ from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
+    fused_boundary_attn_input,
 )
 from sglang.srt.models.deepseek_v4_replay_tail import (
     DecoderReplayTail,
@@ -3716,10 +3717,7 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
             last_source = max(config.kv_source_layer_ids)
-            # ROCm starts the tail after the source layer: the gfx950 fused boundary
-            # runs a whole layer in one call, and the ROCm backend carries the source
-            # layer's top-k and candidates into the tail itself.
-            self.tail_writes_source_kv = not _is_hip
+            self.tail_writes_source_kv = True
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
@@ -3930,9 +3928,14 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
+                    if _is_hip and source.hc_boundary_fused:
+                        # The previous FFN hc_post has not run yet, so run it here too.
+                        source_x = fused_boundary_attn_input(source, state)
+                    else:
+                        source_x = mhc.combine(source.attn_hc, state)
                     attn_backend.write_tail_source_kv(
                         layer=source.self_attn,
-                        x=mhc.combine(source.attn_hc, state),
+                        x=source_x,
                         positions=positions,
                         forward_batch=forward_batch,
                     )
