@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.spec import CapabilityRequirement, FormatSignature, KernelBackend
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -195,7 +195,6 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
 
     op = "layernorm.beam_sandwich_residual_rmsnorm"
     capabilities = {KernelBackend.TRITON: {CapabilityRequirement.CUDA}}
-    format_signature = FormatSignature(supported_dtypes=("float16", "bfloat16"))
 
     def _torch_compile_forward(self, num_tokens: int):
         # Native compilation can remove the required intermediate rounding.

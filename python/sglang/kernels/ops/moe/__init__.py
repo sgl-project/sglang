@@ -35,11 +35,6 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
         ),
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="single-token interleaved Beam MoE with FP32 routing weights",
-        ),
-        description="SM103 Beam TP4/EP1 weighted expert outputs; caller owns reduction.",
     )
 )
 

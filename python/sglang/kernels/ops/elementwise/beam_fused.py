@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.spec import CapabilityRequirement, FormatSignature, KernelBackend
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -103,7 +103,6 @@ class BeamAttentionGateOp(BaseFusedOp):
 
     op = "elementwise.beam_attention_gate"
     capabilities = {KernelBackend.TRITON: {CapabilityRequirement.CUDA}}
-    format_signature = FormatSignature(supported_dtypes=("float16", "bfloat16"))
 
     def _torch_compile_forward(self, num_tokens: int):
         # Native compilation can remove the required intermediate rounding.
