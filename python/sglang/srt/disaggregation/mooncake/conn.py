@@ -2915,9 +2915,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if decode_kv_args.requires_dcp_relayout:
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
+                        dst_item_lens: List[Optional[int]]
+                        if decode_kv_args.dst_kv_item_lens:
+                            if (
+                                self.kv_args.kv_layer_ids
+                                or decode_kv_args.dst_kv_layer_ids
+                            ):
+                                dst_indices = resolve_dcp_dst_entry_indices(
+                                    self.kv_args.kv_layer_ids,
+                                    decode_kv_args.dst_kv_layer_ids,
+                                    num_entries,
+                                    len(decode_kv_args.dst_kv_ptrs),
+                                )
+                                dst_item_lens = [
+                                    decode_kv_args.dst_kv_item_lens[j]
+                                    for j in dst_indices
+                                ]
+                            else:
+                                _, dst_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                                    self.kv_args.kv_item_lens,
+                                    decode_kv_args.dst_kv_item_lens,
+                                )
+                            # Draft head slicing is validated during transfer.
+                            if num_draft:
+                                dst_item_lens = (
+                                    dst_item_lens[:-num_draft] + [None] * num_draft
+                                )
+                        else:
+                            dst_item_lens = [decode_kv_args.dst_kv_item_len] * (
+                                num_entries - num_draft
+                            ) + [None] * num_draft
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
                                 dst_item_lens,
