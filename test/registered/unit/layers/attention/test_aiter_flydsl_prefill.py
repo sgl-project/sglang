@@ -54,6 +54,7 @@ class _PrefixProj:
 class TestPrefixKvFp8Projection(unittest.TestCase):
     def _module(self, dtype):
         module = DeepseekMHAForwardMixin()
+        module.layer_id = 0
         module.kv_b_proj = _PrefixProj(dtype)
         module.num_local_heads = 12
         module.qk_nope_head_dim = 128
