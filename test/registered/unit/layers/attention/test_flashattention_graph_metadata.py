@@ -288,7 +288,7 @@ class TestDraftWindowWriteIds(CustomTestCase):
     says, derived from the whole draft window. A multi-step draft step must
     keep its own columns (the window is laid out step-minor per row), and a
     multi-layer draft's extend writes the whole window. The fused window-draft
-    gate admits fa3 on this."""
+    gate admits fa3 and fa4 on this."""
 
     def _write_ids(self, *, bs, topk, num_steps, window_cols, step, mode):
         reader = _WindowReader()

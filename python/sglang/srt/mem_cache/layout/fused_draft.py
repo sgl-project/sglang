@@ -311,8 +311,8 @@ FULL_HOST = register_host_kind(
 )
 
 # Draft backends that give each draft step its own sliding-window reads and
-# writes: Triton builds per-step rails, fa3 reads the plan's window table.
-WINDOW_RAIL_BACKENDS = frozenset({"triton", "fa3"})
+# writes: Triton builds per-step rails, FA (fa3, fa4) reads the plan's window table.
+WINDOW_RAIL_BACKENDS = frozenset({"triton", "fa3", "fa4"})
 
 
 class WindowHostKind(DenseHostKind):

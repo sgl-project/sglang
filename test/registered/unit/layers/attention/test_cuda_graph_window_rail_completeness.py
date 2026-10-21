@@ -185,7 +185,7 @@ class TestFlashAttentionWindowTableFills(CustomTestCase):
     function that fills the plan's full-attention table but not the window one
     (a graph refill above all) leaves a fused draft's window layers reading an
     earlier forward's rows: wrong drafts, no error. The fused window-draft gate
-    admits fa3 on this. A source scan, since the module needs sgl_kernel."""
+    admits fa3 and fa4 on this. A source scan, since the module needs sgl_kernel."""
 
     def test_every_plan_table_fill_also_fills_the_window_table(self):
         spec = importlib.util.find_spec(

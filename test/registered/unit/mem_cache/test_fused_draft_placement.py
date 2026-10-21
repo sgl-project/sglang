@@ -231,10 +231,10 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertIn("cannot share", decision.declined)
 
     def test_a_window_draft_needs_a_rail_carrying_draft_backend(self):
-        """Only the Triton and fa3 draft backends give each draft step its own
-        window reads and writes; any other could write the window layers into
-        other steps' slots."""
-        for backend in ("triton", "fa3"):
+        """Only the Triton and FA (fa3/fa4) draft backends give each draft step
+        its own window reads and writes; any other could write the window
+        layers into other steps' slots."""
+        for backend in ("triton", "fa3", "fa4"):
             decision = _place(
                 _profile(window_layer_ids=(0,), window=128),
                 target_window=128,
