@@ -2235,7 +2235,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Cached prefixes contribute to seq_lens_sum, but only this
+            # forward's query rows may be passed to the draft model.
+            num_tokens = self._original_num_tokens
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]

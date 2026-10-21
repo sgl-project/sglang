@@ -266,6 +266,33 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
 
+    def test_chunked_prefill_unpads_hidden_states_to_query_tokens(self):
+        # A cached prefix contributes to seq_lens_sum, but the draft consumes
+        # only this chunk's query rows from the target's FULL hidden states.
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(5),
+            req_pool_indices=torch.tensor([1]),
+            seq_lens=torch.tensor([13]),
+            out_cache_loc=torch.arange(5),
+            seq_lens_sum=13,
+            positions=torch.arange(8, 13),
+            seq_lens_cpu=torch.tensor([13]),
+            lora_ids=[None],
+        )
+        fb._original_batch_size = fb.batch_size
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=12, bs=1)
+        hidden_states = torch.arange(48).reshape(12, 4)
+        logits = torch.randn(1, 16)
+        output = SimpleNamespace(next_token_logits=logits, hidden_states=hidden_states)
+
+        fb.post_forward_mlp_sync_batch(output)
+
+        torch.testing.assert_close(output.hidden_states, hidden_states[:5])
+        torch.testing.assert_close(output.next_token_logits, logits)
+        torch.testing.assert_close(fb.positions, torch.arange(8, 13))
+
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()
         spec_info.num_tokens_per_req = 4
