@@ -20,6 +20,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.spec import CapabilityRequirement, FormatSignature, KernelBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -94,3 +96,56 @@ def fused_attention_gate(
         num_warps=4,
     )
     return out
+
+
+class BeamAttentionGateOp(BaseFusedOp):
+    """Apply a per-head bias and sigmoid gate to flat attention output."""
+
+    op = "elementwise.beam_attention_gate"
+    capabilities = {KernelBackend.TRITON: {CapabilityRequirement.CUDA}}
+    format_signature = FormatSignature(supported_dtypes=("float16", "bfloat16"))
+
+    def _torch_compile_forward(self, num_tokens: int):
+        # Native compilation can remove the required intermediate rounding.
+        return None
+
+    def forward_torch_compile(self, *args, **kwargs):
+        if self._compiled_native is None:
+            # Register and warm the opaque op before tracing its dispatch wrapper.
+            self.forward_triton(*args, **kwargs)
+            self._compiled_native = torch.compile(
+                self.forward_triton, options={"emulate_precision_casts": True}
+            )
+        return self._compiled_native(*args, **kwargs)
+
+    def forward_native(
+        self,
+        attention_output: torch.Tensor,
+        gate: torch.Tensor,
+        gate_bias: torch.Tensor,
+        head_dim: int,
+    ) -> torch.Tensor:
+        heads = gate_bias.numel()
+        multiplier = torch.sigmoid(
+            gate.reshape(-1, heads, head_dim) + gate_bias[None, :, None]
+        )
+        return (attention_output.reshape(-1, heads, head_dim) * multiplier).reshape_as(
+            attention_output
+        )
+
+    def forward_triton(
+        self,
+        attention_output: torch.Tensor,
+        gate: torch.Tensor,
+        gate_bias: torch.Tensor,
+        head_dim: int,
+    ) -> torch.Tensor:
+        if not attention_output.is_cuda or attention_output.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return self.forward_native(attention_output, gate, gate_bias, head_dim)
+        return fused_attention_gate(attention_output, gate, gate_bias, head_dim)
+
+
+_BEAM_ATTENTION_GATE = BeamAttentionGateOp()
