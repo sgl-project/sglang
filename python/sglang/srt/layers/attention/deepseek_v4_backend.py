@@ -2805,9 +2805,9 @@ class DeepseekV4AttnBackend(
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
             )
-        # Dense prefill reads only what metadata init has already snapshotted
-        # (core_attn_metadata, the request-window layout, the V4.1 index-K
-        # slots), so it reaches the same boundary without a cache.
+        # Dense prefill builds no cache: like every layer, it reads only what
+        # metadata init snapshotted (core_attn_metadata, the request-window
+        # layout, the V4.1 index-K slots).
         return SharedReadEnds.PRE_REPLAY
 
     def _build_sparse_prefill_chunk_cache(
