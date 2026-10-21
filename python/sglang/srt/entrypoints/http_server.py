@@ -2406,10 +2406,16 @@ def _execute_server_warmup(server_args: ServerArgs):
     if (
         not model_info["is_generation"]
         and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
-        and load_joint_head_config(get_model().model_path, get_model().revision)
-        is not None
+        and (
+            getattr(
+                _global_state.tokenizer_manager.model_config, "valen_head_config", None
+            )
+            is not None
+            or load_joint_head_config(get_model().model_path, get_model().revision)
+            is not None
+        )
     ):
-        # A Clef checkpoint answers /v1/systemone decisions only.
+        # Native decision heads answer /v1/systemone decisions only.
         request_name = "/v1/systemone"
         json_data = {
             "model": "warmup",

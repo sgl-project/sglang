@@ -1231,8 +1231,18 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         response = await leading.handle_request(few, None)
         self.assertEqual(response.status_code, 200)
 
+    async def test_generative_score_label_limit(self):
+        handler = self._serving()
+        request = _systemone_request(
+            {"q": {"type": "score", "criteria": [str(i) for i in range(11)]}}
+        )
+        response = await handler.handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most 10", json.loads(response.body)["message"])
+        self.assertEqual(handler.tokenizer_manager.requests, [])
+
     def test_request_validation(self):
-        levels = [str(i) for i in range(11)]
+        levels = [str(i) for i in range(256)]
         refused = {
             "noul that asks nothing": {"q": {"type": "noul"}},
             "noul with blank criteria": {
@@ -1248,7 +1258,7 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             "256 options": {
                 "q": {"type": "choice", "criteria": {str(i): None for i in range(256)}}
             },
-            "11 levels": {"q": {"type": "score", "criteria": levels}},
+            "256 levels": {"q": {"type": "score", "criteria": levels}},
             "null level": {"q": {"type": "score", "criteria": ["low", None]}},
             "blank level": {"q": {"type": "score", "criteria": ["low", " "]}},
             "repeated option name": {
