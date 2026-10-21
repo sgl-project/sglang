@@ -84,17 +84,16 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
-    is_hip,
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
-_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -362,7 +361,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
-                simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
+                simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -378,9 +377,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._simulate_acc_greedy = (
-            _is_hip
-            and self._simulate_acc_len > 0
-            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+            self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
         )
         if (
             self._simulate_acc_len > 0
@@ -713,17 +710,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 output_size=num_tokens,
             )
         draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
-        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
+        if (
+            getattr(draft_pool, "swa_valid_from", None) is not None
+            and batch.encoder_swa_reset is not None
+        ):
             # A newly placed request's ring holds nothing below its cached prefix.
             placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
             if placed:
-                draft_pool.reset_swa_req_ring(
-                    batch.req_pool_indices[placed],
-                    torch.tensor(
-                        [batch.prefix_lens[i] for i in placed],
-                        dtype=torch.int64,
-                        device=device,
-                    ),
+                # Pinned copies and a device gather: a list index or a pageable
+                # copy here would wait for the whole target forward.
+                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
+                valid_from = async_h2d(
+                    [batch.prefix_lens[i] for i in placed],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                draft_pool.set_swa_valid_from(
+                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
                 )
         # The draft KV goes to the slots the target prefill just wrote.
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
