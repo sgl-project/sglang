@@ -25,6 +25,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
+        s.hisparse_v2_coordinator = None
         s.waiting_queue = [SimpleNamespace(rid="req-0")]
         s.chunked_req = None
         s.min_free_slots_delayer = None
@@ -45,6 +46,31 @@ class TestEmptyBatchFullLatch(CustomTestCase):
                 prefill_delayer_single_pass=None, running_batch=running_batch
             )
         self.assertFalse(running_batch.batch_is_full)
+
+    def test_hisparse_demotion_reopens_a_nonempty_batch(self):
+        """Reclaimable HiSparse prefixes must reopen a queue latched during prefill."""
+        s = self._scheduler()
+        s.hisparse_v2_coordinator = object()
+        running_batch = ScheduleBatch(
+            reqs=[SimpleNamespace(rid="active")], batch_is_full=True
+        )
+        with self.assertRaises(_AdmissionAttempted):
+            s._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+        self.assertFalse(running_batch.batch_is_full)
+
+    def test_resident_nonempty_batch_keeps_its_latch(self):
+        s = self._scheduler()
+        running_batch = ScheduleBatch(
+            reqs=[SimpleNamespace(rid="active")], batch_is_full=True
+        )
+        result, updated = s._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=None, running_batch=running_batch
+        )
+        self.assertIsNone(result)
+        self.assertIs(updated, running_batch)
+        self.assertTrue(updated.batch_is_full)
 
 
 if __name__ == "__main__":

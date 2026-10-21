@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.hisparse_v2_coordinator import HiSparseV2Coordinator
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -103,6 +104,7 @@ class SchedulerBatchResultProcessor:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
+    hisparse_v2_coordinator: Optional[HiSparseV2Coordinator] = None
     req_to_token_pool: ReqToTokenPool
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
@@ -392,6 +394,8 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
+                        if get_memory().enable_hisparse_v2:
+                            self.hisparse_v2_coordinator.admit_request(req)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
