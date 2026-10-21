@@ -286,7 +286,7 @@ def prepare_for_draft(
                     prepared_mrope_positions = torch.empty(
                         (3, bs), dtype=torch.int64, device=batch.device
                     )
-            # FIXME(lsyin): align with the default code path
+            # TODO(lsyin): align with the default code path
             assign_draft_cache_locs_contiguous_func(
                 batch.req_pool_indices,
                 req_to_token_pool.req_to_token,

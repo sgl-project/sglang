@@ -376,7 +376,6 @@ def build_tree_kernel_efficient_func(
     num_verify_tokens: int,
     tree_mask_mode: TreeMaskMode,
 ) -> None:
-    """Build the verify tree with this platform's kernel."""
     if _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),

@@ -42,7 +42,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-# DFlash has never run sampling verify on NPU; enabling it is its own change.
+# DFlash does not run sampling verify on NPU, even where the op exists.
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
     tree_speculative_sampling_target_only is not None and not is_npu()
 )

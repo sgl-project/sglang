@@ -170,7 +170,6 @@ def reconstruct_indices_from_tree_mask_func(
     batch_size: int,
     draft_token_num: int,
 ) -> None:
-    """The Triton kernel on XPU, the compiled op everywhere else."""
     if _is_xpu:
         reconstruct_indices_from_tree_mask_triton(
             tree_mask,
