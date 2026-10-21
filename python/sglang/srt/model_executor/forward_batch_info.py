@@ -626,6 +626,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
 
     # === Derived from ScheduleBatch.reqs ===
+    # True for synthetic capture batches; init_new snapshots real request ranges.
+    # Running decode rows do not complete a prefill.
+    contains_last_prefill_chunk: bool = True
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -1009,6 +1012,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        contains_last_prefill_chunk = False
+        if batch.forward_mode.is_extend_without_speculative():
+            decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
+            contains_last_prefill_chunk = any(
+                req.extend_end == len(req.full_untruncated_fill_ids)
+                for req in batch.reqs
+                if id(req) not in decoding_req_ids
+            )
+
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
@@ -1066,6 +1078,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            contains_last_prefill_chunk=contains_last_prefill_chunk,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
