@@ -112,6 +112,21 @@ class TestSamplingMaskValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support streaming"):
             self.manager._validate_one_request(req, req.input_ids)
 
+    def test_output_store_opt_in_rejects_batch_and_parallel_sampling(self):
+        """When one sub-request of a batch or n>1 request fails, nothing deletes the
+        objects its siblings stored, so only one output sequence may use the store."""
+        GenerateReqInput(
+            input_ids=[1, 2], sampling_params={"n": 1}, return_outputs_via_store=True
+        ).normalize_batch_and_arguments()
+        for fields in (
+            {"input_ids": [[1, 2], [3]]},
+            {"input_ids": [1, 2], "sampling_params": {"n": 2}},
+            {"input_ids": [1, 2], "sampling_params": {"n": 2, "beam_width": 2}},
+        ):
+            req = GenerateReqInput(return_outputs_via_store=True, **fields)
+            with self.subTest(**fields), self.assertRaisesRegex(ValueError, "n=1"):
+                req.normalize_batch_and_arguments()
+
 
 if __name__ == "__main__":
     unittest.main()

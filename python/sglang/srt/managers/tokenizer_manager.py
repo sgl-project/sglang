@@ -2324,8 +2324,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # them. Keep LoRA on tokenized_obj for the correct prefix-cache key.
                 tmp_obj.lora_path = None
                 tmp_obj.lora_id = None
-                # The warmup response is discarded, so it must not write to the store.
-                tmp_obj.return_outputs_via_store = False
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:

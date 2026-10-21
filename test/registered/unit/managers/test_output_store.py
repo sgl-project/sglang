@@ -3,6 +3,8 @@
 import concurrent.futures
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -71,6 +73,29 @@ class _MemoryBackend(StorageBackend):
 
     def close(self):
         pass
+
+
+class _BlockingPutBackend(_MemoryBackend):
+    """Holds each put until released, and records put, delete, and close order."""
+
+    def __init__(self):
+        super().__init__()
+        self.put_started = threading.Event()
+        self.release_put = threading.Event()
+        self.events = []
+
+    def put_many(self, objects):
+        self.put_started.set()
+        self.release_put.wait(timeout=10)
+        self.events.append("put")
+        return super().put_many(objects)
+
+    def delete_many(self, keys, *, parts):
+        self.events.append("delete")
+        super().delete_many(keys, parts=parts)
+
+    def close(self):
+        self.events.append("close")
 
 
 class TestTokenOutputCollector(CustomTestCase):
@@ -182,6 +207,29 @@ class TestOutputStoreWriter(CustomTestCase):
         ).result()
         writer.cleanup_refs([other.to_builtins()])
         writer._executor.shutdown(wait=True)
+        self.assertEqual(backend.objects, {})
+
+    def test_shutdown_still_deletes_a_running_put_handed_to_cleanup(self):
+        """A request cancelled while its put runs hands the put to cleanup; when the
+        writer shuts down before that put finishes, the object must still be deleted
+        before the backend disconnects."""
+        backend = _BlockingPutBackend()
+        writer = OutputStoreWriter(OutputStore(backend=backend))
+        put = writer.submit_put(
+            TokenOutputCollector(routed_experts=torch.zeros(1, 1, 1, dtype=torch.int32))
+        )
+        self.assertTrue(backend.put_started.wait(timeout=10))
+        writer.cleanup_after(put)
+
+        stopping = threading.Thread(target=writer.shutdown)
+        stopping.start()
+        deadline = time.monotonic() + 10
+        while not writer._executor._shutdown and time.monotonic() < deadline:
+            time.sleep(0.001)
+        backend.release_put.set()
+        stopping.join(timeout=10)
+
+        self.assertEqual(backend.events, ["put", "delete", "close"])
         self.assertEqual(backend.objects, {})
 
     def test_failed_delete_logs_the_ref(self):

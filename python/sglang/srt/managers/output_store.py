@@ -8,9 +8,7 @@ The sampled tokens' logprobs, one per token, stay in ``meta_info``; support-mode
 logprobs are stored with the mask.
 SGLang-specific assumptions:
 
-- Non-streaming requests only.
-- Each request, and each sub-request of a batch or n>1 request, is stored on its own;
-  when a sibling fails, the objects of the others are left to the storage plane.
+- Requests of one prompt with n=1, no streaming or beam search.
 - The tokenizer process is a pure client and stores off its event loop.
 """
 
@@ -108,6 +106,7 @@ class OutputStoreWriter:
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=_MAX_STORE_WORKERS, thread_name_prefix="output-store"
         )
+        self._closed = False
 
     def submit_put(
         self, collector: TokenOutputCollector
@@ -116,7 +115,7 @@ class OutputStoreWriter:
 
     def cleanup_after(self, future: concurrent.futures.Future[StoreRef]) -> None:
         """Delete the object once a put whose ref will never be sent succeeds."""
-        future.add_done_callback(self._cleanup_completed_put)
+        self._executor.submit(self._delete_put_result, future)
 
     def cleanup_refs(self, refs: Iterable[Dict]) -> None:
         """Delete the objects behind refs that were built but will never be sent."""
@@ -125,16 +124,24 @@ class OutputStoreWriter:
         for ref in refs:
             self._executor.submit(self._delete, StoreRef.from_builtins(ref))
 
+    def shutdown(self) -> None:
+        """Finish the queued puts and deletes, then disconnect from the backend."""
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=True)
+        self._store.close()
+
     def _put(self, collector: TokenOutputCollector) -> StoreRef:
         (ref,) = self._store.put_many([collector.to_stash()])
         return ref
 
-    def _cleanup_completed_put(
-        self, future: concurrent.futures.Future[StoreRef]
-    ) -> None:
+    def _delete_put_result(self, future: concurrent.futures.Future[StoreRef]) -> None:
+        # Waits only on a put running on another writer thread: cancelling the
+        # awaiting task already cancelled a put that had not started.
         if future.cancelled() or future.exception() is not None:
             return
-        self._executor.submit(self._delete, future.result())
+        self._delete(future.result())
 
     def _delete(self, ref: StoreRef) -> None:
         try:

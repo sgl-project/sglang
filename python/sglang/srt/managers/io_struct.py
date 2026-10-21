@@ -268,8 +268,8 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
-    # Return routed experts, indexer top-k, and sampling mask through the server's
-    # --output-store-backend as meta_info.output_store_ref; non-streaming only.
+    # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
+    # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
     return_outputs_via_store: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -438,6 +438,15 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        # TODO(guapisolo): support batch, n>1 (deleting the others' stored objects
+        # when a sub-request fails), and beam search; RL sends one prompt per request.
+        if self.return_outputs_via_store and (
+            not self.is_single or self._sampling_params_beam_width() > 1
+        ):
+            raise ValueError(
+                "return_outputs_via_store supports one prompt with n=1 "
+                "and no beam search."
+            )
 
         if self.is_single:
             self._normalize_single_inputs()
