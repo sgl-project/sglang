@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     for (uint32_t rank = 0; rank < World; ++rank)
       ptx::st_relaxed_16B(value, epoch.slot_ptr(rank, p.rank), idx);
   }
-  // Fetch epilogue inputs while the peers publish their rank-local payloads.
+  // Fetch epilogue inputs while the peers publish; asm loads stay ahead of the poll.
   Vec post, residual;
   ptx::ld_relaxed_16B(post, p.post_weight, tx);
   ptx::ld_relaxed_16B(residual, p.residual, idx);
@@ -174,6 +174,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
 template <uint32_t World, uint32_t Hidden, uint32_t Cluster, uint32_t TopK>
 struct BeamAllReduceNorm {
   static_assert(World == 2 || World == 4 || World == 8);
+  // Whole warps per CTA, and at most 32 in a cluster so inv_rms reduces them in one warp.
   static_assert(Hidden % (Cluster * 256) == 0 && Hidden <= 8192);
   static void
   run(host::distributed::CommunicatorRef ref,

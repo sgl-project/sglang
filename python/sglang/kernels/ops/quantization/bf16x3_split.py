@@ -27,10 +27,10 @@ def _split_fp32_to_bf16x3_kernel(w_ptr, out_ptr, numel, BLOCK: tl.constexpr):
 def split_fp32_to_bf16x3(
     w: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """[N, K] fp32 -> [3N, K] bf16 as (hi, mid, lo) blocks with w == hi + mid + lo.
+    """[N, K] fp32 -> [3N, K] bf16 (hi, mid, lo) blocks, each rounding what remains.
 
-    Exact for |w| >= 2**-110: each part takes the next 8 significant bits, and the
-    last residual then stays a normal number.
+    hi + mid + lo == w for 2**-110 <= |w| < 2**128 - 2**119: below that the last
+    remainder drops under BF16's subnormals, above it hi rounds to infinity.
     """
     n, k = w.shape
     if not (w.is_cuda and w.dtype == torch.float32 and w.is_contiguous()):

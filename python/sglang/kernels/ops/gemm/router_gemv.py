@@ -191,9 +191,8 @@ def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """[M, K] bf16 x [N, K] fp32 router logits on BF16 tensor cores.
 
     The fp32 weight is split per call, so in-place weight updates take effect
-    without any refresh. Every bf16 x bf16 product is exact in fp32, but
-    tensor-core accumulation is not IEEE fp32: the error is a few times that of
-    an fp32 SGEMM.
+    without any refresh. Each bf16 x bf16 product is exact within fp32's exponent
+    range, but tensor-core accumulation is not IEEE fp32 summation.
     """
     n = w.shape[0]
     w3 = split_fp32_to_bf16x3(w)

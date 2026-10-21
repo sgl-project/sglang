@@ -20,6 +20,7 @@ def _module(world_size: int, hidden_size: int, cluster: int = 1, topk: int = 1):
                 f"BeamAllReduceNorm<{world_size}, {hidden_size}, {cluster}, {topk}>::run",
             )
         ],
+        # Round every multiply and add separately, as the unfused norm does.
         extra_cuda_cflags=["--fmad=false"],
     )
 
