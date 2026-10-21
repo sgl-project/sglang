@@ -14,11 +14,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
-register_xpu_ci(
-    est_time=20,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="XPU image lacks apache-tvm-ffi (NgramCorpus JIT dependency)",
-)
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
