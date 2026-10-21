@@ -30,6 +30,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         self,
         sigma_shift_scales=None,
         dmd_denoising_steps: tuple[int, ...] | None = None,
+        pdd_heads: str | None = None,
     ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
@@ -38,7 +39,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
-        pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        # The pipeline resolves the release's fused heads; the env var serves
+        # stages built without a pipeline.
+        pdd_heads = pdd_heads or envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             from safetensors import safe_open
 
