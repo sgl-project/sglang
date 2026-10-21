@@ -11,23 +11,31 @@ Covers:
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
+  - _handle_batch_output takes non-streaming first_token_time from the scheduler
 """
 
 import asyncio
+import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    EmbeddingReqInput,
     GenerateReqInput,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -35,6 +43,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
+    SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
 
@@ -252,6 +261,42 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
+    async def test_cumulative_stream_backlog_preserves_customized_info(self):
+        """Cumulative streaming returns only the last queued output.
+
+        A customized_info key that arrived on an earlier queued output must
+        still reach the client through the accumulated state.
+        """
+        self.tm.incremental_streaming_output = False
+        key = "request_score"
+        hidden_key = "hidden_metric"
+        stream = self.tm._wait_one_response(self.state.obj)
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
+        self.state.out_list.extend(
+            [
+                {"output_ids": [1], "meta_info": first_meta_info},
+                {
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                },
+            ]
+        )
+        self.state.finished = True
+        self.state.event.set()
+
+        out = await anext(stream)
+
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
     async def test_cancelling_pending_wait_removes_event_waiter(self):
         stream = self.tm._wait_one_response(self.state.obj)
         pending = asyncio.create_task(anext(stream))
@@ -308,16 +353,23 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
     """Test that _handle_abort_req removes rid from rid_to_state."""
 
     def test_abort_removes_rid_from_state(self):
-        """After _handle_abort_req, rid should be removed from rid_to_state."""
-        tm = _make_tokenizer_manager(self)
-        rid = "abort_test_rid"
-        state = _make_req_state(rid)
-        tm.rid_to_state[rid] = state
+        """An abort must release its adapter even when no response waiter remains."""
 
-        abort_req = _make_abort_req(rid)
-        tm._handle_abort_req(abort_req)
+        async def drive():
+            tm = _make_tm_for_generate(self, enable_lora=True)
+            obj = GenerateReqInput(
+                text="prompt", rid="abort_test_rid", lora_path="adapter"
+            )
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            await tm._validate_and_resolve_lora(obj)
 
-        self.assertNotIn(rid, tm.rid_to_state)
+            tm._handle_abort_req(_make_abort_req(obj.rid))
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertNotIn(obj.rid, tm.rid_to_state)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+
+        asyncio.run(drive())
 
     def test_abort_allows_resubmit_same_rid(self):
         """After abort, _init_req_state should accept the same rid again."""
@@ -453,6 +505,109 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestRequestTpotGating(CustomTestCase):
+    """Request TPOT is observed once, only for requests with a real decode
+    interval that ran to completion on a non-prefill worker."""
+
+    def _run(
+        self,
+        batches,
+        disaggregation_mode=DisaggregationMode.NULL,
+        *,
+        stream=False,
+        prefill_finished_time=0.0,
+    ):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_metrics = True
+        tm.enable_priority_scheduling = False
+        tm.disaggregation_mode = disaggregation_mode
+        tm.metrics_collector = MagicMock(labels={})
+        rid = "tpot_rid"
+        state = _make_req_state(rid)
+        state.obj.log_metrics = True
+        state.obj.sampling_params = {}
+        state.obj.custom_labels = None
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
+        tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
+        for completion_tokens, finished_reason in batches:
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.completion_tokens = [completion_tokens]
+            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            asyncio.run(tm._handle_batch_output(batch_output))
+        (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
+        return call.kwargs["time_per_output_token"]
+
+    def test_single_batch_finish(self):
+        produced = time.perf_counter() - 0.5
+        # Streaming: first and final output in one batch leave no decode interval.
+        self.assertIsNone(
+            self._run(
+                [(40, {"type": "stop"})],
+                stream=True,
+                prefill_finished_time=produced,
+            )
+        )
+        # Non-streaming: decode runs from the scheduler's first-token time.
+        self.assertGreater(
+            self._run([(40, {"type": "stop"})], prefill_finished_time=produced),
+            0.0,
+        )
+
+    def test_multi_batch_records_only_completed_decode(self):
+        cases = [
+            ("stop", {"type": "stop"}, DisaggregationMode.NULL, True),
+            ("abort", {"type": "abort"}, DisaggregationMode.NULL, False),
+            ("prefill", {"type": "stop"}, DisaggregationMode.PREFILL, False),
+        ]
+        for name, finished_reason, mode, recorded in cases:
+            with self.subTest(name):
+                tpot = self._run(
+                    [(1, _NOT_FINISHED), (3, finished_reason)],
+                    disaggregation_mode=mode,
+                )
+                if recorded:
+                    self.assertGreater(tpot, 0.0)
+                else:
+                    self.assertIsNone(tpot)
+
+
+class TestNonStreamingFirstTokenTime(CustomTestCase):
+    def _run(self, *, stream: bool, prefill_finished_time: float):
+        tm = _make_tokenizer_manager(self)
+        rid = "ttft_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = stream
+        state.time_stats.created_time = time.perf_counter() - 1.0
+        tm.rid_to_state[rid] = state
+        sched_stats = SchedulerReqTimeStats(
+            enable_metrics=True, prefill_finished_time=prefill_finished_time
+        )
+        batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        arrival = time.perf_counter()
+        asyncio.run(tm._handle_batch_output(batch_output))
+        return state.time_stats, arrival
+
+    def test_non_streaming_uses_scheduler_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=False, prefill_finished_time=produced)
+        self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
+        self.assertGreaterEqual(stats.last_time, arrival)
+
+    def test_streaming_uses_arrival_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(stream=True, prefill_finished_time=produced)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
+
+    def test_falls_back_to_arrival_without_scheduler_time(self):
+        stats, arrival = self._run(stream=False, prefill_finished_time=0.0)
+        self.assertGreaterEqual(stats.first_token_time, arrival)
+
+
 class TestInitReqStateDuplicateDetection(CustomTestCase):
     """Test that _init_req_state raises ValueError for duplicate rids."""
 
@@ -488,6 +643,164 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestInitReqStateAtomicity(CustomTestCase):
+    def assert_map_unchanged(self, tm, original_map, original_states):
+        self.assertIs(tm.rid_to_state, original_map)
+        self.assertEqual(set(tm.rid_to_state), set(original_states))
+        for rid, state in original_states.items():
+            self.assertIs(tm.rid_to_state[rid], state)
+
+    def test_live_collision_preserves_map_and_adapter_references(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for collision_index in range(3):
+                with self.subTest(
+                    request_type=request_type.__name__, position=collision_index
+                ):
+                    tm = _make_tm_for_generate(self, enable_lora=True)
+                    tm.enable_trace = True
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    tm.abort_request = Mock()
+                    tm._release_lora_once = Mock()
+                    tm._tokenize_one_request = AsyncMock()
+                    tm._send_one_request = AsyncMock()
+                    rids = ["fresh0", "fresh1", "fresh2"]
+                    rids[collision_index] = "live"
+                    obj = request_type(
+                        text=["a", "b", "c"], rid=rids, lora_path="adapter"
+                    )
+
+                    async def drive():
+                        live_state.obj.lora_path = "adapter"
+                        live_state.obj.lora_id = await tm.lora_registry.acquire(
+                            "adapter"
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "Duplicate request ID detected: live"
+                        ):
+                            await tm.generate_request(obj).__anext__()
+                        self.assertEqual(
+                            tm.lora_registry._counters["adapter"].value(), 1
+                        )
+
+                    with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+                        asyncio.run(drive())
+                    self.assert_map_unchanged(tm, original_map, original_states)
+                    trace.assert_not_called()
+                    tm.abort_request.assert_not_called()
+                    tm._release_lora_once.assert_not_called()
+                    tm._tokenize_one_request.assert_not_called()
+                    tm._send_one_request.assert_not_called()
+                    tm.send_to_scheduler.send_pyobj.assert_not_called()
+                    self.assertFalse(live_state.abort_sent)
+                    self.assertFalse(live_state.lora_released)
+
+    def test_initialization_exceptions_preserve_map(self):
+        targets = (
+            "ReqState",
+            "APIServerReqTimeStats",
+            "APIServerReqTimeStats.init_trace_ctx",
+            "APIServerReqTimeStats.set_created_time",
+        )
+        for target in targets:
+            for failure_index in range(2):
+                with self.subTest(target=target, failure_index=failure_index):
+                    tm = _make_tokenizer_manager(self)
+                    tm.enable_trace = True
+                    tm.rid_to_state = {"live": _make_req_state("live")}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+                    obj.normalize_batch_and_arguments()
+                    first_result = {
+                        "ReqState": _make_req_state("fresh0"),
+                        "APIServerReqTimeStats": APIServerReqTimeStats(),
+                    }.get(target)
+                    effects = [first_result] * failure_index + [
+                        RuntimeError("initialization failed")
+                    ]
+                    with patch(
+                        f"sglang.srt.managers.tokenizer_manager.{target}",
+                        side_effect=effects,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "initialization failed"
+                        ):
+                            tm._init_req_state(obj)
+                    self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_valid_single_and_batch_requests(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for single in (True, False):
+                with self.subTest(request_type=request_type.__name__, single=single):
+                    tm = _make_tokenizer_manager(self)
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    obj = request_type(
+                        text="a" if single else ["a", "b"],
+                        rid="fresh" if single else ["fresh0", "fresh1"],
+                        received_time=123.0,
+                    )
+                    obj.normalize_batch_and_arguments()
+                    tm._init_req_state(obj)
+                    items = [obj] if single else [obj[i] for i in range(len(obj.rid))]
+                    self.assertEqual(len(tm.rid_to_state), len(items) + 1)
+                    self.assertIs(tm.rid_to_state["live"], live_state)
+                    for item in items:
+                        state = tm.rid_to_state[item.rid]
+                        self.assertIs(state.obj, item)
+                        self.assertEqual(state.time_stats.created_time, 123.0)
+                        self.assertFalse(state.dispatched)
+                        self.assertFalse(state.event.is_set())
+
+    def test_within_batch_duplicates_preserve_map(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(request_type=request_type.__name__):
+                tm = _make_tm_for_generate(self)
+                tm.rid_to_state = {"live": _make_req_state("live")}
+                original_map = tm.rid_to_state
+                original_states = dict(original_map)
+                obj = request_type(text=["a", "b"], rid=["duplicate", "duplicate"])
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "Duplicate"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_direct_initialization_rejects_duplicate_ids(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+        obj.normalize_batch_and_arguments()
+        obj.rid = ["duplicate", "duplicate"]
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(obj)
+        self.assertFalse(tm.rid_to_state)
+
+    def test_trace_metadata_is_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_trace = True
+        obj = GenerateReqInput(
+            text=["a", "b"],
+            rid=["fresh0", "fresh1"],
+            bootstrap_room=[10, 11],
+            received_time=123.0,
+        )
+        obj.normalize_batch_and_arguments()
+        request = Mock(headers={"traceparent": "parent", "unrelated": "ignored"})
+        with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+            tm._init_req_state(obj, request)
+        self.assertEqual(trace.call_count, 2)
+        for i, trace_call in enumerate(trace.call_args_list):
+            self.assertEqual(
+                trace_call.args, (obj.rid[i], 10 + i, {"traceparent": "parent"})
+            )
+            self.assertEqual(tm.rid_to_state[obj.rid[i]].time_stats.created_time, 123.0)
 
 
 class TestResubmitAfterCompletion(CustomTestCase):
@@ -555,7 +868,7 @@ class _DummyAsyncCM:
         return False
 
 
-def _make_tm_for_generate(case) -> TokenizerManager:
+def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     """Augment the mocked TokenizerManager with what generate_request needs."""
     tm = _make_tokenizer_manager(case)
     tm.server_args.language_only = False
@@ -569,7 +882,17 @@ def _make_tm_for_generate(case) -> TokenizerManager:
     tm.is_pause_cond = asyncio.Condition()
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
-    tm._validate_and_resolve_lora = AsyncMock(return_value=None)
+    tm.request_metrics_exporter_manager = Mock()
+    tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+    tm._lora_release_tasks = set()
+    if enable_lora:
+        tm.enable_lora = True
+        tm.server_args.max_loaded_loras = None
+        tm.lora_registry = LoRARegistry(
+            [LoRARef(lora_id="adapter", lora_name="adapter")]
+        )
+    else:
+        tm._validate_and_resolve_lora = AsyncMock(return_value=None)
     return tm
 
 
@@ -595,7 +918,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._release_req_states_on_failure([rid])
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_undelivered_batch_removes_all(self):
@@ -603,7 +926,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
-        tm._release_req_states_on_failure(rids)
+        tm._release_req_states_on_failure(dict(tm.rid_to_state))
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
@@ -611,7 +934,12 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         """A rid that is no longer present must not raise."""
         tm = _make_tokenizer_manager(self)
         tm.rid_to_state["p1"] = _make_req_state("p1")
-        tm._release_req_states_on_failure(["p1", "already_gone"])
+        tm._release_req_states_on_failure(
+            {
+                "p1": tm.rid_to_state["p1"],
+                "already_gone": _make_req_state("already_gone"),
+            }
+        )
         self.assertNotIn("p1", tm.rid_to_state)
 
     def test_dispatched_single_is_aborted_and_state_kept(self):
@@ -624,8 +952,8 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         state = _make_req_state(rid)
         state.dispatched = True
         tm.rid_to_state[rid] = state
-        tm._release_req_states_on_failure([rid])
-        tm._release_req_states_on_failure([rid])
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
+        tm._release_req_states_on_failure({rid: tm.rid_to_state[rid]})
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual(
@@ -645,7 +973,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         live.dispatched = True
         tm.rid_to_state[delivered] = live
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
-        tm._release_req_states_on_failure([delivered, undelivered])
+        tm._release_req_states_on_failure(dict(tm.rid_to_state))
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual([type(m) for m in sent], [AbortReq])
@@ -664,11 +992,55 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
 
         with self.assertLogs(level="ERROR"):
-            tm._release_req_states_on_failure([delivered, undelivered])
+            tm._release_req_states_on_failure(dict(tm.rid_to_state))
 
         self.assertIn(delivered, tm.rid_to_state)
         self.assertFalse(live.abort_sent)
         self.assertNotIn(undelivered, tm.rid_to_state)
+
+    def test_completed_sample_reuse_survives_sibling_cleanup(self):
+        """Batch cleanup must preserve a reused sample RID, adapter ref and encoder gate."""
+
+        async def drive(dispatched):
+            tm = _make_tm_for_generate(self, enable_lora=True)
+            tm._dispatch_to_scheduler = Mock()
+            samples = [
+                GenerateReqInput(text="sample", lora_path="adapter") for _ in range(2)
+            ]
+            for sample in samples:
+                sample.normalize_batch_and_arguments()
+                tm._init_req_state(sample)
+                await tm._validate_and_resolve_lora(sample)
+            request_states = dict(tm.rid_to_state)
+            rid = samples[0].rid
+            await tm._handle_batch_output(_make_batch_str_output(rid))
+            await asyncio.gather(*tm._lora_release_tasks)
+
+            replacement = GenerateReqInput(text="new", rid=rid, lora_path="adapter")
+            replacement.normalize_batch_and_arguments()
+            tm._init_req_state(replacement)
+            await tm._validate_and_resolve_lora(replacement)
+            replacement_state = tm.rid_to_state[rid]
+            replacement_state.dispatched = dispatched
+            gate = asyncio.Event()
+            tm.encoder_dispatch_ready[rid] = gate
+
+            tm._release_req_states_on_failure(request_states)
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertIs(tm.rid_to_state.get(rid), replacement_state)
+            self.assertNotIn(samples[1].rid, tm.rid_to_state)
+            self.assertIs(tm.encoder_dispatch_ready.get(rid), gate)
+            self.assertFalse(gate.is_set())
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+            tm._dispatch_to_scheduler.assert_not_called()
+
+            await tm._handle_batch_output(_make_batch_str_output(rid))
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+
+        for dispatched in (False, True):
+            with self.subTest(dispatched=dispatched):
+                asyncio.run(drive(dispatched))
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
@@ -735,24 +1107,22 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     """
 
     def test_single_failure_before_dispatch_cleans_up(self):
-        tm = _make_tm_for_generate(self)
-        rid = "single_overlen"
-        obj = _make_generate_obj(rid, is_single=True)
-        # Simulate over-length rejection during tokenization/validation.
+        """Validation failure must return the adapter reference acquired earlier."""
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        obj = GenerateReqInput(text="prompt", rid="single_overlen", lora_path="adapter")
         tm._tokenize_one_request = AsyncMock(side_effect=ValueError("input too long"))
         tm._send_one_request = Mock()
 
         async def drive():
-            await tm.generate_request(obj).__anext__()
+            with self.assertRaisesRegex(ValueError, "input too long"):
+                await tm.generate_request(obj).__anext__()
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
 
-        with self.assertRaises(ValueError):
-            asyncio.run(drive())
-
-        # Got past _init_req_state (which created the entry) ...
+        asyncio.run(drive())
         tm._tokenize_one_request.assert_awaited_once()
         tm._send_one_request.assert_not_called()
-        # ... and the entry was cleaned up rather than leaked.
-        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertNotIn(obj.rid, tm.rid_to_state)
 
     def test_batch_failure_before_dispatch_cleans_up_all(self):
         tm = _make_tm_for_generate(self)
@@ -856,6 +1226,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)
@@ -888,6 +1259,175 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestLoRARequestLifecycle(CustomTestCase):
+    def test_abort_waiter_preserves_reused_rid(self):
+        """An old abort must neither erase a new request nor release its reference."""
+
+        async def drive(status_code, expected_exception):
+            tm = _make_tm_for_generate(self, enable_lora=True)
+            obj = GenerateReqInput(text="old", rid="reused", lora_path="adapter")
+            tm._tokenize_one_request = AsyncMock(
+                side_effect=lambda req: SimpleNamespace(rid=req.rid)
+            )
+            dispatched = asyncio.Event()
+
+            async def send(tokenized):
+                tm._mark_state_dispatched(tokenized.rid)
+                dispatched.set()
+
+            tm._send_one_request = send
+            generator = tm.generate_request(obj)
+            waiter = asyncio.create_task(generator.__anext__())
+            await dispatched.wait()
+
+            abort = _make_abort_req(obj.rid)
+            abort.finished_reason["status_code"] = status_code
+            tm._handle_abort_req(abort)
+            # Reuse the ID before the old waiter resumes on its abort notification.
+            replacement = GenerateReqInput(text="new", rid=obj.rid, lora_path="adapter")
+            replacement.normalize_batch_and_arguments()
+            tm._init_req_state(replacement)
+            await tm._validate_and_resolve_lora(replacement)
+            replacement_state = tm.rid_to_state[obj.rid]
+
+            with self.assertRaises(expected_exception) as ctx:
+                await waiter
+            if expected_exception is HTTPException:
+                self.assertEqual(ctx.exception.status_code, status_code)
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertIs(tm.rid_to_state.get(obj.rid), replacement_state)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+
+            await tm._handle_batch_output(_make_batch_str_output(obj.rid))
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+            await generator.aclose()
+
+        for status_code, expected_exception in (
+            (400, ValueError),
+            (503, HTTPException),
+        ):
+            with self.subTest(status_code=status_code):
+                asyncio.run(drive(status_code, expected_exception))
+
+    async def _drive_parallel_request(self, fail_second_warmup=False):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        obj = GenerateReqInput(
+            text=["first", "second"],
+            lora_path="adapter",
+            sampling_params={"n": 2, "max_new_tokens": 4},
+        )
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=lambda req: SimpleNamespace(
+                rid=req.rid,
+                lora_id=req.lora_id,
+                input_ids=[1],
+                mm_inputs=None,
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+                sampling_params=SimpleNamespace(max_new_tokens=4),
+            )
+        )
+        sent = asyncio.Queue()
+
+        async def send(tokenized):
+            tm._mark_state_dispatched(tokenized.rid)
+            sent.put_nowait(tokenized)
+
+        tm._send_one_request = send
+        generator = tm.generate_request(obj)
+        response = asyncio.create_task(generator.__anext__())
+        try:
+            for i in range(2):
+                warmup = await asyncio.wait_for(sent.get(), timeout=1)
+                self.assertEqual(warmup.lora_id, "adapter")
+                self.assertEqual(warmup.sampling_params.max_new_tokens, 0)
+                reason = None
+                if fail_second_warmup and i == 1:
+                    reason = {
+                        "type": "abort",
+                        "status_code": 400,
+                        "message": "invalid grammar",
+                    }
+                await tm._handle_batch_output(
+                    _make_batch_str_output(warmup.rid, reason)
+                )
+
+            if fail_second_warmup:
+                with self.assertRaisesRegex(ValueError, "invalid grammar"):
+                    await response
+                self.assertTrue(sent.empty())  # No samples were dispatched.
+            else:
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 4)
+                for remaining in (3, 2, 1, 0):
+                    sample = await asyncio.wait_for(sent.get(), timeout=1)
+                    await tm._handle_batch_output(_make_batch_str_output(sample.rid))
+                    await asyncio.gather(*tm._lora_release_tasks)
+                    self.assertEqual(
+                        tm.lora_registry._counters["adapter"].value(), remaining
+                    )
+                self.assertEqual(len(await response), 4)
+
+            await asyncio.gather(*tm._lora_release_tasks)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+            self.assertFalse(tm.rid_to_state)
+        finally:
+            response.cancel()
+            await asyncio.gather(response, return_exceptions=True)
+            await generator.aclose()
+
+    def test_parallel_warmups_do_not_release_sample_references(self):
+        """Prefix warmups must not let an adapter unload while samples use it."""
+        asyncio.run(self._drive_parallel_request())
+
+    def test_second_parallel_warmup_failure_releases_all_references(self):
+        """A failed warmup must return references even after earlier warmups finish."""
+        asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
+
+
+class TestPriorityRange(CustomTestCase):
+    """Request priorities reach the radix cache as signed 64-bit integers, so an
+    out-of-range value is rejected before dispatch instead of failing inside
+    the scheduler, and the boundary values themselves pass through unchanged."""
+
+    INT64_MIN = -(1 << 63)
+    INT64_MAX = (1 << 63) - 1
+
+    def test_int64_boundaries_are_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_priority_scheduling = True
+        tm.default_priority_value = 0
+        for priority in (self.INT64_MIN, self.INT64_MAX):
+            with self.subTest(priority=priority):
+                obj = GenerateReqInput(input_ids=[1], priority=priority)
+                tm._set_default_priority(obj)
+                self.assertEqual(obj.priority, priority)
+
+    def test_out_of_range_priority_is_rejected_before_dispatch(self):
+        for enabled in (False, True):
+            for priority in (self.INT64_MIN - 1, self.INT64_MAX + 1):
+                for source in ("body", "default"):
+                    if source == "default" and not enabled:
+                        continue
+                    with self.subTest(
+                        enabled=enabled, priority=priority, source=source
+                    ):
+                        tm = _make_tm_for_generate(self)
+                        del tm._set_default_priority  # the real one is under test
+                        tm.enable_priority_scheduling = enabled
+                        tm.default_priority_value = (
+                            priority if source == "default" else 0
+                        )
+                        tm._init_req_state = Mock()
+                        obj = GenerateReqInput(
+                            input_ids=[1],
+                            priority=priority if source == "body" else None,
+                        )
+                        with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+                            asyncio.run(tm.generate_request(obj).__anext__())
+                        tm._init_req_state.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Field order preserving the ServerArgs positional constructor signature.
 
-``collect_input_fields`` appends unlisted fields after these entries.
+Append new built-in fields to this tuple; inserting or regrouping changes existing
+calls. ``collect_input_fields`` appends unlisted extension fields after these entries.
 """
 
 # fmt: off
@@ -79,6 +80,7 @@ POSITIONAL_FIELD_ORDER = (
     "pp_max_micro_batch_size",
     "pp_async_batch_depth",
     "dp_size",
+    "attn_dp_size",
     "load_balance_method",
     "attn_cp_size",
     "moe_dp_size",
@@ -89,6 +91,7 @@ POSITIONAL_FIELD_ORDER = (
     "cp_strategy",
     "enable_dsa_cache_layer_split",
     "enable_cp_decode_attn_tp",
+    "enable_kv_cache_sharding",
     "enable_dp_attention",
     "enable_dp_attention_local_control_broadcast",
     "enable_dp_lm_head",
@@ -226,7 +229,6 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_bs_decode",
     "cuda_graph_bs_prefill",
     "cuda_graph_prefill_max_context",
-    "cuda_graph_tc_compiler",
     "disable_prefill_cuda_graph",
     "disable_decode_cuda_graph",
     "disable_cuda_graph",
@@ -250,6 +252,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_torch_symm_mem",
     "enable_scattered_sconv",
     "pre_warm_nccl",
+    "boundary_reduction",
     "enable_quant_communications",
     "enable_flashinfer_allreduce_fusion",
     "enforce_disable_flashinfer_allreduce_fusion",
@@ -282,9 +285,9 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_window_size",
     "speculative_moe_runner_backend",
     "speculative_moe_a2a_backend",
+    "speculative_enable_w4a4_mxfp4_megamoe",
     "speculative_draft_model_quantization",
     "_speculative_draft_quantization_explicitly_set",
-    "speculative_skip_dp_mlp_sync",
     "enable_multi_layer_eagle",
     "speculative_adaptive",
     "speculative_adaptive_config",
@@ -518,5 +521,30 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "qsa_indexer_dtype",
+    "disaggregation_decode_allocation_policy",
+    "speculative_boundary_reduction",
+    "speculative_use_block_verification",
+    "speculative_draft_sink_size",
+    "disable_aiter_allreduce_fusion_in_prefill",
+    "disable_aiter_allreduce_fusion_in_decode",
+    "monokernel_backend",
+    "dsa_triton_union",
+    "enable_dsa_fused_indexer",
+    "enable_cp_tp_group_sharing",
+    "enable_watermark",
+    "watermark_config",
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_context_window",
+    "watermark_mixing_probability",
+    "watermark_max_probability",
+    "watermark_default_enabled",
+    "watermark_enforce_all",
+    "grpc_response_timeout_secs",
+    "enable_paged_experts",
+    "paged_experts_num_resident",
+    "enable_nvidia_megakernel",
+    "enable_megamoe_for_layernorm_sp",
 )
 # fmt: on

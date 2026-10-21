@@ -81,10 +81,22 @@ impl Runnable for Intake {
                 .wait();
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
-                // A fresh request and one returning from either pool.
-                Some(Lane::Event(
-                    TmEvent::Intake(req) | TmEvent::Tokenized(req) | TmEvent::Encoded(req),
-                )) => self.drive(req),
+                // A fresh request first passes the cancellation-safe admission
+                // handoff; requests returning from either worker pool are already
+                // owned by Intake and continue through the state machine directly.
+                Some(Lane::Event(TmEvent::Intake { request, admission })) => {
+                    if admission.try_accept() {
+                        self.drive(request);
+                    } else {
+                        tracing::debug!(
+                            rid = %request.rid,
+                            "intake discarded request cancelled before admission"
+                        );
+                    }
+                }
+                Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
+                    self.drive(req)
+                }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -110,8 +122,8 @@ impl Intake {
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Log only server faults (500); 4xx/499/503 are expected and would spam.
-        if err.http_status() == 500 {
+        // Expected request, capacity, and cancellation outcomes would spam.
+        if err.is_server_fault() {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
@@ -154,19 +166,26 @@ impl Intake {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
-                    if !self.register_detok(&req) {
-                        let _ = req
-                            .state
-                            .apply(Event::Error(Error::Internal("detok shard gone".into())));
-                        continue;
+                    // A tokenize request is answered by the tokenizer pool
+                    // through its own sink, never by a detok shard.
+                    if !matches!(req.kind, RequestKind::Tokenize { .. }) {
+                        if !self.register_detok(&req) {
+                            let _ = req
+                                .state
+                                .apply(Event::Error(Error::Internal("detok shard gone".into())));
+                            continue;
+                        }
+                        registered = true;
                     }
-                    registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control and detokenize skip normalization (no sampling params)
-                // straight to the pre-send checks; generate goes to Normalizing.
+                // Control, detokenize and tokenize skip normalization (no
+                // sampling params) straight to the pre-send checks; generate
+                // goes to Normalizing.
                 RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
+                    RequestKind::Control(_)
+                    | RequestKind::Detokenize { .. }
+                    | RequestKind::Tokenize { .. } => {
                         let _ = req
                             .state
                             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
@@ -296,7 +315,7 @@ impl Intake {
                 }
                 // Hand the request to the stage that answers it: the scheduler
                 // channel (generate payload or control frame), or -- for detokenize
-                // — the detok shard itself.
+                // and tokenize — the detok shard or the tokenizer pool itself.
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the
                     // discriminant and `req` can be moved into each push.
@@ -304,6 +323,7 @@ impl Intake {
                         RequestKind::Generate(_) => self.push_to_channel(req),
                         RequestKind::Control(_) => self.push_control_to_channel(req),
                         RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
+                        RequestKind::Tokenize { .. } => self.push_tokenize_to_pool(req),
                     }
                     return;
                 }
@@ -337,7 +357,12 @@ impl Intake {
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Control(_)
+            | RequestKind::Detokenize { .. }
+            | RequestKind::Tokenize { .. } => (
+                false, /* decode_logprob_text */
+                false, /* no_stop_trim */
+            ),
         };
         self.senders
             .detok_for(&req.rid)
@@ -355,7 +380,11 @@ impl Intake {
     /// already holds this rid's sink: `register_detok` queued `Register` on the
     /// same channel from this same thread, so FIFO gives Register → Decode.
     fn push_detokenize_to_shard(&self, mut req: Request) {
-        let RequestKind::Detokenize { token_ids } = &req.kind else {
+        let RequestKind::Detokenize {
+            token_ids,
+            skip_special_tokens,
+        } = &req.kind
+        else {
             self.fail(
                 &mut req,
                 Error::Internal("non-detokenize request reached push_detokenize_to_shard".into()),
@@ -371,10 +400,26 @@ impl Intake {
             .send(DetokMsg::Decode {
                 rid: req.rid.clone(),
                 token_ids,
+                skip_special_tokens: *skip_special_tokens,
             })
             .is_err()
         {
             self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
+        }
+    }
+
+    /// Hand a `Tokenize` request to the tokenizer pool, which answers it
+    /// through the request's own sink. It was never registered with a detok
+    /// shard, so a failure here has nothing to deregister.
+    fn push_tokenize_to_pool(&self, req: Request) {
+        if let Err(err) = self.senders.tokenizer_tx.send(req) {
+            // Pool gone (workers exited); flume hands the request back.
+            let mut req = err.into_inner();
+            self.fail(
+                &mut req,
+                Error::Internal("tokenizer pool gone".into()),
+                false, /* registered */
+            );
         }
     }
 
@@ -407,11 +452,9 @@ impl Intake {
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
-    /// A failed push is logged, not retried: the scheduler keeps generating and the
-    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
-    /// That wastes GPU work until the request finishes on its own, but it cannot be
-    /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    /// Aborts use the reserved scheduler-control lane, so request-ring
+    /// backpressure cannot discard cancellation after public selector state is
+    /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
     /// abort there yet: it is marked `Aborted` and dropped when it returns.
@@ -426,20 +469,17 @@ impl Intake {
             tracing::debug!(rid = %rid, "abort recorded for request");
             return;
         }
+        if matches!(source, AbortSource::Local(_)) {
+            return;
+        }
 
-        // The channel is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.to_scheduler_tx.try_push(SchedulerRequest {
+                if !self.to_scheduler_tx.push_priority(SchedulerRequest {
                     header,
                     buffers: Vec::new(),
                 }) {
-                    tracing::error!(
-                        rid = %rid,
-                        "abort dropped: to_scheduler channel is full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
-                    );
+                    tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
                 }
             }
             Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),

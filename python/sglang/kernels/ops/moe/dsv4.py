@@ -9,9 +9,6 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
-
-_is_xpu = is_xpu()
 
 
 def make_name(name: str) -> str:
@@ -39,8 +36,8 @@ def _jit_hash_topk_module():
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+def _jit_mega_moe_pre_dispatch_module(quant_group_size: int, write_shared_sf: bool):
+    args = make_cpp_args(quant_group_size, is_arch_support_pdl(), write_shared_sf)
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
         *args,
@@ -68,41 +65,6 @@ def _jit_silu_mul_quant_varlen_module(
         *args,
         cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
         cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
-        extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
-def _jit_silu_mul_quant_contig_module(
-    quant_group_size: int,
-    scale_ue8m0: bool,
-    swizzle: bool,
-    apply_swiglu_limit: bool,
-):
-    args = make_cpp_args(
-        quant_group_size,
-        scale_ue8m0,
-        swizzle,
-        is_arch_support_pdl(),
-        apply_swiglu_limit,
-    )
-    return load_jit(
-        make_name("silu_mul_quant_contig"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulContigPostQuantKernel<{args}>::run")],
-        extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
-def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl())
-    return load_jit(
-        make_name("silu_and_mul_clamp"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
         extra_cuda_cflags=["-use_fast_math"],
     )
 
@@ -162,8 +124,16 @@ def mega_moe_pre_dispatch(
     buf_topk_idx: torch.Tensor,
     buf_topk_weights: torch.Tensor,
     quant_group_size: int = 32,
+    *,
+    shared_x_sf: Optional[torch.Tensor] = None,
+    shared_block_m: int = 0,
 ) -> None:
-    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    if x.shape[0] == 0 and x.stride(0) != x.shape[1]:
+        x = x.new_empty(x.shape)
+    # shared_block_m must match the consuming MoE's paged scale layout
+    module = _jit_mega_moe_pre_dispatch_module(
+        quant_group_size, shared_x_sf is not None
+    )
     module.run(
         x,
         topk_idx,
@@ -172,21 +142,9 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
+        shared_x_sf,
+        shared_block_m,
     )
-
-
-def silu_and_mul_clamp(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    swiglu_limit: float,
-) -> None:
-    if _is_xpu:
-        from sgl_kernel import silu_and_mul_clamp
-
-        silu_and_mul_clamp(input, output, float(swiglu_limit))
-    else:
-        module = _jit_silu_and_mul_clamp_module(input.dtype)
-        module.run(input, output, float(swiglu_limit))
 
 
 def silu_and_mul_masked_post_quant(
@@ -211,29 +169,6 @@ def silu_and_mul_masked_post_quant(
         output_scale,
         masked_m,
         topk,
-        transposed,
-        float(swiglu_limit) if apply_swiglu_limit else 0.0,
-    )
-
-
-def silu_and_mul_contig_post_quant(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_scale: torch.Tensor,
-    quant_group_size: int,
-    scale_ue8m0: bool = False,
-    transposed: bool = False,
-    swiglu_limit: Optional[float] = None,
-    swizzle: bool = False,
-) -> None:
-    apply_swiglu_limit = swiglu_limit is not None
-    module = _jit_silu_mul_quant_contig_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
-    )
-    module.run(
-        input,
-        output,
-        output_scale,
         transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )

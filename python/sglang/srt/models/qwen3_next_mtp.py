@@ -48,7 +48,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config

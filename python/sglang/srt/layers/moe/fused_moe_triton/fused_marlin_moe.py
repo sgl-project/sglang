@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,10 +15,14 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
+# Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
 @triton.jit
 def _tl_tanh(x):
     return 2.0 * tl.sigmoid(2.0 * x) - 1.0
@@ -109,6 +114,17 @@ def swiglu_limit_func(
     swiglu_limit: float = 0.0,
 ) -> None:
     d = input.shape[1] // 2
+    if (
+        _is_cuda
+        and get_platform().is_sm90
+        and input.is_cuda
+        and input.dtype in (torch.bfloat16, torch.float16)
+        and d % 16 == 0
+        and input.is_contiguous()
+        and output.is_contiguous()
+    ):
+        silu_and_mul_with_activation_rounding(input, output, clamp_limit=swiglu_limit)
+        return
     gate = input[:, :d]
     up = input[:, d:]
 
@@ -162,6 +178,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -186,6 +203,8 @@ def fused_marlin_moe(
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
     - num_bits (int): The number of bits in expert weights quantization.
+    - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
+        ``[num_tokens, topk, hidden]``, instead of their top-k sum.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -286,15 +305,14 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
-    intermediate_cache13 = torch.zeros(
-        (M * topk_ids.shape[1] * max(gemm1_n, K),),
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
-    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
+    intermediate_cache3 = intermediate_cache13[: M * topk * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
@@ -362,9 +380,9 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
-        intermediate_cache3.zero_()
-
+    # Gate-up is dead after activation, so its storage can hold the down output.
+    # Skipped down routes must start at zero before the top-k reduction.
+    intermediate_cache3.zero_()
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -393,6 +411,9 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
+
+    if no_combine:
+        return intermediate_cache3
 
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:
