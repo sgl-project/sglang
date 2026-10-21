@@ -1209,10 +1209,6 @@ class AiterAttnBackend(AttentionBackend):
             bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
         )
 
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
         cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
         cu_seqlens_q[1:] = torch.cumsum(
             forward_batch.extend_seq_lens.to(torch.int32), dim=0
@@ -2598,7 +2594,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
-                    None,
+                    self.indices_updater_prefill.qo_indptr[: bs + 1],
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -4423,7 +4419,7 @@ class AiterAttnBackend(AttentionBackend):
                         self.k_scale.reshape(1),  # Q is cast at unit scale.
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4499,7 +4495,7 @@ class AiterAttnBackend(AttentionBackend):
                         fp8_q_descale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4538,8 +4534,8 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_q_descale.reshape(1),
                     k_descale.reshape(1),
                     v_descale.reshape(1),
-                    self.qo_indptr[:bs0],
-                    self.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,
                     self.forward_metadata.max_q_len,
                     softmax_scale=layer.scaling,
@@ -4628,7 +4624,7 @@ class AiterAttnBackend(AttentionBackend):
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
