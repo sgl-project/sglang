@@ -92,6 +92,7 @@ class UnifiedCacheExecutor:
         self.generation = self.claims.generation
         self._thread = threading.get_ident()
         self.gpu_copy_capacity = None
+        self.cache_salt_transform = None
         self.transfers = None
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
@@ -183,7 +184,13 @@ class UnifiedCacheExecutor:
             )
         if compatibility.layout_id not in (None, self.layout_id):
             raise ControlError("unsupported", "Unsupported cache layout")
-        return msgspec.structs.replace(compatibility, layout_id=self.layout_id)
+        return msgspec.structs.replace(
+            compatibility,
+            layout_id=self.layout_id,
+            cache_salt=self.cache_salt_transform(compatibility.cache_salt)
+            if self.cache_salt_transform is not None
+            else compatibility.cache_salt,
+        )
 
     def _walk(self, tokens, compatibility):
         key = RadixKey(

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Annotated
 
 import msgspec
@@ -163,8 +165,23 @@ Command = (
 
 
 class KVControlService:
-    def __init__(self, cache, config: ServiceConfig, *, clock=time.monotonic):
+    def __init__(
+        self,
+        cache,
+        config: ServiceConfig,
+        *,
+        clock=time.monotonic,
+        namespace_keys=False,
+        idle_check=None,
+    ):
+        if type(namespace_keys) is not bool:
+            raise ValueError("namespace_keys must be a bool")
+        self.namespace_keys = namespace_keys
+        self.idle_check = idle_check
         self.cache, self.config = cache, validated(config, ServiceConfig)
+        self.base_namespace = self.config.namespace
+        if self.namespace_keys:
+            self.cache_salt(None)  # Reject an unencodable namespace at startup.
         self.control = KVControl(
             config.engine_id or uuid.uuid4().hex,
             config.namespace,
@@ -172,10 +189,7 @@ class KVControlService:
             limits=config.limits,
             clock=clock,
         )
-        self.control.executor = cache.create_kv_control_executor(
-            engine_id=self.control.registry.engine_id,
-            engine_epoch=self.control.registry.engine_epoch,
-        )
+        self.control.executor = self._bind_executor()
         capabilities = self.control.executor.capabilities()
         if not capabilities["actions"]:
             raise ValueError(
@@ -183,7 +197,97 @@ class KVControlService:
             )
         cache.kv_control_service = self
 
+    def _bind_executor(self, capacity=None):
+        executor = self.cache.create_kv_control_executor(
+            engine_id=self.control.registry.engine_id,
+            engine_epoch=self.control.registry.engine_epoch,
+        )
+        executor.gpu_copy_capacity = capacity
+        if self.namespace_keys:
+            executor.cache_salt_transform = self.cache_salt
+        return executor
+
+    def cache_salt(self, original):
+        from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
+
+        return encode_cache_salt(self.config.namespace, original)
+
+    def prepare_request(self, req):
+        if not self.namespace_keys:
+            return
+        if hasattr(req, "kv_control_logical_cache_salt"):
+            if req.kv_control_key_namespace != self.config.namespace:
+                raise ControlError(
+                    "stale_epoch", "Request key belongs to an older model namespace"
+                )
+            return
+        original = req.cache_salt
+        encoded = self.cache_salt(original)
+        req.kv_control_logical_cache_salt = original
+        req.kv_control_key_namespace = self.config.namespace
+        req.cache_salt = encoded
+
+    def rebind_namespace(self, namespace):
+        """Owner boundary after draining model work; never mutates parameters.
+
+        Old physical copies may remain under their old encoded keys. Logical
+        results/declarations/claims rotate, and fresh ordinary/store lookup uses
+        the new namespace even when a caller deliberately retains old buffers.
+        """
+        if threading.get_ident() != self.cache._kv_control_owner_thread:
+            raise ControlError(
+                "wrong_owner", "Namespace rotation must run on the cache owner"
+            )
+        namespace = validated(namespace, Identifier)
+        if not self.namespace_keys or self.idle_check is None:
+            raise ControlError(
+                "unsupported",
+                "Namespace rotation requires namespaced request keys and an owner idle check",
+            )
+        if namespace == self.config.namespace:
+            raise ControlError("conflict", "A changed model requires a fresh namespace")
+        if self.has_pending or not self.idle_check():
+            raise ControlError(
+                "busy",
+                "Drain inference and control operations before namespace rotation",
+            )
+        if self.cache.session.any_holding_kv():
+            raise ControlError(
+                "busy", "Close StreamingSessions holding KV before namespace rotation"
+            )
+        if any(
+            getattr(self.cache, name, {})
+            for name in (
+                "ongoing_write_through",
+                "ongoing_load_back",
+                "ongoing_backup",
+                "ongoing_prefetch",
+            )
+        ):
+            raise ControlError(
+                "busy", "Drain cache transfers before namespace rotation"
+            )
+        controller = self.cache.cache_controller
+        if controller is not None and controller.has_inflight_device_transfers():
+            raise ControlError("busy", "Cache controller still owns transfer buffers")
+        for node in self.cache.tree_core._node_arena.values():
+            if node is not self.cache.tree_core.root_node and any(
+                cd.lock_ref or cd.host_lock_ref for cd in node.component_data
+            ):
+                raise ControlError(
+                    "busy", "Cache content still has active correctness references"
+                )
+        capacity = self.control.executor.gpu_copy_capacity
+        self.control.reset(namespace)
+        self.config = msgspec.structs.replace(self.config, namespace=namespace)
+        claims = self.cache.tree_core.priority_claims
+        claims.config = replace(claims.config, namespace=namespace)
+        claims.reset()
+        self.control.executor = self._bind_executor(capacity)
+
     def capabilities(self):
+        from sglang.srt.managers.kv_control.key_namespace import SALT_ENCODING
+
         registry = self.control.registry
         return dict(
             enabled=True,
@@ -195,6 +299,10 @@ class KVControlService:
             topology="single_owner",
             attached_caller_id="request",
             weight_updates="unsupported",
+            cache_salt_namespace=registry.namespace if self.namespace_keys else None,
+            cache_salt_encoding=SALT_ENCODING
+            if self.namespace_keys
+            else "owner_assertion",
         )
 
     @property
@@ -213,11 +321,7 @@ class KVControlService:
     def reset_after_cache_flush(self):
         capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(self.config.namespace)
-        self.control.executor = self.cache.create_kv_control_executor(
-            engine_id=self.control.registry.engine_id,
-            engine_epoch=self.control.registry.engine_epoch,
-        )
-        self.control.executor.gpu_copy_capacity = capacity
+        self.control.executor = self._bind_executor(capacity)
 
     def attach(self, req, envelope, *, unsupported_request=False):
         if envelope is None or not any(
@@ -269,7 +373,9 @@ class KVControlService:
             committed = TokensTarget(
                 namespace=self.config.namespace,
                 token_ids=tuple(req.full_untruncated_fill_ids[:committed_len]),
-                cache_salt=req.cache_salt,
+                cache_salt=getattr(
+                    req, "kv_control_logical_cache_salt", req.cache_salt
+                ),
                 extra_key=req.extra_key,
                 is_multimodal=req.multimodal_inputs is not None,
                 allow_clip=True,

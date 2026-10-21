@@ -303,3 +303,42 @@ approval before and after flush. The poisoned-byte CUDA test passed in
 /tmp/sglang-kv-gpu-hicache-poison-smoke.log. Final isort, formatting, whitespace,
 and no-added-Ruff-finding checks passed. Verdict: approve this bounded
 persistent-host transfer feature for its local commit.
+
+### Unit 5a — Namespace encoding for actual request/cache/store keys
+
+Implemented bounded, version-tagged namespace/salt encoding shared by ordinary
+requests and independent control. Actual serving enables it even without hints;
+the low-level callable cache mode retains its explicit owner-assertion contract.
+Request completion binds logical salts, so attached selectors do not encode an
+already encoded salt. Discovery reports the scheme. Namespace rebind is an owner
+boundary guarded by idleness, pending transfers, StreamingSession private KV and
+correctness references; it rotates epoch/logical metadata while old physical
+entries can remain inaccessible under old keys. This does not yet enable the
+parameter mutation APIs.
+
+Review found that preparation inside an overrideable request constructor could
+be bypassed by the documented subclass factory. A caller wrapper now owns the
+namespace/hint preparation while the original constructor remains an extension
+point. Tests use an actual subclass overriding only that constructor. Ordinary,
+session and unknown-session construction all use the wrapper.
+
+The eleven new real-CPU cases pass, including unhinted checkpoint/release versus
+independent lookup, Unicode and hash-looking logical salts, no double encoding,
+generated suffix binding, old live physical entries after namespace rebind,
+distinct actual storage hash chains, stale contexts, active rows/locks,
+StreamingSession-owned KV and callback preservation after flush. Existing core,
+priority, service, host transfer and constructor regressions passed (127 tests)
+before the constructor-wrapper correction; focused final proof is recorded below.
+The namespaced OPT dummy-weight HiCache server proof also passed with three
+cached tokens and equal output, plus independent MOVE/COPY and epoch checks.
+
+Final wrapper proof passed 24 tests (namespace 10, service 12, constructor 2);
+the additional wrong-thread regression then passed with all 11 namespace cases.
+Wrong-owner namespace change is refused before changing any records. Total
+unique relevant cases are 138 including the existing 127. GPU server proof after
+the wrapper correction passed at
+/tmp/sglang-kv-opt-namespaced-wrapper-smoke/{server.log,result.json}, including
+independent lookup against actual namespaced ordinary-generation keys and
+loaded-prefix reuse. No added Ruff findings, isort/format and diff whitespace
+checks pass. Verdict: approve the namespace-key foundation for a local commit;
+parameter mutation transactions remain the next required work.

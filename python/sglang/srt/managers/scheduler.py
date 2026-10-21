@@ -705,7 +705,10 @@ class Scheduler(
             )
 
             self.kv_control_service = KVControlService(
-                self.tree_cache, runtime_config()
+                self.tree_cache,
+                runtime_config(),
+                namespace_keys=True,
+                idle_check=self.is_fully_idle,
             )
             self.kv_control_service.control.executor.gpu_copy_capacity = (
                 self._kv_control_gpu_copy_capacity
@@ -2892,13 +2895,20 @@ class Scheduler(
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
-        """Extension point for request-local state, including session requests."""
+        """Constructor extension point; preparation belongs to the caller wrapper."""
+        return Req(*args, **kwargs)
+
+    def _new_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Prepare every constructed subclass, including reconstructed sessions."""
         kwargs.setdefault("kv_hints", recv_req.kv_hints)
-        req = Req(*args, **kwargs)
+        req = self._create_generation_req(recv_req, *args, **kwargs)
         if getattr(self, "kv_control_service", None) is not None:
             from sglang.srt.managers.kv_control.contracts import ControlError
 
             try:
+                self.kv_control_service.prepare_request(req)
                 self.kv_control_service.attach(
                     req,
                     recv_req.kv_hints,
@@ -2979,7 +2989,7 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = self._create_generation_req(
+            req = self._new_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -3073,7 +3083,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
-                req_factory=partial(self._create_generation_req, recv_req),
+                req_factory=partial(self._new_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3095,7 +3105,7 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = self._create_generation_req(
+            req = self._new_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -3690,6 +3700,8 @@ class Scheduler(
             token_indices_to_pool=recv_req.token_indices_to_pool,
             decision_layout=recv_req.decision_layout,
         )
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.prepare_request(req)
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)

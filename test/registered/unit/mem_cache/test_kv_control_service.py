@@ -297,7 +297,7 @@ def test_scheduler_factory_session_reconstruction_and_unallocated_abort(owner):
             kv_hints=envelope(attached=True, opaque=True),
         )
         req = session.create_req(
-            recv, None, 128, req_factory=partial(scheduler._create_generation_req, recv)
+            recv, None, 128, req_factory=partial(scheduler._new_generation_req, recv)
         )
         assert len(req.kv_hints.actions) == 1
         context = req.kv_control_context
@@ -312,7 +312,7 @@ def test_scheduler_factory_session_reconstruction_and_unallocated_abort(owner):
                 == Status.CANCELLED
             )
     scheduler.kv_control_service = None
-    req = scheduler._create_generation_req(
+    req = scheduler._new_generation_req(
         SimpleNamespace(kv_hints=recv.kv_hints, mm_inputs=None),
         rid="off",
         origin_input_text=None,

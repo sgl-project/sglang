@@ -390,6 +390,36 @@ descriptors, coverage kind/window size, effective priority and current lock coun
 cache ownership. `cache.tree_core.priority_claims.capacity()` reports actual
 side-table occupancy and reserved metadata units.
 
+## Model namespaces and actual keys
+
+The scheduler namespaces every ordinary request key when control is enabled,
+including requests without hints. Actual tree/store `cache_salt` is the SHA256
+of compact UTF-8 JSON `["sglang.kv.weight.v1", namespace, original_salt_or_null]`.
+Discovery reports the current namespace and encoding. Public token/content
+targets continue to carry the original logical salt; the executor applies the
+same mapping for lookup and descriptor hashes. Passing a physical encoded salt
+as a logical salt does not bypass that mapping.
+
+Preparation is idempotent for a request and captures its original logical salt.
+`request_cached` completion uses that original salt, so binding does not encode
+it twice. Preparation occurs outside the request-constructor extension point;
+forks returning a `Req` subclass still receive namespace and hint processing.
+Flush rebind preserves both the key mapper and scheduler capacity approval.
+
+The private owner namespace-rebind seam requires model idleness, no outstanding
+operations/transfers, no StreamingSession-owned KV and no correctness references.
+It rotates epoch, logical records and declarations. Old physical copies may
+remain under old encoded keys, but new requests/control cannot match them; their
+actual storage root hashes differ. This seam does not mutate model parameters.
+Weight-update API integration remains unsupported until its guarded transaction
+and failure handling are implemented.
+
+The low-level callable service defaults to owner-asserted compatibility without
+rewriting manually constructed cache keys. The serving scheduler explicitly
+enables `namespace_keys` and supplies its idle check. A low-level owner opting
+into namespaced keys must prepare requests before insertion and supply an idle
+check before invoking namespace rebind.
+
 Cache reset clears claims and changes the cache generation. Existing executors
 reject subsequent work. After the owner safely resets the cache and calls
 `control.reset(namespace)`, it must construct a new executor with the fresh
