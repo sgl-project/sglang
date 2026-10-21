@@ -12,7 +12,7 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     _w8a8_block_fp8_matmul,
     get_w8a8_block_fp8_configs,
 )
-from sglang.srt.utils import get_device, get_device_name
+from sglang.srt.utils import get_device_name
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -27,8 +27,16 @@ DSV41_BLOCK_SHAPE = (32, 32)
 # 服务启动时实际查表的全部 (N, K)：从 `--log-level info` 的
 # "Using configuration from ..." / "Config file not found at ..." 去重得到。
 DSV41_SHAPES = [
-    (512, 5120), (576, 5120), (1280, 5120), (1536, 5120), (1792, 5120),
-    (5120, 5120), (4096, 1280), (5120, 1024), (5120, 15360), (25600, 6144),
+    (512, 5120),
+    (576, 5120),
+    (1280, 5120),
+    (1536, 5120),
+    (1792, 5120),
+    (5120, 5120),
+    (4096, 1280),
+    (5120, 1024),
+    (5120, 15360),
+    (25600, 6144),
     (5120, 288),
 ]
 
@@ -128,8 +136,7 @@ def test_dsv41_block_shape_configs_are_present_for_this_device():
         (N, K)
         for (N, K) in DSV41_SHAPES
         if not (
-            CONFIGS_DIR
-            / f"N={N},K={K},device_name={device},dtype=fp8_w8a8,"
+            CONFIGS_DIR / f"N={N},K={K},device_name={device},dtype=fp8_w8a8,"
             f"block_shape=[{DSV41_BLOCK_SHAPE[0]}, {DSV41_BLOCK_SHAPE[1]}].json"
         ).is_file()
     ]
@@ -145,8 +152,10 @@ def test_config_lookup_finds_shipped_table_for_this_device():
     """
     device = get_device_name().replace(" ", "_")
     candidates = [
-        p for p in _config_files()
-        if _parse_config_name(p)[2] == device and _parse_config_name(p)[3].startswith("fp8_w8a8")
+        p
+        for p in _config_files()
+        if _parse_config_name(p)[2] == device
+        and _parse_config_name(p)[3].startswith("fp8_w8a8")
     ]
     if not candidates:
         pytest.skip(f"当前设备 {device} 没有随仓库发布的 fp8_w8a8 配置表")
@@ -161,8 +170,8 @@ def test_config_lookup_finds_shipped_table_for_this_device():
 
 @pytest.mark.xfail(
     reason="上游 get_configs_compute_bound() 只有 BLOCK_SIZE_K∈{64,128}，"
-           "block_k=32 过滤后为空（调优器对 DS-V4.1 的 32×32 权重不可用）；"
-           "workaround 见 benchmark 侧补候选",
+    "block_k=32 过滤后为空（调优器对 DS-V4.1 的 32×32 权重不可用）；"
+    "workaround 见 benchmark 侧补候选",
     strict=False,
 )
 def test_tuning_search_space_is_nonempty_for_every_block_k():
@@ -184,7 +193,9 @@ def _reference_block_fp8_matmul(A, B, As, Bs, block_n, block_k):
     a = A.double() * As.repeat_interleave(block_k, dim=1).double()
     b = (
         B.double()
-        * Bs.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1).double()
+        * Bs.repeat_interleave(block_n, dim=0)
+        .repeat_interleave(block_k, dim=1)
+        .double()
     )
     return (a @ b.T).to(torch.bfloat16)
 
@@ -201,7 +212,8 @@ def _dyadic_inputs(M, N, K, block_n, block_k, seed=719):
     )
     # scale 取 2 的幂 → 反量化精确
     As = torch.ldexp(
-        torch.ones(M, K // block_k, device="cuda"), -torch.randint(1, 9, (M, K // block_k), generator=g, device="cuda")
+        torch.ones(M, K // block_k, device="cuda"),
+        -torch.randint(1, 9, (M, K // block_k), generator=g, device="cuda"),
     )
     Bs = torch.ldexp(
         torch.ones(N // block_n, K // block_k, device="cuda"),
@@ -213,12 +225,12 @@ def _dyadic_inputs(M, N, K, block_n, block_k, seed=719):
 @pytest.mark.parametrize(
     "M,N,K,block_n,block_k",
     [
-        (1, 512, 5120, 32, 32),      # DS-V4.1 wkv（decode）
-        (64, 5120, 5120, 32, 32),    # DS-V4.1 最大 shape（decode 上限）
-        (128, 1280, 5120, 32, 32),   # DS-V4.1 wq_a
-        (33, 576, 5120, 32, 32),     # 非 2 次幂 M
-        (16, 5120, 288, 32, 32),     # K=288（K/BLOCK_SIZE_K=9，非 2 次幂）
-        (8, 256, 256, 128, 128),     # 其它 block_shape 也要能跑
+        (1, 512, 5120, 32, 32),  # DS-V4.1 wkv（decode）
+        (64, 5120, 5120, 32, 32),  # DS-V4.1 最大 shape（decode 上限）
+        (128, 1280, 5120, 32, 32),  # DS-V4.1 wq_a
+        (33, 576, 5120, 32, 32),  # 非 2 次幂 M
+        (16, 5120, 288, 32, 32),  # K=288（K/BLOCK_SIZE_K=9，非 2 次幂）
+        (8, 256, 256, 128, 128),  # 其它 block_shape 也要能跑
     ],
 )
 def test_block_fp8_matmul_matches_reference(M, N, K, block_n, block_k):
@@ -244,10 +256,32 @@ def test_block_fp8_matmul_matches_reference(M, N, K, block_n, block_k):
 
     A, B, As, Bs = _dyadic_inputs(M, N, K, block_n, block_k)
     C = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-    _w8a8_block_fp8_matmul[(triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)](
-        A, B, C, As, Bs, M, N, K, block_n, block_k,
-        A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2), C.stride(-1),
-        As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0),
+    _w8a8_block_fp8_matmul[
+        (
+            triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+        )
+    ](
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(-2),
+        C.stride(-1),
+        As.stride(-2),
+        As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
         needs_masking=bool(K % config["BLOCK_SIZE_K"] != 0),
         **config,
     )

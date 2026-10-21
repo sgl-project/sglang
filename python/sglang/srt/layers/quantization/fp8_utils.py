@@ -1503,9 +1503,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
                 block_size,
                 output_dtype,
             ):
-                output = fp8_block32_gemm(
-                    q_small, weight, x_scale_small, weight_scale
-                )
+                output = fp8_block32_gemm(q_small, weight, x_scale_small, weight_scale)
                 if bias is not None:
                     output += bias
                 return output.to(dtype=output_dtype).view(*output_shape)
