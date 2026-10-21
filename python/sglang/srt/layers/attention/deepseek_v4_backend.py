@@ -1056,7 +1056,6 @@ class DSV4Metadata:
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
-    prefill_shared_reads_snapshotted: bool = False
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
@@ -1078,7 +1077,6 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
-        self.prefill_shared_reads_snapshotted = False
 
     def refresh_for_breakable_cuda_graph_replay_(
         self,
@@ -1123,7 +1121,6 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
-        self.prefill_shared_reads_snapshotted = False
 
 
 @dataclass
@@ -1203,13 +1200,6 @@ class DeepseekV4AttnBackend(
             if self.model_runner.spec_algorithm.is_dspark():
                 return SharedReadEnds.IN_REPLAY
             return SharedReadEnds.POST_REPLAY
-        metadata = self.forward_metadata
-        if (
-            fm == ForwardMode.EXTEND
-            and isinstance(metadata, DSV4Metadata)
-            and metadata.prefill_shared_reads_snapshotted
-        ):
-            return SharedReadEnds.PRE_REPLAY
         return super().shared_read_ends(fm)
 
     def __init__(
@@ -2739,47 +2729,46 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
+        # Shared with the snapshot hook, so no forward builds the cache after read-done.
+        # The tail stays dense: its window floor lives in swa_page_indices, which
+        # the chunk cache ignores.
         return (
-            forward_batch.forward_mode.is_extend_without_speculative()
+            not self.trtllm_attn
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
+            and self.forward_metadata.late_layer_tail is None
+            and self.token_to_kv_pool.request_window is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             )
         )
 
-    def prepare_prefill_shared_read_snapshot(
+    def _snapshot_prefill_shared_reads(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
-    ) -> None:
+    ) -> SharedReadEnds:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
-        # first layer. DFLASH/DSPARK have no later prefill draft-extend reader;
-        # CP shards the query layout that this global snapshot assumes.
-        metadata = self.forward_metadata
+        # first layer. CP shards the query layout that this global snapshot
+        # assumes; request-window layouts are not covered by the snapshot.
         if self.token_to_kv_pool.request_window is not None:
-            return
-        if isinstance(metadata, DSV4Metadata):
-            metadata.prefill_shared_reads_snapshotted = False
-        snapshot_shared_prefill_reads = (
-            envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
-            and forward_batch.forward_mode == ForwardMode.EXTEND
-            and self.model_runner.spec_algorithm.is_dflash_family()
-            and not is_cp_active(forward_batch)
-        )
-        if not snapshot_shared_prefill_reads:
-            return
+            return SharedReadEnds.UNKNOWN
+        if is_cp_active(forward_batch):
+            return SharedReadEnds.UNKNOWN
+        # The V4.1 low-ratio indexer reads req_to_token and HiSparse translates
+        # through full_to_hisparse in every layer, after any snapshot.
+        if self.is_dsv41 or self.hisparse_coordinator is not None:
+            return SharedReadEnds.UNKNOWN
 
+        metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
-        # The tail never takes the sparse path, so it carries no chunk cache.
-        if metadata.late_layer_tail is None and self._use_sparse_prefill(
-            forward_batch, num_qo_tokens=num_qo_tokens
-        ):
+        if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
             )
-        # Marked for dense prefill too: that path reads only core_attn_metadata,
-        # which init_forward_metadata already snapshotted.
-        metadata.prefill_shared_reads_snapshotted = True
+        # Dense prefill reads only core_attn_metadata, which metadata init has
+        # already snapshotted, so it reaches the same boundary without a cache.
+        return SharedReadEnds.PRE_REPLAY
 
     def _build_sparse_prefill_chunk_cache(
         self,
@@ -3821,11 +3810,8 @@ class DeepseekV4AttnBackend(
         # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
         # to True. Paged attention under active CP needs the page indices.
         return (
-            self.trtllm_attn
-            or self.mega_attn
+            self.mega_attn
             or self.tail_forward_metadata is not None
-            or self.forward_metadata.late_layer_tail is not None
-            or self.token_to_kv_pool.request_window is not None
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
         )
 
@@ -4065,13 +4051,9 @@ class DeepseekV4AttnBackend(
                 num_heads=q.shape[-2],
             )
 
-            # The tail stays dense: its window floor lives in swa_page_indices,
-            # which the sparse chunk cache ignores.
             if (
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
                 and not use_mega_paged
-                and self.forward_metadata.late_layer_tail is None
-                and token_to_kv_pool.request_window is None
             ):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(

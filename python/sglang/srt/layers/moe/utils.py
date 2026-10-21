@@ -379,11 +379,9 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
-    if (
-        get_moe_runner_backend().is_flashinfer_cutedsl()
-        or get_moe_runner_backend().is_cutlass()
-        or get_moe_runner_backend().is_humming()
+    backend = self.runner_backend
+    if backend is not None and (
+        backend.is_flashinfer_cutedsl() or backend.is_cutlass() or backend.is_humming()
     ):
         return DispatcherOutputDtype.BF16
 
@@ -718,9 +716,10 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
 
 def should_use_dp_reduce_scatterv():
     """
-    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
-    with EP, replacing the default all-reduce + dp_scatter path.
-    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    Whether the parallel configuration allows reduce_scatterv for returning an
+    FFN output over attention DP (DP attention with EP), replacing the default
+    all-reduce + dp_scatter path; a stage boundary also needs boundary_reduction
+    rsv or rs+rsv. Only that post-expert return changes; dispatch is unchanged.
 
     The reduce_scatterv group is the global TP group, while its variable split
     sizes are one entry per attention-DP rank. Therefore this optimization is
