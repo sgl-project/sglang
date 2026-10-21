@@ -95,9 +95,8 @@ class ChatEncodingAdapter(Protocol):
         prompt_tokens: int,
         context_length: int,
     ) -> None:
-        """Overlay what the encoding resolved for sampling (defaults and clamps)
-        on the params ``to_sampling_params`` built; most encodings resolve
-        nothing and leave them as they are."""
+        """Overlay what the encoding resolved for sampling on the params
+        ``to_sampling_params`` built; most encodings resolve nothing."""
         ...
 
 
@@ -155,8 +154,7 @@ _BUILDERS: dict[
     dict[EncodingBackend, Callable[[ChatEncodingAdapterContext], ChatEncodingAdapter]],
 ] = {
     "inkling": {"builtin": _build_inkling},
-    # DeepSeek-V4 / V4.1 keep their builtin encoders inline in serving_chat;
-    # --chat-encoding-backend recipe renders them through deepseek-recipe.
+    # The builtin DeepSeek-V4 / V4.1 encoders stay inline in serving_chat.
     "dsv4": {"recipe": _build_deepseek_recipe},
     "dsv41": {"recipe": _build_deepseek_recipe},
 }
@@ -170,10 +168,6 @@ def has_chat_encoding_backend(
     chat_encoding_spec: Optional[str], backend: EncodingBackend
 ) -> bool:
     return backend in _BUILDERS.get(chat_encoding_spec, {})
-
-
-def specs_with_backend(backend: EncodingBackend) -> list[str]:
-    return sorted(spec for spec, builders in _BUILDERS.items() if backend in builders)
 
 
 def build_chat_encoding_adapter(

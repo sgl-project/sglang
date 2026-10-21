@@ -130,8 +130,8 @@ def generate(fixture_path):
         allow_patterns=["*.json", "*.jinja", "*.py", "*.model", "*.tiktoken"],
     )
     config = json.loads(Path(path, "config.json").read_text())
-    # The server args `_validate_request` and the chat encoding adapter read;
-    # `device` is given so resolution does not look for an accelerator.
+    # What `_validate_request` and the chat encoding adapter read; `device` so
+    # resolution does not look for an accelerator.
     reset_context()
     publish(
         ServerArgs(
@@ -171,8 +171,7 @@ def generate(fixture_path):
         tok.texts.clear()
         server.default_chat_template_kwargs = case.get("default_chat_template_kwargs")
         if server._encoding_adapter is not None:
-            # An adapter takes the server defaults when it is built; the recipe one
-            # tokenizes itself, so its rendered prompt is recorded in its place.
+            # Adapters take the server defaults when built and may tokenize themselves.
             server._encoding_adapter = server._build_chat_encoding_adapter()
             if hasattr(server._encoding_adapter, "render"):
                 record_render(server._encoding_adapter, tok.texts)

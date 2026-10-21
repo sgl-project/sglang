@@ -1,12 +1,7 @@
-"""DeepSeek-V4 / V4.1 chat prompts rendered by deepseek-recipe, the encoder behind
-the official API: the ``recipe`` backend of the ``dsv4`` / ``dsv41`` chat encoding
-specs (``--chat-encoding-backend recipe``), registered in ``chat_encoding_adapters``.
-
-`pre_normalize` translates SGLang's own request extensions into recipe's Chat
-Completions request; everything else, validation included, is recipe's.
-`rust/sglang-processor`'s `render/models/deepseek_recipe.rs` mirrors it, and the
-``*-recipe.json`` fixtures in ``rust/sglang-processor/tests/fixtures/parity/`` pin
-both to this serving path's output.
+"""DeepSeek-V4 / V4.1 chat encoding through deepseek-recipe, the encoder behind the
+official API: the ``recipe`` backend of the ``dsv4`` / ``dsv41`` chat encoding specs
+(``--chat-encoding-backend recipe``). ``render/models/deepseek_recipe.rs`` mirrors
+`pre_normalize`; the ``*-recipe.json`` parity fixtures pin both to this serving path.
 """
 
 from __future__ import annotations
@@ -20,7 +15,7 @@ import msgspec
 
 try:
     import deepseek_recipe
-except ImportError:  # The builtin encoders need no wheel.
+except ImportError:
     deepseek_recipe = None
 
 if TYPE_CHECKING:
@@ -31,15 +26,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# recipe resolves the model version from the request `model` and rejects any
-# other name; SGLang serves whatever name the client sent, so recipe's own name
-# for the served checkpoint replaces it.
+# recipe resolves the model version from the request `model`; SGLang's `model` is
+# whatever the client sent.
 MODEL_NAMES = {"v4": "DeepSeek-V4-Pro", "v41": "DeepSeek-V4.1-Flash"}
 # The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it <｜image｜>.
 IMAGE_TOKEN = "<｜deepseek_image｜>"
-# The efforts recipe accepts; numbers are rejected as the API rejects them. It
-# folds them onto four: minimal and low -> Low, medium and high -> High,
-# xhigh -> Xhigh, ultra and max -> Max.
+# The efforts recipe accepts; numbers are rejected as the API rejects them.
 REASONING_EFFORTS = (
     "none",
     "minimal",
@@ -56,15 +48,13 @@ class RecipeRender(msgspec.Struct, kw_only=True):
     """A rendered request plus the sampling recipe resolved for it."""
 
     prompt: str
-    # None when the encoder has no tokenizer or the caller skipped tokenization.
-    prompt_ids: Optional[list[int]]
+    prompt_ids: Optional[list[int]]  # None when the caller skipped tokenization.
     temperature: Optional[float]
     top_p: Optional[float]
-    # recipe's ConversationRequest, for `resolve_max_tokens`; None in tests.
-    request: Any = None
+    request: Any = None  # recipe's ConversationRequest, for `resolve_max_tokens`.
 
 
-def is_available() -> bool:
+def is_deepseek_recipe_available() -> bool:
     return deepseek_recipe is not None
 
 
@@ -73,17 +63,9 @@ def pre_normalize(
 ) -> dict[str, Any]:
     """Rewrite an SGLang chat request body for recipe's Chat Completions adapter.
 
-    Returns a new body; `defaults` are the server's --default-chat-template-kwargs.
-    Only SGLang's own request extensions are translated: the chat_template_kwargs
-    thinking flag and effort, `reasoning`, `developer` turns, object-typed tool
-    call arguments, `continue_final_message` and the structural_tag response
-    format. recipe validates and renders the rest as the official API does; the
-    caller sets `model`.
-
-    The Python handler hands over a validated request, where protocol.py has
-    already folded `reasoning` and serving_chat has applied the kwargs effort and
-    the defaults; the Rust hosts hand over the wire body, so those steps repeat
-    here. Mirrored in `deepseek_recipe.rs`.
+    Only SGLang's own extensions are translated; recipe validates and renders the
+    rest. The Rust hosts pass the wire body, so the `reasoning` fold and the
+    kwargs-effort / default-kwargs steps the Python handler already ran repeat here.
     """
     defaults = defaults or {}
     request = copy.deepcopy(body)
@@ -116,8 +98,7 @@ def pre_normalize(
         thinking = effort != "none"
     if thinking is not None:
         kwargs.setdefault("thinking", thinking)
-    # serving_chat._convert_to_internal_request: the kwargs effort replaces the
-    # request's; _process_messages: the server defaults fill in.
+    # serving_chat: the kwargs effort replaces the request's, the defaults fill in.
     effort = kwargs.pop("reasoning_effort", None)
     if effort is not None:
         request["reasoning_effort"] = effort
@@ -129,7 +110,7 @@ def pre_normalize(
     if request.get("thinking") is None and "thinking" in kwargs:
         request["thinking"] = {"type": "enabled" if kwargs["thinking"] else "disabled"}
 
-    # The host enforces structural_tag with its grammar; recipe does not know it.
+    # The host enforces structural_tag with its grammar.
     response_format = request.get("response_format")
     if response_format and response_format.get("type") == "structural_tag":
         del request["response_format"]
@@ -140,33 +121,18 @@ def pre_normalize(
 
 
 def _normalize_tool_choice(request: dict[str, Any]) -> None:
-    """`required` and a named tool render as `auto`: recipe would pre-open the
-    DSML calls block in the prompt, but SGLang enforces the choice with its own
-    grammar and its parsers expect the model to emit the block. A named tool
-    keeps only that tool, and `none` or no tools drops them, as
-    `serving_chat._process_messages` hands them to the encoder."""
+    """`required` and a named tool render as `auto`: SGLang enforces the choice
+    with its grammar, and its parsers expect the model to open the calls block."""
     choice = request.get("tool_choice")
     if not request.get("tools") or choice == "none":
         request.pop("tools", None)
         request.pop("tool_choice", None)
-    elif isinstance(choice, dict):
-        name = choice["function"]["name"]
-        chosen = [
-            tool
-            for tool in request.get("tools") or []
-            if tool["function"].get("name") == name
-        ]
-        if chosen:
-            request["tools"] = chosen
-        request["tool_choice"] = "auto"
-    elif choice == "required":
+    elif choice == "required" or isinstance(choice, dict):
         request["tool_choice"] = "auto"
 
 
 def _normalize_history(messages: list[dict[str, Any]], continue_final: bool) -> None:
-    """In place: `developer` turns become `system` (recipe has no developer role),
-    object-typed tool call arguments become the JSON string recipe takes, and
-    `continue_final_message` marks the last assistant turn as recipe's `prefix`."""
+    """developer -> system, object arguments -> JSON, continue_final_message -> prefix."""
     for message in messages:
         if message["role"] == "developer":
             message["role"] = "system"
@@ -189,10 +155,9 @@ def _error_message(body: Any) -> str:
 
 
 class RecipeEncoder:
-    """One recipe encoding per served model: conversion options, the prompt
-    encoding, and the tokenizer that turns rendered prompts into ids."""
+    """recipe's conversion options, prompt encoding and tokenizer for one served model."""
 
-    def __init__(self, model_version: str, tokenizer_json: Optional[str] = None):
+    def __init__(self, model_version: str, tokenizer_json: str):
         self.model = MODEL_NAMES[model_version]
         special = deepseek_recipe.SpecialTokens(image=IMAGE_TOKEN)
         self._options = deepseek_recipe.ConversionOptions().with_special_tokens(special)
@@ -201,20 +166,14 @@ class RecipeEncoder:
             if model_version == "v4"
             else deepseek_recipe.DeepseekV41Encoding()
         )
-        encoding = encoding.with_special_tokens(special)
-        self._tokenizer = (
-            deepseek_recipe.Tokenizer.from_str(tokenizer_json)
-            if tokenizer_json
-            else None
+        self._tokenizer = deepseek_recipe.Tokenizer.from_str(tokenizer_json)
+        self._encoding = encoding.with_special_tokens(special).with_tokenizer(
+            self._tokenizer
         )
-        if self._tokenizer is not None:
-            encoding = encoding.with_tokenizer(self._tokenizer)
-        self._encoding = encoding
 
     @classmethod
     def from_hf_tokenizer(cls, model_version: str, tokenizer: Any) -> RecipeEncoder:
-        """Build from the served Hugging Face fast tokenizer, so ids come from the
-        checkpoint's own vocabulary rather than recipe's bundled copy."""
+        """From the served fast tokenizer, so ids come from the checkpoint's vocabulary."""
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if backend is None:
             raise ValueError(
@@ -229,9 +188,7 @@ class RecipeEncoder:
         *,
         encode: bool = True,
     ) -> RecipeRender:
-        """Normalize, convert and render one request; `encode=False` skips the
-        tokenization (`prompt_ids` is None). Raises ValueError for a request
-        recipe rejects."""
+        """Render one request; `encode=False` skips tokenization. Raises ValueError."""
         normalized = pre_normalize(body, defaults)
         normalized["model"] = self.model
         try:
@@ -241,15 +198,10 @@ class RecipeEncoder:
         except deepseek_recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
         conversation = converted.conversation
-        # The binding tokenizes from the conversation (rendering it again); it
-        # exposes no prompt-plus-ranges entry point.
+        # The binding encodes from the conversation, not from the rendered text.
         return RecipeRender(
             prompt=self._encoding.render_conversation(conversation).prompt,
-            prompt_ids=(
-                self._encoding.encode(conversation)
-                if encode and self._tokenizer is not None
-                else None
-            ),
+            prompt_ids=self._encoding.encode(conversation) if encode else None,
             temperature=converted.inference_options.temperature,
             top_p=converted.inference_options.top_p,
             request=converted,
@@ -263,11 +215,8 @@ def overlay_sampling(
     prompt_tokens: int,
     context_length: int,
 ) -> None:
-    """Overlay the sampling the official API resolves: recipe's top_p rule (on
-    V4.1, 1.0 outside thinking mode and at least 0.95 inside it), its temperature
-    when it sets one, and its default max_tokens for a request without one.
-    Grammar stays SGLang's: `to_sampling_params` derives it from response_format
-    and tool_choice."""
+    """Overlay the temperature, top_p and default max_tokens recipe resolved;
+    grammar stays SGLang's (`to_sampling_params`)."""
     if render.temperature is not None:
         sampling_params["temperature"] = render.temperature
     if render.top_p is not None:
@@ -282,17 +231,12 @@ def overlay_sampling(
 
 
 class DeepSeekRecipeChatEncodingAdapter:
-    """recipe renders and tokenizes the prompt (the checkpoint's tokenizer, special
-    tokens by id, plain BPE between them) and resolves the sampling defaults the
-    official API applies. Output parsing stays with the registered DeepSeek
-    reasoning and tool-call parsers, so ``tool_choice`` is enforced by SGLang's
-    grammar rather than by recipe's pre-opened calls block (see
-    `_normalize_tool_choice`)."""
+    """recipe renders and tokenizes the prompt and resolves the API's sampling
+    defaults; output stays with the registered DeepSeek parsers."""
 
     collects_openai_media = True
     output = None
-    # recipe serializes object-typed arguments itself and passes strings through.
-    strict_tool_call_arguments = False
+    strict_tool_call_arguments = False  # recipe serializes object arguments itself.
 
     def __init__(
         self,
@@ -307,6 +251,7 @@ class DeepSeekRecipeChatEncodingAdapter:
     def from_context(
         cls, ctx: ChatEncodingAdapterContext
     ) -> DeepSeekRecipeChatEncodingAdapter:
+        # Resolved at boot: a bad server default fails startup, not requests.
         defaults = ctx.default_chat_template_kwargs or {}
         effort = defaults.get("reasoning_effort")
         if effort is not None and effort not in REASONING_EFFORTS:
@@ -314,12 +259,10 @@ class DeepSeekRecipeChatEncodingAdapter:
                 f"--default-chat-template-kwargs reasoning_effort={effort!r} is not "
                 f"a deepseek-recipe effort ({', '.join(REASONING_EFFORTS)})"
             )
-        if not is_available():
+        if not is_deepseek_recipe_available():
             raise ValueError(
                 "--chat-encoding-backend recipe requires the deepseek-recipe package"
             )
-        # The spec already names the checkpoint family (resolve_chat_encoding_spec);
-        # the served tokenizer makes the ids come from the checkpoint's vocabulary.
         encoder = RecipeEncoder.from_hf_tokenizer(
             {"dsv4": "v4", "dsv41": "v41"}[ctx.chat_encoding_spec],
             ctx.require("tokenizer"),
@@ -333,10 +276,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         tools: Optional[list[dict]],
         encode: bool = True,
     ) -> RecipeRender:
-        """recipe's view of the request. `tools` is the handler's effective list,
-        None when tools are off for this request; it replaces the request's."""
-        # The wire request rather than the handler's normalized messages: recipe
-        # applies its own message rules.
+        """recipe's view of the request; `tools` is the handler's effective list."""
+        # The wire request, not the handler's normalized messages.
         body = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
         if tools is None:
             body.pop("tools", None)
@@ -362,9 +303,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         prompt_tokens: int,
         context_length: int,
     ) -> None:
-        # Resolved from the request again rather than kept from encode_messages:
-        # the adapter is shared by concurrent requests, and a request that arrives
-        # with input_ids (router-forwarded) never passed through encode_messages.
+        # Resolved from the request again: the adapter is shared, and a request
+        # forwarded with input_ids never went through encode_messages.
         tools = (
             [
                 tool.model_dump(exclude_unset=True, by_alias=True, mode="json")
@@ -387,8 +327,7 @@ class DeepSeekRecipeChatEncodingAdapter:
 
 
 def _without_unset(tool: dict[str, Any]) -> dict[str, Any]:
-    """The handler dumps tool models with None for unset fields; a client omits
-    those keys, and recipe renders a null description or parameters differently."""
+    """Drop the None fields `model_dump` adds; recipe renders them as values."""
     cleaned = {key: value for key, value in tool.items() if value is not None}
     cleaned["function"] = {
         key: value for key, value in tool["function"].items() if value is not None

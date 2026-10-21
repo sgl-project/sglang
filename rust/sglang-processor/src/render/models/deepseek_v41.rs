@@ -152,7 +152,7 @@ fn effort_budget(effort: &Value) -> Option<u8> {
         Value::String(tier) => match tier.as_str() {
             "low" => Some(50),
             "high" | "xhigh" => Some(75),
-            "max" => Some(100),
+            "ultra" | "max" => Some(100),
             _ => None,
         },
         Value::Number(number) => match number.as_u64() {

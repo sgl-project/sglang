@@ -153,10 +153,8 @@ impl ChatFormatter {
         }
     }
 
-    /// Render an SGLang chat request body with deepseek-recipe: the prompt split at
-    /// its special tokens, recipe's token ids when the formatter has the checkpoint's
-    /// tokenizer, and the thinking mode and sampling recipe resolved. Only
-    /// [`ChatFormatter::DeepSeekRecipe`] renders this way.
+    /// Render with deepseek-recipe: the prompt, its token ids when the formatter
+    /// has a tokenizer, and the settings recipe resolved.
     #[cfg(feature = "recipe")]
     pub fn render_recipe(
         &self,
@@ -284,8 +282,7 @@ impl ChatFormatter {
     }
 }
 
-/// The SGLang request body the recipe formatter reads, built from a Dynamo
-/// request the way the DeepSeek-V4 `render_prompt` arm builds its body.
+/// The SGLang request body the recipe formatter reads, from a Dynamo request.
 #[cfg(feature = "recipe")]
 fn deepseek_request_body(request: &dyn OAIChatLikeRequest) -> Result<Value, TemplateError> {
     let messages = match request.typed_messages() {

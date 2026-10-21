@@ -498,10 +498,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         ):
             logger.warning(
-                "--chat-encoding-backend %s applies to %s only; this model keeps "
-                "its builtin chat encoding",
+                "--chat-encoding-backend %s applies to DeepSeek-V4 / V4.1 only; "
+                "this model keeps its builtin chat encoding",
                 backend,
-                ", ".join(chat_encoding_adapters.specs_with_backend(backend)),
             )
             backend = "builtin"
         if not chat_encoding_adapters.has_chat_encoding_adapter(
@@ -769,7 +768,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if value is not None and value != "none":
             logger.warning(
                 "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
-                "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
+                "default %r (low/high/xhigh/ultra/max, a float in [0, 0.99], or an "
                 "integer budget in [1, 100] via chat_template_kwargs are accepted).",
                 value,
                 self._dsv41_default_reasoning_effort,

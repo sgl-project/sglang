@@ -103,8 +103,7 @@ fn check_case(
     check_tokens(&encode(tokenizer, &prompt, &prefix, bos), case)
 }
 
-/// deepseek-recipe renders and tokenizes on its own; without the checkpoint's
-/// `tokenizer.json` only the prompt text is checked.
+/// deepseek-recipe tokenizes on its own; without `tokenizer.json` only the text is checked.
 #[cfg(feature = "recipe")]
 fn check_recipe_case(
     formatter: &ChatFormatter,
@@ -141,8 +140,7 @@ fn check_tokens(ids: &[u32], case: &Value) -> Result<(), String> {
 }
 
 /// What `select_chat_formatter` picks for the fixture's `config.json` and Jinja
-/// template. A deepseek-recipe fixture builds the recipe formatter as the hosts do,
-/// with the cached `tokenizer.json` when there is one.
+/// template; a deepseek-recipe fixture builds its formatter as the hosts do.
 fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
     #[cfg(feature = "recipe")]
     if fixture["chat_encoding_backend"] == "recipe" {

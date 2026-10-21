@@ -100,8 +100,9 @@ class TestPreNormalize(CustomTestCase):
                 "tool_choice": {"type": "function", "function": {"name": "b"}},
             }
         )
+        # The handler already filtered the tools to the named one.
         self.assertEqual(named["tool_choice"], "auto")
-        self.assertEqual([t["function"]["name"] for t in named["tools"]], ["b"])
+        self.assertEqual(len(named["tools"]), 2)
         required = recipe.pre_normalize(
             {"messages": [_user()], "tools": tools, "tool_choice": "required"}
         )
@@ -242,7 +243,9 @@ class TestAdapterRegistry(CustomTestCase):
                 )
             )
 
-    @unittest.skipUnless(recipe.is_available(), "deepseek-recipe is not installed")
+    @unittest.skipUnless(
+        recipe.is_deepseek_recipe_available(), "deepseek-recipe is not installed"
+    )
     def test_recipe_adapter_encodes_like_the_fixture_and_overlays_sampling(self):
         from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer

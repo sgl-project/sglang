@@ -285,9 +285,8 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
-    /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render through
-    /// deepseek-recipe, which tokenizes its prompts with the checkpoint's
-    /// `tokenizer.json`. Any other model keeps its formatter, as the engine does.
+    /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render and tokenize
+    /// through deepseek-recipe; other models keep their formatter, as the engine does.
     pub fn with_recipe_backend(mut self, tokenizer_json: Option<&str>) -> Result<Self> {
         let model = match self.processor {
             Some(ProcessorFormatter::DeepSeekV41) => RecipeModel::V41,
@@ -426,7 +425,6 @@ impl ChatFormatter {
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
         if let Some(formatter @ ProcessorFormatter::DeepSeekRecipe(_)) = &self.processor {
-            // recipe tokenizes its own prompt: special tokens by id, plain text as plain BPE.
             let render = formatter
                 .render_recipe(request.clone(), &self.worker_defaults)
                 .context("render chat")?;

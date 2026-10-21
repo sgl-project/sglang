@@ -35,10 +35,9 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
-    /// `sglang_processor::ChatFormatter::DeepSeekRecipe`. The prompt is submitted
-    /// as text and encoded in one pass, so unlike the Python and router hosts this
-    /// one does not keep user-typed special-token spellings as plain text, and
-    /// recipe's sampling defaults are not applied here (see REFERENCE.md).
+    /// deepseek-recipe under `--chat-encoding-backend recipe`. The prompt is
+    /// submitted as text and encoded in one pass; recipe's sampling defaults are
+    /// not applied here (see the router's REFERENCE.md).
     Recipe(sglang_processor::ChatFormatter),
 }
 
@@ -57,9 +56,7 @@ impl ChatFormatter {
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
             ChatFormatter::Recipe(formatter) => {
-                // The typed request plus what the protocol type does not carry:
-                // `chat_template_kwargs` (recipe's thinking toggle) and the
-                // continuation flag Dynamo expresses as "no generation prompt".
+                // The typed request plus the fields its type does not carry.
                 let mut body =
                     serde_json::to_value(request).map_err(|error| TemplateError::Renderer {
                         message: format!("failed to serialize the request: {error}"),

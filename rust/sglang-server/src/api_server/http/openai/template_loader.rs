@@ -133,10 +133,8 @@ pub(super) fn load_chat_formatter(
     }
 }
 
-/// `--chat-encoding-backend recipe`: the deepseek-recipe formatter for a
-/// DeepSeek-V4 / V4.1 checkpoint, read from its `config.json`. `Ok(None)` for
-/// any other model, which keeps the formatter [`load_chat_formatter`] selects;
-/// an unreadable config is an error, not a silent fallback.
+/// `--chat-encoding-backend recipe`: the deepseek-recipe formatter for a DeepSeek-V4 /
+/// V4.1 `config.json`; `Ok(None)` for any other model, an unreadable config is an error.
 pub(super) fn load_recipe_formatter(
     model_config_file: Option<&str>,
 ) -> Result<Option<ChatFormatter>, TemplateError> {

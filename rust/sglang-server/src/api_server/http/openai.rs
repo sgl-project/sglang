@@ -51,8 +51,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
         return None;
     }
     if server_args.chat_encoding_backend == "recipe" {
-        // The model's config.json: `model_path` first, the tokenizer source when the
-        // model directory is not local.
+        // `model_path` first; the tokenizer source when the model directory is not local.
         let model_config = [&server_args.model_path, &server_args.tokenizer_path]
             .into_iter()
             .filter(|path| !path.is_empty())
