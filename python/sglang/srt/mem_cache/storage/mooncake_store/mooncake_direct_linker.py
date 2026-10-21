@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
 import torch
@@ -36,6 +39,63 @@ from sglang.srt.utils import freeze_gc, get_device_module
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# How long a prefetched existence answer stands in for a fresh RPC. Mooncake
+# leases every key `batch_is_exist` reports present for 10 s (the master's
+# default_kv_lease_ttl), so a load that follows a cached hit starts inside it.
+EXIST_CACHE_TTL_S = 5.0
+
+
+class _ExistenceCache:
+    """Recent `batch_is_exist` answers by key, shared across linker threads."""
+
+    def __init__(self, ttl_s: float):
+        self.ttl_s = ttl_s
+        self.entries: dict[str, tuple[float, int]] = {}
+        self.lock = threading.Lock()
+        self.last_prune = time.monotonic()
+
+    def query(
+        self, keys: list[str], fetch: Callable[[list[str]], list[int]]
+    ) -> list[int]:
+        """Answer from fresh entries and fetch only the rest."""
+        now = time.monotonic()
+        with self.lock:
+            cached = [self.entries.get(key) for key in keys]
+        results = [
+            entry[1] if entry is not None and now - entry[0] < self.ttl_s else None
+            for entry in cached
+        ]
+        missing = [i for i, result in enumerate(results) if result is None]
+        if missing:
+            fetched = self.fetch_and_store([keys[i] for i in missing], fetch)
+            for i, result in zip(missing, fetched):
+                results[i] = result
+        return results
+
+    def fetch_and_store(
+        self, keys: list[str], fetch: Callable[[list[str]], list[int]]
+    ) -> list[int]:
+        # Stamp before the RPC: the lease it grants cannot start earlier.
+        stamp = time.monotonic()
+        results = fetch(keys)
+        with self.lock:
+            if stamp - self.last_prune > self.ttl_s:
+                self.entries = {
+                    key: entry
+                    for key, entry in self.entries.items()
+                    if stamp - entry[0] < self.ttl_s
+                }
+                self.last_prune = stamp
+            for key, result in zip(keys, results):
+                # Negative results are RPC errors, not answers.
+                if result in (0, 1):
+                    self.entries[key] = (stamp, result)
+        return results
+
+    def clear(self) -> None:
+        with self.lock:
+            self.entries.clear()
+
 
 def _storage_suffix(
     *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
@@ -48,6 +108,10 @@ def _storage_suffix(
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    # Re-prefetch halfway through an answer's life so a waiting request keeps
+    # a fresh one.
+    lookup_prefetch_refresh_s = EXIST_CACHE_TTL_S / 2
+
     def __init__(
         self,
         server_args,
@@ -144,6 +208,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.exist_cache = _ExistenceCache(EXIST_CACHE_TTL_S)
+        self.lookup_prefetcher = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"mooncake-lookup-prefetch-tp{tp_rank}"
+        )
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -183,15 +251,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        expanded = self.pool_group.resolve_transfers(transfers)
-        if not expanded:
-            return []
-        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        page_keys = list(kv.keys)
-        if not page_keys:
-            return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
-        restorable = result.restorable_prefix_pages or []
+        restorable = self._restorable_prefix_pages(
+            transfers,
+            lambda keys: self.exist_cache.query(keys, self.storage._batch_exist),
+        )
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
@@ -201,6 +264,40 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def prefetch_lookup(
+        self, build_transfers: Callable[[], list[PoolTransfer]]
+    ) -> None:
+        self.lookup_prefetcher.submit(self._prefetch_lookup, build_transfers)
+
+    def _prefetch_lookup(
+        self, build_transfers: Callable[[], list[PoolTransfer]]
+    ) -> None:
+        try:
+            self._restorable_prefix_pages(
+                build_transfers(),
+                lambda keys: self.exist_cache.fetch_and_store(
+                    keys, self.storage._batch_exist
+                ),
+            )
+        except Exception:
+            # Best effort: the scheduler's lookup fetches whatever is missing.
+            logger.exception("Mooncake lookup prefetch failed")
+
+    def _restorable_prefix_pages(
+        self,
+        transfers: list[PoolTransfer],
+        exist_fn: Callable[[list[str]], list[int]],
+    ) -> list[int]:
+        expanded = self.pool_group.resolve_transfers(transfers)
+        if not expanded:
+            return []
+        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
+        page_keys = list(kv.keys)
+        if not page_keys:
+            return []
+        result = self.storage.batch_exists_v2(page_keys, expanded, exist_fn=exist_fn)
+        return result.restorable_prefix_pages or []
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -420,6 +517,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
+        # The single prefetch worker runs jobs in order, so once this no-op
+        # returns no earlier prefetch can refill the cache after the clear.
+        self.lookup_prefetcher.submit(lambda: None).result()
+        self.exist_cache.clear()
         self.load_queue.join()
         self.offload_queue.join()
         self.broadcast_loads.clear()
@@ -432,6 +533,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def close(self) -> None:
         self.reset()
+        self.lookup_prefetcher.shutdown(wait=True, cancel_futures=True)
         self.load_queue.put(None)
         self.offload_queue.put(None)
         self.load_thread.join()

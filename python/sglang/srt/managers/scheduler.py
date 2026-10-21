@@ -296,6 +296,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
+    prefetch_external_lookups,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
@@ -4256,6 +4257,8 @@ class Scheduler(
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+        if self.enable_unified_cache_external_linker:
+            prefetch_external_lookups(self.waiting_queue, self.tree_cache)
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill

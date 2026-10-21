@@ -446,6 +446,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
         never allocates, loads, or queries external tiers."""
 
+    def prefetch_external_lookups(
+        self, keyed_reqs: Sequence[tuple[Req, RadixKey]]
+    ) -> None:
+        """Start the external-store lookups that matching these keys will run.
+        Caches without an external store ignore it."""
+
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
         return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)

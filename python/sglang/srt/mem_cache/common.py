@@ -211,6 +211,34 @@ def _req_radix_key(
     )
 
 
+# How many requests at the head of the waiting queue get their external-store
+# lookup started ahead of their match.
+EXTERNAL_LOOKUP_PREFETCH_DEPTH = 8
+
+
+def prefetch_external_lookups(
+    waiting_queue: list[Req], tree_cache: BasePrefixCache
+) -> None:
+    """Start the external-store lookups the next prefill round's matches need."""
+    keyed_reqs = []
+    for req in waiting_queue[:EXTERNAL_LOOKUP_PREFETCH_DEPTH]:
+        # These match through other paths (session slot, no prefix cache, dLLM blocks).
+        if (
+            req.session is not None
+            or req.positional_embed_overrides is not None
+            or req.is_dllm()
+        ):
+            continue
+        # Build the key exactly as Req.init_next_round_input will.
+        req.refresh_fill_ids()
+        token_ids = req.full_untruncated_fill_ids
+        key = _req_radix_key(
+            tree_cache, req, token_ids, req._compute_max_prefix_len(len(token_ids))
+        )
+        keyed_reqs.append((req, key))
+    tree_cache.prefetch_external_lookups(keyed_reqs)
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)

@@ -6,7 +6,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import requests
 import torch
@@ -870,13 +870,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        *,
+        exist_fn: Optional[Callable[[List[str]], List[int]]] = None,
     ) -> PoolTransferResult:
+        # `exist_fn` lets a caller answer existence queries from its own cache.
+        exist_fn = exist_fn or self._batch_exist
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
             kv_pages = len(keys)
         else:
-            kv_pages = self.batch_exists(keys, extra_info)
+            kv_pages = self.batch_exists(keys, extra_info, exist_fn=exist_fn)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # Start from every KV prefix and let each pool remove the stop points it
@@ -899,7 +903,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
-        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
+        all_exists = exist_fn(all_component_keys) if all_component_keys else []
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
                 break
@@ -1415,7 +1419,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return exist_result[0] == 1
 
     def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+        self,
+        keys,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        *,
+        exist_fn: Optional[Callable[[List[str]], List[int]]] = None,
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1437,7 +1445,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys)
+        exist_result = (exist_fn or self._batch_exist)(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier

@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -155,6 +156,10 @@ class UnifiedCacheLinker(ABC):
             events.append(kv_written)
         return events
 
+    # Seconds a prefetched lookup stays useful; None when the backend does not
+    # prefetch, which keeps the tree from preparing any.
+    lookup_prefetch_refresh_s: Optional[float] = None
+
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
@@ -167,6 +172,14 @@ class UnifiedCacheLinker(ABC):
         let the tree pick a length that is invalid on another rank.
 
         Local to this rank; the tree intersects the sets across ranks.
+        """
+
+    def prefetch_lookup(
+        self, build_transfers: Callable[[], list[PoolTransfer]]
+    ) -> None:
+        """Warm a later ``lookup`` off the scheduler thread.
+
+        ``build_transfers`` is pure and may run on another thread.
         """
 
     @abstractmethod
@@ -266,6 +279,8 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # rid -> when its lookup was last prefetched.
+        self.lookup_prefetch_times: dict[str, float] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -291,14 +306,9 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
-                return result
-            lookup_transfers.append(transfer)
+        lookup_transfers = self._lookup_transfers(tail_hashes)
+        if lookup_transfers is None:
+            return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
@@ -332,6 +342,73 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _lookup_transfers(
+        self, tail_hashes: Sequence[str]
+    ) -> Optional[list[PoolTransfer]]:
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                return None
+            transfers.append(transfer)
+        return transfers
+
+    # ---- prefetch: start lookups for requests about to be matched ----
+
+    def prefetch_lookups(self, keyed_reqs: Sequence[tuple[Req, RadixKey]]) -> None:
+        """Start the store lookups ``match`` will run for these requests.
+
+        Only the device walk runs here; hashing and the store RPC run on the
+        backend's thread. A guess that turns out wrong (the device prefix moved,
+        the request was matched first) only leaves ``match`` its normal RPC.
+        """
+        refresh_s = self.cache_linker.lookup_prefetch_refresh_s
+        if refresh_s is None:
+            return
+        cache = self.cache
+        tree_core = cache.tree_core
+        page = cache.page_size
+        now = time.monotonic()
+        if len(self.lookup_prefetch_times) > 4 * len(keyed_reqs):
+            self.lookup_prefetch_times = {
+                rid: stamp
+                for rid, stamp in self.lookup_prefetch_times.items()
+                if now - stamp < refresh_s
+            }
+        for req, key in keyed_reqs:
+            if now - self.lookup_prefetch_times.get(req.rid, -refresh_s) < refresh_s:
+                continue
+            key, _ = key.maybe_to_bigram_view(tree_core.is_eagle)
+            device_len, node_id, _ = tree_core.match_full_device_prefix(key)
+            tail_len = (len(key) - device_len) // page * page
+            if tail_len == 0:
+                continue
+            anchor = None
+            if device_len > 0:
+                anchor = self._page_hash(node_id, device_len // page)
+                if anchor is None:
+                    continue
+            self.lookup_prefetch_times[req.rid] = now
+            tail = key[device_len : device_len + tail_len]
+            self.cache_linker.prefetch_lookup(
+                lambda tail=tail, anchor=anchor: (
+                    self._lookup_transfers(
+                        get_storage_hash_str(tail, anchor, page_size=page)
+                    )
+                    or []
+                )
+            )
+
+    def _page_hash(self, node_id: NodeId, num_pages: int) -> Optional[str]:
+        """Storage hash of the ``num_pages``-th page on the path to ``node_id``,
+        which may stop inside that node."""
+        tree_core = self.cache.tree_core
+        index = num_pages - len(tree_core.get_prefix_hash_values(node_id)) - 1
+        node_hashes = tree_core.get_hash_values(node_id)
+        return node_hashes[index] if 0 <= index < len(node_hashes) else None
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
