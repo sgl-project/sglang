@@ -82,8 +82,8 @@ export const config = {
     "default|fp8":       "Qwen/Qwen3.8-2.4T-A95B-FP8",
     "default|nvfp4":     "RadixArk/Qwen3.8-2.4T-A95B-NVFP4",
     "default|mxfp4":     "Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4",
-    "default|modelslim": "Qwen/Qwen3.8-2.4T-A95B",
-    a3:                  "Qwen/Qwen3.8-2.4T-A95B",
+    "default|modelslim": "Eco-Tech/Qwen3.8-2.4T-A95B-w4a8",
+    a3:                  "Eco-Tech/Qwen3.8-2.4T-A95B-w4a8",
   },
 
   placeholders: {
