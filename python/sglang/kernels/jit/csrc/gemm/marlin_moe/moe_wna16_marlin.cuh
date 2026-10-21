@@ -316,7 +316,8 @@ bool is_valid_config(
         IS_ZP_FLOAT,                                                                                                   \
         kIsEP,                                                                                                         \
         kHasBias,                                                                                                      \
-        kExpertIdsAreSorted>;                                                                                          \
+        kExpertIdsAreSorted,                                                                                           \
+        kZeroInactiveOutput>;                                                                                          \
   }
 
 // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
@@ -441,7 +442,7 @@ bool is_valid_config(
   ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
   ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
 
-template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted, bool kZeroInactiveOutput>
 MarlinFuncPtr get_marlin_kernel(
     const host::ScalarType q_type,
     int thread_m_blocks,
@@ -477,7 +478,7 @@ MarlinFuncPtr get_marlin_kernel(
   return kernel;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted, bool kZeroInactiveOutput>
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
     int prob_m,
@@ -550,7 +551,7 @@ exec_config_t determine_exec_config(
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
+    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput>(
         q_type,
         thread_m_blocks,
         th_config.thread_n / 16,
@@ -588,7 +589,7 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted, bool kZeroInactiveOutput>
 void marlin_mm(
     const void* A,
     const void* B,
@@ -728,7 +729,7 @@ void marlin_mm(
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
+    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput>(
         q_type,
         prob_m,
         prob_n,
@@ -800,7 +801,7 @@ void marlin_mm(
       ", max_shared_mem = ",
       max_shared_mem);
 
-  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
+  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput>(
       q_type,
       thread_m_blocks,
       thread_n_blocks,
@@ -851,7 +852,7 @@ void marlin_mm(
 
 }  // namespace device::marlin_moe
 
-template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted, bool kZeroInactiveOutput>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView c,
@@ -1089,7 +1090,7 @@ void moe_wna16_marlin_gemm(
   // Early return for zero-size M (moved after all validation)
   if (size_m == 0) return;
 
-  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
+  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput>(
       a.data_ptr(),
       b_q_weight.data_ptr(),
       c.data_ptr(),

@@ -56,7 +56,8 @@ template <
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
-    const bool kExpertIdsAreSorted       // sorted block expert IDs
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -87,6 +88,27 @@ __global__ void Marlin(
 }  // namespace device::marlin_moe
 
 #else
+
+template <bool kExpertIdsAreSorted, int kMoeBlockSize>
+__device__ __forceinline__ void zero_inactive_output_rows(
+    int4* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    int num_blocks,
+    int num_routes,
+    int row_vectors) {
+  for (int block = blockIdx.x; block < num_blocks; block += gridDim.x) {
+    if constexpr (!kExpertIdsAreSorted) {
+      if (expert_ids[block] != -1) continue;
+    }
+    for (int offset = threadIdx.x; offset < kMoeBlockSize * row_vectors; offset += blockDim.x) {
+      int route = sorted_token_ids[block * kMoeBlockSize + offset / row_vectors];
+      if (route < num_routes) {
+        output[static_cast<int64_t>(route) * row_vectors + offset % row_vectors] = {0, 0, 0, 0};
+      }
+    }
+  }
+}
 
 // m16n8k16 tensor core mma instruction with fp16 inputs and fp32
 // output/accumulation.
@@ -300,7 +322,8 @@ template <
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
-    const bool kExpertIdsAreSorted       // sorted block expert IDs
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -399,6 +422,11 @@ __global__ void Marlin(
         else
           last = middle;
       }
+      if constexpr (kZeroInactiveOutput) {
+        // Preserve the original route table until its inactive destinations are written.
+        zero_inactive_output_rows<true, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, first, prob_m * top_k, prob_n / 8);
+      }
       parallel -= first;
       if (parallel == 0) return;
       expert_ids_ptr += first;
@@ -412,6 +440,12 @@ __global__ void Marlin(
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
       num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
+    }
+    if constexpr (kZeroInactiveOutput) {
+      if (num_invalid_blocks > 0) {
+        zero_inactive_output_rows<false, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, parallel, prob_m * top_k, prob_n / 8);
+      }
     }
     parallel -= num_invalid_blocks;
     if (parallel == 0) return;

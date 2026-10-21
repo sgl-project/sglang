@@ -17,9 +17,15 @@ _MAX_THREAD_N = 256
 
 @cache_once
 def _jit_moe_wna16_marlin_module(
-    dtype: torch.dtype, is_ep: bool, has_bias: bool, expert_ids_are_sorted: bool = False
+    dtype: torch.dtype,
+    is_ep: bool,
+    has_bias: bool,
+    expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, is_ep, has_bias, expert_ids_are_sorted)
+    args = make_cpp_args(
+        dtype, is_ep, has_bias, expert_ids_are_sorted, zero_inactive_output
+    )
     return load_jit(
         "moe_wna16_marlin",
         *args,
@@ -68,10 +74,13 @@ def moe_wna16_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
     expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
 ) -> torch.Tensor:
     """Project routes, preserving inactive rows in a caller-provided output.
 
-    Inactive rows are zero when this function allocates the output.
+    Inactive rows are zero when this function allocates the output. With
+    ``zero_inactive_output=True``, the GEMM also zeros caller-owned rows present
+    in inactive routing blocks; omitted routes remain untouched.
     ``expert_ids_are_sorted`` certifies ascending block expert IDs within the
     padded token count, with any -1 blocks first. Unused tail entries are ignored.
     Leave it false after remapping that can produce scattered inactive blocks.
@@ -146,7 +155,11 @@ def moe_wna16_marlin_gemm(
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
     module = _jit_moe_wna16_marlin_module(
-        a.dtype, is_ep, has_bias, expert_ids_are_sorted and not is_ep
+        a.dtype,
+        is_ep,
+        has_bias,
+        expert_ids_are_sorted and not is_ep,
+        zero_inactive_output,
     )
     module.moe_wna16_marlin_gemm(
         a,

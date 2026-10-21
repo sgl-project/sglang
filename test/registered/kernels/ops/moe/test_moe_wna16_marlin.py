@@ -1146,7 +1146,7 @@ def _check_marlin_inactive_routes(
 
 
 def test_moe_wna16_marlin_inactive_output_ownership():
-    """Sorted prefixes and generic scattered masks ignore unused table tails."""
+    """Inactive-output policy honors sorted/EP routing and ignores unused tails."""
     torch.manual_seed(57)
     m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
     w_ref, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
@@ -1168,16 +1168,18 @@ def test_moe_wna16_marlin_inactive_output_ownership():
         return tensor
 
     cases = (
-        ("inactive-default", (-1, -1, -1), False, False),
-        ("inactive-sorted", (-1, -1, -1), True, False),
-        ("empty-sorted", (-1, -1, -1), True, False),
-        ("mixed-default", (-1, 0, 1), False, False),
-        ("mixed-sorted", (-1, 0, 1), True, False),
-        ("mixed-scattered", (-1, 0, 1), False, True),
-        ("valid-default", (0, 1, 2), False, False),
-        ("valid-sorted", (0, 1, 2), True, False),
+        ("inactive-default", (-1, -1, -1), False, False, False),
+        ("inactive-sorted", (-1, -1, -1), True, False, False),
+        ("empty-sorted", (-1, -1, -1), True, False, False),
+        ("mixed-default", (-1, 0, 1), False, False, False),
+        ("mixed-sorted", (0, -1, 1), True, False, False),
+        ("mixed-scattered", (-1, 0, 1), False, True, False),
+        ("inactive-ep", (-1, -1, -1), False, False, True),
+        ("mixed-ep", (-1, 0, 1), False, True, True),
+        ("valid-default", (0, 1, 2), False, False, False),
+        ("valid-sorted", (0, 1, 2), True, False, False),
     )
-    for case, route_ids, sorted_proof, scatter in cases:
+    for case, route_ids, sorted_proof, scatter, is_ep in cases:
         ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
         sorted_ids, expert_ids, num_post = moe_align_block_size(ids, block_m, e)
         if scatter:
@@ -1192,10 +1194,11 @@ def test_moe_wna16_marlin_inactive_output_ownership():
         if case != "empty-sorted":
             used_blocks = 1 if max(route_ids) < 0 else topk
             if not scatter and route_ids[0] < 0:
-                # Two leading inactive blocks guard against skipping only one;
-                # duplicate their token padding without changing live routes.
+                # An empty inactive block guards against skipping only one;
+                # real routes stay unique, as the alignment producer guarantees.
+                empty_block = torch.full_like(sorted_ids[:block_m], topk)
                 sorted_ids = torch.cat(
-                    (sorted_ids[:block_m], sorted_ids[: used_blocks * block_m])
+                    (empty_block, sorted_ids[: used_blocks * block_m])
                 )
                 expert_ids = torch.cat((expert_ids[:1], expert_ids[:used_blocks]))
                 num_post.add_(block_m)
@@ -1212,54 +1215,64 @@ def test_moe_wna16_marlin_inactive_output_ownership():
                     torch.full((4 * block_m,), topk, device="cuda", dtype=torch.int32),
                 )
             )
-        # Omit the new argument on generic calls to guard its safe default.
-        gemm = (
-            partial(moe_wna16_marlin_gemm, expert_ids_are_sorted=True)
-            if sorted_proof
-            else moe_wna16_marlin_gemm
-        )
-        caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
-        for output in (None, caller_output):
-            with patch.object(torch, "empty", side_effect=poisoned_empty):
-                result = _run_single_gemm(
-                    gemm,
-                    x,
-                    output,
-                    qweight,
-                    scales,
-                    zeros,
-                    g_idx,
-                    permutation,
-                    workspace,
-                    sorted_ids,
-                    expert_ids,
-                    num_post,
-                    routing_weights,
-                    scalar_types.uint4b8,
-                    block_m,
-                    topk,
-                    m,
-                    n,
-                    k,
-                    False,
-                    True,
-                    True,
-                )
-            expected = (
-                torch.zeros_like(result)
-                if output is None
-                else torch.full_like(result, 3.0)
+
+        def gemm(*args, **kwargs):
+            kwargs["is_ep"] = is_ep
+            if sorted_proof:
+                kwargs["expert_ids_are_sorted"] = True
+            return moe_wna16_marlin_gemm(*args, **kwargs)
+
+        # Omit the policy on default calls to guard caller-owned inactive rows.
+        for zero_inactive_output in (False, True):
+            project = (
+                partial(gemm, zero_inactive_output=True)
+                if zero_inactive_output
+                else gemm
             )
-            for slot, expert in enumerate(route_ids):
-                if expert >= 0:
-                    expected[slot] = (x[0].float() @ w_ref[expert].float().T).to(
-                        expected.dtype
+            caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
+            for output in (None, caller_output):
+                with patch.object(torch, "empty", side_effect=poisoned_empty):
+                    result = _run_single_gemm(
+                        project,
+                        x,
+                        output,
+                        qweight,
+                        scales,
+                        zeros,
+                        g_idx,
+                        permutation,
+                        workspace,
+                        sorted_ids,
+                        expert_ids,
+                        num_post,
+                        routing_weights,
+                        scalar_types.uint4b8,
+                        block_m,
+                        topk,
+                        m,
+                        n,
+                        k,
+                        False,
+                        True,
+                        True,
                     )
-            torch.testing.assert_close(result, expected, rtol=0.03, atol=0.02)
-            inactive = ids.reshape(-1) < 0
-            torch.testing.assert_close(
-                result[inactive], expected[inactive], rtol=0, atol=0
-            )
+                expected = (
+                    torch.zeros_like(result)
+                    if output is None
+                    else torch.full_like(result, 3.0)
+                )
+                if zero_inactive_output and case != "empty-sorted":
+                    expected[ids.reshape(-1) < 0] = 0
+                for slot, expert in enumerate(route_ids):
+                    if expert >= 0:
+                        expected[slot] = (x[0].float() @ w_ref[expert].float().T).to(
+                            expected.dtype
+                        )
+                torch.testing.assert_close(result, expected, rtol=0.03, atol=0.02)
+                inactive = ids.reshape(-1) < 0
+                torch.testing.assert_close(
+                    result[inactive], expected[inactive], rtol=0, atol=0
+                )
 
 
 def test_marlin_lora_direct_inactive_routes():

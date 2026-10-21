@@ -35,7 +35,8 @@ template <
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
-    const bool kExpertIdsAreSorted       // sorted block expert IDs
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
