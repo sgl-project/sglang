@@ -1,10 +1,10 @@
 // Run the selector's real command builder without a browser or JSX dependency.
-// Usage: node docs/scripts/check_minimax_m25_deployment.mjs
+// Usage: node --test docs/scripts/tests/minimax-m25-deployment.test.mjs
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-const source = readFileSync(new URL('../src/snippets/autoregressive/minimax-m25-deployment.jsx', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../../src/snippets/autoregressive/minimax-m25-deployment.jsx', import.meta.url), 'utf8');
 const hooksStart = source.indexOf('  const [values, setValues]');
 assert.ok(hooksStart > 0, 'The component must expose its pure setup before React hooks');
 const setup = source.slice(0, hooksStart).replace(/^export /, '');

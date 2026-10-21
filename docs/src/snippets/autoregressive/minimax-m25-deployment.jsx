@@ -13,8 +13,8 @@ export const MiniMaxM25Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'a2', label: 'Ascend A2', subtitle: '8 × 910B4 / 32 GiB · smoke tested', default: false },
-        { id: 'a3', label: 'Ascend A3', subtitle: 'Reference · hardware validation pending', default: false }
+        { id: 'a2', label: 'Ascend A2', description: '8 × 910B4 / 32 GiB per device. The fixed single-request configuration is smoke tested.', default: false },
+        { id: 'a3', label: 'Ascend A3', description: 'Reference configuration only. A3 hardware validation is pending.', default: false }
       ]
     },
     gpuCount: {
@@ -393,6 +393,7 @@ export const MiniMaxM25Deployment = () => {
     borderRadius: '4px',
     display: 'flex',
     alignItems: 'center',
+    flexWrap: 'wrap',
     gap: '12px',
     background: isDark ? '#1f2937' : '#fff',
   };
@@ -405,11 +406,12 @@ export const MiniMaxM25Deployment = () => {
   };
   const itemsStyle = {
     display: 'flex',
-    rowGap: '2px',
+    rowGap: '6px',
     columnGap: '6px',
     flexWrap: 'wrap',
     alignItems: 'center',
-    flex: 1,
+    flex: '1 1 260px',
+    minWidth: 0,
   };
   const labelBaseStyle = {
     padding: '4px 10px',
@@ -441,13 +443,16 @@ export const MiniMaxM25Deployment = () => {
   };
   const subtitleStyle = {
     display: 'block',
-    fontSize: '9px',
+    fontSize: '12px',
     marginTop: '1px',
-    lineHeight: '1.1',
+    lineHeight: '1.4',
     opacity: 0.7,
   };
   const textInputStyle = {
     flex: 1,
+    minWidth: 0,
+    width: '100%',
+    boxSizing: 'border-box',
     padding: '8px 10px',
     borderRadius: '4px',
     border: `1px solid ${isDark ? '#4b5563' : '#d1d5db'}`,
@@ -457,6 +462,9 @@ export const MiniMaxM25Deployment = () => {
   };
   const commandDisplayStyle = {
     flex: 1,
+    minWidth: 0,
+    width: '100%',
+    boxSizing: 'border-box',
     padding: '12px 16px',
     background: isDark ? '#111827' : '#f5f5f5',
     borderRadius: '6px',
@@ -479,6 +487,7 @@ export const MiniMaxM25Deployment = () => {
           return null;
         }
         const items = option.getDynamicItems ? option.getDynamicItems(values) : option.items || [];
+        const description = items.find((item) => item.id === values[option.name])?.description;
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
@@ -504,6 +513,7 @@ export const MiniMaxM25Deployment = () => {
                       title={item.disabledReason || ''}
                       style={{
                         ...labelBaseStyle,
+                        ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
                         ...(isChecked ? checkedStyle : {}),
                         ...(isDisabled ? disabledStyle : {}),
                       }}
@@ -541,6 +551,7 @@ export const MiniMaxM25Deployment = () => {
                       title={item.disabledReason || ''}
                       style={{
                         ...labelBaseStyle,
+                        ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
                         ...(isChecked ? checkedStyle : {}),
                         ...(isDisabled ? disabledStyle : {}),
                       }}
@@ -569,12 +580,17 @@ export const MiniMaxM25Deployment = () => {
                   );
                 })
               )}
+              {description && (
+                <p style={{ margin: '4px 0 0', flexBasis: '100%', fontSize: '12px', lineHeight: '1.5', color: isDark ? '#d1d5db' : '#4b5563' }}>
+                  {description}
+                </p>
+              )}
             </div>
           </div>
         );
       })}
       <div style={{ ...cardStyle, flexDirection: 'column', alignItems: 'stretch' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
           <div style={titleStyle}>Run this Command:</div>
           <button
             type="button"
