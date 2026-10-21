@@ -97,20 +97,19 @@ _VERIFY_BACKENDS = (
     "flashinfer",
     "fa3",
 )
-_MHA_RAILS = ("triton", "flashinfer", "fa3", "trtllm_mha")
+_MHA_RAILS = ("triton", "flashinfer", "fa3")
 
 
 class TestUnifiedMemorySpecGate(unittest.TestCase):
     VERIFY_BACKENDS = _VERIFY_BACKENDS
     MHA_RAILS = _MHA_RAILS
     MLA_ONLY = tuple(b for b in _VERIFY_BACKENDS if b not in _MHA_RAILS)
-    UNAUDITED = ("fa4",)
+    UNAUDITED = ("fa4", "trtllm_mha")
 
     def test_dspark_verify_backends(self):
         for backend in self.VERIFY_BACKENDS:
             self.assertTrue(_accepts("DSPARK", backend=backend), backend)
-        # trtllm_mha is audited for the EAGLE and DFLASH arms only.
-        for backend in self.UNAUDITED + ("trtllm_mha",):
+        for backend in self.UNAUDITED:
             self.assertFalse(_accepts("DSPARK", backend=backend), backend)
 
     def test_dcp_keeps_flashinfer_off_the_verify_list(self):
