@@ -1,6 +1,5 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
-  playgroundVerificationStatus: (cell, s) => ["a3", "a5"].includes(s.hw) ? cell.verificationStatus : undefined,
 
   supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x", "tpu7x", "a3", "a5"],
 
@@ -29,8 +28,8 @@ export const config = {
       id: "quant",
       title: "Quantization",
       options: [
-        { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a3"].includes(s.hw), id: "w8a8", label: "W8A8 (ModelSlim)", disabled: (s) => s.hw !== "a3", disableReason: "The W8A8 checkpoint is the A3 recipe." },
-        { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a5"].includes(s.hw), id: "w8a8-mxfp8", label: "W8A8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The W8A8_MXFP8 checkpoint is the 950PR/DT series recipe." },
+        { showWhen: (s) => s.hw === "a3", id: "w8a8", label: "W8A8 (ModelSlim)", disabled: (s) => s.hw !== "a3", disableReason: "The W8A8 checkpoint is the A3 recipe." },
+        { showWhen: (s) => s.hw === "a5", id: "w8a8-mxfp8", label: "W8A8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The W8A8_MXFP8 checkpoint is the 950PR/DT series recipe." },
         { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "fp8", label: "FP8" },
         { showWhen: (s) => !["a3", "a5"].includes(s.hw),
           id: "mxfp4",
@@ -263,13 +262,6 @@ export const config = {
   runModes: (s) => ["mi355x", "tpu7x", "a3", "a5"].includes(s.hw) ? ["python"] : ["python", "docker"],
 
   placeholders: {
-    NPU_MODEL_PATH: {"target":"command","label":"NPU checkpoint directory","default":"/models/GLM-5.3-Flash-w8a8"},
-    NETWORK_IFACE: {"target":"command","label":"HCCL / Gloo interface","default":"<network-interface>"},
-    LOCAL_IP: {"target":"command","label":"This worker IP","default":"<this-node-ip>"},
-    PREFILL_HOST: {"target":"command","label":"Prefill head IP","default":"<prefill-head-ip>"},
-    DECODE_HOST: {"target":"command","label":"Decode head IP","default":"<decode-head-ip>"},
-    NODE0_IP: {"target":"command","label":"Head node IP","default":"<node0-ip>"},
-    NODE_RANK: {"target":"command","label":"This node rank","default":"<node-rank>"},
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30000" },
     HF_TOKEN: { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
@@ -526,13 +518,13 @@ sgl-eval run gsm8k \\
     const flags = recipe.flags.map((flag) => flag.startsWith("--port ")
       ? "--port " + (recipe.pdMode === "decode" ? 30100 : 30000) : flag);
     if (recipe.nnodes > 1) flags.push("--nnodes " + recipe.nnodes,
-      "--node-rank {{NODE_RANK}}", "--dist-init-addr {{NODE0_IP}}:20000");
+      "--node-rank <node-rank>", "--dist-init-addr <node0-ip>:20000");
     const command = [...recipe.env, "sglang serve", ...flags.map((flag) => "  " + flag)].join(" \\\n");
     return { ...cell, ...recipe, pd: true, verified: false, warn: undefined, router,
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://{{PREFILL_HOST}}:30000 8998 \\\n  --decode http://{{DECODE_HOST}}:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --worker-startup-timeout-secs 3600 \\\n  --request-timeout-secs 7200 \\\n  --disable-retries",
+  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --worker-startup-timeout-secs 3600 \\\n  --request-timeout-secs 7200 \\\n  --disable-retries",
 
   npuPdRecipes: [
     {
@@ -544,12 +536,12 @@ sgl-eval run gsm8k \\
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         "STREAMS_PER_DEVICE=32",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
+        "GLOO_SOCKET_IFNAME=\"<network-interface>\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24707\"",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
-        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\"",
+        "SGLANG_HOST_IP=\"<this-node-ip>\"",
         "HCCL_BUFFSIZE=1200",
         "DEEPEP_HCCL_BUFFSIZE=1200",
         "DEEPEP_NORMAL_LONG_SEQ_ROUND=128",
@@ -559,7 +551,7 @@ sgl-eval run gsm8k \\
         "HCCL_IF_BASE_PORT=61000"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8\"",
         "--trust-remote-code",
         "--tp-size 4",
         "--pp-size 4",
@@ -597,12 +589,12 @@ sgl-eval run gsm8k \\
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         "STREAMS_PER_DEVICE=32",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
+        "GLOO_SOCKET_IFNAME=\"<network-interface>\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24707\"",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
-        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\"",
+        "SGLANG_HOST_IP=\"<this-node-ip>\"",
         "HCCL_BUFFSIZE=512",
         "DEEPEP_HCCL_BUFFSIZE=512",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16",
@@ -613,7 +605,7 @@ sgl-eval run gsm8k \\
         "HCCL_IF_BASE_PORT=61010"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--pp-size 1",
@@ -633,7 +625,7 @@ sgl-eval run gsm8k \\
         "--page-size 128",
         "--max-running-requests 32",
         "--cuda-graph-bs-decode 1 2",
-        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-model-path \"/models/GLM-5.3-Flash-w8a8\"",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -650,12 +642,12 @@ sgl-eval run gsm8k \\
       env: [
         "SGLANG_NPU_PROFILING=0",
         "HCCL_BUFFSIZE=256",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24670\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24670\"",
         "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
-        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\""
+        "SGLANG_HOST_IP=\"<this-node-ip>\""
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--trust-remote-code",
         "--tp-size 8",
         "--pp-size 1",
@@ -674,7 +666,7 @@ sgl-eval run gsm8k \\
         "--mem-fraction-static 0.83",
         "--page-size 64",
         "--max-running-requests 16",
-        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--speculative-draft-kv-cache-dtype bf16",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 4",
@@ -694,12 +686,12 @@ sgl-eval run gsm8k \\
       env: [
         "SGLANG_NPU_PROFILING=0",
         "HCCL_BUFFSIZE=256",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24670\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24670\"",
         "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
-        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\""
+        "SGLANG_HOST_IP=\"<this-node-ip>\""
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--trust-remote-code",
         "--tp-size 8",
         "--pp-size 1",
@@ -718,7 +710,7 @@ sgl-eval run gsm8k \\
         "--mem-fraction-static 0.83",
         "--page-size 64",
         "--max-running-requests 16",
-        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--speculative-draft-kv-cache-dtype bf16",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 4",
@@ -1532,7 +1524,7 @@ sgl-eval run gsm8k \\
         "HCCL_BUFFSIZE=1536"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--quantization modelslim",
@@ -1549,7 +1541,7 @@ sgl-eval run gsm8k \\
         "--enable-multimodal",
         "--moe-a2a-backend deepep",
         "--deepep-mode auto",
-        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-model-path \"/models/GLM-5.3-Flash-w8a8\"",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1574,7 +1566,7 @@ sgl-eval run gsm8k \\
         "HCCL_BUFFSIZE=256"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--trust-remote-code",
         "--tp-size 8",
         "--quantization modelslim",
@@ -1588,7 +1580,7 @@ sgl-eval run gsm8k \\
         "--load-format auto",
         "--max-running-requests 16",
         "--pre-warm-nccl",
-        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-model-path \"/models/GLM-5.3-Flash-w8a8-mxfp8\"",
         "--speculative-draft-kv-cache-dtype bf16",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 4",

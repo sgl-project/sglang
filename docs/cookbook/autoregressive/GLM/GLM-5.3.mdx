@@ -86,9 +86,11 @@ export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 </Tab>
 </Tabs>
 
-Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
 
 Use a locally prepared **W8A8** checkpoint for A3. On 950PR/DT series, both unified serving and PD disaggregation use the same **W8A8C8_MXFP8** checkpoint. Both 950PR/DT series recipes explicitly use FP8 E4M3 KV cache and BF16 draft KV cache.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
 
 </Accordion>
 
@@ -105,7 +107,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <Warning>
-  The NVIDIA and AMD recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.3.
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.3.
 </Warning>
 
 ## Playground

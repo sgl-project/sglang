@@ -3,7 +3,6 @@
 
 export const config = {
   modelName: "GLM-5.3",
-  playgroundVerificationStatus: (cell, s) => ["a3", "a5"].includes(s.hw) ? cell.verificationStatus : undefined,
 
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
@@ -20,8 +19,8 @@ export const config = {
     { id: "default", label: "GLM-5.3", subtitle: "MoE · DSA" },
   ],
   quantizations: [
-    { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a5"].includes(s.hw), id: "w8a8c8-mxfp8", label: "W8A8C8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The 950PR/DT series unified and PD recipes use the W8A8C8_MXFP8 checkpoint." },
-    { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a3"].includes(s.hw), id: "w8a8", label: "W8A8 (ModelSlim)" },
+    { showWhen: (s) => s.hw === "a5", id: "w8a8c8-mxfp8", label: "W8A8C8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The 950PR/DT series unified and PD recipes use the W8A8C8_MXFP8 checkpoint." },
+    { showWhen: (s) => s.hw === "a3", id: "w8a8", label: "W8A8 (ModelSlim)" },
     { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "fp8", label: "FP8" },
     { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "bf16", label: "BF16" },
     { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "nvfp4", label: "NVFP4 (Experimental)" },
@@ -45,13 +44,6 @@ export const config = {
   },
 
   placeholders: {
-    NPU_MODEL_PATH: {"target":"command","label":"NPU checkpoint directory","default":"/models/GLM-5.3"},
-    NETWORK_IFACE: {"target":"command","label":"HCCL / Gloo interface","default":"<network-interface>"},
-    LOCAL_IP: {"target":"command","label":"This worker IP","default":"<this-node-ip>"},
-    PREFILL_HOST: {"target":"command","label":"Prefill head IP","default":"<prefill-head-ip>"},
-    DECODE_HOST: {"target":"command","label":"Decode head IP","default":"<decode-head-ip>"},
-    GLOO_IFACE: {"target":"command","label":"Gloo interface","default":"<gloo-interface>"},
-    MF_STORE_IP: {"target":"command","label":"950PR/DT series MemFabric store host","default":"<memfabric-store-host>"},
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"  },
     PORT:      { target: "command", label: "Bind port",         default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",      default: "<node0-ip>"   },
@@ -349,7 +341,7 @@ sgl-eval run aime25 \\
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://{{PREFILL_HOST}}:30000 8998 \\\n  --decode http://{{DECODE_HOST}}:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin",
+  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin",
 
   npuPdRecipes: [
     {
@@ -361,11 +353,11 @@ sgl-eval run aime25 \\
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         "STREAMS_PER_DEVICE=32",
         "ASCEND_MF_LOG_LEVEL=2",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24707\"",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
+        "GLOO_SOCKET_IFNAME=\"<network-interface>\"",
         "HCCL_BUFFSIZE=1200",
         "DEEPEP_NORMAL_LONG_SEQ_ROUND=72",
         "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024",
@@ -376,7 +368,7 @@ sgl-eval run aime25 \\
         "SGLANG_PP_LAYER_PARTITION=18,20,24,16"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 8",
         "--pp-size 4",
@@ -421,11 +413,11 @@ sgl-eval run aime25 \\
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         "STREAMS_PER_DEVICE=32",
         "ASCEND_MF_LOG_LEVEL=2",
-        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<prefill-head-ip>:24707\"",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
+        "GLOO_SOCKET_IFNAME=\"<network-interface>\"",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "DEEPEP_HCCL_BUFFSIZE=200",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16",
@@ -433,7 +425,7 @@ sgl-eval run aime25 \\
         "SGLANG_NPU_USE_MULTI_STREAM=1"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 32",
         "--dp-size 32",
@@ -481,17 +473,17 @@ sgl-eval run aime25 \\
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35",
         "TRANSFORMERS_VERBOSITY=error",
         "HCCL_HOST_SOCKET_PORT_RANGE=auto",
-        "GLOO_SOCKET_IFNAME=\"{{GLOO_IFACE}}\"",
+        "GLOO_SOCKET_IFNAME=\"<gloo-interface>\"",
         "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
-        "ASCEND_MF_STORE_URL=\"tcp://{{MF_STORE_IP}}:31001\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<memfabric-store-host>:31001\"",
         "ASCEND_MF_LOG_LEVEL=2",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
         "DEEPEP_HCCL_BUFFSIZE=2048",
         "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
         "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--dp 4",
@@ -536,17 +528,17 @@ sgl-eval run aime25 \\
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35",
         "TRANSFORMERS_VERBOSITY=error",
         "HCCL_HOST_SOCKET_PORT_RANGE=auto",
-        "GLOO_SOCKET_IFNAME=\"{{GLOO_IFACE}}\"",
+        "GLOO_SOCKET_IFNAME=\"<gloo-interface>\"",
         "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
-        "ASCEND_MF_STORE_URL=\"tcp://{{MF_STORE_IP}}:31001\"",
+        "ASCEND_MF_STORE_URL=\"tcp://<memfabric-store-host>:31001\"",
         "ASCEND_MF_LOG_LEVEL=2",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
         "DEEPEP_HCCL_BUFFSIZE=400",
         "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--dp 4",
@@ -1385,7 +1377,7 @@ sgl-eval run aime25 \\
         "SGLANG_NPU_USE_MULTI_STREAM=1"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--attention-backend ascend",
@@ -1421,14 +1413,14 @@ sgl-eval run aime25 \\
       env: [
         "SGLANG_SET_CPU_AFFINITY=1",
         "STREAMS_PER_DEVICE=32",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
+        "GLOO_SOCKET_IFNAME=\"<network-interface>\"",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40",
         "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
         "HCCL_BUFFSIZE=2000"
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 32",
         "--dp-size 16",
@@ -1480,11 +1472,11 @@ sgl-eval run aime25 \\
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "TRANSFORMERS_VERBOSITY=error",
         "HCCL_HOST_SOCKET_PORT_RANGE=auto",
-        "GLOO_SOCKET_IFNAME=\"{{GLOO_IFACE}}\"",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\""
+        "GLOO_SOCKET_IFNAME=\"<gloo-interface>\"",
+        "HCCL_SOCKET_IFNAME=\"<network-interface>\""
       ],
       flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--model-path \"/models/GLM-5.3\"",
         "--trust-remote-code",
         "--tp-size 16",
         "--dp 1",

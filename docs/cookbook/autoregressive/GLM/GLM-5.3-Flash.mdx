@@ -75,18 +75,20 @@ source /usr/local/memfabric_hybrid/set_env.sh
 </Tab>
 </Tabs>
 
-Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
 
 Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for 950PR/DT series.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
 
 </Accordion>
 
 The cookbook opens on **B300**. Choose your hardware, then choose the operating point that matches your workload:
 
-- **Low Latency** on NVIDIA and AMD starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
+- **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed GPU platform exposes both strategies; TPU7x has a Low Latency recipe only. Ascend NPU recipes use the supplied NEXTN operating point under Low Latency. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed GPU platform exposes both strategies; TPU7x has a Low Latency recipe only. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration adds the host tier described in [Extend the cache hierarchy](#extend-the-cache-hierarchy). Do not treat the CUDA benchmark rows as MI355X measurements.
 

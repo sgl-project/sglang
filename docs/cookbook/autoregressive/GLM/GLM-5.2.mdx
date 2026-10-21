@@ -79,10 +79,12 @@ export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 </Tab>
 </Tabs>
 
-Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
 
 For A3, use the locally prepared **GLM-5.2-w8a8** checkpoint described in the [model-weight prerequisites](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2#model-weights).
-For 950PR/DT series, use your locally prepared GLM-5.2 **W8A8C8_MXFP8** checkpoint, including MTP weights, and set **Env → NPU checkpoint directory** to its mounted path.
+For 950PR/DT series, use your locally prepared GLM-5.2 **W8A8C8_MXFP8** checkpoint, including MTP weights, and replace the model path in the generated command with its mounted path.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
 
 </Accordion>
 
@@ -99,7 +101,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <Warning>
-  The NVIDIA and AMD recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.
 </Warning>
 
 <Note>
