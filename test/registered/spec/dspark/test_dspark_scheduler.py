@@ -143,18 +143,18 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             history_survival_probs=survival,
             sps_table=table,
             cfg=cfg,
-            extra_seconds_per_token=0.01,
+            cost_corrections={(1, 4): 0.04},
         )
         self.assertEqual(baseline.budget, 3)
         self.assertEqual(corrected.budget, 2)
-        self.assertAlmostEqual(corrected.predicted_step_seconds, 0.04)
+        self.assertAlmostEqual(corrected.predicted_step_seconds, 0.01)
 
         # No artificial savings inside one physical CUDA Graph tier.
         padded = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=table,
             cfg=cfg,
-            extra_seconds_per_token=0.01,
+            cost_corrections={(1, 4): 0.04},
             capture_num_tokens=[4],
         )
         self.assertEqual(padded.budget, 3)
@@ -173,7 +173,7 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             history_survival_probs=survival,
             sps_table=additive,
             cfg=cfg,
-            extra_seconds_per_token=0.01,
+            cost_corrections={(1, 4): 0.04},
             capture_num_tokens=[4],
         )
         self.assertEqual(corrected_additive.budget, 3)
@@ -181,6 +181,19 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             corrected_additive.predicted_step_seconds,
             additive.step_time(num_reqs=1, budget=3) + 0.04,
         )
+
+    def test_signed_cost_corrections_do_not_cross_request_counts(self):
+        survival = torch.tensor([[0.9, 0.8, 0.1]])
+        table = SpsCostTable([1, 2, 3, 4], [100.0, 100.0, 100.0, 10.0], 4)
+        cfg = DSparkScheduleConfig(gamma=3)
+        for corrections, expected in (({(1, 4): -0.095}, 3), ({(2, 4): -0.095}, 2)):
+            actual = compute_verify_token_budget(
+                history_survival_probs=survival,
+                sps_table=table,
+                cfg=cfg,
+                cost_corrections=corrections,
+            )
+            self.assertEqual(actual.budget, expected)
 
     def test_online_feedback_uses_baseline_and_skips_profile_budgets(self):
         table = SpsCostTable([1, 2, 3, 4], [100.0] * 4, 4)
@@ -204,11 +217,11 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         )
         for _ in range(64):
             planner.observe_step_cost(obs, 0.05)
-        self.assertAlmostEqual(host.online_cost.seconds_per_token, 0.01)
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], 0.04)
         host.forced_budget_frac = 1.0
         for _ in range(64):
             planner.observe_step_cost(obs, 0.01)
-        self.assertAlmostEqual(host.online_cost.seconds_per_token, 0.01)
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], 0.04)
         host.forced_budget_frac = None
         confidence = torch.tensor([[0.9, 0.8 / 0.9, 0.1 / 0.8]])
         generation = torch.ones(1, dtype=torch.int64)
@@ -229,7 +242,8 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
 
         def broadcast(value, *, src, group):
             self.assertEqual(src, 4)
-            value[0] = 0.02
+            value.zero_()
+            value[0] = torch.tensor([1, 4, -0.002])
 
         with (
             patch(
@@ -239,7 +253,8 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             patch("torch.distributed.broadcast", side_effect=broadcast),
         ):
             planner._sync_online_cost()
-        self.assertAlmostEqual(host.online_cost.seconds_per_token, 0.02)
+        self.assertEqual(set(host.online_cost.corrections), {(1, 4)})
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], -0.002)
 
     def test_budget_argmax_matches_bruteforce_scan_across_sps_cliffs(self):
         torch.manual_seed(1)

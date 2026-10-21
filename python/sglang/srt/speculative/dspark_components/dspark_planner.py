@@ -280,6 +280,7 @@ class DSparkVerifyPlanner:
             )
         )
         planner.online_cost.observe(
+            num_requests=obs.bs,
             batch_tokens=obs.num_verify_tokens,
             baseline_seconds=baseline,
             actual_seconds=actual_seconds,
@@ -290,11 +291,18 @@ class DSparkVerifyPlanner:
             return
         group = get_parallel().attn_tp_group
         correction = self._budget_planner.online_cost
-        value = torch.tensor([correction.seconds_per_token], dtype=torch.float64)
+        # At most MAX_SAMPLES // MIN_SAMPLES shapes can have enough samples.
+        value = torch.zeros(
+            (correction.MAX_SAMPLES // correction.MIN_SAMPLES, 3), dtype=torch.float64
+        )
+        for i, ((n, g), delta) in enumerate(correction.corrections.items()):
+            value[i] = torch.tensor([n, g, delta], dtype=torch.float64)
         # CPU collective: all attention-TP ranks must use the same cost curve
         # before selecting a budget / CUDA Graph tier, even with TP sync off.
         torch.distributed.broadcast(value, src=group.ranks[0], group=group.cpu_group)
-        correction.seconds_per_token = float(value[0])
+        correction.corrections = {
+            (int(n), int(g)): delta for n, g, delta in value.tolist() if n > 0
+        }
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -921,7 +929,7 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
-    extra_seconds_per_token: float = 0.0,
+    cost_corrections: Optional[dict[tuple[int, int], float]] = None,
     capture_num_tokens: Optional[list[int]] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
@@ -945,21 +953,30 @@ def compute_verify_token_budget(
             grid[indices.clamp(max=grid.numel() - 1)],
             num_requests * (cfg.gamma + 1),
         )
+    correction = None
+    if cost_corrections:
+        correction = torch.tensor(
+            [
+                cost_corrections.get((num_requests, g), 0.0)
+                for g in batch_tokens.tolist()
+            ],
+            dtype=torch.float64,
+        )
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
             batch_tokens=batch_tokens,
         )
-        if extra_seconds_per_token:
-            step_time = step_time + extra_seconds_per_token * batch_tokens
+        if correction is not None:
+            step_time = (step_time + correction).clamp_min(1e-9)
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
-        if extra_seconds_per_token:
-            sps = 1.0 / (1.0 / sps + extra_seconds_per_token * batch_tokens)
+        if correction is not None:
+            sps = 1.0 / (1.0 / sps + correction).clamp_min(1e-9)
         theta = tau_star * sps
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
@@ -1069,8 +1086,8 @@ class HostConfidenceBudgetPlanner:
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
-            extra_seconds_per_token=(
-                self.online_cost.seconds_per_token if self.online_cost else 0.0
+            cost_corrections=(
+                self.online_cost.corrections if self.online_cost else None
             ),
             capture_num_tokens=capture_grid,
         )
