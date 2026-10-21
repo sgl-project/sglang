@@ -417,10 +417,10 @@ def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind)
     """The masked kernel's grid is capped at the resident CTAs, so one CTA may walk
     several real rows of masked_m. Every real row must match the contig kernel
     byte for byte, and no padded row may be written."""
-    from sglang.kernels.ops.moe.dsv4 import (
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
         silu_and_mul_contig_post_quant,
-        silu_and_mul_masked_post_quant,
     )
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 
     group_size, hidden, experts, topk = 128, 2048, 8, 8
     scale_ue8m0 = transposed

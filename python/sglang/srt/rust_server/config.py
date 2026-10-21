@@ -164,7 +164,11 @@ def _build_server_args(
             if ref.lora_name is not None
         },
         enable_strict_thinking=get_serving().enable_strict_thinking,
-        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
+        # A list of pairs keeps the configured order, which decides the error
+        # when several modalities are over their limit.
+        limit_mm_data_per_request=list(
+            (get_mm().limit_mm_data_per_request or {}).items()
+        ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
