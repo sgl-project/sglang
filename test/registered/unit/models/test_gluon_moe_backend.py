@@ -121,7 +121,7 @@ def test_quark_post_load_invokes_gluon_prepare(monkeypatch):
 
     monkeypatch.setattr(quark_moe, "_is_gfx1250", False)
     monkeypatch.setattr(quark_moe, "_is_shuffle_moe_mxfp4", False)
-    monkeypatch.setattr(quark_moe, "e8m0_shuffle", lambda value: value)
+    monkeypatch.setattr(quark_moe, "e8m0_shuffle", lambda value: value, raising=False)
     scheme = object.__new__(quark_moe.QuarkW4A4MXFp4MoE)
     scheme._owns_moe_weight_layout = True
     scheme.is_checkpoint_mxfp4_serialized = True
