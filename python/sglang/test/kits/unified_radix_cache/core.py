@@ -89,7 +89,7 @@ class PagedFullComponent(FullComponent):
         super().__init__(*args, **kwargs)
         self.rows_handed_back: dict[int, int] = {}
 
-    def reclaimable_tokens(self, node):
+    def reclaimable_value_len(self, node):
         return self.value_len(node) // 2 - self.rows_handed_back.get(node.id, 0)
 
 

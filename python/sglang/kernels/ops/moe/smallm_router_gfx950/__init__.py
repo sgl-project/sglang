@@ -217,7 +217,7 @@ def smallm_router_glm(
     return wts, ids
 
 
-def glm_moe_topk_output(moe, hidden_states, num_token_non_padded=None):
+def glm_moe_topk_output(moe, hidden_states):
     """StandardTopKOutput for a GLM-5.x DeepseekV2MoE (sigmoid noaux_tc, one fused shared expert) on the aiter
     path, or None (unfused path)."""
     from sglang.srt.eplb.expert_distribution import (
@@ -271,6 +271,9 @@ def glm_moe_topk_output(moe, hidden_states, num_token_non_padded=None):
         or not smallm_router_supported(hidden_states, GLM_MAX_TOK)
         or is_in_tc_piecewise_cuda_graph()
     ):
+        return None
+    num_token_non_padded, dispatch_info = moe.topk.routing_inputs()
+    if dispatch_info is not None:
         return None
     rsf = cfg.routed_scaling_factor if cfg.routed_scaling_factor is not None else 1.0
     shared_w = cfg.fused_shared_experts_scaling_factor

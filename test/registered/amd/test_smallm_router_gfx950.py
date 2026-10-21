@@ -148,6 +148,37 @@ class TestSmallMRouterGfx950(CustomTestCase):
             self.assertTrue(torch.equal(gw[:n_valid], w[:n_valid]), n_valid)
             self._assert_padded_rows(R, gw, gids, n_valid, shared_w)
 
+    def test_glm_moe_topk_output_routing_inputs(self):
+        from types import SimpleNamespace
+
+        from sglang.kernels.ops.moe import smallm_router_gfx950 as R
+        from sglang.srt.configs.shared_experts import SharedExpertsConfig
+        from sglang.srt.layers.moe.topk import TopKConfig
+
+        x, wg, bias = self._glm_inputs(R, 8)
+        cfg = TopKConfig(
+            top_k=R.GLM_TOPK + 1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
+            correction_bias=bias,
+            scoring_func="sigmoid",
+            routed_scaling_factor=2.5,
+            fused_shared_experts_scaling_factor=0.75,
+        )
+        n = torch.tensor(5, dtype=torch.int32, device="cuda")
+        routing = [(n, None)]
+        moe = SimpleNamespace(
+            _smallm_router_glm_ok=True,
+            gate=SimpleNamespace(weight=wg),
+            layer_id=0,
+            topk=SimpleNamespace(topk_config=cfg, routing_inputs=lambda: routing[0]),
+        )
+        out = R.glm_moe_topk_output(moe, x)
+        self.assertIsNotNone(out)
+        self._assert_padded_rows(R, out.topk_weights, out.topk_ids, 5, 0.75)
+        # expert-location dispatch (EPLB, non-trivial placement) needs the unfused remap
+        routing[0] = (n, object())
+        self.assertIsNone(R.glm_moe_topk_output(moe, x))
+
     def test_glm_router_matches_unfused_path(self):
         from sglang.kernels.ops.moe import smallm_router_gfx950 as R
         from sglang.srt.configs.shared_experts import SharedExpertsConfig

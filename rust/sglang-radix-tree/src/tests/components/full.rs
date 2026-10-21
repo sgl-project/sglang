@@ -496,13 +496,13 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
     // asynchronously under write_back; matching can split it before the ack.
     let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
     let published_a = match action {
-        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+        Some(CacheAction::UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
             new_child_node_id,
         }) => {
-            assert_eq!((ack_id, old_node_id, new_child_node_id), (a, a, a));
+            assert_eq!((ack_id, old_node_id, new_child_node_id), (Some(a), a, a));
             assert_eq!(new_node_id, tc.arena.node(prefix_idx).id);
             vec![new_node_id, new_child_node_id]
         }
