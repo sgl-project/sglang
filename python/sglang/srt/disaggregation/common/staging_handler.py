@@ -137,7 +137,7 @@ class DecodeStagingHandler:
         # unregister may leave orphan writer entries; these do not keep a
         # retired room active.
         if self._room_to_decode_req or self._room_to_receiver:
-            return "staging rooms or writers are still active"
+            return "staging rooms are still active"
         return None
 
     def close(self):

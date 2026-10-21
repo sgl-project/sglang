@@ -1016,9 +1016,9 @@ class TestMooncakeStagingResource(unittest.TestCase):
         handler._room_to_decode_req = {7: object()}
         handler._room_to_receiver = {7: object()}
         handler._writer_counts = {7: {0: [(0, 1, "writer")]}}
-        self.assertIn("writers", handler.check_idle())
+        self.assertIn("rooms", handler.check_idle())
         handler._room_to_decode_req.clear()
-        self.assertIn("writers", handler.check_idle())
+        self.assertIn("rooms", handler.check_idle())
         handler._room_to_receiver.clear()
         # An arrival after unregister can recreate a nonempty orphan entry.
         self.assertIsNone(handler.check_idle())

@@ -515,8 +515,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.deregister_buffer_to_engine()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
-            if resource is not None:
-                raise
 
         if resource is not None:
             resource.release(self.disaggregation_mode.value)
