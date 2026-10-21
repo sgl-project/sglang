@@ -357,6 +357,99 @@ class TestGgufInactiveRoutes(CustomTestCase):
             )
 
     @torch.inference_mode()
+    def test_musa_branch_avoids_input_copy_with_cuda_providers(self):
+        """MUSA Python masks preserve input storage and exclude inactive NaN rows.
+
+        Coverage uses CUDA providers; native MUSA requires separate hardware.
+        """
+        from sgl_kernel import gelu_and_mul as legacy_gelu_and_mul
+        from sgl_kernel import silu_and_mul as legacy_silu_and_mul
+
+        for quant_type in (GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q8_0):
+            packed, _ = self._weights(quant_type)
+            for tokens in (3, 96):
+                for activation in ("silu", "gelu"):
+                    with self.subTest(
+                        quant_type=quant_type, tokens=tokens, activation=activation
+                    ):
+                        repeats = (tokens + 2) // 3
+                        ids = torch.tensor(
+                            [[0, 1], [1, -1], [-1, -1]],
+                            device="cuda",
+                            dtype=torch.int32,
+                        ).repeat(repeats, 1)[:tokens]
+                        weights = torch.tensor(
+                            [
+                                [0.25, 0.75],
+                                [0.5, float("nan")],
+                                [float("nan"), float("nan")],
+                            ],
+                            device="cuda",
+                        ).repeat(repeats, 1)[:tokens]
+                        inactive = ids < 0
+                        inputs = torch.full(
+                            (tokens, 256), 0.25, device="cuda", dtype=torch.float16
+                        )
+                        inputs[inactive.all(dim=-1)] = float("nan")
+                        provider_name = (
+                            "ggml_moe_a8" if tokens > 64 else "ggml_moe_a8_vec"
+                        )
+                        native = (
+                            gguf_runtime.ggml_moe_a8
+                            if tokens > 64
+                            else gguf_runtime.ggml_moe_a8_vec
+                        )
+                        calls = 0
+
+                        def observe_projection(projection_input, *args, **kwargs):
+                            nonlocal calls
+                            if calls == 0:
+                                self.assertEqual(
+                                    projection_input.data_ptr(), inputs.data_ptr()
+                                )
+                            calls += 1
+                            return native(projection_input, *args, **kwargs)
+
+                        with (
+                            patch.object(gguf_runtime, "_is_cuda", False),
+                            patch.object(gguf_runtime, "_is_musa", True),
+                            patch.object(
+                                gguf_runtime, "silu_and_mul", legacy_silu_and_mul
+                            ),
+                            patch.object(
+                                gguf_runtime, "gelu_and_mul", legacy_gelu_and_mul
+                            ),
+                        ):
+                            expected = fused_moe_gguf(
+                                inputs.nan_to_num(),
+                                *packed,
+                                weights.masked_fill(inactive, 0),
+                                ids.clamp_min(0),
+                                quant_type,
+                                quant_type,
+                                activation,
+                            )
+                            with patch.object(
+                                gguf_runtime, provider_name, observe_projection
+                            ):
+                                actual = fused_moe_gguf(
+                                    inputs,
+                                    *packed,
+                                    weights,
+                                    ids,
+                                    quant_type,
+                                    quant_type,
+                                    activation,
+                                )
+                        self.assertEqual(calls, 2)
+                        self.assertGreater(expected.abs().max().item(), 1e-3)
+                        self.assertTrue(torch.isfinite(actual).all().item())
+                        self.assertEqual(
+                            torch.count_nonzero(actual[inactive.all(dim=-1)]).item(), 0
+                        )
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @torch.inference_mode()
     def test_unquantized_fallback_drops_negative_ids(self):
         """The slow path must not alias a dropped route to the last expert."""
         generator = torch.Generator(device="cuda").manual_seed(17)

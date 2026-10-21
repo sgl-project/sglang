@@ -289,7 +289,6 @@ def fused_moe_gguf(
 
     if _is_musa:
         inactive = topk_ids < 0
-        x = x.masked_fill(inactive.all(dim=-1, keepdim=True), 0.0)
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
