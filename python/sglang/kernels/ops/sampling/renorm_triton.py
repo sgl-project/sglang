@@ -51,6 +51,121 @@ def _normalize_kernel(
     tl.store(out_ptr + offsets, values / denominator, mask=mask)
 
 
+_TOP_P_BLOCK = 1024
+_TOP_P_CHUNK = 4096
+_TOP_P_FANOUT = 8
+# Probabilities are in [0, 1], so their fp32 keys lie in [0, _ONE_KEY], fewer than
+# 2**30 values; each pass divides the search interval by _TOP_P_FANOUT (2**3).
+_ONE_KEY = 0x3F800000
+_TOP_P_PASSES = 10
+
+
+@triton.jit
+def _top_p_pass_kernel(
+    probs_ptr,
+    top_ps_ptr,
+    out_ptr,
+    part_ptr,
+    bounds_ptr,
+    below_ptr,
+    num_rows,
+    vocab_size,
+    num_tiles,
+    PASS: tl.constexpr,
+    PASSES: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FANOUT: tl.constexpr,
+    ONE_KEY: tl.constexpr,
+):
+    # The pivot is the smallest probability v with mass(probs <= v) >= 1 - top_p,
+    # i.e. the ascending sort / cumsum / searchsorted pivot, found without a sort:
+    # non-negative fp32 values order like their int32 bit patterns, so bisect on
+    # the keys with FANOUT candidates per pass. Each launch is one pass over
+    # (row, tile) programs. Passes 0..PASSES-1 store per-tile candidate masses in
+    # part[pass, row, tile, :]; from pass 1 on, every program of a row first folds
+    # the previous pass's masses into the same next [lo, hi] (bounds) and
+    # mass(key < lo) (below). Pass PASSES writes the renormalized row.
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    j = tl.arange(0, FANOUT)
+    t = tl.arange(0, NUM_CHUNKS)
+    tile_ptr = probs_ptr + row * vocab_size + tile * CHUNK
+    offs = tl.arange(0, BLOCK)
+    stride_pass = num_rows * NUM_CHUNKS * FANOUT
+    stride_row = NUM_CHUNKS * FANOUT
+
+    if PASS == 0:
+        lo = 0
+        hi = ONE_KEY
+    else:
+        if PASS == 1:
+            lo = 0
+            hi = ONE_KEY
+            below = 0.0
+        else:
+            lo = tl.load(bounds_ptr + ((PASS - 1) * num_rows + row) * 2)
+            hi = tl.load(bounds_ptr + ((PASS - 1) * num_rows + row) * 2 + 1)
+            below = tl.load(below_ptr + (PASS - 1) * num_rows + row)
+        step = (hi - lo + FANOUT) // FANOUT
+        cand = tl.minimum(lo + (j + 1) * step - 1, hi)
+        prev = part_ptr + (PASS - 1) * stride_pass + row * stride_row
+        mass = tl.load(
+            prev + t[:, None] * FANOUT + j[None, :],
+            mask=(t < num_tiles)[:, None],
+            other=0.0,
+        )
+        mass = tl.sum(mass, axis=0)
+        target = 1.0 - tl.load(top_ps_ptr + row)
+        # The last candidate is hi; if rounding leaves even it short, keep hi.
+        first = tl.minimum(
+            tl.min(tl.where(mass >= target, j, FANOUT), axis=0), FANOUT - 1
+        )
+        prev_cand = tl.sum(tl.where(j == first - 1, cand, 0), axis=0)
+        prev_mass = tl.sum(tl.where(j == first - 1, mass, 0.0), axis=0)
+        hi = tl.sum(tl.where(j == first, cand, 0), axis=0)
+        lo = tl.where(first == 0, lo, prev_cand + 1)
+        below = tl.where(first == 0, below, prev_mass)
+        if tile == 0:
+            tl.store(bounds_ptr + (PASS * num_rows + row) * 2, lo)
+            tl.store(bounds_ptr + (PASS * num_rows + row) * 2 + 1, hi)
+            tl.store(below_ptr + PASS * num_rows + row, below)
+
+    if PASS < PASSES:
+        step = (hi - lo + FANOUT) // FANOUT
+        cand = tl.minimum(lo + (j + 1) * step - 1, hi)
+        mass_acc = tl.zeros([BLOCK, FANOUT], dtype=tl.float32)
+        for start in range(0, CHUNK, BLOCK):
+            idx = tile * CHUNK + start + offs
+            p = tl.load(tile_ptr + start + offs, mask=idx < vocab_size, other=0.0)
+            key = p.to(tl.int32, bitcast=True)
+            mass_acc += tl.where(key[:, None] <= cand[None, :], p[:, None], 0.0)
+        out_part = part_ptr + PASS * stride_pass + row * stride_row + tile * FANOUT
+        tl.store(out_part + j, tl.sum(mass_acc, axis=0))
+    else:
+        # Pass 0's last candidate is ONE_KEY, so its mass is the row total.
+        first_part = part_ptr + row * stride_row
+        total = tl.sum(
+            tl.load(
+                first_part + t * FANOUT + FANOUT - 1, mask=t < num_tiles, other=0.0
+            ),
+            axis=0,
+        )
+        kept_sum = total - below
+        out_tile_ptr = out_ptr + row * vocab_size + tile * CHUNK
+        for start in range(0, CHUNK, BLOCK):
+            idx = tile * CHUNK + start + offs
+            m = idx < vocab_size
+            p = tl.load(tile_ptr + start + offs, mask=m, other=0.0)
+            key = p.to(tl.int32, bitcast=True)
+            tl.store(
+                out_tile_ptr + start + offs,
+                tl.where(key >= lo, p / kept_sum, 0.0),
+                mask=m,
+            )
+
+
 def _prepare_probs(probs: torch.Tensor) -> torch.Tensor:
     if probs.ndim != 2:
         raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
@@ -94,9 +209,9 @@ def top_p_renorm_probs_triton(
 ) -> torch.Tensor:
     """Apply exact top-p thresholding and renormalize each probability row.
 
-    Sorting and prefix sums use PyTorch's device kernels because a vocabulary-sized
-    in-register Triton sort does not scale to 100K+ vocabularies. Triton performs
-    the bandwidth-heavy masking, partial reduction, and normalization.
+    Same pivot as FlashInfer's: sort ascending, discard the prefix whose
+    cumulative mass is below 1 - p, and retain all ties at the pivot. The
+    kernel finds it by bisection instead of a vocabulary-wide sort and scan.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
@@ -119,17 +234,44 @@ def top_p_renorm_probs_triton(
             (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
         )
 
-    # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
-    # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
-        1
+    out = torch.empty_like(probs_fp32)
+    num_chunks = triton.next_power_of_2(triton.cdiv(vocab_size, _TOP_P_CHUNK))
+    device = probs.device
+    part = torch.empty(
+        (_TOP_P_PASSES, batch_size, num_chunks, _TOP_P_FANOUT),
+        dtype=torch.float32,
+        device=device,
     )
-    cutoff.clamp_(max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
-
-    return _renorm_from_pivots(probs_fp32, pivots)
+    bounds = torch.empty(
+        (_TOP_P_PASSES + 1, batch_size, 2), dtype=torch.int32, device=device
+    )
+    below = torch.empty(
+        (_TOP_P_PASSES + 1, batch_size), dtype=torch.float32, device=device
+    )
+    top_ps = top_ps.contiguous()
+    num_tiles = triton.cdiv(vocab_size, _TOP_P_CHUNK)
+    grid = (batch_size, num_tiles)
+    for pass_id in range(_TOP_P_PASSES + 1):
+        _top_p_pass_kernel[grid](
+            probs_fp32,
+            top_ps,
+            out,
+            part,
+            bounds,
+            below,
+            batch_size,
+            vocab_size,
+            num_tiles,
+            PASS=pass_id,
+            PASSES=_TOP_P_PASSES,
+            NUM_CHUNKS=num_chunks,
+            CHUNK=_TOP_P_CHUNK,
+            BLOCK=_TOP_P_BLOCK,
+            FANOUT=_TOP_P_FANOUT,
+            ONE_KEY=_ONE_KEY,
+            num_warps=4,
+        )
+    return out
 
 
 def top_k_renorm_probs_triton(
