@@ -1213,6 +1213,11 @@ class MqaAttentionBase(nn.Module):
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        from sglang.srt.layers.cp.cp_decode_attn_dp import use_cp_decode_attn_dp
+
+        if isinstance(self, MQALayer) and use_cp_decode_attn_dp(forward_batch):
+            yield
+            return
         ctx = get_cp_decode_attn_tp_ctx()
         attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
         with ctx.maybe_use_decode_attn_tp(
@@ -2477,6 +2482,30 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_prepare_decode_dp(
+        self, x, positions, forward_batch, attn_backend, layout, q_out, x_quant
+    ):
+        """Replicate KV updates; project only this rank's full-head queries."""
+        x_linear = x_quant if x_quant is not None else x
+        qkv_a = self.wqkv_a(x_linear)[0] if self.fuse_wqa_wkv else None
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        self._compute_kv_to_cache(
+            x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+        )
+        if self.compress_ratio in (1, 2):
+            attn_backend.forward_low_ratio_sources(
+                layer=self,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        elif self.compressor is not None or self.indexer is not None:
+            raise NotImplementedError("CP decode DP requires V4.1 low-ratio sources")
+        assert isinstance(q_for_wqb, torch.Tensor)
+        q = self._compute_q_b(layout.select(q_for_wqb), layout.select(positions), q_out)
+        return q, None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2489,6 +2518,10 @@ class MQALayer(MqaAttentionBase):
             return x
 
         attn_backend = get_attn_backend()
+        from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
+
+        decode_dp = cp_decode_query_layout(forward_batch, x.shape[0])
+        query_rows = decode_dp.local_rows if decode_dp is not None else x.shape[0]
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
@@ -2537,6 +2570,10 @@ class MQALayer(MqaAttentionBase):
         )
 
         unified = is_unified_kv_triton()
+        if decode_dp is not None and (unified or self.use_mega_attention):
+            raise NotImplementedError(
+                "CP decode DP requires the regular FlashMLA cache path"
+            )
         unified_fp8_verify = (
             unified
             and is_unified_kv_fp8()
@@ -2586,7 +2623,7 @@ class MQALayer(MqaAttentionBase):
         ):
             kernel_num_heads = self.n_local_heads
             q_out = torch.empty(
-                (x.shape[0], self.n_local_heads, self.head_dim),
+                (query_rows, self.n_local_heads, self.head_dim),
                 dtype=torch.float8_e4m3fn,
                 device=x.device,
             )
@@ -2610,14 +2647,17 @@ class MQALayer(MqaAttentionBase):
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
-                else self._kernel_num_heads(x.shape[0])
+                else self._kernel_num_heads(query_rows)
             )
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
                     # V4.1 kernels read all padded heads, so the padding must be zero.
-                    q_padded = self._zero_padded_q(x, kernel_num_heads, attn_backend)
+                    query_x = decode_dp.select(x) if decode_dp is not None else x
+                    q_padded = self._zero_padded_q(
+                        query_x, kernel_num_heads, attn_backend
+                    )
                 elif _is_gfx942_supported:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
@@ -2629,7 +2669,12 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
-        if enable_multi_stream:
+        if decode_dp is not None:
+            q, kv = self._forward_prepare_decode_dp(
+                x, positions, forward_batch, attn_backend, decode_dp, q_out, x_quant
+            )
+            positions = decode_dp.select(positions)
+        elif enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -2771,6 +2816,7 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
+                    query_layout=decode_dp,
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
@@ -2932,7 +2978,8 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        projected = self._project_wo_b(o, defer_all_reduce)
+        return decode_dp.gather(projected) if decode_dp is not None else projected
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
