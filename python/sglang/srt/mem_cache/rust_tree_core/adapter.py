@@ -18,7 +18,6 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -41,8 +40,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
-    ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
@@ -165,8 +164,8 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
         return MambaEvictExcessPathStates(tail_node_id=action[1])
-    if tag == "replace_write_through_on_node_split":
-        return ReplaceWriteThroughOnNodeSplit(
+    if tag == "update_pending_backup_on_node_split":
+        return UpdatePendingBackupOnNodeSplit(
             ack_id=action[1],
             old_node_id=action[2],
             new_node_id=action[3],
@@ -469,8 +468,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
-                swa_sliding_window_size=params.sliding_window_size,
-                swa_req_ring=is_swa_req_ring(self._allocator),
+                # Rust's tree window has the same cache-history contract as
+                # SWAComponent, including the fused draft's front rows.
+                swa_sliding_window_size=params.swa_retain_window,
+                swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
