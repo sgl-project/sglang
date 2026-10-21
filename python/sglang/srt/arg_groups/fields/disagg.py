@@ -84,7 +84,8 @@ class Disagg(msgspec.Struct):
             help=(
                 "JSON list of Prefill bootstrap endpoints (host:port) that a "
                 "Decode server may query. Configure every Prefill endpoint "
-                "used by the router; unlisted request endpoints are rejected."
+                "used by the router; unlisted request endpoints are rejected. "
+                "Defaults to empty, which rejects all request endpoints."
             ),
             type_parser=json_list_type,
         ),

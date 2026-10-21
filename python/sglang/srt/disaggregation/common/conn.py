@@ -464,6 +464,8 @@ class CommonKVManager(BaseKVManager):
                 _normalize_bootstrap_addr(addr)
                 for addr in get_disagg().disaggregation_bootstrap_allowlist
             )
+            self._empty_bootstrap_allowlist_error_logged = False
+            self._empty_bootstrap_allowlist_log_lock = threading.Lock()
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
@@ -1361,6 +1363,18 @@ class CommonKVManager(BaseKVManager):
         return True
 
     def get_allowed_prefill_bootstrap_addr(self, bootstrap_addr: str) -> Optional[str]:
+        if not self.prefill_bootstrap_allowlist:
+            with self._empty_bootstrap_allowlist_log_lock:
+                should_log = not self._empty_bootstrap_allowlist_error_logged
+                self._empty_bootstrap_allowlist_error_logged = True
+            if should_log:
+                logger.error(
+                    "Rejecting Decode bootstrap requests because no Prefill "
+                    "bootstrap endpoints are configured. Set "
+                    "--disaggregation-bootstrap-allowlist to a JSON list of "
+                    "every router-selectable Prefill host:port endpoint."
+                )
+            return None
         try:
             normalized_addr = _normalize_bootstrap_addr(bootstrap_addr)
         except (TypeError, ValueError):

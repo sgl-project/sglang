@@ -1,6 +1,7 @@
 """Regression tests for Decode bootstrap endpoint validation."""
 
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,6 +23,8 @@ class TestBootstrapAddrValidation(CustomTestCase):
     def _manager(self, allowed_addrs):
         manager = CommonKVManager.__new__(CommonKVManager)
         manager.prefill_bootstrap_allowlist = set(allowed_addrs)
+        manager._empty_bootstrap_allowlist_error_logged = False
+        manager._empty_bootstrap_allowlist_log_lock = threading.Lock()
         manager.prefill_info_table = {}
         manager.kv_args = SimpleNamespace(page_size=16, state_types=[])
         manager.kv_cache_dtype_str = "auto"
@@ -61,6 +64,20 @@ class TestBootstrapAddrValidation(CustomTestCase):
 
         get.assert_not_called()
         self.assertEqual(manager.prefill_info_table, {})
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_empty_allowlist_logs_flag_guidance_once(self, get):
+        manager = self._manager(set())
+
+        with self.assertLogs(
+            "sglang.srt.disaggregation.common.conn", level="ERROR"
+        ) as captured:
+            self.assertFalse(manager.try_ensure_parallel_info("prefill-a:8998"))
+            self.assertFalse(manager.try_ensure_parallel_info("prefill-b:8998"))
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("--disaggregation-bootstrap-allowlist", captured.output[0])
+        get.assert_not_called()
 
     @patch("sglang.srt.disaggregation.common.conn.requests.get")
     def test_registered_bootstrap_address_is_queried_with_timeout(self, get):
