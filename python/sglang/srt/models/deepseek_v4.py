@@ -4032,7 +4032,7 @@ class DeepseekV4Model(nn.Module):
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
             if use_tail_graph and tail is None and i == self.late_layer_start:
-                residual, pre, aux = self.decoder_replay_tail.run_idle(
+                residual, pre, aux = self.decoder_replay_tail.run_without_tail(
                     state=state,
                     positions=positions,
                     input_ids=input_ids,

@@ -301,6 +301,21 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             result_b, self.normal(self.model(predecessor=True), self.batch(offset=20))
         )
 
+    def test_split_prefill_never_enters_row_bucket_tail_graphs(self):
+        model = self.model(predecessor=True)
+        model.decoder_replay_tail = Mock()
+        model.decoder_replay_tail.plan.side_effect = AssertionError(
+            "unexpected tail graph"
+        )
+        batch = self.batch()
+        self.assertIsNone(self.split(model, batch, (0, 2)))
+        result = self.split(model, batch, (2, 4))
+        self.assert_results_equal(
+            result, self.normal(self.model(predecessor=True), self.batch())
+        )
+        model.decoder_replay_tail.plan.assert_not_called()
+        model.decoder_replay_tail.run_without_tail.assert_not_called()
+
     def test_cuda_residual_stream_survives_interleaved_slices(self):
         class CudaLayer(_PrevLayer):
             def __call__(
