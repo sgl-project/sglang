@@ -30,7 +30,7 @@ KV_HEADS = (1, 2)
 class TestVattnAsmSegmentPlanCap(CustomTestCase):
     def test_cap_is_twice_the_exact_uniform_cu_share(self):
         cases = [
-            (8, 1, 64),  # share 32
+            (8, 1, 64),  # share 32, clamped to 64
             (2, 1, 256),  # share 128, clamped to 256 (num_cus)
             (9, 1, 56),  # 28 is not a power of two
             (16, 1, 32),  # exact divisor: pow2 and exact agree
@@ -60,8 +60,8 @@ class TestVattnAsmSegmentPlanCap(CustomTestCase):
                 self.assertEqual(caps, sorted(caps, reverse=True))
 
     def test_cap_stays_within_the_kernel_bounds(self):
-        """The partial buffers are allocated for the cap; past 64 segments
-        (vred's one-per-lane limit) the reduce runs in Triton, up to num_cus."""
+        """The partial buffers are allocated for the cap, and the assembly
+        kernel's reduce falls back to Triton past 64."""
         for num_kv_heads in KV_HEADS:
             for num_seqs in range(1, NUM_CU + 2):
                 cap = mtp_verify_attn_seg_max(num_seqs, num_kv_heads, num_cus=NUM_CU)

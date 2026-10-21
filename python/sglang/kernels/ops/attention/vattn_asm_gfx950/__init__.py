@@ -29,12 +29,6 @@ logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG2E = 1.4426950408889634
-# 1 WG/CU (LDS-bound), so small batches need up to num_cus segments to fill the GPU;
-# vred reduces at most 64 (one per lane), more go through _reduce_triton.
-_SEG_CAP = 256
-_VRED_MAX_SEGS = 64
-# >= 256 tokens per segment: shorter ones cost more in fp32 partials than they save
-_MIN_SEG_TILES = 16
 
 _hip = None
 _kernels = {}
@@ -334,7 +328,7 @@ def mtp_verify_attn_seg_max(
     num_seqs: int, num_kv_heads: int, num_cus: int | None = None
 ) -> int:
     """Static grid.x for the planned split: 2x the exact equal-share CU budget,
-    clamped to 16.._SEG_CAP.
+    clamped to 16..num_cus (1 WG/CU, so a small batch needs that many to fill the GPU).
 
     Unlike mtp_verify_attn_num_segments (the legacy fixed split), the share is
     not rounded down to a power of two: that quantization costs a long request
@@ -347,7 +341,7 @@ def mtp_verify_attn_seg_max(
     if num_cus is None:
         num_cus = _seg_plan_target_wgs()
     uniform_share = max(1, num_cus // max(1, num_seqs * num_kv_heads))
-    return max(16, min(_SEG_CAP, 2 * uniform_share))
+    return max(16, min(num_cus, 2 * uniform_share))
 
 
 def _get_plan_kernel():
@@ -366,7 +360,6 @@ def _get_plan_kernel():
             num_work,
             target_wgs,
             seg_max,
-            min_tiles,
             BLOCK_B: tl.constexpr,
             BLOCK_W: tl.constexpr,
             BLOCK_Q: tl.constexpr,
@@ -385,7 +378,7 @@ def _get_plan_kernel():
                     (total + target_wgs - 1) // target_wgs,
                     (mx + seg_max - 1) // seg_max,
                 ),
-                tl.maximum(min_tiles, 1),
+                16,  # >= 256 tokens: shorter segments cost more in fp32 partials than they save
             )
             slack = target_wgs - num_seqs
             hi = tl.where(
@@ -458,7 +451,6 @@ def build_seg_plan(seq_lens, cu_seqlens_q, num_tokens, seg_max, num_kv_heads=1):
         num_work,
         seg_plan_target_wgs(num_kv_heads),
         seg_max,
-        _MIN_SEG_TILES,
         BLOCK_B=max(16, triton.next_power_of_2(num_seqs)),
         BLOCK_W=max(64, triton.next_power_of_2(seg_max)),
         BLOCK_Q=16,
@@ -517,7 +509,6 @@ def _get_reduce_triton():
             num_q_heads,
             out_s0,
             out_s1,
-            HAS_TOK_NSEG: tl.constexpr,
             NSEG_P2: tl.constexpr,
             HEAD_SIZE: tl.constexpr,
             BLOCK_D: tl.constexpr,
@@ -525,12 +516,8 @@ def _get_reduce_triton():
             # same contract as vred.s, one program per (token, head, BLOCK_D dims)
             t = tl.program_id(0)
             h = tl.program_id(1)
-            if HAS_TOK_NSEG:
-                cnt = tl.load(tok_nseg_ptr + t)
-            else:
-                cnt = num_segments
             s = tl.arange(0, NSEG_P2)
-            msk = s < cnt
+            msk = s < tl.load(tok_nseg_ptr + t)
             row = (t * num_q_heads + h).to(tl.int64) * num_segments + s
             m = tl.load(sm_ptr + row, mask=msk, other=float("-inf"))
             l = tl.load(se_ptr + row, mask=msk, other=0.0)
@@ -551,8 +538,6 @@ def _get_reduce_triton():
 
 
 def _reduce_triton(out, segm_out, segm_max, segm_expsum, tok_nseg, num_segments):
-    import triton
-
     num_tokens, num_q_heads, head_size = out.shape
     block_d = 64
     _get_reduce_triton()[(num_tokens, num_q_heads, head_size // block_d)](
@@ -560,13 +545,12 @@ def _reduce_triton(out, segm_out, segm_max, segm_expsum, tok_nseg, num_segments)
         segm_out,
         segm_max,
         segm_expsum,
-        tok_nseg if tok_nseg is not None else segm_max,
+        tok_nseg,
         num_segments,
         num_q_heads,
         out.stride(0),
         out.stride(1),
-        HAS_TOK_NSEG=tok_nseg is not None,
-        NSEG_P2=triton.next_power_of_2(num_segments),
+        NSEG_P2=1 << (num_segments - 1).bit_length(),
         HEAD_SIZE=head_size,
         BLOCK_D=block_d,
         num_warps=4,
@@ -655,7 +639,7 @@ def mtp_verify_attn_fwd_asm(
         kern.launch((num_segments, num_seqs, num_kv_heads), (512, 1, 1), args, stream)
 
     assert out.stride(2) == 1 and out.dtype == torch.bfloat16
-    if num_segments > _VRED_MAX_SEGS:
+    if num_segments > 64:  # vred.s reduces one segment per lane
         _reduce_triton(out, segm_out, segm_max, segm_expsum, tok_nseg, num_segments)
         return out
     rm, rsh = _magic_u32(num_q_heads)

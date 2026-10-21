@@ -123,7 +123,7 @@ class TestVattnSegPlan(CustomTestCase):
         T, work = plan[0], plan[1:]
         nts = [(kv + 15) // 16 for kv in seq_lens.tolist()]
         target = V.seg_plan_target_wgs(hkv)
-        lo = max(_cdiv(sum(nts), target), _cdiv(max(nts), seg_max), V._MIN_SEG_TILES, 1)
+        lo = max(_cdiv(sum(nts), target), _cdiv(max(nts), seg_max), 16)
         slack = target - len(lens)
         hi = max(lo, _cdiv(sum(nts), slack)) if slack > 0 else lo
         while lo < hi:
