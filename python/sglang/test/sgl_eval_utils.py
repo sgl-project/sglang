@@ -77,6 +77,61 @@ def _print_truncated_samples(result):
         print(f"sgl-eval truncated sample: {json.dumps(preview)}", flush=True)
 
 
+_INVALID_ANSWER_CATEGORIES = ("no_boxed", "boxed_not_brace", "unclosed", "other")
+
+
+def _classify_invalid_answer(text):
+    """Bucket a generation from which no \\boxed answer could be extracted."""
+    text = text or ""
+    idx = text.rfind("\\boxed")
+    if idx < 0:
+        return "no_boxed"
+    rest = text[idx + len("\\boxed") :]
+    if not rest.startswith("{"):
+        return "boxed_not_brace"
+    depth = 0
+    for char in rest:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return "other"
+    return "unclosed"
+
+
+def _print_invalid_samples(result, limit=3):
+    counts = dict.fromkeys(_INVALID_ANSWER_CATEGORIES, 0)
+    previews = []
+    for example in result.per_example:
+        for repeat, (sample, answer) in enumerate(
+            zip(example.samples, example.extracted)
+        ):
+            if answer is not None:
+                continue
+            text = sample.text or ""
+            category = _classify_invalid_answer(text)
+            counts[category] += 1
+            if len(previews) < limit:
+                previews.append(
+                    {
+                        "example_id": example.example.id,
+                        "repeat": repeat,
+                        "category": category,
+                        "finish_reason": sample.finish_reason,
+                        "completion_tokens": sample.completion_tokens,
+                        "text_chars": len(text),
+                        "tail": text[-300:],
+                    }
+                )
+    total = sum(counts.values())
+    if not total:
+        return
+    print(f"sgl-eval invalid answers: total={total} {json.dumps(counts)}", flush=True)
+    for preview in previews:
+        print(f"sgl-eval invalid sample: {json.dumps(preview)}", flush=True)
+
+
 def run_sgl_eval(args):
     # math_verify uses SIGALRM, which requires the process's main thread.
     if threading.current_thread() is not threading.main_thread():
@@ -208,6 +263,7 @@ def run_sgl_eval(args):
         )
     )
     _print_truncated_samples(result)
+    _print_invalid_samples(result)
     if result.aggregate.get("error_rate", 0) > 0:
         raise RuntimeError(
             f"{spec.name} evaluation had request errors "
