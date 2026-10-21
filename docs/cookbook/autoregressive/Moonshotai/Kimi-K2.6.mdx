@@ -103,6 +103,10 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 
 Kimi-K2.6 can also be deployed on the **Ascend A3 Series** (e.g., Atlas 800I A3) with the W4A8 INT8 quantized checkpoint and an EAGLE3 draft model for speculative decoding. Select **A3** as the hardware platform in the generator above, then pick a **Deployment Shape** to get the full command set:
 
+<Note>
+The A3 recipes in this section were validated with the pinned `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3` image (CANN 9.0.0, Ascend A3).
+</Note>
+
 - **1×A3, PD co-located** — a single 8-card node serving prefill and decode together, tuned for low latency (reference TPOT ≈ 20 ms on 3.5k+1.5k).
 - **2×A3, PD disaggregated** — one prefill node plus one decode node behind the SGLang router, tuned for long-context throughput (reference TPOT ≈ 100 ms on 64k+1.5k).
 
@@ -129,7 +133,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 Benchmark the co-located shape (random dataset, 3.5k input / 1.5k output, concurrency 64):
 
 ```bash Command
-python -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -145,13 +149,36 @@ python -m sglang.bench_serving \
 
 Measured on one Atlas 800I A3 server (16 dies, W4A8 + EAGLE3, `--mem-fraction-static 0.85`):
 
-| Metric | Result |
-| --- | --- |
-| Accuracy (EvalScope, GSM8K, limit 100) | 98% |
-| Median time per output token | 21.5 ms (reference 20 ms) |
-| Mean time per output token | 26.55 ms |
-| Output throughput | 1491 tok/s (peak 2745 tok/s) |
-| EAGLE3 acceptance length | 4.25 |
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th>Result</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Accuracy (EvalScope, GSM8K, limit 100)</td>
+      <td>98%</td>
+    </tr>
+    <tr>
+      <td>Median time per output token</td>
+      <td>21.5 ms (reference 20 ms)</td>
+    </tr>
+    <tr>
+      <td>Mean time per output token</td>
+      <td>26.55 ms</td>
+    </tr>
+    <tr>
+      <td>Output throughput</td>
+      <td>1491 tok/s (peak 2745 tok/s)</td>
+    </tr>
+    <tr>
+      <td>EAGLE3 acceptance length</td>
+      <td>4.25</td>
+    </tr>
+  </tbody>
+</table>
 
 <Warning>
 **Device OOM under burst load on custom builds.** The co-located command is tuned for the reference container image, in which `--mem-fraction-static 0.865` leaves only ~2.7 GB free per die after startup. On self-built environments whose kernels reserve more workspace, a 64-way concurrent burst can exhaust that headroom and crash a scheduler (allocation failure inside `deep_ep` dispatch / `AtbRingMLA`). If this happens, lower `--mem-fraction-static` (e.g. `0.85`; the minimum viable value for this model is ~0.828) and re-run.
@@ -160,7 +187,7 @@ Measured on one Atlas 800I A3 server (16 dies, W4A8 + EAGLE3, `--mem-fraction-st
 Benchmark the PD shape against the router (random dataset, 64k input / 1.5k output, long-context throughput):
 
 ```bash Command
-python -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -176,14 +203,31 @@ python -m sglang.bench_serving \
 
 Measured on two Atlas 800I A3 nodes (1P1D, W4A8 + EAGLE3, single request):
 
-| Metric | Result |
-| --- | --- |
-| Accuracy (EvalScope, GSM8K, limit 100) | 99% |
-| Time per output token | 35.77 ms (reference 100 ms) |
-| Mean time to first token | 8318 ms (64k prefill) |
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th>Result</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Accuracy (EvalScope, GSM8K, limit 100)</td>
+      <td>99%</td>
+    </tr>
+    <tr>
+      <td>Time per output token</td>
+      <td>35.77 ms (reference 100 ms)</td>
+    </tr>
+    <tr>
+      <td>Mean time to first token</td>
+      <td>8318 ms (64k prefill)</td>
+    </tr>
+  </tbody>
+</table>
 
 <Info>
-In offline environments, pass `--tokenizer <local model path>` and `--dataset-path <local ShareGPT json>` to `bench_serving` so it does not try to download them; note that some SGLang versions no longer accept the legacy `--max-attempts` flag. End-to-end accuracy can be verified against the running server with EvalScope (e.g. `--datasets gsm8k`) — see [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+In offline environments, pass `--tokenizer <local model path>` and `--dataset-path <local ShareGPT json>` to the benchmark command so it does not try to download them; note that some SGLang versions no longer accept the legacy `--max-attempts` flag. End-to-end accuracy can be verified against the running server with EvalScope (e.g. `--datasets gsm8k`) — see [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 </Info>
 
 <Info>
