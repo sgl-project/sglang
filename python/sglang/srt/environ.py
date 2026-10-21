@@ -1893,6 +1893,8 @@ class Envs:
     SGLANG_MUSE_VERIFY_SWA_GQA = EnvBool(True)
     SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
     SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
+    # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
+    SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )

@@ -16,6 +16,7 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import logging
 import math
 from typing import Optional
 
@@ -24,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.dflash_block_splitkv import dflash_block_splitkv
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
@@ -36,6 +38,12 @@ if _is_cuda:
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+
+logger = logging.getLogger(__name__)
+
+# DFlash draft blocks (Muse Spark DFlash2 at TP8) on gfx950 take the split-KV kernel.
+_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_MUSE_DFLASH_SPLITKV.get()
+_dflash_block_splitkv_logged: set = set()
 
 try:
     _triton_version_parts = tuple(
@@ -966,6 +974,63 @@ def extend_attention_fwd(
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+
+    # DFlash draft block: up to 8 requests x 8 query rows, 8 heads on one KV
+    # head, head_dim 128, non-causal, against an FP8 prefix cache. The generic
+    # kernel walks the whole window prefix in one program per (block, head);
+    # split-KV spreads it across workgroups, with BF16 probabilities for P.V.
+    if (
+        _use_dflash_block_splitkv
+        and 1 <= batch_size <= 8
+        and Lq == Lk == Lv == 128
+        and head_num == 8
+        and k_extend.shape[1] == 1
+        and max_len_extend == 8
+        and q_extend.shape[0] == batch_size * 8
+        and not is_causal
+        and (sliding_window_size < 0 or sliding_window_size >= 8)
+        and q_extend.dtype == k_extend.dtype == v_extend.dtype == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        and k_buffer.ndim == v_buffer.ndim == 3
+        and o_extend.is_contiguous()
+        and custom_mask is None
+        and sinks is None
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and score_mod is None
+        and aux_tensors is None
+        and lse_extend is None
+        and not skip_prefix
+        and not skip_extend
+        and not identity_kv_indices
+    ):
+        if k_buffer.data_ptr() not in _dflash_block_splitkv_logged:
+            _dflash_block_splitkv_logged.add(k_buffer.data_ptr())
+            logger.info(
+                "Muse DFlash split-KV16 active: Q=%s, window=%d, prefix_cache=%d, "
+                "BF16 probability PV",
+                tuple(q_extend.shape),
+                sliding_window_size,
+                k_buffer.data_ptr(),
+            )
+        dflash_block_splitkv(
+            q_extend,
+            k_extend,
+            v_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kscale=k_scale,
+            vscale=v_scale,
+            softmax_scale=sm_scale,
+            pv_bf16=True,
+            out=o_extend,
+            window_left=sliding_window_size,
+        )
+        return
+
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
     zero_prefix_shape = (
         head_num == 12
