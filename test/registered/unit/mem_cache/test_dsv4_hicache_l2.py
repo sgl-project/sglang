@@ -178,6 +178,42 @@ class TestDSV4HostViews(CustomTestCase):
 
 
 class TestC128L2Ownership(CustomTestCase):
+    def test_eviction_hooks_accept_cache_actions(self):
+        pages = torch.tensor([7, 8])
+        data = SimpleNamespace(value=pages, host_value=None)
+        node = SimpleNamespace(component_data={ComponentType.C128: data})
+        component = C128SidecarComponent.__new__(C128SidecarComponent)
+        component.tree_core = SimpleNamespace(
+            component_evictable_size_={ComponentType.C128: 2}
+        )
+        device_frees = {ComponentType.C128: []}
+        host_frees = {ComponentType.C128: []}
+        actions = []
+
+        self.assertEqual(
+            component.evict_component(
+                node, device_frees, host_frees, cache_actions=actions
+            ),
+            (0, 0),
+        )
+        self.assertIsNone(data.value)
+        self.assertIs(device_frees[ComponentType.C128][0], pages)
+        self.assertEqual(
+            component.tree_core.component_evictable_size_[ComponentType.C128], 0
+        )
+
+        component.is_evict_device_ongoing = False
+        component.evict_device_start(1)
+        try:
+            self.assertIsNone(
+                component.evict_device_next_node(
+                    {}, device_frees, host_frees, cache_actions=actions
+                )
+            )
+        finally:
+            component.evict_device_end()
+        self.assertEqual(actions, [])
+
     def test_load_back_retains_and_attaches_each_c128_page(self):
         allocator = SimpleNamespace(
             c128_attn_allocator=SimpleNamespace(page_size=4),

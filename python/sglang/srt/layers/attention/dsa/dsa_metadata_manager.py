@@ -6,7 +6,7 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING
 
-from sglang.kernels.ops.attention.dsa_metadata import (
+from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
@@ -50,14 +50,14 @@ class DSAMetadataManagementMixin:
         self._fused_verify_metadata = fused_dsa_target_verify_metadata
         self._fused_draft_extend_metadata = fused_dsa_draft_extend_metadata
         if self.experimental_kpool_metadata_fusion:
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.decode import (
-                fused_dsa_decode_metadata as decode,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.decode import (
+                fused_dsa_decode_metadata_kpool as decode,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.draft_extend import (
-                fused_dsa_draft_extend_metadata as draft_extend,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.draft_extend import (
+                fused_dsa_draft_extend_metadata_kpool as draft_extend,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.verify import (
-                fused_dsa_target_verify_metadata as verify,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
+                fused_dsa_target_verify_metadata_kpool as verify,
             )
 
             self._fused_decode_metadata = partial(
@@ -84,7 +84,7 @@ class DSAMetadataManagementMixin:
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 

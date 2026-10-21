@@ -887,7 +887,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if (
             in_capture
-            and envs.SGLANG_FLASHINFER_VERIFY_HOST_PLAN.get()
+            and envs.SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN.get()
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
@@ -2420,8 +2420,9 @@ def _build_draft_indptr_host(
     """Mirror the draft kernel's prefix sums from resolved host lengths.
 
     At draft entry, positions repeat each committed sequence length ``topk``
-    times. Step i adds i+1 tokens per branch. This also covers the graph
-    runner's padded rows, whose CPU lengths have already been filled.
+    times. Step i adds i+1 tokens per branch. Only live entries match the
+    device prefix sums: graph padding fills CPU lengths with 1 while device
+    positions stay 0, so padded entries differ.
     """
     assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
     offsets = [0]
@@ -2518,7 +2519,7 @@ class FlashInferMultiStepDraftBackend:
         )
         host_lengths = forward_batch.seq_lens_cpu
         use_host_indptr = (
-            envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.get()
             and self.draft_window_size == 0
             and host_lengths is not None
             and host_lengths.device.type == "cpu"
