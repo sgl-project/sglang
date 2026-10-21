@@ -1285,13 +1285,12 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
-    def determine_num_fused_shared_experts(self):
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
         # The GLM target Gluon kernels consume the rank-local appended shared
         # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
         # models whose kernels have not implemented that ABI.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+        return hf_config.n_shared_experts or 0
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
@@ -1306,14 +1305,14 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 
-    def determine_num_fused_shared_experts(self):
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
         # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
         # model-level loader decision as well as the layer-level decision so
         # the checkpoint remap cannot append it to the routed expert bank.
         if get_moe_runner_backend().is_gluon():
-            self.num_fused_shared_experts = 0
-        else:
-            super().determine_num_fused_shared_experts()
+            return 0
+        return super().num_fusable_shared_experts(hf_config)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):

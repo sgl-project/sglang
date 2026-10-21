@@ -676,17 +676,6 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = is_shared_experts_fusion_disabled() or (
-            get_moe_runner_backend().is_gluon()
-            and (
-                is_nextn
-                or (
-                    self.moe_ep_size > 1
-                    and getattr(config, "model_type", None) != "glm_moe_dsa"
-                )
-            )
-        )
-
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
@@ -3431,16 +3420,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Return the model's fusable shared-expert count."""
+        # Generic Gluon EP kernels keep the shared expert native. GLM's
+        # target class overrides this hook for its fused rank-local slot.
+        if get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1:
+            return 0
         return hf_config.n_shared_experts or 0
-
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0
-            if is_shared_experts_fusion_disabled()
-            or (get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1)
-            else self.config.n_shared_experts
-        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

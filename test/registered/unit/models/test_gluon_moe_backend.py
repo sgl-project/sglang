@@ -158,71 +158,100 @@ class _Gluon:
         return False
 
 
+def _resolve_shared_experts(monkeypatch, model_class, *, disable_fusion=False):
+    from sglang.srt.layers.moe import utils as moe_utils
+
+    monkeypatch.setattr(
+        moe_utils,
+        "get_exec",
+        lambda: SimpleNamespace(
+            moe=SimpleNamespace(
+                disable_shared_experts_fusion=disable_fusion, enable_waterfill=False
+            )
+        ),
+    )
+    # Isolate the Gluon layout policy from the generic hardware/quant gates.
+    monkeypatch.setattr(
+        model_class, "shared_experts_fusion_disable_reason", lambda *_: None
+    )
+    return moe_utils.resolve_shared_experts_config(
+        model_class, SimpleNamespace(n_shared_experts=1), None
+    )
+
+
 def test_gluon_ep1_reuses_generic_shared_expert_fusion(monkeypatch):
-    model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
-    model.config = SimpleNamespace(n_shared_experts=1)
-    monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: False)
     monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
     monkeypatch.setattr(
         deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=1)
     )
 
-    model.determine_num_fused_shared_experts()
+    config = _resolve_shared_experts(monkeypatch, deepseek_v2.DeepseekV2ForCausalLM)
 
-    assert model.num_fused_shared_experts == 1
+    assert config.num_fused_shared_experts == 1
 
 
 def test_gluon_ep1_honors_disable_shared_experts_fusion(monkeypatch):
-    model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
-    model.config = SimpleNamespace(n_shared_experts=1)
-    monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: True)
     monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
     monkeypatch.setattr(
         deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=1)
     )
 
-    model.determine_num_fused_shared_experts()
+    config = _resolve_shared_experts(
+        monkeypatch, deepseek_v2.DeepseekV2ForCausalLM, disable_fusion=True
+    )
 
-    assert model.num_fused_shared_experts == 0
+    assert config.fusion_disabled
+    assert config.num_fused_shared_experts == 0
 
 
 def test_gluon_ep_keeps_shared_expert_native(monkeypatch):
-    model = deepseek_v2.DeepseekV2ForCausalLM.__new__(deepseek_v2.DeepseekV2ForCausalLM)
-    model.config = SimpleNamespace(n_shared_experts=1)
-    monkeypatch.setattr(deepseek_v2, "is_shared_experts_fusion_disabled", lambda: False)
     monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
     monkeypatch.setattr(
         deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=4)
     )
 
-    model.determine_num_fused_shared_experts()
+    config = _resolve_shared_experts(monkeypatch, deepseek_v2.DeepseekV2ForCausalLM)
 
-    assert model.num_fused_shared_experts == 0
+    assert config.num_fused_shared_experts == 0
 
 
-def test_gluon_glm_target_ep_fuses_shared_expert(monkeypatch):
+@pytest.mark.parametrize("ep_size", (1, 4))
+@pytest.mark.parametrize("disable_fusion", (False, True))
+def test_gluon_glm_target_ep_fuses_shared_expert(monkeypatch, ep_size, disable_fusion):
     from sglang.srt.models import glm4_moe
 
-    model = glm4_moe.GlmMoeDsaForCausalLM.__new__(glm4_moe.GlmMoeDsaForCausalLM)
-    model.config = SimpleNamespace(n_shared_experts=1)
-    monkeypatch.setattr(glm4_moe, "is_shared_experts_fusion_disabled", lambda: False)
+    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: _Gluon())
+    monkeypatch.setattr(
+        deepseek_v2, "get_parallel", lambda: SimpleNamespace(moe_ep_size=ep_size)
+    )
 
-    model.determine_num_fused_shared_experts()
+    config = _resolve_shared_experts(
+        monkeypatch, glm4_moe.GlmMoeDsaForCausalLM, disable_fusion=disable_fusion
+    )
 
-    assert model.num_fused_shared_experts == 1
+    assert config.num_fused_shared_experts == (0 if disable_fusion else 1)
 
 
 def test_gluon_glm_nextn_pins_shared_expert_native(monkeypatch):
     from sglang.srt.models import glm4_moe
 
-    model = glm4_moe.GlmMoeDsaForCausalLMNextN.__new__(
-        glm4_moe.GlmMoeDsaForCausalLMNextN
-    )
     monkeypatch.setattr(glm4_moe, "get_moe_runner_backend", lambda: _Gluon())
 
-    model.determine_num_fused_shared_experts()
+    config = _resolve_shared_experts(monkeypatch, glm4_moe.GlmMoeDsaForCausalLMNextN)
 
-    assert model.num_fused_shared_experts == 0
+    assert config.num_fused_shared_experts == 0
+
+
+def test_non_gluon_glm_nextn_reuses_generic_fusion_policy(monkeypatch):
+    from sglang.srt.models import glm4_moe
+
+    backend = SimpleNamespace(is_gluon=lambda: False)
+    monkeypatch.setattr(glm4_moe, "get_moe_runner_backend", lambda: backend)
+    monkeypatch.setattr(deepseek_v2, "get_moe_runner_backend", lambda: backend)
+
+    config = _resolve_shared_experts(monkeypatch, glm4_moe.GlmMoeDsaForCausalLMNextN)
+
+    assert config.num_fused_shared_experts == 1
 
 
 def test_gluon_backend_rejects_fp8_quant_method(monkeypatch):
