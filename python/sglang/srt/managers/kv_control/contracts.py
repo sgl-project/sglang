@@ -89,9 +89,24 @@ class ContentSpan(Value):
     start_token: Position
     end_token: Position
     dependency_start: Position = 0
+    coverage_kind: Literal["tokens", "window", "checkpoint"] = "tokens"
+    window_size: Position | None = None
 
 
-class ContentTarget(Value, tag="content", tag_field="kind"):
+class CacheCompatibility(Value):
+    cache_salt: Identifier | None = None
+    extra_key: Identifier | None = None
+    layout_id: Identifier | None = None
+    is_multimodal: bool = False
+
+
+def cache_compatibility(target) -> CacheCompatibility:
+    return CacheCompatibility(
+        **{name: getattr(target, name) for name in CacheCompatibility.__struct_fields__}
+    )
+
+
+class ContentTarget(CacheCompatibility, tag="content", tag_field="kind", kw_only=True):
     namespace: Identifier
     token_count: Position
     components: Annotated[
@@ -103,7 +118,7 @@ class ContentTarget(Value, tag="content", tag_field="kind"):
     allow_clip: bool = False
 
 
-class TokensTarget(Value, tag="tokens", tag_field="kind"):
+class TokensTarget(CacheCompatibility, tag="tokens", tag_field="kind", kw_only=True):
     namespace: Identifier
     token_ids: Annotated[
         tuple[Position, ...], msgspec.Meta(min_length=1, max_length=65536)
@@ -237,6 +252,9 @@ class TargetOutcome(Value):
     completed_steps: tuple[Identifier, ...] = ()
     code: str = ""
     reason: str = ""
+    # Checkpoints are points [end, end], not per-token physical coverage.
+    coverage_kind: Literal["tokens", "window", "checkpoint"] = "tokens"
+    window_size: Position | None = None
 
 
 class TaskIdentity(Value):
@@ -324,18 +342,35 @@ def validate_target(target: LogicalTarget) -> None:
                 not 0
                 <= span.dependency_start
                 <= span.start_token
-                < span.end_token
+                <= span.end_token
                 <= target.token_count
             ):
                 raise ControlError(
                     "invalid_payload", "Invalid content or dependency range"
+                )
+            if (span.coverage_kind == "checkpoint") != (
+                span.start_token == span.end_token
+            ) or span.end_token == 0:
+                raise ControlError(
+                    "invalid_payload",
+                    "Checkpoint descriptors are nonzero points; token spans are nonempty",
+                )
+            if (span.coverage_kind == "window" and not span.window_size) or (
+                span.coverage_kind != "window" and span.window_size is not None
+            ):
+                raise ControlError(
+                    "invalid_payload",
+                    "Window descriptors require a positive window size",
                 )
             if span.component not in target.components:
                 raise ControlError("invalid_payload", "Undeclared content component")
             by_component.setdefault(span.component, []).append(span)
         for spans in by_component.values():
             ordered = sorted(spans, key=lambda span: span.start_token)
-            if any(a.end_token > b.start_token for a, b in zip(ordered, ordered[1:])):
+            if len({(s.coverage_kind, s.window_size) for s in spans}) > 1 or any(
+                a.end_token > b.start_token or a.start_token == b.start_token
+                for a, b in zip(ordered, ordered[1:])
+            ):
                 raise ControlError(
                     "invalid_payload", "Overlapping component descriptors"
                 )

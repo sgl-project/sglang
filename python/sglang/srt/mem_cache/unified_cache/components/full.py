@@ -206,6 +206,9 @@ class FullComponent(TreeComponent):
         self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
+        if getattr(self.tree_core, "priority_claims", None) is not None:
+            self._evict_device_heap = []
+            return
         self._evict_device_heap = [
             (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_device_leaves
@@ -219,6 +222,11 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
         ct = self.component_type
+        if getattr(self.tree_core, "priority_claims", None) is not None:
+            if tracker[ct] >= self._evict_device_request_cnt:
+                return None
+            candidate = self._control_eviction_candidate()
+            return candidate.id if candidate is not None else None
         lv = self._evict_device_last_node
         if (
             lv is not None

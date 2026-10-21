@@ -464,6 +464,8 @@ class SWAComponent(TreeComponent):
             )
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
+        if getattr(self.tree_core, "priority_claims", None) is not None:
+            self.tree_core.priority_claims.forget(node, BASE_COMPONENT_TYPE)
         full_cd.value = incoming_full.clone()
         cache_actions.append(FreeDeviceKVFullOnly([old_full]))
         self._publish_window(node=node, cache_actions=cache_actions)
@@ -731,7 +733,10 @@ class SWAComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        if self.tree_core.enable_session_radix_cache:
+        if (
+            self.tree_core.enable_session_radix_cache
+            and getattr(self.tree_core, "priority_claims", None) is None
+        ):
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
             self._evict_device_cursor = lru.cursor_next()
@@ -756,7 +761,12 @@ class SWAComponent(TreeComponent):
         """
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
-        enabled = self.tree_core.enable_session_radix_cache
+        controlled = getattr(self.tree_core, "priority_claims", None) is not None
+        enabled = self.tree_core.enable_session_radix_cache and not controlled
+        if tracker[ct] >= self._evict_device_request_cnt:
+            return None
+        if controlled:
+            self._evict_device_cursor = self._control_eviction_candidate()
         if self._evict_device_cursor is not None and not lru.in_list(
             self._evict_device_cursor
         ):
@@ -824,7 +834,10 @@ class SWAComponent(TreeComponent):
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
-        if self.tree_core.enable_session_radix_cache:
+        if (
+            self.tree_core.enable_session_radix_cache
+            and getattr(self.tree_core, "priority_claims", None) is None
+        ):
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
 

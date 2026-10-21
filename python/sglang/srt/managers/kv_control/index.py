@@ -9,6 +9,7 @@ import msgspec
 
 from sglang.srt.managers.kv_control.contracts import (
     Associate,
+    CacheCompatibility,
     ContentSpan,
     ContentTarget,
     ControlError,
@@ -23,6 +24,7 @@ from sglang.srt.managers.kv_control.contracts import (
     TokenRange,
     TokensTarget,
     Value,
+    cache_compatibility,
     validate_target,
     validated,
 )
@@ -117,7 +119,9 @@ class LogicalIndex:
         self.generation = 0
         self._sessions: dict[str, _Session] = {}
         self._continuations: dict[tuple[str, str], Continuation] = {}
-        self._members: dict[ContentSpan, set[tuple[str, str]]] = {}
+        self._members: dict[
+            tuple[CacheCompatibility, ContentSpan], set[tuple[str, str]]
+        ] = {}
         self._spans = 0
         self._tokens = 0
 
@@ -239,7 +243,9 @@ class LogicalIndex:
         session.continuations.add(payload.continuation_id)
         if isinstance(content, ContentTarget):
             for span in content.spans:
-                self._members.setdefault(span, set()).add(key)
+                self._members.setdefault(
+                    (cache_compatibility(content), span), set()
+                ).add(key)
         self._spans += spans - old_spans
         self._tokens += tokens - old_tokens
         self._touch(payload.session_id)
@@ -247,6 +253,11 @@ class LogicalIndex:
 
     @staticmethod
     def _check_extension(old, new):
+        if cache_compatibility(old) != cache_compatibility(new):
+            raise ControlError(
+                "incompatible_namespace",
+                "Continuation cache compatibility cannot change",
+            )
         if type(old) is not type(new) or _length(new) < _length(old):
             raise ControlError("conflict", "Continuation identity is append-only")
         if isinstance(old, TokensTarget):
@@ -260,6 +271,11 @@ class LogicalIndex:
             )
 
     def _check_parent(self, parent, child, end):
+        if cache_compatibility(parent) != cache_compatibility(child):
+            raise ControlError(
+                "incompatible_namespace",
+                "Branch cache compatibility differs from parent",
+            )
         if not 0 < end <= min(_length(parent), _length(child)):
             raise ControlError("missing", "Parent prefix boundary is not tracked")
         if type(parent) is not type(child):
@@ -288,10 +304,16 @@ class LogicalIndex:
             session.revision = self.generation
             session_id = session.parent_id
 
-    def members(self, span: ContentSpan) -> tuple[tuple[str, str], ...]:
+    def members(
+        self,
+        span: ContentSpan,
+        *,
+        compatibility: CacheCompatibility = CacheCompatibility(),
+    ) -> tuple[tuple[str, str], ...]:
         """Reverse lookup of an exact descriptor in this index's namespace."""
         span = validated(span, ContentSpan)
-        return tuple(sorted(self._members.get(span, ())))
+        compatibility = validated(compatibility, CacheCompatibility)
+        return tuple(sorted(self._members.get((compatibility, span), ())))
 
     def token_members(self, prefix: TokensTarget) -> tuple[tuple[str, str], ...]:
         """Explicit bounded query by token equality; stores no per-token index."""
@@ -306,6 +328,7 @@ class LogicalIndex:
                 key
                 for key, record in self._continuations.items()
                 if isinstance(record.content, TokensTarget)
+                and cache_compatibility(record.content) == cache_compatibility(prefix)
                 and record.content.token_ids[: len(prefix.token_ids)]
                 == prefix.token_ids
             )
@@ -370,12 +393,53 @@ class LogicalIndex:
                 )
         else:
             for component in content.components:
-                cursor = start
+                checkpoints = [
+                    s
+                    for s in content.spans
+                    if s.component == component and s.coverage_kind == "checkpoint"
+                ]
+                if checkpoints:
+                    selected = [s for s in checkpoints if start < s.end_token <= end]
+                    full.extend(selected)
+                    dependencies.update(
+                        TokenRange(
+                            component=component,
+                            start_token=s.dependency_start,
+                            end_token=s.end_token,
+                        )
+                        for s in selected
+                        if s.dependency_start < s.end_token
+                    )
+                    if not selected:
+                        missing.append(
+                            RangeGap(
+                                coverage=TokenRange(
+                                    component=component,
+                                    start_token=start,
+                                    end_token=end,
+                                ),
+                                reason="missing_checkpoint",
+                            )
+                        )
+                    continue
+                window = next(
+                    (
+                        s.window_size
+                        for s in content.spans
+                        if s.component == component and s.coverage_kind == "window"
+                    ),
+                    None,
+                )
+                range_start = max(start, end - window) if window is not None else start
+                cursor = range_start
                 for span in sorted(
                     (s for s in content.spans if s.component == component),
                     key=lambda s: s.start_token,
                 ):
-                    left, right = max(start, span.start_token), min(end, span.end_token)
+                    left, right = (
+                        max(range_start, span.start_token),
+                        min(end, span.end_token),
+                    )
                     if left >= right:
                         continue
                     if left > cursor:
@@ -390,7 +454,7 @@ class LogicalIndex:
                             )
                         )
                     cursor = max(cursor, right)
-                    if span.start_token < start or span.end_token > end:
+                    if span.start_token < range_start or span.end_token > end:
                         unaligned.append(span)
                     else:
                         full.append(span)
@@ -519,10 +583,11 @@ class LogicalIndex:
     def _remove_members(self, key, content):
         if isinstance(content, ContentTarget):
             for span in content.spans:
-                members = self._members[span]
+                identity = cache_compatibility(content), span
+                members = self._members[identity]
                 members.remove(key)
                 if not members:
-                    del self._members[span]
+                    del self._members[identity]
 
     def _remove(self, key):
         record = self._continuations.pop(key)

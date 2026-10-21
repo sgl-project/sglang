@@ -435,6 +435,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.priority_claims = None
+        if params.kv_control_config is not None:
+            from sglang.srt.mem_cache.unified_cache.priority_claims import (
+                CopyPriorityClaims,
+            )
+
+            if (
+                params.disable
+                or params.component_registry_override
+                or ComponentType.FULL not in components
+                or set(components)
+                - {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
+            ):
+                raise ValueError(
+                    "programmable priorities require an enabled cache with built-in FULL/SWA/Mamba components"
+                )
+            if params.eviction_policy.lower() not in ("lru", "priority"):
+                raise ValueError(
+                    "programmable priorities use signed priorities with LRU ties"
+                )
+            self.priority_claims = CopyPriorityClaims(
+                params.kv_control_config, params.page_size, self
+            )
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
@@ -471,14 +494,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     # ==== Tree API ====
 
-    def _session_lru_predicate(self, ct: ComponentType):
-        if not self.enable_session_radix_cache or ct is ComponentType.FULL:
+    def _session_lru_predicate(self, ct: ComponentType, *, host: bool = False):
+        if (
+            not self.enable_session_radix_cache
+            or ct is ComponentType.FULL
+            or (self.priority_claims is not None and not host)
+        ):
             return None
         return lambda node: node.component_data[ct].session_ref > 0
 
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        if getattr(self, "priority_claims", None) is not None:
+            self.priority_claims.reset()
         # End suspended walks while their session-cursor sentinels still
         # belong to the old LRUs, clearing any pending internal victim.
         for component in self.components:
@@ -519,7 +548,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ct,
                 self.component_types,
                 use_host_ptr=True,
-                is_referenced=self._session_lru_predicate(ct),
+                is_referenced=self._session_lru_predicate(ct, host=True),
             )
             for ct in self.component_types
         }
@@ -709,6 +738,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
+        if getattr(self, "priority_claims", None) is not None:
+            for component in self.component_types:
+                self.priority_claims.forget(node, component)
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -1476,6 +1508,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
+        if getattr(self, "priority_claims", None) is not None:
+            self.priority_claims.split(new_node, child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # A split of a backuped node tells the cache to fix its publish list.
@@ -1700,7 +1734,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(made_progress=True)
         node = self._node_arena.get(node_id)
         lru = self.lru_lists[component_type]
-        enabled = self.enable_session_radix_cache
+        enabled = self.enable_session_radix_cache and self.priority_claims is None
         if (
             node is None
             or node.component_data[component_type].value is None
@@ -2130,7 +2164,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 return False
             if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                 return False
-            if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+            if (
+                cd.session_ref > 0
+                and trigger.session_ref(node) == 0
+                and not (
+                    EvictLayer.DEVICE in target
+                    and getattr(trigger.tree_core, "priority_claims", None) is not None
+                )
+            ):
                 return False
         if EvictLayer.DEVICE in target:
             assert cd.lock_ref == 0
@@ -2159,6 +2200,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
         had_host_copy = node.component_data[comp.component_type].host_value is not None
+        if (
+            getattr(self, "priority_claims", None) is not None
+            and EvictLayer.DEVICE in target
+        ):
+            self.priority_claims.forget(node, comp.component_type)
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
@@ -2879,6 +2925,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
         cd = node.component_data[component_type]
+        if getattr(self, "priority_claims", None) is not None:
+            self.priority_claims.forget(node, component_type)
         cd.value = value
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):

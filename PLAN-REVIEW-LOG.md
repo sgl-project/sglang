@@ -102,3 +102,32 @@ on actual CPU pools: `4 passed, 16 warnings in 9.51s`. Its test-utils port defau
 cannot parse an empty `CUDA_VISIBLE_DEVICES`; the CPU run used the nonexistent
 device `999` and first asserted `torch.cuda.device_count() == 0`. Production and
 test-utils source were not changed for this environment issue.
+
+### Unit 2a — Real cache priorities, parent takeover
+
+The builder added optional copy-scoped side metadata, real UnifiedRadixCache
+execution/inspection, FULL/SWA/Mamba geometry and lifecycle hooks, and explicit
+Rust-to-Python selection. The delegated run stopped on its usage limit before
+producing a completion report. The parent took over without retrying delegation,
+read all changes and independently ran the initial proof: 100 passed, 16 warnings,
+9 subtests passed in 13.68s.
+
+Parent review reproduced quadratic candidate selection: reclaiming 32 leaves
+computed 528 ordering keys. The correction uses one candidate heap per walk,
+updates exposed parents and rebuilds at claim-edit or TTL boundaries. Regressions
+cover key-count growth on real FULL/SWA/Mamba pools, expiration and claim edits
+during a walk, and the explicitly selected profile's session migration. The
+profile uses LRU without claims, as specified; disabled caches retain legacy
+session ordering. No claim/scoring metadata is added to ordinary node records.
+
+Final parent proof ran each file in its own process with accelerators hidden and
+the Python TreeCore selected: control 78 passed; real priorities 21 passed with
+18 subtests; session 4 passed; joint allocation/eviction 15 passed with 45
+subtests; lock refs 1 passed; Mamba path cap 5 passed, 5 GPU cases skipped, 2
+subtests; SWA locked recovery 8 passed. Total: 132 passed, 5 skipped. The original
+Rust-toolchain failure remains a limitation, not a successful Rust test.
+Repository isort, Ruff formatting/syntax/name checks and git diff whitespace
+checks pass. The key-count regression permits at most 64 evaluations for 32
+victims in all three component paths, with and without a live claim.
+Verdict: approve the real-cache priority feature for a local commit.
+Serving transport, request callbacks, transfers and policies are still pending.

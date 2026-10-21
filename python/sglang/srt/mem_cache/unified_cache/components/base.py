@@ -577,8 +577,49 @@ class TreeComponent(ABC):
         assert not self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction already in progress"
         )
+        self._control_eviction_walk = None
+        if getattr(self.tree_core, "priority_claims", None) is not None:
+            from sglang.srt.mem_cache.unified_cache.priority_claims import (
+                PriorityEvictionWalk,
+            )
+
+            core, ct = self.tree_core, self.component_type
+            if ct == BASE_COMPONENT_TYPE:
+
+                def candidates():
+                    return iter(core.evictable_device_leaves)
+
+                def eligible(node):
+                    return node in core.evictable_device_leaves
+            else:
+                lru = core.lru_lists[ct]
+
+                def candidates():
+                    node = lru.get_lru_no_lock()
+                    while node is not None:
+                        yield node
+                        node = lru.get_prev_no_lock(node)
+
+                def eligible(node):
+                    return (
+                        lru.in_list(node)
+                        and node.component_data[ct].value is not None
+                        and node.component_data[ct].lock_ref == 0
+                        and node.load_back_pending_id is None
+                    )
+
+            self._control_eviction_walk = PriorityEvictionWalk(
+                core.priority_claims,
+                ct,
+                candidates,
+                eligible,
+                auxiliary=ct != BASE_COMPONENT_TYPE,
+            )
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
+
+    def _control_eviction_candidate(self):
+        return self._control_eviction_walk.next()
 
     def evict_device_next_node(
         self,
@@ -603,6 +644,7 @@ class TreeComponent(ABC):
             f"{self.component_type} device eviction not started"
         )
         self._evict_device_end()
+        self._control_eviction_walk = None
         self.is_evict_device_ongoing = False
 
     @abstractmethod

@@ -196,6 +196,37 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self._kv_control_unsupported_reason = ""
+        self._kv_control_owner_thread = (
+            threading.get_ident() if params.kv_control_config is not None else None
+        )
+        if params.kv_control_config is not None:
+            if (
+                params.is_eagle
+                or params.pp_size != 1
+                or params.attn_cp_size != 1
+                or any(
+                    group is not None
+                    for group in (
+                        params.tp_cache_group,
+                        params.attn_cp_cache_group,
+                        params.attn_tp_cache_group,
+                    )
+                )
+            ):
+                self._kv_control_unsupported_reason = "Speculative and distributed cache priority execution is not integrated"
+            elif (
+                params.mtp_draft_device_pools
+                or params.mtp_draft_mamba_pools
+                or params.enable_mamba_extra_buffer
+                or params.enable_mamba_extra_buffer_lazy
+                or params.decoder_swa_bounded_replay
+                or not params.swa_gates_prefix_match
+                or page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
+            ):
+                self._kv_control_unsupported_reason = (
+                    "Auxiliary/draft/sharded cache layouts are unsupported"
+                )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -402,6 +433,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+    def create_kv_control_executor(self, *, engine_id: str, engine_epoch: str):
+        """Bind native control to this opted-in cache on the scheduler owner."""
+        from sglang.srt.mem_cache.unified_cache.kv_control_adapter import (
+            UnifiedCacheExecutor,
+        )
+
+        return UnifiedCacheExecutor(
+            self, engine_id=engine_id, engine_epoch=engine_epoch
+        )
 
     def reset(self) -> None:
         if self.linker is not None:

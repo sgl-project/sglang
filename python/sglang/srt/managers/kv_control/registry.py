@@ -355,8 +355,23 @@ class OperationRegistry:
         if len(update.target_outcomes) > self.limits.max_scope_spans:
             raise ControlError("capacity", "Result coverage exceeds limit")
         for outcome in update.target_outcomes:
+            coverage = outcome.coverage
+            point = outcome.coverage_kind == "checkpoint"
             if (
-                outcome.coverage.start_token >= outcome.coverage.end_token
+                (coverage.start_token != coverage.end_token or coverage.end_token == 0)
+                if point
+                else coverage.start_token >= coverage.end_token
+            ):
+                raise ControlError("invalid_payload", "Invalid component coverage")
+            if (
+                (
+                    outcome.coverage_kind == "window"
+                    and (outcome.window_size is None or outcome.window_size == 0)
+                )
+                or (
+                    outcome.coverage_kind != "window"
+                    and outcome.window_size is not None
+                )
                 or len(outcome.reason) > 4096
                 or len(outcome.code) > 256
                 or len(outcome.completed_steps) > 32

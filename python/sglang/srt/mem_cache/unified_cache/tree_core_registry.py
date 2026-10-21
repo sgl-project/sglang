@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    if params.kv_control_config is not None:
+        return (
+            "programmable copy priorities require the Python TreeCore lifecycle hooks"
+        )
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
@@ -112,6 +116,10 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     Explicit Rust selections use the same compatibility policy as the default.
     Build, import, and runtime failures remain errors when the toolchain is usable.
     """
+    if params.kv_control_config is not None and name not in ("python", "rust"):
+        raise ValueError(
+            "programmable copy priorities are unsupported by this TreeCore backend"
+        )
     if name != "rust":
         return name
     reason = _rust_fallback_reason(params)

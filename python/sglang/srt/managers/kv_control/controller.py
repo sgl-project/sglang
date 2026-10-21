@@ -44,6 +44,7 @@ class ExecutionRequest(Value):
     ref: OperationRef
     payload: Primitive
     target: ResolvedTarget
+    max_result_targets: int = 4096
 
 
 class Executor(Protocol):
@@ -345,7 +346,10 @@ class KVControl:
         try:
             update = self.executor.start(
                 ExecutionRequest(
-                    ref=pending.ref, payload=pending.payload, target=pending.target
+                    ref=pending.ref,
+                    payload=pending.payload,
+                    target=pending.target,
+                    max_result_targets=self.limits.max_scope_spans,
                 )
             )
             self._execution_update(pending, update)
@@ -395,6 +399,8 @@ class KVControl:
                 outcome.coverage,
                 outcome.content_id,
                 outcome.location,
+                outcome.coverage_kind,
+                outcome.window_size,
             )
 
         outcomes = list(previous.target_outcomes)
@@ -488,18 +494,24 @@ class KVControl:
                     in_scope |= (
                         branch.requested.start_token
                         <= coverage.start_token
-                        < coverage.end_token
+                        <= coverage.end_token
                         <= min(
                             branch.requested.end_token, len(branch.content.token_ids)
+                        )
+                        and (
+                            outcome.coverage_kind != "checkpoint"
+                            or coverage.end_token > branch.requested.start_token
                         )
                     )
                 else:
                     in_scope |= any(
                         span.component == coverage.component
                         and span.content_id == outcome.content_id
+                        and span.coverage_kind == outcome.coverage_kind
+                        and span.window_size == outcome.window_size
                         and span.start_token
                         <= coverage.start_token
-                        < coverage.end_token
+                        <= coverage.end_token
                         <= span.end_token
                         for span in branch.spans
                     )
@@ -537,6 +549,8 @@ class KVControl:
                 and o.coverage.component == component
                 and (content_id is None or o.content_id == content_id)
             )
+            if start == end:
+                return (start, end) in intervals
             cursor = start
             for left, right in intervals:
                 if left > cursor:
@@ -553,16 +567,28 @@ class KVControl:
                     for outcome in complete
                     if outcome.branch_index == branch_index
                 }
-                covered = bool(components) and all(
-                    covers(
-                        branch_index,
-                        component,
-                        None,
+                covered = bool(components)
+                for component in components:
+                    members = [
+                        o
+                        for o in complete
+                        if o.branch_index == branch_index
+                        and o.coverage.component == component
+                    ]
+                    kinds = {(o.coverage_kind, o.window_size) for o in members}
+                    if len(kinds) != 1:
+                        covered = False
+                        break
+                    kind, window = kinds.pop()
+                    start, end = (
                         branch.requested.start_token,
                         branch.requested.end_token,
                     )
-                    for component in components
-                )
+                    if kind == "checkpoint":
+                        start = end
+                    elif kind == "window":
+                        start = max(start, end - window)
+                    covered &= covers(branch_index, component, None, start, end)
             else:
                 covered = bool(branch.spans) and all(
                     covers(
