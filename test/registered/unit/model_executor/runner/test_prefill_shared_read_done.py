@@ -100,6 +100,21 @@ def test_dflash_target_prefill_publishes():
     assert isinstance(published, _Event) and published.recorded
 
 
+@pytest.mark.parametrize("draft_swa_ring", [False, True])
+def test_dspark_publishes_only_with_a_draft_swa_ring(draft_swa_ring):
+    """DSpark's post-prefill KV inject reads the target's full-to-SWA mapping
+    unless encoder replay gives its draft a per-request SWA ring."""
+    runner = _model_runner(spec_algorithm=SpeculativeAlgorithm.DSPARK)
+    with (
+        envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
+        get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=draft_swa_ring
+        ),
+    ):
+        _prepare_and_publish(runner, _batch())
+    assert (runner.shared_read_done_event is not None) == draft_swa_ring
+
+
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         for runner, batch in (
