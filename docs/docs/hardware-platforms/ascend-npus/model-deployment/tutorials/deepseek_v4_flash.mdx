@@ -1,17 +1,27 @@
 ---
 title: "DeepSeek-V4-Flash"
 metatags:
-  description: "Deploy DeepSeek-V4-Flash model with SGLang on Ascend NPUs, including multi-node PD disaggregation mode."
+  description: "Deploy DeepSeek-V4-Flash with SGLang on Ascend NPUs, including DSpark speculative decoding, optional Compact mode, and PD disaggregation."
 ---
 
 ## Introduction
 
-DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model developed by DeepSeek, featuring 284B total
-parameters with 13B active parameters. It employs hybrid sparse attention (CSA + HCA) and DeepSeekMoE architecture with
-a bundled multi-token prediction (MTP) draft head for speculative decoding, supporting a 1M-token context length.
+DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model developed by DeepSeek, with 284B total
+parameters and 13B active parameters. It combines hybrid sparse attention (CSA + HCA) with the DeepSeekMoE architecture
+and supports a 1M-token context length. This guide describes its deployment with SGLang on Ascend NPUs, focusing on
+DSpark speculative decoding and optional Compact verification in A3 single-node PD mixed mode, with references for
+multi-node PD disaggregation.
 
-This document demonstrates the deployment of DeepSeek-V4-Flash on Ascend NPUs using SGLang, including multi-node PD
-disaggregation mode, feature configuration, and performance optimization.
+In this deployment, DSpark improves decoding efficiency by combining parallel block-level draft computation with a
+lightweight Markov Head that models dependencies between draft tokens. The draft model proposes a token block, which
+the target model verifies to determine the accepted prefix and the next token at the acceptance boundary. When several
+draft tokens are accepted, a single verification step advances generation by multiple tokens.
+
+DSpark's optional Compact mode reduces target-verification work by adapting the verification length to each request.
+It combines Confidence Head estimates with a profiled steps-per-second (SPS) cost table to select draft prefixes and
+pack them into a variable-length verification batch. The target model continues to determine acceptance, while shorter
+prefixes reduce logical verification work. The performance benefit depends on the workload, graph padding, and
+scheduling overhead.
 
 This document is validated and written based on **SGLang v0.5.16**. The current model (DeepSeek-V4-Flash) is fully
 supported in this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is
@@ -28,7 +38,8 @@ recommended to use v0.5.16 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56` |
-| Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
+| Speculative Decoding (DSpark) | `--speculative-algorithm DSPARK \`<br/>`--speculative-dspark-block-size 5 \`<br/>`--speculative-num-draft-tokens 6` |
+| DSpark Compact | `export SGLANG_RAGGED_VERIFY_MODE=compact`<br/>`--speculative-dspark-sps-table-path /path/to/dspark_sps.json`<br/>See [DSpark Compact](#dspark-compact-optional). |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 | DP Attention                  | `--dp-size 16 \`<br/>`--enable-dp-attention`                                                                           |
@@ -47,6 +58,8 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/pa
 
 ### Environment
 
+For the DSpark examples, use a build with Ascend DSpark support; Compact additionally requires ragged target verification in the DSV4 NPU backend.
+
 Before following this tutorial, complete the environment setup in the documents below:
 
 - [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) — the fastest way to get started.
@@ -62,15 +75,20 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [DeepSeek-V4-Flash-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp) (W8A8 quantized version, 300GB)
+- [DeepSeek-V4-Flash-0731-w8a8](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8) (W8A8 quantized version)
+
+Download the weights to a local directory and set `MODEL_PATH` to that directory. The launch example defaults
+`DRAFT_MODEL_PATH` to `MODEL_PATH` for a checkpoint with bundled DSpark draft weights; set
+`--speculative-draft-model-path` to a separate compatible draft directory when needed.
+Ensure that the local checkpoint includes the matching DSpark draft configuration and weights.
+Compact additionally requires trained Confidence Head weights.
 
 <Info>
-The W8A8 variant (300GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to
-8 dies on an A3 Series node (4 cards).
+Allow device-memory capacity for the target model, DSpark draft weights, KV caches, and graph buffers.
+The weight-file size alone does not determine the memory required for DSpark serving.
 </Info>
 
-This is the minimum recommended configuration. For optimized configurations,
-see [Best practices](#best-practices), which may require additional cards or nodes.
+For optimized deployment configurations, see [Best practices](#best-practices).
 
 For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
@@ -89,11 +107,7 @@ command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is p
 release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
 ```bash Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
 docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
@@ -135,17 +149,22 @@ quay.io/ascend/sglang:main-cann9.1.0-a3
 
 ### Single-node PD mixed deployment
 
-Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. In such scenarios, DeepSeek-V4-Flash can be launched with half of an Ascend A3 Series
-node (4 cards, 8 dies). The configuration below was validated with `--tp-size 8`.
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode).
+The DSpark example below uses one Ascend A3 node with 16 NPU dies (8 cards), TP=16, and DP attention=16.
+Adjust memory limits for the checkpoint in [Model weights](#model-weights) and your workload.
+
+Save the following command block as `launch_dspark.sh`. It starts DSpark with fixed-window verification (`static`)
+by default. The [Compact subsection](#dspark-compact-optional) reuses the same script, model, and parallelism settings.
 
 ```bash Command
 # ============================================================
-# Before running, update the following variable:
-#   MODEL_PATH: path to the model weights directory
+# Before running, update the following variables:
+#   MODEL_PATH: path to DSpark-compatible target weights
+#   DRAFT_MODEL_PATH: compatible draft weights; defaults to MODEL_PATH
 # ============================================================
 
-MODEL_PATH=/path/to/model-weights
+MODEL_PATH=${MODEL_PATH:-/path/to/DeepSeek-V4-Flash-0731-w8a8}
+DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-${MODEL_PATH}}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
@@ -176,28 +195,138 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
+# Use one shared launch command for Static and Compact.
+export SGLANG_RAGGED_VERIFY_MODE="${SGLANG_RAGGED_VERIFY_MODE:-static}"
+export SGLANG_DSPARK_FAST_KERNEL=0
+export SGLANG_ENABLE_WAR_BARRIER=1
+export SGLANG_FORCE_COARSE_WAR_BARRIER=1
+
+DSPARK_ARGS=()
+if [ "${SGLANG_RAGGED_VERIFY_MODE}" = "compact" ]; then
+    : "${SPS_TABLE_PATH:?Set SPS_TABLE_PATH to a profiled SPS JSON file}"
+    DSPARK_ARGS+=(--speculative-dspark-sps-table-path "${SPS_TABLE_PATH}")
+fi
+
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
+    --served-model-name deepseek-v4-flash \
     --page-size 128 \
-    --tp-size 8 \
+    --tp-size 16 \
     --trust-remote-code \
     --device npu \
     --attention-backend dsv4 \
     --watchdog-timeout 9000 \
     --host 127.0.0.1 --port 6688 \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.68 \
     --prefill-max-requests 160 \
     --max-prefill-tokens 80000 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 8 --enable-dp-attention \
+    --dp-size 16 --enable-dp-attention \
     --moe-a2a-backend deepep --deepep-mode auto \
     --quantization modelslim --enable-dp-lm-head \
-    --kv-cache-dtype bfloat16
+    --kv-cache-dtype bfloat16 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
+    --speculative-draft-model-quantization modelslim \
+    --speculative-draft-attention-backend ascend \
+    --speculative-dspark-block-size 5 \
+    --speculative-num-draft-tokens 6 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
+    "${DSPARK_ARGS[@]}"
 ```
+
+Start the default Static service with `bash launch_dspark.sh`.
+The draft block size is five tokens; the verification width is six positions, including one anchor.
+The block size and verification width must satisfy `speculative_num_draft_tokens = block_size + 1`.
+For normal serving, leave `SGLANG_SIMULATE_ACC_LEN` unset and disable SPS recording unless you are profiling.
 
 For the complete benchmark data and additional single-node configurations, see
 [DeepSeek-V4-Flash Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash#single-node-pd-mixed).
+
+#### DSpark Compact (optional)
+
+This optional configuration applies to the same **Ascend A3 single-node PD mixed deployment with 16 NPU dies**.
+Follow the steps below to profile the SPS table and enable Compact using the shared launch script.
+For three requests, lengths `[6, 4, 2]` contain 12 logical verification positions instead of Static's 18;
+each length includes its anchor.
+
+Use a build with NPU Compact support and the Confidence Head checkpoint described in [Model weights](#model-weights).
+The SPS table models decode-step cost, not token acceptance probabilities. Without a profiled table, the uninitialized
+flat cost model degenerates to verify-all, so selecting `compact` alone does not provide adaptive token-budget savings.
+
+**1. Profile the SPS table.** Stop the Static server with Ctrl+C first. Use a dedicated server: the profiler flushes
+cache and aborts its profiling requests between measurement rounds. In terminal A, start the shared script with profiling settings:
+
+```bash
+SGLANG_RAGGED_VERIFY_MODE=static \
+SGLANG_DSPARK_ENABLE_SPS_RECORD=1 \
+SGLANG_SIMULATE_ACC_LEN=1.0 \
+bash launch_dspark.sh
+```
+
+In terminal B, use the same SGLang checkout/runtime and a tokenizer directory accessible to that process:
+
+```bash
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731-w8a8
+SPS_TABLE_PATH=/path/to/output/dspark_sps.json
+python3 -m sglang.benchmark.dspark_sps_profiler all \
+    --base-url http://127.0.0.1:6688 \
+    --local-tokenizer-path "${MODEL_PATH}" \
+    --batch-size 1 2 4 8 10 \
+    --out "${SPS_TABLE_PATH}" \
+    --no-plot
+```
+
+`--batch-size` is the request count per DP rank; with DP=16, the sweep sends 16, 32, 64, 128, and 160 requests.
+Keep the sweep within the captured decode graph range and the running-request limit.
+The profiler writes the SPS JSON and its measurement records, then reloads the table for a lookup self-check.
+This static sweep provides an initial one-dimensional cost model; validate it on representative serving workloads.
+
+**2. Enable Compact.** Stop the profiling server with Ctrl+C, then restart the same script:
+
+```bash
+unset SGLANG_SIMULATE_ACC_LEN SGLANG_DSPARK_ENABLE_SPS_RECORD
+SGLANG_RAGGED_VERIFY_MODE=compact \
+SPS_TABLE_PATH=/path/to/output/dspark_sps.json \
+bash launch_dspark.sh
+```
+
+The startup log should report `DSpark ragged-verify scheduler enabled` with `mode=compact` and the SPS path.
+Use [Functional verification](#functional-verification) to send requests. This checks serving; inspect the scheduled
+lengths separately to establish whether Compact reduces verification work.
+
+**3. Inspect scheduling when needed.** Stop the server and repeat the Compact launch with
+`SGLANG_DSPARK_DEBUG_DUMP=core,reqs` added before `bash launch_dspark.sh`.
+After sending requests through the same functional-verification endpoint, inspect the recorded steps:
+
+```bash
+curl --fail --max-time 60 http://127.0.0.1:6688/server_info -o compact_server_info.json
+python3 - <<'PY'
+import json
+
+with open('compact_server_info.json', encoding='utf-8') as f:
+    info = json.load(f)
+for rank, state in enumerate(info.get('internal_states', [])):
+    data = state.get('dspark_info_record') or {}
+    width = data.get('verify_num_draft_tokens', 6)
+    for row in (data.get('records') or [])[-5:]:
+        reqs = row.get('reqs') or []
+        if not reqs:
+            continue
+        lens = [req['verify_len'] for req in reqs]
+        print(rank, row.get('mode'), lens, 'logical=', sum(lens),
+              'static=', len(lens) * width,
+              'graph_key=', row.get('verify_tokens_graph_key'))
+PY
+```
+
+Some lengths below six, with a logical total below request count × six, show that shorter prefixes were scheduled.
+Graph padding and DP synchronization can still keep the executed size unchanged; `num_verify_tokens` records the
+graph-layout size in this implementation, not necessarily the sum of live lengths. Check graph replay and matched
+Static/Compact measurements before concluding that the graph size or latency decreased.
+Disable detailed diagnostics after this check. See [Performance](#performance) and [Performance tuning](#performance-tuning)
+for the evaluation entry point and comparison guidance.
 
 ### Multi-node PD disaggregation deployment
 
@@ -235,6 +364,10 @@ see [Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/i
 
 For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 
+For DSpark and Compact, keep prompts, generation limits, reasoning options, and sampling settings identical between runs,
+and leave `SGLANG_SIMULATE_ACC_LEN` unset. Include long outputs, normal completion, and client cancellation in stability
+checks; verify that subsequent requests succeed without KV pool leaks.
+
 ## Performance
 
 For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
@@ -250,6 +383,12 @@ For complete optimal configurations with deployment scripts and benchmark comman
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
 guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+For Static/Compact comparisons, reuse the single-node launch configuration and change only the verification mode and
+the required SPS-table argument. Keep the checkpoint, TP/DP, overlap settings, graph range, memory limits, sampling,
+warmup, and diagnostic settings fixed. Compact primarily changes decode verification work; fewer logical tokens do
+not guarantee lower TTFT/TPOT or higher throughput. Measure graph sizes, acceptance length, actual output-token counts,
+and end-to-end performance on the target workload.
 
 ## FAQ
 
