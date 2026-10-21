@@ -118,7 +118,7 @@ def to_json(value: Any) -> str:
     """Serialize a value to JSON string."""
     try:
         return json.dumps(value, ensure_ascii=False)
-    except:
+    except Exception:
         return json.dumps(value, ensure_ascii=True)
 
 

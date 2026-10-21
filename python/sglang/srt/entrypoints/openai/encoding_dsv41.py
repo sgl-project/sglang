@@ -108,7 +108,7 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 def to_json(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False)
-    except:
+    except Exception:
         return json.dumps(value, ensure_ascii=True)
 
 
