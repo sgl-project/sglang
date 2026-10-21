@@ -1504,7 +1504,7 @@ class ScoringRequest(BaseModel):
     return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
-    # Base request id; expanded to `<rid>_<i>` per item.
+    # Base request id; expanded to `<rid>_<i>` per item (`i` zero-padded).
     rid: Optional[str] = None
 
     # Setwise readout: when set, the readout is taken AT every occurrence of this

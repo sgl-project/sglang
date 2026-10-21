@@ -4203,12 +4203,15 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def _log_schedule_decision(
+    def _maybe_log_schedule_decision(
         self,
+        *,
         can_run_list: List[Req],
         running_batch: ScheduleBatch,
         adder: PrefillAdder,
     ) -> None:
+        if not self.log_schedule_decisions:
+            return
         # KV budget this pass saw: free now plus what eviction could reclaim.
         pool_stats = self.pool_stats_observer.get_pool_stats()
         logger.info(
@@ -4471,8 +4474,9 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
             # Empty passes are the key signal for head-of-line blocking.
-            if self.log_schedule_decisions:
-                self._log_schedule_decision(can_run_list, running_batch, adder)
+            self._maybe_log_schedule_decision(
+                can_run_list=can_run_list, running_batch=running_batch, adder=adder
+            )
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4486,8 +4490,9 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         # After the re-queue, so #left-in-queue is what the next pass sees.
-        if self.log_schedule_decisions:
-            self._log_schedule_decision(can_run_list, running_batch, adder)
+        self._maybe_log_schedule_decision(
+            can_run_list=can_run_list, running_batch=running_batch, adder=adder
+        )
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
