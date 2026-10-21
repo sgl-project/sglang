@@ -50,7 +50,7 @@ export const agentx = {
    },
    "4303": {
     "run": null,
-    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
+    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
     "status": "in-progress"
    }
   }
@@ -1132,7 +1132,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
+    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1334,7 +1334,6 @@ export const agentx = {
         ["--nnodes", "4"],
         ["--node-rank", "$NODE_RANK"],
         ["--request-plane", "tcp"],
-        ["--kv-events-config", "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\"}"],
         ["--cuda-graph-max-bs-decode", "24"],
         ["--data-parallel-size", "16"],
         ["--disaggregation-decode-extra-slots", "36"],
@@ -1401,7 +1400,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
+    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1606,7 +1605,6 @@ export const agentx = {
         ["--nnodes", "4"],
         ["--node-rank", "$NODE_RANK"],
         ["--request-plane", "tcp"],
-        ["--kv-events-config", "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\"}"],
         ["--cuda-graph-max-bs-decode", "40"],
         ["--data-parallel-size", "16"],
         ["--disaggregation-decode-extra-slots", "80"],
@@ -4616,7 +4614,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
+    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -4824,7 +4822,6 @@ export const agentx = {
         ["--nnodes", "4"],
         ["--node-rank", "$NODE_RANK"],
         ["--request-plane", "tcp"],
-        ["--kv-events-config", "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\"}"],
         ["--cuda-graph-max-bs-decode", "64"],
         ["--data-parallel-size", "16"],
         ["--disaggregation-decode-extra-slots", "128"],
