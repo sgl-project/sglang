@@ -8,7 +8,7 @@ from sglang.kernels.ops.attention.fla import kda_packed_decode_rowstream as rows
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.utils import is_gfx95_supported
