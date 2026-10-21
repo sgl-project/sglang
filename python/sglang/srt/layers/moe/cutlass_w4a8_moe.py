@@ -22,6 +22,7 @@ else:
     from sgl_kernel import silu_and_mul
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
+    compute_cutlass_w4a8_moe_input_scale,
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -34,10 +35,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
-from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
-    per_tensor_quant_fp8,
-)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def cutlass_w4a8_moe(
@@ -127,8 +125,19 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    # Both graph padding and nonlocal routes use -1, including without EP.
-    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    if a1_scale is None:
+        a1_scale = torch.full(
+            (1,),
+            1e-10 / torch.finfo(torch.float8_e4m3fn).max,
+            dtype=torch.float32,
+            device=device,
+        )
+        compute_cutlass_w4a8_moe_input_scale(
+            input=a,
+            topk_ids=topk_ids,
+            output_s=a1_scale,
+            num_local_experts=num_local_experts,
+        )
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
@@ -139,15 +148,6 @@ def cutlass_w4a8_moe(
         device=device,
         dtype=torch.float8_e4m3fn,
     )
-
-    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
-    if a1_scale is None:
-        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        # Inactive rows must not change the quantization of live expert inputs.
-        inactive_rows = (topk_ids == num_local_experts).all(dim=-1, keepdim=True)
-        scale_input = a.masked_fill(inactive_rows, 0.0)
-        per_tensor_absmax_fp8(scale_input, a1_scale)
-        a1_scale.clamp_(min=1e-10 / torch.finfo(torch.float8_e4m3fn).max)
 
     pre_reorder_for_cutlass_moe(
         a,

@@ -54,6 +54,7 @@ if _is_cuda:
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.moe.gguf_moe_weights import apply_gguf_moe_weights
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -233,6 +234,29 @@ def fused_mul_mat_gguf(
     return y
 
 
+def _prepare_gguf_moe_safe_ids(
+    topk_ids: torch.Tensor, out_hidden_states: torch.Tensor
+) -> torch.Tensor:
+    id_bytes = topk_ids.element_size()
+    output_bytes = out_hidden_states.element_size()
+    if (
+        _is_cuda
+        and topk_ids.dtype == torch.int32
+        and out_hidden_states.is_contiguous()
+        and out_hidden_states.stride(-1) == 1
+        and out_hidden_states.stride(0) * output_bytes % id_bytes == 0
+        and out_hidden_states.shape[-1] * output_bytes % id_bytes == 0
+        and out_hidden_states.numel() * output_bytes >= topk_ids.numel() * id_bytes
+    ):
+        # Both vector GEMMs finish reading IDs before moe_sum overwrites this output.
+        safe_ids = out_hidden_states.view(topk_ids.dtype).as_strided(
+            topk_ids.shape, (topk_ids.shape[1], 1)
+        )
+        torch.clamp_min(topk_ids, 0, out=safe_ids)
+        return safe_ids
+    return topk_ids.clamp_min(0)
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -243,15 +267,29 @@ def fused_moe_gguf(
     qweight_type2: int,
     activation: str,
 ) -> torch.Tensor:
-    def act(x: torch.Tensor):
+    def act(x: torch.Tensor, *, routed: bool = False):
         if activation == "silu":
-            return silu_and_mul(x)
+            activation_fn = silu_and_mul
         elif activation == "gelu":
-            return gelu_and_mul(x)
-        raise ValueError(f"Unsupported activation: {activation}")
+            activation_fn = gelu_and_mul
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        if routed and _is_musa:
+            x.masked_fill_(inactive.reshape(-1, 1), 0.0)
+        return activation_fn(x)
 
-    inactive = topk_ids < 0
-    x = x.masked_fill(inactive.all(dim=-1, keepdim=True), 0.0)
+    def sum_expert_outputs(out: torch.Tensor):
+        if _is_cuda:
+            apply_gguf_moe_weights(out, topk_weights, topk_ids)
+        else:
+            out.masked_fill_(inactive.reshape(-1, 1), 0.0)
+            valid_weights = topk_weights.masked_fill(inactive, 0.0)
+            out.view(*topk_ids.shape, -1).mul_(valid_weights.unsqueeze(-1))
+        moe_sum(out.view(*topk_ids.shape, -1), out_hidden_states)
+
+    if _is_musa:
+        inactive = topk_ids < 0
+        x = x.masked_fill(inactive.all(dim=-1, keepdim=True), 0.0)
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
@@ -283,8 +321,7 @@ def fused_moe_gguf(
             top_k,
             num_tokens,
         )
-        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
-        out = act(out)
+        out = act(out, routed=True)
         out = ggml_moe_a8(
             out,
             w2,
@@ -296,13 +333,8 @@ def fused_moe_gguf(
             1,
             num_tokens * top_k,
         )
-        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
-        valid_weights = topk_weights.masked_fill(inactive, 0.0)
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            valid_weights.view(num_tokens, top_k, 1)
-        )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
-        moe_sum(out, out_hidden_states)
+        sum_expert_outputs(out)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -310,20 +342,14 @@ def fused_moe_gguf(
 
         # Older vector kernels form weight addresses before checking -1.
         # They have no per-expert capacity buffer; discard their dummy slots.
-        safe_ids = topk_ids.clamp_min(0)
+        safe_ids = _prepare_gguf_moe_safe_ids(topk_ids, out_hidden_states)
         out = ggml_moe_a8_vec(x, w1, safe_ids, top_k, qweight_type, N, num_tokens)
-        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
-        out = act(out)
+        out = act(out, routed=True)
 
         out = ggml_moe_a8_vec(
             out, w2, safe_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
-        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
-        valid_weights = topk_weights.masked_fill(inactive, 0.0)
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            valid_weights.view(num_tokens, top_k, 1)
-        )
-        moe_sum(out, out_hidden_states)
+        sum_expert_outputs(out)
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
