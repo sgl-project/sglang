@@ -4,11 +4,11 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
 from sglang.kernels.ops.attention.dsa.triton_hadamard_quant import (
     _FP8_DTYPE,
     fused_hadamard_act_quant,
 )
+from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
