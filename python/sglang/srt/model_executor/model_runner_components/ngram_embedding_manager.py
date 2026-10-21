@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
+from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -181,16 +181,16 @@ class NgramEmbeddingManager:
             for req in batch.reqs:
                 # full_untruncated_fill_ids is only refreshed on the extend and
                 # decode paths, which a PD decode request has not run yet.
-                fill_ids = req.origin_input_ids + req.output_ids
-                end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
-                rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
+                # Slice the tail first: origin_input_ids can be ~100k tokens.
+                tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
+                rows.append(self.engram_hasher.history_row(tail[:-1]))
+            # Pinned copies keep the admission fence from stalling the CPU.
+            slots = async_h2d(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
                 device=history.device,
             )
-            history[slots] = torch.tensor(
+            history[slots] = async_h2d(
                 rows, dtype=history.dtype, device=history.device
             ).view(len(rows), n1)
             return
@@ -200,7 +200,7 @@ class NgramEmbeddingManager:
         for req, start in zip(batch.reqs, batch.prefix_lens, strict=True):
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
-            rows.append([0] * (n1 - len(ids)) + list(ids))
+            rows.append(self.engram_hasher.history_row(ids))
         # The forward stream waits on the schedule stream, which orders this copy.
         batch.engram_history = async_h2d(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
