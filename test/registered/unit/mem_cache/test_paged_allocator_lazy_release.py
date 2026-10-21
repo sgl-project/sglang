@@ -31,6 +31,43 @@ def _page_ids(indices: torch.Tensor) -> torch.Tensor:
 
 
 class TestPagedAllocatorLazyRelease(CustomTestCase):
+    def test_generations_are_opt_in_for_external_linkers(self):
+        allocator = _make_allocator(need_sort=False)
+        allocated = allocator.alloc(2)
+
+        self.assertIsNone(allocator.allocation_generations(allocated))
+
+    def test_allocation_generations_change_only_on_writable_reuse(self):
+        allocator = _make_allocator(need_sort=False)
+        allocator.enable_allocation_generations()
+        allocated = allocator.alloc(4)
+        first = allocator.allocation_generations(allocated)
+
+        self.assertIsNotNone(first)
+        self.assertTrue(allocator.allocation_generations_match(allocated, first))
+        allocator.free(allocated)
+        self.assertTrue(allocator.allocation_generations_match(allocated, first))
+
+        reused = allocator.alloc(4)
+        self.assertTrue(torch.equal(reused, allocated))
+        second = allocator.allocation_generations(reused)
+        self.assertIsNotNone(second)
+        self.assertFalse(torch.equal(first, second))
+        self.assertFalse(allocator.allocation_generations_match(reused, first))
+
+    def test_clear_keeps_process_generation_monotonic(self):
+        allocator = _make_allocator(need_sort=False)
+        allocator.enable_allocation_generations()
+        allocated = allocator.alloc(2)
+        first = allocator.allocation_generations(allocated)
+
+        allocator.clear()
+        replacement = allocator.alloc(2)
+        second = allocator.allocation_generations(replacement)
+
+        self.assertTrue(torch.equal(replacement, allocated))
+        self.assertGreater(int(second[0]), int(first[0]))
+
     def test_release_stages_until_free_pages_run_dry(self):
         allocator = _make_allocator(need_sort=True)
         allocated = allocator.alloc(24)

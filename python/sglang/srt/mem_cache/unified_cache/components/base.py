@@ -857,6 +857,10 @@ class TreeComponent(ABC):
 
     # ---- External Cache Linker Hooks ----
 
+    def enable_external_linker_generations(self) -> None:
+        """Enable allocator identities required by this component's linker."""
+        pass
+
     def build_external_linker_transfer(
         self,
         phase: LinkerTransferPhase,

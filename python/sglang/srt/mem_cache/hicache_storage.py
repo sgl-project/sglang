@@ -117,6 +117,10 @@ class PoolTransfer:
     name: PoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
+    # One allocator-issued identity per complete physical device page.
+    # This fences stale control completion after reuse; it is not a physical
+    # DMA/RDMA/CUDA termination receipt.
+    device_generations: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None

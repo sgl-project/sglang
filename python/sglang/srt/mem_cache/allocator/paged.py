@@ -193,6 +193,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        self._issue_allocation_generations(out_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -273,6 +274,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
 
+        self._issue_allocation_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -322,6 +324,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        self._issue_allocation_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 

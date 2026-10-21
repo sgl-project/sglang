@@ -246,6 +246,8 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
+        for component in self._components:
+            component.enable_external_linker_generations()
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
 
