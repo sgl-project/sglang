@@ -188,6 +188,7 @@ def _run_marlin_flow(
         merged=[],
         fused_tails=0,
         marlin_is_ep=[],
+        marlin_sorted=[],
         marlin_output_ids=[],
         marlin_output_initialized=[],
         align_num_experts=[],
@@ -307,6 +308,7 @@ def _run_marlin_flow(
 
     def fake_marlin_gemm(_x, output, *_args, **kwargs):
         calls.marlin_is_ep.append(kwargs["is_ep"])
+        calls.marlin_sorted.append(kwargs.get("expert_ids_are_sorted", False))
         calls.marlin_output_ids.append(id(output))
         calls.marlin_output_initialized.append(
             bool(torch.isfinite(output).all() and torch.count_nonzero(output) == 0)
@@ -428,6 +430,7 @@ def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
 
     assert calls.align_num_experts == [1]
     assert calls.marlin_is_ep == [True, True]
+    assert calls.marlin_sorted == [False, False]
 
     assert calls.marlin_output_initialized[1]
 
@@ -453,6 +456,8 @@ def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifeti
         active_lora=False,
         base_mapping=True,
     )
+
+    assert calls.marlin_sorted == [True, True]
 
     # Capture records the LoRA stages even with no live adapter.
     shrinks = [call for call in calls.merged if call["stage"] == "shrink"]
