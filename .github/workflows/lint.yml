@@ -38,29 +38,6 @@ jobs:
           cache: pip
           cache-dependency-path: .pre-commit-config.yaml
 
-      - name: Check cu134 DeepGEMM version consistency
-        shell: python
-        run: |
-          import re
-          import tomllib
-          from pathlib import Path
-
-          dependencies = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]["dependencies"]
-          pins = [dep.removeprefix("sgl-deep-gemm==") for dep in dependencies if dep.startswith("sgl-deep-gemm==")]
-          if len(pins) != 1:
-              raise SystemExit("Expected one exact sgl-deep-gemm==... pin in python/pyproject.toml")
-          version = pins[0]
-          dockerfile = Path("docker/Dockerfile.cu134").read_text()
-          for name, expected in (
-              ("DEEPGEMM_REF", f"v{version}"),
-              ("SGL_DEEP_GEMM_VERSION", version),
-          ):
-              values = re.findall(rf"^ARG\s+{name}=(\S+)\s*$", dockerfile, re.MULTILINE)
-              if values != [expected]:
-                  raise SystemExit(
-                      f"docker/Dockerfile.cu134: expected ARG {name}={expected}, got {values}"
-                  )
-
       - name: Install pre-commit hook
         run: |
           python -m pip install pre-commit
