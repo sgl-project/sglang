@@ -65,6 +65,10 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    inkling = architecture in (
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
@@ -75,7 +79,9 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+    if (
+        nemotron or longcat or kimi_k3 or inkling
+    ) and cfg.enable_attn_tp_input_scattered:
         # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
@@ -311,6 +317,12 @@ def handle_data_parallelism(server_args: Any):
             "_handle_data_parallelism",
             schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
         )
+        if envs.SGLANG_RUST_SERVER.get():
+            declare_resolution(
+                server_args,
+                "_handle_data_parallelism",
+                enable_dp_attention_local_control_broadcast=True,
+            )
         assert cfg.tp_size % cfg.attn_dp_size == 0
         original_chunked_prefill_size = cfg.chunked_prefill_size
         declare_resolution(
@@ -354,35 +366,26 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if _graph_may_capture_collectives(server_args):
+    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
         _disable_nccl_graph_buffer_registration(
-            "graph-captured collectives run on graph-pool temporaries whose "
-            "addresses the pool also hands to other tensors"
+            "the graph-captured TP LM-head all-to-all can deadlock with "
+            "registered buffers"
+        )
+    if _graph_pool_is_pausable(server_args):
+        _disable_nccl_graph_buffer_registration(
+            "graph replay can hang once torch_memory_saver resume remaps the "
+            "graph pool, leaving the capture-time registrations on released pages"
         )
 
 
-def _graph_may_capture_collectives(server_args: Any) -> bool:
-    """Whether any captured CUDA graph can hold a cross-rank collective.
-
-    Capture binds a collective's send/recv buffers to graph-pool temporaries,
-    and the pool hands those same addresses to other tensors. Which collective
-    got captured, which phase captured it, and whether the pool is later
-    remapped by torch_memory_saver only change how that aliasing is reached -
-    not whether it exists - so the guard tracks the hazard rather than the
-    feature flags that expose it. A decode-only check would miss a prefill
-    capture into a pausable pool, which the pool guard used to cover.
-
-    Errs toward True. Later passes can still narrow cuda_graph_config, and
-    turning the registration off has no measured throughput cost, so a false
-    positive is cheaper than a missed deployment shape.
-    """
-    view = resolving_view(server_args)
-    if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
-        return False
-    config = getattr(view, "cuda_graph_config", None)
-    if config is None:
-        return True
-    return any(config[phase].backend != Backend.DISABLED for phase in Phase.ALL)
+def _graph_pool_is_pausable(server_args: Any) -> bool:
+    """Whether CUDA graphs are captured into torch_memory_saver memory, which
+    release/resume of the `cuda_graph` tag remaps to new physical pages at the
+    same virtual addresses."""
+    return bool(
+        resolving_view(server_args).enable_memory_saver
+        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+    )
 
 
 def _disable_nccl_graph_buffer_registration(reason: str) -> None:
@@ -567,6 +570,43 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
+        from sglang.srt.elastic_ep.topology import physical_ep_size_to_dp_size
+
+        try:
+            divisor = cfg.attn_dp_size * resolved.attn_cp_size
+            if (
+                cfg.tp_size <= 0
+                or cfg.attn_dp_size <= 0
+                or resolved.attn_cp_size <= 0
+                or cfg.tp_size % divisor
+            ):
+                raise ValueError(
+                    "Invalid attention topology: "
+                    f"tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
+                    f"attn_cp_size={resolved.attn_cp_size}."
+                )
+            attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=resolved.attn_cp_size,
+                attn_dp_size=cfg.attn_dp_size,
+            )
+            attn_replica_size = attn_tp_size * resolved.attn_cp_size
+            physical_ep_size_to_dp_size(cfg.max_ep_size, attn_replica_size)
+            physical_ep_size_to_dp_size(
+                cfg.elastic_ep_initial_size or cfg.tp_size, attn_replica_size
+            )
+            if cfg.ep_join_mode == "scale":
+                physical_ep_size_to_dp_size(cfg.ep_join_rank_offset, attn_replica_size)
+        except ValueError as exc:
+            raise AssertionError(str(exc)) from exc
+
+        if attn_tp_size > 1:
+            assert cfg.moe_dense_tp_size == 1, (
+                "Elastic EP scale-up with attention TP greater than one requires "
+                "--moe-dense-tp-size 1 "
+                f"(got moe_dense_tp_size={cfg.moe_dense_tp_size})."
+            )
+
         assert cfg.elastic_ep_scale_timeout > 0, (
             "--elastic-ep-scale-timeout must be greater than zero."
         )
@@ -631,6 +671,11 @@ def handle_elastic_ep(server_args: Any):
             "Elastic EP scale-up requires --pp-size 1 "
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
+        assert attn_tp_size % cfg.dcp_size == 0, (
+            "Elastic EP scale-up requires --dcp-size to divide the fixed "
+            "attention TP width "
+            f"(got dcp_size={cfg.dcp_size}, attn_tp_size={attn_tp_size})."
+        )
 
         decode_backend = cfg.cuda_graph_config.decode.backend
         assert decode_backend in (Backend.DISABLED, Backend.FULL), (
@@ -682,12 +727,8 @@ def handle_elastic_ep(server_args: Any):
         )
         assert resolved.ep_size == cfg.tp_size, (
             "Elastic EP scale-up requires ep_size == tp_size "
-            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
-            "and the attention DP group must all coincide with WORLD."
-        )
-        assert cfg.attn_dp_size == cfg.tp_size, (
-            "Elastic EP scale-up requires attn_dp_size == tp_size "
-            f"(got attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size})."
+            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); "
+            "physical EP membership must coincide with the launch-time TP span."
         )
         assert resolved.moe_a2a_backend == "nixl", (
             "Elastic EP scale-up requires --moe-a2a-backend nixl "

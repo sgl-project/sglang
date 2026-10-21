@@ -198,8 +198,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
+                    "enable_fused_qk_norm_rope",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
@@ -214,10 +216,18 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "watermark_context_window",
+                    "watermark_default_enabled",
+                    "watermark_enforce_all",
+                    "watermark_key",
+                    "watermark_key_b",
+                    "watermark_max_probability",
+                    "watermark_mixing_probability",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )
@@ -1283,6 +1293,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=model_config,
             ),
             hf_config,
@@ -1351,6 +1364,78 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_eplb_picks_routed_runner_on_sm100(self):
+        """flashinfer_trtllm cannot take the EPLB remap; with redundant experts it
+        fails its routing shape check at startup."""
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        for quantization in ("modelopt_fp4", "nvfp4_online"):
+            with self.subTest(quantization):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.enable_eplb = True
+                server_args.ep_num_redundant_experts = 32
+                if quantization == "nvfp4_online":
+                    server_args.quantization = quantization
+                    server_args._model_config.quantization = quantization
+
+                with (
+                    override_platform(is_sm100=True),
+                    override_platform(is_blackwell=True),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+
+                self.assertEqual(
+                    overrides["moe_runner_backend"], "flashinfer_trtllm_routed"
+                )
+
+    def test_nemotron_h_expert_remap_validation(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _validate_expert_remap,
+        )
+
+        def puzzle(*n_routed_experts):
+            return SimpleNamespace(
+                block_configs=[
+                    {"block_type": "moe", "n_routed_experts": n}
+                    for n in n_routed_experts
+                ]
+                + [{"block_type": "mamba"}]
+            )
+
+        def args(moe_runner_backend, moe_a2a_backend="none"):
+            return SimpleNamespace(
+                enable_eplb=True,
+                moe_runner_backend=moe_runner_backend,
+                moe_a2a_backend=moe_a2a_backend,
+            )
+
+        dense = ("NemotronHForCausalLM", SimpleNamespace())
+        rejected = {
+            "flashinfer_trtllm": (args("flashinfer_trtllm"), *dense),
+            "cutedsl_without_a2a": (args("flashinfer_cutedsl"), *dense),
+            "puzzle_mixed_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 128),
+            ),
+        }
+        accepted = {
+            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "puzzle_equal_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 64),
+            ),
+        }
+        for name, (cfg, model_arch, hf_config) in rejected.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                _validate_expert_remap(cfg, hf_config, model_arch)
+        for name, (cfg, model_arch, hf_config) in accepted.items():
+            with self.subTest(name):
+                _validate_expert_remap(cfg, hf_config, model_arch)
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1518,6 +1603,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
             attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
             _model_config=model_config,
         )
 
@@ -2233,6 +2321,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=mc,
             )
             defaults.update(kw)
@@ -3812,7 +3903,11 @@ class TestDeclarationValidation(CustomTestCase):
 
 
 class TestBeamOverrides(CustomTestCase):
-    def _args(self, **kw):
+    def test_only_nvfp4_defaults_to_trtllm_moe_on_blackwell(self):
+        """The cookbook NVFP4 recipe sets neither backend; other formats and
+        explicit runners must keep their MoE runner."""
+        attention = {"attention_backend": "trtllm_mha"}
+        trtllm_moe = {**attention, "moe_runner_backend": "flashinfer_trtllm"}
         defaults = dict(
             attention_backend=None,
             prefill_attention_backend=None,
@@ -3821,109 +3916,32 @@ class TestBeamOverrides(CustomTestCase):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
         )
-        defaults.update(kw)
-        return SimpleNamespace(**defaults)
-
-    def test_beam_defaults_to_trtllm_mha_on_hopper_and_blackwell(self):
-        from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
-
-        hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])
-        cases = {
-            (True, False, False): {"attention_backend": "trtllm_mha"},
-            (False, True, False): {"attention_backend": "trtllm_mha"},
-            (False, False, True): {"attention_backend": "trtllm_mha"},
-            (False, False, False): {},
-        }
-        for (is_sm90, is_sm100, is_sm120), expected in cases.items():
-            with (
-                self.subTest(is_sm90=is_sm90, is_sm100=is_sm100, is_sm120=is_sm120),
-                override_platform(is_sm90=is_sm90),
-                override_platform(is_sm100=is_sm100),
-                override_platform(is_sm120=is_sm120),
-            ):
-                self.assertEqual(_beam_overrides(self._args(), hf_config), expected)
-                # An explicit choice on any of the three fields is kept.
-                for field in (
-                    "attention_backend",
-                    "prefill_attention_backend",
-                    "decode_attention_backend",
-                ):
-                    self.assertEqual(
-                        _beam_overrides(self._args(**{field: "flashinfer"}), hf_config),
-                        {},
-                    )
-
-    def test_nvfp4_beam_defaults_to_trtllm_moe_on_blackwell(self):
-        """Only NVFP4 needs TRTLLM; BF16, FP8 and explicit choices keep their backend."""
-        from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
-
-        bf16 = SimpleNamespace(architectures=["BeamForCausalLM"])
-        nvfp4 = SimpleNamespace(
-            architectures=["BeamForCausalLM"],
-            quantization_config={
-                "quant_method": "compressed-tensors",
-                "format": "nvfp4-pack-quantized",
-            },
+        cases = (
+            ("NVFP4", {}, trtllm_moe),
+            ("FP8", {}, attention),
+            (None, {}, attention),
+            ("NVFP4", {"moe_runner_backend": "flashinfer_cutlass"}, attention),
         )
-        trtllm = {"moe_runner_backend": "flashinfer_trtllm"}
-        cases = [
-            (nvfp4, {}, trtllm),
-            (bf16, {"quantization": "modelopt_fp4"}, trtllm),
-            (bf16, {}, {}),
-            (nvfp4, {"moe_runner_backend": "flashinfer_cutlass"}, {}),
-            (nvfp4, {"moe_a2a_backend": "deepep"}, {}),
-        ]
-        # Defaults must not force TRTLLM for other formats, even those rejected
-        # later by Beam's checkpoint validation.
-        for method in ("fp8", "w8a8_fp8", "modelopt_fp8"):
-            cases.extend(
-                [
-                    (_hf(method), {}, {}),
-                    (bf16, {"quantization": method}, {}),
-                    (nvfp4, {"quantization": method}, {}),
-                ]
-            )
-        for method in ("compressed-tensors", "compressed_tensors"):
-            for fmt, expected in (
-                ("float-quantized", {}),
-                ("nvfp4-pack-quantized", trtllm),
-            ):
-                hf_config = SimpleNamespace(
-                    quantization_config={"quant_method": method, "format": fmt}
-                )
-                cases.append((hf_config, {}, expected))
-                cases.append((hf_config, {"quantization": method}, expected))
-        for algo, expected in (("FP8", {}), ("NVFP4", trtllm)):
-            hf_config = SimpleNamespace(
-                quantization_config={"quant_method": "modelopt", "quant_algo": algo}
-            )
-            cases.append((hf_config, {}, expected))
-        # Pin the attention backend so only the MoE decision is compared.
-        pinned = {"attention_backend": "flashinfer"}
-        with override_platform(is_sm100=True):
-            for hf_config, kw, expected in cases:
-                with self.subTest(hf_config=hf_config, kw=kw):
-                    self.assertEqual(
-                        _beam_overrides(self._args(**pinned, **kw), hf_config),
-                        expected,
-                    )
-        with override_platform(is_sm100=False):
-            self.assertEqual(_beam_overrides(self._args(**pinned), nvfp4), {})
-
-    def test_beam_family_is_registered(self):
         with (
             override_platform(is_sm90=False),
             override_platform(is_sm100=True),
             override_platform(is_sm120=False),
         ):
-            self.assertEqual(
-                collect_model_override_declarations(
-                    "BeamForCausalLM",
-                    self._args(),
-                    SimpleNamespace(architectures=["BeamForCausalLM"]),
-                ),
-                [("_beam_overrides", {"attention_backend": "trtllm_mha"})],
-            )
+            for quant_algo, overrides, expected in cases:
+                with self.subTest(quant_algo=quant_algo, **overrides):
+                    hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])
+                    if quant_algo is not None:
+                        hf_config.quantization_config = {
+                            "quant_method": "modelopt",
+                            "quant_algo": quant_algo,
+                        }
+                    args = SimpleNamespace(**{**defaults, **overrides})
+                    self.assertEqual(
+                        collect_model_override_declarations(
+                            "BeamForCausalLM", args, hf_config
+                        ),
+                        [("_beam_overrides", expected)],
+                    )
 
 
 class TestQwen3VLHopperServingOverrides(CustomTestCase):
