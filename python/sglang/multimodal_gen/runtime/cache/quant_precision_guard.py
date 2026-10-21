@@ -18,27 +18,32 @@ def install_quant_precision_guard(transformer):
     """Invalidate Cache-DiT histories when the effective quant precision changes.
 
     Timestep-quantized schedules (e.g. W4A8 at the schedule boundaries, W4A4
-    elsewhere) change the numerics of cached residuals mid-run. Every module
-    that exposes a ``precision_policy_target`` (attention and linear schemes
-    alike) contributes to the per-run signature; when the signature changes,
+    elsewhere) change the numerics of cached residuals mid-run. MXFP4 attention
+    and linear schemes with a ``precision_policy_target`` contribute to the
+    per-run signature; when the signature changes,
     both CFG branch histories and calibrator caches are dropped and the step
     is recomputed.
     """
     modules = getattr(transformer, "modules", None)
     if modules is None:
         return
+    attention_policies = []
     policies = []
     for module in modules():
-        for attr in ("attention_quant_scheme", "scheme"):
-            scheme = getattr(module, attr, None)
-            target = getattr(scheme, "precision_policy_target", None)
-            if target is not None and not any(scheme is p for p in policies):
-                policies.append(scheme)
-    if not policies or getattr(transformer.forward, "_sglang_precision_guard", False):
+        if getattr(module, "attention_quant_scheme", None) == "MXFP4":
+            attention_policies.append(module.attention_quant_description)
+        scheme = getattr(module, "scheme", None)
+        target = getattr(scheme, "precision_policy_target", None)
+        if target is not None and not any(scheme is p for p in policies):
+            policies.append(scheme)
+    if not (attention_policies or policies) or getattr(
+        transformer.forward, "_sglang_precision_guard", False
+    ):
         return
 
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
         default_mxfp4_policy,
+        resolve_precision,
     )
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         get_forward_context_or_none,
@@ -61,8 +66,9 @@ def install_quant_precision_guard(transformer):
             previous_signature = force_step = None
         default_policy = default_mxfp4_policy(num_steps)
         signature = tuple(
-            scheme.resolve_precision(default_policy) for scheme in policies
-        )
+            resolve_precision(description, "fa", "MXFP4", default_policy)
+            for description in attention_policies
+        ) + tuple(scheme.resolve_precision(default_policy) for scheme in policies)
         contexts = [
             transformer._context_manager.get_context(name)
             for name in transformer._context_names

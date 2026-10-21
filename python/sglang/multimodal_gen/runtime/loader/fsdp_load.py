@@ -919,8 +919,7 @@ def load_model_from_full_model_state_dict(
             key for key in skipped_checkpoint_keys if key.endswith(("q_rot", "k_rot"))
         ]
         quantized_attention_required_rotations = any(
-            (scheme := getattr(module, "attention_quant_scheme", None)) is not None
-            and scheme.requires_exported_rotations
+            getattr(module, "attention_quant_scheme", None) == "MXFP4"
             for module in model.modules()
         )
         if skipped_rotations and quantized_attention_required_rotations:

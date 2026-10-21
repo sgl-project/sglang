@@ -10,13 +10,8 @@ effective per-step precision changes mid-run.
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.multimodal_gen.runtime.cache.quant_precision_guard import (
     install_quant_precision_guard,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.attention_quant_scheme import (
-    AttentionQuantScheme,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
     default_mxfp4_policy,
@@ -135,11 +130,6 @@ class TestResolvePrecision(CustomTestCase):
                 "MXFP4",
             )
 
-    def test_attention_scheme_resolves_boundary_steps(self):
-        scheme = AttentionQuantScheme("blocks.0.attn", "MXFP4", {}, True, True)
-        with set_forward_context(0, None, forward_batch=SimpleNamespace()):
-            self.assertEqual(scheme.resolve_precision(default_mxfp4_policy(8)), "MXFP4")
-
     def test_checkpoint_policy_overrides_schedule(self):
         description = {
             "timestep_policy": {
@@ -159,9 +149,10 @@ class TestResolvePrecision(CustomTestCase):
         )
 
     def test_unquantized_attention_has_no_policy(self):
-        scheme = AttentionQuantScheme("blocks.0.attn", None, {}, False, False)
         with set_forward_context(3, None, forward_batch=SimpleNamespace()):
-            self.assertEqual(scheme.resolve_precision(default_mxfp4_policy(8)), "FLOAT")
+            self.assertEqual(
+                resolve_precision({}, None, "FLOAT", default_mxfp4_policy(8)), "FLOAT"
+            )
 
     def test_invalid_precision_still_rejected(self):
         description = {"timestep_policy": {"fa": {"default": "W4A8"}}}
@@ -172,78 +163,12 @@ class TestResolvePrecision(CustomTestCase):
             resolve_precision(description, "fa", "MXFP4", None)
 
 
-class TestRegisterQKRotationBuffers(CustomTestCase):
-    """Scheme-owned q_rot/k_rot registration, shared by Wan and Flux paths."""
-
-    def _scheme(self, description):
-        return AttentionQuantScheme.from_quant_config(
-            SimpleNamespace(quant_description=description), "blocks.0.attn1"
-        )
-
-    def test_registers_buffers_and_binds(self):
-        scheme = self._scheme(
-            {
-                "blocks.0.attn1.quant_type": "MXFP4_DYNAMIC",
-                "blocks.0.attn1.to_q_rot": "FLOAT",
-                "blocks.0.attn1.to_k_rot": "FLOAT",
-            }
-        )
-        registered = []
-        module = type(
-            "Module",
-            (),
-            {
-                "register_buffer": staticmethod(
-                    lambda name, tensor, persistent=True: registered.append(
-                        (name, tuple(tensor.shape), tensor.dtype, persistent)
-                    )
-                ),
-                "q_rot": None,
-                "k_rot": None,
-            },
-        )()
-        self.assertTrue(scheme.register_qk_rotation_buffers(module, head_dim=128))
-        self.assertEqual(
-            registered,
-            [
-                ("q_rot", (128, 128), torch.bfloat16, True),
-                ("k_rot", (128, 128), torch.bfloat16, True),
-            ],
-        )
-        # apply_qk_rotation can now reach the module through the weakref bind.
-        module.q_rot = torch.eye(128)
-        module.k_rot = torch.eye(128)
-        query = torch.randn(2, 4, 128)
-        rotated_q, rotated_k = scheme.apply_qk_rotation(query, query)
-        torch.testing.assert_close(rotated_q, query)
-        torch.testing.assert_close(rotated_k, query)
-
-    def test_no_registration_without_exported_rotations(self):
-        scheme = self._scheme({"blocks.0.attn1.quant_type": "MXFP4_DYNAMIC"})
-        module = type("Module", (), {"register_buffer": lambda *a, **k: None})()
-        self.assertFalse(scheme.register_qk_rotation_buffers(module, head_dim=128))
-
-    def test_legacy_q_rot_spelling_also_registers(self):
-        scheme = self._scheme(
-            {
-                "blocks.0.attn1.q_rot": "FLOAT",
-                "blocks.0.attn1.k_rot": "FLOAT",
-            }
-        )
-        module = type("Module", (), {"register_buffer": lambda *a, **k: None})()
-        self.assertTrue(scheme.use_offline_qk_rotation)
-        self.assertFalse(scheme.is_quant, "Flux-style legacy path stays unquantized")
-        # Registration works from the legacy descriptor spelling too.
-        self.assertTrue(scheme.register_qk_rotation_buffers(module, head_dim=128))
-
-
 class TestPrecisionGuard(CustomTestCase):
     def _transformer(self):
         contexts = [_FakeCachedContext(NUM_STEPS) for _ in range(2)]
         modules = [
-            _FakeQuantModule(
-                AttentionQuantScheme("blocks.0.attn", "MXFP4", {}, True, True),
-                "attention_quant_scheme",
+            SimpleNamespace(
+                attention_quant_scheme="MXFP4", attention_quant_description={}
             ),
             _FakeQuantModule(_FakeLinearScheme({}), "scheme"),
         ]

@@ -17,11 +17,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.attention_quant_scheme import (
-    AttentionQuantScheme,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
     mxfp4_quant_kwargs,
+    resolve_precision,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -237,9 +235,7 @@ class AscendMXFP4Attention:
     to the backend's unquantized paths.
     """
 
-    def __init__(
-        self, scheme: AttentionQuantScheme, head_size: int, causal: bool
-    ) -> None:
+    def __init__(self, description: dict, head_size: int, causal: bool) -> None:
         if causal or head_size != 128 or get_ring_parallel_world_size() > 1:
             raise NotImplementedError(
                 "MXFP4 attention requires unmasked D=128 attention without "
@@ -251,8 +247,7 @@ class AscendMXFP4Attention:
             raise RuntimeError(
                 "MXFP4 attention requires PyTorch with float8_e8m0fnu support"
             )
-        self.scheme = scheme
-        self.description = scheme.description
+        self.description = description
         self.pad_base = self.description.get("mxfp4_attention_pad_size", 512)
         if self.pad_base not in (256, 512):
             raise ValueError("mxfp4_attention_pad_size must be 256 or 512")
@@ -522,33 +517,41 @@ class AscendFAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         quant_config = extra_impl_args.get("quant_config")
-        self._attention_scheme = AttentionQuantScheme.from_quant_config(
-            quant_config, prefix
+        self._attention_scheme = (
+            quant_config.get_attention_scheme(prefix)
+            if hasattr(quant_config, "get_attention_scheme")
+            else None
+        )
+        self._attention_description = (
+            getattr(quant_config, "quant_description", {}) or {}
         )
         self._mxfp4_attention = None
         self._quant_scheme = (
             resolve_mx_fa_scheme(quant_config)
-            if not self._attention_scheme.is_quant
+            if self._attention_scheme is None
             else None
         )
         attention_prefix = prefix.removesuffix(".impl")
-        self.use_offline_qk_rotation = (
-            self._attention_scheme.use_offline_qk_rotation
-            or (
-                not attention_prefix
-                and getattr(quant_config, "use_offline_qk_rotation", False)
+        self.use_offline_qk_rotation = all(
+            any(
+                self._attention_description.get(f"{attention_prefix}.{name}") == "FLOAT"
+                for name in names
             )
+            for names in (("to_q_rot", "q_rot"), ("to_k_rot", "k_rot"))
+        ) or (
+            not attention_prefix
+            and getattr(quant_config, "use_offline_qk_rotation", False)
         )
         self._is_cross_attention = bool(
             extra_impl_args.get("is_cross_attention", False)
         )
-        if self._attention_scheme.is_quant:
+        if self._attention_scheme == "MXFP4":
             if self._is_cross_attention:
                 raise NotImplementedError(
                     "Quantized MXFP4 attention is supported only for self-attention"
                 )
             self._mxfp4_attention = AscendMXFP4Attention(
-                self._attention_scheme, head_size, causal
+                self._attention_description, head_size, causal
             )
         if self._quant_scheme is not None:
             self._head_size = head_size
@@ -595,7 +598,7 @@ class AscendFAImpl(AttentionImpl):
     ) -> torch.Tensor:
         if (
             self._mxfp4_attention is not None
-            and self._attention_scheme.resolve_precision() == "MXFP4"
+            and resolve_precision(self._attention_description, "fa", "MXFP4") == "MXFP4"
         ):
             return self._mxfp4_attention.forward(
                 query, key, value, self.softmax_scale, return_softmax_lse
@@ -666,7 +669,7 @@ class AscendFAImpl(AttentionImpl):
         del max_seqlen
         if (
             self._mxfp4_attention is not None
-            and self._attention_scheme.resolve_precision() == "MXFP4"
+            and resolve_precision(self._attention_description, "fa", "MXFP4") == "MXFP4"
         ):
             boundaries = _packed_boundaries(
                 cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
