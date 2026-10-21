@@ -1128,6 +1128,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None:
+            self.linker.on_request_released(req.rid)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1258,6 +1260,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     ),
                 )
             )
+
+        if self.linker is not None:
+            self.linker.on_request_inserted(req.rid, req.kv.cache_inserted_len)
 
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.

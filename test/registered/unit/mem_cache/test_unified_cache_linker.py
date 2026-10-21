@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+    _LoadedPages,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -347,17 +348,18 @@ class TestUnifiedCacheLinkerPythonBackend(
         req.extra_key = None
         req.lock = cache.lock(req.last_node)
 
-    def test_full_offload_load_round_trip_and_dedup(self):
-        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
-        self.cfg = cfg
-        stored_keys = defaultdict(set)
+    def _load_from_producer(self, stored_keys, tokens, loaded_len):
+        """Verify write-through and load its prefix into a fresh consumer."""
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
-        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer, producer_allocator, producer_req_pool = build_fixture(self.cfg)
         producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
         producer.init_cache_linker(producer_linker)
-        tokens = list(range(1, 9))
+        stored_tokens = tokens[:loaded_len]
 
-        inserted = self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        inserted = self._insert(
+            producer, producer_allocator, producer_req_pool, stored_tokens
+        )
         self.assertEqual(len(producer_linker.offload_calls), 1)
         (kv_offload,) = producer_linker.offload_calls[0]
         self.assertEqual(kv_offload.name, PoolName.KV)
@@ -387,7 +389,7 @@ class TestUnifiedCacheLinkerPythonBackend(
             inserted.last_device_node,
         )
 
-        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        self._insert(producer, producer_allocator, producer_req_pool, stored_tokens)
         self.assertEqual(len(producer_linker.offload_calls), 1)
 
         producer_linker.complete_next_offload(True)
@@ -401,10 +403,10 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertTrue(
             producer.tree_core.is_external_cache_stored(inserted.last_device_node)
         )
-        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        self._insert(producer, producer_allocator, producer_req_pool, stored_tokens)
         self.assertEqual(len(producer_linker.offload_calls), 1)
 
-        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer, consumer_allocator, consumer_req_pool = build_fixture(self.cfg)
         consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
         consumer.init_cache_linker(consumer_linker)
         req = self._make_req(consumer_req_pool)
@@ -412,17 +414,17 @@ class TestUnifiedCacheLinkerPythonBackend(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
         self.assertEqual(match.device_prefix_len, 0)
-        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(match.host_hit_length, loaded_len)
         self._apply_match_to_req(req, match)
 
-        loaded_len, loaded_node = consumer.init_load_back(
+        actual_loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded_len, len(tokens))
+        self.assertEqual(actual_loaded_len, loaded_len)
         loaded = consumer.linker.private_load_indices[req.rid]
         # The tail is request-private: nothing is published until it lands.
         self.assertEqual(loaded_node, req.last_node)
@@ -433,20 +435,62 @@ class TestUnifiedCacheLinkerPythonBackend(
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
+        if loaded_len < len(tokens):
+            computed = consumer_allocator.alloc(len(tokens) - loaded_len)
+            consumer_req_pool.write(
+                (req.kv.req_pool_idx, slice(loaded_len, len(tokens))), computed
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         consumer.checkpoint(req, up_to=req.extend_end)
         consumer.unlock(req.lock)
         req.lock = None
+        node = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        indices = consumer.path_device_indices(node)
+        self.assertEqual(len(indices), len(tokens))
+        self.assertTrue(torch.equal(indices[:loaded_len], loaded))
+        return consumer, consumer_allocator, consumer_req_pool, consumer_linker
+
+    def test_full_offload_load_round_trip_and_dedup(self):
+        tokens = list(range(1, 9))
+        consumer, _, _, consumer_linker = self._load_from_producer(
+            defaultdict(set), tokens, loaded_len=len(tokens)
+        )
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
+        # The store already holds the whole node: it is published without a write.
+        self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertEqual(consumer.linker.loaded_pages, {})
+        self.assertTrue(
+            consumer.tree_core.is_external_cache_stored(final_match.last_device_node)
+        )
+        consumer.sanity_check()
+
+    def test_offload_sends_only_computed_pages_of_a_loaded_node(self):
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 13))
+        consumer, _, _, consumer_linker = self._load_from_producer(
+            stored_keys, tokens, loaded_len=8
+        )
+
+        node = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        self.assertEqual(len(consumer_linker.offload_calls), 1)
+        (kv_offload,) = consumer_linker.offload_calls[0]
+        self.assertEqual(kv_offload.keys, consumer.tree_core.get_hash_values(node)[4:])
         self.assertTrue(
             torch.equal(
-                consumer.path_device_indices(final_match.last_device_node), loaded
+                kv_offload.device_indices,
+                _device_value(consumer, node, ComponentType.FULL)[8:],
             )
         )
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
+        self.assertTrue(consumer.tree_core.is_external_cache_stored(node))
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
@@ -1084,9 +1128,11 @@ def test_finish_loads_adopts_a_peer_rank_failure():
         _cache_for_wrapper(_all_reduce_attn_groups=reduce), _FakeLinker()
     )
     wrapper.inflight_load_rids = ["a", "b"]
+    wrapper.private_load_pages["a"] = _LoadedPages(4, frozenset({"h0", "h1"}))
     wrapper.start_layer_wise_loading()
 
     assert wrapper.finish_loads() == ["a", "b"]  # this rank landed, a peer did not
+    assert wrapper.loaded_pages == {}  # agrees with the peer, not its own load
     assert wrapper.finish_loads() == []  # nothing loaded: no collective
     reduce.assert_called_once()
 
