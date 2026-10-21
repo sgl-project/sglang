@@ -4047,6 +4047,21 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                 )
                 self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
 
+    def test_plain_tp_defaults_off(self):
+        # The motivating shape: plain TP with the all-to-all and memory saver off.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            server_args = self._resolve(
+                attn_dp_size=1,
+                tp_size=2,
+                enable_tp_lm_head_all_to_all=False,
+                enable_memory_saver=False,
+            )
+            self.assertFalse(
+                resolution_result(server_args, "enable_tp_lm_head_all_to_all")
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
     def test_pausable_graph_pool_defaults_off(self):
         # Isolates the torch_memory_saver trigger: the all-to-all stays off, so
         # only the remapped graph pool can account for the default.
