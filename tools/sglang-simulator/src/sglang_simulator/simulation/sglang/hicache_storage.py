@@ -45,6 +45,10 @@ class MockHiCacheStorage:
         """Register one pool from UnifiedRadixCache's multi-pool HiCache stack."""
         self.registered_pools[host_pool_name] = host_pool
 
+    def on_host_pools_registered(self):
+        """The initial registration burst is over (see HiCacheStorage)."""
+        pass
+
     @staticmethod
     def _pool_storage_key(key: str, pool_name) -> str:
         name = str(pool_name)

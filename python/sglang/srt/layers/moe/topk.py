@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_forward,
     get_lora,
     get_model,
@@ -103,11 +104,16 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackendLike,
+    RoutingMethodType,
     has_per_rank_fused_shared_slots,
+)
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -268,6 +274,8 @@ class TopKConfig:
     # router's shared weights on the other standard path.
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+    routing_method_type: Optional[RoutingMethodType] = None
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
@@ -276,6 +284,8 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    # Lazy materialization still needs the producer's solver and capture slot.
+    layer_id: Optional[int] = None
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -390,10 +400,10 @@ class TritonKernelTopKOutput(NamedTuple):
 
 
 class BypassedTopKOutput(NamedTuple):
-    """Bypassed top-k output format."""
+    """Lazy routing that can be materialized or consumed by an in-kernel router."""
 
     hidden_states: torch.Tensor
-    router_logits: torch.Tensor
+    raw_router_logits: torch.Tensor
     topk_config: TopKConfig
     num_token_non_padded: Optional[torch.Tensor] = None
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None
@@ -402,14 +412,23 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
+    @property
+    def router_logits(self) -> torch.Tensor:
+        if self.expert_location_dispatch_info is not None:
+            raise NotImplementedError(
+                "Expert placement remapping requires materialized TopK routing; "
+                "this MoE kernel routes directly from logits."
+            )
+        return self.raw_router_logits
+
     def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
         return select_experts(
             hidden_states=self.hidden_states,
-            router_logits=self.router_logits,
+            router_logits=self.raw_router_logits,
             topk_config=self.topk_config,
-            layer_id=layer_id,
+            layer_id=self.topk_config.layer_id if layer_id is None else layer_id,
             num_token_non_padded=self.num_token_non_padded,
             expert_location_dispatch_info=self.expert_location_dispatch_info,
         )
@@ -584,7 +603,65 @@ def _simulate_balanced_routing(
     )
 
 
+def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
+    """Match the native selector to the materialized router's policy."""
+    method = config.routing_method_type
+    if (
+        method is None
+        or method == RoutingMethodType.Unspecified
+        or config.sqrtsoftplus_log1p
+        or config.num_shared_topk_slots != 0
+    ):
+        return False
+    plain = not config.use_grouped_topk and config.correction_bias is None
+    if method == RoutingMethodType.Llama4:
+        return (
+            plain
+            and config.top_k == 1
+            and not config.renormalize
+            and config.custom_routing_function is not None
+        )
+    if config.custom_routing_function is not None:
+        return False
+    if method == RoutingMethodType.DeepSeekV3:
+        # The biased grouped router uses sigmoid regardless of scoring_func.
+        return (
+            config.use_grouped_topk
+            and config.correction_bias is not None
+            and config.renormalize
+        )
+    if not plain:
+        return False
+    if method in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive):
+        return config.scoring_func == "softmax" and config.renormalize
+    if method == RoutingMethodType.Default:
+        return config.scoring_func == "softmax" and not config.renormalize
+    if method == RoutingMethodType.SigmoidRenorm:
+        return config.scoring_func == "sigmoid" and config.renormalize
+    if method == RoutingMethodType.Sigmoid:
+        return config.scoring_func == "sigmoid" and not config.renormalize
+    return False
+
+
 # -------------------------------- TopK ---------------------------------------
+
+
+def resolve_routing_inputs(
+    *,
+    layer_id: int,
+    is_draft: bool,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+):
+    if num_token_non_padded is None and has_forward_context():
+        get_bound = get_forward_context().moe_num_token_non_padded
+        if get_bound is not None:
+            num_token_non_padded = get_bound()
+    if is_draft:
+        expert_location_dispatch_info = None
+    elif expert_location_dispatch_info is None:
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id)
+    return num_token_non_padded, expert_location_dispatch_info
 
 
 class TopK(BaseFusedOp):
@@ -606,6 +683,7 @@ class TopK(BaseFusedOp):
         top_k: int,
         *,
         layer_id: int,
+        is_draft: Optional[bool] = None,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -631,6 +709,10 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self.is_draft = (
+            get_flags().moe.in_speculative_scope if is_draft is None else is_draft
+        )
+        self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
         self.enable_waterfill = shared_experts.use_waterfill
@@ -642,6 +724,7 @@ class TopK(BaseFusedOp):
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k + num_shared_slots,
+            layer_id=layer_id,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
@@ -659,8 +742,62 @@ class TopK(BaseFusedOp):
             scoring_func=scoring_func,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
             fused_gate_packed_ids=fused_gate_packed_ids,
-            allow_routed_experts_capture=allow_routed_experts_capture,
+            allow_routed_experts_capture=allow_routed_experts_capture
+            and not self.is_draft,
         )
+
+    def routing_inputs(self):
+        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+
+    def _resolve_routing_inputs(
+        self, num_token_non_padded, expert_location_dispatch_info
+    ):
+        return resolve_routing_inputs(
+            layer_id=self.layer_id,
+            is_draft=self.is_draft,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
+    def bind_runner_backend(
+        self,
+        runner_backend: Optional[MoeRunnerBackendLike],
+        *,
+        routing_method_type: Optional[RoutingMethodType] = None,
+    ) -> None:
+        """Associate the owning experts once; repeating the same association is safe."""
+        if self._runner_backend_bound:
+            if (
+                runner_backend != self.topk_config.runner_backend
+                or routing_method_type != self.topk_config.routing_method_type
+            ):
+                raise RuntimeError("TopK cannot bind a different MoE runner backend.")
+            return
+        self._runner_backend_bound = True
+        self.topk_config.runner_backend = runner_backend
+        self.topk_config.routing_method_type = routing_method_type
+        self.topk_config.fused_gate_packed_ids &= (
+            runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
+        )
+        if self.topk_config.output_format is not None:
+            return
+        if runner_backend is not None and runner_backend.is_triton_kernels():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+        elif runner_backend is not None and (
+            runner_backend.is_flashinfer_trtllm()
+            and _can_bypass_trtllm_routing(self.topk_config)
+            or runner_backend.is_flashinfer_mxfp4()
+            and not self.is_fp4_experts
+        ):
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if runner_backend.is_experimental_sgl_trtllm()
+                and get_lora().enable_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        else:
+            output_format = TopKOutputFormat.STANDARD
+        self.topk_config.output_format = output_format
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
@@ -694,6 +831,11 @@ class TopK(BaseFusedOp):
         dynamic_expert_bias: Optional[torch.Tensor] = None,
         router_logits_partials: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        num_token_non_padded, expert_location_dispatch_info = (
+            self._resolve_routing_inputs(
+                num_token_non_padded, expert_location_dispatch_info
+            )
+        )
         if router_logits_partials is not None:
             rocm_router_reduce_partials(router_logits_partials, router_logits)
         self.topk_config.torch_native = True
@@ -721,30 +863,31 @@ class TopK(BaseFusedOp):
         """router_logits_partials (ROCm decode router): fp32 split-K partials whose
         fixed-order sum is the logits; router_logits is then a buffer the fused gate
         fills, and any other reader first reduces the partials into it."""
+        explicit_dispatch_info = expert_location_dispatch_info is not None
+        num_token_non_padded, expert_location_dispatch_info = (
+            self._resolve_routing_inputs(
+                num_token_non_padded, expert_location_dispatch_info
+            )
+        )
         if dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
-            output_format = TopKOutputFormat.TRITON_KERNEL
-        # ===== TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_experimental_sgl_trtllm():
-            try:
-                use_standard_for_lora = bool(get_lora().enable_lora)
-            except ValueError:
-                use_standard_for_lora = False
-            output_format = (
-                TopKOutputFormat.STANDARD
-                if use_standard_for_lora
-                else TopKOutputFormat.BYPASSED
-            )
-        # ===== END TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
-        ):
-            output_format = TopKOutputFormat.BYPASSED
         else:
-            output_format = TopKOutputFormat.STANDARD
+            raise RuntimeError(
+                "TopK requires the owning experts' runner backend or an explicit output format."
+            )
+
+        requires_remapping = expert_location_dispatch_info is not None and (
+            explicit_dispatch_info
+            or is_expert_remapping_enabled()
+            or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
+        )
+        if output_format == TopKOutputFormat.TRITON_KERNEL and requires_remapping:
+            raise NotImplementedError(
+                "Expert placement remapping requires a MoE runner with standard TopK routing; "
+                f"got {output_format.name}."
+            )
 
         if (
             router_logits_partials is not None
@@ -765,6 +908,7 @@ class TopK(BaseFusedOp):
                 router_logits,
                 self.topk_config.top_k,
                 sm_first=not self.topk_config.renormalize,
+                n_rows=num_token_non_padded,
             )
             return TritonKernelTopKOutput(
                 a_ragged_metadata,
@@ -776,10 +920,12 @@ class TopK(BaseFusedOp):
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
-                router_logits=router_logits,
+                raw_router_logits=router_logits,
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
+                expert_location_dispatch_info=(
+                    expert_location_dispatch_info if requires_remapping else None
+                ),
             )
         else:
             self.topk_config.torch_native = False
@@ -807,6 +953,11 @@ class TopK(BaseFusedOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        num_token_non_padded, expert_location_dispatch_info = (
+            self._resolve_routing_inputs(
+                num_token_non_padded, expert_location_dispatch_info
+            )
+        )
         topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
@@ -827,6 +978,11 @@ class TopK(BaseFusedOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        num_token_non_padded, expert_location_dispatch_info = (
+            self._resolve_routing_inputs(
+                num_token_non_padded, expert_location_dispatch_info
+            )
+        )
         if dynamic_expert_bias is not None:
             self.topk_config.torch_native = False
             return select_experts(
@@ -855,12 +1011,13 @@ class TopK(BaseFusedOp):
     ) -> TopKOutput:
         """Return an empty topk output for a rank with zero tokens this forward.
 
-        When ``layer_id`` is provided and the active dispatch algorithm is LP,
-        also calls ``LPLBSolver.solve(empty)`` so that this rank participates
-        in the EP all-reduce. Without this, an empty rank would skip the
-        collective and deadlock under DP-attention.
+        Target layers call their owning ``LPLBSolver.solve(empty)`` so this
+        rank participates in the EP all-reduce even without tokens. Draft
+        layers skip the target solver. The optional ``layer_id`` is retained
+        for caller compatibility; the router's owning layer determines the solver.
         """
-        if layer_id is not None:
+        if not self.is_draft:
+            layer_id = self.layer_id
             # Skip the full ExpertLocationDispatchInfo allocation — we only
             # need the per-layer solver to participate in the EP all-reduce.
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
@@ -904,6 +1061,11 @@ class TopK(BaseFusedOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        num_token_non_padded, expert_location_dispatch_info = (
+            self._resolve_routing_inputs(
+                num_token_non_padded, expert_location_dispatch_info
+            )
+        )
         self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
         #   - support 'topk_softmax' and 'topk_sigmoid'
@@ -1265,8 +1427,8 @@ def grouped_topk_gpu(
         )
         if routed_scaling_factor is not None:
             topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -1278,8 +1440,8 @@ def grouped_topk_gpu(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -1403,8 +1565,8 @@ def kimi_k2_biased_topk_impl(
         # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
@@ -1455,8 +1617,8 @@ def biased_topk_impl(
         )
         if routed_scaling_factor is not None:
             topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -1468,8 +1630,8 @@ def biased_topk_impl(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
@@ -1735,7 +1897,6 @@ def _fused_gate_emits_packed_ids(
     return (
         enabled
         and _fused_gate_masks_padded_rows(scoring_func)
-        and get_moe_runner_backend().is_flashinfer_mxfp4()
         and expert_location_dispatch_info is None
         and num_shared_topk_slots == 0
         and not routing_overridden
@@ -1748,6 +1909,12 @@ def _mask_topk_ids_padded_region(
     fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
+        return
+    if not topk_ids.is_cuda:
+        if _is_npu:
+            return
+        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        topk_ids.masked_fill_((rows >= num_token_non_padded)[:, None], fill_value)
         return
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
@@ -1766,6 +1933,10 @@ def _zero_topk_weights_padded_region(
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     if num_token_non_padded is None:
+        return
+    if not topk_weights.is_cuda:
+        rows = torch.arange(topk_weights.shape[0], device=topk_weights.device)
+        topk_weights.masked_fill_((rows >= num_token_non_padded)[:, None], 0.0)
         return
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
@@ -2353,12 +2524,27 @@ def _post_process_topk_ids(
 
             lplb_solver = get_global_lplb_solver(layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                lp_routed_ids = (
+                    topk_ids[:, :-num_shared_topk_slots]
+                    if router_wrote_shared_cols
+                    else topk_ids
+                )
+                log2phy_prob = lplb_solver.solve(lp_routed_ids)
 
         if log2phy_prob is not None:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
-            )
+            if router_wrote_shared_cols:
+                shared_cols = topk_ids[:, -num_shared_topk_slots:]
+                routed_cols = topk_ids_logical_to_physical(
+                    topk_ids[:, :-num_shared_topk_slots],
+                    expert_location_dispatch_info,
+                    log2phy_prob,
+                )
+                topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+                recorder_topk_ids = topk_ids[:, :-num_shared_topk_slots]
+            else:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info, log2phy_prob
+                )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         elif router_wrote_shared_cols:
             # Shared IDs are outside EPLB's routed-expert table for both global
@@ -2438,6 +2624,21 @@ def _post_process_topk_ids(
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
+
+    else:
+        if num_shared_topk_slots > 0:
+            shared_cols = topk_ids[:, -num_shared_topk_slots:]
+            routed_cols = topk_ids_logical_to_physical(
+                topk_ids[:, :-num_shared_topk_slots], expert_location_dispatch_info
+            )
+            _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+            recorder_topk_ids = routed_cols
+        else:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = (
@@ -2531,6 +2732,14 @@ def _post_process_topk_ids(
         # supplied 1/ep_size factor the shared contribution is summed ep_size times.
         topk_weights[:, -num_shared_topk_slots:] *= fused_shared_experts_scaling_factor
 
+    if _is_npu:
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        if recorder_topk_ids is not None and num_token_non_padded is not None:
+            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+            recorder_topk_ids = recorder_topk_ids.masked_fill(
+                (rows >= num_token_non_padded)[:, None], -1
+            )
+
     if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
@@ -2623,6 +2832,7 @@ def select_experts(
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
+    fold_scale_after_routing = False
     num_routed_topk = top_k - num_shared_topk_slots
     # On aiter and on the per-rank shared-slot path, _post_process_topk_ids appends
     # the shared columns, so the router selects and renormalizes routed experts only.
@@ -2682,11 +2892,7 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert num_token_non_padded is None, (
-            "num_token_non_padded is not yet supported in fused_topk_native"
-        )
-        assert expert_location_dispatch_info is None
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -2696,8 +2902,7 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        if scoring_func not in ("sqrtsoftplus", "sigmoid"):
-            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = scoring_func not in ("sqrtsoftplus", "sigmoid")
 
         # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
         _can_use_jit_kernel = not _is_cpu
@@ -2747,7 +2952,8 @@ def select_experts(
             )
             padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
         elif (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            topk_config.runner_backend is not None
+            and topk_config.runner_backend.is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
         ):
@@ -2775,6 +2981,10 @@ def select_experts(
                 and expert_location_dispatch_info is None
                 and num_shared_topk_slots == 0
                 and not routing_overridden
+                and not (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor not in (None, 1.0)
+                )
             ):
                 num_experts = router_logits.shape[-1]
                 if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
@@ -2804,7 +3014,10 @@ def select_experts(
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                apply_routed_scaling_factor_on_output=(
+                    apply_routed_scaling_factor_on_output
+                    and not fold_scale_after_routing
+                ),
                 **_fused_topk_kwargs,
             )
     else:
@@ -2812,13 +3025,22 @@ def select_experts(
         # padded rows is garbage. That is fine because _post_process_topk_ids
         # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
         # weights on HIP) after the logical->physical remap.
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k_for_gate,
             renormalize=renormalize,
         )
+
+    if (
+        fold_scale_after_routing
+        and apply_routed_scaling_factor_on_output
+        and routed_scaling_factor is not None
+    ):
+        # Shared columns keep their own weight; only routed experts take this scale.
+        num_routed_for_gate = top_k_for_gate - num_shared_topk_slots_for_gate
+        topk_weights[:, :num_routed_for_gate] *= routed_scaling_factor
 
     if routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so

@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -163,6 +163,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
 
     def create_weights(
         self,

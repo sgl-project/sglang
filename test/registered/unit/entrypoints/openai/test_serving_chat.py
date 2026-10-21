@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.entrypoints.openai.serving_inkling import InklingChatEncodingAdapter
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -195,6 +196,7 @@ class _MockTemplateManager:
         self.reasoning_config = None
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
+        self.python_chat_template = None
 
 
 class TestChatTemplateCache(CustomTestCase):
@@ -5236,6 +5238,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
@@ -5263,6 +5266,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -5299,6 +5303,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[

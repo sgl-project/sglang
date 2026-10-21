@@ -152,6 +152,7 @@ class HYV3MoEFused(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
