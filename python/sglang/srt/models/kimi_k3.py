@@ -1217,6 +1217,8 @@ class KimiK3MoE(nn.Module):
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
+        # Both front helpers include the BF16 down-projection, bypassing MXFP4.
+        # Leave routed_input unset for separate routing and MXFP4 compression below.
         routed_input = None
         if not self._use_latent_mxfp4(num_tokens=hidden_states.shape[0]):
             routed_input = self._ep_front(hidden_states)
