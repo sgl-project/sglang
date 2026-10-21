@@ -3000,16 +3000,17 @@ class DeepseekV4AttnBackend(
             and self.is_dsv41
             and get_platform().is_sm90
             and not self.mega_attn
+            and self.token_to_kv_pool.request_window is None
             and isinstance(
                 forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
             )
             and forward_batch.attn_cp_metadata.local_index is None
             and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
         )
-        
+
         return (
-            not self.trtllm_attn and
-            forward_batch.forward_mode.is_extend_without_speculative()
+            not self.trtllm_attn
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and (not cp_active or cp_sparse_prefill)
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
@@ -4585,18 +4586,20 @@ class DeepseekV4AttnBackend(
             n_compressed = flat_token_ids.shape[0]
             reuse_compressed = compress_ratio in (1, 2) and is_cp_active(forward_batch)
             if reuse_compressed:
-                workspace = self.shared_compressed_prefill_workspaces[compress_ratio].get(
-                    n_compressed + cache.swa_token_ids.shape[0]
-                )
+                workspace = self.shared_compressed_prefill_workspaces[
+                    compress_ratio
+                ].get(n_compressed + cache.swa_token_ids.shape[0])
                 compressed_slice = workspace[:n_compressed]
             else:
-                workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
-                    n_compressed + cache.swa_token_ids.shape[0],
-                    head_source=(
-                        extra_k_cache.data_ptr(),
-                        flat_token_ids.data_ptr(),
-                        n_compressed,
-                    ),
+                workspace, compressed_filled = (
+                    self.sparse_prefill_kv_buffer.get_with_head(
+                        n_compressed + cache.swa_token_ids.shape[0],
+                        head_source=(
+                            extra_k_cache.data_ptr(),
+                            flat_token_ids.data_ptr(),
+                            n_compressed,
+                        ),
+                    )
                 )
                 if not compressed_filled:
                     compressed_slice = workspace[:n_compressed]
