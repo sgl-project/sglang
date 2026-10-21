@@ -2229,6 +2229,13 @@ class TestSSLArgs(unittest.TestCase):
         self.assertIn("--enable-ssl-refresh", str(context.exception))
         self.assertIn("--ssl-certfile", str(context.exception))
 
+    def test_http_worker_reuseport_requires_multiple_uvicorn_workers(self):
+        for kwargs in ({}, {"tokenizer_worker_num": 2, "enable_http2": True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError) as context:
+                self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
+            self.assertIn("--enable-http-worker-reuseport", str(context.exception))
+        self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
+
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
         server_args = self._validate_ssl(

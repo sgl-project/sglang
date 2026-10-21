@@ -754,7 +754,8 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         floor = torch.cat(
             [torch.full((n,), s, device=device) for s, n in zip(starts, lens)]
         )
-    layout = window_layout(req, pos, floor=floor, num_groups=2)
+    # Only the query-side indices matter here; no window history is copied.
+    layout = window_layout(req, pos, zero_row=0, floor=floor, num_groups=2)
     seq = torch.tensor(
         [s + n for s, n in zip(starts, lens)], device=device, dtype=torch.int32
     )
