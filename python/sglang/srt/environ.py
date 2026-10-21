@@ -1766,6 +1766,9 @@ class Envs:
     # Encoder SWA replay on HIP: fold each hit's replay rows into its extend
     # instead of running a separate replay forward first.
     SGLANG_HIP_FOLD_ENCODER_SWA_REPLAY = EnvBool(True)
+    # Encoder SWA replay on HIP: decode and target-verify read and write the
+    # per-request SWA ring in place; only prefill/extend stage it in the workspace.
+    SGLANG_HIP_REQUEST_WINDOW_DIRECT = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

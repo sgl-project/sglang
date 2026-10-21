@@ -102,7 +102,10 @@ from sglang.srt.layers.attention.hip_flash_mla import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.mem_cache.dsv41_request_window import (
+    direct_window_layout,
+    window_layout,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.monokernels.runtime import is_metadata_unread
 from sglang.srt.monokernels.spec import StepMetadata
@@ -1227,6 +1230,7 @@ class DeepseekV4HipRadixBackend(
             num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(req_pool_indices),
+            direct_window=attach_decode_streams,
         )
         # Normal prefill starts with a conservative exact_num_tokens=False.
         # Its CPU length mirror proves the exact query count without a D2H sync.
@@ -1530,6 +1534,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             num_groups=bs,
+            direct_window=True,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -1604,6 +1609,7 @@ class DeepseekV4HipRadixBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=need_compress,
+            direct_window=True,
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
         indexer_metadata = (
@@ -3554,8 +3560,11 @@ class DeepseekV4HipRadixBackend(
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        direct_window: bool = False,
     ) -> DSV4AttnMetadata:
-        """swa_replay_start floors every row's window at that absolute position."""
+        """swa_replay_start floors every row's window at that absolute position.
+        direct_window: the rows are each request's newest positions (decode,
+        target-verify), so a request window addresses its ring in place."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         raw_positions = seq_lens_casual - 1
 
@@ -3579,13 +3588,31 @@ class DeepseekV4HipRadixBackend(
                 swa_replay_start = _cuda_backend._pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
-            request_layout = window_layout(
-                req_pool_indices_repeated,
-                raw_positions,
-                capacity=window.capacity,
-                floor=swa_replay_start,
-                num_groups=num_groups,
-            )
+            if (
+                direct_window
+                and not self.encoder_replay
+                and envs.SGLANG_HIP_REQUEST_WINDOW_DIRECT.get()
+            ):
+                rows_per_request = max(1, self.target_verify_num_draft_tokens or 1)
+                assert window.capacity >= SWA_WINDOW + rows_per_request - 1, (
+                    f"ring capacity {window.capacity} cannot hold a {SWA_WINDOW}-row "
+                    f"window plus {rows_per_request} rows written in place"
+                )
+                request_layout = direct_window_layout(
+                    req_pool_indices_repeated,
+                    raw_positions,
+                    capacity=window.capacity,
+                    window=SWA_WINDOW,
+                    floor=swa_replay_start,
+                )
+            else:
+                request_layout = window_layout(
+                    req_pool_indices_repeated,
+                    raw_positions,
+                    capacity=window.capacity,
+                    floor=swa_replay_start,
+                    num_groups=num_groups,
+                )
             swa_page_indices = _pad_last_dim(
                 request_layout.indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
             )

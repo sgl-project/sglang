@@ -10,7 +10,10 @@ from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
 )
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
+
+_is_hip = is_hip()
 
 # A window row the replay expects but no longer holds; that request's attention
 # would read the wrong rows.
@@ -31,6 +34,8 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+    # Rows address the ring itself (indices / write_loc are ring rows); no workspace.
+    direct: bool = False
 
     def leading_rows(self, num_rows: int) -> "WindowLayout":
         """The layout of the live queries; a prefill CUDA graph pads the rest."""
@@ -171,6 +176,53 @@ def window_layout(
     )
 
 
+def direct_window_layout(
+    req,
+    pos,
+    *,
+    capacity: int,
+    window: int = 128,
+    floor: Optional[torch.Tensor] = None,
+):
+    """Window layout over the per-request ring (row ``req * capacity + pos % capacity``).
+
+    Only for forwards whose rows are each request's newest positions (decode,
+    target-verify): with ``capacity >= window + rows_per_request - 1`` a row this
+    forward writes never aliases a row another of its queries still reads, so the
+    store can land in the ring before attention."""
+    n = pos.numel()
+    if n == 0:
+        raise ValueError("request-window layout needs at least one query")
+    req = req.to(torch.int64)
+    pos = pos.to(torch.int64)
+    device = pos.device
+    seen_pos = pos[:, None] - torch.arange(window, device=device)
+    valid = seen_pos >= 0
+    if floor is not None:
+        valid &= seen_pos >= floor.to(torch.int64)[:, None]
+    indices = torch.where(valid, req[:, None] * capacity + seen_pos % capacity, -1).to(
+        torch.int32
+    )
+    lengths = valid.sum(-1).to(torch.int32)
+    write_loc = (req * capacity + pos % capacity).to(torch.int32)
+    empty = torch.empty(0, dtype=torch.int64, device=device)
+    no_rows = torch.empty(0, dtype=torch.bool, device=device)
+    return WindowLayout(
+        req,
+        pos,
+        write_loc,
+        indices,
+        lengths,
+        empty,
+        empty,
+        empty,
+        no_rows,
+        no_rows,
+        0,
+        direct=True,
+    )
+
+
 def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout.V4):
     """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
@@ -213,6 +265,11 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._rows = None
+        self._rows_layout = None
+        self._rows_layer = -1
+        self._tags_layout = None
+        self._tags_layer = -1
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -244,6 +301,8 @@ class RequestWindow:
             return
         self.layout = layout
         self.prepared = None
+        if layout.direct:
+            return
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -269,7 +328,22 @@ class RequestWindow:
             self.zero_row,
         )
 
+    def _history_rows(self, layer):
+        """History source ring rows of the active layout.
+
+        They are the same for every layer, so they are built once per forward --
+        at its first layer or when another layout (the late-layer tail) takes
+        over. A captured graph records the build there and replays it."""
+        layout = self.layout
+        if self._rows_layout is not layout or layer <= self._rows_layer:
+            self._rows = self._history_src(layout)
+            self._rows_layout = layout
+        self._rows_layer = layer
+        return self._rows
+
     def buffer(self, layer):
+        if self.layout is not None and self.layout.direct:
+            return self.state.kv_buffer[layer]
         # The runner's capture scope includes eager warmups before CUDA capture
         # starts, so the phase is part of the key: leaving the scope revalidates.
         in_capture = get_is_capture_mode() or _capturing()
@@ -278,7 +352,7 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
+            src = self._history_rows(layer) if _is_hip else self._history_src(layout)
             # Signal-only: skip building the predicate when detection is off.
             if not in_capture and resolve_level() >= InvariantCheckLevel.WARN:
                 expect(
@@ -300,6 +374,14 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
+        if layout.direct:
+            # The store already wrote the ring. Every layer gets the same rows, so
+            # one tag update at the forward's first layer covers all of them.
+            if self._tags_layout is not layout or layer <= self._tags_layer:
+                self.tags[:, layout.write_loc.to(torch.int64)] = layout.pos
+                self._tags_layout = layout
+            self._tags_layer = layer
+            return
         commit_packed_rows(
             self.buffer(layer),
             self.state.kv_buffer[layer],
