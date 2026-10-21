@@ -606,10 +606,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
-    fps: Optional[float] = None
-    max_frames: Optional[int] = None
-    max_tokens_per_frame: Optional[int] = None
-    max_image_tokens: Optional[int] = None
+    fps: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    max_frames: Optional[int] = Field(default=None, gt=0)
+    max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
+    max_image_tokens: Optional[int] = Field(default=None, gt=0)
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):

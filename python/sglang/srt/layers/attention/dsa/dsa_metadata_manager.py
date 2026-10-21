@@ -6,7 +6,7 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING
 
-from sglang.kernels.ops.attention.dsa_metadata import (
+from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
@@ -50,14 +50,14 @@ class DSAMetadataManagementMixin:
         self._fused_verify_metadata = fused_dsa_target_verify_metadata
         self._fused_draft_extend_metadata = fused_dsa_draft_extend_metadata
         if self.experimental_kpool_metadata_fusion:
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.decode import (
-                fused_dsa_decode_metadata as decode,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.decode import (
+                fused_dsa_decode_metadata_kpool as decode,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.draft_extend import (
-                fused_dsa_draft_extend_metadata as draft_extend,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.draft_extend import (
+                fused_dsa_draft_extend_metadata_kpool as draft_extend,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.verify import (
-                fused_dsa_target_verify_metadata as verify,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
+                fused_dsa_target_verify_metadata_kpool as verify,
             )
 
             self._fused_decode_metadata = partial(
@@ -84,7 +84,7 @@ class DSAMetadataManagementMixin:
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 
@@ -214,6 +214,7 @@ class DSAMetadataManagementMixin:
                 dst.pooled_paged_mqa_schedule_metadata,
                 src.pooled_paged_mqa_schedule_metadata,
             )
+            and _match(dst.pooled_topk_v2_plan, src.pooled_topk_v2_plan)
             and _match(dst.kpool_write_plan, src.kpool_write_plan)
         ):
             return False
@@ -223,6 +224,7 @@ class DSAMetadataManagementMixin:
             and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
             and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
             and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
+            and _match(dst_plan.pool_topk_v2_plan, src_plan.pool_topk_v2_plan)
         ):
             return False
         return True
@@ -298,6 +300,8 @@ class DSAMetadataManagementMixin:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(
                 src_metadata.pooled_paged_mqa_schedule_metadata
             )
+        if metadata.pooled_topk_v2_plan is not None:
+            metadata.pooled_topk_v2_plan.copy_(src_metadata.pooled_topk_v2_plan)
 
         dst_plan = metadata.kpool_write_plan
         src_plan = src_metadata.kpool_write_plan
@@ -315,3 +319,5 @@ class DSAMetadataManagementMixin:
             dst_plan.pool_schedule_metadata.copy_(src_plan.pool_schedule_metadata)
         if dst_plan.effective_n_per_batch is not None:
             dst_plan.effective_n_per_batch.copy_(src_plan.effective_n_per_batch)
+        if dst_plan.pool_topk_v2_plan is not None:
+            dst_plan.pool_topk_v2_plan.copy_(src_plan.pool_topk_v2_plan)
