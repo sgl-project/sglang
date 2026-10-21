@@ -6,7 +6,7 @@ import flashinfer
 import pytest
 import torch
 
-from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 

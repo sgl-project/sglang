@@ -42,6 +42,9 @@ class Pi05PipelineConfig(PipelineConfig):
     image_normalization_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_normalization_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
 
+    # Experimental eager completion-boundary execution; scheduler opt-in.
+    enable_segmented_actions: bool = False
+
     enable_global_prefix_cache: bool = False
     enable_prefix_cuda_graph: bool = True
     # Opt-in prompt buckets shared by prefix and action CUDA graphs. Padding
@@ -120,10 +123,15 @@ class Pi05PipelineConfig(PipelineConfig):
     def check_pipeline_config(self) -> None:
         super().check_pipeline_config()
         self._validate_cuda_graph_config()
+        if self.enable_segmented_actions and self.offload_action_expert_after_denoise:
+            raise ValueError(
+                "Segmented actions do not support per-request action offload"
+            )
 
     def prefix_cuda_graph_available(self) -> bool:
         return bool(
-            self.enable_prefix_cuda_graph
+            not self.enable_segmented_actions
+            and self.enable_prefix_cuda_graph
             and self.prefix_cuda_graph_max_entries > 0
             and not any(
                 (
@@ -140,7 +148,8 @@ class Pi05PipelineConfig(PipelineConfig):
 
     def action_cuda_graph_available(self) -> bool:
         return bool(
-            self.enable_action_cuda_graph
+            not self.enable_segmented_actions
+            and self.enable_action_cuda_graph
             and self.action_cuda_graph_max_entries > 0
             and not self.offload_action_expert_after_denoise
         )
