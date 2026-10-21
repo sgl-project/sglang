@@ -963,6 +963,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
+            if self.reasoning_parser and request.separate_reasoning:
+                tool_output_ids = reasoning_parser_dict[index].take_content_output_ids()
+                cumulative = False
+            else:
+                tool_output_ids = content.get("output_ids")
+                cumulative = not get_serving().incremental_streaming_output
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -973,6 +979,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 created=created,
                 continuous_usage_stats=continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                output_ids=tool_output_ids,
+                cumulative_output_ids=cumulative,
             ):
                 if chunk:
                     yield chunk
@@ -2439,6 +2447,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle reasoning content
             reasoning_text = None
             tool_calls = None
+            content_output_ids = ret_item.get("output_ids")
             if encoding_output is not None:
                 reasoning_text, text, tool_calls, finish_reason = (
                     encoding_output.parse_chat_response(
@@ -2461,7 +2470,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
+                    reasoning_text, text = parser.parse_non_stream(
+                        text, output_ids=content_output_ids
+                    )
+                    content_output_ids = parser.take_content_output_ids()
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -2480,6 +2492,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    output_ids=content_output_ids,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2664,8 +2677,9 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: dict[str, Any],
         tool_choice: str | ToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
+        output_ids: list[int] | None = None,
     ) -> ToolCallProcessingResult:
-        """Process tool calls in the response"""
+        """Process tool calls in the response; ``output_ids`` decode to ``text``."""
 
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
 
@@ -2681,6 +2695,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
+            parser.observe_output_ids(output_ids)
             if should_try_parser and parser.has_tool_call(text):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
@@ -2829,6 +2844,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_parser_active=self._tool_call_parsing_active(request),
             )
         reasoning_parser = reasoning_parser_dict[index]
+        reasoning_parser.observe_stream_output_ids(
+            content.get("output_ids"),
+            cumulative=not get_serving().incremental_streaming_output,
+        )
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
         if finish_reason_type is not None and finish_reason_type != "abort":
             end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
@@ -3109,11 +3128,14 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        output_ids: list[int] | None = None,
+        cumulative_output_ids: bool = False,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
-        held back waiting for a marker that can no longer arrive.
+        held back waiting for a marker that can no longer arrive. ``output_ids``
+        decode to ``delta``; every id so far when ``cumulative_output_ids`` is set.
         """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
@@ -3153,6 +3175,9 @@ class OpenAIServingChat(OpenAIServingBase):
             result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
         else:
+            parser.observe_stream_output_ids(
+                output_ids, cumulative=cumulative_output_ids
+            )
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:
                 end_text, end_calls = parser.parse_stream_end()

@@ -141,6 +141,7 @@ class FunctionCallParser:
         self.detector = self._required_tool_parser or detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        self._stream_output_ids_seen = 0
 
     def owns_tool_format(self) -> bool:
         return (
@@ -164,12 +165,34 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def observe_output_ids(self, output_ids: Optional[List[int]]) -> None:
+        """Take the token ids that decode to the text parsed next: all of it
+        before ``parse_non_stream`` or ``has_tool_call``, a chunk's before
+        ``parse_stream_chunk``."""
+        if output_ids is not None and self.detector.wants_output_ids:
+            self.detector.observe_output_ids(output_ids)
+
+    def observe_stream_output_ids(
+        self, output_ids: Optional[List[int]], *, cumulative: bool
+    ) -> None:
+        """``observe_output_ids`` for a stream chunk whose ids are every id so
+        far when ``cumulative`` is set."""
+        if output_ids is None:
+            return
+        if cumulative:
+            output_ids = output_ids[self._stream_output_ids_seen :]
+        self._stream_output_ids_seen += len(output_ids)
+        self.observe_output_ids(output_ids)
+
+    def parse_non_stream(
+        self, full_text: str, output_ids: Optional[List[int]] = None
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
         Args:
             full_text: The complete text to parse
+            output_ids: The token ids that decode to full_text, when known
 
         Returns:
             A tuple containing:
@@ -178,6 +201,7 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
+        self.observe_output_ids(output_ids)
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
