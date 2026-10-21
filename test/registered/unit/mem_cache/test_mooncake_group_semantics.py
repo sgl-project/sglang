@@ -87,17 +87,26 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.put_calls = []
+            self.has_memory_segment = True
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
 
         def setup(self, *args, **kwargs):
+            self.has_memory_segment = args[2] > 0
             return 0
 
         def register_buffer(self, *args, **kwargs):
             return 0
 
         def put(self, key, value, *args):
+            if len(args) > 1 or (args and args[0] is None):
+                raise TypeError("put expects an omitted config or a ReplicateConfig")
+            self.put_calls.append((key, value, args))
+            replica_num = args[0].replica_num if args else 1
+            if replica_num > 0 and not self.has_memory_segment:
+                return -1
             self.objects[key] = value
             return 0
 
@@ -273,6 +282,7 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    global_segment_size=1024 * 1024,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -290,6 +300,8 @@ def _make_store(
         tp_size=tp_size,
         tp_lcm_size=tp_lcm_size,
     )
+
+    cfg.extra_config["global_segment_size"] = global_segment_size
 
     with patch.dict(
         "os.environ",
@@ -349,6 +361,40 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
         self.assertEqual(fake_store.batch_put_calls[0]["args"], ())
+
+    def test_default_warmup_uses_two_arg_put(self):
+        _, fake_store = _make_store()
+
+        self.assertEqual(len(fake_store.put_calls), 1)
+        self.assertEqual(fake_store.put_calls[0][2], ())
+
+    def test_custom_warmup_uses_request_scoped_replica_config(self):
+        store, fake_store = _make_store(replica_num=2, dfs_replica_num=1)
+        warmup_config = fake_store.put_calls[0][2][0]
+        self.assertEqual(warmup_config.replica_num, 2)
+        self.assertEqual(warmup_config.dfs_replica_num, 1)
+        self.assertIsNone(warmup_config.group_ids)
+
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store.batch_set_v1(["page0"], torch.tensor([0]))
+        write_config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertIsNot(warmup_config, write_config)
+        self.assertIsNone(warmup_config.group_ids)
+
+    def test_dfs_only_initializes_and_writes_without_memory_segments(self):
+        store, fake_store = _make_store(
+            replica_num=0, dfs_replica_num=1, global_segment_size=0
+        )
+        self.assertFalse(fake_store.has_memory_segment)
+        warmup_config = fake_store.put_calls[0][2][0]
+        self.assertEqual(warmup_config.replica_num, 0)
+        self.assertEqual(warmup_config.dfs_replica_num, 1)
+
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        write_config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertEqual(write_config.replica_num, 0)
+        self.assertEqual(write_config.dfs_replica_num, 1)
 
     def test_dfs_replica_config_is_forwarded(self):
         store, fake_store = _make_store(
@@ -424,8 +470,11 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["args"][0].dfs_replica_num, 1)
 
     def test_invalid_replica_counts_fail_during_initialization(self):
-        with self.assertRaisesRegex(ValueError, "replica_num must be at least 1"):
+        with self.assertRaisesRegex(ValueError, "at least one memory or DFS replica"):
             _make_store(replica_num=0)
+
+        with self.assertRaisesRegex(ValueError, "replica_num must be non-negative"):
+            _make_store(replica_num=-1, dfs_replica_num=1)
 
         with self.assertRaisesRegex(ValueError, "dfs_replica_num must be 0 or 1"):
             _make_store(dfs_replica_num=2)

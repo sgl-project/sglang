@@ -12,6 +12,13 @@ def _fake_mooncake_modules(fake_store_cls):
     mooncake = types.ModuleType("mooncake")
     mooncake_store = types.ModuleType("mooncake.store")
     mooncake_store.MooncakeDistributedStore = fake_store_cls
+
+    class ReplicateConfig:
+        def __init__(self):
+            self.replica_num = 1
+            self.dfs_replica_num = 0
+
+    mooncake_store.ReplicateConfig = ReplicateConfig
     return {
         "mooncake": mooncake,
         "mooncake.store": mooncake_store,
@@ -20,6 +27,12 @@ def _fake_mooncake_modules(fake_store_cls):
 
 class TestMooncakeStandaloneDummyMamba(CustomTestCase):
     def test_setup_dummy_includes_hybrid_buffers(self):
+        self._check_dummy_setup()
+
+    def test_dfs_only_dummy_warmup_forwards_replica_config(self):
+        self._check_dummy_setup(replica_num=0, dfs_replica_num=1)
+
+    def _check_dummy_setup(self, replica_num=1, dfs_replica_num=0):
         """Standalone(dummy) must size shared mapping for KV + Mamba buffers."""
         import torch
 
@@ -38,7 +51,8 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
             def register_buffer(self, ptr, size):
                 return 0
 
-            def put(self, *args, **kwargs):
+            def put(self, key, value, *args):
+                captured["put_args"] = args
                 return 0
 
             def is_exist(self, *args, **kwargs):
@@ -127,6 +141,8 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
                 extra_config={
                     "standalone_storage": True,
                     "client_server_address": "127.0.0.1:50052",
+                    "replica_num": replica_num,
+                    "dfs_replica_num": dfs_replica_num,
                 },
             )
 
@@ -141,6 +157,13 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
                 * mem_pool.mamba.conv_buffer[0].element_size()
             )
             self.assertEqual(captured["required_bytes"], expected)
+            if dfs_replica_num:
+                self.assertEqual(captured["put_args"][0].replica_num, replica_num)
+                self.assertEqual(
+                    captured["put_args"][0].dfs_replica_num, dfs_replica_num
+                )
+            else:
+                self.assertEqual(captured["put_args"], ())
 
 
 if __name__ == "__main__":

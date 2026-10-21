@@ -408,10 +408,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "dfs_replica_num",
                 extra_config.get("dfs_replica_num", 0) if extra_config else 0,
             )
-            if self.replica_num < 1:
-                raise ValueError("Mooncake replica_num must be at least 1")
+            if self.replica_num < 0:
+                raise ValueError("Mooncake replica_num must be non-negative")
             if self.dfs_replica_num not in (0, 1):
                 raise ValueError("Mooncake dfs_replica_num must be 0 or 1")
+            if self.replica_num + self.dfs_replica_num == 0:
+                raise ValueError("Mooncake requires at least one memory or DFS replica")
             if self.dfs_replica_num > 0 and self.config.tenant_id != DEFAULT_TENANT_ID:
                 raise ValueError(
                     "Mooncake DFS replicas currently require tenant_id='default'"
@@ -739,7 +741,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         retry_delay = 1.0  # seconds
 
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            if self._use_custom_replica_config:
+                ret = self.store.put(
+                    warmup_key, warmup_value, self._new_replicate_config()
+                )
+            else:
+                ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
             logger.warning(
