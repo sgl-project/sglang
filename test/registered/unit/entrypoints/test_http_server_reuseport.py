@@ -7,6 +7,7 @@ start instead of silently joining the first server's reuseport group.
 import copy
 import signal
 import socket
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -177,3 +178,7 @@ def test_real_uvicorn_process_accepts_on_private_listener(config):
     finally:
         process.terminate()
         process.join()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
