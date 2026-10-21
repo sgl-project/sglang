@@ -57,9 +57,9 @@ DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_A5_EXTRA_OPS_SO": "/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so",
-    "ASCEND_CUSTOM_OPP_PATH": "/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH",
-    "LD_LIBRARY_PATH": "/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH",
+    # "SGLANG_DSPARK_A5_EXTRA_OPS_SO": "/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so",
+    # "ASCEND_CUSTOM_OPP_PATH": "/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH",
+    # "LD_LIBRARY_PATH": "/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH",
 }
 
 DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
