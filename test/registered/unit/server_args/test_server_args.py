@@ -2244,6 +2244,35 @@ class TestHiCacheArgs(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
                     handle_pd_disaggregation(args)
 
+    def test_dcp_hicache_admits_only_single_chain_eagle_and_dspark_drafts(self):
+        for algorithm, topk, supported in (
+            (None, None, True),
+            ("DSPARK", None, True),
+            ("EAGLE", None, True),
+            ("NEXTN", 1, True),
+            ("EAGLE", 2, False),
+            ("EAGLE3", 1, False),
+            ("STANDALONE", 1, False),
+        ):
+            with self.subTest(algorithm=algorithm, topk=topk):
+                args = self._make_args(
+                    dcp_size=2,
+                    enable_hierarchical_cache=True,
+                    speculative_algorithm=algorithm,
+                    speculative_eagle_topk=topk,
+                )
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    if supported:
+                        handle_hicache(args)
+                    else:
+                        with self.assertRaisesRegex(
+                            NotImplementedError, "--dcp-size > 1"
+                        ):
+                            handle_hicache(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),

@@ -56,8 +56,12 @@ def _draft_bytes(target, draft) -> int:
     if isinstance(draft, BaseSWAKVPool):
         # Match sidecar construction: only SWA drafts follow target SWA slots.
         target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        target_slots = target.size
+    else:
+        # DCP widens the target's slots; its draft sidecar mirrors every one.
+        target_slots = target.size * get_parallel().attn_dcp_size
     # A sidecar has one host slot per target slot, however few slots the draft has.
-    return _pool_bytes(draft) * target.size // draft.size
+    return _pool_bytes(draft) * target_slots // draft.size
 
 
 def _estimate_hicache_bytes(

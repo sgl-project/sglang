@@ -586,13 +586,18 @@ class TestNixlUnified(CustomTestCase):
             quant_block_size=128,
             page_size=64,
             index_page_size=64,
+            index_kpool=1,
             skip_topk_layers=[False, False],
             index_k_with_scale_buffer=[
                 torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
             ],
         )
         anchor = SimpleNamespace(
-            page_size=64, layout="page_first", size=256, page_num=4
+            page_size=64,
+            layout="page_first",
+            size=256,
+            logical_size=256,
+            page_num=4,
         )
         host = DSAIndexerPoolHost(
             make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False

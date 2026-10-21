@@ -21,10 +21,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _worker(monkeypatch, draft_config, target_pool, draft_pools):
+def _worker(monkeypatch, draft_config, target_pool, draft_pools, *, dcp=False):
     monkeypatch.setattr(
-        spec, "get_memory", lambda: SimpleNamespace(enable_hierarchical_cache=True)
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
+        ),
     )
+    monkeypatch.setattr(spec, "get_parallel", lambda: SimpleNamespace(dcp_enabled=dcp))
     target = SimpleNamespace(
         spec_algorithm=SpeculativeAlgorithm.EAGLE,
         req_to_token_pool=SimpleNamespace(mamba_pool=target_pool),
@@ -127,6 +132,32 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+@pytest.mark.parametrize("num_drafts, topk", [(1, 1), (3, 1), (1, 2)])
+def test_dcp_backs_up_mtp_draft_as_a_sidecar(monkeypatch, num_drafts, topk):
+    """A DCP draft KV is replicated over the widened slots, so it must not be
+    packed into the target's per-rank host rows."""
+    worker, target, runners = _worker(
+        monkeypatch,
+        SimpleNamespace(num_nextn_predict_layers=num_drafts),
+        None,
+        (None,) * num_drafts,
+        dcp=True,
+    )
+    monkeypatch.setattr(
+        spec, "get_spec", lambda: SimpleNamespace(speculative_eagle_topk=topk)
+    )
+    if num_drafts != 1 or topk != 1:
+        with pytest.raises(NotImplementedError, match="--dcp-size > 1"):
+            spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+        return
+
+    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+    assert plan.mode == spec.HiCacheDraftMode.SIDECAR
+    assert plan.device_pools == (runners[0].token_to_kv_pool,)
+    assert target.mtp_draft_device_pools == ()
 
 
 @pytest.mark.parametrize("temporal_width", [0, 4])

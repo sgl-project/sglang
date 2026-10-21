@@ -471,6 +471,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64
         draft_kv_pool.index_page_size = 64
+        draft_kv_pool.index_kpool = 1
         draft_kv_pool.skip_topk_layers = [False]
         draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
         draft_host_pool = SimpleNamespace(layer_num=1)
@@ -538,6 +539,7 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.index_head_dim = 128
     pool.page_size = 64
     pool.index_page_size = 64
+    pool.index_kpool = 1
     pool.skip_topk_layers = [False] * layer_num
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
     pool.layer_shard_enabled = shard is not None

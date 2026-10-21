@@ -114,7 +114,11 @@ def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
-    index_page_bytes = pool.index_page_size * dsa_indexer_bytes_per_token_per_layer(
+    # One stored index-K row per pool page. A DCP-replicated draft's row packs
+    # dcp_size kernel pages, so index_page_size undercounts it.
+    index_page_bytes = (
+        pool.page_size // pool.index_kpool
+    ) * dsa_indexer_bytes_per_token_per_layer(
         index_head_dim=pool.index_head_dim,
         quant_block_size=pool.quant_block_size,
     )
@@ -193,8 +197,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
         self.indexer_dtype = storage_info.dtype
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
+        # Index-K stays replicated under DCP, so it spans every widened logical
+        # slot while a DCP anchor stores only this rank's rows.
+        self.size = anchor_host.logical_size
+        self.page_num = self.size // self.page_size
 
         # uint8 storage, so element counts below are byte counts
         self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)

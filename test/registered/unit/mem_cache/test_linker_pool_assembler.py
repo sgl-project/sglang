@@ -709,6 +709,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         enable_unified_cache_external_linker=linker_enabled,
                     ),
                 ),
+                patch.object(
+                    spec,
+                    "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
             ):
                 if linker_enabled and not nextn_layers:
                     with self.assertRaisesRegex(
