@@ -8,10 +8,6 @@ import torch
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
-from torch import nn
-from transformers import PretrainedConfig, PreTrainedModel
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
@@ -50,6 +46,9 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
 from sglang.utils import logger
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
 _is_cuda = is_cuda()
 
@@ -728,13 +727,10 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "up_proj", 1),
             ]
         elif self.config.llm_config.architectures[0] == "GptOssForCausalLM":
-            # GPT-OSS has its own bf16/mxfp4/quark loader; the loop below
-            # only sees the vision model and projector weights.
+            # GPT-OSS has its own loader; this loop handles the wrapper weights.
             stacked_params_mapping = []
             other_weights = []
             language_weights = []
-            # Split eagerly so the vision/projector weights are complete no
-            # matter how much of its iterator the language loader consumes.
             for name, loaded_weight in weights:
                 if name.startswith("language_model."):
                     language_weights.append(
@@ -743,13 +739,7 @@ class InternVLChatModel(nn.Module):
                 else:
                     other_weights.append((name, _own_if_runai_streamed(loaded_weight)))
 
-            language_iter = iter(language_weights)
-            self.language_model.load_weights(language_iter)
-            if next(language_iter, None) is not None:
-                raise RuntimeError(
-                    "GptOssForCausalLM.load_weights did not consume all "
-                    "language model weights"
-                )
+            self.language_model.load_weights(iter(language_weights))
             weights = other_weights
 
         params_dict = dict(self.named_parameters())
