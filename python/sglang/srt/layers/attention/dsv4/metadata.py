@@ -188,6 +188,7 @@ class PagedIndexerMetadata:
     # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
     # all rows at once.
     row_chunk: int = 0
+    rows_per_request: int = 1
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
@@ -211,9 +212,13 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_jit_indexer = not self.force_deep_gemm_metadata and (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            use_jit_indexer = (
+                not self.force_deep_gemm_metadata
+                and self.rows_per_request == 1
+                and (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
@@ -226,6 +231,11 @@ class PagedIndexerMetadata:
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             num_rows = compressed_seq_lens.shape[0]
+            group = self.rows_per_request
+            if group > 1:
+                assert compressed_seq_lens.shape[1] == 1 and num_rows % group == 0, (
+                    f"{num_rows} query rows do not group by {group}"
+                )
             self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
             self.rows_per_chunk = plan_indexer_row_chunks(
                 num_rows=num_rows,
@@ -233,6 +243,8 @@ class PagedIndexerMetadata:
                 budget_bytes=self.mqa_logits_budget_bytes,
                 sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
             )
+            if self.rows_per_chunk is not None and group > 1:
+                self.rows_per_chunk = max(group, self.rows_per_chunk // group * group)
             if self.rows_per_chunk is not None:
                 logger.debug(
                     "DSV4 indexer chunks %d query rows x %d compressed cols into "
@@ -257,7 +269,7 @@ class PagedIndexerMetadata:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
-                        compressed_seq_lens[rows],
+                        compressed_seq_lens[rows].view(-1, group),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
                     )
@@ -267,7 +279,7 @@ class PagedIndexerMetadata:
                 ]
             else:
                 self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                    compressed_seq_lens,
+                    compressed_seq_lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
                 )
@@ -377,6 +389,7 @@ class PagedIndexerMetadata:
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
+                "rows_per_request",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
