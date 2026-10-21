@@ -559,9 +559,6 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
-        from sglang.srt.distributed.device_communicators.mlu_communicator import (
-            MluCommunicator,
-        )
         from sglang.srt.distributed.device_communicators.npu_communicator import (
             NpuCommunicator,
         )
@@ -580,10 +577,6 @@ class GroupCoordinator:
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
-
-        self.mlu_communicator: Optional[MluCommunicator] = None
-        if _is_mlu and self.world_size > 1:
-            self.mlu_communicator = MluCommunicator(group=self.device_group)
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -746,9 +739,6 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
-
-        if self.mlu_communicator is not None and not self.mlu_communicator.disabled:
-            return self.mlu_communicator.all_reduce(input_)
 
         if torch.compiler.is_compiling():
             if self._can_use_flashinfer_allreduce(input_):
@@ -1431,11 +1421,6 @@ class GroupCoordinator:
         npu_comm = self.npu_communicator
         if npu_comm is not None and not npu_comm.disabled:
             return npu_comm.all_gather(input_, dim)
-
-        # For MLUs, use MLU communicator.
-        mlu_comm = self.mlu_communicator
-        if mlu_comm is not None and not mlu_comm.disabled:
-            return mlu_comm.all_gather(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.

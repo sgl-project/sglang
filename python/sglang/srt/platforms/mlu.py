@@ -38,7 +38,7 @@ class MluDeviceMixin(DeviceMixin):
 
     def get_device_uuid(self, device_id: int = 0) -> str:
         props = torch.mlu.get_device_properties(device_id)
-        return str(getattr(props, "uuid", f"mlu:{device_id}"))
+        return str(props.uuid)
 
     def get_device_capability(self, device_id: int = 0) -> Optional[DeviceCapability]:
         return None

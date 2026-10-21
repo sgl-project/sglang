@@ -91,6 +91,35 @@ class TestRMSNormMLU(CustomTestCase):
                 )
                 torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
+    def test_input_shape_preservation(self):
+        """Verify shape preservation and numerical agreement with native RMSNorm.
+
+        Cover 1D, higher-rank, and transposed inputs that need reshaping before
+        the MLU kernel call, including residual and post-addition paths.
+        """
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            norm = self.norm.to(dtype=dtype)
+            for shape in ((128,), (2, 3, 128), (2, 3, 4, 128)):
+                x = torch.randn(shape, device="mlu", dtype=dtype)
+                residual = torch.randn_like(x)
+                if len(shape) == 4:
+                    # Last dimension stays contiguous, but flattening the leading
+                    # dimensions requires a copy for both input and residual.
+                    x = x.transpose(0, 1)
+                    residual = residual.transpose(0, 1)
+                post = torch.randn_like(x)
+                for additions in ((), (residual,), (residual, post)):
+                    with self.subTest(dtype=dtype, shape=x.shape, adds=len(additions)):
+                        result = norm(x, *additions)
+                        reference = norm.forward_native(x, *additions)
+                        if not additions:
+                            result, reference = (result,), (reference,)
+                        for actual, expected in zip(result, reference):
+                            self.assertEqual(actual.shape, x.shape)
+                            torch.testing.assert_close(
+                                actual, expected, rtol=1e-2, atol=1e-2
+                            )
+
     def test_noncontiguous_input(self):
         x = torch.randn(128, 4, dtype=torch.bfloat16, device="mlu").T
         residual = torch.randn(128, 4, dtype=torch.bfloat16, device="mlu").T

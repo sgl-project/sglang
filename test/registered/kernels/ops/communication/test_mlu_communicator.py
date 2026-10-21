@@ -1,3 +1,5 @@
+"""Validate generic SGLang collectives on CNCL, including compiled execution."""
+
 import tempfile
 import unittest
 from datetime import timedelta
@@ -12,6 +14,18 @@ from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_mlu_ci(est_time=60, suite="pr-test-2-mlu")
+
+
+def _compile_collectives(graph, example_inputs):
+    # Keep collectives opaque to Dynamo instead of decomposing them into c10d ops.
+    targets = {node.target for node in graph.graph.nodes if node.op == "call_function"}
+    for op in (
+        torch.ops.sglang.inplace_all_reduce,
+        torch.ops.sglang.reg_all_gather_into_tensor,
+    ):
+        assert op in targets or op.default in targets, targets
+    assert not any("c10d" in str(target) for target in targets)
+    return torch._inductor.compile(graph, example_inputs)
 
 
 def _run_mlu_communicator_worker(rank: int, world_size: int, init_method: str):
@@ -36,21 +50,32 @@ def _run_mlu_communicator_worker(rank: int, world_size: int, init_method: str):
             use_mscclpp=False,
             use_torch_symm_mem_allreduce=False,
         )
-        assert comm.mlu_communicator is not None
-        assert not comm.mlu_communicator.disabled
+        assert comm.pynccl_comm is None
 
-        x = torch.full((2, 3), rank + 1, dtype=torch.float32, device="mlu")
-        reduced = comm.all_reduce(x.clone())
-        expected_sum = torch.full((2, 3), 3.0, dtype=torch.float32, device="mlu")
-        torch.testing.assert_close(reduced.cpu(), expected_sum.cpu())
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for dim in (0, 1, -1):
 
-        gathered = comm.all_gather(x, dim=-1)
-        expected_gather = torch.tensor(
-            [[1, 1, 1, 2, 2, 2], [1, 1, 1, 2, 2, 2]],
-            dtype=torch.float32,
-            device="mlu",
-        )
-        torch.testing.assert_close(gathered.cpu(), expected_gather.cpu())
+                def collect(x):
+                    return comm.all_reduce(x.clone()), comm.all_gather(x, dim=dim)
+
+                compiled = torch.compile(
+                    collect, backend=_compile_collectives, fullgraph=True
+                )
+                for fn in (collect, compiled):
+                    # Exercise replay with new values and a changed leading dimension.
+                    for rows, offset in ((2, 0), (2, 3), (4, 1)):
+                        base = torch.arange(rows * 3, dtype=dtype).reshape(rows, 3)
+                        peers = [base + r + offset for r in range(world_size)]
+                        x = peers[rank].to("mlu")
+                        reduced, gathered = fn(x)
+                        torch.testing.assert_close(
+                            reduced.cpu(), sum(peers), rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            gathered.cpu(), torch.cat(peers, dim=dim), rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(x.cpu(), peers[rank], rtol=0, atol=0)
+                torch._dynamo.reset()
     finally:
         if comm is not None:
             comm.destroy()

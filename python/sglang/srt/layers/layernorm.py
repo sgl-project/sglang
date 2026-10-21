@@ -199,7 +199,6 @@ if _is_mlu:
     import torch_mlu_ops
 
 
-
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
     """Resolve aiter's per-1x128 HIP quant functor + FP8 dtype on first use.
@@ -667,6 +666,14 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # TODO: Add and validate deterministic RMSNorm support on MLU.
+        if (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or is_batch_invariant_mode_enabled()
+        ):
+            raise NotImplementedError(
+                "Deterministic inference is not supported for MLU RMSNorm yet."
+            )
         # Fall back for options, dtypes, and layouts unsupported by the fused kernel.
         if (
             self.variance_size_override is not None
@@ -692,9 +699,14 @@ class RMSNorm(BaseFusedOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        # The MLU kernel requires at least two dimensions and flattenable
+        # leading strides. reshape also handles noncontiguous leading dimensions.
+        original_shape = x.shape
+        x = x.reshape(-1, original_shape[-1])
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            residual = residual.reshape(-1, original_shape[-1])
             out, residual_out = torch_mlu_ops.fused_rms_norm(
                 x,
                 residual,
@@ -704,8 +716,8 @@ class RMSNorm(BaseFusedOp):
                 self.variance_epsilon,
                 True,
             )
-            return out, residual_out
-        return torch_mlu_ops.fused_rms_norm(
+            return out.reshape(original_shape), residual_out.reshape(original_shape)
+        out = torch_mlu_ops.fused_rms_norm(
             x,
             None,
             self.weight.data,
@@ -714,6 +726,7 @@ class RMSNorm(BaseFusedOp):
             self.variance_epsilon,
             False,
         )
+        return out.reshape(original_shape)
 
     def forward_aiter(
         self,

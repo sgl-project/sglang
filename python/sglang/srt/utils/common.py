@@ -929,12 +929,9 @@ def get_free_cpu_memory() -> int:
 
 
 def get_mlu_memory_capacity():
-    try:
-        if torch.mlu.is_available():
-            return torch.mlu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-        raise ValueError("No GPU memory values found.")
-    except AttributeError:
-        raise RuntimeError("torch.mlu is not available.")
+    if not is_mlu():
+        raise RuntimeError("MLU device is not available.")
+    return torch.mlu.mem_get_info()[1] // 1024 // 1024  # unit: MB
 
 
 def get_cpu_memory_capacity():
@@ -1052,7 +1049,7 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "mps") and torch.mps.is_available():
         return torch.backends.mps.get_name()
 
-    if hasattr(torch, "mlu") and torch.mlu.is_available():
+    if is_mlu():
         return torch.mlu.get_device_name(device_id)
 
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
@@ -1166,7 +1163,7 @@ def get_device_count() -> int:
         except RuntimeError:
             return 0
 
-    if hasattr(torch, "mlu") and torch.mlu.is_available():
+    if is_mlu():
         try:
             return torch.mlu.device_count()
         except RuntimeError:
@@ -1763,7 +1760,7 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
-    if hasattr(torch, "mlu") and torch.mlu.is_available():
+    if is_mlu():
         torch.mlu.manual_seed_all(seed)
 
 
@@ -3043,6 +3040,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "XPU")
         elif is_musa():
             my_lib.impl(op_name, op_func, "MUSA")
+        elif is_mlu():
+            my_lib.impl(op_name, op_func, "MLU")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
