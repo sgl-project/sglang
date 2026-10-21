@@ -52,7 +52,7 @@ from sglang.srt.utils import (
     is_xpu,
     offloader,
 )
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import print_warning_once, torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -713,11 +713,15 @@ def dispatch_w8a8_block_fp8_linear(
     2. Auto-detection based on hardware capabilities
     """
     backend = get_fp8_gemm_runner_backend()
+    # Native block32 DeepGEMM is the default on SM90. SM100 DeepGEMM casts the
+    # weight scales to UE8M0, so it takes only UE8M0 checkpoints, on request.
     if (
         weight_block_size == [32, 32]
-        and get_platform().is_sm90
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        and (backend.is_auto() or backend.is_deep_gemm())
+        and (
+            (get_platform().is_sm90 and (backend.is_auto() or backend.is_deep_gemm()))
+            or (get_platform().is_sm100 and backend.is_deep_gemm() and act_scale_ue8m0)
+        )
     ):
         return partial(
             deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -726,6 +730,12 @@ def dispatch_w8a8_block_fp8_linear(
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
     if weight_block_size is not None and weight_block_size[1] != 128:
+        if backend.is_deep_gemm():
+            print_warning_once(
+                f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
+                "block FP8 weights on this setup; using Triton. DeepGEMM takes "
+                "[32, 32] blocks on SM90, and on SM100 with UE8M0 scales."
+            )
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     # Handle explicit backend selection via --fp8-gemm-backend
@@ -1408,7 +1418,9 @@ def _deepgemm_block_fp8_supported(
     if output_dtype != torch.bfloat16:
         return False
     n, k = weight_shape
-    if list(block_size) == [32, 32] and get_platform().is_sm90:
+    if list(block_size) == [32, 32] and (
+        get_platform().is_sm90 or get_platform().is_sm100
+    ):
         return n % 8 == 0 and k % 32 == 0
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 
@@ -1424,7 +1436,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # Block32 weight scales stay fp32, so UE8M0 DeepGEMM casts both itself.
+        assert (
+            list(block_size) == [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
         assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
