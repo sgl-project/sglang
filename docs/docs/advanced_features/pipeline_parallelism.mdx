@@ -19,6 +19,47 @@ The key mechanisms of the implementation include:
 * **Decoupled Sync/Async Logic in the Event Loop:** The scheduler uses `async_send` in `_pp_send_pyobj_to_next_stage`. Instead of waiting for a transfer to complete, it returns a `P2PWork` handle. The actual synchronization (`P2PWork.work.wait()`) is deferred until `_pp_commit_comm_work` is called, allowing the CPU to perform other work—like scheduling the next batch or processing metadata—while data is in flight.
 * **Multi-Stream Execution:** In addition to the main `default_stream`, which serves as the synchronization stream, SGLang utilizes dedicated `forward_stream` and `copy_stream` to execute forward pass GPU computation and Data-to-Host (D2H) memory transfers separately for better overlapping. While `_pp_launch_batch` is executing the current micro-batch on the GPU for the current stage, the CPU processes the previous micro-batch's results using `_pp_process_batch_result`.
 
+## CPU-staged Gloo transport
+
+On Linux with NVIDIA CUDA, use `--pp-transport gloo` to stage PP tensors through
+pageable CPU memory and transfer them with Gloo. This supports deployments where
+PP payloads must travel through host memory, including TDX / confidential
+computing environments. The default `--pp-transport default` keeps the existing
+communication path.
+
+The option does not provide encryption, peer authentication or attestation.
+Use trusted peers and protect inter-host traffic at the network layer. Python
+object communication uses pickle. Enabling CPU staging alone does not establish
+a confidential computing security boundary.
+
+For TP1/PP2 across two hosts, run the following on each node, setting `NODE_RANK`
+to `0` or `1`. Both hosts need the same model and SGLang revision:
+
+```bash
+export MODEL_PATH=Qwen/Qwen3-8B
+export NODE0_HOST=10.0.0.10
+export NODE_RANK=0
+export GLOO_SOCKET_IFNAME=eth0
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --tp-size 1 --pp-size 2 \
+  --disable-overlap-schedule --pp-transport gloo \
+  --nnodes 2 --node-rank "$NODE_RANK" --dist-init-addr "$NODE0_HOST:50000"
+```
+
+Select an interface reachable by all peers. Gloo manages its own connections;
+this option does not provide a fixed PP port range. Allow Gloo's peer connections
+as well as the existing rendezvous and bootstrap traffic on the protected network.
+
+This transport requires PP greater than one and does not support elastic rank
+offsets or independent DP replicas. It changes PP communication only; TP
+collectives retain their existing backend. Configure PD KV transfer separately.
+
+Each tensor send owns a contiguous CPU snapshot until Gloo completes the transfer.
+The GPU-to-host copy completes synchronously; an asynchronous send overlaps only
+the Gloo transfer. Receivers restore the original device before TP all-gather
+reassembles sharded payloads. Account for CPU memory, copy overhead and network
+bandwidth when sizing a deployment.
+
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking

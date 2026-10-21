@@ -638,6 +638,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Runtime options
+
+For CPU-staged PP communication, see
+[CPU-staged Gloo transport](/docs/advanced_features/pipeline_parallelism#cpu-staged-gloo-transport)
+for prerequisites, network protection and a two-node example.
+
+| Argument | Description | Default |
+| --- | --- | --- |
+| `--pp-transport` | PP communication path: `default` or `gloo`. | `default` |
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
