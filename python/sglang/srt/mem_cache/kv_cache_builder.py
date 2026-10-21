@@ -372,6 +372,9 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    from sglang.srt.managers.kv_control.service import runtime_config
+
+    kv_control_config = runtime_config()
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
@@ -396,6 +399,9 @@ def build_kv_cache(
         dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        kv_control_config=kv_control_config.cache_config()
+        if kv_control_config
+        else None,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,

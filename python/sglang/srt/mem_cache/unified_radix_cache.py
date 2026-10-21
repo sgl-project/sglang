@@ -206,7 +206,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 or params.pp_size != 1
                 or params.attn_cp_size != 1
                 or any(
-                    group is not None
+                    group is not None and torch.distributed.get_world_size(group) > 1
                     for group in (
                         params.tp_cache_group,
                         params.attn_cp_cache_group,

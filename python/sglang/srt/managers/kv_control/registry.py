@@ -286,6 +286,25 @@ class OperationRegistry:
                 return result
         raise ControlError("missing", "Unknown, acknowledged or expired operation")
 
+    def lookup(self, context: ControlContext, message_id: str, *, limit: int = 256):
+        """Discover bounded fan-out incarnations without guessing binding IDs."""
+        self._key(context, message_id)
+        if type(limit) is not int or not 1 <= limit <= self.limits.max_page_size:
+            raise ControlError("capacity", "Lookup limit exceeds page budget")
+        self.prune()
+        matches = [
+            self._submission(message, replayed=False)
+            for (caller, binding, identity), message in self._messages.items()
+            if caller == context.caller_id
+            and identity == message_id
+            and (context.binding_id is None or binding == context.binding_id)
+        ]
+        if len(matches) > limit:
+            raise ControlError(
+                "capacity", "Too many incarnations; query an explicit binding"
+            )
+        return tuple(matches)
+
     def update(self, ref: OperationRef, update: ExecutionUpdate) -> OperationResult:
         current = self.get(ref)
         update = validated(update, ExecutionUpdate)

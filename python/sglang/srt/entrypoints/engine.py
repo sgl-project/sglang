@@ -1493,6 +1493,18 @@ class Engine(EngineScoreMixin, EngineBase):
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    def kv_capabilities(self):
+        return self.kv_control({"kind": "capabilities"})
+
+    async def async_kv_capabilities(self):
+        return await self.async_kv_control({"kind": "capabilities"})
+
+    def kv_control(self, command):
+        return self.loop.run_until_complete(self.async_kv_control(command))
+
+    async def async_kv_control(self, command):
+        return await self.tokenizer_manager.kv_control(command)
+
     def open_session(
         self,
         capacity_of_str_len: int,

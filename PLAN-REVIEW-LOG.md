@@ -131,3 +131,67 @@ checks pass. The key-count regression permits at most 64 evaluations for 32
 victims in all three component paths, with and without a live claim.
 Verdict: approve the real-cache priority feature for a local commit.
 Serving transport, request callbacks, transfers and policies are still pending.
+
+### Unit 2b — Serving service and request lifecycle
+
+The parent implemented the serving unit directly after the builder's quota
+failure, without further delegation. The service uses the real executor,
+RuntimeContext's opt-in Memory configuration, typed BaseReq IPC, existing
+tokenizer communicator and admin HTTP policy, plus sync/async Engine methods.
+Only single-owner TP/PP/CP/DP=1 is enabled; unsupported topologies fail explicitly.
+This avoids rank-local random clocks/IDs being misrepresented as TP support.
+
+Attached hints survive session reconstruction and native/OpenAI adapters.
+Consumed actions are removed from a fresh per-request envelope; opaque action
+objects remain intact. Message lookup discovers independent fan-out bindings.
+The completion hook runs after real checkpoint and before freeing/unlocking the
+request. Queued and grammar aborts cancel work without requiring a KV row.
+Intermediate checkpoints/preemption do not complete it. Active work blocks
+destructive flush, and successful flush rotates/rebinds the cache epoch.
+Correlated communicator replies reject late responses after RPC cancellation;
+send failures clean up the waiter and inline replies are not lost.
+
+Parent proof, each serving/core regression file run separately except the
+existing config-bag group: control 78; service 12; communicator/config bags 26;
+request construction 2; StreamingSession 11; OpenAI chat 159; completions 21.
+All 309 passed. Service cases use real CPU pools/Req/checkpoint/release,
+in-process HTTP and typed msgpack IPC; no model/cache import stubs.
+An initial HTTP fixture used TestClient's other thread and correctly hit the
+executor owner check; ASGI transport now runs on the actual owner. The release
+test caught use of an obsolete Req field; it now uses authoritative
+full_untruncated_fill_ids and verifies both committed suffix and cache salt.
+
+Ruff's existing whole-file findings in large runtime modules include custom
+Arg annotations and existing late imports/lambdas. The parent compared all
+changed files to HEAD using identical E4/E7/E9/F/UP037 rules: no added findings.
+New files pass those rules without exemptions; repository isort, Ruff format,
+and git whitespace checks pass. User edits to the Chinese RFC/progress report
+are retained and excluded from implementation commits.
+
+### User-authorized small GPU validation
+
+The user made a GPU available and authorized small single-card validation,
+superseding the earlier CPU-only limit. GPU 1 was idle; all other processes were
+preserved. Real CUDA tensor arithmetic passed. The initial kernel import failed
+because the borrowed PyTorch 2.13 ABI lacked CUDAErrorLogCapture. The target
+virtualenv alone was updated to torch 2.14.1 and sglang-kernel 0.4.10, then
+torchvision 0.29.1 to correct its nms ABI; reference packages are untouched.
+After the environment correction, the parent reran control 78, real-cache 21,
+service 12 and communicator 3: all 114 passed on 2.14.1+cu130.
+
+The new manual GPU smoke script passed on NVIDIA A100-SXM4-80GB: real CUDA
+allocator/copies, priority victim choice, retained KV bytes, request-lock
+protection, reclaim under pressure, copy-lifetime/replay and full pool balance.
+It allocated 8,704 peak tensor bytes and ran its cache body in 0.2165 seconds;
+these are fixture measurements, not serving performance results.
+
+A real tiny-Llama server attempt is still unsuccessful before cache init at
+DualGemm's cutlass.cute import. Local nvidia-cutlass-dsl 4.8.0 plus its pinned
+base/cu12/cu13 libraries do not expose that module. Earlier ABI/torchvision
+failures and the final startup failure are preserved in /tmp/sglang-kv-*-failed.log;
+the successful cache output is /tmp/sglang-kv-gpu-cache-smoke-passed.log.
+No version checks or model kernels were bypassed to manufacture a successful
+model result. Further model validation remains necessary.
+
+Verdict: approve the serving/priority entry-point feature with this explicit
+model-validation limitation. Real transfers and composable policies remain work.

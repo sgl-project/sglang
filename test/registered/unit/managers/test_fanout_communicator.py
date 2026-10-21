@@ -11,6 +11,45 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestQueueingCall(CustomTestCase):
+    def test_correlated_late_response_after_cancellation_is_ignored(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(sent.append, 1, correlation_key=lambda obj: obj)
+            cancelled = asyncio.create_task(comm("old"))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            current = asyncio.create_task(comm("new"))
+            await asyncio.sleep(0)
+            comm.handle_recv("old")
+            await asyncio.sleep(0)
+            self.assertFalse(current.done())
+            comm.handle_recv("new")
+            self.assertEqual(await current, ["new"])
+            self.assertEqual(sent, ["old", "new"])
+
+        asyncio.run(scenario())
+
+    def test_synchronous_reply_and_send_exception_cleanup(self):
+        async def scenario():
+            comm = FanOutCommunicator(
+                lambda obj: comm.handle_recv(obj), 1, correlation_key=lambda obj: obj
+            )
+            self.assertEqual(await comm("inline"), ["inline"])
+
+            def fail(obj):
+                raise RuntimeError("send failed")
+
+            comm._send = fail
+            with self.assertRaisesRegex(RuntimeError, "send failed"):
+                await comm("failed")
+            self.assertIsNone(comm._result_event)
+            comm._send = lambda obj: comm.handle_recv(obj)
+            self.assertEqual(await comm("next"), ["next"])
+
+        asyncio.run(scenario())
+
     def test_concurrent_caller_cannot_bypass_queue(self):
         """A new caller arriving in the wakeup window must not overtake a
         queued caller (this interleaving used to raise AssertionError and

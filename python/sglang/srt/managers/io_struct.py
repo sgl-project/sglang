@@ -1861,6 +1861,16 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class KVControlReqInput(BaseReq, kw_only=True):
+    request_id: str
+    command: Dict[str, Any]
+
+
+class KVControlReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    result: Dict[str, Any]
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

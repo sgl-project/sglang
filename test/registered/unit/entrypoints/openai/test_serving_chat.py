@@ -834,6 +834,18 @@ class ServingChatTestCase(CustomTestCase):
             stop=["STOP"],
             return_prompt_token_ids=True,
             cache_salt="tenant-a",
+            kv_hints={
+                "protocol_version": "0.1",
+                "message_id": "keep",
+                "actions": [
+                    {
+                        "action_id": "external",
+                        "action_type": "backend.action",
+                        "action_version": "9",
+                        "payload": {"key": [1, 2]},
+                    }
+                ],
+            },
             extra_key="classification",
         )
 
@@ -849,6 +861,7 @@ class ServingChatTestCase(CustomTestCase):
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         self.assertEqual(adapted.cache_salt, "tenant-a")
+        self.assertEqual(adapted.kv_hints, req.kv_hints)
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 

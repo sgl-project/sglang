@@ -102,10 +102,23 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=1,
             cache_salt="tenant-a",
             extra_key="classification",
+            kv_hints={
+                "protocol_version": "0.1",
+                "message_id": "keep",
+                "actions": [
+                    {
+                        "action_id": "external",
+                        "action_type": "backend.action",
+                        "action_version": "9",
+                        "payload": {"key": [1, 2]},
+                    }
+                ],
+            },
         )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
+        self.assertEqual(internal.kv_hints, req.kv_hints)
 
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(

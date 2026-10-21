@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KVControlReqInput,
+    KVControlReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -107,6 +109,7 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("kv_control", KVControlReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -188,10 +191,32 @@ class TokenizerControlMixin:
                 self._dispatch_to_scheduler,
                 get_parallel().num_dp_ranks,
                 mode,
+                correlation_key=(lambda obj: obj.request_id)
+                if resp_type is KVControlReqOutput
+                else None,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    async def kv_control(self: TokenizerManager, command: Dict[str, Any]):
+        self.auto_create_handle_loop()
+        if (
+            get_parallel().num_dp_ranks != 1
+            or get_parallel().tp_size != 1
+            or get_parallel().pp_size != 1
+        ):
+            return {
+                "success": False,
+                "error": {
+                    "code": "unsupported",
+                    "reason": "KV control requires a single owner",
+                },
+            }
+        response = await self.kv_control_communicator(
+            KVControlReqInput(request_id=uuid.uuid4().hex, command=command)
+        )
+        return response[0].result
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (

@@ -424,6 +424,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
+    # Attached work binds to committed content before request references end.
+    if (
+        service := getattr(tree_cache, "kv_control_service", None)
+    ) is not None and req.finished():
+        service.finish_request(req, committed_len=owned_kv_len, checkpointed=checkpoint)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)

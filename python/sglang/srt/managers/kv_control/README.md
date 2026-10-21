@@ -1,14 +1,16 @@
 # Programmable KV control and local cache priorities
 
 This package implements native control contracts and logical lifecycle.
-`KVControl` is disabled by default. Nothing imports it from serving entry points,
-and importing it installs no scheduler hooks or process-global state. Enabling
-this core executes explicit logical commands; there are no configured policies.
+`KVControl` is disabled by default. `--kv-control-config` explicitly opts the
+scheduler into the service and copy-priority profile; no controller/claims are
+allocated on the disabled path. The service executes explicit commands; there
+are no configured policies.
 With no executor, cache primitives return `unsupported`. The optional
 `UnifiedCacheExecutor` now applies copy-scoped priorities to real
-`UnifiedRadixCache` copies and inspects their current residency. Serving IPC/API
-and transfer integration remain separate features. Verification uses real CPU
-pools; GPU/model execution has not been tested in this run.
+`UnifiedRadixCache` copies and inspects their current residency. The HTTP/Engine
+control APIs and attached request lifecycle use that executor. Transfer
+integration remains a separate feature. Verification uses real CPU pools and a
+small real-CUDA cache smoke test. Model inference has not passed validation.
 
 The design follows the accepted
 [SGLang RFC](../../../../../docs/programmable-kvc/RFC-programmable-kv-cache.md)
@@ -210,12 +212,88 @@ Cancelling a logical interest never authorizes freeing a buffer still accessed
 by a worker or another waiter. Serving integration must continue progress until
 those obligations end, even after a task's finish action completes.
 
-Serving integration still supplies startup configuration, IPC/API entry points,
-request ownership and externally exposed capability discovery. Unit 3 supplies
-transfers, allocator/hold accounting, shared-load
-joining, whole-scope preparation and all-rank publication. Policies and event
-feeds are later units. No serving, reuse, performance or GPU validation is claimed
-by the CPU suite.
+Transfers, shared-load joining, whole-scope preparation and all-rank publication
+remain pending. Policies and event feeds are later units. The CPU suite validates
+in-process HTTP/IPC and cache/request behavior. It does not validate model
+inference, production GPU kernels or serving performance.
+
+## Serving entry points
+
+Launch with an explicit model/weight compatibility namespace:
+
+```bash
+python -m sglang.launch_server --model-path MODEL \
+  --kv-control-config '{"namespace":"model-weights-v1","engine_id":"worker-a"}'
+```
+
+The current executable profile requires TP=PP=CP=DP=1 on one node, the enabled
+built-in unified cache and ordinary text generation. Speculative decoding, PD
+disaggregation and alternate caches are rejected at startup. HiCache/linker
+execution is not enabled by this feature. Python backend fallback is deliberate.
+LoRA, multimodal and StreamingSession primitive execution returns unsupported;
+ordinary inference and opaque action consumers retain their existing behavior.
+
+GET `/v1/kv/capabilities` returns `{success, data}` with `engine_id`,
+`engine_epoch`, `namespace`, executable actions/components/layout and the selected
+topology. POST `/v1/kv/control` accepts a strict tagged command:
+
+| `kind` | Required fields beyond `kind` |
+| --- | --- |
+| `capabilities` | none |
+| `submit` | `context`, `envelope` (the existing KV hints envelope) |
+| `query`, `ack` | `context`, `message_id` |
+| `lookup` | `context`, `message_id`, optional bounded `limit` |
+| `cancel` | exact operation `ref` returned in a submission/query |
+| `residency` | `context`, logical `target`, optional `limit` |
+| `associations` | `context`, optional `session_id`, `cursor`, `limit` |
+| `capacity` | `context` |
+
+`context` contains the discovered engine/epoch/namespace and a `caller_id`.
+Independent submission must omit `binding_id`. Example with Python `requests`:
+
+```python
+import requests
+
+base = "http://localhost:30000"
+owner = requests.get(base + "/v1/kv/capabilities").json()["data"]
+context = {k: owner[k] for k in ("engine_id", "engine_epoch", "namespace")}
+context["caller_id"] = "router-a"
+reply = requests.post(base + "/v1/kv/control", json={
+    "kind": "submit", "context": context, "envelope": kv_hints,
+}).json()
+```
+
+The routes use the server's `ADMIN_OPTIONAL` authentication policy, matching
+cache flush. Caller/session IDs are correlation and declaration identities, not
+credentials. Top-level errors carry `{success: false, error: {code, reason}}`;
+HTTP maps stale ownership/conflicts to 409, capacity to 429, missing to 404 and
+unsupported service to 503. Accepted envelopes have individual action outcomes;
+an HTTP 200 receipt does not imply each action completed successfully. Foreign
+independent actions are returned unhandled for their owner.
+
+Python Engine exposes `kv_capabilities()`, `kv_control(command)` and matching
+`async_kv_capabilities()` / `async_kv_control(command)`. They use typed IPC through
+the tokenizer's correlated communicator, with no synthesized generation request.
+RPC cancellation does not cancel accepted work: query or explicitly cancel it.
+Late responses from a cancelled waiter cannot satisfy a later control call.
+
+Native `/generate` and supported OpenAI chat/completion requests accept
+`kv_hints`. Each sample/request incarnation receives an independent binding even
+when the original envelope or `rid` is shared. Discover attached results with
+`kind: lookup`, `message_id` and `context.caller_id: request`, omitting the
+binding. Each returned result contains its exact context/reference for query,
+ACK or cancellation. Lookup is bounded and reports overflow instead of silently
+dropping branches; narrow subsequent queries to a returned binding.
+
+The native consumer removes only consumed actions from a fresh envelope for
+that request. Successful completion binds `request_cached` to actual committed
+tokens, including a committed generated suffix and the request's effective salt,
+after checkpoint and before releasing cache references. Ordinary checkpoints and
+preemption do not complete it. Queued aborts are cancelled even without a KV row.
+Malformed native siblings have individual rejected results. Whole-envelope or
+registry-capacity rejection aborts the generation with a controlled request error.
+Idle processing progresses independent work. Active work prevents destructive
+flush; successful cache flush rotates the epoch and invalidates old contexts.
 
 Opt into cache-owned priority execution when constructing the real cache:
 
@@ -280,7 +358,7 @@ honors the controller's `ExecutionRequest.max_result_targets` budget.
 | FULL coverage | Page-aligned token ranges, including boundaries inside radix nodes |
 | SWA coverage | Actual page-aligned trailing-window spans, with the physical window size reported; explicit window/token descriptors also resolve current copies |
 | Mamba coverage | An existing sequence-end checkpoint, reported as a point; absent intermediate checkpoints produce missing/partial results |
-| Ingress/ownership | Callable core on the cache's construction thread; one cache owner and epoch |
+| Ingress/ownership | HTTP/Engine or callable core, typed IPC, one scheduler/cache owner and epoch |
 | Unsupported | COPY/MOVE, host/storage priority, HiCache/direct-linker execution, in-flight transfers, TP/PP/CP/sharded execution, speculative/bigram/draft/extra-buffer layouts, LoRA/extra-key and multimodal targeting, custom components/backends |
 
 Tokens are matched through actual namespace-aware `RadixKey` traversal without
@@ -338,11 +416,30 @@ PYTHONPATH=python CUDA_VISIBLE_DEVICES=999 .venv/bin/python -m pytest \
 
 The cache suite asserts `torch.cuda.device_count() == 0`, constructs real CPU
 FULL/SWA/Mamba pools and checks actual victims, pool balances and lock counts.
-The local environment has PyTorch 2.13.0+cu132 and gguf 0.19.0; this does not
-validate SGLang's pinned production GPU stack. Existing joint-allocation tests
+Initial CPU runs used PyTorch 2.13.0+cu132 and gguf 0.19.0. The target virtualenv
+was later updated to the pinned PyTorch 2.14.1+cu130, torchvision 0.29.1 and
+sglang-kernel 0.4.10 for GPU 1 validation; the reference environment is unchanged.
+The core/cache/service/communicator suites passed again on that runtime (114
+tests). This does not validate the complete production GPU stack. Existing joint-allocation tests
 were run with `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`: the unmodified
 default Rust route cannot build with this host's Cargo 1.75 (edition 2024 is
 required). The opt-in Rust-to-Python fallback itself is covered by the CPU suite.
 
-Tests use the repository's registered pure-pytest CPU pattern and real core state.
-They do not require `CustomTestCase`, import stubs, a model, or backend services.
+`test_kv_control_service.py` adds in-process HTTP/typed IPC, real committed request
+release, fan-out discovery, session reconstruction and queued-abort coverage.
+The pure control suite has no runtime dependencies; the cache/service suites use
+the repository's CPU pool fixtures and need no model or backend service.
+
+The manually invoked real-device proof is:
+
+```bash
+PYTHONPATH=python CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  test/manual/entrypoints/programmable_kv_gpu_smoke.py
+```
+
+It verifies actual CUDA KV bytes, victims, request locks, soft-priority reclaim,
+copy-lifetime/replay and allocator balance on one A100. A tiny-Llama server
+attempt has not passed: startup currently fails before cache initialization at
+the existing DualGemm import (`cutlass.cute` unavailable in the locally installed
+4.8.0 DSL distribution). No model output, service latency or throughput claim is
+derived from the cache proof.

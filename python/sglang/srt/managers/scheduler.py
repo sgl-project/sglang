@@ -696,6 +696,17 @@ class Scheduler(
 
         self.init_weight_updater()
 
+        self.kv_control_service = None
+        if get_memory().kv_control_config is not None:
+            from sglang.srt.managers.kv_control.service import (
+                KVControlService,
+                runtime_config,
+            )
+
+            self.kv_control_service = KVControlService(
+                self.tree_cache, runtime_config()
+            )
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -1778,8 +1789,11 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        from sglang.srt.managers.io_struct import KVControlReqInput
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (KVControlReqInput, self.handle_kv_control),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -2174,6 +2188,8 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.progress()
 
         for recv_req in recv_reqs:
             # Before any early exit, so every request releases its CUDA IPC pool slot.
@@ -2873,7 +2889,31 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        return Req(*args, **kwargs)
+        kwargs.setdefault("kv_hints", recv_req.kv_hints)
+        req = Req(*args, **kwargs)
+        if getattr(self, "kv_control_service", None) is not None:
+            from sglang.srt.managers.kv_control.contracts import ControlError
+
+            try:
+                self.kv_control_service.attach(
+                    req,
+                    recv_req.kv_hints,
+                    unsupported_request=recv_req.mm_inputs is not None,
+                )
+            except ControlError as error:
+                req.set_finish_with_abort(
+                    f"KV control rejected: {error.code}: {error}", status_code=400
+                )
+        return req
+
+    def handle_kv_control(self, recv_req):
+        from sglang.srt.managers.io_struct import KVControlReqOutput
+        from sglang.srt.managers.kv_control.service import dispatch
+
+        return KVControlReqOutput(
+            request_id=recv_req.request_id,
+            result=dispatch(self.kv_control_service, recv_req.command),
+        )
 
     def handle_generate_request(
         self,
@@ -3479,6 +3519,8 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.finish_request(req, aborted=True)
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
@@ -5287,6 +5329,8 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
+            if getattr(self, "kv_control_service", None) is not None:
+                idle &= not self.kv_control_service.has_pending
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5441,6 +5485,8 @@ class Scheduler(
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
+            if getattr(self, "kv_control_service", None) is not None:
+                self.kv_control_service.reset_after_cache_flush()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -5610,6 +5656,10 @@ class Scheduler(
         # Abort method 2: call `set_finish_with_abort`
         # The request will still run one prefill forward pass.
         # In this case, we change the input_ids to be only one token to make this prefill cheap.
+        if getattr(self, "kv_control_service", None) is not None:
+            for req in self.grammar_manager.grammar_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    self.kv_control_service.finish_request(req, aborted=True)
         self.grammar_manager.abort_requests(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled

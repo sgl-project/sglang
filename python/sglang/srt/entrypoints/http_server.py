@@ -159,6 +159,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
+from sglang.srt.managers.kv_control.http import (
+    install_routes as install_kv_control_routes,
+)
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
@@ -1007,6 +1010,9 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
     # Only /v1/systemone builds a decision layout, from the prompt it compiles.
     if obj.decision_layout is not None:
         raise ValueError("decision_layout is set only by /v1/systemone")
+
+
+install_kv_control_routes(app, lambda: _global_state.tokenizer_manager)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
