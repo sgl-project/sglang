@@ -8,6 +8,10 @@ import torch
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
@@ -46,9 +50,6 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
 from sglang.utils import logger
-from torch import nn
-from transformers import PretrainedConfig, PreTrainedModel
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
 _is_cuda = is_cuda()
 
