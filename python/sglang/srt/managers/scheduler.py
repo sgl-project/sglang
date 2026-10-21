@@ -709,6 +709,8 @@ class Scheduler(
                 runtime_config(),
                 namespace_keys=True,
                 idle_check=self.is_fully_idle,
+                weight_version=get_serving().weight_version,
+                cache_available=self._native_cache_available,
             )
             self.kv_control_service.control.executor.gpu_copy_capacity = (
                 self._kv_control_gpu_copy_capacity
@@ -2947,6 +2949,10 @@ class Scheduler(
         )
         return max(0, int(budget.remaining_total))
 
+    def _native_cache_available(self):
+        tags = getattr(getattr(self, "weight_updater", None), "offload_tags", ())
+        return "kv_cache" not in tags
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2959,9 +2965,39 @@ class Scheduler(
             ):
                 for item in recv_req.mm_inputs.mm_items:
                     mm_cleanup.callback(item.release_transport_proxies)
+            if self._reject_during_native_weight_update(recv_req, mm_cleanup):
+                return
             self._handle_generate_request(
                 recv_req, mm_cleanup, mm_input_error=mm_input_error
             )
+
+    def _reject_during_native_weight_update(self, recv_req, cleanup):
+        service = getattr(self, "kv_control_service", None)
+        tags = getattr(getattr(self, "weight_updater", None), "offload_tags", ())
+        if service is None or (
+            not service.weights.active
+            and "weights" not in tags
+            and "kv_cache" not in tags
+        ):
+            return False
+        cleanup.close()
+        if isinstance(
+            recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
+        ):
+            for item in recv_req.mm_inputs.mm_items:
+                item.feature = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                rid=recv_req.rid,
+                finished_reason=FINISH_ABORT(
+                    "Model/cache resources are unavailable; finish updates or resume memory before retrying",
+                    status_code=503,
+                    err_type="ServiceUnavailableError",
+                ).to_json(),
+            ),
+            recv_req,
+        )
+        return True
 
     def _handle_generate_request(
         self,
@@ -3671,6 +3707,8 @@ class Scheduler(
             ):
                 for item in recv_req.mm_inputs.mm_items:
                     mm_cleanup.callback(item.release_transport_proxies)
+            if self._reject_during_native_weight_update(recv_req, mm_cleanup):
+                return
             self._handle_embedding_request(
                 recv_req, mm_cleanup, mm_input_error=mm_input_error
             )
@@ -5372,6 +5410,8 @@ class Scheduler(
         if not for_health_check:
             if getattr(self, "kv_control_service", None) is not None:
                 idle &= not self.kv_control_service.has_pending
+                weights = self.kv_control_service.weights
+                idle &= not weights.active or weights.fence.quiescent
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5590,8 +5630,7 @@ class Scheduler(
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
-        self.record_weight_version_change(new_version=recv_req.new_version)
-        return UpdateWeightVersionReqOutput()
+        return self.weight_updater.update_weight_version(recv_req)
 
     def record_weight_version_change(self, new_version: Optional[str]) -> None:
         if new_version is None or new_version == get_serving().weight_version:

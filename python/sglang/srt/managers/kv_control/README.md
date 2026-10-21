@@ -235,10 +235,9 @@ buffer-only and direct-linker control paths remain unsupported. Python backend
 fallback is deliberate.
 LoRA, multimodal and StreamingSession primitive execution returns unsupported;
 ordinary inference and opaque action consumers retain their existing behavior.
-Weight mutation APIs return a typed refusal while this control profile is
-enabled, before accessing runners or collectives. Epoch rotation alone does not
-provide weight-namespace isolation; that integration remains pending and is
-reported as `weight_updates: unsupported` in discovery.
+The serving CPU/CUDA profile supports guarded weight transitions. The callable
+owner-assertion mode without namespaced ordinary keys continues to refuse weight
+mutation. Discovery reports the current update state and committed version.
 
 GET `/v1/kv/capabilities` returns `{success, data}` with `engine_id`,
 `engine_epoch`, `namespace`, executable actions/components/layout and the selected
@@ -411,14 +410,50 @@ operations/transfers, no StreamingSession-owned KV and no correctness references
 It rotates epoch, logical records and declarations. Old physical copies may
 remain under old encoded keys, but new requests/control cannot match them; their
 actual storage root hashes differ. This seam does not mutate model parameters.
-Weight-update API integration remains unsupported until its guarded transaction
-and failure handling are implemented.
+Weight mutation uses this seam before touching parameters and at publication of
+a successfully labelled model generation.
 
 The low-level callable service defaults to owner-asserted compatibility without
 rewriting manually constructed cache keys. The serving scheduler explicitly
 enables `namespace_keys` and supplies its idle check. A low-level owner opting
 into namespaced keys must prepare requests before insertion and supply an idle
 check before invoking namespace rebind.
+
+## Parameter update lifecycle
+
+Disk/IPC updates use a standalone fence. Tensor/distributed updates use the
+existing `begin_weight_update()` / `end_weight_update()` session. The owner
+requires drained inference, control, transfers, StreamingSession KV and
+correctness references before changing lookup generations or packing parameters.
+During an open update, new generation/embedding requests are aborted directly
+with 503 before construction or forwarding; independent KV submissions return
+busy. Read-only discovery remains available.
+
+Parameter work must synchronize before requested cache flush and publication.
+With `flush_cache=False`, old physical cache entries can remain under old
+namespace keys and cannot satisfy new ordinary or independent lookup. A supplied
+new `weight_version` derives a compatible generation from the configured base
+namespace; a known unchanged label or mixed labels in a session are refused.
+Unlabelled updates use fresh generations. Metadata version assertions and the
+debug checker's `reset_tensors` action use the same isolation boundary.
+
+```python
+engine.begin_weight_update(selector="target")
+engine.update_weights_from_tensor(
+    named_tensors, weight_version="step-2", selector="target", flush_cache=False,
+)
+engine.end_weight_update()
+owner = engine.kv_capabilities()["data"]  # obtain the new context
+```
+
+Runner failures/rollback retain a fresh isolated lookup generation; a failed
+chunk is not converted to successful publication by a later `end`. Unexpected
+parameter exceptions or synchronization failures keep inference fenced. Final
+cache-flush failure can be retried through `end` without repeating the parameter
+mutation. Existing runners retain ownership of parameter loading/rollback; this
+layer does not assert atomic replacement of every numerical model parameter.
+Memory release/resume refuses an open weight fence, and offloaded resources must
+be resumed before parameter mutation.
 
 Cache reset clears claims and changes the cache generation. Existing executors
 reject subsequent work. After the owner safely resets the cache and calls

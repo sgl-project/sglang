@@ -173,15 +173,21 @@ class KVControlService:
         clock=time.monotonic,
         namespace_keys=False,
         idle_check=None,
+        weight_version=None,
+        cache_available=None,
     ):
         if type(namespace_keys) is not bool:
             raise ValueError("namespace_keys must be a bool")
         self.namespace_keys = namespace_keys
         self.idle_check = idle_check
+        self.cache_available = cache_available
         self.cache, self.config = cache, validated(config, ServiceConfig)
         self.base_namespace = self.config.namespace
         if self.namespace_keys:
             self.cache_salt(None)  # Reject an unencodable namespace at startup.
+        from sglang.srt.managers.kv_control.weight_lifecycle import WeightLifecycle
+
+        self.weights = WeightLifecycle(self, weight_version)
         self.control = KVControl(
             config.engine_id or uuid.uuid4().hex,
             config.namespace,
@@ -203,9 +209,13 @@ class KVControlService:
             engine_epoch=self.control.registry.engine_epoch,
         )
         executor.gpu_copy_capacity = capacity
+        executor.cache_available = self.cache_is_available
         if self.namespace_keys:
             executor.cache_salt_transform = self.cache_salt
         return executor
+
+    def cache_is_available(self):
+        return self.cache_available is None or self.cache_available()
 
     def cache_salt(self, original):
         from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
@@ -239,6 +249,8 @@ class KVControlService:
                 "wrong_owner", "Namespace rotation must run on the cache owner"
             )
         namespace = validated(namespace, Identifier)
+        if self.weights.active and not self.weights.fence.quiescent:
+            raise ControlError("busy", "Parameter work is not quiescent")
         if not self.namespace_keys or self.idle_check is None:
             raise ControlError(
                 "unsupported",
@@ -246,6 +258,22 @@ class KVControlService:
             )
         if namespace == self.config.namespace:
             raise ControlError("conflict", "A changed model requires a fresh namespace")
+        self.require_quiescent_cache()
+        capacity = self.control.executor.gpu_copy_capacity
+        self.control.reset(namespace)
+        self.config = msgspec.structs.replace(self.config, namespace=namespace)
+        claims = self.cache.tree_core.priority_claims
+        claims.config = replace(claims.config, namespace=namespace)
+        claims.reset()
+        self.control.executor = self._bind_executor(capacity)
+
+    def require_quiescent_cache(self):
+        if threading.get_ident() != self.cache._kv_control_owner_thread:
+            raise ControlError(
+                "wrong_owner", "Cache transitions must run on their owner"
+            )
+        if self.idle_check is None:
+            raise ControlError("unsupported", "An owner idle check is required")
         if self.has_pending or not self.idle_check():
             raise ControlError(
                 "busy",
@@ -277,13 +305,6 @@ class KVControlService:
                 raise ControlError(
                     "busy", "Cache content still has active correctness references"
                 )
-        capacity = self.control.executor.gpu_copy_capacity
-        self.control.reset(namespace)
-        self.config = msgspec.structs.replace(self.config, namespace=namespace)
-        claims = self.cache.tree_core.priority_claims
-        claims.config = replace(claims.config, namespace=namespace)
-        claims.reset()
-        self.control.executor = self._bind_executor(capacity)
 
     def capabilities(self):
         from sglang.srt.managers.kv_control.key_namespace import SALT_ENCODING
@@ -298,7 +319,12 @@ class KVControlService:
             policies=(),
             topology="single_owner",
             attached_caller_id="request",
-            weight_updates="unsupported",
+            weight_updates="guarded_transactions"
+            if self.namespace_keys
+            else "unsupported",
+            weight_version=self.weights.version,
+            weight_update_devices=("cpu", "cuda") if self.namespace_keys else (),
+            updating_weights=self.weights.active,
             cache_salt_namespace=registry.namespace if self.namespace_keys else None,
             cache_salt_encoding=SALT_ENCODING
             if self.namespace_keys
@@ -395,6 +421,10 @@ class KVControlService:
         )
         registry.validate_context(context)
         if isinstance(command, Submit):
+            if self.weights.active:
+                raise ControlError(
+                    "busy", "Finish the weight update before submitting KV actions"
+                )
             if context.binding_id is not None:
                 raise ControlError(
                     "invalid_payload",

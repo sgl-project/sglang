@@ -22,7 +22,7 @@
 
 覆盖行为包括：共享前缀只计费一次、保留运行中请求的 decode 增长估计、整个可复用前缀就绪前持续持有引用、DMA 期间 radix 分裂、单个与全部等待者取消、部分 MOVE、部分提交失败、失败结果的 ACK/重放、独立重试，以及分配前的范围和结果预算检查。超过目标池总容量的操作返回终态 `deferred`，避免留下无法完成的活跃记录。临时容量不足采用可取消的 `queued` 状态。
 
-缓存 flush 会更换 epoch，同时保留调度器的资源批准回调。权重更新暂不支持：开启该控制 profile 时，相关入口在接触 runner 或 collective 前返回明确拒绝，等待权重命名空间隔离实现。
+缓存 flush 会更换 epoch，同时保留调度器的资源批准回调。权重更新的受控流程已另行实现，见文末记录；低层未启用实际 key 命名空间的调用模式仍拒绝参数修改。
 
 ## 单卡验证
 
@@ -58,4 +58,14 @@ tiny Llama 的本地 checkpoint 路径仍未通过启动验证：环境中的 CU
 
 ## 后续实现范围
 
-真实 L3/linker 搬运、混合状态与多 rank 发布、可组合策略与请求 admission 协作、权重更新隔离仍需开发。当前 capabilities 会明确报告已支持的方向、粒度和限制。此处没有 SGLang 吞吐提升或训练权重输出质量结论。
+真实 L3/linker 搬运、混合状态与多 rank 发布、可组合策略与请求 admission 协作仍需开发。当前 capabilities 会明确报告已支持的方向、粒度和限制。此处没有 SGLang 吞吐提升或训练权重输出质量结论。
+
+## 参数更新与版本发布
+
+参数修改前会隔离旧 epoch 和实际 lookup namespace；多步更新期间，新推理直接返回 503，KV 提交返回 busy。参数工作同步完成后才执行所需的 cache flush，并发布版本对应的新命名空间。`flush_cache=False` 时保留的旧物理副本也无法命中新版本查找。
+
+23 项新增 CPU 测试修改实际 tensor，覆盖 disk/IPC、begin/tensor/distributed/end、Python Engine 真实序列化及 typed IPC、版本声明、回滚与部分失败、同步失败、最终 flush 重试、错误线程和内存所有权。相关 CPU 检查合计 143 项通过，2 项跳过，输出在 `/tmp/sglang-kv-weight-cpu-proof.log`。
+
+GPU 1 上的 OPT smoke test 实际修改了 attention LayerNorm bias 参数：修改前后 checksum 不同，namespace 和 epoch 更新；同一输入在新版本首次生成命中 0 个缓存 token，随后重复生成命中 3 个，输出 token 一致。修改的是随机权重 fixture 中的有限偏置参数；这不构成训练质量或完整训练更新结论。结果保存在 `/tmp/sglang-kv-opt-weights-smoke/result.json`。
+
+现有 `test_weight_checker.py` 按其单卡配置运行得到 63 项通过、1 项失败；失败的 FP8 路径缺少 `deep_gemm`。在隐藏 GPU 环境中误运行该套件的失败记录保留在 `/tmp/sglang-kv-weight-checker-cpu-env-failed.log`，单卡输出在 `/tmp/sglang-kv-weight-checker-gpu-proof.log`。未修改既有测试以掩盖依赖问题。

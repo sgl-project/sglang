@@ -15,6 +15,7 @@ def install_routes(app, get_manager):
             if reply["success"]
             else {
                 "unsupported": 503,
+                "unavailable": 503,
                 "capacity": 429,
                 "missing": 404,
                 "conflict": 409,

@@ -93,6 +93,7 @@ class UnifiedCacheExecutor:
         self._thread = threading.get_ident()
         self.gpu_copy_capacity = None
         self.cache_salt_transform = None
+        self.cache_available = None
         self.transfers = None
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
@@ -117,6 +118,11 @@ class UnifiedCacheExecutor:
         if threading.get_ident() != self._thread:
             raise ControlError(
                 "wrong_owner", "Cache control must run on its owning thread"
+            )
+        if self.cache_available is not None and not self.cache_available():
+            raise ControlError(
+                "unavailable",
+                "Cache memory is offloaded; resume it before KV execution",
             )
         if (
             target.engine_epoch != self.engine_epoch
@@ -143,6 +149,7 @@ class UnifiedCacheExecutor:
         supported = not reason and not self.core.enable_external_cache_linker
         return {
             "namespace": self.config.namespace,
+            "available": self.cache_available is None or self.cache_available(),
             "engine_epoch": self.engine_epoch,
             "cache_generation": self.generation,
             "tree_core": "python",
@@ -687,9 +694,11 @@ class UnifiedCacheExecutor:
                 target_outcomes=tuple(outcomes + missing),
             )
         except ControlError as error:
-            status = {"unsupported": Status.UNSUPPORTED, "missing": Status.MISSING}.get(
-                error.code, Status.REJECTED
-            )
+            status = {
+                "unsupported": Status.UNSUPPORTED,
+                "missing": Status.MISSING,
+                "unavailable": Status.DEFERRED,
+            }.get(error.code, Status.REJECTED)
             return ExecutionUpdate(
                 status=status, quiescent=True, code=error.code, reason=str(error)
             )

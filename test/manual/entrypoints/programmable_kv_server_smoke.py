@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--hicache", action="store_true")
+    parser.add_argument(
+        "--check-weight-update",
+        action="store_true",
+        help="OPT fixture: mutate attention LayerNorm biases and verify a cold new namespace",
+    )
     parser.add_argument("--output-dir")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[3]
@@ -273,6 +278,67 @@ def main():
             assert (
                 repeated["meta_info"]["cached_tokens"] >= len(body["input_ids"]) - 1
             ), repeated
+            weights_validation = None
+            if args.check_weight_update:
+
+                def checker(action, **extra):
+                    response = requests.post(
+                        base + "/weights_checker",
+                        json={"action": action, "selector": "target", **extra},
+                        timeout=60,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    assert data["success"], data
+                    return data
+
+                before_checksum = checker("checksum")["per_engine_checksum"]
+                old_owner = owner
+                # Change only OPT attention LayerNorm biases, keeping the
+                # fixture's large projection matrices numerically bounded.
+                skipped = [
+                    "embed_tokens",
+                    "embed_positions",
+                    "lm_head",
+                    ".self_attn.",
+                    ".fc1.",
+                    ".fc2.",
+                    "final_layer_norm",
+                    "self_attn_layer_norm.weight",
+                ]
+                checker("reset_tensors", skip_tensor_list=skipped)
+                owner = get_capabilities()
+                assert owner["namespace"] != old_owner["namespace"]
+                assert owner["engine_epoch"] != old_owner["engine_epoch"]
+                assert not owner["updating_weights"]
+                after_checksum = checker("checksum")["per_engine_checksum"]
+                assert before_checksum != after_checksum
+                cold = requests.post(
+                    base + "/generate",
+                    json={k: v for k, v in body.items() if k != "kv_hints"},
+                    timeout=60,
+                )
+                cold.raise_for_status()
+                cold = cold.json()
+                assert cold["meta_info"]["cached_tokens"] == 0, cold
+                warm = requests.post(
+                    base + "/generate",
+                    json={k: v for k, v in body.items() if k != "kv_hints"},
+                    timeout=60,
+                )
+                warm.raise_for_status()
+                warm = warm.json()
+                assert cold["output_ids"] == warm["output_ids"]
+                assert warm["meta_info"]["cached_tokens"] >= len(body["input_ids"]) - 1
+                weights_validation = dict(
+                    before_namespace=old_owner["namespace"],
+                    after_namespace=owner["namespace"],
+                    before_checksum=before_checksum,
+                    after_checksum=after_checksum,
+                    cold=cold,
+                    warm=warm,
+                    skip_tensor_list=skipped,
+                )
             flush = requests.post(base + "/flush_cache", timeout=15)
             flush.raise_for_status()
             after = get_capabilities()
@@ -304,6 +370,7 @@ def main():
                 "repeat": repeated,
                 "flush_epoch_rotated": True,
                 "stale_status": stale.status_code,
+                "weights_validation": weights_validation,
             }
             (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(

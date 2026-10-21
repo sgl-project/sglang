@@ -342,3 +342,62 @@ independent lookup against actual namespaced ordinary-generation keys and
 loaded-prefix reuse. No added Ruff findings, isort/format and diff whitespace
 checks pass. Verdict: approve the namespace-key foundation for a local commit;
 parameter mutation transactions remain the next required work.
+
+### Unit 5b — Guarded parameter mutation and version publication
+
+Replaced the temporary serving refusal with owner-fenced disk/IPC updates and
+begin/tensor/distributed/end sessions. Namespace/key/epoch isolation precedes any
+runner packing or load. New inference is rejected directly before request/session
+construction or forwarding while the fence is open; native submissions return
+busy. Parameter work synchronizes before requested cache flush and publication.
+No-flush updates retain old physical entries only under incompatible old keys.
+Provided new version labels derive compatible namespaces; unknown generations
+are fresh. Failed results/rollback keep an isolated namespace; failed parts are
+not converted into successful transaction publication by end. Unknown exceptions
+or synchronization failures retain the fence; failed final flush can retry end
+without repeating parameter mutation.
+
+Audit also covered debug reset_tensors and explicit weight-version assertion,
+which now use the same guarded boundary. Memory ownership changes refuse open
+weight fences rather than tripping the scheduler's legacy idle assertion. Their
+typed refusals propagate through existing IPC. Offloaded resources refuse weight
+mutation. Python Engine now forwards optional version labels/selectors through
+real tensor serialization and typed requests.
+
+New CPU tests mutate actual tensors behind the existing manager methods and use
+real cache keys/metadata. They cover standalone and multipart updates, early
+refusal, no-flush isolation, rollback/partial failure, exception fencing, retries,
+debug reset, version assertion/P2P end, selectors, wrong thread, memory ownership
+and Python Engine serialization. Twenty-three cases pass; relevant existing CPU
+suite results are retained in /tmp/sglang-kv-weight-cpu-proof.log.
+
+A real GPU OPT dummy-model reset changed attention LayerNorm bias tensors. Engine
+checksums changed, the model namespace changed, first new-version generation
+reported 0 cached tokens, and repeated generation reported 3 cached tokens with
+equal output IDs. This is a parameter/cache-isolation smoke test, not a model
+quality result. Artifacts: /tmp/sglang-kv-opt-weights-smoke/{server.log,result.json}.
+
+An existing GPU weight-checker suite was initially invoked with GPUs hidden:
+42 cases failed on No CUDA GPUs, and a minimal failed reproduction is preserved
+at /tmp/sglang-kv-weight-checker-cpu-env-failed.log. On GPU 1 it reports 63 passed,
+1 failed; the remaining FP8 lazy-pair case cannot import deep_gemm in this
+host environment. Full output is /tmp/sglang-kv-weight-checker-gpu-proof.log.
+That dependency failure is not counted as passing or hidden by modifying the
+existing checker suite. FP8/model-parallel validation remains outside this
+single-owner FP16 fixture.
+
+Final review added transient memory availability checks and typed memory/version
+refusals, so offloaded KV cannot execute native operations and offloaded model
+resources cannot receive parameter writes. Inference also refuses unavailable
+weights/cache. Namespace/budget/availability callbacks survive rebind. Public
+metadata version assertions participate in the same fence; P2P/RDMA labels remain
+unpublished until end, and unchanged committed labels are no-ops outside an
+update. Wrong-thread end refuses before touching a runner.
+
+The final new weight suite is 24 tests, all passing; weight/service/host suites
+passed together (50 cases). Relevant per-file CPU proof passed 143 cases with
+2 existing skips before the final availability case; no added Ruff findings,
+isort/format and diff-whitespace checks pass. The real GPU parameter-isolation
+proof passed; the separate existing FP8 dependency failure remains recorded.
+Verdict: approve guarded parameter lifecycle for its local feature commit.
+Real storage execution and composable policy/admission work remain outstanding.
