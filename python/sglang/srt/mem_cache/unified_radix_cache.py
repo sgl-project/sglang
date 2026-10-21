@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from collections import deque
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -296,7 +297,13 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        # PP-sync sends not yet received downstream, grouped by scheduler round, oldest
+        # first. A gloo send completes only when the receiver posts its recv, so waiting
+        # on round k's sends ties this rank's round k+1 to the next rank's round k; the
+        # window is the pipeline's own depth and still bounds the list when idle rounds
+        # outrun the followers.
+        self.pp_sync_window = max(1, params.pp_size + params.pp_async_batch_depth)
+        self.work_rounds: deque[list[torch.distributed.Work]] = deque([[]])
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -351,17 +358,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _drain_async_work(self):
-        """
-        Block until all outstanding async sends are consumed, then clear.
-
-        Called at the start of each event round, so work_list holds the sends
-        accumulated since the last round. This bounds it and applies
-        backpressure when a downstream PP rank lags. Scheduler thread only.
-        """
-        for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
+    def _bound_async_work(self) -> None:
+        """Open this round's PP-sync sends and wait out the oldest round once more
+        than pp_sync_window rounds are outstanding. Scheduler thread only."""
+        self.work_rounds.append([])
+        while len(self.work_rounds) > self.pp_sync_window:
+            for work in self.work_rounds.popleft():
+                work.wait()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -397,7 +400,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
-            self.work_list.append(send_work)
+            self.work_rounds[-1].append(send_work)
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -3622,8 +3625,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        self._bound_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()

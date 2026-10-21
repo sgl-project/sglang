@@ -1,16 +1,22 @@
 """Unit tests for HiCache PP synchronization."""
 
+import socket
+import time
 import unittest
+from collections import deque
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+import torch.distributed
+import torch.multiprocessing
 
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 class _FakeWork:
@@ -22,30 +28,110 @@ class _FakeWork:
 
 
 class _Holder:
-    """Minimal carrier exposing only what _drain_async_work touches."""
+    """Minimal carrier exposing only what the PP-sync window touches."""
 
 
-class TestPPSyncDrain(unittest.TestCase):
-    def test_drain_waits_all_and_clears(self):
-        holder = _Holder()
-        works = [_FakeWork(), _FakeWork(), _FakeWork()]
-        holder.work_list = list(works)
-
-        UnifiedRadixCache._drain_async_work(holder)
-
-        self.assertTrue(all(w.waited for w in works))
-        self.assertEqual(holder.work_list, [])
-
-    def test_drain_empty_is_noop(self):
-        holder = _Holder()
-        holder.work_list = []
-
-        UnifiedRadixCache._drain_async_work(holder)
-
-        self.assertEqual(holder.work_list, [])
+def _holder(*, window: int) -> _Holder:
+    holder = _Holder()
+    holder.pp_sync_window = window
+    holder.work_rounds = deque([[]])
+    return holder
 
 
-class TestUnifiedPPSyncBatching(unittest.TestCase):
+def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:
+    """One scheduler round: bound the outstanding sends, then issue this round's."""
+    UnifiedRadixCache._bound_async_work(holder)
+    works = [_FakeWork() for _ in range(sends)]
+    holder.work_rounds[-1].extend(works)
+    return works
+
+
+class TestPPSyncWindow(CustomTestCase):
+    """A gloo send completes only once the next PP rank posts its recv, so waiting on
+    the previous round's sends every round tied each rank to the next rank's progress
+    (#45351). The window waits only on rounds older than the pipeline depth and still
+    bounds the outstanding sends (#28916)."""
+
+    def test_rounds_within_window_are_not_waited(self):
+        holder = _holder(window=3)
+        rounds = [_round(holder, sends=2) for _ in range(3)]
+        self.assertFalse(any(w.waited for works in rounds for w in works))
+
+        _round(holder, sends=1)
+        self.assertTrue(all(w.waited for w in rounds[0]))
+        self.assertFalse(any(w.waited for works in rounds[1:] for w in works))
+        self.assertEqual(len(holder.work_rounds), 3)
+
+    def test_window_one_is_the_single_round_drain(self):
+        holder = _holder(window=1)
+        first = _round(holder, sends=2)
+        self.assertFalse(any(w.waited for w in first))
+
+        _round(holder, sends=1)
+        self.assertTrue(all(w.waited for w in first))
+        self.assertEqual(len(holder.work_rounds), 1)
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _gloo_pp_rank(rank: int, port: int, result: dict) -> None:
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    cache = _holder(window=1)
+    cache.pp_rank = rank
+    cache.pp_size = 2
+    cache.pp_group = torch.distributed.group.WORLD
+    data = torch.zeros(2, dtype=torch.int64)
+    elapsed = {}
+    for phase, window, rounds in (("drain", 1, 2), ("window", 4, 4)):
+        cache.pp_sync_window = window
+        if rank == 1:
+            time.sleep(1.0)
+        start = time.perf_counter()
+        for _ in range(rounds):
+            UnifiedRadixCache._bound_async_work(cache)
+            UnifiedRadixCache._pp_sync(cache, data)
+        elapsed[phase] = time.perf_counter() - start
+        for works in cache.work_rounds:
+            for work in works:
+                work.wait()
+        cache.work_rounds = deque([[]])
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+    if rank == 0:
+        result.update(elapsed)
+
+
+class TestPPSyncWindowGloo(CustomTestCase):
+    """Real gloo sends: rank 0 must issue a window's worth of rounds while rank 1 has
+    posted no recv at all. With a single-round window, rank 0's second round blocks
+    until rank 1 wakes up, which is the lock-step of #45351."""
+
+    def test_leader_runs_ahead_by_window(self):
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ctx.Manager() as manager:
+            result = manager.dict()
+            port = _free_port()
+            procs = [
+                ctx.Process(target=_gloo_pp_rank, args=(rank, port, result))
+                for rank in range(2)
+            ]
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(timeout=60)
+            self.assertTrue(all(proc.exitcode == 0 for proc in procs), procs)
+            elapsed = dict(result)
+        self.assertGreater(elapsed["drain"], 0.5, elapsed)
+        self.assertLess(elapsed["window"], 0.5, elapsed)
+
+
+class TestUnifiedPPSyncBatching(CustomTestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
@@ -54,12 +140,13 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         )
         cache.pp_rank = pp_rank
         cache.pp_size = 2
+        cache.pp_sync_window = 1
+        cache.work_rounds = deque([[]])
         cache.host_memory_mode = "cache"
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
-        cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
