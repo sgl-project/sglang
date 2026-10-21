@@ -100,7 +100,7 @@ jobs:
       matrix:
         include:
           # SM90 runs only the frozen kernels: the current ones are sm_100a/sm_103a.
-          # Dense MLA decoding exists on this side alone, and is why SM90 is built.
+          # The frozen ones are built for sm_90a/sm_100a/sm_103a, so SM100 runs both.
           - arch_label: sm90
             runner: 8-gpu-h200
             wheel_arch: x86_64
@@ -109,13 +109,13 @@ jobs:
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
-            tests: current
-            timeout: 120
+            tests: current legacy
+            timeout: 180
           - arch_label: sm103-aarch64
             runner: 4-gpu-gb300
             wheel_arch: aarch64
-            tests: current
-            timeout: 120
+            tests: current legacy
+            timeout: 180
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -128,6 +128,11 @@ jobs:
           ref: ${{ inputs.branch || 'sgl' }}
           path: FlashMLA
           submodules: recursive
+
+      # The tests need only tests/. The source package would shadow the installed
+      # wheel (its directory has no built extensions), so it is removed.
+      - name: Remove the FlashMLA source package
+        run: rm -rf FlashMLA/flash_mla
 
       - name: Download wheel
         uses: actions/download-artifact@v4
@@ -149,6 +154,9 @@ jobs:
           python3 -c "
           import flash_mla
           from flash_mla._loader import get_ops
+          print('flash_mla:', flash_mla.__file__)
+          import os
+          assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), 'not the installed wheel'
           print('version:', flash_mla.__version__)
           print('has_legacy:', flash_mla.has_legacy())
           assert get_ops(use_legacy=False).sparse_decode_fwd is not None
@@ -156,25 +164,31 @@ jobs:
           "
 
       - name: Run tests (current kernels)
-        if: matrix.tests == 'current'
+        if: contains(matrix.tests, 'current')
         working-directory: FlashMLA
         env:
-          PYTHONPATH: ${{ github.workspace }}/FlashMLA:${{ github.workspace }}/FlashMLA/tests
+          PYTHONPATH: ${{ github.workspace }}/FlashMLA/tests
         run: |
+          python3 -c "import os, flash_mla; assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), flash_mla.__file__"
           python3 tests/test-sparse-prefill.py
           python3 tests/test-sparse-decode.py
 
       - name: Run tests (frozen kernels)
-        if: matrix.tests == 'legacy'
+        if: contains(matrix.tests, 'legacy')
         working-directory: FlashMLA
         env:
           # conftest.py only fixes sys.path under pytest; these are scripts.
-          PYTHONPATH: ${{ github.workspace }}/FlashMLA:${{ github.workspace }}/FlashMLA/tests
+          PYTHONPATH: ${{ github.workspace }}/FlashMLA/tests
         run: |
+          python3 -c "import os, flash_mla; assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), flash_mla.__file__"
           python3 -m pytest tests/legacy/ -q
-          python3 tests/legacy/test_flash_mla_dense_decoding.py
+          # Dense MLA decoding is SM90-only.
+          if [ "${{ matrix.arch_label }}" = sm90 ]; then
+            python3 tests/legacy/test_flash_mla_dense_decoding.py
+          fi
           python3 tests/legacy/test_flash_mla_sparse_prefill.py
           python3 tests/legacy/test_flash_mla_sparse_decoding.py
+          python3 tests/legacy/test_flash_mla_sparse_decoding_v32_bit_equal.py
 
   release:
     if: |
