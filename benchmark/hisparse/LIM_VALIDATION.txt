@@ -3,7 +3,7 @@ Experimental Ascend LIM sparse KV offload
 
 Purpose and configuration
 -------------------------
-Integrate the external FusedLightningIndexerManage (LIM) operator into the
+Integrate the FusedLightningIndexerManage (LIM) operator into the
 SGLang DSA NPU decode path. Full compact attention KV remains in registered
 host DRAM; each request/layer retains C tokens of main KV in HBM. Full indexer
 keys remain in HBM. K is the selected TopK count, fixed at 2048; C is the
@@ -31,12 +31,18 @@ torch.ops.npu registration. No extra LIM vendor package, external .so path,
 vLLM checkout or standalone operator installer is used at build/startup.
 SGLANG_NPU_LIM_LIBRARY is removed and warns if still set; its value is ignored.
 Kernel source branch: McZyWu/sgl-kernel-npu feat/lim-native-kv-offload.
-Kernel source commit: 293a16e0eac94cea110873307aa1d1f4dcbe854e
+Kernel source commit: b5a45667efb377b0312108c01bbd0a730c1f9e78
 
-Migration validation status, 2026-10-21: this direct-launch source port has
-not been compiled/executed on Ascend because 217 SSH was unreachable.
-The measurements below retain their original commits and external-probe
-provenance. They are not new performance or accuracy claims for this port.
+Migration validation on 217, 2026-10-21: the standard A3 wheel builds with
+CANN 9.1 / torch 2.10.0 / torch_npu 2.10.0.post6. All 10 native tests pass.
+Production host allocation, graph replay, request reuse, padding, new-page
+TopK, bitwise selected KV and the fixed-fixture attention comparison also
+pass. The loaded library SHA256 is
+ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8.
+No external LIM probe or custom vendor library is loaded in these checks.
+Checkpoint-backed GLM-5.2-W4A8 A/B is in progress separately; the historical
+measurements below retain their original external-probe provenance and must
+not be attributed to this port.
 
 Selection semantics and accuracy status
 --------------------------------------
