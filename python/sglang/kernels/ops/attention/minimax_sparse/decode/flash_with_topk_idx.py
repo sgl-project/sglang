@@ -990,7 +990,6 @@ def _topk_index_merge_kernel(
     )
 
 
-@torch.no_grad()
 def _num_kv_chunks(rows: int, num_kv_heads: int) -> int:
     # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
     # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
@@ -1072,6 +1071,7 @@ def _launch_decode_score_packed(
     )
 
 
+@torch.no_grad()
 def flash_decode_with_topk_idx(
     q: torch.Tensor,  # [batch_size, num_heads, head_dim]
     sink: Optional[torch.Tensor],
