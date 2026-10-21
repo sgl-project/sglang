@@ -200,6 +200,27 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
 
 
 class TestGetHashStr(unittest.TestCase):
+    def test_wide_tokens_preserve_page_chaining(self):
+        wide = (1 << 62) + 123
+        tokens = [1, 2, wide, 4, 5]
+        first = _legacy_get_hash_str(tokens[:2])
+        second = hashlib.sha256(
+            bytes.fromhex(first)
+            + b"\xff"
+            + wide.to_bytes(8, "little")
+            + (4).to_bytes(8, "little")
+        ).hexdigest()
+        expected = [first, second, _legacy_get_hash_str([5], second)]
+        for values in (tokens, array("q", tokens), array("Q", tokens)):
+            self.assertEqual(get_hash_str(values, page_size=2), expected)
+            self.assertEqual(get_hash_str(values[2:4], first), second)
+        self.assertNotEqual(get_hash_str([wide]), get_hash_str([wide & 0xFFFFFFFF]))
+        self.assertEqual(get_hash_str([(1, wide)]), get_hash_str([1, wide]))
+        self.assertEqual(
+            get_hash_str(_HashKey(array("q", [1, wide, 2]), is_bigram=True)),
+            get_hash_str([(1, wide), (wide, 2)]),
+        )
+
     def test_hash_str_matches_pre_optimization_per_token_loop(self):
         for name, tokens, prior_hash in _single_hash_compatibility_cases():
             with self.subTest(name=name):

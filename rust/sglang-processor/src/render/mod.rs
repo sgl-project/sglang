@@ -4,20 +4,30 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt};
+use dynamo_renderer::deepseek::common::tokens;
+use dynamo_renderer::kimi_k3::KimiK3Formatter;
+use dynamo_renderer::{
+    OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt, RenderedSegment,
+};
 use serde_json::Value;
 use thiserror::Error;
 
 mod legacy;
 mod loader;
 mod models;
+mod reasoning;
 mod selection;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
-use self::models::{deep_sort, dynamo_reasoning_effort, encode_tools_to_typescript};
+use self::models::{
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
+    render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3, render_qwen38,
+    takes_content_parts,
+};
+pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
 
@@ -40,10 +50,19 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
-    DeepSeekV4 {
+    DeepSeekV4(DeepSeekV4Profile),
+    DeepSeekV41,
+    /// GLM-5.3's Jinja template, which `render_request` renders as SGLang does.
+    Glm53(PromptFormatter),
+    /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
+    /// semantics, while [`Self::render_request`] follows SGLang's.
+    KimiK3,
+    /// Qwen3.8's Jinja template, which `render_request` renders as SGLang does.
+    Qwen38 {
         formatter: PromptFormatter,
-        profile: DeepSeekV4Profile,
-        environment_effort: Option<String>,
+        thinking: ThinkingTemplates,
+        /// SGLang hands the template content parts lists rather than strings.
+        content_parts: bool,
     },
     Legacy(Box<LegacyFormatter>),
 }
@@ -62,7 +81,9 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. } => render_oai(formatter, request),
+            ChatFormatter::HuggingFace { formatter, .. }
+            | ChatFormatter::Glm53(formatter)
+            | ChatFormatter::Qwen38 { formatter, .. } => render_oai(formatter, request),
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
                 if let Some(tools) = request.tools() {
@@ -80,25 +101,74 @@ impl ChatFormatter {
                 }
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
-            ChatFormatter::DeepSeekV4 {
-                formatter,
-                profile,
-                environment_effort,
-            } => {
-                let mut args = request.chat_template_args().cloned().unwrap_or_default();
-                let requested = args
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .or(environment_effort.as_deref());
-                let mapped = dynamo_reasoning_effort(*profile, requested);
-                let thinking =
-                    dynamo_renderer::thinking_bool_from_args(Some(&args)).unwrap_or(false);
-                args.insert("thinking".into(), Value::Bool(thinking));
-                args.insert("reasoning_effort".into(), Value::String(mapped.into()));
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+            ChatFormatter::KimiK3 => {
+                KimiK3Formatter::new(true)
+                    .render_prompt(request)
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
+                // Typed messages serialize straight to JSON, skipping minijinja.
+                let messages = match request.typed_messages() {
+                    Some(messages) => serde_json::to_value(messages),
+                    None => serde_json::to_value(request.messages()),
+                }
+                .map_err(|error| TemplateError::Renderer {
+                    message: format!("failed to serialize messages: {error}"),
+                })?;
+                let mut body = serde_json::json!({
+                    "tools": request.tools(),
+                    "reasoning_effort": request.reasoning_effort(),
+                    "chat_template_kwargs": request.chat_template_args(),
+                    "continue_final_message": !request.should_add_generation_prompt(),
+                });
+                body["messages"] = messages;
+                let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
+                let prompt = prompt.into_text();
+                // SGLang tokenizes the prefix on its own and drops its leading BOS.
+                let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
+                if prefix.is_empty() {
+                    return Ok(RenderedPrompt::text(prompt));
+                }
+                Ok(RenderedPrompt::segmented(vec![
+                    RenderedSegment::new(prompt, true),
+                    RenderedSegment::new(prefix, true),
+                ]))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
+    }
+
+    /// Render an SGLang chat request body under the server's default
+    /// `chat_template_kwargs`, returning the prompt and the
+    /// `continue_final_message` prefix SGLang tokenizes separately.
+    /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
+    /// this way; others use [`Self::render_prompt`].
+    pub fn render_request(
+        &self,
+        request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Result<(RenderedPrompt, String), TemplateError> {
+        let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
+        match self {
+            ChatFormatter::DeepSeekV4(profile) => {
+                render_deepseek_v4(*profile, request, default_kwargs).map(text)
+            }
+            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs).map(text),
+            ChatFormatter::Glm53(formatter) => {
+                render_glm53(formatter, request, default_kwargs).map(text)
+            }
+            ChatFormatter::KimiK3 => render_kimi_k3(request, default_kwargs),
+            ChatFormatter::Qwen38 {
+                formatter,
+                content_parts,
+                ..
+            } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
+            _ => Err("this formatter renders through render_prompt".into()),
+        }
+        .map_err(|message| TemplateError::Renderer { message })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -109,9 +179,25 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
-            | ChatFormatter::DeepSeekV4 { .. } => None,
+            | ChatFormatter::DeepSeekV4(_)
+            | ChatFormatter::DeepSeekV41
+            | ChatFormatter::Glm53(_)
+            | ChatFormatter::KimiK3
+            | ChatFormatter::Qwen38 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
+    }
+
+    /// Whether the template always reasons, as `template_detection` resolves
+    /// GLM-5.3's (`glm53_always_think`).
+    pub fn always_thinks(&self) -> bool {
+        matches!(self, ChatFormatter::Glm53(_))
+    }
+
+    /// The template's reasoning toggle kwarg and its default, as
+    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`).
+    pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
+        matches!(self, ChatFormatter::Qwen38 { .. }).then_some(("enable_thinking", true))
     }
 
     /// Resolve the template's effective thinking mode and materialize its
@@ -124,16 +210,24 @@ impl ChatFormatter {
     ) -> Option<bool> {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
-            | ChatFormatter::KimiK25 { thinking, .. } => thinking
+            | ChatFormatter::KimiK25 { thinking, .. }
+            | ChatFormatter::Qwen38 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4 { .. } => {
-                let enabled =
-                    dynamo_renderer::thinking_bool_from_args(args.as_ref()).unwrap_or(false);
+            ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
+                .for_request(tools_enabled)
+                .apply(args, named_tool_choice),
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
+                let enabled = deepseek_v4_thinking(
+                    &serde_json::json!({ "chat_template_kwargs": args }),
+                    &HashMap::new(),
+                );
                 args.get_or_insert_default()
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)
             }
+            // `template_detection`'s `glm53_always_think`.
+            ChatFormatter::Glm53(_) => Some(true),
             ChatFormatter::Legacy(_) => None,
         }
     }

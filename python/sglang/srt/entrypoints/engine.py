@@ -66,6 +66,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
+    run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
@@ -124,6 +125,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -163,6 +165,10 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
+
+
+def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
+    return redact_watermark_secrets(server_args.resolved_dict())
 
 
 @dataclasses.dataclass
@@ -290,10 +296,14 @@ class Engine(EngineScoreMixin, EngineBase):
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                "Engine("
+                + ", ".join(
+                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                )
+                + ")",
             )
         self.server_args = server_args
-        logger.info(f"server_args={server_args.resolved_dict()}")
+        logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -895,8 +905,15 @@ class Engine(EngineScoreMixin, EngineBase):
         use_dp_controller = (
             get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
         )
+        prelaunch_dp_schedulers = (
+            use_dp_controller
+            and get_parallel().attn_dp_enabled
+            and get_exec().moe.elastic_ep_backend is None
+            and not get_exec().moe.is_ep_joiner
+        )
+        prelaunched_schedulers = {}
 
-        if not use_dp_controller:
+        if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=get_exec().features.enable_memory_saver
@@ -909,7 +926,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
+                    reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
                     gpu_id = (
                         get_device().base_gpu_id
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
@@ -917,9 +934,12 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                        if prelaunch_dp_schedulers:
+                            target = run_scheduler_process_with_init_pipe
+                            args = (run_scheduler_process_func, writer)
+                        else:
+                            target = run_scheduler_process_func
+                            args = (
                                 server_args,
                                 port_args,
                                 gpu_id,
@@ -927,8 +947,8 @@ class Engine(EngineScoreMixin, EngineBase):
                                 pp_rank,
                                 None,
                                 writer,
-                            ),
-                        )
+                            )
+                        proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
@@ -936,8 +956,13 @@ class Engine(EngineScoreMixin, EngineBase):
                             proc.start()
 
                     scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
-        else:
+                    if prelaunch_dp_schedulers:
+                        prelaunched_schedulers[pp_rank, tp_rank] = (proc.pid, reader)
+                        writer.close()
+                    else:
+                        scheduler_pipe_readers.append(reader)
+
+        if use_dp_controller:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
@@ -948,10 +973,15 @@ class Engine(EngineScoreMixin, EngineBase):
                     port_args=port_args,
                     pipe_writer=writer,
                     run_scheduler_process_func=run_scheduler_process_func,
+                    prelaunched_schedulers=prelaunched_schedulers or None,
                 ),
             )
-            proc.start()
-            scheduler_procs.append(proc)
+            try:
+                proc.start()
+            finally:
+                for _, init_pipe in prelaunched_schedulers.values():
+                    init_pipe.close()
+            scheduler_procs.insert(0, proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
@@ -970,18 +1000,26 @@ class Engine(EngineScoreMixin, EngineBase):
                     key=lambda source: source["dp_rank"],
                 )
             scheduler_infos.extend(infos)
-            if use_dp_controller:
+            if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def block_until_scheduler_exits():
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} "
-                    f"terminated with {proc.exitcode}"
-                )
+            watchdog = None
+            if prelaunch_dp_schedulers and get_parallel().node_rank > 0:
+                watchdog = SubprocessWatchdog(scheduler_procs)
+                watchdog.start()
+            try:
+                for proc in scheduler_procs:
+                    proc.join()
+                    logger.error(
+                        f"Scheduler or DataParallelController {proc.pid} "
+                        f"terminated with {proc.exitcode}"
+                    )
+            finally:
+                if watchdog is not None:
+                    watchdog.stop()
 
         return (
             SchedulerInitResult(
@@ -1043,6 +1081,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(worker_ipc_names, server_args, port_args),
+            kwargs={"enable_metrics": get_observability().enable_metrics},
         )
         router_proc.start()
         processes.append(router_proc)
@@ -1118,11 +1157,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
-        parsers = resolving_view(server_args)
-        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-            resolve_auto_parsers(server_args)
+        # Architecture defaults and template auto-detection must run before
+        # publication; plugins may register parsers used by either path.
+        resolve_auto_parsers(server_args)
 
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
@@ -1138,7 +1175,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={server_args.resolved_dict()}")
+            logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
@@ -1522,14 +1559,16 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         return msgspec_to_builtins(
-            {
-                **self.tokenizer_manager.server_args.resolved_dict(),
-                "launch_command": self.tokenizer_manager.server_args.launch_command,
-                **self._scheduler_init_result.scheduler_infos[0],
-                "startup_time": self.tokenizer_manager.startup_time,
-                "internal_states": internal_states,
-                "version": __version__,
-            }
+            redact_watermark_secrets(
+                {
+                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    "launch_command": self.tokenizer_manager.server_args.launch_command,
+                    **self._scheduler_init_result.scheduler_infos[0],
+                    "startup_time": self.tokenizer_manager.startup_time,
+                    "internal_states": internal_states,
+                    "version": __version__,
+                }
+            )
         )
 
     def get_model_info(self):
@@ -1882,7 +1921,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.0.post1",
+                "0.7.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

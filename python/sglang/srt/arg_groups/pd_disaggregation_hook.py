@@ -65,7 +65,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         raise ValueError(
             "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
         )
-    if cfg.disaggregation_decode_host_receive_threshold > 0:
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
         if cfg.enable_hisparse or cfg.enable_pd_role_switch:
             raise ValueError(
                 "Decode host receive does not yet support HiSparse or role switching"
@@ -85,12 +85,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "mori",
             "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, mori, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
@@ -106,13 +107,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
-                )
-
             if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
@@ -130,7 +124,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "handle_pd_disaggregation",
                 disable_radix_cache=True,
             )
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            logger.warning("Radix cache is disabled for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the
@@ -139,7 +133,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
             if cfg.max_running_requests is not None:
-                per_worker = cfg.max_running_requests // num_dp_ranks_of(cfg)
+                per_worker = max(1, cfg.max_running_requests // num_dp_ranks_of(cfg))
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
             declare_resolution(
@@ -221,7 +215,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("encoder disaggregation")
     if cfg.enable_hisparse:
         unsupported.append("HiSparse")
-    if cfg.disaggregation_decode_host_receive_threshold > 0:
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
         unsupported.append("decode host KV buffering")
     if cfg.disaggregation_mode == "decode" and (
         cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
@@ -356,9 +350,20 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "MuseSparkForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MuseSpark."
+        )
+
+    if (
+        model_arch == "MuseSparkForConditionalGeneration"
+        and cfg.language_only
+        and cfg.enable_adaptive_dispatch_to_encoder
+    ):
+        raise ValueError(
+            "Muse language-only servers do not load local encoders; "
+            "--enable-adaptive-dispatch-to-encoder is not supported."
         )

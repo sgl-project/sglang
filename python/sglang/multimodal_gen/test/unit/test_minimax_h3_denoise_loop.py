@@ -11,10 +11,6 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
-    _minimax_h3_euler_eta0_step,
-    _minimax_h3_rf_v_to_x0,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
@@ -30,6 +26,40 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _build_cube_attn_metadata,
     _precompute_refined_prompt_embeds,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
+
+
+def _minimax_h3_rf_v_to_x0(
+    xt: torch.Tensor,
+    v: torch.Tensor,
+    timestep: torch.Tensor,
+) -> torch.Tensor:
+    cond_t = timestep.to(device=xt.device, dtype=xt.dtype)
+    while cond_t.ndim < xt.ndim:
+        cond_t = cond_t.unsqueeze(-1)
+    sigma_t = 1 - cond_t
+    return xt + sigma_t * v
+
+
+def _minimax_h3_euler_eta0_step(
+    state: torch.Tensor,
+    denoised: torch.Tensor,
+    *,
+    sigma_curr: float,
+    sigma_ratio: torch.Tensor,
+) -> torch.Tensor:
+    if sigma_curr == 0.0:
+        return state
+    compute_dtype = torch.float32
+    if state.dtype not in (torch.float16, torch.bfloat16):
+        compute_dtype = state.dtype
+    ratio = sigma_ratio.to(device=state.device, dtype=compute_dtype)
+    out = ratio * state.to(dtype=compute_dtype) + (1.0 - ratio) * denoised.to(
+        dtype=compute_dtype
+    )
+    return out.to(dtype=state.dtype)
 
 
 def _branch(
@@ -62,6 +92,32 @@ def _branch(
         token_tags=packed["token_tags"] if token_tags is None else token_tags,
         device=torch.device("cpu"),
     )
+
+
+def test_time_shift_sigmas_build_exact_denoise_step_count():
+    for num_steps in (1, 2, 10, 50):
+        for shift_scale in (3.0, 12.0):
+            sigmas = minimax_h3_time_shift_sigmas(
+                num_steps=num_steps,
+                shift_scale=shift_scale,
+            )
+
+            assert len(sigmas) == num_steps + 1
+            assert sigmas[0] == 1.0
+            assert sigmas[-1] == 0.0
+            assert all(
+                current > following for current, following in zip(sigmas, sigmas[1:])
+            )
+            # Independent closed form for N Euler intervals, including sigma=0.
+            expected = [
+                shift_scale
+                * (num_steps - i)
+                / (num_steps + (shift_scale - 1) * (num_steps - i))
+                for i in range(num_steps + 1)
+            ]
+            torch.testing.assert_close(
+                torch.tensor(sigmas), torch.tensor(expected), rtol=0, atol=2e-7
+            )
 
 
 def test_precomputed_timestep_plan_matches_full_unique_reference():
@@ -137,7 +193,6 @@ def test_inplace_target_update_matches_scheduler_math():
             state,
             denoised,
             sigma_curr=sigma_curr,
-            sigma_next=sigma_next,
             sigma_ratio=ratio,
         )
 
