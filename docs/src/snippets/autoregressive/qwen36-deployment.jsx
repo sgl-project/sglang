@@ -38,16 +38,11 @@ export const Qwen36Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
-      // The Ascend NPU best-practice recipes cover BF16 for both sizes and W8A8
-      // (modelslim) for the 27B dense variant.
+      // Ascend NPU deployment offers BF16 for both model sizes.
       // RTX Spark only has a validated NVFP4 recipe (35B-A3B).
       getDynamicItems: (values) => {
         if (values.hardware === 'a3') {
-          const items = [{ id: 'bf16', label: 'BF16', default: true }];
-          if (values.modelSize === '27b') {
-            items.push({ id: 'w8a8', label: 'W8A8', default: false });
-          }
-          return items;
+          return [{ id: 'bf16', label: 'BF16', default: true }];
         }
         if (values.hardware === 'rtx-spark') {
           return [{ id: 'nvfp4', label: 'NVFP4', default: true }];
@@ -210,20 +205,13 @@ export const Qwen36Deployment = () => {
     // Atlas 800I A3 (Ascend NPU): PD-mixed single-node serving. Follows the
     // baseline settings in the Ascend NPU tutorials — ascend attention
     // backend, bfloat16 mamba state, NEXTN speculative decoding on the built-in
-    // MTP weights, and modelslim W8A8 checkpoints for the 27B dense variant.
+    // MTP weights, with BF16 checkpoints for both model sizes.
     if (hardware === 'a3') {
       const cards = Number(values.npuCards) || 1;
-      const modelName = quantization === 'w8a8'
-        ? `Eco-Tech/Qwen3.6-${sizeConfig.baseName}-w8a8`
-        : `Qwen/Qwen3.6-${sizeConfig.baseName}`;
-      // Resolve the Eco-Tech checkpoint from its documented ModelScope source.
-      const envPrefix = quantization === 'w8a8' ? 'SGLANG_USE_MODELSCOPE=1 ' : '';
-      let cmd = `${envPrefix}sglang serve --model-path ${modelName}`;
+      const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}`;
+      let cmd = `sglang serve --model-path ${modelName}`;
       cmd += ` \\\n  --tp-size ${cards * 2} --nnodes 1`;
       cmd += ` \\\n  --attention-backend ascend --device npu`;
-      if (quantization === 'w8a8') {
-        cmd += ` \\\n  --quantization modelslim`;
-      }
       const reasoningRule = options.reasoning.commandRule(values.reasoning, values);
       if (reasoningRule) cmd += ` \\\n  ${reasoningRule}`;
       const toolcallRule = options.toolcall.commandRule(values.toolcall, values);
