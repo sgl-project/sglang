@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEn
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
-    _pool_suffix_overrides,
+    _pool_suffixes,
     _PoolRangePlan,
     _storage_suffix,
 )
@@ -69,14 +69,13 @@ class TestStorageSuffix(CustomTestCase):
         }
         storage = UMBPStore.__new__(UMBPStore)
         storage.registered_pools = pools
-        storage.mla_suffix = storage.mha_suffix = "tp3_cp1_pp2"
         storage.is_mla_backend = True
         storage.config_prefix = None
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
         linker.storage = storage
         linker.pools = pools
-        linker._pool_suffix_overrides = _pool_suffix_overrides(
-            pools.values(), attn_cp_rank=1, pp_rank=2
+        linker._pool_suffixes = _pool_suffixes(
+            pools.values(), rank_replicated=False, tp_rank=3, attn_cp_rank=1, pp_rank=2
         )
         for name, key in (
             (PoolName.KV, "page_tp0_cp1_pp2_kv"),

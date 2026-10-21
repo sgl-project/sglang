@@ -58,18 +58,19 @@ def _storage_suffix(
     return "_".join(parts)
 
 
-def _pool_suffix_overrides(
-    entries, *, attn_cp_rank: int, pp_rank: int
+def _pool_suffixes(
+    entries, *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
 ) -> dict[PoolName, str]:
+    # A pool that declares a shard is keyed by it instead of this rank, so
+    # every rank holding that shard names the same objects.
     return {
         entry.name: _storage_suffix(
-            rank_replicated=False,
-            tp_rank=entry.shard,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank if entry.shard is None else entry.shard,
             attn_cp_rank=attn_cp_rank,
             pp_rank=pp_rank,
         )
         for entry in entries
-        if entry.shard is not None
     }
 
 
@@ -347,8 +348,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
-            self._pool_suffix_overrides = _pool_suffix_overrides(
+            self._pool_suffixes = _pool_suffixes(
                 self.pool_group.entries,
+                rank_replicated=rank_replicated,
+                tp_rank=tp_rank,
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
             )
@@ -425,7 +428,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
             page_keys,
             transfer,
-            rank_suffix=self._pool_suffix_overrides.get(transfer.name),
+            rank_suffix=self._pool_suffixes[transfer.name],
         )
         entry = self.pools[transfer.name]
         # One key names one stored object, and a packed entry stores a whole

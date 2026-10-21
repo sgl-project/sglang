@@ -42,8 +42,8 @@ class DevicePoolEntry:
         self.page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
-        # Ranks that declare the same shard hold identical objects; None means
-        # every rank holds its own.
+        # Ranks that declare the same shard hold identical objects, e.g. ranks
+        # with the same DCP rank; None means every rank holds its own.
         self.shard = shard
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
