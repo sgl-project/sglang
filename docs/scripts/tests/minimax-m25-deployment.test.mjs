@@ -14,9 +14,9 @@ const { options, generateCommand, getInitialState, getUpdatedValues } = new Func
 const defaults = getInitialState();
 const build = (selection) => generateCommand({ ...defaults, ...selection });
 
-test('A2 exposes editable paths and hides controls that cannot change its tested configuration', () => {
+test('A2 exposes editable paths and hides A3-only fields', () => {
   assert.ok(options.hardware.items.some((item) => item.id === 'a2'));
-  for (const name of ['gpuCount', 'thinking', 'toolcall', 'ascendPreset', 'draftModelPath', 'networkInterface']) {
+  for (const name of ['ascendPreset', 'draftModelPath', 'networkInterface']) {
     assert.equal(options[name].condition({ hardware: 'a2' }), false, name);
   }
   for (const name of ['modelPath', 'tokenizerPath']) {
@@ -80,11 +80,17 @@ test('the AMD two-GPU recipe remains reachable and keeps its AMD backends', () =
   assert.doesNotMatch(command, /ascend_fuseep|flashinfer/);
 });
 
-test('A3 can be selected and hides GPU-only count and parser toggles', () => {
-  assert.ok(options.hardware.items.some((item) => item.id === 'a3'));
-  for (const name of ['gpuCount', 'thinking', 'toolcall']) {
-    assert.equal(options[name].condition?.({ hardware: 'a3' }), false);
-    assert.notEqual(options[name].condition?.({ hardware: 'h200' }), false);
+test('NPU keeps shared rows visible with fixed values matching its command', () => {
+  for (const hardware of ['a2', 'a3']) {
+    const state = { ...defaults, hardware };
+    for (const [name, expected] of [['gpuCount', '8gpu'], ['thinking', 'enabled'], ['toolcall', 'enabled']]) {
+      assert.notEqual(options[name].condition?.(state), false);
+      assert.equal(options[name].getValue(state), expected);
+      assert.ok(options[name].getDynamicItems(state).every((item) => item.disabled));
+      const changed = getUpdatedValues(state, name, name === 'gpuCount' ? '2gpu' : 'disabled');
+      assert.equal(options[name].getValue(changed), expected);
+      assert.equal(generateCommand(changed), generateCommand(state));
+    }
   }
 });
 

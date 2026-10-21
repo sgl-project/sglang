@@ -1,5 +1,10 @@
 export const MiniMaxM25Deployment = () => {
   const modelFamily = 'MiniMaxAI';
+  const isAscend = (values) => values.hardware === 'a2' || values.hardware === 'a3';
+  const parserItems = (values) => [
+    { id: 'disabled', label: 'Disabled', default: true, disabled: isAscend(values) },
+    { id: 'enabled', label: 'Enabled', default: false, disabled: isAscend(values) }
+  ];
 
   const options = {
     hardware: {
@@ -14,14 +19,20 @@ export const MiniMaxM25Deployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'a2', label: 'Ascend A2', description: '8 × 910B4 / 32 GiB per device. The fixed single-request configuration is smoke tested.', default: false },
-        { id: 'a3', label: 'Ascend A3', description: 'Reference configuration only. A3 hardware validation is pending.', default: false }
+        { id: 'a3', label: 'Ascend A3', description: '8 cards / 16 dies · W8A8 + EAGLE3. Reference configuration only; A3 hardware validation is pending.', default: false }
       ]
     },
     gpuCount: {
       name: 'gpuCount',
       title: 'GPU Count',
-      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
+      getTitle: (values) => isAscend(values) ? 'NPU Card Count' : 'GPU Count',
+      getValue: (values) => isAscend(values) ? '8gpu' : values.gpuCount,
       getDynamicItems: (values) => {
+        if (isAscend(values)) return [
+          { id: '2gpu', label: '2', disabled: true },
+          { id: '4gpu', label: '4', disabled: true },
+          { id: '8gpu', label: '8', disabled: true }
+        ];
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
         return [
           {
@@ -48,7 +59,8 @@ export const MiniMaxM25Deployment = () => {
     thinking: {
       name: 'thinking',
       title: 'Thinking Capabilities',
-      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
+      getValue: (values) => isAscend(values) ? 'enabled' : values.thinking,
+      getDynamicItems: parserItems,
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -58,7 +70,8 @@ export const MiniMaxM25Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
-      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
+      getValue: (values) => isAscend(values) ? 'enabled' : values.toolcall,
+      getDynamicItems: parserItems,
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -68,7 +81,7 @@ export const MiniMaxM25Deployment = () => {
     ascendPreset: {
       name: 'ascendPreset',
       title: 'A3 Configuration',
-      condition: (values) => values.hardware === 'a3',
+      condition: () => false,
       items: [
         {
           id: '8p-in3k5-out1k5',
@@ -313,6 +326,7 @@ export const MiniMaxM25Deployment = () => {
   };
 
   const getUpdatedValues = (previous, optionName, value) => {
+    if (isAscend(previous) && ['gpuCount', 'thinking', 'toolcall'].includes(optionName)) return previous;
     const next = { ...previous, [optionName]: value };
     if (optionName === 'hardware' && value !== 'a3' && value !== 'a2') {
       const items = options.gpuCount.getDynamicItems(next);
@@ -480,115 +494,134 @@ export const MiniMaxM25Deployment = () => {
     border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`,
   };
 
+  const renderOption = ([key, option]) => {
+    if (option.condition && !option.condition(values)) {
+      return null;
+    }
+    const items = option.getDynamicItems ? option.getDynamicItems(values) : option.items || [];
+    const selectedValue = option.getValue ? option.getValue(values) : values[option.name];
+    const title = option.getTitle ? option.getTitle(values) : option.title;
+    const description = items.find((item) => item.id === selectedValue)?.description;
+    return (
+      <div key={key} style={cardStyle}>
+        <div style={titleStyle}>{title}</div>
+        <div style={itemsStyle}>
+          {option.type === 'text' ? (
+            <input
+              type="text"
+              aria-label={title}
+              value={values[option.name] || ''}
+              placeholder={option.placeholder || ''}
+              onChange={(event) => handleTextChange(option.name, event.target.value)}
+              style={textInputStyle}
+            />
+          ) : option.type === 'checkbox' ? (
+            (option.items || []).map((item) => {
+              const isChecked = (values[option.name] || []).includes(item.id);
+              const isDisabled =
+                item.required ||
+                (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
+              return (
+                <label
+                  key={item.id}
+                  title={item.disabledReason || ''}
+                  style={{
+                    ...labelBaseStyle,
+                    ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
+                    ...(isChecked ? checkedStyle : {}),
+                    ...(isDisabled ? disabledStyle : {}),
+                    ...(isDisabled && isChecked ? { opacity: 1 } : {}),
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    disabled={isDisabled}
+                    onChange={(event) =>
+                      handleCheckboxChange(option.name, item.id, event.target.checked)
+                    }
+                    style={{ display: 'none' }}
+                  />
+                  {item.label}
+                  {item.subtitle && (
+                    <small
+                      style={{
+                        ...subtitleStyle,
+                        color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
+                      }}
+                    >
+                      {item.subtitle}
+                    </small>
+                  )}
+                </label>
+              );
+            })
+          ) : (
+            items.map((item) => {
+              const isChecked = selectedValue === item.id;
+              const isDisabled = Boolean(item.disabled);
+              return (
+                <label
+                  key={item.id}
+                  title={item.disabledReason || ''}
+                  style={{
+                    ...labelBaseStyle,
+                    ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
+                    ...(isChecked ? checkedStyle : {}),
+                    ...(isDisabled ? disabledStyle : {}),
+                    ...(isDisabled && isChecked ? { opacity: 1 } : {}),
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name={option.name}
+                    value={item.id}
+                    checked={isChecked}
+                    disabled={isDisabled}
+                    onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
+                    style={{ display: 'none' }}
+                  />
+                  {item.label}
+                  {item.subtitle && (
+                    <small
+                      style={{
+                        ...subtitleStyle,
+                        color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
+                      }}
+                    >
+                      {item.subtitle}
+                    </small>
+                  )}
+                </label>
+              );
+            })
+          )}
+          {description && (
+            <p style={{ margin: '4px 0 0', flexBasis: '100%', fontSize: '12px', lineHeight: '1.5', color: isDark ? '#d1d5db' : '#4b5563' }}>
+              {description}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => {
-        if (option.condition && !option.condition(values)) {
-          return null;
-        }
-        const items = option.getDynamicItems ? option.getDynamicItems(values) : option.items || [];
-        const description = items.find((item) => item.id === values[option.name])?.description;
-        return (
-          <div key={key} style={cardStyle}>
-            <div style={titleStyle}>{option.title}</div>
-            <div style={itemsStyle}>
-              {option.type === 'text' ? (
-                <input
-                  type="text"
-                  aria-label={option.title}
-                  value={values[option.name] || ''}
-                  placeholder={option.placeholder || ''}
-                  onChange={(event) => handleTextChange(option.name, event.target.value)}
-                  style={textInputStyle}
-                />
-              ) : option.type === 'checkbox' ? (
-                (option.items || []).map((item) => {
-                  const isChecked = (values[option.name] || []).includes(item.id);
-                  const isDisabled =
-                    item.required ||
-                    (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
-                  return (
-                    <label
-                      key={item.id}
-                      title={item.disabledReason || ''}
-                      style={{
-                        ...labelBaseStyle,
-                        ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
-                        ...(isChecked ? checkedStyle : {}),
-                        ...(isDisabled ? disabledStyle : {}),
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        disabled={isDisabled}
-                        onChange={(event) =>
-                          handleCheckboxChange(option.name, item.id, event.target.checked)
-                        }
-                        style={{ display: 'none' }}
-                      />
-                      {item.label}
-                      {item.subtitle && (
-                        <small
-                          style={{
-                            ...subtitleStyle,
-                            color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
-                          }}
-                        >
-                          {item.subtitle}
-                        </small>
-                      )}
-                    </label>
-                  );
-                })
-              ) : (
-                items.map((item) => {
-                  const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
-                  return (
-                    <label
-                      key={item.id}
-                      title={item.disabledReason || ''}
-                      style={{
-                        ...labelBaseStyle,
-                        ...(key === 'hardware' ? { flex: '0 0 auto', whiteSpace: 'nowrap' } : {}),
-                        ...(isChecked ? checkedStyle : {}),
-                        ...(isDisabled ? disabledStyle : {}),
-                      }}
-                    >
-                      <input
-                        type="radio"
-                        name={option.name}
-                        value={item.id}
-                        checked={isChecked}
-                        disabled={isDisabled}
-                        onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
-                        style={{ display: 'none' }}
-                      />
-                      {item.label}
-                      {item.subtitle && (
-                        <small
-                          style={{
-                            ...subtitleStyle,
-                            color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
-                          }}
-                        >
-                          {item.subtitle}
-                        </small>
-                      )}
-                    </label>
-                  );
-                })
-              )}
-              {description && (
-                <p style={{ margin: '4px 0 0', flexBasis: '100%', fontSize: '12px', lineHeight: '1.5', color: isDark ? '#d1d5db' : '#4b5563' }}>
-                  {description}
-                </p>
-              )}
+      {Object.entries(options).filter(([, option]) => option.type !== 'text').map(renderOption)}
+      {isAscend(values) && (
+        <>
+          <p style={{ margin: '4px 12px', fontSize: '12px', lineHeight: '1.5' }}>
+            Card count and parsers are fixed by this preset. Enabled indicates parser configuration; tool calling has not been validated.
+          </p>
+          <details style={{ ...cardStyle, display: 'block' }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 600 }}>Deployment paths{values.hardware === 'a3' ? ' and network' : ''}</summary>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '8px' }}>
+              {Object.entries(options).filter(([, option]) => option.type === 'text').map(renderOption)}
             </div>
-          </div>
-        );
-      })}
+          </details>
+        </>
+      )}
       <div style={{ ...cardStyle, flexDirection: 'column', alignItems: 'stretch' }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
           <div style={titleStyle}>Run this Command:</div>

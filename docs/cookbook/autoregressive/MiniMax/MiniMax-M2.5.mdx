@@ -98,7 +98,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Select your hardware to generate the deployment command. For **Ascend A2**, complete the A2 prerequisites and enter the model and tokenizer directories; the command reproduces the tested single-request settings on port 31216. For **Ascend A3**, complete its separate prerequisites, enter both model directories as absolute paths inside the container, and set the HCCL / Gloo interface. The unvalidated A3 preset uses 3,500 input and 1,500 output tokens as its reference workload.
+**Interactive Command Generator**: Select your hardware to generate the deployment command. For **Ascend A2**, complete the A2 prerequisites, expand **Deployment paths**, and enter the model and tokenizer directories; the command reproduces the tested single-request settings on port 31216. For **Ascend A3**, complete its separate prerequisites, expand **Deployment paths and network**, enter both model directories as absolute paths inside the container, and set the HCCL / Gloo interface. The unvalidated A3 preset uses 3,500 input and 1,500 output tokens as its reference workload.
 
 <MiniMaxM25Deployment />
 
@@ -188,13 +188,13 @@ The generated A3 command follows the [8-card throughput reference](/docs/hardwar
 | NPU graph batches | `--cuda-graph-bs-decode 1 2 4 8 12 16 20` | Set capture sizes; the argument retains `cuda` in its name on NPU. |
 | API | `127.0.0.1:6688` | Send requests from the same host or container network. |
 
-The A3 preset fixes the reasoning parser to `minimax-append-think` and the tool parser to `minimax-m2`. It does not use the GPU count or parser toggles. To use fewer A3 cards or a different workload, follow the corresponding [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) with its complete configuration.
+The A3 preset fixes the reasoning parser to `minimax-append-think` and the tool parser to `minimax-m2`. The shared form displays a fixed 8-card count and enabled parsers; these controls are read-only for this preset. To use fewer A3 cards or a different workload, follow the corresponding [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) with its complete configuration.
 
 ### 3.4 Ascend A2 configuration (smoke tested)
 
 The A2 selector fixes TP=8, ModelSlim quantization, BF16, `--context-length 4096`, and `--max-running-requests 1`. It uses prefill chunks of 128, maximum prefill tokens of 4096, static memory fraction 0.96, and `--max-total-tokens 4096`, and disables graph capture and radix cache. No EAGLE3 draft model is required.
 
-The `minimax` reasoning parser separated reasoning from answer content in the tested runtime. The `minimax-m2` tool-call parser is configured, but tool calling was not tested. GPU count and parser toggles do not apply to this preset. The final run allocated a **4096-token KV pool on all eight ranks** and completed a synthetic 3500-input/128-output request. This validates that request size on this allocation, not every workload up to the configured limit. See section 5.4 for the earlier capacity failure and the final measurements. GPQA accuracy, standardized throughput, and sustained stability remain unmeasured for this single-request preset; [section 5.5](#5-5-ascend-a2-performance-benchmark) reports synthetic performance measurements using a separate server configuration with concurrency up to 8.
+The `minimax` reasoning parser separated reasoning from answer content in the tested runtime. The `minimax-m2` tool-call parser is configured, but tool calling was not tested. The shared form displays a fixed 8-card count and enabled parsers; these controls are read-only for this preset. The final run allocated a **4096-token KV pool on all eight ranks** and completed a synthetic 3500-input/128-output request. This validates that request size on this allocation, not every workload up to the configured limit. See section 5.4 for the earlier capacity failure and the final measurements. GPQA accuracy, standardized throughput, and sustained stability remain unmeasured for this single-request preset; [section 5.5](#5-5-ascend-a2-performance-benchmark) reports synthetic performance measurements using a separate server configuration with concurrency up to 8.
 
 ## 4. Model Invocation
 
