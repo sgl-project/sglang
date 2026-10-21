@@ -176,9 +176,8 @@ class Grok1MoE(nn.Module):
     def _custom_routing_function_cpu(
         self, hidden_states, gating_output, topk, renormalize
     ):
-        # keep same with `fused_moe_router_shim` triton behavior
-        assert not renormalize
-        return torch.ops.sgl_kernel.fused_moe_router_shim_cpu(
+        assert not renormalize  # same with `fused_moe_router` triton behavior
+        return torch.ops.sgl_kernel.fused_moe_router_cpu(
             hidden_states,
             gating_output,
             topk,

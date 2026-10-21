@@ -417,7 +417,7 @@ def register_fake_ops(tp_size: int):
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
-    @register_cpu_compile_fake("fused_moe_router_shim_cpu")
+    @register_cpu_compile_fake("fused_moe_router_cpu")
     def _(
         hidden_states,
         gating_output,

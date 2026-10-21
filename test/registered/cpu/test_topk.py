@@ -409,7 +409,7 @@ class TestCustomTopK(CustomTestCase):
         )
         torch.testing.assert_close(topk_weights, expected_weights, atol=1e-5, rtol=1e-5)
 
-    def test_fused_moe_router_shim_cpu(self):
+    def test_fused_moe_router_cpu(self):
         for (
             num_tokens,
             hidden_dim,
@@ -446,7 +446,7 @@ class TestCustomTopK(CustomTestCase):
                 torch.softmax(logits, dim=-1), topk, dim=-1
             )
 
-            out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_shim_cpu(
+            out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_cpu(
                 hidden_states=hidden_states,
                 gating_output=router_weight,
                 topk=topk,

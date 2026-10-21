@@ -224,7 +224,7 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
     int64_t topk,
     bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
-std::tuple<at::Tensor, at::Tensor> fused_moe_router_shim_cpu(
+std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
@@ -800,9 +800,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
-      "fused_moe_router_shim_cpu(Tensor hidden_states, Tensor gating_output, int topk, float moe_softcapping, "
+      "fused_moe_router_cpu(Tensor hidden_states, Tensor gating_output, int topk, float moe_softcapping, "
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
-  m.impl("fused_moe_router_shim_cpu", torch::kCPU, &fused_moe_router_shim_cpu);
+  m.impl("fused_moe_router_cpu", torch::kCPU, &fused_moe_router_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
       "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "
