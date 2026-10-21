@@ -81,6 +81,7 @@ from sglang.srt.layers.attention.graph_utils import (
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_gather_full_sequence_states,
@@ -4343,7 +4344,15 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
-                if not (
+                if cp_extend:
+                    # MoE consumes rank-major IDs, so rebuild them from the
+                    # compact local tail rather than indexing the full gather.
+                    input_ids_global = (
+                        attn_cp_interleave_gather(input_ids[:, None]).squeeze(-1)
+                        if get_moe_a2a_backend().is_none()
+                        else input_ids
+                    )
+                elif not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
                     input_ids_global = tail.rows(input_ids_global)
