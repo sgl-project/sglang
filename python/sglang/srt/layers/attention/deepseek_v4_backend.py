@@ -3271,31 +3271,14 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
-        # The per-DP batch width is padded up to attn_tp_size before the forward
-        # (prepare_mlp_sync_batch), so an eager `positions` can carry trailing
-        # pad rows while `extend_seq_lens` only covers the live tokens. The
-        # compressor/indexer rebuild per-token request ids from those lengths
-        # (`repeat_interleave(..., output_size=positions.shape[0])`), which needs
-        # the two to agree, so run them over the live prefix and let the
-        # existing pad masks drop the remaining rows.
-        in_prefill_graph = self._low_ratio_in_prefill_graph()
-        if (
-            forward_batch.forward_mode.is_extend()
-            and not in_prefill_graph
-            and not (
-                isinstance(meta, DSV4Metadata) and meta.late_layer_tail is not None
-            )
-            and forward_batch.extend_seq_lens_cpu is not None
-            and x.shape[0] == positions.shape[0]
-        ):
-            live_tokens = sum(int(n) for n in forward_batch.extend_seq_lens_cpu)
-            if 0 <= live_tokens < positions.shape[0]:
-                x = x[:live_tokens]
-                if q_lora is not None:
-                    q_lora = q_lora[:live_tokens]
-                positions = positions[:live_tokens]
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
+            # DP attention pads an eager extend past the rows extend_seq_lens cover.
+            num_real = hoisted_pos.shape[0]
+            x, positions = x[:num_real], positions[:num_real]
+            if q_lora is not None:
+                q_lora = q_lora[:num_real]
         if (
             hoisted_req is not None
             and hoisted_pos is not None
@@ -3307,7 +3290,10 @@ class DeepseekV4AttnBackend(
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
-        if forward_batch.forward_mode.is_extend() and in_prefill_graph:
+        if (
+            forward_batch.forward_mode.is_extend()
+            and self._low_ratio_in_prefill_graph()
+        ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
             two_level = self._prefill_graph_two_level()
             captured_index = (
