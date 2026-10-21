@@ -313,9 +313,12 @@ You can enable it in any of the three supported configuration methods:
 Use `replica_num` and `dfs_replica_num` in
 `--hicache-storage-backend-extra-config` to control the number of memory and
 descriptor-based DFS replicas created for each HiCache object. The defaults are
-`1` and `0`, respectively. Mooncake currently supports at most one DFS replica,
-and a DFS replica must be accompanied by at least one memory replica. The
-following example uses the default embedded Real Client mode:
+`1` and `0`, respectively. `replica_num` must be non-negative,
+`dfs_replica_num` must be `0` or `1`, and at least one replica is required.
+DFS-only placement (`replica_num=0`, `dfs_replica_num=1`) requires a Mooncake
+version that includes [DFS-only replica support](https://github.com/kvcache-ai/Mooncake/pull/4637).
+The following example uses one memory replica and one DFS replica in the
+default embedded Real Client mode:
 
 ```bash
 python -m sglang.launch_server \
@@ -346,6 +349,45 @@ layout,
 `dfs_replica_num`, `standalone_storage=true`, and `client_server_address`; the
 Dummy Client forwards the request-level replica configuration to the external
 Real Client.
+
+For an embedded DFS-only client that contributes no memory segment, use:
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config \
+    '{"master_server_address":"127.0.0.1:50051","replica_num":0,"dfs_replica_num":1,"global_segment_size":0,"check_server":false,"local_buffer_size":"1gb","enable_ssd_offload":true,"ssd_offload_path":"/tmp/mooncake-file-storage"}'
+```
+
+The DFS environment and file-storage path requirements above still apply.
+When the deployment has no memory segments, set `check_server=false`: the
+segment-list readiness check cannot establish readiness from an empty list.
+The startup warmup instead writes and reads a test object using the requested
+replica placement. In standalone mode, also configure the external Real Client
+without memory segments if the entire deployment should be DFS-only.
+
+**Client Read Buffer (`local_buffer_size`):**
+
+Set `local_buffer_size` in `--hicache-storage-backend-extra-config` to size the
+Mooncake client's scratch buffer. It accepts a positive integer byte count, a
+string containing that count, or an integer GB string such as `"1gb"` (1 GiB).
+The default remains 16 MiB. This is a per-rank setting and is not divided by
+TP or PP size.
+
+In embedded mode, DFS and DISK reads stage data in this buffer before copying
+it to the HiCache host pool. Size it for the object sizes, batch sizes, and
+concurrent reads in your workload; insufficient capacity causes read allocation
+failures. The 1 GiB value above is an example, not a universal sizing requirement.
+A memory-plus-DFS test may read the memory replica, so validate DFS reads with
+DFS-only placement or after making the memory replica unavailable.
+
+In standalone mode, SGLang forwards this setting to `setup_dummy()` for the
+Dummy Client's scratch buffer. DFS read staging occurs in the external Real
+Client, whose `local_buffer_size` must be configured separately. The
+FileStorage restore buffer used by ordinary SSD offload is also a separate
+buffer; this option does not resize it.
 
 **Mooncake Group Semantics (`enable_group_semantics`):**
 
