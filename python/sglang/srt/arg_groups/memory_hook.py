@@ -232,12 +232,7 @@ def handle_gpu_memory_settings(server_args: Any):
 
     if prefill_cuda_graph_config.max_bs is None:
         # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
-        # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-        # To avoid the performance regression, we set max_bs to 2048 by default.
-        if not use_mla_backend(server_args):
-            prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
-        else:
-            prefill_cuda_graph_config.max_bs = 2048
+        prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
 
         # For opt-in PP breakable graphs, capture small aggregate-token
         # buckets by default and leave larger forwards on the eager path.
