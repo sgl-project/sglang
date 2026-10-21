@@ -779,6 +779,7 @@ class AscendAttnBackend(AttentionBackend):
         graph_context_len = self.max_context_len
         if self.speculative_num_draft_tokens is not None:
             graph_context_len += self.speculative_num_draft_tokens
+        total_context_len = graph_context_len + self.page_size - 1
         dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
         if dense_mla_dcp_graph:
             self.graph_metadata = init_mla_dcp_graph_state(
@@ -804,7 +805,6 @@ class AscendAttnBackend(AttentionBackend):
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if self._use_dsa_dcp():
             dcp_page_size = self.dcp_interleave_size * self.dcp_size
-            total_context_len = graph_context_len + self.page_size - 1
             max_dcp_seq_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
             # The captured DSA indexer cache-write operation reads from this fixed
             # buffer. Replay refreshes its allocator-global slot ids before execution.
@@ -837,11 +837,8 @@ class AscendAttnBackend(AttentionBackend):
                     max_bs, dtype=torch.int32, device=self.device
                 )
         if self.is_hybrid_swa:
-            swa_total_context_len = self.max_context_len + self.page_size - 1
-            if self.speculative_num_draft_tokens is not None:
-                swa_total_context_len += self.speculative_num_draft_tokens
             self.graph_metadata["block_tables_swa"] = torch.empty(
-                (max_bs, swa_total_context_len // self.page_size),
+                (max_bs, total_context_len // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -849,14 +846,14 @@ class AscendAttnBackend(AttentionBackend):
             # Pre-allocated at max size, sliced per batch size during capture,
             # content updated via copy_() during replay.
             self.graph_metadata["swa_mask"] = torch.ones(
-                (max_bs, 1, swa_total_context_len),
+                (max_bs, 1, total_context_len),
                 dtype=torch.bool,
                 device=self.device,
             )
             # Pre-allocated index buffer for mask generation during replay,
             # avoids torch.arange allocation on every replay step.
             self.graph_metadata["swa_indices"] = torch.arange(
-                swa_total_context_len,
+                total_context_len,
                 device=self.device,
                 dtype=torch.int32,
             )
@@ -1707,8 +1704,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Load a full MLA prefix, gathering rank-local DCP shards if needed."""
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
+        if self.dcp_size > 1:
             metadata = forward_batch.attn_dcp_metadata
             kv_cached, k_rope_cached = self.token_to_kv_pool.get_mla_kv_buffer(
                 layer,
@@ -1757,7 +1753,6 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
@@ -1817,7 +1812,6 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
-                return_softmax_lse=return_softmax_lse,
             )
 
         if not self.use_mla:
@@ -2673,7 +2667,6 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        return_softmax_lse: bool = False,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -3706,7 +3699,7 @@ class AscendAttnBackend(AttentionBackend):
                     else self.forward_metadata.seq_lens_cpu_int
                 )
                 query_len = num_tokens // forward_batch.batch_size
-                fia_result = self._forward_mla_fia(
+                return self._forward_mla_fia(
                     q,
                     q_rope,
                     kv_c,
@@ -3721,9 +3714,6 @@ class AscendAttnBackend(AttentionBackend):
                         self.forward_metadata.seq_lens if return_softmax_lse else None
                     ),
                 )
-                if return_softmax_lse:
-                    return fia_result
-                attn_output = fia_result
             else:
                 if return_softmax_lse:
                     raise NotImplementedError(

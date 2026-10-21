@@ -34,7 +34,7 @@ def forward_mla_attention_npu(
     """
     use_dcp = backend.uses_dcp_partial_attention(forward_batch)
     attn = module.attn_mqa_for_dcp_decode if use_dcp else module.attn_mqa
-    if use_dcp and not backend.use_dsa:
+    if use_dcp:
         attn_kwargs["return_softmax_lse"] = True
     attn_output = attn(
         q_nope_out,

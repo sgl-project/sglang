@@ -498,6 +498,7 @@ def forward_dsa_prepare_npu(
             )
 
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    use_dcp = backend.uses_dcp_partial_attention(forward_batch)
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -511,7 +512,7 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
-        if backend.uses_dcp_partial_attention(forward_batch):
+        if use_dcp:
             topk_indices = dcp_layout.remap_dcp_sparse_indices(
                 topk_indices,
                 backend.dcp_size,
@@ -521,7 +522,7 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
-    if backend.uses_dcp_partial_attention(forward_batch):
+    if use_dcp:
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
         q_nope_out = q_nope_out.contiguous()
         q_pe = q_pe.contiguous()
