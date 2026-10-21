@@ -25,6 +25,7 @@ Usage:
 """
 
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -186,12 +187,12 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 
     @unittest.skipUnless(is_cuda(), "Stock virtual LoRA hook fixture requires CUDA")
     def test_gate_up_hook_uses_each_stacked_a_projection(self):
-        """Independent gate/up A matrices reach their matching B and output views."""
+        """One shrink/expand pairs independent gate/up ranks, including ragged halves."""
         from sglang.kernels.ops.lora.moe import virtual_experts
         from sglang.srt.layers.moe.moe_runner.triton_utils import override_config
         from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
-        tokens, topk, experts, rank, hidden, intermediate = 3, 2, 2, 16, 64, 32
+        tokens, topk, experts, rank, hidden = 3, 2, 2, 16, 64
         dtype = torch.float16
         x = torch.zeros((tokens, hidden), device=self.device, dtype=dtype)
         x[:, 0] = torch.arange(1, tokens + 1, device=self.device, dtype=dtype)
@@ -212,11 +213,16 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
             "num_stages": 2,
         }
         real_add = virtual_experts.merged_experts_fused_moe_lora_add
-        # The common-A and non-gated layouts must retain one full-width call.
-        for a_parts, b_parts in ((2, 2), (1, 2), (1, 1)):
+        # Split-A, common-A and non-gated layouts retain one full-width call.
+        for (a_parts, b_parts), intermediate in product(
+            ((2, 2), (1, 2), (1, 1)), (17, 32, 48)
+        ):
             for shared_outer in (False, True):
                 with self.subTest(
-                    a_parts=a_parts, b_parts=b_parts, shared_outer=shared_outer
+                    a_parts=a_parts,
+                    b_parts=b_parts,
+                    intermediate=intermediate,
+                    shared_outer=shared_outer,
                 ):
                     a = torch.zeros(
                         (2, 1 if shared_outer else experts, a_parts * rank, hidden),
@@ -282,7 +288,13 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                             projected.untyped_storage().data_ptr(),
                             output.untyped_storage().data_ptr(),
                         )
-                        calls.append((projected.data_ptr(), kwargs["lora_a"].shape[2]))
+                        calls.append(
+                            (
+                                projected.data_ptr(),
+                                kwargs["lora_a"].shape[2],
+                                kwargs.get("a_output_slices", 1),
+                            )
+                        )
                         return real_add(**kwargs)
 
                     with (
@@ -300,17 +312,9 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                         hooks = build_lora_hooks(x, info, ids)
                         hooks.after_gate_up(x, output, weights, ids)
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
-                    self.assertEqual(len(calls), a_parts)
-                    self.assertEqual(calls[0], (output.data_ptr(), rank))
-                    if a_parts == 2:
-                        self.assertEqual(
-                            calls[1],
-                            (
-                                output.data_ptr()
-                                + intermediate * output.element_size(),
-                                rank,
-                            ),
-                        )
+                    self.assertEqual(
+                        calls, [(output.data_ptr(), a_parts * rank, a_parts)]
+                    )
 
     def test_positive_topk_remapped_correctly(self):
         """Sanity: valid (non-negative) IDs follow the

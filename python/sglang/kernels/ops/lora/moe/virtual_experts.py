@@ -521,6 +521,8 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    *,
+    a_output_slices: int = 1,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -528,6 +530,11 @@ def _merged_experts_fused_moe_lora_add_impl(
     3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
     """
+    assert a_output_slices in (1, 2)
+    if a_output_slices == 2:
+        assert lora_a.shape[2] == 2 * lora_b.shape[3]
+        assert lora_b.shape[2] > 0 and lora_b.shape[2] % 2 == 0
+        assert output.shape[-1] == lora_b.shape[2]
     max_loras, _, max_lora_rank, _ = lora_a.shape
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
@@ -716,6 +723,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         fuse_add_to_output=True,
         add_output_mask=token_lora_mask,
         router_topk=topk_ids.shape[1],
+        a_output_slices=a_output_slices,
     )
 
 
@@ -767,8 +775,10 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    *,
+    a_output_slices: int = 1,
 ) -> None:
-    """Public API: wraps the registered op with routing_cache support."""
+    """Add virtual-expert LoRA deltas, optionally pairing A rank/output halves."""
     _merged_experts_fused_moe_lora_add_impl(
         output,
         hidden_states,
@@ -781,4 +791,5 @@ def merged_experts_fused_moe_lora_add(
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
         routing_cache,
+        a_output_slices=a_output_slices,
     )
