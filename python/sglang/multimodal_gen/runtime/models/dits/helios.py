@@ -17,9 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    HELIOS_GATED_RESIDUAL,
     fused_inplace_helios_qk_rope,
-    mark_helios_gated_residual_site,
-    try_helios_gated_residual,
+    try_gated_residual,
 )
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
@@ -497,7 +497,7 @@ class HeliosTransformerBlock(nn.Module):
         # 4. Guidance cross-attention flag
         self.guidance_cross_attn = guidance_cross_attn
 
-        mark_helios_gated_residual_site(self)
+        HELIOS_GATED_RESIDUAL.mark(self)
 
     def forward(
         self,
@@ -528,7 +528,9 @@ class HeliosTransformerBlock(nn.Module):
         attn_output = self.attn1(
             norm_hidden_states, rotary_emb, original_context_length
         )
-        fused = try_helios_gated_residual(self, hidden_states, attn_output, gate_msa)
+        fused = try_gated_residual(
+            HELIOS_GATED_RESIDUAL, self, hidden_states, attn_output, gate_msa
+        )
         hidden_states = (
             fused
             if fused is not None
@@ -567,7 +569,9 @@ class HeliosTransformerBlock(nn.Module):
         # 3. Feed-forward
         norm_hidden_states = self.norm3(hidden_states, c_shift_msa, c_scale_msa)
         ff_output = self.ffn(norm_hidden_states)
-        fused = try_helios_gated_residual(self, hidden_states, ff_output, c_gate_msa)
+        fused = try_gated_residual(
+            HELIOS_GATED_RESIDUAL, self, hidden_states, ff_output, c_gate_msa
+        )
         hidden_states = (
             fused
             if fused is not None

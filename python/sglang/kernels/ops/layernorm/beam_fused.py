@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -175,3 +177,79 @@ def _fused_sandwich_residual_rmsnorm(
         enable_fp_fusion=False,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+
+
+def _rmsnorm_native(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Pure-torch RMSNorm reference: ``(x / RMS(x)) * weight`` in FP32."""
+    y = x.to(torch.float32)
+    y = y * torch.rsqrt(y.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (y * weight).to(x.dtype)
+
+
+class BeamSandwichResidualRMSNormOp(BaseFusedOp):
+    """Post-normalize a branch, combine residuals, then normalize the next input.
+
+    Returns ``(normed, combined)``. Either norm weight may be None; without
+    ``out_weight``, ``normed`` is None (a non-final pipeline stage).
+    """
+
+    op = "layernorm.beam_sandwich_residual_rmsnorm"
+    capabilities = {KernelBackend.TRITON: {CapabilityRequirement.CUDA}}
+
+    def _torch_compile_forward(self, num_tokens: int):
+        # Native compilation can remove the required intermediate rounding.
+        return None
+
+    def forward_torch_compile(self, *args, **kwargs):
+        if self._compiled_native is None:
+            # Register and warm the opaque op before tracing its dispatch wrapper.
+            self.forward_triton(*args, **kwargs)
+            self._compiled_native = torch.compile(
+                self.forward_triton, options={"emulate_precision_casts": True}
+            )
+        return self._compiled_native(*args, **kwargs)
+
+    def forward_native(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        if sandwich_weight is not None:
+            branch = _rmsnorm_native(branch, sandwich_weight, eps)
+        residual = residual.to(branch.dtype)
+        combined = branch * scales[0] + residual * scales[1]
+        out = (
+            _rmsnorm_native(combined, out_weight, eps)
+            if out_weight is not None
+            else None
+        )
+        return out, combined
+
+    def forward_triton(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
+            return self.forward_native(
+                branch, residual, sandwich_weight, out_weight, eps, scales
+            )
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+
+        return fused_sandwich_residual_rmsnorm(
+            branch,
+            residual,
+            sandwich_weight,
+            out_weight,
+            eps,
+            *scales,
+            enable_pdl=is_arch_support_pdl(),
+        )
