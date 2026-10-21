@@ -1239,7 +1239,7 @@ class TestKV4Compatibility(unittest.TestCase):
 
 class TestLoraForwardDomains(unittest.TestCase):
     def test_rejects_concurrent_forwards(self):
-        for runner in ("auto",):
+        for runner in ("auto", "lora_cutedsl"):
             for options in (
                 {"enable_pdmux": True},
                 {"enable_two_batch_overlap": True},

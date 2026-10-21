@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from types import MethodType, ModuleType, SimpleNamespace
+from unittest.mock import Mock, sentinel
 
 import pytest
 
@@ -33,6 +34,48 @@ def _lora_method(module, class_name, name):
         scope,
     )
     return scope[name]
+
+
+@pytest.mark.parametrize("is_prefill,use_cuda_graph", [(False, True), (True, False)])
+def test_moe_core_calls_bound_runner_with_batch_metadata(
+    monkeypatch, is_prefill, use_cuda_graph
+):
+    module = ModuleType("sglang.srt.lora.moe.runner")
+    module.MoeLoraBatch = SimpleNamespace
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    layout = SimpleNamespace(TP_GLOBAL=sentinel.global_layout)
+    metadata = SimpleNamespace(
+        token_slots=[-1, 1, -1],
+        num_tokens=2,
+        is_prefill=is_prefill,
+        use_cuda_graph=use_cuda_graph,
+    )
+    calls = Mock()
+    calls.get_batch_info.return_value = metadata
+    calls.run.return_value = sentinel.combine_input
+    layer = SimpleNamespace(
+        lora_backend=SimpleNamespace(get_batch_info=calls.get_batch_info),
+        _moe_lora_runner=SimpleNamespace(run=calls.run),
+        gate_up_lora_a_weights=sentinel.gate_up_a,
+        gate_up_lora_b_weights=sentinel.gate_up_b,
+        down_lora_a_weights=sentinel.down_a,
+        down_lora_b_weights=sentinel.down_b,
+    )
+    method = _lora_method("layers.py", "FusedMoEWithLoRA", "_run_moe_core_with_lora")
+    method.__globals__["LoRABatchLayout"] = layout
+
+    assert method(layer, sentinel.dispatch) is sentinel.combine_input
+    calls.run.assert_called_once()
+    dispatch, batch = calls.run.call_args.args
+    assert dispatch is sentinel.dispatch
+    assert batch.gate_up_lora_a is sentinel.gate_up_a
+    assert batch.gate_up_lora_b is sentinel.gate_up_b
+    assert batch.down_lora_a is sentinel.down_a
+    assert batch.down_lora_b is sentinel.down_b
+    assert batch.token_lora_mapping == [-1, 1]
+    assert batch.is_prefill is is_prefill
+    assert batch.use_cuda_graph is use_cuda_graph
+    calls.get_batch_info.assert_called_once_with(sentinel.global_layout)
 
 
 @pytest.mark.parametrize("graph_enabled", [False, True], ids=["eager", "graph"])
