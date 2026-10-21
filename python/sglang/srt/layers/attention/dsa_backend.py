@@ -674,7 +674,7 @@ class DeepseekSparseAttnBackend(
                 "kv_lora_rank": (self.kv_lora_rank, 512),
                 "qk_rope_head_dim": (self.qk_rope_head_dim, 64),
                 "index_topk": (self.dsa_index_topk, 2048),
-                "page_size": (self.real_page_size, 64),
+                "page_size": (self.physical_page_size, 64),
             }
             mismatches = [
                 f"{name}={actual} (expected {wanted})"
@@ -3461,7 +3461,7 @@ class DeepseekSparseAttnBackend(
                 raise ValueError(
                     f"native GLM-5.2 NVFP4 decode requires Hq=64, got {num_q_heads}"
                 )
-            packed_kv = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+            packed_kv = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
             indices = page_table_1.unsqueeze(1).contiguous()
             # `_compute_flashmla_metadata` builds the persistent graph schedule
             # for the full 2048 slots, matching the existing FP8 path.  Passing

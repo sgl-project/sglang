@@ -5,7 +5,8 @@ the public attention/indexer methods so bypassing their owner dispatch cannot
 silently fall back to broadcasting full cache buffers.
 """
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,7 +19,7 @@ from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPoo
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -95,6 +96,95 @@ def _backend(pool):
     backend.use_fused_topk = True
     backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
     return backend
+
+
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_nvfp4_backend_constructor_and_native_decode_use_physical_page_size(
+    draft, page_size
+):
+    """Constructed backends must validate and reshape KV with the live page field.
+
+    An old ``real_page_size`` access previously failed before server readiness.
+    Stub hardware queries and the native kernel boundary, not backend setup.
+    """
+    pool = _pool()
+    runner = SimpleNamespace(
+        device="cpu",
+        page_size=page_size,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=[
+                    "GlmMoeDsaForCausalLMNextN" if draft else "GlmMoeDsaForCausalLM"
+                ],
+                index_topk=2048,
+            ),
+            context_len=192,
+            num_attention_heads=64,
+            qk_nope_head_dim=192,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        ),
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(
+            size=4, req_to_token=torch.zeros(5, 192, dtype=torch.int32)
+        ),
+        hisparse_coordinator=None,
+        is_draft_worker=draft,
+        kv_cache_dtype=torch.float4_e2m1fn_x2,
+        max_running_requests=4,
+    )
+    native = ModuleType("sgl_kernel.flash_mla")
+
+    def native_decode(**kwargs):
+        packed = kwargs["k_cache"]
+        assert packed.shape == (4, 64, 1, 416)
+        assert packed.data_ptr() == pool.get_key_buffer(0).data_ptr()
+        return kwargs["q"][..., :512].clone(), None, None, None
+
+    native.flash_mla_with_kvcache_nvfp4 = native_decode
+    native.flash_mla_with_kvcache = None
+    with (
+        get_context().override_server_args(
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_kv",
+            speculative_num_draft_tokens=6,
+            speculative_eagle_topk=1,
+        ),
+        get_parallel().override(attn_tp_size=1, attn_dcp_size=1, attn_dcp_rank=0),
+        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        patch.dict(sys.modules, {"sgl_kernel.flash_mla": native}),
+        patch.object(
+            torch.ops.sgl_kernel, "sparse_decode_fwd_nvfp4", native_decode, create=True
+        ),
+    ):
+        if page_size != 64:
+            with pytest.raises(ValueError, match="page_size=128.*expected 64"):
+                DeepseekSparseAttnBackend(runner)
+            return
+        backend = DeepseekSparseAttnBackend(runner)
+        assert backend.physical_page_size == 64
+        assert backend.speculative_num_draft_tokens == 6
+        query = (
+            torch.arange(64 * 576, dtype=torch.float32)
+            .view(1, 64, 576)
+            .to(torch.bfloat16)
+        )
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([64], dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(flashmla_metadata=None, num_splits=None),
+        )
+        layer = SimpleNamespace(layer_id=0, tp_q_head_num=64, head_dim=576)
+        output = backend._forward_flashmla_kv(
+            q_all=query,
+            kv_cache=pool.get_key_buffer(0),
+            v_head_dim=512,
+            sm_scale=576**-0.5,
+            layer=layer,
+            metadata=metadata,
+            page_table_1=torch.full((1, 2048), -1, dtype=torch.int32),
+        )
+        torch.testing.assert_close(output, query[:, None, :, :512], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
