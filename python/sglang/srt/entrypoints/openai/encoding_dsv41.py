@@ -25,6 +25,35 @@ LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 
+# Spellings of the control tokens this encoder writes. A Hugging Face
+# tokenizer splits added-vocabulary strings even with
+# ``add_special_tokens=False``, so text that spells one of these would be
+# tokenized as the token itself. ``encode_messages`` rejects such text instead
+# of letting client input take over the prompt structure. Grounding tokens
+# (``<｜ref｜>``, ``<｜box｜>``, ``<｜point｜>``, ``<｜polygon｜>``) are deliberately
+# absent: the model emits them and assistant history may carry them.
+RESERVED_SPECIAL_TOKENS: Tuple[str, ...] = (
+    bos_token,
+    eos_token,
+    thinking_start_token,
+    thinking_end_token,
+    USER_SP_TOKEN,
+    ASSISTANT_SP_TOKEN,
+    SYSTEM_SP_TOKEN,
+    LATEST_REMINDER_SP_TOKEN,
+    dsml_token,
+    IMAGE_PLACEHOLDER,
+)
+
+
+def find_reserved_token(text: str) -> Optional[str]:
+    """Return the first reserved special-token spelling in ``text``, if any."""
+    for token in RESERVED_SPECIAL_TOKENS:
+        if token in text:
+            return token
+    return None
+
+
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
     "action": "<｜action｜>",
@@ -66,9 +95,14 @@ REASONING_EFFORT_TEMPLATE = (
 )
 
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    # Aliases follow the reference encoder: minimal is the bottom of the
+    # scale, medium sits with high, and ultra with max.
+    "minimal": 50,
     "low": 50,
+    "medium": 75,
     "high": 75,
     "xhigh": 75,
+    "ultra": 100,
     "max": 100,
 }
 DEFAULT_REASONING_EFFORT = "high"
@@ -126,14 +160,13 @@ def tool_calls_from_openai_format(tool_calls):
     ]
 
 
-def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
-    p_dsml_template = (
-        '<{dsml_token}{tool_parameter_tag_name} name="{key}" string="{is_str}">'
-        "{value}</{dsml_token}{tool_parameter_tag_name}>"
-    )
-    P_dsml_strs = []
+def _decoded_tool_arguments(function: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the arguments the encoder renders as DSML parameters.
 
-    raw_arguments = tool_call["arguments"]
+    The single decoding step the encoder performs, shared with validation so
+    that the checks inspect the same values that reach the prompt.
+    """
+    raw_arguments = function.get("arguments")
     arguments = (
         json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
     )
@@ -141,6 +174,17 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
         raise ValueError(
             "Assistant tool call function.arguments must be a JSON object."
         )
+    return arguments
+
+
+def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
+    p_dsml_template = (
+        '<{dsml_token}{tool_parameter_tag_name} name="{key}" string="{is_str}">'
+        "{value}</{dsml_token}{tool_parameter_tag_name}>"
+    )
+    P_dsml_strs = []
+
+    arguments = _decoded_tool_arguments(tool_call)
 
     for k, v in arguments.items():
         P_dsml_strs.append(
@@ -157,6 +201,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
 
 
 def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
+    _validate_tools_no_reserved_tokens(tools)
     tools_json = [to_json(t) for t in tools]
 
     return TOOLS_TEMPLATE.format(
@@ -591,6 +636,76 @@ def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
         )
 
 
+def _validate_no_reserved_tokens(msg: Dict[str, Any]) -> None:
+    """Reject text that would be tokenized as a control token.
+
+    ``_validate_no_image_sp_tokens`` keeps its image-specific error message;
+    this check covers the rest of the reserved set in message text, tool call
+    names, and the decoded arguments the encoder renders. The encoder decodes
+    ``arguments`` with one ``json.loads`` before writing, so the raw string is
+    not enough to check: JSON escapes can spell a token that only appears
+    after decoding.
+    """
+    _reject_reserved_token(msg.get("reasoning_content"), "reasoning_content")
+    _validate_rendered_content(msg.get("content"), "message content")
+    _validate_rendered_content(msg.get("content_blocks"), "message content")
+
+    response_format = msg.get("response_format")
+    if response_format is not None:
+        _reject_reserved_token(to_json(response_format), "response_format")
+
+    for index, tool_call in enumerate(msg.get("tool_calls") or []):
+        function = (
+            (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
+        )
+        where = f"tool_calls[{index}].function"
+        _reject_reserved_token(function.get("name"), f"{where}.name")
+        arguments = _decoded_tool_arguments(function)
+        for key, value in arguments.items():
+            _reject_reserved_token(key, f"{where}.arguments key")
+            rendered = value if isinstance(value, str) else to_json(value)
+            _reject_reserved_token(rendered, f"{where}.arguments[{key!r}]")
+
+
+def _validate_rendered_content(value: Any, where: str) -> None:
+    """Check every string the encoder can render from a content value.
+
+    Content is a string, a list of blocks, or a tool result whose ``content``
+    is again either. The encoder renders text and tool results from all of
+    these, so validation follows the same shape; image blocks carry no text.
+    """
+    if isinstance(value, str):
+        _reject_reserved_token(value, where)
+        return
+    if not isinstance(value, list):
+        return
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        _reject_reserved_token(block.get("text"), where)
+        if block.get("type") == "tool_result":
+            _validate_rendered_content(block.get("content"), f"{where} tool_result")
+
+
+def _reject_reserved_token(text: Any, where: str) -> None:
+    if not isinstance(text, str):
+        return
+    token = find_reserved_token(text)
+    if token is not None:
+        raise ValueError(
+            f"{where} contains reserved special token {token!r}. Reserved tokens "
+            "are written by the prompt encoder and must not appear in request text."
+        )
+
+
+def _validate_tools_no_reserved_tokens(
+    tools: List[Dict[str, Union[str, Dict[str, Any]]]],
+) -> None:
+    """Reject tool definitions whose text the encoder renders verbatim."""
+    for index, tool in enumerate(tools):
+        _reject_reserved_token(to_json(tool), f"tools[{index}]")
+
+
 def process_image_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -699,6 +814,7 @@ def encode_messages(
     # Validate before merging can discard message-level textual fields.
     for msg in (context or []) + messages:
         _validate_no_image_sp_tokens(msg)
+        _validate_no_reserved_tokens(msg)
 
     # Collect images only after tool results are in their final prompt order.
     context = merge_tool_messages(context or [])
