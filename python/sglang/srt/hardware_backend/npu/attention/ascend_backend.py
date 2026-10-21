@@ -1278,18 +1278,17 @@ class AscendAttnBackend(AttentionBackend):
         ``CPAttentionBackendKind.FLASH_ATTENTION`` because FIA uses the same
         two-call (prev + next) dispatch convention.
         """
-        k_cache_paged = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-        )
-        v_cache_paged = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
-
         def _fia_cp_attn(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
             # The strategy passes cu_seqlens_q (with a leading 0) and plain KV
             # lengths as int32 tensors; FIA wants cumulative query lengths
             # (no leading 0) and KV lengths as Python lists.
-            return torch.ops.npu.npu_fused_infer_attention_score(
+            k_cache_paged = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache_paged = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
+            return torch_npu.npu_fused_infer_attention_score(
                 query=q_chunk.contiguous(),
                 key=k_cache_paged,
                 value=v_cache_paged,
