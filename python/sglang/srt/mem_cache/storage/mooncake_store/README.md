@@ -44,8 +44,9 @@ Prefetch starts when the scheduler enqueues a request through
 `_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV
 into the radix tree after all attention ranks confirm success.
 Failed reads release the slots and fall back to recomputation. It currently
-requires PP=1, reads on every attention TP rank, and stages one request at a
-time. Admission skips pending requests and can select later ready requests.
+supports Full/SWA components, requires PP=1, reads on every attention TP rank,
+and stages one request at a time. Admission skips pending requests and can
+select later ready requests.
 Private GPU slots consume capacity while the I/O is pending. The default
 layer-wise queues, counters, and MLA broadcast stay unchanged.
 

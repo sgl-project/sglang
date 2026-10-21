@@ -30,11 +30,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
-
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -66,6 +64,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -82,7 +81,7 @@ class LayerWiseLoadCounter:
     def __init__(
         self,
         num_layers: int,
-        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+        on_layer_ready: Callable[[int, int], None] | None = None,
     ):
         self.num_layers = num_layers
         self.on_layer_ready = on_layer_ready
@@ -139,6 +138,7 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    pools: dict[PoolName, object]
     load_mode = "layer_wise"
 
     @abstractmethod
@@ -242,7 +242,7 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
@@ -251,10 +251,16 @@ class UnifiedCacheLinkerWrapper:
         self.load_mode = cache_linker.load_mode
         if self.load_mode == "prefetch" and cache.pp_size > 1:
             raise ValueError("External linker prefetch currently requires PP=1.")
+        if (
+            self.load_mode == "prefetch"
+            and ComponentType.MAMBA in cache.tree_components
+        ):
+            raise ValueError(
+                "External linker prefetch does not support MAMBA components."
+            )
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
-        )
+        # A store without SWA pages tombstones restored tails instead.
+        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
         self._components = tuple(
             component
             for component in cache._components_tuple
@@ -617,7 +623,7 @@ class UnifiedCacheLinkerWrapper:
     def _update_load(
         self,
         phase: ExternalLinkerLoadPhase,
-        req: Optional[Req],
+        req: Req | None,
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
         prefix_len: int,
     ) -> list[PoolTransfer]:
