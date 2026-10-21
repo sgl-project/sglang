@@ -1,4 +1,4 @@
-// Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 // Beam's BF16 sandwich norm over the existing CustomAllReduceV2 push protocol.
 #pragma once
 #include <sgl_kernel/tensor.h>

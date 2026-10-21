@@ -1,4 +1,4 @@
-# Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+# SPDX-License-Identifier: Apache-2.0
 """Private Triton activation helpers with CUDA fast-math rounding."""
 
 import triton

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Beam BF16 all-reduce with FP32 sandwich normalization and rounded residuals."""
 
 import torch
