@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_cache.priority_claims import CacheControlConfi
 class CacheLimits(Value):
     max_copy_units: int = 65536
     max_claims_per_copy: int = 16
+    max_policy_claims_per_copy: int = 4
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
 

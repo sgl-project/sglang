@@ -511,3 +511,27 @@ Only the owned server process group was terminated. Parent reviewed all changes;
 strict new-file Ruff, no added old-file findings, isort/format/whitespace pass.
 Verdict: approve local exact file-restoration feature. Linker/multi-branch cold
 work and composable policies with actual admission cooperation remain pending.
+
+## Unit 7a — Explicit authority over internal policy claims
+
+Added internal ExecutionRequest origin (public ingress always explicit), origin-
+scoped revision identities, and live explicit-before-policy effective priorities.
+Independent explicit claims still merge by max; clearing/expiring all explicit
+claims reveals still-live policy claims. The actual radix copy metadata, splits,
+expiry and eviction ordering use that rule. Policy revisions have a separate
+bounded per-copy budget (default four) and cannot consume explicit revision
+slots; total copy-unit capacity remains shared. Configuration and payload
+validation retain their boundaries; caller-name conventions do not grant policy
+origin. Policies are still disabled by default; this is their authority seam.
+
+Three new actual CPU-cache tests cover negative explicit intent vs larger policy
+priority, independent revisions and metadata slots, expiry/clears/stale replays,
+split TTLs, caller-name spoofing and rejection of a public origin payload.
+Existing and new control/cache/service tests pass together (114 cases plus 18
+subtests), /tmp/sglang-kv-policy-priority-cpu-proof.log. Initial test assertions
+used a tuple-containing Python object instead of JSON and expected a different
+existing capacity status; corrected to exercise the real JSON boundary and
+existing REJECTED metadata-capacity semantics. No production behavior was
+changed to satisfy those incorrect expectations. Ruff/isort/format/whitespace
+checks pass. Parent reviewed the complete diff; approve this local feature unit.
+Composable runtime, observations and scheduler admission holds remain ongoing.

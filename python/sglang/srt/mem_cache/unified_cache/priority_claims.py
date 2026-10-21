@@ -23,12 +23,14 @@ class CacheControlConfig:
     max_claims_per_copy: int = 16
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
+    max_policy_claims_per_copy: int = 4
 
     def __post_init__(self):
         validated(self.namespace, Identifier)
         for name in (
             "max_copy_units",
             "max_claims_per_copy",
+            "max_policy_claims_per_copy",
             "max_query_nodes",
             "max_result_targets",
         ):
@@ -60,7 +62,7 @@ class _Copy:
     value: object
     incarnation: int
     units: int
-    claims: dict[tuple[str, str], _Claim] = field(default_factory=dict)
+    claims: dict[tuple[str, str, str], _Claim] = field(default_factory=dict)
 
 
 class CopyPriorityClaims:
@@ -151,9 +153,21 @@ class CopyPriorityClaims:
                 self._units += units
 
     def preflight(
-        self, selections: list[CopySelection], action: SetPriority, caller_id: str
+        self,
+        selections: list[CopySelection],
+        action: SetPriority,
+        caller_id: str,
+        *,
+        origin: str = "explicit",
     ):
-        identity = caller_id, action.claim_id
+        if origin not in ("explicit", "policy"):
+            raise ControlError("invalid_payload", "Unknown internal claim origin")
+        identity = origin, caller_id, action.claim_id
+        limit = (
+            self.config.max_claims_per_copy
+            if origin == "explicit"
+            else self.config.max_policy_claims_per_copy
+        )
         grouped: dict[tuple[int, ComponentType], list[CopySelection]] = {}
         for selection in selections:
             grouped.setdefault((selection.node.id, selection.component), []).append(
@@ -172,7 +186,7 @@ class CopyPriorityClaims:
                         raise ControlError(
                             "conflict", "Conflicting revision on a selected cache copy"
                         )
-                elif len(record.claims) >= self.config.max_claims_per_copy:
+                elif sum(key[0] == origin for key in record.claims) >= limit:
                     raise ControlError(
                         "capacity", "Per-copy revision/claim capacity exhausted"
                     )
@@ -189,11 +203,16 @@ class CopyPriorityClaims:
             raise ControlError("capacity", "Copy-claim metadata capacity exhausted")
 
     def apply(
-        self, selections: list[CopySelection], action: SetPriority, caller_id: str
+        self,
+        selections: list[CopySelection],
+        action: SetPriority,
+        caller_id: str,
+        *,
+        origin: str = "explicit",
     ):
-        self.preflight(selections, action, caller_id)
+        self.preflight(selections, action, caller_id, origin=origin)
         now = self.clock()
-        identity = caller_id, action.claim_id
+        identity = origin, caller_id, action.claim_id
         claim = _Claim(
             action.revision,
             action.value,
@@ -240,14 +259,11 @@ class CopyPriorityClaims:
         if record is None:
             return None
         now = self.clock()
-        return max(
-            (
-                claim.value
-                for claim in record.claims.values()
-                if claim.value is not None and claim.expires_at > now
-            ),
-            default=None,
-        )
+        explicit, policy = [], []
+        for (origin, _, _), claim in record.claims.items():
+            if claim.value is not None and claim.expires_at > now:
+                (explicit if origin == "explicit" else policy).append(claim.value)
+        return max(explicit or policy, default=None)
 
     def eviction_key(self, node, component):
         """Account for every component the structural eviction would reclaim."""

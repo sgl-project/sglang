@@ -685,3 +685,20 @@ through `/v1/kv/control`, then verifies subsequent generation reuses that KV.
 The OPT-125m dummy-weight probe reports three cached input tokens and identical
 output IDs. Real nonzero low-level KV byte checks complement that serving
 interface proof.
+
+## Internal policy claim authority
+
+Execution requests carry private explicit/policy provenance. Public hints always
+use explicit authority, regardless of caller names, and primitive schemas reject
+an `origin` payload field. A live explicit claim takes precedence over all local
+policy claims on that same physical component, including a negative explicit
+priority. Independent explicit callers retain max merging. Once all explicit
+claims expire or clear, remaining live policy claims become effective.
+
+Origin is also part of claim revision identity, so a policy revision cannot
+block an explicit renewal or clear with the same caller/claim strings. Splits
+preserve each origin's expiry and tombstones. The existing per-copy explicit
+claim bound remains `max_claims_per_copy`; `max_policy_claims_per_copy` (default
+4) separately bounds policy revisions so policies cannot consume explicit
+revision slots. The total copy-unit metadata budget remains shared and bounded.
+This authority seam does not activate any policy by default.

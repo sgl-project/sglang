@@ -708,6 +708,7 @@ class UnifiedCacheExecutor:
                 [row.selection for row in rows],
                 work.payload,
                 work.ref.context.caller_id,
+                origin=work.origin,
             )
             # All scope, compatibility, result and claim budgets pass before
             # splitting or changing claims. The synchronous owner cannot race.
@@ -716,6 +717,7 @@ class UnifiedCacheExecutor:
                 [row.selection for row in rows],
                 work.payload,
                 work.ref.context.caller_id,
+                origin=work.origin,
             )
             step = (
                 "priority_cleared" if work.payload.value is None else "priority_applied"

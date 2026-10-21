@@ -16,12 +16,16 @@ from sglang.srt.managers.kv_control.contracts import (
     ContentTarget,
     ControlError,
     Limits,
+    Location,
+    OperationRef,
     ParentPrefix,
     SessionTarget,
+    SetPriority,
     Status,
     TokensTarget,
     cache_compatibility,
 )
+from sglang.srt.managers.kv_control.controller import ExecutionRequest
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -268,6 +272,105 @@ class TestKVControlCache(CustomTestCase):
 
     def inspect(self, control, selection=None):
         return control.executor.residency(control.index.resolve(selection or target()))
+
+    def local_policy_priority(
+        self, control, *, value=90, ttl=20, revision=1, claim="c"
+    ):
+        payload = SetPriority(
+            target=target(),
+            location=Location(tier="gpu"),
+            claim_id=claim,
+            revision=revision,
+            value=value,
+            ttl_seconds=ttl if value is not None else None,
+        )
+        return control.executor.start(
+            ExecutionRequest(
+                ref=OperationRef(
+                    context=control.context("router"),
+                    message_id="local-policy",
+                    action_id=claim,
+                    operation_id="local-policy-" + claim,
+                ),
+                payload=payload,
+                target=control.index.resolve(target()),
+                origin="policy",
+            )
+        )
+
+    def test_explicit_priority_precedes_policy_and_has_separate_claim_capacity(self):
+        cache, control = self.make(
+            config=CacheControlConfig(
+                namespace="ns", max_claims_per_copy=1, max_policy_claims_per_copy=1
+            )
+        )
+        insert(cache, [1, 2, 3, 4])
+        self.assertEqual(
+            self.local_policy_priority(control, revision=10).status, Status.COMPLETED
+        )
+        self.assertEqual(
+            self.priority(control, value=-15, ttl=1).status, Status.COMPLETED
+        )
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [-15]
+        )
+        self.assertEqual(
+            self.local_policy_priority(control, claim="other").status, Status.REJECTED
+        )
+        self.clock.now += 2
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [90]
+        )
+        self.local_policy_priority(control, value=None, revision=11)
+        self.priority(control, value=None, revision=2)
+        self.priority(control, value=100, revision=1)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [0]
+        )
+
+    def test_policy_origin_and_explicit_ttls_survive_radix_splits(self):
+        cache, control = self.make()
+        insert(cache, [1, 2, 3, 4])
+        self.local_policy_priority(control, ttl=10)
+        self.priority(control, target(end_token=2), value=-5, ttl=5)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [-5, 90]
+        )
+        self.clock.now += 6
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [90, 90]
+        )
+        self.clock.now += 5
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [0, 0]
+        )
+        cache.sanity_check()
+
+    def test_public_caller_names_and_payloads_cannot_choose_policy_origin(self):
+        cache, control = self.make()
+        insert(cache, [1, 2, 3, 4])
+        self.local_policy_priority(control, value=100)
+        self.priority(control, caller="policy:tool-wait", value=-1)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [-1]
+        )
+        spoof = self.submit(
+            control,
+            "set_priority",
+            {
+                "target": msgspec.json.decode(msgspec.json.encode(target())),
+                "location": {"tier": "gpu"},
+                "claim_id": "spoof",
+                "revision": 1,
+                "value": 999,
+                "ttl_seconds": 10,
+                "origin": "policy",
+            },
+        )
+        self.assertEqual(spoof.status, Status.REJECTED)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [-1]
+        )
 
     def test_disabled_has_no_claim_state_and_rust_fallback_is_explicit(self):
         disabled, _ = self.make(enabled=False)

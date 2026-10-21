@@ -45,6 +45,9 @@ class ExecutionRequest(Value):
     payload: Primitive
     target: ResolvedTarget
     max_result_targets: int = 4096
+    # Internal provenance, supplied by the owner. Public envelopes/contexts
+    # cannot choose policy authority by naming a caller or adding payload keys.
+    origin: Literal["explicit", "policy"] = "explicit"
 
 
 class Executor(Protocol):
