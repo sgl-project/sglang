@@ -611,12 +611,15 @@ class PrefillAdder:
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
+        # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
+        # ends on pages, which some batch-invariant kernels depend on.
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
             and dllm_config is None
             and not (
                 tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
             )
+            and not get_exec().deterministic.enable_deterministic_inference
         )
 
         if self.dllm_config is not None:
