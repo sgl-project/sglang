@@ -114,6 +114,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         server_args,
         chat_formatter: None,
         generate_hook: None,
+        prompt_encoder: None,
     })
 }
 
@@ -179,6 +180,7 @@ pub(super) fn answering_app_state_with(
         server_args,
         chat_formatter: Some(formatter),
         generate_hook: None,
+        prompt_encoder: None,
     })
 }
 
