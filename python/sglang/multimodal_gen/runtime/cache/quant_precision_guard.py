@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def install_quant_precision_guard(transformer):
+def set_quant_precision_guard(transformer):
     """Clear both CFG histories and force computation when quant precision changes."""
     modules = getattr(transformer, "modules", None)
     if modules is None:
