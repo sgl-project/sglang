@@ -438,6 +438,16 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         the full checkpoint. FP8 checkpoints stream weight and scale tensors
         separately, so those pairs are staged until both sides have arrived.
         """
+        from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+
+        def own_pending_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            # RunAI reuses its buffers between yields; paired tensors can cross files.
+            if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False) or getattr(
+                tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, False
+            ):
+                return tensor.detach().to("cpu", copy=True)
+            return tensor
+
         pending_w13_weights = {}
         pending_w13_lock = threading.Lock()
         pending_fp8_weights = {}
@@ -526,17 +536,16 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 return
 
             pending_key = expert_id
-            current = (
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-            )
             with pending_w13_lock:
                 pending = pending_w13_weights.pop(pending_key, None)
                 if pending is None:
-                    pending_w13_weights[pending_key] = current
+                    pending_w13_weights[pending_key] = (
+                        param,
+                        own_pending_tensor(loaded_weight),
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                    )
                     return
 
             (
@@ -610,7 +619,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 if weight_scale is None:
                     pending_fp8_weights[key] = (
                         param,
-                        loaded_weight,
+                        own_pending_tensor(loaded_weight),
                         weight_name,
                         shard_id,
                         expert_id,
@@ -632,7 +641,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             with pending_fp8_lock:
                 pending = pending_fp8_weights.pop(key, None)
                 if pending is None:
-                    pending_fp8_weight_scales[key] = loaded_weight
+                    pending_fp8_weight_scales[key] = own_pending_tensor(loaded_weight)
                     return
 
             log_quantization_start()

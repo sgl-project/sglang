@@ -19,13 +19,15 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_triton import (
-    fused_post_expert_norm_weighted_sum,
-)
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm import (
+from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce import (
     FusedPostExpertNormWeightedSumTRTLLM,
 )
-from sglang.kernels.ops.muse_spark.norm_fp4_quant import fused_norm_fp4_quant
+from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
+    fused_norm_fp4_quant,
+)
+from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
+    fused_post_expert_norm_weighted_sum,
+)
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
@@ -35,7 +37,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils.common import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+    from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,
     )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -106,11 +108,13 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.top_k = top_k
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
+        self.moe_runner_backend = _resolve_moe_runner_backend()
         # SwiGLU, and no routed_scaling here -- Muse folds its route_scale into
         # the topk weights before they reach us.
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=num_local_experts,
+            runner_backend=self.moe_runner_backend,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size,
             top_k=top_k,
@@ -125,7 +129,6 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.dispatcher = _DirectDispatcher()
 
         capability = get_device_capability() if is_cuda() else None
-        self.moe_runner_backend = _resolve_moe_runner_backend()
         self.use_marlin = self.moe_runner_backend.is_marlin()
         self._sm_major = capability[0] if capability is not None else 0
         if not self.use_marlin and capability is not None and capability < (10, 0):
@@ -384,6 +387,9 @@ class MuseSpark1xFp4Experts(nn.Module):
         from sglang.kernels.ops.activation.activation import silu_and_mul
         from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            _map_topk_ids_to_local_experts,
+        )
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
         hidden_states = hidden_states.contiguous()
@@ -395,7 +401,7 @@ class MuseSpark1xFp4Experts(nn.Module):
 
         local_topk_ids = topk_ids.to(torch.int32)
         if expert_map is not None:
-            local_topk_ids = expert_map[local_topk_ids]
+            local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
         local_topk_ids = local_topk_ids.contiguous()
         topk_weights = topk_scores.to(torch.float32).contiguous()
 
@@ -427,13 +433,13 @@ class MuseSpark1xFp4Experts(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        cache13 = torch.empty(
-            (num_tokens * topk * max(gemm1_n, size_k),),
+        cache13 = torch.zeros(
+            (num_tokens * topk * (gemm1_n + size_k),),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         cache1 = cache13[: num_tokens * topk * gemm1_n].view(-1, gemm1_n)
-        cache3 = cache13[: num_tokens * topk * size_k].view(-1, size_k)
+        cache3 = cache13[num_tokens * topk * gemm1_n :].view(-1, size_k)
 
         cache1 = moe_wna16_marlin_gemm(
             hidden_states,
@@ -522,6 +528,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
             hidden_states, topk_scores, topk_ids
         )
+        topk_scores = topk_scores.masked_fill(local_topk_ids < 0, 0.0)
         if self._post_expert_norm is not post_expert_norm:
             self.set_post_expert_norm(post_expert_norm)
         if self._post_expert_norm_weight is not None:
