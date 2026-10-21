@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -798,6 +798,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if fused_static is not None and onorm_gate is not None:
                 f_b_weight, norm_weight, norm_eps, a_log = fused_static
@@ -808,7 +809,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 out = mixed_qkv.new_empty(
                     (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
                 )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                if fused_ops is not None and fused_ops.covered(
                     a,
                     f_b_weight,
                     mixed_qkv,
@@ -819,7 +820,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     output_gate,
                     norm_weight,
                 ):
-                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                    core_attn_out = fused_ops.run(
                         f_a=a,
                         f_b_weight=f_b_weight,
                         mixed_qkv=mixed_qkv,
