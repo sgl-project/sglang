@@ -111,9 +111,13 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
         super().__init__(config, **kwargs)
         self.use_fp32_output = True
 
-    def _compute_lm_head(self, hidden_states, lm_head, embedding_bias=None):
-        if not hasattr(lm_head, "weight"):
-            return super()._compute_lm_head(hidden_states, lm_head, embedding_bias)
+    def _compute_lm_head(
+        self, hidden_states, lm_head, embedding_bias=None, *, out=None
+    ):
+        if out is not None or not hasattr(lm_head, "weight"):
+            return super()._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=out
+            )
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
         if use_intel_amx_backend(lm_head):
             # ParallelLMHead swaps in PackWeightMethod on CPU+AMX, which repacks

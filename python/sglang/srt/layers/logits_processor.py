@@ -915,16 +915,10 @@ class LogitsProcessor(nn.Module):
         direct_buffer = self._direct_fp32_logits_buffer(
             hidden_states, lm_head, logits_metadata, embedding_bias, use_logits_buffer
         )
-        if direct_buffer is not None:
-            logits = torch.mm(
-                hidden_states,
-                lm_head.weight.T,
-                out_dtype=torch.float32,
-                out=direct_buffer,
+        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
+            logits = self._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=direct_buffer
             )
-        else:
-            with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -1107,6 +1101,8 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
@@ -1116,7 +1112,14 @@ class LogitsProcessor(nn.Module):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if self.use_fp32_lm_head:
+            if out is not None:
+                logits = torch.mm(
+                    hidden_states,
+                    lm_head.weight.T,
+                    out_dtype=torch.float32,
+                    out=out,
+                )
+            elif self.use_fp32_lm_head:
                 # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
                 # inputs. Retain explicit FP32 casts for unsupported devices or
                 # dtype combinations.
