@@ -267,12 +267,13 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
+        q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            q,
             data.k_cache,
             data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
+            lens,
+            table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
@@ -344,12 +345,13 @@ class SparseTableBackend:
         topk_plans = metadata.topk_metadata_chunks
         assert not metadata.use_topk_v2 or topk_plans is not None
         for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+            q, lens, table = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
-                (data.q_fp4[rows], data.q_sf[rows]),
+                q,
                 data.k_cache,
                 data.weights[rows],
-                metadata.compressed_seq_lens[rows],
-                metadata.page_table[rows],
+                lens,
+                table,
                 plan,
                 metadata.max_compressed_seq_len,
             )

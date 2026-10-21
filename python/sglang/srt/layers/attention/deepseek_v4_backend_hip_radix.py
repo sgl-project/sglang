@@ -28,9 +28,9 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     sparse_buffers,
     widen_pair_i64,
 )
-from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
-    CandidateBlocks,
-    slice_candidate_blocks,
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    late_layer_tail_layout,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     HEAD_DIM as SWAPAB_HEAD_DIM,
@@ -44,7 +44,9 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     SOFTMAX_SCALE as SWAPAB_SOFTMAX_SCALE,
 )
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -55,10 +57,6 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    late_layer_tail_layout,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -689,6 +687,8 @@ class DSV4Metadata:
     low_ratio_pos_i64: Optional[torch.Tensor] = None
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
+    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
+    q_pad_captured: bool = False
     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
     fp4_low_ratio_decode_workspaces: Dict[
         int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
@@ -744,7 +744,10 @@ class DSV4Metadata:
         )
 
     # allocated inside a captured segment (graph-pool storage), so a refresh must keep it
-    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = ("q_pad_buffer",)
+    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "q_pad_buffer",
+        "q_pad_captured",
+    )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -885,6 +888,7 @@ class DeepseekV4HipRadixBackend(
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
@@ -973,7 +977,7 @@ class DeepseekV4HipRadixBackend(
         )
         if self.enable_decoder_swa_bounded_replay:
             # both read the store target off the full batch, not the tail metadata
-            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
                 is_unified_kv_triton,
             )
 
@@ -981,10 +985,10 @@ class DeepseekV4HipRadixBackend(
                 raise NotImplementedError(
                     "decoder SWA bounded replay is not wired for unified_kv_triton"
                 )
-        # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
+        # the model switches onto it at the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
-        # Read by the shared forward_low_ratio_sources; the ROCm tail starts after
-        # the source layer, so nothing sets it.
+        # The source layer whose KV write_tail_source_kv wrote for every row; cleared in
+        # exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -1185,7 +1189,7 @@ class DeepseekV4HipRadixBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
 
-        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
             ExpandPrefillCausally,
         )
 
@@ -1430,7 +1434,7 @@ class DeepseekV4HipRadixBackend(
         """Whether the V4.1 DSpark draft block takes the block-window metadata; DSv4's
         draft keeps the causal verify indices, and unified_kv addresses its ring by
         (slot, position) and keeps its own path."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2307,60 +2311,23 @@ class DeepseekV4HipRadixBackend(
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
-        return value. Each request's candidate mask is cut to its tail rows."""
+        return value. The source layer runs inside the tail and publishes its top-k and
+        candidates on the tail rows, so nothing is carried over from the full rows."""
+        assert self.tail_source_kv_layer_id is not None, (
+            "write_tail_source_kv must run before enter_late_layer_tail"
+        )
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)
-        tail = tail_metadata.late_layer_tail
-        tail_lens_cpu = tail.extend_seq_lens_cpu
-        if isinstance(self.candidate_masks, list) and self.candidate_masks:
-            # the last tail_len rows of each request's candidate publication
-            self.candidate_masks = [
-                (
-                    None
-                    if mask is None
-                    else (
-                        slice_candidate_blocks(
-                            mask, slice(mask.ids.shape[0] - t, mask.ids.shape[0])
-                        )
-                        if isinstance(mask, CandidateBlocks)
-                        else mask[mask.shape[0] - t :]
-                    )
-                )
-                for mask, t in zip(self.candidate_masks, tail_lens_cpu)
-            ]
-        # the consumers after the switch read the tail buffers, so carry the last source's rows over
-        full_core = saved[0].core_attn_metadata
-        tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                tail_buf[: rows.shape[0]].copy_(rows)
-                if tail.pad_rows:
-                    tail_buf[rows.shape[0] :].fill_(0 if tail_buf.ndim == 1 else -1)
         self.forward_metadata = tail_metadata
         window = self.token_to_kv_pool.request_window
         if window is not None:
-            window.activate(tail_core.request_window_layout)
+            window.activate(tail_metadata.core_attn_metadata.request_window_layout)
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
         self.forward_metadata, self.candidate_masks = saved
+        self.tail_source_kv_layer_id = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(
@@ -2420,7 +2387,7 @@ class DeepseekV4HipRadixBackend(
             self._refresh_fp4_prefill_workspace(forward_batch)
             assert isinstance(self.forward_metadata, DSV4Metadata)
             return self.forward_metadata
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2568,7 +2535,7 @@ class DeepseekV4HipRadixBackend(
         """fp8 unified_kv asm decode: per-stream KV bound for the split plan
         and, at init (outside capture, before warmup), the constant split
         table and the HCA persistent workspace."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
         )
 
@@ -2603,7 +2570,7 @@ class DeepseekV4HipRadixBackend(
     ) -> None:
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -2737,7 +2704,7 @@ class DeepseekV4HipRadixBackend(
         num_tokens: int,
         exact_num_tokens: bool = True,
     ) -> None:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2805,6 +2772,7 @@ class DeepseekV4HipRadixBackend(
         wo_a_quant_freqs (fp8 decode): return the inverse-RoPE'd wo_a mxfp8
         operands instead of the attention output."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
@@ -2837,7 +2805,7 @@ class DeepseekV4HipRadixBackend(
             if save_kv_cache:
                 # Only verify reaches this under fp8; plain decode's rows are
                 # written by the fused kernel itself, which leaves kv None.
-                runtime.store_swa_into_unified(
+                dsv4_unified_kv_store.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
                     positions=positions,
@@ -2951,7 +2919,7 @@ class DeepseekV4HipRadixBackend(
                     ),
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
-                _kv_splits_for_stream,
+                kv_splits_for_stream,
             )
 
             return runtime.decode(
@@ -2963,7 +2931,7 @@ class DeepseekV4HipRadixBackend(
                 softmax_scale=self.softmax_scale,
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
-                kv_splits=_kv_splits_for_stream(compress_ratio),
+                kv_splits=kv_splits_for_stream(compress_ratio),
             )
 
         # prefill / extend
@@ -3049,7 +3017,7 @@ class DeepseekV4HipRadixBackend(
             n_real = kv.shape[0] if _cp_active else state_slot_full.shape[0]
             # the store launches one program per kv row and never checks these lengths
             assert min(state_slot_full.shape[0], positions_full.shape[0]) >= n_real
-            runtime.store_swa_into_unified(
+            dsv4_unified_kv_store.store_swa_into_unified(
                 kv=kv[:n_real],
                 state_slot=state_slot_full[:n_real],
                 positions=positions_full[:n_real],
@@ -3218,7 +3186,7 @@ class DeepseekV4HipRadixBackend(
         cache = state.cache
         num_swa_rows = cache.swa_token_ids.shape[0]
         swa_rows = self.opus_prefill_workspace.get(num_swa_rows)
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -3267,7 +3235,7 @@ class DeepseekV4HipRadixBackend(
             )
             num_rows = gather.flat_token_ids.shape[0]
             rows = self.opus_compressed_workspaces[compress_ratio].get(num_rows)
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 c_cache,
                 gather.flat_token_ids,
                 page_size=c_page_size,
@@ -3321,7 +3289,7 @@ class DeepseekV4HipRadixBackend(
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

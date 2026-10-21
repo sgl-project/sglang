@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
@@ -52,7 +52,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 MAX_CTX = 1024
 
 
@@ -94,6 +94,7 @@ class _Fixture:
             reqs=reqs,
             encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
+            req_pool_indices_cpu=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
             extend_num_tokens=self.extend_num_tokens,
