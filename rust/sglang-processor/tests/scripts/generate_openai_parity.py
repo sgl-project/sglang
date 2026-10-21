@@ -40,6 +40,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers.common import get_context_length
@@ -58,6 +59,8 @@ UNREAD_META = {
     "num_retractions",
     "dp_rank",
 }
+# What each `/generate` stream frame repeats in full; fixtures keep only what a frame adds.
+GROWING = {"text", "output_ids", "output_token_logprobs", "output_top_logprobs"}
 # The bare request of each endpoint; cases keep only the sampling params they change.
 BARE_REQUESTS = {
     "completions": {"prompt": "x"},
@@ -107,6 +110,45 @@ def trim_meta(output):
     return output
 
 
+def frame_delta(prev, frame):
+    """`frame` as stored: `index`, what it appends to `GROWING` and the keys that changed."""
+    delta = {}
+    for key, value in frame.items():
+        if key in GROWING:
+            delta[key] = value[len(prev[key]) :]
+        elif key == "meta_info":
+            delta[key] = frame_delta(prev[key], value)
+        elif key == "index" or prev.get(key) != value:
+            delta[key] = value
+    assert frame_merge(prev, delta) == frame
+    return delta
+
+
+def frame_merge(prev, delta):
+    frame = dict(prev)
+    for key, value in delta.items():
+        if key in GROWING:
+            frame[key] = prev[key] + value
+        elif key == "meta_info":
+            frame[key] = frame_merge(prev[key], value)
+        else:
+            frame[key] = value
+    return frame
+
+
+def stream_frames(frames, store):
+    """Each choice's stream frames as stored (`store`) or as the engine sent them."""
+    last, out = {}, []
+    for frame in frames:
+        prev = last.get(frame.get("index"))
+        if prev is not None and "meta_info" in frame:
+            out.append(frame_delta(prev, frame) if store else frame_merge(prev, frame))
+        else:
+            out.append(frame)
+        last[frame.get("index")] = frame if store else out[-1]
+    return out
+
+
 def record_frames(engine_url, body):
     response = requests.post(
         f"{engine_url}/generate", json=body, stream=body.get("stream")
@@ -117,7 +159,9 @@ def record_frames(engine_url, body):
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("data: ") and line != "data: [DONE]":
             frames.append(json.loads(line[len("data: ") :]))
-    return {"status": 200, "frames": frames}
+    # Unread keys can appear in one frame only, which deltas cannot express.
+    trim_meta({"frames": frames})
+    return {"status": 200, "frames": stream_frames(frames, store=True)}
 
 
 def replay(output):
@@ -137,7 +181,7 @@ def replay(output):
                 raise ValueError(body["error"]["message"])
             yield internal(json.loads(json.dumps(body)))
             return
-        for frame in json.loads(json.dumps(output["frames"])):
+        for frame in json.loads(json.dumps(stream_frames(output["frames"], False))):
             if "error" in frame:
                 raise ValueError(frame["error"]["message"])
             yield internal(frame)
@@ -145,11 +189,16 @@ def replay(output):
     return generate_request
 
 
+def event_json(event):
+    data = event.removeprefix("data: ").strip()
+    return data if data == "[DONE]" else json.loads(data)
+
+
 async def openai_response(handler, request, raw_request):
     response = await handler.handle_request(request, raw_request)
     if isinstance(response, StreamingResponse):
         events = [chunk async for chunk in response.body_iterator]
-        return {"events": events}
+        return {"events": [event_json(event) for event in events]}
     if isinstance(response, Response):
         return {"status": response.status_code, "body": json.loads(response.body)}
     return {"status": 200, "body": jsonable_encoder(response)}
@@ -175,7 +224,7 @@ def lower(case, settings, model):
         create_abort_task=lambda obj: None,
     )
     # A checkpoint without a Jinja template, as DeepSeek-V4's.
-    template_manager = SimpleNamespace(
+    template_manager = model.template_manager or SimpleNamespace(
         completion_template_name=settings.get("completion_template"),
         chat_template_name=None,
         jinja_template_content_format="string",
@@ -217,13 +266,28 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
+def load_template_manager(path, tokenizer):
+    """The server's `TemplateManager` for a checkpoint with a Jinja template."""
+    if not tokenizer.chat_template:
+        return None
+    manager = TemplateManager()
+    owner = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    manager.load_chat_template(owner, None, path)
+    return manager
+
+
 def load_model(path):
     config = json.loads(Path(path, "config.json").read_text())
-    generation = json.loads(Path(path, "generation_config.json").read_text())
+    generation_file = Path(path, "generation_config.json")
+    generation = (
+        json.loads(generation_file.read_text()) if generation_file.exists() else {}
+    )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
+    tokenizer = get_tokenizer(path, trust_remote_code=True)
     return SimpleNamespace(
         path=path,
-        tokenizer=get_tokenizer(path, trust_remote_code=True),
+        tokenizer=tokenizer,
+        template_manager=load_template_manager(path, tokenizer),
         hf_config=SimpleNamespace(**config, to_dict=lambda: config),
         text_config=SimpleNamespace(**config.get("text_config", config)),
         sampling_defaults={
@@ -239,11 +303,29 @@ def generate(path, model, engine_url):
         "context_length": get_context_length(model.text_config),
         "generation_config": model.sampling_defaults,
     }
+    config = model.template_manager and model.template_manager.reasoning_config
+    if config is not None and config.special_case == "always":
+        fixture["chat_model"]["always_thinks"] = True
+    elif (
+        config is not None
+        and config.toggle_param
+        and config.default_enabled is not None
+    ):
+        fixture["chat_model"]["reasoning_toggle"] = {
+            "toggle_param": config.toggle_param,
+            "default_enabled": config.default_enabled,
+        }
     defaults = generate_defaults()
     fixture["generate_defaults"] = {
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS
     }
     settings = fixture.get("settings", {})
+    # The encoder SGLang renders with; its OpenAI layer special-cases `kimi_k3`.
+    handler = lower(
+        {"endpoint": "chat", "request": BARE_REQUESTS["chat"]}, settings, model
+    )[0]
+    if handler.chat_encoding_spec is not None:
+        fixture["chat_model"]["chat_encoding_spec"] = handler.chat_encoding_spec
     fixture["sampling_defaults"] = {
         endpoint: lower({"endpoint": endpoint, "request": bare}, settings, model)[
             2

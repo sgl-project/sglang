@@ -80,10 +80,19 @@ class StreamingSession:
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
             return None
         return slot
+
+    def will_lend_record(self, req: Optional[Req]) -> bool:
+        """Whether req has a slot record to borrow. Unlike find_active_slot, it
+        leaves a pre-aborted req attached."""
+        if not _is_streaming(req) or req.to_finish is not None:
+            return False
+        slot = self.slots.get(req.session.session_id)
+        return slot is not None and slot.kv.holds_kv
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -160,6 +169,7 @@ class StreamingSession:
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 

@@ -27,6 +27,7 @@ import random
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -45,7 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -132,6 +133,17 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue.enqueue(self._store(1, None, session_id="session-a"))
         queue.enqueue(self._store(2, 1, session_id="session-b"))
         self.assertEqual(len(queue.take()), 2)
+
+
+class TestLoRANameTable(unittest.TestCase):
+    def test_resolves_the_lora_id_suffix_of_extra_key(self):
+        lora_id = "0123456789abcdef0123456789abcdef"
+        table = LoRANameTable()
+        table.register(lora_id=lora_id, lora_name="adapter-a")
+
+        # Req adds lora_id to the end of the extra_key from the caller.
+        self.assertEqual(table.resolve("tenant-" + lora_id), "adapter-a")
+        self.assertIsNone(table.resolve("tenant-" + "f" * 32))
 
 
 class TestRadixKey(unittest.TestCase):
@@ -493,7 +505,9 @@ class TestRadixCache(CustomTestCase):
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
 
-    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+    def _checkpoint_split_request(self, priority):
+        """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
+
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -521,7 +535,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
-            priority=0,
+            priority=priority,
             last_node=cache.root_node,
             lock=None,
         )
@@ -530,9 +544,17 @@ class TestRadixCache(CustomTestCase):
         cache.checkpoint(req, up_to=up_to)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
         cache.unlock(req.lock)
+        return cache, prompt_ids, output_ids
 
+    @staticmethod
+    def _split_nodes(cache):
         (prompt_node,) = cache.root_node.children.values()
         (output_node,) = prompt_node.children.values()
+        return prompt_node, output_node
+
+    def test_finished_request_splits_prompt_from_output_for_eviction(self):
+        cache, prompt_ids, output_ids = self._checkpoint_split_request(priority=0)
+        prompt_node, output_node = self._split_nodes(cache)
         self.assertEqual(len(prompt_node.key), len(prompt_ids))
         self.assertEqual(len(output_node.key), len(output_ids))
 
@@ -542,6 +564,15 @@ class TestRadixCache(CustomTestCase):
             MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
         )
         self.assertEqual(match.device_prefix_len, len(prompt_ids))
+
+    def test_prompt_priority_boost_saturates_at_int64_max(self):
+        """The prompt is kept one priority above the request; priorities are
+        signed 64-bit integers, so at INT64_MAX the boost saturates."""
+        int64_max = torch.iinfo(torch.int64).max
+        cache, _, _ = self._checkpoint_split_request(priority=int64_max)
+        prompt_node, output_node = self._split_nodes(cache)
+        self.assertEqual(prompt_node.priority, int64_max)
+        self.assertEqual(output_node.priority, int64_max)
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""
@@ -782,6 +813,103 @@ class TestRadixCache(CustomTestCase):
                 )
             self.assertEqual(published[0], published[1])
             self.assertIsNotNone(published[1][-1][0])
+
+    def test_dynamo_format_separates_lora_blocks_from_base_blocks(self):
+        """Adapter blocks and base blocks with the same tokens share block hashes in
+        the default format. The dynamo format gives them different hashes."""
+        lora_id = "0123456789abcdef0123456789abcdef"
+        lora_names = LoRANameTable()
+        lora_names.register(lora_id=lora_id, lora_name="adapter-a")
+        tokens = [1, 2, 3, 4]
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
+            dynamo_kv_event_format=True,
+            kv_event_lora_names=lora_names,
+        )
+        for extra_key in (None, lora_id):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens), extra_key=extra_key),
+                    value=torch.tensor(tokens, dtype=torch.int64),
+                )
+            )
+
+        base, lora = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertNotEqual(lora.block_hashes, base.block_hashes)
+        self.assertEqual(lora.lora_name, "adapter-a")
+
+        cache.evict(EvictParams(num_tokens=2 * len(tokens)))
+        removed = [
+            block_hash
+            for event in cache.take_events()
+            if isinstance(event, BlockRemoved)
+            for block_hash in event.block_hashes
+        ]
+        self.assertCountEqual(removed, base.block_hashes + lora.block_hashes)
+
+    def test_dynamo_format_parent_link_survives_node_split(self):
+        cache = RadixCache.create_simulated(
+            page_size=2, enable_kv_cache_events=True, dynamo_kv_event_format=True
+        )
+        for tokens in ([1, 2, 3, 4], [1, 2, 9, 10]):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens), extra_key="lora-a"),
+                    value=torch.tensor(tokens, dtype=torch.int64),
+                )
+            )
+        first, branch = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(branch.parent_block_hash, first.block_hashes[0])
+
+    def test_base_request_with_empty_lora_path_keeps_base_hashes(self):
+        """lora_path="" resolves to no adapter; it must not namespace the
+        base-model blocks published after it."""
+        published = []
+        for register_empty in (False, True):
+            cache = RadixCache.create_simulated(
+                page_size=2, enable_kv_cache_events=True
+            )
+            if register_empty:
+                base_req = SimpleNamespace(extra_key=None, lora_id=None)
+                cache.kv_events.lora_names.register(base_req, "")
+            cache.insert(InsertParams(key=RadixKey(array("q", [1, 2, 3, 4]))))
+            published.append(
+                [
+                    (event.lora_name, tuple(event.block_hashes))
+                    for event in cache.take_events()
+                    if isinstance(event, BlockStored)
+                ]
+            )
+        self.assertEqual(published[0], published[1])
+
+    def test_loaded_adapter_id_does_not_namespace_a_base_request(self):
+        """A base request's user extra_key cannot borrow a loaded adapter's hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        published = []
+        for namespace in (None, extra_key):
+            cache = RadixCache.create_simulated(
+                page_size=2, enable_kv_cache_events=True
+            )
+            cache.kv_events.lora_names.register(
+                lora_id=extra_key, lora_name="adapter-a"
+            )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2, 3, 4]), extra_key=namespace)
+                )
+            )
+            published.append(
+                [
+                    (event.lora_name, tuple(event.block_hashes))
+                    for event in cache.take_events()
+                    if isinstance(event, BlockStored)
+                ]
+            )
+        self.assertEqual(published[0], published[1])
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)

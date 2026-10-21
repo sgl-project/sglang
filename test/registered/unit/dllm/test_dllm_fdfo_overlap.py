@@ -118,12 +118,14 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         direct = SimpleNamespace(
             batch_size=2,
             input_ids=input_ids.clone().reshape(-1),
+            dllm_prompt_mask=None,
         )
         algo.step(direct, logits, [None, None])
 
         batched = SimpleNamespace(
             batch_size=2,
             input_ids=input_ids.clone().reshape(-1),
+            dllm_prompt_mask=None,
         )
         result = algo._run_fdfo(_Runner(logits), batched, None)
 
@@ -140,7 +142,9 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         for tensor_done in (False, True):
             with self.subTest(tensor_done=tensor_done):
                 algo = _low_confidence()
-                batch = SimpleNamespace(batch_size=2, input_ids=torch.zeros(8))
+                batch = SimpleNamespace(
+                    batch_size=2, input_ids=torch.zeros(8), dllm_prompt_mask=None
+                )
                 runner = _Runner(torch.zeros(8, 6))
                 done = [[True, False], [True, True]]
                 if tensor_done:
@@ -169,7 +173,9 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
     def test_result_snapshot_survives_next_step(self):
         algo = _low_confidence()
         inputs = torch.tensor([[2, 0, 0, 0]])
-        batch = SimpleNamespace(batch_size=1, input_ids=inputs.flatten())
+        batch = SimpleNamespace(
+            batch_size=1, input_ids=inputs.flatten(), dllm_prompt_mask=None
+        )
         result = algo.run(_Runner(_logits_for(inputs, 6)), batch)
         batch.input_ids.fill_(5)
         self.assertEqual(result.block_tokens.tolist(), [[2, 1, 1, 1]])
@@ -178,7 +184,9 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
     def test_fdfo_commits_only_after_forward_on_final_tokens(self):
         algo = _low_confidence()
         ids = torch.tensor([[2, 0, 0, 0]])
-        batch = SimpleNamespace(batch_size=1, input_ids=ids.flatten())
+        batch = SimpleNamespace(
+            batch_size=1, input_ids=ids.flatten(), dllm_prompt_mask=None
+        )
         runner = _Runner(_logits_for(ids, 6))
         result = algo.run(runner, batch)
         self.assertEqual(result.block_tokens.tolist(), [[2, 1, 1, 1]])
@@ -194,7 +202,9 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         # Both masked positions stay under the 0.5 threshold. Position 1 is higher.
         logits[0, 0, 1] = 0.2
         logits[0, 1, 2] = 0.4
-        batch = SimpleNamespace(batch_size=2, input_ids=input_ids.clone().reshape(-1))
+        batch = SimpleNamespace(
+            batch_size=2, input_ids=input_ids.clone().reshape(-1), dllm_prompt_mask=None
+        )
 
         done = algo.step(batch, logits.reshape(-1, 6), [None, None])
 
@@ -322,7 +332,9 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         worker = SimpleNamespace(dllm_algorithm=algo, model_runner=runner)
         result = TpModelWorker._forward_batch_generation_dllm(
             worker,
-            SimpleNamespace(batch_size=1, input_ids=inputs.flatten()),
+            SimpleNamespace(
+                batch_size=1, input_ids=inputs.flatten(), dllm_prompt_mask=None
+            ),
             SimpleNamespace(reqs=[req]),
         )
         self.assertGreater(req.dllm_block_id, first_id)
@@ -336,7 +348,10 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
             model_runner=_Runner(_logits_for(inputs, 6)),
         )
         result = TpModelWorker._forward_batch_generation_dllm(
-            worker, SimpleNamespace(batch_size=1, input_ids=inputs.flatten())
+            worker,
+            SimpleNamespace(
+                batch_size=1, input_ids=inputs.flatten(), dllm_prompt_mask=None
+            ),
         )
         self.assertIsNone(result.dllm_block_ids)
 

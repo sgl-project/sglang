@@ -140,10 +140,10 @@ class SchedulerDllmMixin:
                     "q", next_token_ids
                 )
 
-                len_input = len(req.origin_input_ids)
-                if len_fill > len_input:
-                    if len_fill - block_size < len_input:
-                        next_token_ids = next_token_ids[len_input - len_fill :]
+                committed_len = len(req.origin_input_ids) + len(req.output_ids)
+                if len_fill > committed_len:
+                    if len_fill - block_size < committed_len:
+                        next_token_ids = next_token_ids[committed_len - len_fill :]
 
                     has_new_tokens = True
                     self.metrics_reporter.num_generated_tokens += len(next_token_ids)
@@ -386,7 +386,10 @@ class SchedulerDllmMixin:
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, num_held_rows=num_held_rows
+            ):
                 running_batch.batch_is_full = True
 
             # Try preemption if batch is full

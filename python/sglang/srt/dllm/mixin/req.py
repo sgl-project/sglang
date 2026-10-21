@@ -26,6 +26,7 @@ class ReqDllmMixin:
         self.dllm_block_done = False
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.dllm_has_literal_mask = False
 
         if self.dllm_config is not None:
             if self.dllm_config.requires_separate_context_encoding:
@@ -59,9 +60,11 @@ class ReqDllmMixin:
             return
 
         block_end = prefix_length + self.dllm_config.block_size
+        # Retraction re-encodes committed outputs before opening a new block.
+        committed_len = len(self.origin_input_ids) + len(self.output_ids)
         self.dllm_phase = (
             DllmReqPhase.STAGING_PREFILL
-            if block_end <= len(self.origin_input_ids)
+            if block_end <= committed_len
             else DllmReqPhase.STAGING_DECODE
         )
 
@@ -76,6 +79,14 @@ class ReqDllmMixin:
             # (add_dllm_staging_req) before this req is scheduled, mirroring the
             # non-incomplete path which also defers it to the adder.
             return
+
+        if not self.dllm_initialized:
+            # Committed tokens are immutable, so a literal mask ID among them
+            # needs the explicit prompt mask. Recomputed after retraction.
+            mask_id = self.dllm_config.mask_id
+            self.dllm_has_literal_mask = (
+                mask_id in self.origin_input_ids or mask_id in self.output_ids
+            )
 
         if self.dllm_config.requires_separate_context_encoding:
             self.refresh_fill_ids()

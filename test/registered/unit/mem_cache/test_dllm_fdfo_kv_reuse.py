@@ -1,4 +1,4 @@
-"""Tests dLLM FDFO KV slot reuse in alloc_for_extend."""
+"""Tests dLLM KV reuse and committed-token boundaries."""
 
 import unittest
 from array import array
@@ -10,14 +10,18 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,6 +39,16 @@ class _FakeAllocator:
 
     def available_size(self):
         return 1 << 30
+
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        *,
+        conservative_num_tokens,
+        shard_size,
+    ):
+        return conservative_num_tokens
 
     def alloc(self, need_size):
         self.alloc_calls.append(need_size)
@@ -109,6 +123,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
+        hisparse_coordinator=None,
         prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
@@ -232,7 +247,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
             self.assertRaises(SelectionComplete),
         ):
             unwrap(Scheduler.get_next_batch_to_run)(
-                scheduler, SimpleNamespace(is_prefill_only=False), None
+                scheduler, ScheduleBatch(reqs=[], dllm_config=req.dllm_config), None
             )
         return selected[0]
 
@@ -539,6 +554,228 @@ class TestDllmFdfoResolvedBlockKeepsRow(CustomTestCase):
         self.assertTrue(req.kv.holds_kv)
         self.assertEqual(req.kv.req_pool_idx, row)
         self.assertNotIn(row, pool.free_slots)
+
+
+class TestDllmCommittedTokens(unittest.TestCase):
+    @staticmethod
+    def make_req(prompt, output=()):
+        req = Req(
+            rid="committed-tokens",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(max_new_tokens=16, temperature=0),
+            vocab_size=128,
+            dllm_config=DllmConfig("LowConfidence", {}, 4, 99, 4),
+        )
+        req.sampling_params.normalize(None)
+        req.output_ids.extend(output)
+        return req
+
+    def test_cache_lookup_stops_before_partial_prompt_and_synthetic_masks(self):
+        # A different request legitimately cached these literal mask IDs. Only
+        # the first complete block belongs to this request's committed prefix.
+        cache = RadixCache.create_simulated(page_size=4)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 99, 99, 99])),
+                value=torch.arange(8),
+            )
+        )
+        req = self.make_req([1, 2, 3, 4, 5])
+        req.init_next_round_input(cache)
+        self.assertEqual(req.prefix_len, 4)
+        self.assertEqual(req.dllm_block_offset, 4)
+        self.assertFalse(req.is_dllm_prefill())
+        self.assertFalse(req.dllm_has_literal_mask)
+        self.assertEqual(list(req.full_untruncated_fill_ids[4:8]), [5, 99, 99, 99])
+
+    def test_retraction_reencodes_committed_outputs_before_denoising(self):
+        req = self.make_req([1, 99, 2], [7, 99, 8, 9, 10])
+        req.reset_for_retract()
+        req.init_next_round_input()
+        self.assertEqual(list(req.output_ids), [7, 99, 8, 9, 10])
+        self.assertTrue(req.dllm_has_literal_mask)
+        self.assertTrue(req.is_dllm_prefill())
+        # The second complete block consists of already-emitted output tokens.
+        req.prefix_len = 4
+        req.determine_dllm_phase()
+        self.assertTrue(req.is_dllm_prefill())
+        req.prefix_len = 8
+        req.determine_dllm_phase()
+        self.assertFalse(req.is_dllm_prefill())
+
+    def test_repeated_denoise_passes_do_not_subtract_cache_hits(self):
+        req = self.make_req([1, 2, 3, 4, 5])
+        req._init_fill_ids_for_dllm()
+        req.prefix_len = 4
+        req.extend_end = 8
+        req.already_computed = 8
+        req.cached_tokens = 4
+        req._cache_breakdown_computed = True
+        batch = ScheduleBatch(
+            reqs=[req],
+            device="cpu",
+            dllm_config=req.dllm_config,
+            model_config=SimpleNamespace(is_encoder_decoder=False, vocab_size=128),
+        )
+        execution = SimpleNamespace(
+            features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
+            mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        # Allocation and sampling are collaborators; exercise the scheduler's
+        # real cache accounting on two revisits of the same fixed-size block.
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.get_exec", return_value=execution
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
+            ),
+        ):
+            for _ in range(2):
+                batch.prepare_for_extend()
+                self.assertEqual(req.cached_tokens, 4)
+
+    def test_retracted_committed_and_partial_blocks_emit_only_new_tokens(self):
+        for fdfo in (False, True):
+            with self.subTest(fdfo=fdfo):
+                committed = self.make_req([1, 2, 3, 4], [7, 8, 9, 10])
+                partial = self.make_req([1, 2, 3], [7, 8])
+                for req in (committed, partial):
+                    req.dllm_config.first_done_first_out_mode = fdfo
+                    req.reset_for_retract()
+                    req.init_next_round_input()
+                    req.prefix_len = 4
+                    req.extend_end = 8
+                batch = ScheduleBatch(
+                    reqs=[committed, partial],
+                    device="cpu",
+                    dllm_config=committed.dllm_config,
+                    model_config=SimpleNamespace(
+                        is_encoder_decoder=False, vocab_size=128
+                    ),
+                )
+                execution = SimpleNamespace(
+                    features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+                )
+                with (
+                    patch(
+                        "sglang.srt.managers.schedule_batch.get_exec",
+                        return_value=execution,
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                        return_value=(
+                            torch.arange(8),
+                            torch.tensor([0, 1]),
+                            torch.tensor([0, 1]),
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
+                    ),
+                ):
+                    batch.prepare_for_extend()
+                # Re-encoding already-emitted outputs needs one forward and no
+                # denoising; the partial row still has three new positions.
+                self.assertTrue(committed.dllm_block_done)
+                self.assertFalse(partial.dllm_block_done)
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.dllm_config = committed.dllm_config
+                scheduler.model_config = SimpleNamespace(context_len=64)
+                scheduler.token_to_kv_pool_allocator = Mock()
+                scheduler.metrics_reporter = Mock(num_generated_tokens=0)
+                scheduler.output_streamer = Mock()
+                scheduler.process_batch_result_dllm(
+                    batch,
+                    GenerationBatchResult(
+                        next_token_ids=torch.tensor([[7, 8, 9, 10], [8, 11, 12, 13]]),
+                        dllm_block_done=torch.tensor([True, True]) if fdfo else None,
+                        dllm_block_ids=(committed.dllm_block_id, partial.dllm_block_id),
+                    ),
+                )
+                self.assertEqual(list(committed.output_ids), [7, 8, 9, 10])
+                self.assertEqual(list(partial.output_ids), [7, 8, 11, 12, 13])
+                self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 3)
+                self.assertTrue(partial.dllm_block_done)
+
+    def test_literal_prompt_masks_are_preserved_and_not_emitted(self):
+        class Runner:
+            def forward(self, batch, **kwargs):
+                logits = torch.zeros(4, 16)
+                logits[:, 7] = 20
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(full_logits=logits),
+                    can_run_graph=False,
+                )
+
+        for cls, vectorized in (
+            (LowConfidence, False),
+            (JointThreshold, False),
+            (JointThreshold, True),
+        ):
+            for fdfo in (False, True):
+                with self.subTest(
+                    algorithm=cls.__name__, vectorized=vectorized, fdfo=fdfo
+                ):
+                    algorithm = cls(
+                        DllmConfig(
+                            cls.__name__,
+                            {"vectorized_decoding": vectorized},
+                            4,
+                            15,
+                            1,
+                            fdfo,
+                        )
+                    )
+                    batch = SimpleNamespace(
+                        batch_size=1,
+                        input_ids=torch.tensor([15, 2, 15, 15]),
+                        dllm_prompt_mask=torch.tensor([[True, True, False, False]]),
+                    )
+                    states = None
+                    for _ in range(32):
+                        result = algorithm.run(Runner(), batch, states)
+                        states = result.algo_states
+                        self.assertEqual(batch.input_ids[:2].tolist(), [15, 2])
+                        if not fdfo or result.block_done.tolist() == [True]:
+                            break
+                    else:
+                        self.fail("denoising did not finish")
+                    self.assertEqual(batch.input_ids.tolist(), [15, 2, 7, 7])
+                    # The algorithm returns a full block; the scheduler owns
+                    # stripping immutable prompt tokens before emission.
+                    req = self.make_req([15, 2])
+                    req.dllm_config = DllmConfig(cls.__name__, {}, 4, 15, 1, fdfo)
+                    req.init_next_round_input()
+                    req.extend_end = 4
+                    scheduler = Scheduler.__new__(Scheduler)
+                    scheduler.dllm_config = req.dllm_config
+                    scheduler.model_config = SimpleNamespace(context_len=64)
+                    scheduler.token_to_kv_pool_allocator = Mock()
+                    scheduler.metrics_reporter = Mock(num_generated_tokens=0)
+                    scheduler.output_streamer = Mock()
+                    scheduler.process_batch_result_dllm(
+                        SimpleNamespace(
+                            reqs=[req],
+                            return_logprob=False,
+                            prefill_stats=None,
+                            dp_cooperation_info=None,
+                        ),
+                        GenerationBatchResult(
+                            next_token_ids=result.block_tokens,
+                            dllm_block_done=result.block_done,
+                            dllm_algo_state=result.algo_states,
+                            dllm_block_ids=(req.dllm_block_id,),
+                        ),
+                    )
+                    self.assertEqual(list(req.output_ids), [7, 7])
+                    self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 2)
 
 
 if __name__ == "__main__":

@@ -288,6 +288,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             waiting_queue=[],
             grammar_manager=[],
+            enable_fpm=False,
             enable_priority_scheduling=False,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
@@ -321,7 +322,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0
+                    disaggregation_decode_host_receive_threshold=1
                 ),
             ),
             patch(
@@ -419,7 +420,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0,
+                    disaggregation_decode_host_receive_threshold=1,
                     language_only=False,
                 ),
             ),

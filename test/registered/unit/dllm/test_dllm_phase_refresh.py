@@ -45,7 +45,7 @@ class _Scheduler(SchedulerDllmMixin):
         self.tree_cache = None
         self.truncation_align_size = config.block_size
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, running_bs, num_held_rows=0):
         return 16
 
     def _create_dllm_prefill_adder(self, *args, **kwargs):
@@ -177,6 +177,23 @@ class TestDllmPhaseRefresh(CustomTestCase):
                 req.determine_dllm_phase()
 
                 self.assertEqual(req.dllm_phase, expected)
+
+    def test_retracted_outputs_set_phase_before_input_initialization(self):
+        req = _req("retracted", _config(), prompt_len=16)
+        req.output_ids.extend([1] * 48)
+        req.reset_for_retract()
+        fill = req.full_untruncated_fill_ids[:]
+        for prefix_len, expected in (
+            (32, DllmReqPhase.STAGING_PREFILL),
+            (64, DllmReqPhase.STAGING_DECODE),
+        ):
+            with self.subTest(prefix_len=prefix_len):
+                req.prefix_len = prefix_len
+                req.determine_dllm_phase()
+                self.assertEqual(req.dllm_phase, expected)
+                self.assertFalse(req.dllm_initialized)
+                self.assertEqual(req.full_untruncated_fill_ids, fill)
+                self.assertEqual(list(req.output_ids), [1] * 48)
 
     def test_real_prompt_block_keeps_prefill_priority(self):
         config = _config()
