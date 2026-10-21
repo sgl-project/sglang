@@ -1436,6 +1436,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
+        self._moe_runner_backend = None
         if get_moe_runner_backend().is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -2063,6 +2064,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
+        runner_backend = self.get_moe_runner_backend(layer)
+        runner_is_aiter = runner_backend is not None and runner_backend.is_aiter()
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -2087,7 +2091,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
@@ -2098,16 +2102,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.is_shuffled = True
                 layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-            layer._aiter_gate_up_interleaved = False
+            if runner_is_aiter:
+                # Pre-shuffle weights
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
@@ -2913,8 +2918,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            # Direct kernels declare the layout they consume.
+            self._moe_runner_backend = moe_runner_backend
+
+    def get_moe_runner_backend(self, layer):
+        if self.runner is not None:
+            return self.runner.runner_backend
+        return self._moe_runner_backend
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
@@ -3208,6 +3218,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
+            routing_method_type = layer.routing_method_type
+            if routing_method_type is None:
+                routing_method_type = RoutingMethodType.DeepSeekV3
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -3215,10 +3229,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=int(
-                    getattr(layer, "routing_method_type", None)
-                    or RoutingMethodType.DeepSeekV3
-                ),
+                routing_method_type=int(routing_method_type),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 weight_block_k=(
