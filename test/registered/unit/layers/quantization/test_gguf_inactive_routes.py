@@ -357,131 +357,251 @@ class TestGgufInactiveRoutes(CustomTestCase):
             )
 
     @torch.inference_mode()
-    def test_musa_branch_avoids_input_copy_with_cuda_providers(self):
-        """MUSA Python masks preserve input storage and exclude inactive NaN rows.
+    def test_musa_branch_preserves_input_and_route_budgets(self):
+        """MUSA consumers exclude NaNs without input copies or route temporaries.
 
-        Coverage uses CUDA providers; native MUSA requires separate hardware.
+        CUDA execution covers Python dispatch; native MUSA runs in its own CI lane.
         """
         from sgl_kernel import gelu_and_mul as legacy_gelu_and_mul
         from sgl_kernel import silu_and_mul as legacy_silu_and_mul
+        from torch.utils._python_dispatch import TorchDispatchMode
 
-        for quant_type in (GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q8_0):
-            packed, _ = self._weights(quant_type)
-            for tokens in (3, 96):
-                for activation in ("silu", "gelu"):
-                    with self.subTest(
-                        quant_type=quant_type, tokens=tokens, activation=activation
-                    ):
-                        repeats = (tokens + 2) // 3
-                        ids = torch.tensor(
-                            [[0, 1], [1, -1], [-1, -1]],
-                            device="cuda",
-                            dtype=torch.int32,
-                        ).repeat(repeats, 1)[:tokens]
-                        weights = torch.tensor(
-                            [
-                                [0.25, 0.75],
-                                [0.5, float("nan")],
-                                [float("nan"), float("nan")],
-                            ],
-                            device="cuda",
-                        ).repeat(repeats, 1)[:tokens]
-                        inactive = ids < 0
-                        inputs = (
-                            torch.linspace(
-                                0.125, 2.0, tokens, device="cuda", dtype=torch.float16
-                            )
-                            .unsqueeze(1)
-                            .expand(tokens, 256)
-                            .contiguous()
-                        )
-                        inputs[inactive.all(dim=-1)] = float("nan")
-                        provider_name = (
-                            "ggml_moe_a8" if tokens > 64 else "ggml_moe_a8_vec"
-                        )
-                        native = (
-                            gguf_runtime.ggml_moe_a8
-                            if tokens > 64
-                            else gguf_runtime.ggml_moe_a8_vec
-                        )
-                        calls = 0
+        from sglang.kernels.ops.moe.gguf_moe_weights_aot import resolve_gguf_moe_weights
+        from sglang.srt.utils import is_musa
 
-                        def observe_projection(projection_input, *args, **kwargs):
-                            nonlocal calls
-                            if calls == 0:
-                                self.assertEqual(
-                                    projection_input.data_ptr(), inputs.data_ptr()
-                                )
-                            calls += 1
-                            return native(projection_input, *args, **kwargs)
-
-                        with (
-                            patch.object(gguf_runtime, "_is_cuda", False),
-                            patch.object(gguf_runtime, "_is_musa", True),
-                            patch.object(
-                                gguf_runtime, "silu_and_mul", legacy_silu_and_mul
-                            ),
-                            patch.object(
-                                gguf_runtime, "gelu_and_mul", legacy_gelu_and_mul
-                            ),
-                        ):
-                            expected = fused_moe_gguf(
-                                inputs.nan_to_num(),
-                                *packed,
-                                weights.masked_fill(inactive, 0),
-                                ids.clamp_min(0),
-                                quant_type,
-                                quant_type,
-                                activation,
-                            )
-                            with patch.object(
-                                gguf_runtime, provider_name, observe_projection
+        finalizer = resolve_gguf_moe_weights("musa" if is_musa() else "cuda")
+        finalizers = (None,) if finalizer is None else (None, finalizer)
+        for finalizer in finalizers:
+            with self.subTest(native_finalizer=finalizer is not None):
+                for quant_type in (
+                    GGMLQuantizationType.Q4_0,
+                    GGMLQuantizationType.Q8_0,
+                ):
+                    packed, _ = self._weights(quant_type)
+                    for tokens in (3, 96):
+                        for activation in ("silu", "gelu"):
+                            with self.subTest(
+                                quant_type=quant_type,
+                                tokens=tokens,
+                                activation=activation,
                             ):
-                                actual = fused_moe_gguf(
-                                    inputs,
-                                    *packed,
-                                    weights,
-                                    ids,
-                                    quant_type,
-                                    quant_type,
-                                    activation,
+                                repeats = (tokens + 2) // 3
+                                ids = torch.tensor(
+                                    [[0, 1], [1, -1], [-1, -1]],
+                                    device="cuda",
+                                    dtype=torch.int32,
+                                ).repeat(repeats, 1)[:tokens]
+                                weights = torch.tensor(
+                                    [
+                                        [0.25, 0.75],
+                                        [0.5, float("nan")],
+                                        [float("nan"), float("nan")],
+                                    ],
+                                    device="cuda",
+                                ).repeat(repeats, 1)[:tokens]
+                                inactive = ids < 0
+                                inputs = (
+                                    torch.linspace(
+                                        0.125,
+                                        2.0,
+                                        tokens,
+                                        device="cuda",
+                                        dtype=torch.float16,
+                                    )
+                                    .unsqueeze(1)
+                                    .expand(tokens, 256)
+                                    .contiguous()
                                 )
-                        self.assertEqual(calls, 2)
-                        self.assertGreater(expected.abs().max().item(), 1e-3)
-                        self.assertTrue(torch.isfinite(actual).all().item())
-                        self.assertEqual(
-                            torch.count_nonzero(actual[inactive.all(dim=-1)]).item(), 0
-                        )
-                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                                inputs[inactive.all(dim=-1)] = float("nan")
+                                provider_name = (
+                                    "ggml_moe_a8" if tokens > 64 else "ggml_moe_a8_vec"
+                                )
+                                native = (
+                                    gguf_runtime.ggml_moe_a8
+                                    if tokens > 64
+                                    else gguf_runtime.ggml_moe_a8_vec
+                                )
+                                calls = 0
+                                route_costs = []
+
+                                class ObserveRouteCosts(TorchDispatchMode):
+                                    def __torch_dispatch__(
+                                        self, func, types, args=(), kwargs=None
+                                    ):
+                                        if func in (
+                                            torch.ops.aten.lt.Scalar,
+                                            torch.ops.aten.clamp_min.default,
+                                            torch.ops.aten.clamp_min.out,
+                                            torch.ops.aten.masked_fill.Scalar,
+                                            torch.ops.aten.masked_fill_.Scalar,
+                                            torch.ops.aten.arange.default,
+                                        ):
+                                            route_costs.append(str(func))
+                                        return func(*args, **(kwargs or {}))
+
+                                def observe_projection(
+                                    projection_input, *args, **kwargs
+                                ):
+                                    nonlocal calls
+                                    if calls == 0:
+                                        self.assertEqual(
+                                            projection_input.data_ptr(),
+                                            inputs.data_ptr(),
+                                        )
+                                    if finalizer is not None and tokens <= 64:
+                                        self.assertIs(args[1], ids)
+                                    calls += 1
+                                    return native(projection_input, *args, **kwargs)
+
+                                with (
+                                    patch.object(gguf_runtime, "_is_cuda", False),
+                                    patch.object(gguf_runtime, "_is_musa", True),
+                                    patch.object(
+                                        gguf_runtime,
+                                        "_musa_apply_gguf_moe_weights",
+                                        None,
+                                    ),
+                                    patch.object(
+                                        gguf_runtime,
+                                        "silu_and_mul",
+                                        legacy_silu_and_mul,
+                                    ),
+                                    patch.object(
+                                        gguf_runtime,
+                                        "gelu_and_mul",
+                                        legacy_gelu_and_mul,
+                                    ),
+                                ):
+                                    expected = fused_moe_gguf(
+                                        inputs.nan_to_num(),
+                                        *packed,
+                                        weights.masked_fill(inactive, 0),
+                                        ids.clamp_min(0),
+                                        quant_type,
+                                        quant_type,
+                                        activation,
+                                    )
+                                    with (
+                                        ObserveRouteCosts(),
+                                        patch.object(
+                                            gguf_runtime,
+                                            provider_name,
+                                            observe_projection,
+                                        ),
+                                        patch.object(
+                                            gguf_runtime,
+                                            "_musa_apply_gguf_moe_weights",
+                                            finalizer,
+                                        ),
+                                    ):
+                                        actual = fused_moe_gguf(
+                                            inputs,
+                                            *packed,
+                                            weights,
+                                            ids,
+                                            quant_type,
+                                            quant_type,
+                                            activation,
+                                        )
+                                self.assertEqual(calls, 2)
+                                if finalizer is not None:
+                                    self.assertEqual(route_costs, [])
+                                self.assertGreater(expected.abs().max().item(), 1e-3)
+                                self.assertTrue(torch.isfinite(actual).all().item())
+                                self.assertEqual(
+                                    torch.count_nonzero(
+                                        actual[inactive.all(dim=-1)]
+                                    ).item(),
+                                    0,
+                                )
+                                torch.testing.assert_close(
+                                    actual, expected, rtol=0, atol=0
+                                )
 
     @torch.inference_mode()
     def test_unquantized_fallback_drops_negative_ids(self):
-        """The slow path must not alias a dropped route to the last expert."""
+        """Dropped routes stay zero without adding a valid-route accumulator."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+
         generator = torch.Generator(device="cuda").manual_seed(17)
         w13 = torch.randn(2, 32, 16, generator=generator, device="cuda").half() / 16
         w2 = torch.randn(2, 16, 16, generator=generator, device="cuda").half() / 16
-        hidden = torch.ones(2, 16, device="cuda", dtype=torch.float16)
-        hidden[1].fill_(float("nan"))
-        ids = torch.tensor([[0, -1], [-1, -1]], device="cuda", dtype=torch.int32)
+        hidden = torch.ones(4, 16, device="cuda", dtype=torch.float16)
+        hidden[-1].fill_(float("nan"))
+        ids = torch.tensor(
+            [[0, -3, -1], [0, 1, 0], [-1, 1, 0], [-1, -3, -1]],
+            device="cuda",
+            dtype=torch.int32,
+        )
         weights = torch.tensor(
-            [[1.0, float("nan")], [float("nan"), float("nan")]], device="cuda"
+            [
+                [1.0, float("nan"), float("nan")],
+                [0.2, 0.3, 0.5],
+                [float("nan"), 0.75, 0.25],
+                [float("nan"), float("nan"), float("nan")],
+            ],
+            device="cuda",
         )
-        output = fused_moe_gguf(
-            hidden,
-            w13,
-            w2,
-            weights,
-            ids,
-            GGMLQuantizationType.F16,
-            GGMLQuantizationType.F16,
-            "silu",
+        original_hidden, original_ids, original_weights = (
+            hidden.clone(),
+            ids.clone(),
+            weights.clone(),
         )
-        projected = hidden[0] @ w13[0].t()
-        gate, up = projected.chunk(2)
-        expected = (torch.nn.functional.silu(gate) * up) @ w2[0].t()
+        observed = {
+            op: []
+            for op in (
+                torch.ops.aten.zeros_like.default,
+                torch.ops.aten.add_.Tensor,
+                torch.ops.aten.mul_.Tensor,
+                torch.ops.aten.zero_.default,
+            )
+        }
+
+        class ObserveTensorOps(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in observed:
+                    observed[func].append(args[0].data_ptr())
+                return func(*args, **(kwargs or {}))
+
+        with ObserveTensorOps():
+            output = fused_moe_gguf(
+                hidden,
+                w13,
+                w2,
+                weights,
+                ids,
+                GGMLQuantizationType.F16,
+                GGMLQuantizationType.F16,
+                "silu",
+            )
+        projected = torch.einsum("th,enh->ten", hidden.nan_to_num(), w13)
+        gate, up = projected.float().chunk(2, dim=-1)
+        activated = (torch.nn.functional.silu(gate) * up).to(hidden.dtype)
+        experts = torch.einsum("tek,eok->teo", activated, w2)
+        selected = experts.gather(
+            1, ids.clamp_min(0).long().unsqueeze(-1).expand(-1, -1, hidden.shape[1])
+        )
+        expected = (
+            selected.float() * weights.masked_fill(ids < 0, 0).unsqueeze(-1)
+        ).sum(dim=1)
+        self.assertGreater(expected.abs().max().item(), 1e-3)
         self.assertTrue(torch.isfinite(output).all().item())
-        self.assertEqual(torch.count_nonzero(output[1]).item(), 0)
-        torch.testing.assert_close(output[0], expected, atol=1e-3, rtol=1e-3)
+        self.assertEqual(torch.count_nonzero(output[-1]).item(), 0)
+        torch.testing.assert_close(output.float(), expected, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(hidden, original_hidden, equal_nan=True)
+        torch.testing.assert_close(ids, original_ids)
+        torch.testing.assert_close(weights, original_weights, equal_nan=True)
+        self.assertNotEqual(output.data_ptr(), hidden.data_ptr())
+        self.assertEqual(observed[torch.ops.aten.zeros_like.default], [])
+        self.assertEqual(
+            observed[torch.ops.aten.zero_.default], [output[-1].data_ptr()]
+        )
+        weighted_outputs = observed[torch.ops.aten.mul_.Tensor]
+        self.assertEqual(len(weighted_outputs), 6)
+        self.assertEqual(
+            observed[torch.ops.aten.add_.Tensor],
+            [weighted_outputs[1], weighted_outputs[1], weighted_outputs[4]],
+        )
 
 
 if __name__ == "__main__":

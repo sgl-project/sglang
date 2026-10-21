@@ -82,6 +82,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.apply_gguf_moe_weights",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.moe.gguf_moe_weights_aot:apply_gguf_moe_weights",
+        capabilities=frozenset(
+            {CapabilityRequirement.CUDA, CapabilityRequirement.MUSA}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.compute_cutlass_w4a8_moe_input_scale",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
