@@ -10,6 +10,10 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.layers.cp.base import (
+    from_cp_sharded,
+    is_cp_sharded_padded,
+)
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import ceil_align
@@ -234,6 +238,8 @@ class SchedulerPoolStatsObserver:
 
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
@@ -310,6 +316,11 @@ class SchedulerPoolStatsObserver:
                 swa_capacity=self.swa_tokens_per_layer,
             )
         )
+        if is_cp_sharded_padded():
+            full_capacity = from_cp_sharded(full_capacity)
+            full_available_size = from_cp_sharded(full_available_size)
+            swa_capacity = from_cp_sharded(swa_capacity)
+            swa_available_size = from_cp_sharded(swa_available_size)
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix

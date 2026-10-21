@@ -74,6 +74,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
@@ -195,6 +196,23 @@ class KVIndexTranslator:
                 )
                 self._spaces[IdSpaceKind.FULL] = IdSpace(
                     key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize
+                )
+            elif is_cp_sharded_padded():
+                # Keep the plan's global rows; each sub-pool writes only owned pages.
+                strategy = get_cp_strategy()
+                c, p = strategy.cp_size, page_size
+
+                def localize(ids):
+                    shifted = ids.to(torch.int64) + (c - 1) * p
+                    local = (shifted // (c * p)) * p + shifted % p
+                    return torch.where(
+                        (ids > 0) & ((shifted // p) % c == strategy.cp_rank),
+                        local,
+                        0,
+                    )
+
+                self._spaces[IdSpaceKind.FULL] = IdSpace(
+                    key=(IdSpaceKind.FULL, "cp-rank-local"), write=localize
                 )
             else:
                 localize = None
