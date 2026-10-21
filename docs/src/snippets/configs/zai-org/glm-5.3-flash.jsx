@@ -1,10 +1,13 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x", "tpu7x"],
+  supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x", "tpu7x", "a3", "a5"],
 
   // One TPU7x (Ironwood) host: 4 chips, 8 TensorCores, served by sglang-torchtpu.
-  hardware: [{ id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" }],
+  hardware: [{ id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" },
+    { id: "a3", label: "A3", vram: "64GB/die", vendor: "npu", npuDevices: 16 },
+    { id: "a5", label: "A5", vram: "128GB", vendor: "npu", npuDevices: 8 },
+  ],
 
   matchDims: [
     {
@@ -25,6 +28,8 @@ export const config = {
       id: "quant",
       title: "Quantization",
       options: [
+        { id: "w8a8", label: "W8A8 (ModelSlim)", disabled: (s) => s.hw !== "a3", disableReason: "The W8A8 checkpoint is the A3 recipe." },
+        { id: "w8a8-mxfp8", label: "W8A8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The W8A8_MXFP8 checkpoint is the A5 recipe." },
         { id: "fp8", label: "FP8" },
         {
           id: "mxfp4",
@@ -49,6 +54,7 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
+    if (["a3", "a5"].includes(s.hw)) return false;
     const pairing = s.hw === "mi355x" ? "fp8-tilelang"
       : s.hw === "tpu7x" ? "fp8-pallas"
       : ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
@@ -62,7 +68,19 @@ export const config = {
 
   overlayDims: [
     {
+      id: "pdMode", title: "NPU PD mode", default: "unified",
+      showWhen: (s) => ["a3", "a5"].includes(s.hw),
+      options: [
+        { id: "unified", label: "Unified" },
+        { id: "prefill", label: "Prefill" },
+        { id: "decode", label: "Decode" },
+        { id: "router", label: "Router" },
+      ],
+    },
+
+    {
       id: "kvDsaPair",
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       title: "KV Cache + DSA Backend",
       default: "fp8-trtllm",
       options: [
@@ -134,6 +152,7 @@ export const config = {
     },
     {
       id: "bcg",
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       title: "Breakable Cuda Graph",
       default: "off",
       options: [
@@ -150,6 +169,7 @@ export const config = {
     },
     {
       id: "mmTransport",
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       title: "VLM Transport",
       default: "auto",
       options: [
@@ -168,6 +188,7 @@ export const config = {
     },
     {
       id: "hicache",
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       title: "HiCache",
       default: "off",
       options: [
@@ -204,6 +225,7 @@ export const config = {
     // detection (v0.5.20+).
     {
       id: "parsers",
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       title: "Parsers",
       default: "auto",
       options: [
@@ -227,6 +249,8 @@ export const config = {
   ],
 
   modelNames: {
+    "a3|w8a8": "GLM-5.3-Flash",
+    "a5|w8a8-mxfp8": "GLM-5.3-Flash",
     default: "zai-org/GLM-5.3-Flash",
     nvfp4: "RadixArk/GLM-5.3-Flash-NVFP4",
     "mi355x|mxfp4": "OneNexus/GLM-5.3-Flash-MXFP4",
@@ -235,9 +259,16 @@ export const config = {
 
   // MI355X uses a ROCm environment and TPU7x an sglang-torchtpu install; the
   // Docker images below are NVIDIA-only.
-  runModes: (s) => ["mi355x", "tpu7x"].includes(s.hw) ? ["python"] : ["python", "docker"],
+  runModes: (s) => ["mi355x", "tpu7x", "a3", "a5"].includes(s.hw) ? ["python"] : ["python", "docker"],
 
   placeholders: {
+    NPU_MODEL_PATH: {"target":"command","label":"NPU checkpoint directory","default":"/models/GLM-5.3-Flash-w8a8"},
+    NETWORK_IFACE: {"target":"command","label":"HCCL / Gloo interface","default":"<network-interface>"},
+    LOCAL_IP: {"target":"command","label":"This worker IP","default":"<this-node-ip>"},
+    PREFILL_HOST: {"target":"command","label":"Prefill head IP","default":"<prefill-head-ip>"},
+    DECODE_HOST: {"target":"command","label":"Decode head IP","default":"<decode-head-ip>"},
+    NODE0_IP: {"target":"command","label":"Head node IP","default":"<node0-ip>"},
+    NODE_RANK: {"target":"command","label":"This node rank","default":"<node-rank>"},
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30000" },
     HF_TOKEN: { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
@@ -289,6 +320,7 @@ sgl-eval run gsm8k \\
   // template parser detection (#38297) that `--*-parser auto` needs; the old
   // glm-5.3-flash dev image (2026-09-03) predates #38297 and misdetects.
   dockerImages: {
+    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash",
     gb300: "lmsysorg/sglang:latest",
     h100: "lmsysorg/sglang:latest",
     h200: "lmsysorg/sglang:latest",
@@ -303,6 +335,7 @@ sgl-eval run gsm8k \\
 
   playgroundFeatures: {
     attention: {
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       knobs: [
         { id: "tp", label: "TP", values: [
           null, 1, 2, 4,
@@ -354,6 +387,7 @@ sgl-eval run gsm8k \\
     },
 
     moe: {
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       backend: {
         options: [
           { id: null, label: "Inherited" },
@@ -411,6 +445,7 @@ sgl-eval run gsm8k \\
     },
 
     parsers: {
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
         { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser auto" },
@@ -427,6 +462,7 @@ sgl-eval run gsm8k \\
     // so a Low Latency base derives onto that chip instead of showing
     // "Inherited from base", and re-picking it is a no-op.
     speculative: {
+      showWhen: (s) => !["a3", "a5"].includes(s.hw),
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off (greedy)" },
@@ -475,6 +511,226 @@ sgl-eval run gsm8k \\
     },
 
   },
+
+  // Ascend recipes are transcribed from the linked tutorial. PD roles own their
+  // worker topology; changing a GPU overlay must never rewrite these commands.
+  resolveRecipe: (cell, s) => {
+    if (!(["a3", "a5"].includes(s.hw)) || !["prefill", "decode", "router"].includes(s.pdMode)) return cell;
+    const router = { port: 30000, command: config.npuRouterCommand };
+    if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
+      nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
+      commands: { python: config.npuRouterCommand, docker: `docker run --network host --rm swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash ${config.npuRouterCommand}` }, router };
+    const recipe = config.npuPdRecipes.find((r) => r.hw === s.hw && r.pdMode === s.pdMode);
+    if (!recipe) return cell;
+    const flags = recipe.flags.map((flag) => flag.startsWith("--port ")
+      ? "--port " + (recipe.pdMode === "decode" ? 30100 : 30000) : flag);
+    if (recipe.nnodes > 1) flags.push("--nnodes " + recipe.nnodes,
+      "--node-rank {{NODE_RANK}}", "--dist-init-addr {{NODE0_IP}}:20000");
+    const command = [...recipe.env, "sglang serve", ...flags.map((flag) => "  " + flag)].join(" \\\n");
+    return { ...cell, ...recipe, pd: true, verified: false, warn: undefined, router,
+      commands: { python: command } };
+  },
+
+  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://{{PREFILL_HOST}}:30000 8998 \\\n  --decode http://{{DECODE_HOST}}:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --worker-startup-timeout-secs 3600 \\\n  --request-timeout-secs 7200 \\\n  --disable-retries",
+
+  npuPdRecipes: [
+    {
+      hw: "a3",
+      pdMode: "prefill",
+      nnodes: 1,
+      env: [
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
+        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\"",
+        "HCCL_BUFFSIZE=1200",
+        "DEEPEP_HCCL_BUFFSIZE=1200",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=128",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+        "TASK_QUEUE_ENABLE=2",
+        "HCCL_IF_BASE_PORT=61000"
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 4",
+        "--pp-size 4",
+        "--dp-size 4",
+        "--quantization modelslim",
+        "--device npu",
+        "--attention-backend ascend",
+        "--enable-multimodal",
+        "--served-model-name GLM-5.3-Flash",
+        "--disaggregation-mode prefill",
+        "--disaggregation-bootstrap-port 8998",
+        "--disaggregation-transfer-backend ascend",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-dense-tp 1",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode normal",
+        "--load-balance-method round_robin",
+        "--mem-fraction-static 0.78",
+        "--page-size 128",
+        "--max-running-requests 16",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 8192",
+        "--watchdog-timeout 9000",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      hw: "a3",
+      pdMode: "decode",
+      nnodes: 1,
+      env: [
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "GLOO_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
+        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24707\"",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200",
+        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\"",
+        "HCCL_BUFFSIZE=512",
+        "DEEPEP_HCCL_BUFFSIZE=512",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1",
+        "SGLANG_NPU_USE_MULTI_STREAM=1",
+        "TASK_QUEUE_ENABLE=0",
+        "HCCL_IF_BASE_PORT=61010"
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 16",
+        "--pp-size 1",
+        "--dp-size 16",
+        "--quantization modelslim",
+        "--device npu",
+        "--attention-backend ascend",
+        "--enable-multimodal",
+        "--served-model-name GLM-5.3-Flash",
+        "--disaggregation-mode decode",
+        "--disaggregation-transfer-backend ascend",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode low_latency",
+        "--load-balance-method round_robin",
+        "--mem-fraction-static 0.75",
+        "--page-size 128",
+        "--max-running-requests 32",
+        "--cuda-graph-bs-decode 1 2",
+        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--watchdog-timeout 9000",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      hw: "a5",
+      pdMode: "prefill",
+      nnodes: 1,
+      env: [
+        "SGLANG_NPU_PROFILING=0",
+        "HCCL_BUFFSIZE=256",
+        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24670\"",
+        "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
+        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\""
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 8",
+        "--pp-size 1",
+        "--dp-size 2",
+        "--quantization modelslim",
+        "--load-format auto",
+        "--device npu",
+        "--attention-backend ascend",
+        "--served-model-name GLM-5.3-Flash",
+        "--disaggregation-mode prefill",
+        "--disaggregation-bootstrap-port 8998",
+        "--disaggregation-transfer-backend ascend",
+        "--enable-dp-attention",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--mem-fraction-static 0.83",
+        "--page-size 64",
+        "--max-running-requests 16",
+        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-kv-cache-dtype bf16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 4",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 5",
+        "--pre-warm-nccl",
+        "--watchdog-timeout 1200",
+        "--cuda-graph-bs-decode 1 8 64",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      hw: "a5",
+      pdMode: "decode",
+      nnodes: 1,
+      env: [
+        "SGLANG_NPU_PROFILING=0",
+        "HCCL_BUFFSIZE=256",
+        "ASCEND_MF_STORE_URL=\"tcp://{{PREFILL_HOST}}:24670\"",
+        "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
+        "SGLANG_HOST_IP=\"{{LOCAL_IP}}\""
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 8",
+        "--pp-size 1",
+        "--dp-size 2",
+        "--quantization modelslim",
+        "--load-format auto",
+        "--device npu",
+        "--attention-backend ascend",
+        "--served-model-name GLM-5.3-Flash",
+        "--disaggregation-mode decode",
+        "--disaggregation-bootstrap-port 8998",
+        "--disaggregation-transfer-backend ascend",
+        "--enable-dp-attention",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--mem-fraction-static 0.83",
+        "--page-size 64",
+        "--max-running-requests 16",
+        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-kv-cache-dtype bf16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 4",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 5",
+        "--pre-warm-nccl",
+        "--watchdog-timeout 1200",
+        "--cuda-graph-bs-decode 1 8 64",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    }
+  ],
 
   cells: [
     // The first cell seeds both widgets on a fresh page load.
@@ -1260,5 +1516,87 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
+
+    // Ascend NPU: keep the tutorial's recipes unverified until measured.
+    {
+      match: {
+        hw: "a3",
+        strategy: "low-latency",
+        quant: "w8a8"
+      },
+      nnodes: 1,
+      verified: false,
+      env: [
+        "HCCL_BUFFSIZE=1536"
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 16",
+        "--quantization modelslim",
+        "--attention-backend ascend",
+        "--device npu",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 8192",
+        "--mem-fraction-static 0.78",
+        "--page-size 128",
+        "--served-model-name GLM-5.3-Flash",
+        "--cuda-graph-bs-decode 16",
+        "--max-running-requests 16",
+        "--load-balance-method round_robin",
+        "--enable-multimodal",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--watchdog-timeout 9000",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+    {
+      match: {
+        hw: "a5",
+        strategy: "low-latency",
+        quant: "w8a8-mxfp8"
+      },
+      nnodes: 1,
+      verified: false,
+      env: [
+        "SGLANG_NPU_PROFILING=0",
+        "ASCEND_LAUNCH_BLOCKING=1",
+        "HCCL_BUFFSIZE=256"
+      ],
+      flags: [
+        "--model-path \"{{NPU_MODEL_PATH}}\"",
+        "--trust-remote-code",
+        "--tp-size 8",
+        "--quantization modelslim",
+        "--attention-backend ascend",
+        "--device npu",
+        "--chunked-prefill-size 8192",
+        "--max-prefill-tokens 8192",
+        "--mem-fraction-static 0.83",
+        "--page-size 64",
+        "--served-model-name GLM-5.3-Flash",
+        "--load-format auto",
+        "--max-running-requests 16",
+        "--pre-warm-nccl",
+        "--speculative-draft-model-path \"{{NPU_MODEL_PATH}}\"",
+        "--speculative-draft-kv-cache-dtype bf16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 4",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 5",
+        "--watchdog-timeout 1200",
+        "--cuda-graph-bs-decode 1 8 64",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}"
+      ]
+    },
+
   ],
 };
