@@ -39,7 +39,10 @@ from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
 from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -367,6 +370,33 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
     """`free_full` inside a free group must defer and land at `free_group_end`;
     the composite carries that pile itself, not through the SWA parent's hooks."""
 
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_allocation_reclaim_flushes_full_only_segment_frees(self):
+        """FULL-only queued pages already satisfy this allocation. Ignoring
+        their queue makes two-pool reclaim report insufficient capacity."""
+        from test_unified_swa_shared_virtual_ids import _build
+
+        alloc = _build(64, 32, 2, 4)
+        indices = alloc.alloc(8)
+        alloc.free_swa(indices)
+        before = alloc.full_available_size()
+        alloc.free_group_begin()
+        self.addCleanup(alloc.free_group_end)
+        alloc.free_full_segment(indices, start_pos=0)
+        self.assertEqual(alloc.full_available_size(), before)
+        cache = mock.Mock()
+        cache.supports_prefix_sharing.return_value = True
+        cache.full_evictable_size.return_value = 0
+        cache.swa_evictable_size.return_value = 0
+        cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
+
+        self.assertTrue(alloc.evict_to_free_tokens(cache, before + 4, swa_num_tokens=0))
+        self.assertEqual(alloc.full_available_size(), before + 8)
+
     def test_full_only_frees_defer_until_group_end(self):
         from test_unified_swa_shared_virtual_ids import _build
 
@@ -383,7 +413,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         self.assertEqual(alloc.full_available_size(), before + 8)
 
 
-class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
+class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice with
     host-int, page-aligned bounds, so `free_swa_segment` must reach the
     swa side with caller-derived page ids: no `torch.unique` and no stale-slot
@@ -519,6 +549,40 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 self.assertEqual(recorder.hits, [])
                 self.assertEqual(alloc.full_available_size(), full_before)
                 self.assertEqual(alloc.swa_available_size(), swa_before)
+
+    def test_disabled_detection_launches_no_predicate_operations(self):
+        """Disabled segment checks must not still compute GPU predicates.
+
+        The discarded lookup/comparison used to run before `expect` could
+        inspect the level, adding kernels to every sliding-window retirement.
+        """
+
+        class ComparisonRecorder(TorchDispatchMode):
+            def __init__(self):
+                super().__init__()
+                self.comparisons = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in (torch.ops.aten.gt.Scalar, torch.ops.aten.le.Scalar):
+                    self.comparisons += 1
+                return func(*args, **(kwargs or {}))
+
+        for level in (
+            InvariantCheckLevel.OFF,
+            InvariantCheckLevel.WARN,
+            InvariantCheckLevel.STRICT,
+        ):
+            with self.subTest(level=level):
+                allocator = self._swa_composite(lazy=True)
+                tokens = allocator.alloc(4 * self.PS)
+                recorder = ComparisonRecorder()
+                with envs.SGLANG_INVARIANT_CHECK.override(int(level)), recorder:
+                    allocator.free_swa_segment(tokens, start_pos=0)
+                    allocator.free_full_segment(tokens, start_pos=0)
+                self.assertEqual(
+                    recorder.comparisons,
+                    0 if level == InvariantCheckLevel.OFF else 2,
+                )
 
     def test_a_double_ratchet_is_reported(self):
         """A segment free trusts its caller that the swa pages are bound (the

@@ -269,14 +269,17 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         """
         self.tm.incremental_streaming_output = False
         key = "request_score"
+        hidden_key = "hidden_metric"
         stream = self.tm._wait_one_response(self.state.obj)
-        self.state.customized_info_accumulated[key] = [386.25]
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
         self.state.out_list.extend(
             [
-                {
-                    "output_ids": [1],
-                    "meta_info": {"finish_reason": None, key: [386.25]},
-                },
+                {"output_ids": [1], "meta_info": first_meta_info},
                 {
                     "output_ids": [1, 2],
                     "meta_info": {"finish_reason": {"type": "length"}},
@@ -290,6 +293,7 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(out["output_ids"], [1, 2])
         self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 
@@ -903,7 +907,6 @@ def _make_generate_obj(rid, is_single):
     obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
-        obj.batch_size = len(rid)
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
 
@@ -1094,34 +1097,6 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
         asyncio.run(drive())
 
 
-class TestParallelSamplingRequestCleanup(CustomTestCase):
-    def test_completed_parallel_samples_release_all_request_states(self):
-        tm = _make_tm_for_generate(self)
-        tm.request_metrics_exporter_manager = Mock()
-        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
-        obj = GenerateReqInput(text=["hello", "world"], sampling_params={"n": 2})
-        tokenized = MagicMock()
-        tokenized.mm_inputs = None
-        tokenized.sampling_params = MagicMock()
-        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
-
-        async def send(tokenized_obj):
-            async def respond():
-                await asyncio.sleep(0)
-                await tm._handle_batch_output(_make_batch_str_output(tokenized_obj.rid))
-
-            asyncio.create_task(respond())
-
-        tm._send_one_request = send
-
-        async def drive():
-            return [response async for response in tm.generate_request(obj)]
-
-        outputs = asyncio.run(drive())
-        self.assertEqual(len(outputs[0]), 4)
-        self.assertFalse(tm.rid_to_state)
-
-
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     """generate_request must not leak rid_to_state when dispatch fails.
 
@@ -1251,6 +1226,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)

@@ -18,15 +18,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import canonicalize_stride
-from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -363,7 +363,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         # fmha_v2 prefill kernel supports SM90 and SM120
         self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
-
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
         # head dims (power-of-2 pages). Mirror that precondition here so an

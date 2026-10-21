@@ -549,10 +549,7 @@ class MetadataBuffers:
 
         # Compute multimodal prompt token counts on the prefill node so decode
         # can report them in usage.
-        if req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
@@ -765,6 +762,20 @@ def _get_cp_rank_page_bounds(
     local_start = cp_rank * base + min(cp_rank, rem)
     n_pages = base + (1 if cp_rank < rem else 0)
     return local_start, local_start + n_pages
+
+
+def filter_kv_indices_for_shard_rank(
+    *,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    shard_rank: int,
+    shard_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Logical page l lives on rank l % N as local page l // N; returns the owned
+    local ids and their send positions, which replace the contiguous index_slice."""
+    owned = kv_indices % shard_size == shard_rank
+    positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
+    return kv_indices[owned] // shard_size, positions[owned]
 
 
 def filter_kv_indices_for_cp_rank(
@@ -1752,17 +1763,22 @@ def setup_state_kv_args(
                 raise RuntimeError(
                     "DSV4 target and draft pools must share the SWA index mapping"
                 )
+            # Under encoder replay the target window and the draft ring address SWA
+            # by request slot; equal rows per slot let them share one page list.
+            request_window = token_to_kv_pool.request_window
             target_geometry = (
                 token_to_kv_pool.page_size,
                 token_to_kv_pool.sliding_window,
+                request_window.capacity if request_window is not None else None,
             )
             draft_geometry = (
                 draft_token_to_kv_pool.page_size,
                 draft_token_to_kv_pool.sliding_window,
+                draft_token_to_kv_pool.swa_req_ring_size,
             )
             if target_geometry != draft_geometry:
                 raise RuntimeError(
-                    "DSV4 target and draft pools must share paged SWA geometry: "
+                    "DSV4 target and draft pools must share SWA geometry: "
                     f"target={target_geometry}, draft={draft_geometry}"
                 )
             draft_ptrs, draft_lens, draft_item_lens = (
@@ -1777,6 +1793,13 @@ def setup_state_kv_args(
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+            )
+        row_ptrs, row_lens, row_item_lens = (
+            draft_token_to_kv_pool.get_swa_valid_from_buf_infos()
+        )
+        if row_ptrs:
+            append_state_component(
+                kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
             )
 
     if (
@@ -1834,6 +1857,15 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+
+
+def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
+    """The KV byte layout both PD roles must share, for pools that have more than one."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        return token_to_kv_pool.pd_kv_layout()
+    return None
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
