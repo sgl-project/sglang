@@ -941,6 +941,20 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
 
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        return (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else (
+                self.token_indices[: self.real_rows_count]
+                if self.real_rows_count is not None
+                else self.token_indices
+            )
+        )
+
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
         if self.pad_rows:
@@ -1779,6 +1793,10 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
     ) -> DSV4Metadata:
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        cp_encoder_replay = (
+            is_cp_active(forward_batch)
+            and get_exec().features.enable_encoder_swa_bounded_replay
+        )
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
@@ -1849,8 +1867,13 @@ class DeepseekV4AttnBackend(
             # are bucket-sized and graph-safe.
             out_cache_loc = loc_buf
         else:
+            # Folded CP replay rows must not overwrite their persistent KV.
             out_cache_loc = _tail_rows(
-                forward_batch.out_cache_loc,
+                (
+                    self._compressor_out_loc(forward_batch)
+                    if cp_encoder_replay
+                    else forward_batch.out_cache_loc
+                ),
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
@@ -1951,6 +1974,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices if cp_encoder_replay else None,
             )
         # Same requests as the extend in use, so the same index-K slots; other rows,
         # so its own plans.
