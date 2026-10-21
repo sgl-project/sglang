@@ -315,7 +315,8 @@ bool is_valid_config(
         GROUP_BLOCKS,                                                                                                  \
         IS_ZP_FLOAT,                                                                                                   \
         kIsEP,                                                                                                         \
-        kHasBias>;                                                                                                     \
+        kHasBias,                                                                                                      \
+        kExpertIdsAreSorted>;                                                                                          \
   }
 
 // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
@@ -440,7 +441,7 @@ bool is_valid_config(
   ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
   ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
 MarlinFuncPtr get_marlin_kernel(
     const host::ScalarType q_type,
     int thread_m_blocks,
@@ -476,7 +477,7 @@ MarlinFuncPtr get_marlin_kernel(
   return kernel;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
     int prob_m,
@@ -549,7 +550,7 @@ exec_config_t determine_exec_config(
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
+    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
         q_type,
         thread_m_blocks,
         th_config.thread_n / 16,
@@ -587,7 +588,7 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
 void marlin_mm(
     const void* A,
     const void* B,
@@ -626,8 +627,7 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float,
-    bool expert_ids_are_sorted) {
+    bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
 
@@ -728,7 +728,7 @@ void marlin_mm(
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias>(
+    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
         q_type,
         prob_m,
         prob_n,
@@ -800,7 +800,7 @@ void marlin_mm(
       ", max_shared_mem = ",
       max_shared_mem);
 
-  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
+  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
       q_type,
       thread_m_blocks,
       thread_n_blocks,
@@ -843,7 +843,7 @@ void marlin_mm(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem, expert_ids_are_sorted);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
   // clang-format on
 }
 
@@ -851,7 +851,7 @@ void marlin_mm(
 
 }  // namespace device::marlin_moe
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kExpertIdsAreSorted>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView c,
@@ -885,10 +885,10 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float,
-    bool expert_ids_are_sorted) {
+    bool is_zp_float) {
   using namespace host;
 
+  static_assert(!kIsEP || !kExpertIdsAreSorted, "Sorted block IDs are specialized only without EP");
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");
 
@@ -1089,7 +1089,7 @@ void moe_wna16_marlin_gemm(
   // Early return for zero-size M (moved after all validation)
   if (size_m == 0) return;
 
-  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias>(
+  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted>(
       a.data_ptr(),
       b_q_weight.data_ptr(),
       c.data_ptr(),
@@ -1127,8 +1127,7 @@ void moe_wna16_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
-      is_zp_float,
-      expert_ids_are_sorted);
+      is_zp_float);
 }
 
 }  // namespace sglang

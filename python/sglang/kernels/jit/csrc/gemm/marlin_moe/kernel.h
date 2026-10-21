@@ -11,7 +11,7 @@
       const int32_t *__restrict__ sorted_token_ids_ptr, const int32_t *__restrict__ expert_ids_ptr,                  \
       const int32_t *__restrict__ num_tokens_past_padded_ptr, const float *__restrict__ topk_weights_ptr, int top_k, \
       bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem, bool expert_ids_are_sorted
+      bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
 
 namespace sglang {
 
@@ -34,7 +34,8 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted       // sorted block expert IDs
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 

@@ -1146,7 +1146,7 @@ def _check_marlin_inactive_routes(
 
 
 def test_moe_wna16_marlin_inactive_output_ownership():
-    """Sorted admission and generic scattered masks preserve output ownership."""
+    """Sorted prefixes and generic scattered masks ignore unused table tails."""
     torch.manual_seed(57)
     m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
     w_ref, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
@@ -1189,6 +1189,29 @@ def test_moe_wna16_marlin_inactive_output_ownership():
         elif case == "empty-sorted":
             sorted_ids, expert_ids = sorted_ids[:0], expert_ids[:0]
             num_post.zero_()
+        if case != "empty-sorted":
+            used_blocks = 1 if max(route_ids) < 0 else topk
+            if not scatter and route_ids[0] < 0:
+                # Two leading inactive blocks guard against skipping only one;
+                # duplicate their token padding without changing live routes.
+                sorted_ids = torch.cat(
+                    (sorted_ids[:block_m], sorted_ids[: used_blocks * block_m])
+                )
+                expert_ids = torch.cat((expert_ids[:1], expert_ids[:used_blocks]))
+                num_post.add_(block_m)
+                used_blocks += 1
+            # Only the published prefix is ordered. A binary search or scan
+            # over allocated capacity would miscount these extra negative IDs.
+            dirty_ids = torch.tensor(
+                [0, -1, e - 1, -1], device="cuda", dtype=torch.int32
+            )
+            expert_ids = torch.cat((expert_ids[:used_blocks], dirty_ids))
+            sorted_ids = torch.cat(
+                (
+                    sorted_ids[: used_blocks * block_m],
+                    torch.full((4 * block_m,), topk, device="cuda", dtype=torch.int32),
+                )
+            )
         # Omit the new argument on generic calls to guard its safe default.
         gemm = (
             partial(moe_wna16_marlin_gemm, expert_ids_are_sorted=True)
@@ -1304,10 +1327,13 @@ def test_marlin_lora_direct_inactive_routes():
     assert torch.count_nonzero(down_output[ids < 0]) == 0
 
 
+@pytest.mark.parametrize("use_expert_map", [False, True])
 @pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
 @pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
-def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate, weight_first):
+def test_muse_marlin_inactive_routes(
+    fused_norm, hidden, intermediate, weight_first, use_expert_map
+):
     """Muse finalization excludes undefined inactive projection rows and weights."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
     from sglang.srt.layers.muse_spark.muse_spark_layers import (
@@ -1325,8 +1351,12 @@ def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate, weight_fi
     layer.params_dtype = dtype
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = local_experts
-    layer.global_num_experts = 4
-    layer._expert_map = torch.tensor([-1, -1, 0, 1], device="cuda", dtype=torch.int32)
+    layer.global_num_experts = 4 if use_expert_map else local_experts
+    layer._expert_map = (
+        torch.tensor([-1, -1, 0, 1], device="cuda", dtype=torch.int32)
+        if use_expert_map
+        else None
+    )
     references = []
     for prefix, n, k in (
         ("w13", 2 * intermediate, hidden),
@@ -1354,6 +1384,8 @@ def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate, weight_fi
     local_ids = torch.tensor(
         [[0, 1], [1, -1], [-1, 0], [-1, -1]], device="cuda", dtype=torch.int32
     )
+    if not use_expert_map:
+        ids = local_ids.clone()
     weights = torch.tensor(
         [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
     )

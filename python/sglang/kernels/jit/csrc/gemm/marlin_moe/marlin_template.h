@@ -55,7 +55,8 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted       // sorted block expert IDs
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -81,8 +82,7 @@ __global__ void Marlin(
     int* locks,                                              // extra global storage for barrier synchronization
     bool use_atomic_add,                                     // whether to use atomic add to reduce
     bool use_fp32_reduce,                                    // whether to use fp32 global reduce
-    int max_shared_mem,
-    bool expert_ids_are_sorted) {}
+    int max_shared_mem) {}
 
 }  // namespace device::marlin_moe
 
@@ -299,7 +299,8 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted       // sorted block expert IDs
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -329,8 +330,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem,
-    bool expert_ids_are_sorted) {
+    int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -387,9 +387,25 @@ __global__ void Marlin(
   int parallel = num_tokens_past_padded / moe_block_size;
   if (parallel == 0) return;
   int num_invalid_blocks = 0;
-  // A sorted table with a valid first block cannot contain inactive blocks.
-  // Generic and EP callers retain the full scan, including scattered -1 IDs.
-  if (kIsEP || !expert_ids_are_sorted || expert_ids_ptr[0] < 0) {
+  if constexpr (kExpertIdsAreSorted) {
+    if (expert_ids_ptr[0] < 0) {
+      // Only the used prefix is sorted; allocated tail entries are undefined.
+      int first = 0;
+      int last = parallel;
+      while (first < last) {
+        int middle = first + (last - first) / 2;
+        if (expert_ids_ptr[middle] < 0)
+          first = middle + 1;
+        else
+          last = middle;
+      }
+      parallel -= first;
+      if (parallel == 0) return;
+      expert_ids_ptr += first;
+      sorted_token_ids_ptr += first * moe_block_size;
+    }
+  } else {
+    // Generic and EP callers may have scattered inactive blocks.
     for (int i = threadIdx.x % 32; i < parallel; i += 32) {
       num_invalid_blocks += expert_ids_ptr[i] == -1;
     }
@@ -397,9 +413,9 @@ __global__ void Marlin(
     for (int offset = 16; offset > 0; offset /= 2) {
       num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
     }
+    parallel -= num_invalid_blocks;
+    if (parallel == 0) return;
   }
-  parallel -= num_invalid_blocks;
-  if (parallel == 0) return;
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
@@ -527,22 +543,27 @@ __global__ void Marlin(
     if (par_id >= parallel) return;
 
     old_expert_id = expert_id;
-    if (num_invalid_blocks > 0) {
-      int skip_count = block_id == -1 ? par_id : 0;
-      block_id++;
-      for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
-        expert_id = expert_ids_ptr[i];
-        if (expert_id != -1) {
-          if (skip_count == 0) {
-            block_id = i;
-            break;
-          };
-          skip_count--;
-        };
-      }
-    } else {
+    if constexpr (kExpertIdsAreSorted) {
       block_id = par_id;
       expert_id = expert_ids_ptr[block_id];
+    } else {
+      if (num_invalid_blocks > 0) {
+        int skip_count = block_id == -1 ? par_id : 0;
+        block_id++;
+        for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
+          expert_id = expert_ids_ptr[i];
+          if (expert_id != -1) {
+            if (skip_count == 0) {
+              block_id = i;
+              break;
+            };
+            skip_count--;
+          };
+        }
+      } else {
+        block_id = par_id;
+        expert_id = expert_ids_ptr[block_id];
+      }
     }
 
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
