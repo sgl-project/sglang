@@ -259,6 +259,19 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
+def drop_unconsumed_states_before_norm(
+    hidden_states: Any, *, forward_batch, has_aux_hidden_states: bool
+) -> Any:
+    """Drop DSV4's pre-mHC-head states before the CP gather when logits won't read them."""
+    # The logits processor reads them only to store hidden states for MTP/EAGLE;
+    # gathering them otherwise moves ~4x the hidden-state bytes for nothing.
+    if not isinstance(hidden_states, tuple) or (
+        forward_batch.capture_hidden_mode.need_capture() and not has_aux_hidden_states
+    ):
+        return hidden_states
+    return hidden_states[0]
+
+
 def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
