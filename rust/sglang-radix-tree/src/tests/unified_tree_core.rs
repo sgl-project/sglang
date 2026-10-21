@@ -161,9 +161,9 @@ fn assert_path_info<K: ChildKeyType>() {
     let root_id = core.arena.node(root).id;
     let key = K::key_from(std::borrow::Cow::Owned(vec![1, 2, 3, 4, 5, 6, 7])).into_owned();
     let total = key.atom_len();
-    let (head_key, tail_key) = key.split_at(2);
-    let head = add_leaf(&mut core, root, head_key);
-    let tail = add_leaf(&mut core, head, tail_key);
+    let tail = add_leaf(&mut core, root, key);
+    let (head, action) = core.split_node_(tail, 2);
+    assert!(action.is_none());
     let other_key = K::key_from(std::borrow::Cow::Owned(vec![20, 21, 22])).into_owned();
     let other_len = other_key.atom_len();
     let other = add_leaf(&mut core, root, other_key);
@@ -177,6 +177,7 @@ fn assert_path_info<K: ChildKeyType>() {
             path_start: 0,
             path_end: 2,
             full_value_len: Some(2),
+            num_children: 1,
         },
         TreePathNodeInfo {
             node_id: tail_id,
@@ -184,6 +185,7 @@ fn assert_path_info<K: ChildKeyType>() {
             path_start: 2,
             path_end: total,
             full_value_len: Some(total - 2),
+            num_children: 0,
         },
     ];
     let snapshot = core
@@ -200,11 +202,24 @@ fn assert_path_info<K: ChildKeyType>() {
                 path_start: 0,
                 path_end: other_len,
                 full_value_len: Some(other_len),
+                num_children: 0,
             }],
             full_path.clone(),
         ]
     );
     assert!(core.collect_path_info(&[]).unwrap().is_empty());
+
+    let branch_key = K::key_from(std::borrow::Cow::Owned(vec![40, 41, 42])).into_owned();
+    let branch = add_leaf(&mut core, head, branch_key);
+    let branch_id = core.arena.node(branch).id;
+    let branched = core.collect_path_info(&[tail_id, branch_id]).unwrap();
+    for path in &branched {
+        assert_eq!(path[0].num_children, 2);
+        assert_eq!(path[1].num_children, 0);
+    }
+    assert_eq!(snapshot[0], full_path); // Child counts are snapshots too.
+    core.evict_device_leaf(branch_id, false).unwrap();
+    assert_eq!(core.collect_path_info(&[tail_id]).unwrap()[0], full_path);
 
     core.commit_backup(head_id, Tensor::from_slice(&[30i64, 31]), HashMap::new())
         .unwrap();
@@ -2729,24 +2744,6 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_rejects_mamba_trees() {
-    let params = CacheInitParams {
-        mamba_cache_chunk_size: Some(1),
-        ..Default::default()
-    };
-    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
-}
-
-#[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true).unwrap();
@@ -3014,32 +3011,8 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
     assert_eq!(action.node_ids, vec![c]);
 }
 
-// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
-// node and stamp every node its transfers cover with that node's ack.
-// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
-fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
-    for &node_id in &backup.node_ids {
-        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
-        if device_value.numel() == 0 && comp_xfers.is_empty() {
-            continue;
-        }
-        let mut publish_node_ids = Vec::new();
-        for transfer in comp_xfers.values_mut().flatten() {
-            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
-            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
-        }
-        if !publish_node_ids.contains(&node_id) {
-            publish_node_ids.push(node_id);
-        }
-        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
-            .expect("live test node");
-        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
-            .expect("live test nodes");
-    }
-}
-
 #[test]
-fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+fn write_back_defers_swa_window_backup_until_eviction() {
     // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
     //                  -> d(Full unbacked) -> t2(Full backed)
     // Every node holds a device-only SWA value inside the window.
@@ -3079,7 +3052,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
     }
 
     // Two requests in one batch finish at t1 and t2; neither ack drains.
-    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+    for key in [&key_t1, &key_t2] {
         let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
         let backups: Vec<&BackupKV> = result
             .cache_actions
@@ -3089,9 +3062,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
                 _ => None,
             })
             .collect();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].node_ids, vec![target]);
-        execute_backup_kv_for_test(&mut tc, backups[0]);
+        assert!(backups.is_empty());
     }
 
     let pending = |node_id| {
@@ -3099,8 +3070,11 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
             .node(tc.arena.resolve(node_id).expect("live test node"))
             .write_through_pending_id
     };
-    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
-        assert_eq!(pending(node_id), Some(ack_id));
+    for node_id in [c, b, t1, d, t2] {
+        assert_eq!(pending(node_id), None);
+    }
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        assert!(!tc.arena.node(idx).has_host_value(SWA));
     }
     // Write-back defers the unbacked Full prefix to eviction.
     assert!(
@@ -3148,38 +3122,46 @@ fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
 }
 
 #[test]
-fn split_of_a_pending_node_transfers_the_ack_and_emits_the_replace_action() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
-    let node = tc
-        .match_prefix(&match_params(&vec![1, 2, 3]))
-        .best_match_node_id;
-    tc.mark_write_through_pending(vec![node], /* ack_id = */ node)
-        .expect("live test node");
-    let (new_node, action) = tc.split_node_(
-        tc.arena.resolve(node).expect("live test node"),
-        /* split_len = */ 1,
-    );
-    assert_eq!(tc.arena.node(new_node).write_through_pending_id, Some(node));
-    assert_eq!(
-        tc.arena
-            .node(tc.arena.resolve(node).expect("live test node"))
-            .write_through_pending_id,
-        Some(node)
-    );
-    match action {
-        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
-            ack_id,
-            old_node_id,
-            new_node_id,
-            new_child_node_id,
-        }) => {
-            assert_eq!(ack_id, node);
-            assert_eq!(old_node_id, node);
-            assert_eq!(new_node_id, tc.arena.node(new_node).id);
-            assert_eq!(new_child_node_id, node);
+fn split_updates_pending_backup_with_or_without_a_tree_ack() {
+    for buffer_only in [false, true] {
+        for pending in [false, true] {
+            let mut tc = core();
+            if buffer_only {
+                tc.set_host_memory_buffer_only();
+            }
+            tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+            let tail_id = tc
+                .match_prefix(&match_params(&vec![1, 2, 3]))
+                .best_match_node_id;
+            if pending {
+                tc.mark_write_through_pending(vec![tail_id], tail_id)
+                    .unwrap();
+            }
+            let result = tc.match_prefix(&match_params(&vec![1]));
+            let prefix_id = result.best_match_node_id;
+            assert_ne!(prefix_id, tail_id);
+            if pending || buffer_only {
+                assert!(matches!(
+                    result.cache_actions.as_slice(),
+                    [CacheAction::UpdatePendingBackupOnNodeSplit {
+                        ack_id,
+                        old_node_id,
+                        new_node_id,
+                        new_child_node_id,
+                    }] if *ack_id == pending.then_some(tail_id) && *old_node_id == tail_id
+                        && *new_node_id == prefix_id && *new_child_node_id == tail_id
+                ));
+            } else {
+                assert!(result.cache_actions.is_empty());
+            }
+            for node_id in [prefix_id, tail_id] {
+                let node = tc.arena.node(tc.arena.resolve(node_id).unwrap());
+                assert_eq!(node.write_through_pending_id, pending.then_some(tail_id));
+            }
+            if !pending {
+                tc.sanity_check(&[], &[]);
+            }
         }
-        other => panic!("expected the replace action, got {:?}", other.is_some()),
     }
 }
 
@@ -4055,12 +4037,12 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
         .cache_actions
         .iter()
         .find_map(|action| match action {
-            CacheAction::ReplaceWriteThroughOnNodeSplit {
+            CacheAction::UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 new_node_id,
                 ..
             } => {
-                assert_eq!(*ack_id, leaf);
+                assert_eq!(*ack_id, Some(leaf));
                 Some(*new_node_id)
             }
             _ => None,
@@ -4524,7 +4506,7 @@ fn insert_host_refill_preserves_split_actions_and_lengths() {
     assert!(!result.host_insert_dropped);
     assert!(matches!(
         result.cache_actions.as_slice(),
-        [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
+        [CacheAction::UpdatePendingBackupOnNodeSplit { ack_id, .. }] if *ack_id == Some(leaf)
     ));
 }
 

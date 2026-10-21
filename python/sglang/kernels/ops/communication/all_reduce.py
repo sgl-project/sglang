@@ -228,6 +228,10 @@ def custom_all_reduce(
 ) -> torch.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
     result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    # Already a torch.Tensor once tvm-ffi loads torch's DLPack exchange API;
+    # re-wrapping it is a pure round trip (~15 us per call on GB300).
+    if isinstance(result, torch.Tensor):
+        return result
     return torch.from_dlpack(result)
 
 

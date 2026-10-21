@@ -814,7 +814,10 @@ class UnoWorkerV2(BaseSpecWorker):
             else contextlib.nullcontext()
         )
         attn_context = (
-            forward_context(ForwardContext(attn_backend=self._uno_draft_attn_backend))
+            forward_context(
+                ForwardContext(attn_backend=self._uno_draft_attn_backend),
+                forward_batch=forward_batch,
+            )
             if self.tree_mode
             else contextlib.nullcontext()
         )
