@@ -1,26 +1,30 @@
 """CPU unit tests for NVFP4 fused-MoE GEMM1 global-scale handling.
 
 w13 fuses the gate (w1) and up (w3) projections, which can carry separate NVFP4
-weight scales. These tests pin the two helpers that handle that: the gate/up
-split in _compute_gemm1_alphas and the TRT-LLM up-half output scalar in
-_compute_g1_scale_c. Both are plain tensor ops, so they run on CPU.
+weight scales. These tests cover their checkpoint loading, the gate/up split
+in _compute_gemm1_alphas, the TRT-LLM up-half output scalar in _compute_g1_scale_c,
+and the post-load SwiGLU/SiTU parameters. GPU weight packing is stubbed.
 
 The full TRT-LLM path only runs on Blackwell, and most checkpoints ship
 near-equal gate/up scales, so this regression wouldn't surface in an accuracy
-eval -- hence the direct contract tests. The wiring around the helpers (Marlin's
-single-scale collapse, the w1/w3 mismatch warning, and registering g1_alphas /
-g1_alphas_up in process_weights_after_loading) needs the GPU kernels and is
-covered on-device.
+eval -- hence the direct contract tests with distinct scales. Kernel execution
+and end-to-end model accuracy are not covered here.
 
 Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
 sizes, so a failure looks like one a real checkpoint would hit.
+
+The TRT-LLM weight padding is pinned here too: Nemotron 3 (hidden 2688,
+intermediate 1856, ReLU2 experts) needs a 128-aligned intermediate and, for
+per-token activations, a 512-aligned hidden; padding must be zero-filled.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -29,10 +33,22 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
-from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
-from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
+from sglang.srt.layers.quantization import modelopt_quant
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptNvFp4FusedMoEMethod,
+    _compute_gemm1_alphas,
+)
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    _align_fp4_moe_weights,
+    _compute_g1_scale_c,
+    trtllm_nvfp4_hidden_alignment,
+)
 
 # isort: on
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.runtime_context import get_flags
 from sglang.test.test_utils import CustomTestCase
 
 # Representative NVFP4 MoE shapes (name, num_experts, hidden, intermediate,
@@ -59,6 +75,172 @@ def _global_scales(num_experts: int, num_cols: int, seed: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     scales = torch.rand((num_experts, num_cols), generator=g) * 0.19 + 0.01
     return scales if num_cols > 1 else scales.squeeze(1)
+
+
+def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
+    """Small CPU buffers with the real quant method and checkpoint loader."""
+    config = MoeRunnerConfig(is_gated=is_gated)
+    with mock.patch.object(
+        modelopt_quant, "get_platform", return_value=SimpleNamespace(is_blackwell=True)
+    ):
+        method = ModelOptNvFp4FusedMoEMethod(
+            SimpleNamespace(use_per_token_activation=False)
+        )
+    method.moe_runner_config = config
+    layer = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(layer)
+    layer.quant_method = method
+    layer.quant_config = method.quant_config
+    layer.moe_runner_config = config
+    layer.scheme = None
+    layer._has_fused_shared = False
+    layer.use_flashinfer_trtllm_moe = method.enable_flashinfer_trtllm_moe
+    layer.use_triton_kernels = False
+    layer.use_presharded_weights = False
+    layer.moe_tp_size = 2
+    layer.moe_tp_rank = tp_rank
+    layer.dispatcher = SimpleNamespace(set_quant_config=lambda config: None)
+    num_shards = 2 if is_gated else 1
+    for name, data in {
+        "w13_weight": torch.zeros(1, num_shards * 64, 32, dtype=torch.uint8),
+        "w13_weight_scale": torch.zeros(
+            1, num_shards * 64, 4, dtype=torch.float8_e4m3fn
+        ),
+        "w13_weight_scale_2": torch.zeros(1, num_shards),
+        "w13_input_scale": torch.full((1, num_shards), 0.5),
+        "w2_weight": torch.zeros(1, 64, 32, dtype=torch.uint8),
+        "w2_weight_scale": torch.zeros(1, 64, 4, dtype=torch.float8_e4m3fn),
+        "w2_weight_scale_2": torch.ones(1),
+        "w2_input_scale": torch.ones(1),
+    }.items():
+        layer.register_parameter(name, torch.nn.Parameter(data, requires_grad=False))
+    return layer
+
+
+class TestNvfp4MoeScaleLoading(CustomTestCase):
+    def test_global_scales_keep_gate_up_order_across_weight_layouts(self):
+        """Changing backend layout must not change which projection an alpha scales.
+
+        Exercise the full shard dispatch, including TP slicing and a second load
+        in reverse order, so a loader-wide w1/w3 swap cannot hide behind tied scales.
+        """
+        layouts = [
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, MoeA2ABackend.NONE, True),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, MoeA2ABackend.NONE, True),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, MoeA2ABackend.MEGAMOE, False),
+            (MoeRunnerBackend.FLASHINFER_CUTLASS, MoeA2ABackend.NONE, True),
+            (MoeRunnerBackend.FLASHINFER_CUTEDSL, MoeA2ABackend.NONE, True),
+            (MoeRunnerBackend.FLASHINFER_CUTEDSL, MoeA2ABackend.DEEPEP, False),
+        ]
+        for backend, a2a, up_first in layouts:
+            for tp_rank in (0, 1):
+                with (
+                    self.subTest(backend=backend, a2a=a2a, tp_rank=tp_rank),
+                    get_flags().moe.override(runner_backend=backend, a2a_backend=a2a),
+                ):
+                    layer = _nvfp4_loader_layer(tp_rank=tp_rank)
+                    gate = torch.arange(128, dtype=torch.uint8)[:, None].expand(128, 32)
+                    up = gate + 128
+                    for reload, shards in enumerate((("w1", "w3"), ("w3", "w1"))):
+                        for shard in shards:
+                            is_gate = shard == "w1"
+                            values = {
+                                "w13_weight": gate if is_gate else up,
+                                "w13_weight_scale": torch.full(
+                                    (128, 4),
+                                    1.0 if is_gate else 2.0,
+                                    dtype=torch.float8_e4m3fn,
+                                ),
+                                "w13_weight_scale_2": torch.tensor(
+                                    (0.25 if is_gate else 1.0) * (reload + 1)
+                                ),
+                            }
+                            for name, value in values.items():
+                                layer._weight_loader_impl(
+                                    getattr(layer, name), value, name, shard, 0
+                                )
+                        halves = (up, gate) if up_first else (gate, up)
+                        expected = torch.cat(
+                            [half[tp_rank * 64 : (tp_rank + 1) * 64] for half in halves]
+                        )
+                        torch.testing.assert_close(layer.w13_weight[0], expected)
+                        expected_blocks = (
+                            torch.tensor([2.0, 1.0] if up_first else [1.0, 2.0])
+                            .repeat_interleave(64)[:, None]
+                            .expand(128, 4)
+                        )
+                        torch.testing.assert_close(
+                            layer.w13_weight_scale[0].float(), expected_blocks
+                        )
+                        gate_alpha, up_alpha = _compute_gemm1_alphas(
+                            layer.w13_weight_scale_2, torch.tensor(0.5), True
+                        )
+                        torch.testing.assert_close(
+                            gate_alpha, torch.tensor([0.125 * (reload + 1)])
+                        )
+                        torch.testing.assert_close(
+                            up_alpha, torch.tensor([0.5 * (reload + 1)])
+                        )
+
+    def test_non_gated_trtllm_loads_one_projection(self):
+        with get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
+            a2a_backend=MoeA2ABackend.NONE,
+        ):
+            layer = _nvfp4_loader_layer(is_gated=False, tp_rank=1)
+            weight = torch.arange(128, dtype=torch.uint8)[:, None].expand(128, 32)
+            layer._weight_loader_impl(layer.w13_weight, weight, "w13_weight", "w1", 0)
+            layer._weight_loader_impl(
+                layer.w13_weight_scale_2,
+                torch.tensor(0.25),
+                "w13_weight_scale_2",
+                "w1",
+                0,
+            )
+            torch.testing.assert_close(layer.w13_weight[0], weight[64:])
+            gate_alpha, up_alpha = _compute_gemm1_alphas(
+                layer.w13_weight_scale_2, torch.tensor(0.5), False
+            )
+            torch.testing.assert_close(gate_alpha, torch.tensor([0.125]))
+            torch.testing.assert_close(up_alpha, gate_alpha)
+
+    def test_trtllm_post_load_activation_parameters(self):
+        """Beta adds one in dequantized up units; SiTU keeps its linear scale."""
+        for activation in ("silu", "situ"):
+            with (
+                self.subTest(activation=activation),
+                get_flags().moe.override(
+                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    a2a_backend=MoeA2ABackend.NONE,
+                ),
+                mock.patch.object(modelopt_quant, "reorder_rows_for_gated_act_gemm"),
+                mock.patch.object(modelopt_quant, "shuffle_matrix_sf_a"),
+            ):
+                layer = _nvfp4_loader_layer()
+                layer.w13_weight_scale_2.data.copy_(torch.tensor([[0.25, 1.0]]))
+                config = layer.moe_runner_config
+                config.activation = activation
+                config.gemm1_alpha = 1.702 if activation == "silu" else 4.0
+                config.gemm1_clamp_limit = None if activation == "silu" else 25.0
+                config.swiglu_limit = 7.0
+                # Only GPU packing is stubbed; scale conversion and registration run.
+                with mock.patch.object(
+                    layer.quant_method, "_align_fp4_moe_weights_for_flashinfer_trtllm"
+                ):
+                    layer.quant_method.process_weights_after_loading(layer)
+                torch.testing.assert_close(
+                    layer.gemm1_alpha, torch.tensor([config.gemm1_alpha])
+                )
+                if activation == "silu":
+                    torch.testing.assert_close(
+                        layer.gemm1_beta * layer.g1_alphas_up, torch.ones(1)
+                    )
+                    torch.testing.assert_close(
+                        layer.gemm1_clamp_limit * layer.g1_alphas, torch.tensor([7.0])
+                    )
+                else:
+                    self.assertFalse(hasattr(layer, "gemm1_clamp_limit"))
+                    torch.testing.assert_close(layer.gemm1_beta, torch.tensor([25.0]))
 
 
 class TestGemm1Alphas(CustomTestCase):
@@ -322,6 +504,111 @@ class TestG1ScaleC(CustomTestCase):
         )
 
         self.assertEqual(g1_scale_c.dtype, torch.float32)
+
+
+def _generate_fp4_moe_weights(
+    num_experts: int, hidden: int, inter: int, is_gated: bool
+):
+    """Packed FP4 weights + E4M3 block scales in checkpoint layout, no zeros."""
+    gate_up = (2 if is_gated else 1) * inter
+
+    def u8(*shape):
+        return torch.randint(1, 255, shape, dtype=torch.uint8)
+
+    w13 = u8(num_experts, gate_up, hidden // 2)
+    w13_scale = u8(num_experts, gate_up, hidden // 16).view(torch.float8_e4m3fn)
+    w2 = u8(num_experts, hidden, inter // 2)
+    w2_scale = u8(num_experts, hidden, inter // 16).view(torch.float8_e4m3fn)
+    return w13, w13_scale, w2, w2_scale
+
+
+def _byte_sum(t: torch.Tensor) -> int:
+    return t.view(torch.uint8).to(torch.int64).sum().item()
+
+
+class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):
+    def test_only_per_token_non_gated_is_padded(self):
+        for per_token, is_gated, expected in [
+            (True, False, 512),
+            (True, True, 1),
+            (False, False, 1),
+            (False, True, 1),
+        ]:
+            self.assertEqual(
+                trtllm_nvfp4_hidden_alignment(
+                    use_per_token_activation=per_token, is_gated=is_gated
+                ),
+                expected,
+            )
+
+
+class TestAlignFp4MoeWeights(CustomTestCase):
+    def test_aligned_shapes_are_returned_untouched(self):
+        weights = _generate_fp4_moe_weights(4, 3072, 1920, is_gated=False)
+
+        out = _align_fp4_moe_weights(
+            *weights, is_gated=False, intermediate_alignment=128, hidden_alignment=512
+        )
+
+        self.assertEqual(out[4:], (1920, 3072))
+        for original, returned in zip(weights, out[:4]):
+            self.assertIs(returned, original)
+
+    def test_nemotron_pads_intermediate_and_hidden_with_zero_fill(self):
+        num_experts, hidden, inter = 4, 2688, 1856
+        padded_hidden, padded_inter = 3072, 1920
+        w13, w13_scale, w2, w2_scale = _generate_fp4_moe_weights(
+            num_experts, hidden, inter, is_gated=False
+        )
+
+        p_w13, p_w13_scale, p_w2, p_w2_scale, out_inter, out_hidden = (
+            _align_fp4_moe_weights(
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                is_gated=False,
+                intermediate_alignment=128,
+                hidden_alignment=512,
+            )
+        )
+
+        self.assertEqual((out_inter, out_hidden), (padded_inter, padded_hidden))
+        # GEMM1: rows are intermediate, K is hidden (2 values/byte, 16/scale).
+        self.assertEqual(p_w13.shape, (num_experts, padded_inter, padded_hidden // 2))
+        self.assertEqual(
+            p_w13_scale.shape, (num_experts, padded_inter, padded_hidden // 16)
+        )
+        # GEMM2: rows are hidden, K is intermediate.
+        self.assertEqual(p_w2.shape, (num_experts, padded_hidden, padded_inter // 2))
+        self.assertEqual(
+            p_w2_scale.shape, (num_experts, padded_hidden, padded_inter // 16)
+        )
+        torch.testing.assert_close(p_w13[:, :inter, : hidden // 2], w13)
+        torch.testing.assert_close(p_w2[:, :hidden, : inter // 2], w2)
+        # Equal byte sums with the originals embedded means the padding is zero.
+        for padded, original in [
+            (p_w13, w13),
+            (p_w13_scale, w13_scale),
+            (p_w2, w2),
+            (p_w2_scale, w2_scale),
+        ]:
+            self.assertEqual(padded.dtype, original.dtype)
+            self.assertEqual(_byte_sum(padded), _byte_sum(original))
+
+    def test_gated_pads_only_intermediate_by_default(self):
+        num_experts, hidden, inter = 2, 2688, 1000
+        w13, w13_scale, w2, w2_scale = _generate_fp4_moe_weights(
+            num_experts, hidden, inter, is_gated=True
+        )
+
+        p_w13, _, p_w2, _, out_inter, out_hidden = _align_fp4_moe_weights(
+            w13, w13_scale, w2, w2_scale, is_gated=True, intermediate_alignment=16
+        )
+
+        self.assertEqual((out_inter, out_hidden), (1008, hidden))
+        self.assertEqual(p_w13.shape, (num_experts, 2 * 1008, hidden // 2))
+        self.assertEqual(p_w2.shape, (num_experts, hidden, 1008 // 2))
 
 
 if __name__ == "__main__":

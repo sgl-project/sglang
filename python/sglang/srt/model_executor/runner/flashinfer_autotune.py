@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -34,8 +35,10 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -51,6 +54,24 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
+
+
+def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    for module in model_runner.model.modules():
+        method = getattr(module, "quant_method", None)
+        if (
+            isinstance(method, Fp8LinearMethod)
+            and method.block_fp8_as_mxfp8
+            and module.block_fp8_mxfp8_ready
+            and (
+                method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+                or method.mxfp8_dense_backend.is_flashinfer_cutlass()
+            )
+        ):
+            return True
+    return False
 
 
 def should_run_flashinfer_autotune(
@@ -94,6 +115,7 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_megamoe",
     ]
 
     from sglang.srt.layers.quantization.fp4_utils import (
@@ -120,7 +142,7 @@ def should_run_flashinfer_autotune(
     elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
     else:
-        fp8_gemm_needs_autotune = False
+        fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
@@ -147,12 +169,14 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
-        str(mr.ps.tp_size),
+        str(get_parallel().tp_size),
         str(get_parallel().pp_size),
-        str(mr.ps.attn_dp_size),
-        str(mr.ps.moe_ep_size),
+        str(get_parallel().attn_dp_size),
+        str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # Retune caches created before FlashInfer's default tactic joined the race.
+    model_key_parts.append("candidate_selection=v2_default")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
@@ -169,10 +193,20 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return (
-        cache_dir
-        / f"rank_tp{mr.ps.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.ps.dp_rank or 0}.json"
-    )
+    rank_key = f"rank_tp{get_parallel().tp_rank}_pp{get_parallel().pp_rank}_dp{get_parallel().dp_rank or 0}"
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+        and not mr.is_draft_worker
+    ):
+        from sglang.srt.platforms import current_platform
+
+        # Ordinary FlashInfer tactics use best-effort merging, but MegaMoE's
+        # namespaced records currently require one writer per file. Follow the
+        # P2P cache's device isolation, using physical UUIDs for stable identity
+        # across CUDA index remapping and restarts. Engines sharing physical GPUs
+        # must use separate SGLANG_CACHE_DIRs.
+        rank_key += f"_gpu{current_platform.get_device_uuid(mr.gpu_id)}"
+    return cache_dir / f"{rank_key}.json"
 
 
 def _autotune_tactic_sync_group(
@@ -249,12 +283,14 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
+    from flashinfer import autotune_v2
+
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    sync_group = _autotune_tactic_sync_group(mr.tp_group)
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
     if reuse_cache:
         autotune_cache = cache_path
@@ -265,7 +301,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         runs_dir = cache_path.parent / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
-        autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+        autotune_cache = runs_dir / (
+            f"{cache_path.stem}.{timestamp}.{uuid.uuid4().hex}{cache_path.suffix}"
+        )
         logger.info(
             "Running FlashInfer autotune (cache reuse DISABLED via "
             "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
@@ -277,6 +315,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            megamoe_autotune_context,
+        )
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
@@ -284,6 +325,27 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+        mega_context = empty_context()
+        if (
+            get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+            and not mr.is_draft_worker
+            and "flashinfer_megamoe" not in skip_ops
+        ):
+            # The chunk size is already per DP rank. Prepare one prefill profile
+            # independently of the optional full-model EXTEND autotune pass.
+            prefill_num_tokens = (
+                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+            )
+            mega_context = megamoe_autotune_context(
+                decode_num_tokens=max(
+                    mr.max_decode_logits_rows(),
+                    get_eager_max_batch_size(mr.max_running_requests)
+                    * mr.decode_num_tokens_per_req(
+                        num_draft_tokens=max_speculative_num_draft_tokens()
+                    ),
+                ),
+                prefill_num_tokens=prefill_num_tokens,
+            )
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -291,6 +353,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
+            autotune_v2(mode="tune", persistent_cache=False),
+            mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield
@@ -425,7 +489,7 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(mr.tp_group) is not None:
+        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
             # Tuning is collective: this rank has stopped reducing while its
             # peers wait on the next tactic, so skipping the pass would hang
             # them. Fail instead of degrading alone.
