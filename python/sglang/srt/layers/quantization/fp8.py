@@ -68,6 +68,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_mxfp8_linear,
     input_to_float8,
     mxfp8_group_quantize,
+    mxfp8_sf_swizzle_128x4,
     normalize_e4m3fn_to_e4m3fnuz,
     prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
@@ -956,6 +957,20 @@ class Fp8LinearMethod(LinearMethodBase):
         n, k = layer.weight.shape
         if k % 32 != 0:
             return
+        if (
+            self.mxfp8_dense_backend is not None
+            and self.mxfp8_dense_backend.is_flashinfer_b12x()
+            and k % 128 != 0
+        ):
+            # The b12x kernel requires K % 128 == 0; leave this layer on the
+            # Triton block kernel instead of failing at the first GEMM.
+            logger.warning(
+                "Block-fp8 layer stays on the Triton kernel: the b12x MXFP8 "
+                "kernel requires K %% 128 == 0, got K=%d (layer %s).",
+                k,
+                getattr(layer, "prefix", "<unknown>"),
+            )
+            return
         try:
             scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
                 layer.weight_scale_inv.data, (n, k), self.weight_block_size
@@ -1028,6 +1043,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer,
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
+            )
+        elif backend.is_flashinfer_b12x():
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
+            # The b12x kernel consumes 1D 128x4-swizzled ue8m0 scale bytes over
+            # the (N, K/32) per-row grid; block_scale_interleave's layout is
+            # what the cutlass/cute-dsl backends take instead.
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_swizzled",
+                mxfp8_sf_swizzle_128x4(scale_u8.contiguous()).contiguous(),
             )
         elif backend.is_gfx95():
             fp8_hip.process_dense_weights(self, layer, scale_u8)
@@ -1304,7 +1330,11 @@ class Fp8LinearMethod(LinearMethodBase):
                         is_batch_invariant_mode_enabled()
                         or get_exec().deterministic.enable_deterministic_inference
                     )
-            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
+            if (
+                backend.is_flashinfer_cutlass()
+                or backend.is_flashinfer_cutedsl()
+                or backend.is_flashinfer_b12x()
+            ):
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
