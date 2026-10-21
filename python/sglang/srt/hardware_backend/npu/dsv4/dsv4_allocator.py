@@ -170,7 +170,14 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return out_full_loc[completed_group] // 4
 
     def retain_c128_pages(self, page_ids: torch.Tensor) -> None:
-        page_ids = page_ids.to(torch.int64).view(-1)
+        # Symmetric with release_c128_pages: de-duplicate and drop the page-0
+        # sentinel (release filters `> 0`). Without this, a page appearing twice
+        # in one retain (or the sentinel) inflates the refcount, so the matching
+        # release never reaches 0 and the page leaks (never returned to the
+        # free list). Kept identical to release's normalization so the pair is
+        # exactly balanced.
+        page_ids = torch.unique(page_ids.to(torch.int64).view(-1))
+        page_ids = page_ids[page_ids > 0]
         if page_ids.numel() == 0:
             return
         self.c128_page_refcount.index_add_(

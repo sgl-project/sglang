@@ -81,27 +81,6 @@ class KVAndScore:
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
 
-def c4_state_transfer_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    ring_size: int,
-) -> np.ndarray:
-    """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
-    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
-    # pair the overlap compressor's live rows by logical token position.
-    if ring_size < 8 or ring_size % 4 != 0:
-        raise ValueError(
-            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
-        )
-
-    seq_len = max(0, int(seq_len))
-    state_len = seq_len % 4 + 4
-    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
-    return rows.astype(np.int32)
-
-
 def request_scoped_state_transfer_indices(
     req_pool_idx: int,
     seq_len: int,
