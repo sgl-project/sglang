@@ -422,6 +422,7 @@ def _extend_batch(fx):
         encoder_swa_replay=False,
         encoder_swa_row_floor=fx.folded.row_floor,
         encoder_swa_compress_rows=fx.folded.keep_rows,
+        swa_recompute=False,
     )
 
 

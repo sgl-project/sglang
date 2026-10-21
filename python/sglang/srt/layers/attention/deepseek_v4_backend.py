@@ -1017,6 +1017,13 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
+def swa_recompute_floor(forward_batch: ForwardBatch) -> torch.Tensor:
+    """Per-token replay start: window rows below it were never rebuilt."""
+    extend_lens = forward_batch.extend_seq_lens.to(torch.int64)
+    prefix_lens = forward_batch.seq_lens.to(torch.int64) - extend_lens
+    return torch.repeat_interleave(prefix_lens, extend_lens).to(torch.int32)
+
+
 # The candidate window (2,048 blocks of 8 tokens): inside it the captured full
 # top-k equals the two-level selection.
 _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
@@ -1663,6 +1670,8 @@ class DeepseekV4AttnBackend(
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = self._prefill_graph_seq_limit()
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        if forward_batch.swa_recompute:
+            return False
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
         if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
@@ -3009,6 +3018,11 @@ class DeepseekV4AttnBackend(
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
+                swa_replay_start=(
+                    swa_recompute_floor(forward_batch)
+                    if forward_batch.swa_recompute
+                    else None
+                ),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
