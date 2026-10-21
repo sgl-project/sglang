@@ -1,5 +1,6 @@
 """Unit tests for EmbeddingCacheController paged host pool behavior."""
 
+import asyncio
 import threading
 import unittest
 from queue import Queue
@@ -377,6 +378,75 @@ class TestGetPoolViews(unittest.TestCase):
         ctrl.release_pool_views(["h"])
         self.assertEqual(entry.ref_count, 0)
         self.assertIn("h", ctrl.vision_pool.evictable)
+
+
+class TestRetainReadyEntries(unittest.TestCase):
+    def test_retained_entry_survives_concurrent_prefetch(self):
+        async def run():
+            ctrl = _make_controller(num_pages=1)
+            entry = _insert_ready_entry(ctrl, "hit", torch.ones(2, 4))
+            with ctrl.retain_ready_entries(["hit"]):
+                await asyncio.to_thread(
+                    ctrl.prefetch, "other", ["new"], [2], Modality.IMAGE
+                )
+                self.assertIs(ctrl.entries["hit"], entry)
+                self.assertEqual(entry.ref_count, 1)
+            self.assertEqual(entry.ref_count, 0)
+
+        asyncio.run(run())
+
+    def test_retained_hits_survive_pressure_and_nested_reads(self):
+        ctrl = _make_controller(num_pages=1)
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        entry = _insert_ready_entry(ctrl, "hit", tensor)
+        with ctrl.retain_ready_entries(["hit", "hit", "missing"]) as ready:
+            self.assertEqual(ready, {"hit"})
+            self.assertEqual(entry.ref_count, 1)
+            with ctrl.retain_ready_entries(["hit"]):
+                views = ctrl.get_pool_views(["hit"])
+                self.assertEqual(entry.ref_count, 3)
+                self.assertTrue(torch.equal(torch.cat(views[0]), tensor))
+                ctrl.release_pool_views(["hit"])
+            self.assertEqual(entry.ref_count, 1)
+            ctrl.prefetch("other", ["new"], [2], Modality.IMAGE)
+            self.assertNotIn("new", ctrl.entries)
+            self.assertIs(ctrl.entries["hit"], entry)
+        self.assertEqual(entry.ref_count, 0)
+        ctrl.prefetch("other", ["new"], [2], Modality.IMAGE)
+        self.assertNotIn("hit", ctrl.entries)
+        self.assertIn("new", ctrl.entries)
+
+    def test_only_ready_entries_are_retained(self):
+        ctrl = _make_controller(num_pages=2)
+        entry = _insert_ready_entry(ctrl, "hit", torch.ones(2, 4))
+        ctrl.prefetch("pending", ["loading"], [2], Modality.IMAGE)
+        with ctrl.retain_ready_entries(["hit", "loading", "missing"]) as ready:
+            self.assertEqual(ready, {"hit"})
+            self.assertEqual(entry.ref_count, 1)
+            self.assertEqual(ctrl.entries["loading"].ref_count, 0)
+        self.assertEqual(entry.ref_count, 0)
+
+    def test_errors_and_cancellation_release_owned_pins(self):
+        for error in (RuntimeError, asyncio.CancelledError):
+            with self.subTest(error=error):
+                ctrl = _make_controller(num_pages=1)
+                entry = _insert_ready_entry(ctrl, "hit", torch.ones(2, 4))
+                with self.assertRaises(error):
+                    with ctrl.retain_ready_entries(["hit"]):
+                        raise error()
+                self.assertEqual(entry.ref_count, 0)
+                self.assertIn("hit", ctrl.vision_pool.evictable)
+
+    def test_release_does_not_unpin_replacement(self):
+        ctrl = _make_controller(num_pages=2)
+        entry = _insert_ready_entry(ctrl, "hit", torch.ones(2, 4))
+        with ctrl.retain_ready_entries(["hit"]):
+            replacement = _insert_ready_entry(ctrl, "hit", torch.zeros(2, 4))
+            with ctrl.lock:
+                ctrl._pin_read(replacement)
+        self.assertEqual(entry.ref_count, 0)
+        self.assertEqual(replacement.ref_count, 1)
+        self.assertNotIn("hit", ctrl.vision_pool.evictable)
 
 
 class TestTransferBuffers(unittest.TestCase):

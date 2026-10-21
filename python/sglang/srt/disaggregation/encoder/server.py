@@ -8,6 +8,7 @@ import pickle
 import time
 import traceback
 from abc import ABC, abstractmethod
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -1418,6 +1419,7 @@ class MMEncoder:
         hit_indices: List[int],
         hit_hashes: List[str],
         prefetch_failed: bool,
+        retained_entries: ExitStack,
     ) -> List[int]:
         fallback_mask = torch.zeros(ctx.num_items, dtype=torch.int32)
         if self.rank == 0 and hit_indices:
@@ -1435,8 +1437,11 @@ class MMEncoder:
 
                     await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
 
+                    ready_hashes = retained_entries.enter_context(
+                        self.mm_global_cache.retain_ready_entries(hit_hashes)
+                    )
                     for i, idx in enumerate(hit_indices):
-                        if not self.mm_global_cache.has_local_embedding(hit_hashes[i]):
+                        if hit_hashes[i] not in ready_hashes:
                             fallback_mask[idx] = 1
                     num_partial_fail = int(fallback_mask.sum().item())
                     if num_partial_fail > 0:
@@ -1653,69 +1658,72 @@ class MMEncoder:
                 ctx, missing_indices, new_slices
             )
 
-        fallback_indices = await self._wait_global_cache_prefetch(
-            ctx, hit_indices, hit_hashes, prefetch_failed
-        )
+        with ExitStack() as retained_entries:
+            fallback_indices = await self._wait_global_cache_prefetch(
+                ctx, hit_indices, hit_hashes, prefetch_failed, retained_entries
+            )
 
-        fallback_slices = []
-        fallback_hashes = []
-        fallback_d2h_handles = []
-        if fallback_indices:
-            logger.info(
-                f"Req {ctx.req_id}: All ranks running ViT fallback "
-                f"for {len(fallback_indices)} items."
-            )
-            fallback_slices = self._encode_missing(
-                ctx.mm_feature,
-                ctx.preprocess_result,
-                fallback_indices,
-                ctx.modality,
-                ctx.get_feature_fn,
-            )
-            if self.rank == 0 and not keep_on_gpu:
-                fallback_hashes, fallback_d2h_handles = self._stage_global_cache_slices(
-                    ctx, fallback_indices, fallback_slices
+            fallback_slices = []
+            fallback_hashes = []
+            fallback_d2h_handles = []
+            if fallback_indices:
+                logger.info(
+                    f"Req {ctx.req_id}: All ranks running ViT fallback "
+                    f"for {len(fallback_indices)} items."
                 )
-
-        if self.rank == 0:
-            if keep_on_gpu:
-                # Start staging newly computed GPU slices into the CPU cache
-                # pool asynchronously before assembling the GPU output.
-                if new_slices:
-                    miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
-                        ctx, missing_indices, new_slices
-                    )
-                if fallback_slices:
+                fallback_slices = self._encode_missing(
+                    ctx.mm_feature,
+                    ctx.preprocess_result,
+                    fallback_indices,
+                    ctx.modality,
+                    ctx.get_feature_fn,
+                )
+                if self.rank == 0 and not keep_on_gpu:
                     fallback_hashes, fallback_d2h_handles = (
                         self._stage_global_cache_slices(
                             ctx, fallback_indices, fallback_slices
                         )
                     )
-                mm_embedding = self._assemble_global_cache_gpu(
-                    ctx,
-                    missing_indices,
-                    fallback_indices,
-                    new_slices,
-                    fallback_slices,
-                )
-            else:
-                mm_embedding = self._assemble_global_cache_cpu(
-                    ctx,
-                    hit_indices,
-                    missing_indices,
-                    fallback_indices,
-                    new_slices,
-                    fallback_slices,
-                )
 
-            self._launch_global_cache_insert(
-                ctx,
-                miss_hashes + fallback_hashes,
-                miss_d2h_handles + fallback_d2h_handles,
-            )
-            return mm_embedding
+            if self.rank == 0:
+                if keep_on_gpu:
+                    # Start staging newly computed GPU slices into the CPU cache
+                    # pool asynchronously before assembling the GPU output.
+                    if new_slices:
+                        miss_hashes, miss_d2h_handles = self._stage_global_cache_slices(
+                            ctx, missing_indices, new_slices
+                        )
+                    if fallback_slices:
+                        fallback_hashes, fallback_d2h_handles = (
+                            self._stage_global_cache_slices(
+                                ctx, fallback_indices, fallback_slices
+                            )
+                        )
+                    mm_embedding = self._assemble_global_cache_gpu(
+                        ctx,
+                        missing_indices,
+                        fallback_indices,
+                        new_slices,
+                        fallback_slices,
+                    )
+                else:
+                    mm_embedding = self._assemble_global_cache_cpu(
+                        ctx,
+                        hit_indices,
+                        missing_indices,
+                        fallback_indices,
+                        new_slices,
+                        fallback_slices,
+                    )
 
-        return None
+                self._launch_global_cache_insert(
+                    ctx,
+                    miss_hashes + fallback_hashes,
+                    miss_d2h_handles + fallback_d2h_handles,
+                )
+                return mm_embedding
+
+            return None
 
     async def _compute_direct_embedding(
         self,
