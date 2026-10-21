@@ -14,7 +14,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -191,13 +190,10 @@ def tiny_gemm_bf16(
     else:
         assert out_dtype is None or out_dtype == out.dtype
     if n_split is None:
-        if _prefer_k_variant(n, k):
-            n_split = _default_k_gemm_n_split(n, k)
-        elif w.dtype == torch.float32 and (n, k) == (256, 5120) and max_m <= 16:
-            # Rotating 49 FP32 router weights under CUDA graph replay.
-            small_m = 8 if get_jit_cuda_arch().major == 10 else 4
-            n_split = 1 if x.shape[0] <= small_m else 2
-        else:
-            n_split = _default_n_gemm_n_split(n, k, max_m)
+        n_split = (
+            _default_k_gemm_n_split(n, k)
+            if _prefer_k_variant(n, k)
+            else _default_n_gemm_n_split(n, k, max_m)
+        )
     _tiny_gemm_custom_op(x, w, out, max_m, n_split)
     return out
