@@ -286,7 +286,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
     if (
         x.is_cuda
-        and (x_flat.shape[0] >= 128 or hopper_medium)
+        and x_flat.shape[0] >= 32
         and x_flat.is_contiguous()
         and (get_platform().is_sm100 or get_platform().is_sm90)
         and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
