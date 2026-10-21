@@ -8,86 +8,15 @@ use std::collections::HashMap;
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::deepseek::common::tokens;
-use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, RenderedPrompt, TextInput};
-use sglang_processor::dynamo_tokenizers::Tokenizer;
+use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
 
 pub use sglang_processor::ChatFormatter;
 use sglang_processor::TemplateError;
 
+pub(super) use crate::message::request::RenderedChat;
+
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
-
-/// A rendered chat prompt and the `continue_final_message` text after it.
-pub(super) struct RenderedChat {
-    /// The template output, ending where generation would start without a
-    /// continuation (e.g. an opening `<think>`).
-    pub(super) prompt: RenderedPrompt,
-    pub(super) continuation: String,
-}
-
-impl RenderedChat {
-    pub(super) fn into_text(self) -> String {
-        self.prompt.into_text() + &self.continuation
-    }
-}
-
-/// Encodes rendered chat prompts as Python's chat layer does.
-#[derive(Clone)]
-pub struct PromptEncoder {
-    tokenizer: Tokenizer,
-    /// Ids the tokenizer adds on its own (`encode("")`).
-    auto_specials: Vec<u32>,
-}
-
-impl PromptEncoder {
-    pub fn new(tokenizer: Tokenizer) -> Self {
-        let auto_specials = tokenizer
-            .encode("")
-            .map(|encoding| encoding.token_ids().to_vec())
-            .unwrap_or_default();
-        Self {
-            tokenizer,
-            auto_specials,
-        }
-    }
-
-    /// The template output without the tokenizer's own specials, its segments
-    /// keeping their special-token policy (Kimi K3), then the continuation
-    /// encoded on its own without its BOS.
-    pub(super) fn encode(&self, rendered: &RenderedChat) -> Result<Vec<u32>, String> {
-        let encode = |text: &str| match self.tokenizer.encode(text) {
-            Ok(encoding) => Ok(encoding.token_ids().to_vec()),
-            Err(error) => Err(error.to_string()),
-        };
-        let mut ids = match rendered.prompt.encode_segments() {
-            Some(segments) => self
-                .tokenizer
-                .encode_segments(&segments)
-                .map_err(|error| error.to_string())?
-                .token_ids()
-                .to_vec(),
-            None => encode(rendered.prompt.as_str())?,
-        };
-        if ids.starts_with(&self.auto_specials) {
-            ids.drain(..self.auto_specials.len());
-        }
-        if !rendered.continuation.is_empty() {
-            let suffix = encode(&rendered.continuation)?;
-            let bos = self.auto_specials.first();
-            let skip = usize::from(bos.is_some() && suffix.first() == bos);
-            ids.extend(&suffix[skip..]);
-        }
-        Ok(ids)
-    }
-
-    /// [`Self::encode`] off the async workers.
-    pub(super) async fn encode_blocking(&self, rendered: RenderedChat) -> Result<Vec<u32>, String> {
-        let encoder = self.clone();
-        tokio::task::spawn_blocking(move || encoder.encode(&rendered))
-            .await
-            .map_err(|error| error.to_string())?
-    }
-}
 
 /// Render a chat request for the tokenizer pool.
 /// Formatters with an SGLang request path render the raw `body` and return the
@@ -95,7 +24,7 @@ impl PromptEncoder {
 /// their templates fold any continuation into the prompt.
 pub(super) fn render_chat(
     formatter: &ChatFormatter,
-    body: &Value,
+    body: Value,
     request: &CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<RenderedChat, TemplateError> {
@@ -105,9 +34,8 @@ pub(super) fn render_chat(
         | ChatFormatter::Glm53(_)
         | ChatFormatter::KimiK3
         | ChatFormatter::Qwen38 { .. } => {
-            // The server has no `--default-chat-template-kwargs`.
-            let (prompt, mut continuation) =
-                formatter.render_request(body.clone(), &HashMap::new())?;
+            // `--default-chat-template-kwargs` is refused at launch.
+            let (prompt, mut continuation) = formatter.render_request(body, &HashMap::new())?;
             // SGLang tokenizes the DeepSeek-V4 prefix on its own and drops its leading BOS.
             if matches!(
                 formatter,

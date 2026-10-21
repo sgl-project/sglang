@@ -30,8 +30,6 @@ pub(super) struct AppState {
     pub(super) generation_policy: GenerationPolicy,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
     pub(super) generate_hook: Option<Arc<dyn GenerateHook>>,
-    /// Encodes chat prompts; `None` leaves them to the tokenizer pool.
-    pub(super) prompt_encoder: Option<openai::PromptEncoder>,
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
@@ -75,13 +73,8 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
     hicache_manager: Arc<HiCacheManager>,
-    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
-    let prompt_encoder = chat_formatter
-        .as_ref()
-        .and(tokenizer)
-        .map(openai::PromptEncoder::new);
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
@@ -89,7 +82,6 @@ pub async fn serve(
         generation_policy,
         chat_formatter,
         generate_hook,
-        prompt_encoder,
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));

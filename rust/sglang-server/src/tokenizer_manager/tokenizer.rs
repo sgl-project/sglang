@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use crate::message::request::{Request, RequestKind};
+use dynamo_tokenizers::EncodeSegment;
+
+use crate::message::request::{RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
@@ -30,6 +32,16 @@ pub trait TextTokenizer: Send + Sync {
     /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
     fn auto_specials(&self) -> Vec<i64> {
         Vec::new()
+    }
+
+    /// Encode rendered segments, each with its own special-token policy.
+    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
+        self.encode(
+            &segments
+                .iter()
+                .map(|segment| segment.text)
+                .collect::<String>(),
+        )
     }
 }
 
@@ -94,6 +106,18 @@ impl TextTokenizer for DynamoTokenizer {
             })
             .unwrap_or_default()
     }
+
+    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
+        let encoding = self
+            .inner
+            .encode_segments(segments)
+            .map_err(|e| Error::Tokenize(e.to_string()))?;
+        Ok(encoding
+            .token_ids()
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect())
+    }
 }
 
 /// Remove one leading run of auto-added specials — exactly what an
@@ -153,6 +177,23 @@ impl TokenizerWorker {
             strip_auto_specials(ids, &self.auto_specials)
         })
     }
+
+    /// Python's chat encode: the template output without auto specials, then
+    /// the continuation on its own without its BOS.
+    fn encode_chat(&self, chat: &RenderedChat) -> Result<TokenIds, Error> {
+        let ids = match chat.prompt.encode_segments() {
+            Some(segments) => self.tokenizer.encode_segments(&segments)?,
+            None => self.tokenizer.encode(chat.prompt.as_str())?,
+        };
+        let mut ids = strip_auto_specials(ids, &self.auto_specials);
+        if !chat.continuation.is_empty() {
+            let suffix = self.tokenizer.encode(&chat.continuation)?;
+            let bos = self.auto_specials.first();
+            let skip = usize::from(bos.is_some() && suffix.first() == bos);
+            ids.extend_from_slice(&suffix[skip..]);
+        }
+        Ok(ids)
+    }
 }
 
 impl Runnable for TokenizerWorker {
@@ -160,12 +201,15 @@ impl Runnable for TokenizerWorker {
         while let Ok(mut req) = self.rx.recv() {
             // A tokenize request is answered here, through its own sink: it is
             // not registered with a detok shard and does not return to intake.
-            if let RequestKind::Tokenize {
-                text,
-                add_special_tokens,
-            } = &req.kind
-            {
-                let item = match self.tokenize(text, *add_special_tokens) {
+            if let RequestKind::Tokenize(input) = &req.kind {
+                let encoded = match input {
+                    TokenizeInput::Text {
+                        text,
+                        add_special_tokens,
+                    } => self.tokenize(text, *add_special_tokens),
+                    TokenizeInput::Chat(chat) => self.encode_chat(chat),
+                };
+                let item = match encoded {
                     Ok(ids) => ResponseItem::TokenIds(ids),
                     Err(err) => ResponseItem::Error(err),
                 };
@@ -193,13 +237,22 @@ impl Runnable for TokenizerWorker {
                 if let Some(n) = stop_tokens {
                     g.sampling_params.stop_str_max_len = n;
                 }
-                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
+                let encoded = match g.chat_prompt.take() {
+                    Some(chat) => self.encode_chat(&chat),
+                    None => self
+                        .tokenizer
+                        .encode(g.text.as_deref().unwrap_or(""))
+                        .map(|ids| {
+                            if g.skip_special_tokens {
+                                strip_auto_specials(ids, &self.auto_specials)
+                            } else {
+                                ids
+                            }
+                        }),
+                };
+                match encoded {
                     Ok(ids) => {
-                        g.input_ids = Some(if g.skip_special_tokens {
-                            strip_auto_specials(ids, &self.auto_specials)
-                        } else {
-                            ids
-                        });
+                        g.input_ids = Some(ids);
                         Event::TokenizeDone
                     }
                     Err(err) => Event::Error(err),
@@ -226,6 +279,7 @@ mod tests {
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::{AfterTokenize, RequestState};
+    use sglang_processor::dynamo_renderer::RenderedPrompt;
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs
@@ -350,7 +404,7 @@ mod tests {
     /// `add_special_tokens=False` at the chat-template encode site.
     #[test]
     fn skip_special_tokens_strips_the_auto_added_specials() {
-        let run = |skip_special_tokens: bool| {
+        let run = |skip_special_tokens: bool, chat_prompt: Option<Box<RenderedChat>>| {
             let (req_tx, req_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             req_tx
@@ -363,6 +417,7 @@ mod tests {
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
                         text: Some("hi".into()),
+                        chat_prompt,
                         skip_special_tokens,
                         ..Default::default()
                     })),
@@ -378,8 +433,25 @@ mod tests {
             };
             g.input_ids.clone().expect("tokenized")
         };
-        assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
-        assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+        assert_eq!(
+            run(false, None),
+            vec![0, 2],
+            "plain text prompts keep specials"
+        );
+        assert_eq!(
+            run(true, None),
+            vec![2],
+            "rendered prompts lose the auto BOS"
+        );
+        let chat = RenderedChat {
+            prompt: RenderedPrompt::text("hi".into()),
+            continuation: "abc".into(),
+        };
+        assert_eq!(
+            run(false, Some(Box::new(chat))),
+            vec![2, 3],
+            "chat and continuation lose it too"
+        );
     }
 
     /// A tokenize request is answered through its own sink and never returns
@@ -397,10 +469,10 @@ mod tests {
                     rid: "t".into(),
                     state: RequestState::Queued,
                     sink: ResponseSink::Local(sink_tx),
-                    kind: RequestKind::Tokenize {
+                    kind: RequestKind::Tokenize(TokenizeInput::Text {
                         text: text.into(),
                         add_special_tokens,
-                    },
+                    }),
                 })
                 .expect("send");
             drop(req_tx);

@@ -96,7 +96,6 @@ mod tests {
             server_args,
             chat_formatter: None,
             generate_hook: None,
-            prompt_encoder: None,
         });
         routes().with_state(state)
     }

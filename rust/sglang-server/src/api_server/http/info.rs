@@ -356,7 +356,6 @@ mod tests {
                 server_args,
                 chat_formatter: None,
                 generate_hook: None,
-                prompt_encoder: None,
             }),
             intake_rx,
             abort_rx,
