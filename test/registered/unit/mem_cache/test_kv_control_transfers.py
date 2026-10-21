@@ -628,6 +628,65 @@ def test_scope_larger_than_device_pool_defers_terminally_without_idle_leak(owner
         and not service.control.executor.transfers.interests
     )
     assert cache.token_to_kv_pool_allocator.available_size() == 64
+
+
+@pytest.mark.parametrize("direction", ["h2d_existing", "d2h_missing"])
+def test_transfer_holds_preserve_running_growth_even_without_new_gpu_allocation(
+    owner, direction
+):
+    from array import array
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    _, cache, service, dma = owner
+    node = seed(cache)
+    if direction == "h2d_existing":
+        initial = transfer(service)
+        service.progress()
+        dma.finish()
+        service.progress()
+        assert current(service, initial).status == Status.COMPLETED
+    submitted = len(dma.submitted)
+    other = cache.token_to_kv_pool_allocator.alloc(60)
+    running = Req(
+        rid="decode",
+        origin_input_text=None,
+        origin_input_ids=array("q", [99]),
+        sampling_params=SamplingParams(max_new_tokens=4, ignore_eos=True),
+        vocab_size=128,
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tree_cache = cache
+    scheduler.token_to_kv_pool_allocator = cache.token_to_kv_pool_allocator
+    scheduler.running_batch = SimpleNamespace(reqs=[running])
+    scheduler.chunked_req = None
+    scheduler.new_token_ratio_tracker = SimpleNamespace(current=0.01)
+    service.control.executor.gpu_copy_capacity = scheduler._kv_control_gpu_copy_capacity
+    assert scheduler._kv_control_gpu_copy_capacity() == 0
+    result = transfer(
+        service,
+        src="host" if direction == "h2d_existing" else "gpu",
+        dst="gpu" if direction == "h2d_existing" else "host",
+        message="growth",
+    )
+    assert result.status == Status.QUEUED, result
+    assert not dma.pending and len(dma.submitted) == submitted
+    assert node.component_data[ComponentType.FULL].lock_ref == 0
+    # Four real allocator rows make running growth feasible while the scope is
+    # held; neither direction allocates a new GPU row for this transfer.
+    cache.token_to_kv_pool_allocator.free(other[:4])
+    service.progress()
+    if direction == "d2h_missing":
+        assert len(dma.pending) == 1
+        dma.finish()
+        service.progress()
+    assert current(service, result).status == Status.COMPLETED, current(service, result)
+    assert cache.token_to_kv_pool_allocator.available_size() == 4
+    cache.token_to_kv_pool_allocator.free(other[4:])
+    cache.sanity_check()
     assert not dma.pending
     cache.sanity_check()
 

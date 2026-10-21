@@ -635,3 +635,24 @@ and whitespace checks pass; parent read the complete implementation/diff.
 Approve this local retention-runtime feature. Tool-wait cost/pressure policy,
 quota guidance and full preparation holds through actual admission remain
 ongoing work.
+
+## Running-growth headroom for control holds
+
+Preparation review found that clamping the owner's remaining GPU budget to zero
+could approve zero-allocation H2D while its resident-prefix hold consumed rows
+needed by running decode. The callback now preserves the signed remainder, so
+whole-scope H2D refuses that fit and drops temporary holds. GPU→host work that
+needs real DMA also checks headroom after acquiring source holds; otherwise a
+source pin could remove the only reclaimable rows required by running growth.
+Already-backed no-DMA source work keeps its existing behavior.
+
+Two new actual CPU-pool tests fill all 64 rows, leave only the selected four-row
+prefix evictable, and use a real Req's four-token ignore-EOS growth estimate.
+Both an already-resident H2D and an unbacked D2H queue without DMA or holds until
+four real rows are freed. They then complete without allocating GPU rows and
+preserve the four-row decode allowance. Sixteen transfer cases pass in
+/tmp/sglang-kv-growth-holds-cpu-proof.log. Existing prefill memory-budget
+regressions pass in /tmp/sglang-kv-growth-budget-regressions.log. Scheduler has
+no added Ruff findings; changed small files, isort/format and whitespace checks
+pass. Parent reviewed this budget boundary before implementing preparation
+handoff. No GPU/model/performance result is inferred from the CPU boundary test.

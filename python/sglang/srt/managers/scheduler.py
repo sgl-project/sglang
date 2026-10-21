@@ -2932,7 +2932,7 @@ class Scheduler(
         )
 
     def _kv_control_gpu_copy_capacity(self):
-        # Called only for explicit H2D approval, after holding selected cache
+        # Called for native transfer approval, after holding selected cache
         # prefixes. Reuse the allocator budget and the prefill growth estimate;
         # no extra reservation is carried into ordinary request admission.
         budget = self.token_to_kv_pool_allocator.create_prefill_budget(self.tree_cache)
@@ -2947,7 +2947,10 @@ class Scheduler(
             for req in requests
             if not req.finished()
         )
-        return max(0, int(budget.remaining_total))
+        # A negative remainder means selected source/destination holds already
+        # consume headroom needed by running decode. Preserve that fact even
+        # when a copy needs zero new GPU rows.
+        return int(budget.remaining_total)
 
     def _native_cache_available(self):
         tags = getattr(getattr(self, "weight_updater", None), "offload_tags", ())

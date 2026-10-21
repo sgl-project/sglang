@@ -803,3 +803,10 @@ with `--storage`. It checks policy-derived child queries, larger policy priority
 remaining subordinate to explicit priority, and a fresh policy claim on actual
 restored GPU KV before generation reuses it. Model-path, FP16 dummy-weight and
 other fixture limits are the same as the serving probe above.
+
+Native transfer approval preserves a signed remaining GPU budget after selected
+prefix holds. A negative remainder indicates that those holds consume expected
+running-decode headroom, even when H2D needs zero new GPU rows. Such H2D waits
+without holds. A GPU→host copy that requires DMA also waits when its source holds
+would consume that headroom. This check uses the same fresh scheduler budget;
+it does not carry an additional reservation into request admission.

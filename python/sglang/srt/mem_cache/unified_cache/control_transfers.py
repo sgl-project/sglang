@@ -285,6 +285,15 @@ class HostCacheTransfers:
             )
             if src == "gpu":
                 available = self.cache.cache_controller.mem_pool_host.available_size()
+                if (
+                    needed
+                    and self.executor.gpu_copy_capacity is not None
+                    and self.executor.gpu_copy_capacity() < 0
+                ):
+                    self._release_host(job)
+                    self._release_gpu(job)
+                    job.waiting = "running_growth_capacity"
+                    return
             else:
                 available = self._gpu_available()
             if needed > available:
