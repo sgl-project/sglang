@@ -1962,13 +1962,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # MLA CP: q is rank-local zigzag-split; run the
                     # absorbed-MLA kernel twice (prev/next halves) against
                     # the full latent KV pool through the selected strategy.
-                    # Concat q_nope + q_rope along dim=-1 so the wrapper's
-                    # chunk(2, dim=0) keeps their alignment; split back
-                    # inside the closure.
                     assert not use_cascade_attn, (
                         "Cascade attention under MLA CP is not supported."
                     )
-                    q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
                         q_chunk,
@@ -1976,8 +1972,7 @@ class FlashAttentionBackend(AttentionBackend):
                         cache_seqlens_cp,
                         max_seqlen_q_cp,
                     ):
-                        q_nope_chunk = q_chunk[..., : layer.v_head_dim]
-                        q_rope_chunk = q_chunk[..., layer.v_head_dim :]
+                        q_nope_chunk, q_rope_chunk = q_chunk
                         return flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
@@ -2002,7 +1997,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     o = cp_strategy.run_attention(
-                        q_fused,
+                        (q_nope, q_rope),
                         forward_batch,
                         self.device,
                         _mla_cp_attn,

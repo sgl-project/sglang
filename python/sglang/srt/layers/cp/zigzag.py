@@ -372,13 +372,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
         meta = forward_batch.attn_cp_metadata
-        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
-        q_next = q[meta.total_q_prev_tokens : logical_tokens]
+        # MLA passes separate query components to avoid concatenating them just
+        # to split the token dimension. Slice every component identically.
+        queries = q if isinstance(q, tuple) else (q,)
+        q_prev = tuple(t[: meta.total_q_prev_tokens] for t in queries)
+        q_next = tuple(t[meta.total_q_prev_tokens : logical_tokens] for t in queries)
+        if not isinstance(q, tuple):
+            q_prev, q_next = q_prev[0], q_next[0]
 
         prev_kwargs = {}
         next_kwargs = {}
         if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+            assert not isinstance(q, tuple)
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -404,7 +410,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
-        pad_size = q.shape[0] - logical_tokens
+        pad_size = queries[0].shape[0] - logical_tokens
         assert pad_size >= 0
         if pad_size > 0:
             result = torch.cat(
