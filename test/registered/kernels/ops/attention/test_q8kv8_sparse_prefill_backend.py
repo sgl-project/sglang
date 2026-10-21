@@ -180,6 +180,7 @@ def _make_backend(
     dsv4_prefill_backend: str = "auto",
 ) -> DeepseekV4AttnBackend:
     backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+    backend.hisparse_coordinator = None
     backend.forward_metadata = SimpleNamespace(
         sparse_prefill_cache=None, late_layer_tail=None
     )
