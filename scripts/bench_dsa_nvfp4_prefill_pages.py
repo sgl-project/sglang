@@ -72,7 +72,7 @@ def _source_identity() -> dict:
     ]
     git_diff = _command(["git", "diff", "HEAD", "--", *files], root)
     versions = {}
-    for package in ("torch", "sglang", "sgl-kernel", "triton", "flashinfer-python"):
+    for package in ("torch", "sglang", "sglang-kernel", "triton", "flashinfer-python"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
