@@ -106,6 +106,9 @@ class ForwardMetadata:
     # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
+    flash_mla_seq_lens: Optional[torch.Tensor] = None
+    flash_mla_seqused_q: Optional[torch.Tensor] = None
+    flash_mla_metadata: Optional[torch.Tensor] = None
 
     # DCP decode inputs
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -311,6 +314,9 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
+    use_flash_mla: bool = False
+    requires_host_seq_lens_update: bool = True
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -385,6 +391,36 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
+        self.use_flash_mla = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
+        if self.use_flash_mla:
+            spec_algorithm = model_runner.spec_algorithm
+            if (
+                self.use_dsa
+                or self.model_dtype != torch.bfloat16
+                or self.kv_cache_dtype != torch.bfloat16
+                or (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64)
+                or get_parallel().attn_cp_size > 1
+                or get_parallel().dcp_enabled
+                or model_runner.is_hybrid_swa
+                or model_runner.server_args.enable_mixed_chunk
+                or (
+                    spec_algorithm is not None
+                    and not spec_algorithm.is_none()
+                    and not spec_algorithm.is_dspark()
+                )
+            ):
+                raise ValueError(
+                    "NPU FlashMLA supports ordinary BF16 MLA (latent 512, RoPE 64), "
+                    "decode and static DSpark verify, without CP or mixed chunks."
+                )
+            from cann_ops_transformer.ops.attention.flash_mla import (
+                flash_mla,
+                flash_mla_metadata,
+            )
+
+            self.flash_mla = flash_mla
+            self.flash_mla_metadata = flash_mla_metadata
+            self.requires_host_seq_lens_update = False
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -405,6 +441,8 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
+        if self.use_flash_mla:
+            self.flash_mla_mask = self.mtp_mask.to(torch.int8)
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
@@ -439,16 +477,15 @@ class AscendAttnBackend(AttentionBackend):
         self.attn_cp_size = get_parallel().attn_cp_size
 
         # Static gate for the scheduler's per-step pinned-D2H seq_lens_cpu
-        # mirror. Under False this backend sources the host lengths itself;
-        # paths that cannot run mirrorless force the mirror back on.
+        # mirror. Device-length paths can opt out; host-bound consumers keep it.
         _env_opt_out = not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
         # DSA models dispatch every forward mode to forward_sparse (device
         # lengths), so the MLA host-bound check does not apply to them.
         self.is_dsa_model = is_deepseek_dsa(model_runner.model_config.hf_config)
         _host_bound = bool(
-            (self.use_mla and not self.is_dsa_model)  # atb MLA: SymInt[] host-only
-            or self.use_fia  # Preserve the upstream FIA host-length guard
-            or self.use_fias_v2_bsnd  # FIA v2 actual_seq_kvlen host-only
+            (self.use_mla and not self.is_dsa_model and not self.use_flash_mla)
+            or (self.use_fia and not self.use_flash_mla)
+            or (self.use_fias_v2_bsnd and not self.use_flash_mla)
             or self.is_hybrid_swa  # SWA table/mask paths read host max_len
             or getattr(self, "use_alibi", False)  # attn_alibi consumes host lengths
             or get_parallel().dcp_enabled  # DCP local-KV metadata is host-built
@@ -532,7 +569,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if in_capture:
+        if self.use_flash_mla:
+            seq_lens_cpu = None
+        elif in_capture:
             seq_lens_cpu = forward_batch.seq_lens.cpu()
         elif forward_batch.seq_lens_cpu is None and not self.needs_cpu_seq_lens:
             if self.is_dsa_model:
@@ -562,10 +601,8 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        # Data-driven branch: take the CPU-mirror path whenever the mirror is
-        # present, instead of statically gating on needs_cpu_seq_lens. When the
-        # mirror is absent (true mirrorless), fall through to the else branch.
-        if forward_batch.seq_lens_cpu is not None:
+        # Use a supplied CPU mirror when present; FlashMLA keeps device-only metadata.
+        if forward_batch.seq_lens_cpu is not None and not self.use_flash_mla:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -617,6 +654,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens is not None
                 and forward_batch.seq_lens_cpu is None
                 and not forward_batch.forward_mode.is_decode_or_idle()
+                and not self.use_flash_mla
             ):
                 # Mirrorless opt-out (non-decode only): derive the mirror from
                 # the device seq_lens and publish it back so host consumers
@@ -658,7 +696,7 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify():
+        if forward_batch.forward_mode.is_target_verify() and not self.use_flash_mla:
             spec_algorithm = forward_batch.spec_algorithm
             if (
                 spec_algorithm is None or not spec_algorithm.is_dflash_family()
@@ -669,6 +707,7 @@ class AscendAttnBackend(AttentionBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
+            and not self.use_flash_mla
         ):
             if self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
@@ -778,6 +817,16 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
 
+        if self.use_flash_mla and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            self._prepare_flash_mla_metadata(
+                self.forward_metadata,
+                forward_batch.seq_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -906,8 +955,11 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = seq_lens
+        if self.use_flash_mla:
+            metadata.seq_lens = torch.empty_like(seq_lens)
+        else:
+            metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+            metadata.seq_lens = seq_lens
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -1091,7 +1143,6 @@ class AscendAttnBackend(AttentionBackend):
             ]
             metadata.block_tables[:bs, : src.shape[1]].copy_(src // self.page_size)
 
-
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
@@ -1145,6 +1196,15 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        if self.use_flash_mla:
+            self._prepare_flash_mla_metadata(
+                metadata, seq_lens[:bs], forward_mode, spec_info
+            )
+            metadata.seq_lens[:bs].copy_(metadata.flash_mla_seq_lens)
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
+
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
@@ -1166,6 +1226,107 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _prepare_flash_mla_metadata(
+        self,
+        metadata: ForwardMetadata,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        if getattr(spec_info, "ragged_verify_layout", None) is not None:
+            raise ValueError("NPU FlashMLA currently requires static DSpark verify")
+        query_len = (
+            self.speculative_num_draft_tokens if forward_mode.is_target_verify() else 1
+        )
+        offset = query_len if forward_mode.is_target_verify() else 0
+        if forward_mode.is_decode_or_idle() and spec_info is not None:
+            offset = self.speculative_step_id + 1
+        if metadata.flash_mla_seq_lens is None:
+            metadata.flash_mla_seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
+            metadata.flash_mla_seqused_q = torch.empty_like(seq_lens, dtype=torch.int32)
+        active = seq_lens > 0
+        # Own the effective lengths: never add the verify width into the input
+        # prefix tensor, and keep the addresses read by captured graphs stable.
+        metadata.flash_mla_seq_lens.copy_(
+            torch.where(active, seq_lens + offset, 0).to(torch.int32)
+        )
+        metadata.flash_mla_seqused_q.copy_(active.to(torch.int32) * query_len)
+        if seq_lens.numel() == 0:
+            metadata.flash_mla_metadata = torch.empty_like(seq_lens, dtype=torch.int32)
+            return
+        schedule = self.flash_mla_metadata(
+            cache_seqlens=metadata.flash_mla_seq_lens,
+            num_heads_q=self.tp_q_head_num,
+            num_heads_kv=1,
+            cu_seqlens_q=None,
+            seqused_q=metadata.flash_mla_seqused_q,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            head_dim_qk=self.kv_lora_rank + self.qk_rope_head_dim,
+            head_dim_v=self.kv_lora_rank,
+            mask_mode=3,
+            layout_q="BSND",
+        )
+        if metadata.flash_mla_metadata is None:
+            metadata.flash_mla_metadata = torch.empty_like(schedule)
+        metadata.flash_mla_metadata.copy_(schedule)
+
+    def _forward_flash_mla(self, q, q_rope, layer, forward_batch):
+        metadata = self.forward_metadata
+        batch_size = metadata.flash_mla_seq_lens.shape[0]
+        query_len = (
+            self.speculative_num_draft_tokens
+            if forward_batch.forward_mode.is_target_verify()
+            else 1
+        )
+        num_tokens = batch_size * query_len
+        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
+        if batch_size == 0:
+            return q.new_zeros(
+                (q_nope.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
+        if q_nope.shape[0] < num_tokens:
+            raise ValueError("NPU FlashMLA requires one fixed query block per request")
+        query = torch.cat(
+            (
+                q_nope[:num_tokens],
+                q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)[
+                    :num_tokens
+                ],
+            ),
+            dim=-1,
+        ).view(batch_size, query_len, layer.tp_q_head_num, -1)
+        output, _ = self.flash_mla(
+            query,
+            self.token_to_kv_pool.get_flash_mla_buffer(layer.layer_id),
+            block_table=metadata.block_tables,
+            cache_seqlens=metadata.flash_mla_seq_lens,
+            cu_seqlens_q=None,
+            seqused_q=metadata.flash_mla_seqused_q,
+            attn_mask=self.flash_mla_mask,
+            metadata=metadata.flash_mla_metadata,
+            head_dim_v=self.kv_lora_rank,
+            softmax_scale=layer.scaling,
+            mask_mode=3,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            layout_q="BSND",
+            layout_kv="PA_BBND",
+            layout_out="BSND",
+            return_softmax_lse=False,
+        )
+        output = output.masked_fill(
+            (metadata.flash_mla_seqused_q == 0).view(batch_size, 1, 1, 1), 0
+        ).reshape(num_tokens, -1)
+        if q_nope.shape[0] > num_tokens:
+            output = torch.cat(
+                (
+                    output,
+                    output.new_zeros(q_nope.shape[0] - num_tokens, output.shape[1]),
+                )
+            )
+        return output
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -2538,6 +2699,9 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
+        if self.use_flash_mla and forward_batch.forward_mode.is_target_verify():
+            return self._forward_flash_mla(q, q_rope, layer, forward_batch)
+
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -2897,6 +3061,9 @@ class AscendAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+
+        if self.use_flash_mla:
+            return self._forward_flash_mla(q, q_rope, layer, forward_batch)
 
         if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -3441,6 +3608,8 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
+            if self.use_flash_mla:
+                return self._forward_flash_mla(q, q_rope, layer, forward_batch)
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)

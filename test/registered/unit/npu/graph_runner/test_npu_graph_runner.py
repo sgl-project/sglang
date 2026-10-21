@@ -13,7 +13,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
+@pytest.mark.parametrize("requires_host_seq_lens_update", [True, False])
+def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
+    requires_host_seq_lens_update,
+):
     runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
     runner.require_mlp_tp_gather = False
     runner.capture_bs = [2]
@@ -36,7 +39,10 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner.is_encoder_decoder = False
     runner._pad_to_bucket = lambda raw_bs, buckets: raw_bs
     runner._make_graph_key = lambda bs: ("graph", bs)
-    attention = SimpleNamespace(init_forward_metadata_out_graph=mock.Mock())
+    attention = SimpleNamespace(
+        init_forward_metadata_out_graph=mock.Mock(),
+        requires_host_seq_lens_update=requires_host_seq_lens_update,
+    )
     runner._replay_attn_backend = lambda: attention
     runner.backend = SimpleNamespace(
         replay_with_input_update=mock.Mock(
@@ -45,6 +51,9 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
                 hidden_states=torch.arange(3, dtype=torch.float32).view(3, 1),
             )
         )
+    )
+    runner.backend.replay = mock.Mock(
+        return_value=runner.backend.replay_with_input_update.return_value
     )
     runner.is_dllm = False
     runner.if_use_v2 = False
@@ -79,12 +88,17 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
 
     runner.deepep_adapter.replay.assert_called_once_with()
     attention.init_forward_metadata_out_graph.assert_called_once_with("replay-view")
-    runner.backend.replay_with_input_update.assert_called_once_with(
-        ("graph", 2),
-        seq_lens=[10, 11],
-        attr_name=runner._get_update_attr_name(),
-        attr_type=runner._get_update_attr_type(),
-    )
+    if requires_host_seq_lens_update:
+        runner.backend.replay_with_input_update.assert_called_once_with(
+            ("graph", 2),
+            seq_lens=[10, 11],
+            attr_name=runner._get_update_attr_name(),
+            attr_type=runner._get_update_attr_type(),
+        )
+        runner.backend.replay.assert_not_called()
+    else:
+        runner.backend.replay.assert_called_once_with(("graph", 2), forward_batch)
+        runner.backend.replay_with_input_update.assert_not_called()
     torch.testing.assert_close(output.next_token_logits, torch.tensor([[0.0], [1.0]]))
     torch.testing.assert_close(output.hidden_states, torch.tensor([[0.0], [1.0]]))
 

@@ -4456,6 +4456,12 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def get_flash_mla_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_flash_mla_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
