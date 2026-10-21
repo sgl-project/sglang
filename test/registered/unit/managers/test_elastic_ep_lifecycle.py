@@ -1,9 +1,12 @@
 import asyncio
 import json
 import unittest
+import uuid
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -30,14 +33,17 @@ from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ElasticScaleUpdateReq,
+    ObserveElasticEPMembershipProgressOutput,
     ObserveElasticEPMembershipReqInput,
     ObserveElasticEPMembershipReqOutput,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
+    sock_recv,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.tokenizer_manager import (
     MembershipObservationTimeout,
     TokenizerManager,
@@ -677,13 +683,32 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(result.observation_key, "observation-key")
 
-    async def test_membership_observation_traverses_control_route(self):
+    async def test_membership_observation_traverses_real_zmq_control_route(self):
         manager = _manager()
         manager.elastic_worker_count = 2
         manager.elastic_active_rank_status = [True, True]
 
+        context = zmq.Context()
+
+        def make_channel():
+            endpoint = f"inproc://membership-{uuid.uuid4().hex}"
+            receiver = context.socket(zmq.PULL)
+            receiver.setsockopt(zmq.RCVTIMEO, 1000)
+            receiver.bind(endpoint)
+            sender = context.socket(zmq.PUSH)
+            sender.connect(endpoint)
+            return sender, receiver
+
+        tokenizer_to_dpc, dpc_receiver = make_channel()
+        dpc_to_scheduler, scheduler_receiver = make_channel()
+        scheduler_to_tokenizer, tokenizer_receiver = make_channel()
+
+        manager.send_to_scheduler = tokenizer_to_dpc
+        manager.tokenizer_ipc_name = None
+        del manager._dispatch_to_scheduler
+
         controller = DataParallelController.__new__(DataParallelController)
-        controller.workers = [object(), object()]
+        controller.workers = [dpc_to_scheduler, None]
         controller.status = [True, True]
         controller._active_workers = [0, 1]
         controller.control_message_step = 1
@@ -694,64 +719,100 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         scheduler.weight_updater = MagicMock()
         scheduler.profiler_manager = MagicMock()
         scheduler.rust_server = None
-        send_to_tokenizer = MagicMock()
-        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=send_to_tokenizer)
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SenderWrapper(scheduler_to_tokenizer)
+        )
         scheduler.init_request_dispatcher()
 
-        manager._dispatch_to_scheduler = controller._request_dispatcher
         with get_parallel().override(num_dp_ranks=2):
             manager.init_request_dispatcher()
 
-        def return_to_tokenizer(output, _request):
-            manager._result_dispatcher(output)
-
-        send_to_tokenizer.send_output.side_effect = return_to_tokenizer
-
-        def deliver_to_scheduler(worker, request):
-            self.assertIs(worker, controller.workers[0])
-            output = scheduler._request_dispatcher(request)
-            scheduler.send_control_output(output, request)
-
-        with (
-            patch(
-                "sglang.srt.managers.data_parallel_controller.sock_send",
-                side_effect=deliver_to_scheduler,
-            ),
-            patch(
-                "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
-                return_value="observation-key",
-            ),
-            patch(
-                "sglang.srt.managers.scheduler.get_parallel",
-                return_value=SimpleNamespace(dp_rank=0),
-            ),
-        ):
-            result = await manager.observe_elastic_ep_membership(
-                ObserveElasticEPMembershipReqInput(
-                    runtime_instance_id="runtime-1",
-                    topology_generation=3,
-                    rank=1,
-                    failed_allocation_incarnation="pod-uid-5",
-                    membership_epoch=4,
+        try:
+            with (
+                patch(
+                    "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
+                    return_value="observation-key",
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler.get_parallel",
+                    return_value=SimpleNamespace(dp_rank=0),
+                ),
+            ):
+                task = asyncio.create_task(
+                    manager.observe_elastic_ep_membership(
+                        ObserveElasticEPMembershipReqInput(
+                            runtime_instance_id="runtime-1",
+                            topology_generation=3,
+                            rank=1,
+                            failed_allocation_incarnation="pod-uid-5",
+                            membership_epoch=4,
+                        )
+                    )
                 )
-            )
+                await asyncio.sleep(0)
+
+                dpc_request = sock_recv(dpc_receiver)
+                self.assertIsInstance(dpc_request, ObserveElasticEPMembershipReqInput)
+                controller._request_dispatcher(dpc_request)
+
+                scheduler_request = sock_recv(scheduler_receiver)
+                self.assertIsInstance(
+                    scheduler_request, ObserveElasticEPMembershipReqInput
+                )
+                scheduler_output = scheduler._request_dispatcher(scheduler_request)
+                scheduler.send_control_output(scheduler_output, scheduler_request)
+
+                received_stages = []
+                while True:
+                    tokenizer_output = sock_recv(tokenizer_receiver)
+                    manager._result_dispatcher(tokenizer_output)
+                    if isinstance(
+                        tokenizer_output, ObserveElasticEPMembershipProgressOutput
+                    ):
+                        received_stages.append(tokenizer_output.completed_stage)
+                        continue
+                    self.assertIsInstance(
+                        tokenizer_output, ObserveElasticEPMembershipReqOutput
+                    )
+                    break
+
+                result = await task
+        finally:
+            for socket in (
+                tokenizer_to_dpc,
+                dpc_receiver,
+                dpc_to_scheduler,
+                scheduler_receiver,
+                scheduler_to_tokenizer,
+                tokenizer_receiver,
+            ):
+                socket.close(linger=0)
+            context.term()
 
         self.assertTrue(result.accepted)
         self.assertEqual(result.observation_key, "observation-key")
-        send_to_tokenizer.send_output.assert_called_once()
+        self.assertEqual(
+            received_stages,
+            [
+                "scheduler_handler_entered",
+                "scheduler_store_started",
+                "scheduler_store_completed",
+            ],
+        )
 
-    async def test_membership_observation_times_out_without_survivor_reply(self):
+    async def test_membership_timeout_reports_cross_path_completed_stage(self):
         manager = _manager()
         manager.elastic_active_rank_status = [True, True]
-        manager.elastic_scheduler_response_timeout = 0.001
+        manager.elastic_scheduler_response_timeout = 0.01
+        sent = []
         manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
-            send=MagicMock(),
+            send=sent.append,
             fan_out=2,
             correlation_attr="submission_id",
         )
 
-        with self.assertRaises(MembershipObservationTimeout) as raised:
-            await manager.observe_elastic_ep_membership(
+        task = asyncio.create_task(
+            manager.observe_elastic_ep_membership(
                 ObserveElasticEPMembershipReqInput(
                     runtime_instance_id="runtime-1",
                     topology_generation=3,
@@ -760,10 +821,23 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     membership_epoch=4,
                 )
             )
+        )
+        await asyncio.sleep(0)
+        manager._record_membership_observation_progress(
+            ObserveElasticEPMembershipProgressOutput(
+                submission_id=sent[0].submission_id,
+                responder_rank=0,
+                completed_stage="scheduler_store_started",
+            )
+        )
+        with self.assertRaises(MembershipObservationTimeout) as raised:
+            await task
         self.assertEqual(raised.exception.expected_ranks, [0])
         self.assertEqual(raised.exception.received_ranks, [])
         self.assertEqual(raised.exception.missing_ranks, [0])
-        self.assertEqual(raised.exception.last_tokenizer_stage, "dispatched")
+        self.assertEqual(
+            raised.exception.last_completed_stage, "scheduler_store_started"
+        )
         self.assertGreater(raised.exception.elapsed_seconds, 0)
         self.assertIsNone(
             manager.observe_elastic_ep_membership_communicator._result_event
@@ -787,6 +861,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     submission_id="submission-1",
                     expected_ranks=[0],
                     received_ranks=[],
+                    last_completed_stage="scheduler_store_started",
                     elapsed_seconds=30.001,
                 )
             )
@@ -815,7 +890,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                 "expected_ranks": [0],
                 "received_ranks": [],
                 "missing_ranks": [0],
-                "last_tokenizer_stage": "dispatched",
+                "last_completed_stage": "scheduler_store_started",
                 "elapsed_seconds": 30.001,
             },
         )

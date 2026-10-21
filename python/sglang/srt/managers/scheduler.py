@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
+    ObserveElasticEPMembershipProgressOutput,
     ObserveElasticEPMembershipReqInput,
     ObserveElasticEPMembershipReqOutput,
     OpenSessionReqInput,
@@ -6173,6 +6174,9 @@ class Scheduler(
         if responder_rank is None:
             responder_rank = 0
 
+        self._send_membership_observation_progress(
+            recv_req, responder_rank, "scheduler_handler_entered"
+        )
         logger.info(
             "[Elastic EP][membership] scheduler_entered submission_id=%s "
             "responder_rank=%s",
@@ -6180,6 +6184,9 @@ class Scheduler(
             responder_rank,
         )
         try:
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_store_started"
+            )
             logger.info(
                 "[Elastic EP][membership] store_started submission_id=%s "
                 "responder_rank=%s",
@@ -6192,6 +6199,9 @@ class Scheduler(
                 rank=recv_req.rank,
                 failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
                 membership_epoch=recv_req.membership_epoch,
+            )
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_store_completed"
             )
             logger.info(
                 "[Elastic EP][membership] store_completed submission_id=%s "
@@ -6227,6 +6237,21 @@ class Scheduler(
             observation_key=key,
             submission_id=recv_req.submission_id,
             responder_rank=responder_rank,
+        )
+
+    def _send_membership_observation_progress(
+        self,
+        recv_req: ObserveElasticEPMembershipReqInput,
+        responder_rank: int,
+        completed_stage: str,
+    ) -> None:
+        self.send_control_output(
+            ObserveElasticEPMembershipProgressOutput(
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+                completed_stage=completed_stage,
+            ),
+            recv_req,
         )
 
     def _maybe_schedule_recovery_warmup(self) -> None:

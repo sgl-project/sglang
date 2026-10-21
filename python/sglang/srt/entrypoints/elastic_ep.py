@@ -274,7 +274,7 @@ async def observe_elastic_ep_membership(raw_request: Request):
                 "expected_ranks": exc.expected_ranks,
                 "received_ranks": exc.received_ranks,
                 "missing_ranks": exc.missing_ranks,
-                "last_tokenizer_stage": exc.last_tokenizer_stage,
+                "last_completed_stage": exc.last_completed_stage,
                 "elapsed_seconds": round(exc.elapsed_seconds, 3),
             },
             status_code=HTTPStatus.GATEWAY_TIMEOUT,
