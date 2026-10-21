@@ -72,10 +72,16 @@ class TritonBf16ContiguousProvider(ContiguousRowDomainProvider):
         )
         # Both GEMMs share a sort; upstream makes their BLOCK_SIZE_M equal.
         resolved = (dict(config), dict(down_config) if down_config else None)
-        # Classic Triton kernels do not accept the TMA launcher's flag.
-        resolved[0].pop("USE_TMA", None)
-        if resolved[1]:
-            resolved[1].pop("USE_TMA", None)
+        for stage_config in resolved:
+            if stage_config is None:
+                continue
+            # Classic Triton kernels do not accept the TMA launcher's flag.
+            stage_config.pop("USE_TMA", None)
+            if self._config_block_shape is not None:
+                # One dot tile must not span independently scaled K groups.
+                stage_config["BLOCK_SIZE_K"] = min(
+                    stage_config["BLOCK_SIZE_K"], self._config_block_shape[1]
+                )
         self._configs[num_tokens] = resolved
         return resolved
 

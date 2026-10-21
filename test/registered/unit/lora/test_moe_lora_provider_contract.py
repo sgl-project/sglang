@@ -33,6 +33,42 @@ def _function(source: str, name: str) -> str:
     raise AssertionError(f"function {name!r} not found")
 
 
+class TestProviderGeometry(CustomTestCase):
+    def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
+        source = _function((PROVIDER / "triton_bf16.py").read_text(), "_config_for")
+        namespace = {}
+        exec("from __future__ import annotations\n" + source, namespace)
+        config_for = namespace["_config_for"]
+        module = types.ModuleType(
+            "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"
+        )
+        # The FP8 GEMM loads one scale per K block: a 256-wide block over
+        # [128, 128] scale groups would apply the first group's scale to its
+        # second half, and upstream never clamps override or table configs.
+        original = {"BLOCK_SIZE_K": 256, "USE_TMA": True}
+        upstream = (dict(original), dict(original))
+        module.try_get_optimal_moe_config = mock.Mock(
+            return_value=(upstream[0], (upstream[1], None))
+        )
+        provider = SimpleNamespace(
+            quant_info=SimpleNamespace(
+                w13_weight=SimpleNamespace(shape=(2, 256, 128)),
+                w2_weight=SimpleNamespace(shape=(2, 128, 128)),
+            ),
+            _config_dtype_tag="fp8_w8a8",
+            _config_block_shape=[128, 128],
+            _configs={},
+        )
+        with mock.patch.dict(sys.modules, {module.__name__: module}):
+            resolved = config_for(provider, 32, 2)
+            self.assertIs(config_for(provider, 32, 2), resolved)
+        for actual, cached in zip(resolved, upstream):
+            self.assertEqual(actual, {"BLOCK_SIZE_K": 128})
+            self.assertEqual(cached, original)
+            self.assertIsNot(actual, cached)
+        module.try_get_optimal_moe_config.assert_called_once()
+
+
 class TestMaterializedFinalize(CustomTestCase):
     """Execute the host dispatch with real CPU buffers and mocked GPU launches."""
 
