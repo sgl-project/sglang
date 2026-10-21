@@ -19,11 +19,10 @@ from types import SimpleNamespace
 
 import torch
 import torch.multiprocessing as mp
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cuda_ci(est_time=180, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-b200")
 
 LAYER_NUM = 4
 PAGE_SIZE = 64
@@ -34,7 +33,14 @@ SIZE = PAGE_SIZE * 3  # a few pages
 PORT = 29711
 
 
-def _run(rank: int, world: int, port: int, nvfp4: bool = False, fp8: bool = False):
+def _run(
+    rank: int,
+    world: int,
+    port: int,
+    nvfp4: bool = False,
+    fp8: bool = False,
+    owner_graph: bool = False,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
@@ -58,6 +64,9 @@ def _run(rank: int, world: int, port: int, nvfp4: bool = False, fp8: bool = Fals
     publish_build_topology(tp_size=world, attn_cp_size=world, world_rank=rank)
     initialize_model_parallel()
 
+    if owner_graph:
+        _run_nvfp4_owner_graph(rank, world)
+        return
     if nvfp4:
         _run_nvfp4(rank, world)
         return
@@ -156,18 +165,18 @@ def _run_fp8(rank: int, world: int):
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     device = f"cuda:{rank}"
-    kwargs = dict(
-        size=SIZE,
-        page_size=PAGE_SIZE,
-        kv_lora_rank=KV_LORA_RANK,
-        dtype=torch.float8_e4m3fn,
-        qk_rope_head_dim=QK_ROPE,
-        layer_num=5,
-        device=device,
-        index_head_dim=INDEX_HEAD_DIM,
-        enable_memory_saver=False,
-        kv_cache_dim=656,
-    )
+    kwargs = {
+        "size": SIZE,
+        "page_size": PAGE_SIZE,
+        "kv_lora_rank": KV_LORA_RANK,
+        "dtype": torch.float8_e4m3fn,
+        "qk_rope_head_dim": QK_ROPE,
+        "layer_num": 5,
+        "device": device,
+        "index_head_dim": INDEX_HEAD_DIM,
+        "enable_memory_saver": False,
+        "kv_cache_dim": 656,
+    }
     reference = DSATokenToKVPool(**kwargs)
     pool = LayerSplitDSATokenToKVPool(
         **kwargs, layer_shard_rank=rank, layer_shard_size=world
@@ -212,24 +221,23 @@ def _run_fp8(rank: int, world: int):
 @torch.inference_mode()
 def _run_nvfp4(rank: int, world: int):
     from sgl_kernel import flashmla_nvfp4_ops  # noqa: F401
-
     from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     assert hasattr(torch.ops.sgl_kernel, "sparse_decode_fwd_nvfp4")
     device = f"cuda:{rank}"
-    kwargs = dict(
-        size=SIZE,
-        page_size=PAGE_SIZE,
-        kv_lora_rank=KV_LORA_RANK,
-        dtype=torch.float4_e2m1fn_x2,
-        qk_rope_head_dim=QK_ROPE,
-        layer_num=5,
-        device=device,
-        index_head_dim=INDEX_HEAD_DIM,
-        enable_memory_saver=False,
-        kv_cache_dim=416,
-    )
+    kwargs = {
+        "size": SIZE,
+        "page_size": PAGE_SIZE,
+        "kv_lora_rank": KV_LORA_RANK,
+        "dtype": torch.float4_e2m1fn_x2,
+        "qk_rope_head_dim": QK_ROPE,
+        "layer_num": 5,
+        "device": device,
+        "index_head_dim": INDEX_HEAD_DIM,
+        "enable_memory_saver": False,
+        "kv_cache_dim": 416,
+    }
     reference = DSATokenToKVPool(**kwargs)
     pool = LayerSplitDSATokenToKVPool(
         **kwargs, layer_shard_rank=rank, layer_shard_size=world
@@ -378,6 +386,272 @@ def _run_nvfp4(rank: int, world: int):
     )
 
 
+@torch.inference_mode()
+def _run_nvfp4_owner_graph_case(rank: int, world: int, query_count: int, mode):
+    """An eager prefix changes scratch state between graph replays.
+
+    The next decode must use the new owner-local KV and index bytes. This
+    protects the non-PD owner route from stale scratch tags, capture-time
+    tensor values, and a broadcast whose root differs from layer ownership.
+    """
+    from sgl_kernel import flashmla_nvfp4_ops, flashmla_ops  # noqa: F401
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    device = f"cuda:{rank}"
+    kwargs = {
+        "size": SIZE,
+        "page_size": PAGE_SIZE,
+        "kv_lora_rank": KV_LORA_RANK,
+        "dtype": torch.float4_e2m1fn_x2,
+        "qk_rope_head_dim": QK_ROPE,
+        "layer_num": 5,
+        "device": device,
+        "index_head_dim": INDEX_HEAD_DIM,
+        "enable_memory_saver": False,
+        "kv_cache_dim": 416,
+    }
+    reference = DSATokenToKVPool(**kwargs)
+    pool = LayerSplitDSATokenToKVPool(
+        **kwargs,
+        layer_shard_rank=rank,
+        layer_shard_size=world,
+        unified_decode=True,
+    )
+    assert pool.use_owner_compute(mode)
+    assert not pool.use_owner_compute(ForwardMode.EXTEND)
+    generator = torch.Generator(device=device).manual_seed(9100 + query_count)
+    layers = [
+        SimpleNamespace(
+            layer_id=layer_id, head_dim=576, v_head_dim=512, tp_q_head_num=64
+        )
+        for layer_id in range(5)
+    ]
+    backend = SimpleNamespace(token_to_kv_pool=pool)
+    for layer in layers:
+        for current in (reference, pool):
+            current.set_mla_kv_global_scale(layer.layer_id, 0.5 + layer.layer_id / 4)
+
+    loc = torch.arange(65, 65 + query_count, device=device)
+    nope = torch.empty(5, query_count, 1, 512, device=device, dtype=torch.bfloat16)
+    rope = torch.empty(5, query_count, 1, 64, device=device, dtype=torch.bfloat16)
+    index_keys = torch.empty(
+        5, query_count, 128, device=device, dtype=torch.float8_e4m3fn
+    )
+    index_scales = torch.empty(5, query_count, 1, device=device)
+    q = torch.empty(5, query_count, 1, 64, 576, device=device, dtype=torch.bfloat16)
+    index_q = torch.empty(5, query_count, 128, device=device)
+    valid = torch.zeros(SIZE + PAGE_SIZE, device=device, dtype=torch.bool)
+    valid[1:65] = True
+    metadata, num_splits = torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
+        torch.ones(query_count, device=device, dtype=torch.int32),
+        64,
+        1,
+        64,
+        True,
+        2048,
+    )
+
+    def random_values(count):
+        return (
+            torch.randn(count, 1, 512, device=device, generator=generator).bfloat16(),
+            torch.randn(count, 1, 64, device=device, generator=generator).bfloat16(),
+            torch.randn(count, 128, device=device, generator=generator).to(
+                torch.float8_e4m3fn
+            ),
+            torch.rand(count, 1, device=device, generator=generator) + 0.5,
+        )
+
+    def prefill_write(write_loc):
+        for layer in layers:
+            values = random_values(write_loc.numel())
+            for current in (reference, pool):
+                current.set_mla_kv_buffer(layer, write_loc, values[0], values[1])
+                current.index_key_cache.store_quantized(
+                    layer.layer_id, write_loc, values[2], values[3]
+                )
+        # Leave the eager scratch tagged layer 0, unlike the graph's final
+        # layer 4. The production forward boundary must invalidate it.
+        pool.prefetch_kv_buffer(0)
+        torch.testing.assert_close(
+            pool.get_key_buffer(0), reference.get_key_buffer(0), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            pool.index_key_cache.get_buffer(0),
+            reference.index_key_cache.get_buffer(0),
+            rtol=0,
+            atol=0,
+        )
+
+    def fill_step(step):
+        loc.copy_(torch.arange(query_count, device=device) + 65 + step * query_count)
+        valid[loc] = True
+        for layer in layers:
+            layer_id = layer.layer_id
+            values = random_values(query_count)
+            nope[layer_id].copy_(values[0])
+            rope[layer_id].copy_(values[1])
+            index_keys[layer_id].copy_(values[2])
+            index_scales[layer_id].copy_(values[3])
+        q.copy_(torch.randn(q.shape, device=device, generator=generator).bfloat16())
+        index_q.copy_(torch.randn(index_q.shape, device=device, generator=generator))
+
+    def select_indices(current, layer_id):
+        # Independently unpack the production page layout. This small
+        # indexer uses 16 candidates so changing the stored K/scales changes
+        # the selected tokens. Transport still uses the native 2048 width.
+        raw = (
+            current.get_owned_index_buffer(layer_id)
+            if current is pool
+            else current.index_key_cache.get_buffer(layer_id)
+        )
+        keys = raw[:, : PAGE_SIZE * 128].reshape(-1, 128)
+        keys = keys.view(torch.float8_e4m3fn).float()
+        scales = raw[:, PAGE_SIZE * 128 :].contiguous().view(torch.float32)
+        keys = keys * scales.reshape(-1, 1)
+        logits = index_q[layer_id] @ keys.T
+        logits.masked_fill_(~valid.unsqueeze(0), -torch.inf)
+        selected = torch.topk(logits, 16, dim=-1).indices.to(torch.int32)
+        indices = torch.full((query_count, 2048), -1, device=device, dtype=torch.int32)
+        indices[:, :16] = selected
+        return indices
+
+    def decode(current, layer_id, indices):
+        packed = (
+            current.get_owned_key_buffer(layer_id)
+            if current is pool
+            else current.get_key_buffer(layer_id)
+        )
+        return torch.ops.sgl_kernel.sparse_decode_fwd_nvfp4.default(
+            q[layer_id],
+            packed.view(-1, 64, 1, 416),
+            current.get_mla_kv_global_scale(layer_id),
+            indices.unsqueeze(1),
+            None,
+            None,
+            metadata,
+            num_splits,
+            512,
+            576**-0.5,
+        )[0]
+
+    def forward(current):
+        result = []
+        for layer in layers:
+            layer_id = layer.layer_id
+            if current is pool:
+                current.run_on_layer_owner(
+                    layer_id,
+                    lambda layer=layer, layer_id=layer_id: (
+                        current.set_owned_mla_kv_buffer(
+                            layer, loc, nope[layer_id], rope[layer_id]
+                        )
+                    ),
+                    shape=None,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            else:
+                current.set_mla_kv_buffer(layer, loc, nope[layer_id], rope[layer_id])
+            current.index_key_cache.store_quantized(
+                layer_id, loc, index_keys[layer_id], index_scales[layer_id]
+            )
+            if current is pool:
+                indices = current.run_on_layer_owner(
+                    layer_id,
+                    lambda layer_id=layer_id: select_indices(current, layer_id),
+                    shape=(query_count, 2048),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                output = DeepseekSparseAttnBackend._forward_on_layer_owner(
+                    backend,
+                    q[layer_id],
+                    None,
+                    layer,
+                    lambda layer_id=layer_id, indices=indices: decode(
+                        current, layer_id, indices
+                    ),
+                )
+            else:
+                indices = select_indices(current, layer_id)
+                output = decode(current, layer_id, indices)
+            # If the helper reuses a result buffer, keep each layer's own
+            # output before the next layer broadcasts into that buffer.
+            result.append((indices.clone(), output.clone()))
+        return result
+
+    prefill_write(torch.arange(1, 65, device=device))
+    fill_step(0)
+    warmup_stream = torch.cuda.Stream(device=device)
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(2):
+            pool.prepare_owner_compute()
+            forward(pool)
+            forward(reference)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    pool.prepare_owner_compute()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward(pool)
+
+    for step in range(4):
+        # Interleave a prefill-like mutation and scratch materialization
+        # before every replay, including an existing prefix token.
+        prefill_write(torch.tensor([31 + step], device=device))
+        fill_step(step)
+        pool.prepare_owner_compute()
+        graph.replay()
+        expected = forward(reference)
+        torch.cuda.synchronize()
+        for layer_id, (actual_pair, expected_pair) in enumerate(
+            zip(captured, expected)
+        ):
+            torch.testing.assert_close(actual_pair[0], expected_pair[0], rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual_pair[1], expected_pair[1], atol=8e-4, rtol=2.01 / 128
+            )
+            if pool._is_layer_owned(layer_id):
+                assert torch.equal(
+                    pool.get_owned_key_buffer(layer_id),
+                    reference.get_key_buffer(layer_id),
+                )
+                assert torch.equal(
+                    pool.get_owned_index_buffer(layer_id),
+                    reference.index_key_cache.get_buffer(layer_id),
+                )
+        # Eager reads after graph execution must also materialize the
+        # current owner bytes rather than reuse a capture-time scratch tag.
+        pool.prepare_owner_compute()
+        for layer in layers:
+            assert torch.equal(
+                pool.get_key_buffer(layer.layer_id),
+                reference.get_key_buffer(layer.layer_id),
+            )
+            assert torch.equal(
+                pool.index_key_cache.get_buffer(layer.layer_id),
+                reference.index_key_cache.get_buffer(layer.layer_id),
+            )
+    torch.distributed.barrier()
+    print(
+        f"[rank {rank}] NVFP4 owner graph CP={world} Q={query_count}: "
+        "four replays, eager prefixes, index/KV bytes and native outputs OK",
+        flush=True,
+    )
+
+
+def _run_nvfp4_owner_graph(rank: int, world: int):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    for query_count, mode in ((1, ForwardMode.DECODE), (6, ForwardMode.TARGET_VERIFY)):
+        _run_nvfp4_owner_graph_case(rank, world, query_count, mode)
+
+
 class TestLayerSplitDSABroadcast(CustomTestCase):
     def test_owner_broadcast(self):
         world = min(4, torch.cuda.device_count())
@@ -408,6 +682,21 @@ class TestLayerSplitDSABroadcast(CustomTestCase):
                 with self.subTest(world=world):
                     mp.spawn(
                         _run, args=(world, PORT + world, True), nprocs=world, join=True
+                    )
+
+    def test_nvfp4_owner_compute_decode_and_verify_graph_replay(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("NVFP4 owner graph test needs >= 2 GPUs")
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("NVFP4 DSA requires SM100")
+        for world in (2, 4):
+            if torch.cuda.device_count() >= world:
+                with self.subTest(world=world):
+                    mp.spawn(
+                        _run,
+                        args=(world, PORT + 20 + world, False, False, True),
+                        nprocs=world,
+                        join=True,
                     )
 
 

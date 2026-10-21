@@ -1131,6 +1131,7 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._prepare_layer_owner_compute()
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1656,6 +1657,7 @@ class DeepseekSparseAttnBackend(
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
+        self._prepare_layer_owner_compute()
         self.set_dsa_prefill_impl(forward_batch=None)
 
         if forward_mode.is_decode_or_idle():
@@ -1830,6 +1832,7 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        self._prepare_layer_owner_compute()
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -2149,6 +2152,7 @@ class DeepseekSparseAttnBackend(
             precomputed: Precomputed metadata to copy from
             forward_mode: Forward mode
         """
+        self._prepare_layer_owner_compute()
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -2180,6 +2184,22 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    def _prepare_layer_owner_compute(self) -> None:
+        pool = getattr(self, "token_to_kv_pool", None)
+        if getattr(pool, "unified_decode", False):
+            pool.prepare_owner_compute()
+
+    def _forward_on_layer_owner(self, q, q_rope, layer, compute):
+        q_dim = layer.head_dim if q_rope is None else layer.v_head_dim
+        rows = q.numel() // (layer.tp_q_head_num * q_dim)
+        return self.token_to_kv_pool.run_on_layer_owner(
+            layer.layer_id,
+            compute,
+            shape=(rows, 1, layer.tp_q_head_num, layer.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2196,8 +2216,35 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        _layer_owner_only: bool = False,
     ) -> torch.Tensor:
-
+        pool = self.token_to_kv_pool
+        if (
+            not _layer_owner_only
+            and getattr(pool, "unified_decode", False)
+            and pool.use_owner_compute(forward_batch.forward_mode)
+        ):
+            return self._forward_on_layer_owner(
+                q,
+                q_rope,
+                layer,
+                lambda: self.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                    cos_sin_cache,
+                    is_neox,
+                    llama_4_scaling,
+                    attn_sink,
+                    _layer_owner_only=True,
+                ),
+            )
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2252,7 +2299,12 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                writer = (
+                    pool.set_owned_mla_kv_buffer
+                    if _layer_owner_only
+                    else pool.set_mla_kv_buffer
+                )
+                writer(
                     layer,
                     cache_loc,
                     k,
@@ -2276,7 +2328,11 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = (
+            pool.get_owned_key_buffer(layer.layer_id)
+            if _layer_owner_only
+            else pool.get_key_buffer(layer.layer_id)
+        )
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2583,8 +2639,35 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        _layer_owner_only: bool = False,
     ) -> torch.Tensor:
-
+        pool = self.token_to_kv_pool
+        if (
+            not _layer_owner_only
+            and getattr(pool, "unified_decode", False)
+            and pool.use_owner_compute(forward_batch.forward_mode)
+        ):
+            return self._forward_on_layer_owner(
+                q,
+                q_rope,
+                layer,
+                lambda: self.forward_decode(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope,
+                    k_rope,
+                    topk_indices,
+                    cos_sin_cache,
+                    is_neox,
+                    llama_4_scaling,
+                    attn_sink,
+                    _layer_owner_only=True,
+                ),
+            )
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2622,7 +2705,12 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                writer = (
+                    pool.set_owned_mla_kv_buffer
+                    if _layer_owner_only
+                    else pool.set_mla_kv_buffer
+                )
+                writer(
                     layer,
                     cache_loc,
                     k,
@@ -2630,7 +2718,11 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = (
+            pool.get_owned_key_buffer(layer.layer_id)
+            if _layer_owner_only
+            else pool.get_key_buffer(layer.layer_id)
+        )
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(

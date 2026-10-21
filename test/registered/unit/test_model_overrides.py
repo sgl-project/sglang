@@ -233,6 +233,47 @@ class TestModelOverridableWhitelist(CustomTestCase):
         )
 
 
+class TestUnifiedDSALayerSplitValidation(CustomTestCase):
+    def test_rejects_topologies_with_different_queries_on_owner_ranks(self):
+        """Owner broadcasts require the same complete query batch on every rank."""
+        from sglang.srt.arg_groups.model_hook import (
+            _validate_unified_dsa_cache_layer_split,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        defaults = dict(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            tp_size=8,
+            attn_cp_size=8,
+            dp_size=1,
+            attn_dp_size=1,
+            dcp_size=1,
+            pp_size=1,
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_kv",
+        )
+        _validate_unified_dsa_cache_layer_split(
+            ServerArgs(**defaults), "GlmMoeDsaForCausalLM"
+        )
+        invalid = (
+            ({"attn_cp_size": 4}, "TP=CP"),
+            ({"dp_size": 2, "attn_dp_size": 2}, "attention DP"),
+            ({"dcp_size": 2}, "DCP=1"),
+            ({"pp_size": 2}, "PP=1"),
+            ({"enable_cp_decode_attn_tp": True}, "decode attention TP"),
+            ({"enable_two_batch_overlap": True}, "two-batch overlap"),
+            ({"kv_cache_dtype": "fp8_e4m3"}, "nvfp4"),
+            ({"dsa_decode_backend": "trtllm"}, "flashmla_kv"),
+        )
+        for changed, error in invalid:
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, error):
+                    _validate_unified_dsa_cache_layer_split(
+                        ServerArgs(**(defaults | changed)), "GlmMoeDsaForCausalLM"
+                    )
+
+
 class TestBoundaryReductionDefaults(CustomTestCase):
     def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
         from unittest.mock import patch

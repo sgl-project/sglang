@@ -2164,6 +2164,7 @@ class KVCacheConfigurator:
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            pool_kwargs["unified_decode"] = get_disagg().disaggregation_mode == "null"
         else:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:

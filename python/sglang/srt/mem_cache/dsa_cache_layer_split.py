@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -197,6 +197,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        unified_decode: bool = False,
         **kwargs,
     ):
         assert layer_shard_rank is not None and layer_shard_size > 1, (
@@ -206,11 +207,91 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        self.unified_decode = unified_decode
         super().__init__(*args, **kwargs)
+        if unified_decode and not self.dsa_kv_cache_store_nvfp4:
+            raise ValueError("Non-PD layer split requires the NVFP4 DSA cache")
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
         my_start, _ = self._owned_local_layer_range()
         self.layer_shard_start = self.start_layer + my_start
+
+    def use_owner_compute(self, forward_mode) -> bool:
+        """Run replicated non-PD decode/verify queries where the KV resides."""
+        return self.unified_decode and (
+            forward_mode.is_decode() or forward_mode.is_target_verify()
+        )
+
+    def prepare_owner_compute(self) -> None:
+        """Invalidate scratch before eager execution and before graph replay.
+
+        Graph replay updates owned KV without executing Python bookkeeping.
+        The attention metadata boundary calls this on every forward, including
+        a prefill that follows a replay, so a previous scratch label can never
+        hide writes performed by a captured owner-compute path.
+        """
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
+        self.index_key_cache.remote_layer_id = None
+
+    def run_on_layer_owner(
+        self,
+        layer_id: int,
+        compute: Callable[[], Optional[torch.Tensor]],
+        *,
+        shape: Optional[tuple[int, ...]],
+        dtype: torch.dtype,
+        device,
+    ) -> Optional[torch.Tensor]:
+        """Compute on the owner and broadcast a fixed-shape result to CP ranks.
+
+        The caller guarantees identical queries and physical cache locations
+        across this CP group. The callback must use owned-buffer accessors;
+        ordinary layer-split getters would issue unmatched collectives. No
+        allocation here depends on tensor contents, including under capture.
+        ``shape=None`` executes an owner-only cache write without a result.
+        """
+        assert self.unified_decode
+        self.prepare_owner_compute()
+        if self._is_layer_owned(layer_id):
+            result = compute()
+            if shape is None:
+                return None
+            assert result is not None and tuple(result.shape) == shape
+            assert result.dtype == dtype
+            result = result.contiguous()
+        else:
+            if shape is None:
+                return None
+            result = torch.empty(shape, dtype=dtype, device=device)
+        return self._broadcast_tensor_from_owner(
+            result, layer_id, src_tensor=result, use_layer_broadcast_comm=True
+        )
+
+    def get_owned_key_buffer(self, layer_id: int) -> torch.Tensor:
+        assert self._is_layer_owned(layer_id)
+        return self.kv_buffer[self._local_layer_idx(layer_id)]
+
+    def get_owned_index_buffer(self, layer_id: int) -> torch.Tensor:
+        assert self._is_layer_owned(layer_id)
+        return self.index_key_cache.get_local_buffer(layer_id)
+
+    def set_owned_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "owner MLA KV write")
+        self._write_mla_kv_buffer(
+            layer.layer_id,
+            self.get_owned_key_buffer(layer.layer_id),
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
 
     # ---- layer ownership helpers ------------------------------------------
 
