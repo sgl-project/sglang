@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 import uvicorn
+from uvicorn.supervisors import multiprocess
 from uvicorn.supervisors.multiprocess import SIGNALS
 
 from sglang.srt.entrypoints import http_server
@@ -49,9 +50,11 @@ def _start(config, monkeypatch):
     children = []
 
     class FakeProcess:
-        def __init__(self, _config, _target, sockets):
+        # The uvicorn supervisor spawns through the module-level Process name.
+        def __init__(self, _config, sockets):
             self.sockets = sockets
             self.alive = True
+            self.exitcode = None
             self.pid = len(children) + 1
 
         def start(self):
@@ -60,6 +63,9 @@ def _start(config, monkeypatch):
 
         def is_alive(self, timeout):
             return self.alive
+
+        def wait_until_ready(self, timeout, should_exit=None):
+            return True
 
         def kill(self):
             self.alive = False
@@ -70,8 +76,8 @@ def _start(config, monkeypatch):
         def join(self):
             return None
 
-    monkeypatch.setattr(http_server, "Process", FakeProcess)
-    supervisor = http_server._ReusePortMultiprocess(config, target=None)
+    monkeypatch.setattr(multiprocess, "Process", FakeProcess)
+    supervisor = http_server._ReusePortMultiprocess(config)
     supervisor.init_processes()
     return supervisor, children
 
@@ -91,11 +97,18 @@ def test_worker_listener_lifecycle(monkeypatch, config):
         old = supervisor.processes[0]
         old.alive = False
         supervisor.keep_subprocess_alive()
-        assert supervisor.processes[0] is not old and old.listener.fileno() == -1
+        new = supervisor.processes[0]
+        assert new is not old and old.listener.fileno() == -1
+        assert new.sockets[0].fileno() == -1 and new.listener.fileno() != -1
 
         before_restart = list(supervisor.processes)
         supervisor.restart_all()
         assert all(process.listener.fileno() == -1 for process in before_restart)
+        assert all(p.sockets[0].fileno() == -1 for p in supervisor.processes)
+
+        supervisor.handle_ttin()
+        assert len(supervisor.processes) == config.workers + 1
+        assert supervisor.processes[-1].sockets[0].fileno() == -1
     finally:
         for sock in children:
             sock.close()
@@ -103,24 +116,24 @@ def test_worker_listener_lifecycle(monkeypatch, config):
 
 def test_partial_spawn_failure_cleans_up_workers(monkeypatch, config):
     config.workers = 3
-    supervisor = http_server._ReusePortMultiprocess(config, target=None)
-    supervisor._reserved_socket.close()
     workers = [Mock(), Mock()]
     monkeypatch.setattr(
-        supervisor, "_spawn", Mock(side_effect=[*workers, RuntimeError("failed")])
+        multiprocess, "Process", Mock(side_effect=[*workers, RuntimeError("failed")])
     )
+    supervisor = http_server._ReusePortMultiprocess(config)
     with pytest.raises(RuntimeError):
         supervisor.init_processes()
     for worker in workers:
         worker.terminate.assert_called_once()
         worker.join.assert_called_once()
+    assert supervisor._reserved_socket is None and not supervisor._handed_out
 
 
 def test_unresolvable_host_exits_cleanly(monkeypatch, caplog, config):
     resolve = Mock(side_effect=socket.gaierror("bad host"))
     monkeypatch.setattr(socket, "getaddrinfo", resolve)
     with pytest.raises(SystemExit):
-        http_server._ReusePortMultiprocess(config, target=None)
+        http_server._ReusePortMultiprocess(config)
     assert "bad host" in caplog.text
 
 
@@ -148,7 +161,7 @@ def test_concurrent_supervisor_reservation(
         worker_config.host = hosts[index]
         worker_config.port = 0 if ephemeral else config.port
         try:
-            return http_server._ReusePortMultiprocess(worker_config, target=None)
+            return http_server._ReusePortMultiprocess(worker_config)
         except SystemExit:
             return None
 
@@ -163,21 +176,22 @@ def test_concurrent_supervisor_reservation(
     assert len(winners) == expected_winners
 
 
-def test_real_uvicorn_process_accepts_on_private_listener(config):
+def test_real_uvicorn_worker_accepts_on_private_listener(config):
     config.workers = 1
-    supervisor = http_server._ReusePortMultiprocess(config, uvicorn.Server(config).run)
-    supervisor._reserved_socket.close()
-    supervisor._reserved_socket = None
-    process = supervisor._spawn()
+    supervisor = http_server._ReusePortMultiprocess(config)
+    supervisor.init_processes()
     try:
+        assert supervisor._reserved_socket is None and not supervisor._handed_out
+        # The listener accepts at once; the reply waits for the spawned worker,
+        # which re-imports this module and its server imports before serving.
         with socket.create_connection(
-            (config.host, config.port), timeout=5
+            (config.host, config.port), timeout=120
         ) as connection:
             connection.sendall(b"GET /openapi.json HTTP/1.0\r\n\r\n")
             assert b"404 Not Found" in connection.recv(1024)
     finally:
-        process.terminate()
-        process.join()
+        supervisor.terminate_all()
+        supervisor.join_all()
 
 
 if __name__ == "__main__":

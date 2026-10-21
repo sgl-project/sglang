@@ -66,7 +66,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-from uvicorn.supervisors.multiprocess import Multiprocess, Process
+from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
@@ -2566,58 +2566,75 @@ def _wait_weights_ready():
 
 
 class _ReusePortMultiprocess(Multiprocess):
-    """Run each uvicorn worker on its own SO_REUSEPORT listener."""
+    """Give each uvicorn worker a private SO_REUSEPORT listener.
 
-    def __init__(self, config: uvicorn.Config, target: Callable[..., None]):
-        super().__init__(config, target, sockets=[])
-        self._reserved_socket = _reserve_reuseport_socket(config)
+    uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
+    fresh listener is handed out on every read and the parent's copy is closed
+    once the child holds it; the lifecycle (health checks, restarts, SIGTTIN)
+    stays uvicorn's own. Requires uvicorn >= 0.51, whose Process builds its
+    own Server.
+    """
+
+    def __init__(self, config: uvicorn.Config):
+        self._handed_out: List[socket.socket] = []
+        self._reserved_socket: Optional[socket.socket] = _reserve_reuseport_socket(
+            config
+        )
         self._socket_family = self._reserved_socket.family
         self._socket_address = self._reserved_socket.getsockname()
+        super().__init__(config, sockets=[])
 
-    def _spawn(self) -> Process:
+    @property
+    def sockets(self) -> List[socket.socket]:
+        self._close_handed_out()
         sock = self._reserved_socket
+        self._reserved_socket = None
         if sock is None:
             sock = _bind_reuseport_socket(
                 self.config, self._socket_family, self._socket_address
             )
-        self._reserved_socket = None
-        with sock:
-            process = Process(self.config, self.target, [sock])
-            process.start()
-        return process
+        self._handed_out.append(sock)
+        return [sock]
+
+    @sockets.setter
+    def sockets(self, value: List[socket.socket]) -> None:
+        if value:
+            raise ValueError("_ReusePortMultiprocess binds its own listeners")
+
+    def _close_handed_out(self) -> None:
+        # Each spawn site starts its Process before the next read, so every
+        # listener handed out so far is already held by its child.
+        for sock in self._handed_out:
+            sock.close()
+        self._handed_out.clear()
 
     def init_processes(self) -> None:
         try:
-            for _ in range(self.processes_num):
-                self.processes.append(self._spawn())
+            super().init_processes()
         except BaseException:
             self.terminate_all()
             self.join_all()
             raise
+        finally:
+            self._close_handed_out()
 
     def restart_all(self) -> None:
-        for index, process in enumerate(self.processes):
-            process.terminate()
-            process.join()
-            self.processes[index] = self._spawn()
+        try:
+            super().restart_all()
+        finally:
+            self._close_handed_out()
 
     def keep_subprocess_alive(self) -> None:
-        if self.should_exit.is_set():
-            return
-        for index, process in enumerate(self.processes):
-            if process.is_alive(timeout=self.config.timeout_worker_healthcheck):
-                continue
-            process.kill()
-            process.join()
-            if self.should_exit.is_set():
-                return
-            logger.info(f"Child process [{process.pid}] died")
-            self.processes[index] = self._spawn()
+        try:
+            super().keep_subprocess_alive()
+        finally:
+            self._close_handed_out()
 
     def handle_ttin(self) -> None:
-        logger.info("Received SIGTTIN, increasing the number of processes.")
-        self.processes_num += 1
-        self.processes.append(self._spawn())
+        try:
+            super().handle_ttin()
+        finally:
+            self._close_handed_out()
 
 
 def _bind_reuseport_socket(config: uvicorn.Config, family, address) -> socket.socket:
@@ -2971,9 +2988,7 @@ def _setup_and_run_http_server(
                 }
                 if get_serving().enable_http_worker_reuseport:
                     config = uvicorn.Config(app_path, **uvicorn_options)
-                    supervisor = _ReusePortMultiprocess(
-                        config, uvicorn.Server(config).run
-                    )
+                    supervisor = _ReusePortMultiprocess(config)
                     logger.info(
                         f"Uvicorn running on {config.host}:{config.port} "
                         f"with {config.workers} SO_REUSEPORT workers"
