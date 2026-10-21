@@ -77,7 +77,7 @@ docker run \
 
 For **MI355X → Pro / Pro Official → FP4 → Multi-Nodes**, the panel generates a **1P1D deployment**: one prefill node and one decode node, each running an independent worker. Select **Router**, **Prefill**, or **Decode** to copy its command. Start the [UMBP tier](#3-8-unified-cache-external-linker-umbp) on the prefill node, then both workers, then the router. Send client requests to the router on port `8000`.
 
-The MI355X multi-node strategies follow the [InferenceX AgentX submission](https://github.com/SemiAnalysisAI/InferenceX/pull/3664): **Low-Latency**, **Balanced**, and **High-Throughput** use fixed concurrency presets of **16**, **48**, and **256**, respectively. **Pro** uses EAGLE/MTP; **Pro Official (0813)** uses DSpark, matching the InferenceX checkpoint. Both enable UMBP on prefill by default. The Playground inherits the selected worker, including its speculative decoder and cache settings.
+The MI355X multi-node strategies **Low-Latency**, **Balanced**, and **High-Throughput** use fixed concurrency presets of **16**, **48**, and **256**, respectively. **Pro** uses EAGLE/MTP; **Pro Official (0813)** uses DSpark. Both enable UMBP on prefill by default. The Playground inherits the selected worker, including its speculative decoder and cache settings.
 
 Run these recipes' **Python** commands inside the ROCm image shown in the **Docker** tab, where Aiter is already enabled. Add explicit parser and network-device settings through the Playground's **Parsers** and **PD Disagg → IB Device** controls.
 
@@ -778,7 +778,6 @@ Four adjustments are not in the commands below. Add them when they apply:
 **TP8, concurrency 1–16:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
@@ -820,7 +819,6 @@ python3 -m sglang.launch_server \
 **DP8 (DP Attention), concurrency 128:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
@@ -871,7 +869,6 @@ python3 -m sglang.launch_server \
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
@@ -950,17 +947,17 @@ docker run \
     --ulimit nofile=1048576:1048576 \
     --network host --ipc=host --shm-size 32g \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001 \
+    lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019 \
     python3 -m sglang.launch_server <role args below>
 ```
 
-The Deployment and Playground Docker outputs retain this `v0.5.21` base image for the MI355X Pro and Pro Official FP4 multi-node recipes. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+Use this image for the **MI355X Pro / Pro Official FP4 multi-node** workers and router, including the additional concurrency points below. The Deployment and Playground Docker outputs select it for all three PD roles. It supports the documented `SGLANG_DSV4_DENSE_MXSCALE` and `SGLANG_ROUTER_P2C_LOAD_METRIC` settings. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
 For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 
 #### Role-based configuration
 
-Select **MI355X → Pro Official → FP4 → Multi-Nodes**, then a strategy and role. The commands use the [submitted recipe at `df5e433239d7`](https://github.com/SemiAnalysisAI/InferenceX/blob/df5e433239d72106529ece4dd97cc36e4c3adf4c/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/sglang/mi355x-fp4/agentx/disagg-umbp-dspark.yaml), with cluster-specific paths replaced by local placeholders and benchmark acceptance simulation removed. The Pro Official commands additionally apply the kernel and routing updates described below.
+Select **MI355X → Pro Official → FP4 → Multi-Nodes**, then a strategy and role. Replace the host and model-path placeholders with your deployment's values. The Pro Official commands use the kernel and routing settings described below.
 
 | Strategy | Concurrency | Prefill → Decode | `--max-running-requests` | DSpark block size |
 |---|---|---|---|---|
@@ -981,7 +978,7 @@ Selecting a TP-only role forces **DP-Attention** off and greys the control. `--m
 </Note>
 
 <Warning>
-**Speculative decoding changes how you size `--max-running-requests`.** For a target concurrency of N, set it to `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and 512 serves the high-throughput concurrency of 256.
+**Speculative decoding changes how you size `--max-running-requests`.** For the strategy presets above, a target concurrency of N uses `N*2` on **both** roles; at N the served batch stays below the concurrency you are aiming for. This holds for DSpark and EAGLE/MTP alike. The table above follows it: 32 serves a concurrency of 16, 96 serves 48, and 512 serves the high-throughput concurrency of 256. The Pro Official c1 override below is an exception: retain 8 request slots on each role even though client concurrency is 1.
 
 The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size`, the per-rank batch. The strategy presets apply both rules: decode graphs cover 1–32, 1–96, and 1–64, respectively.
 </Warning>
@@ -1143,7 +1140,7 @@ The multi-node router presets retain the default request timeout. The standalone
 
 The panel keeps its c16 / c48 / c256 strategy presets. Apply the following overrides to the **Multi-Nodes** commands to reproduce the optimized recipe's endpoints. Here `cN` means a target concurrency of N.
 
-**c1 (replaces c4):** start from Low-Latency. Keep prefill TP4, set decode to `--tp 4`, and set `--max-running-requests 2` on both roles. Replace decode's graph list with `--cuda-graph-bs-decode 1 2`. Keep DSpark block size 6 (7 draft tokens), `MORI_MAX_DISPATCH_TOKENS_DECODE=448`, and both kernel switches on both roles. The source also sets `SGLANG_MLA_HCA_KV_SPLITS=8` on both roles; the FP8 KV path does not read this setting. Benchmark with concurrency 1.
+**c1 (replaces c4):** start from Low-Latency. Keep prefill TP4, set decode to `--tp 4`, and set `--max-running-requests 8` on both roles. Replace decode's graph list with `--cuda-graph-bs-decode 1 2 3 4 5 6 7 8`. Keep DSpark block size 6 (7 draft tokens), `MORI_MAX_DISPATCH_TOKENS_DECODE=448`, and both kernel switches on both roles. The source also sets `SGLANG_MLA_HCA_KV_SPLITS=8` on both roles; the FP8 KV path does not read this setting. Keep these 8 server slots and graph sizes when benchmarking with client concurrency 1; do not reduce them to 2 using the strategy presets' `N*2` rule.
 
 **c32:** start from Low-Latency, keep TP4 → TP8 and block size 6, set both admission limits to 64, and capture decode graph sizes 1–64. Both roles use FP8 KV and mxscale, as at c16 and c48.
 
