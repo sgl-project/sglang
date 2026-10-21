@@ -1,5 +1,5 @@
 """The CUDA-graph captured KDA extend (linear/kda_prefill_graph.py) against the
-eager KDAAttnBackend.forward_extend.
+eager KDAAttnBackend.forward_extend, with the Triton and the FlashInfer prefill.
 
 One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
@@ -14,17 +14,24 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.linear import kda_prefill_graph
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+    FLASHINFER_KDA_PREFILL_TILE_TOKENS,
+    FlashInferKDAPrefillGraphConfig,
+    FlashInferKDAPrefillGraphScratch,
+)
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HEADS, HEAD_DIM, CONV = 2, 128, 4
 DIM = 3 * HEADS * HEAD_DIM
@@ -58,7 +65,7 @@ def _layer():
     )
 
 
-def _backend(conv_pool, ssm_pool):
+def _backend(conv_pool, ssm_pool, prefill=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = KDAAttnBackend.__new__(KDAAttnBackend)
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
@@ -75,9 +82,9 @@ def _backend(conv_pool, ssm_pool):
     backend.accept_lens_pool = None
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = KDAKernelDispatcher(
-        LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
+        decode_backend=LinearAttnKernelBackend.TRITON,
+        prefill_backend=prefill,
+        verify_backend=LinearAttnKernelBackend.TRITON,
     )
     return backend
 
@@ -139,6 +146,7 @@ class TestKDAPrefillGraph(CustomTestCase):
             )
             * 0.05
         )
+        self.prefill = LinearAttnKernelBackend.TRITON
         self.backend = _backend(self.conv_pool, self.ssm_pool)
         # Static inputs the captured graph reads.
         self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
@@ -157,13 +165,14 @@ class TestKDAPrefillGraph(CustomTestCase):
                 cache_indices=self.backend._prefill_graph_cache_indices(batch),
             )
 
-    def _capture(self):
+    def _capture(self, flashinfer=None):
         meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,
             max_seqs_cap=MAX_SEQS,
             track=True,
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
+            flashinfer=flashinfer,
         )
         capture_batch = _batch([BUCKET], [0])
         self._fill(meta, capture_batch)
@@ -180,7 +189,8 @@ class TestKDAPrefillGraph(CustomTestCase):
             run()  # warmup: Triton compile / autotune outside the capture
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # FlashInfer binds its workspace to the warmup stream.
+        with torch.cuda.graph(graph, stream=stream):
             out = run()
         # Warmup and capture ran on the pools; restore them.
         self.conv_pool.copy_(snapshot[0])
@@ -202,10 +212,13 @@ class TestKDAPrefillGraph(CustomTestCase):
             torch.randn(1, BUCKET, HEADS * HEAD_DIM, generator=g, device="cuda")
         )
         self.b.copy_(torch.randn(1, BUCKET, HEADS, generator=g, device="cuda"))
+        if self.prefill.is_flashinfer():
+            self.a[:, total:] = float("nan")
+            self.b[:, total:] = float("nan")
 
         # Eager reference on cloned pools.
         ref_conv, ref_ssm = self.conv_pool.clone(), self.ssm_pool.clone()
-        ref_backend = _backend(ref_conv, ref_ssm)
+        ref_backend = _backend(ref_conv, ref_ssm, prefill=self.prefill)
         ref_batch = _batch(lens, prefixes, track=track)
         ref_backend.init_forward_metadata(ref_batch)
         ref_out = ref_backend.forward_extend(
@@ -225,8 +238,7 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
         self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
 
-    def test_replays_match_eager(self):
-        meta, graph, out = self._capture()
+    def _check_replays(self, meta, graph, out):
         cases = [
             # (extend lens, prefix lens, track {row: tracked length from prefix}).
             # Tracked lengths are >= one chunk and within the row's extend, as
@@ -242,6 +254,9 @@ class TestKDAPrefillGraph(CustomTestCase):
             ([1], [900], None),
         ]
         for i, (lens, prefixes, track) in enumerate(cases):
+            # Eager FlashInfer runs Triton with no more tokens than sequences.
+            if self.prefill.is_flashinfer() and sum(lens) <= len(lens):
+                continue
             with self.subTest(case=i):
                 self._check_replay(
                     meta,
@@ -252,6 +267,34 @@ class TestKDAPrefillGraph(CustomTestCase):
                     track=track,
                     seed=100 + i,
                 )
+
+    def test_replays_match_eager(self):
+        self._check_replays(*self._capture())
+
+    @unittest.skipUnless(
+        torch.cuda.get_device_capability() in ((10, 0), (10, 3)),
+        "FlashInfer KDA prefill requires SM100/SM103",
+    )
+    def test_flashinfer_replays_match_eager(self):
+        """FlashInfer's last tile reads rows past the batch that the conv never writes;
+        NaN there must not reach the output or the cached states."""
+        from flashinfer.kda_prefill_cute import _CHUNK_SIZE
+
+        self.assertEqual(FLASHINFER_KDA_PREFILL_TILE_TOKENS, _CHUNK_SIZE)
+        self.prefill = LinearAttnKernelBackend.FLASHINFER
+        self.backend = _backend(self.conv_pool, self.ssm_pool, prefill=self.prefill)
+        config = FlashInferKDAPrefillGraphConfig(
+            checkpoint_every_n_tokens=CHUNK, scratch=FlashInferKDAPrefillGraphScratch()
+        )
+        real_conv = kda_prefill_graph.causal_conv1d_fn
+
+        def conv_with_nan_tail(*args, **kwargs):
+            meta = self.backend.prefill_graph_metadata
+            past_batch = meta.token_index >= meta.num_logical_tokens
+            return real_conv(*args, **kwargs).masked_fill_(past_batch, float("nan"))
+
+        with patch.object(kda_prefill_graph, "causal_conv1d_fn", conv_with_nan_tail):
+            self._check_replays(*self._capture(flashinfer=config))
 
     def test_capacity(self):
         meta = KDAPrefillGraphMetadata.allocate(

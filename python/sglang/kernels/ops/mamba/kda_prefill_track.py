@@ -9,7 +9,8 @@ rows (the bucket's sequence bound) and read a per-row mode instead:
 * ``track_mode[r] == 1``: the tracked length is chunk aligned; the snapshot is
   the post-extend state of the row's own cache slot.
 * ``track_mode[r] == 2``: the snapshot is the chunk-boundary state the chunked
-  delta-rule kernel wrote to ``h_track[r]`` (fp32).
+  delta-rule kernel wrote to ``h_track[r]`` (fp32, or the SSM-state dtype on the
+  FlashInfer path).
 
 Every tracked row (mode 1 or 2) also snapshots its conv window: the
 ``STATE_LEN`` raw pre-conv input rows ending at the tracked boundary.
@@ -62,7 +63,7 @@ def _kda_track_conv_window_kernel(
 @triton.jit
 def _kda_track_ssm_kernel(
     ssm_pool,  # [slots, ...] per-slot contiguous
-    h_track,  # [rows, ...] fp32 chunk-boundary snapshots
+    h_track,  # [rows, ...] chunk-boundary snapshots, any float dtype
     track_mode,  # [rows] int32
     track_dst,  # [rows] int64 physical track slot
     cache_indices,  # [rows] physical cache slot of the row
@@ -130,7 +131,7 @@ def kda_track_ssm_state(
     cache_indices: torch.Tensor,
 ) -> None:
     """Snapshot the tracked rows' SSM state into their track slots (mode 1:
-    the row's final state, mode 2: its fp32 chunk-boundary state)."""
+    the row's final state, mode 2: its chunk-boundary state)."""
     rows = track_mode.shape[0]
     numel = ssm_pool[0].numel()
     assert ssm_pool[0].is_contiguous(), "per-slot SSM state must be contiguous"

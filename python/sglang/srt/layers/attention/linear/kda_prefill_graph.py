@@ -11,17 +11,22 @@ Python -- eagerly.
 For each bucket this module allocates static tables sized by the bucket's
 bounds:
 
-* ``max_seqs`` sequences (``min(bucket, cap)``; batches with more sequences run
-  eagerly, through the runner's replay vote on
-  ``AttentionBackend.prefill_cuda_graph_max_batch_size``),
+* ``max_seqs`` sequences (``prefill_graph_max_seqs``: ``min(bucket, cap)``, or
+  ``min(bucket - 1, cap)`` for FlashInfer; batches with more sequences run eagerly
+  through the runner's replay vote on
+  ``AttentionBackend.prefill_cuda_graph_max_batch_size``, or replay the bucket's
+  eager-metadata variant when the backend captures one),
 * ``max_chunks = cdiv(bucket, 64) + max_seqs`` delta-rule chunks,
 * ``max_conv_blocks = cdiv(bucket, 8) + max_seqs`` conv blocks.
 
 Before every replay ``fill`` rebuilds the tables from the batch's CPU lengths
-(one host-to-device copy plus a few device gathers, no synchronization). The
-captured kernels launch fixed grids over the bounds; padded rows point past
-their sequence (chunk tables) or carry ``PAD_SLOT_ID`` (conv blocks, state
-slots) and return immediately.
+(one host-to-device copy plus a few device gathers, no synchronization; the
+FlashInfer extend adds two checkpoint-table copies and a device-side re-plan per
+layer). The captured kernels launch fixed grids over the bounds; padded rows
+point past their sequence (chunk tables) or carry ``PAD_SLOT_ID`` (conv blocks,
+state slots) and return immediately. The FlashInfer extend instead points padded
+state slots at the reserved padding slot 0 and zeroes the q/k/v rows its last
+tile reads past the batch.
 """
 
 from __future__ import annotations
@@ -44,6 +49,12 @@ from sglang.kernels.ops.mamba.kda_prefill_track import (
     kda_track_conv_window,
     kda_track_ssm_state,
 )
+from sglang.kernels.ops.mamba.pad_rows import zero_rows_past_batch
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+    FLASHINFER_KDA_PREFILL_TILE_TOKENS,
+    FlashInferKDAPrefillGraphConfig,
+    FlashInferKDAPrefillGraphState,
+)
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
     build_prefill_track_plan,
 )
@@ -57,6 +68,16 @@ KDA_CHUNK_SIZE = 64
 # Chunk index of padded chunk_indices rows: past the end of any sequence, so
 # every varlen chunk kernel returns on its `i_t * BT >= T` guard.
 _PAD_CHUNK = 1 << 20
+
+
+def prefill_graph_max_seqs(
+    *, num_tokens: int, max_seqs_cap: int, flashinfer: bool
+) -> int:
+    if flashinfer:
+        # FlashInfer prefills only with more tokens than sequences;
+        # otherwise it dispatches decode (kda_prefill._is_plain_multi_token_prefill).
+        return min(num_tokens - 1, max_seqs_cap)
+    return max(1, min(num_tokens, max_seqs_cap))
 
 
 class KDAPrefillTrackRows(msgspec.Struct, frozen=True):
@@ -102,6 +123,8 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
     track_dst: torch.Tensor  # [max_seqs] int64
     token_index: torch.Tensor  # [num_tokens] int32 arange
 
+    flashinfer: Optional[FlashInferKDAPrefillGraphState] = None
+
     @classmethod
     def allocate(
         cls,
@@ -111,8 +134,13 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        flashinfer: Optional[FlashInferKDAPrefillGraphConfig] = None,
     ) -> KDAPrefillGraphMetadata:
-        max_seqs = max(1, min(num_tokens, max_seqs_cap))
+        max_seqs = prefill_graph_max_seqs(
+            num_tokens=num_tokens,
+            max_seqs_cap=max_seqs_cap,
+            flashinfer=flashinfer is not None,
+        )
         max_chunks = triton.cdiv(num_tokens, KDA_CHUNK_SIZE) + max_seqs
         max_conv_blocks = triton.cdiv(num_tokens, CAUSAL_CONV1D_FWD_BLOCK_M) + max_seqs
         sizes = [
@@ -149,6 +177,17 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
             has_initial_state=torch.zeros(max_seqs, dtype=torch.bool, device=device),
             track_dst=torch.zeros(max_seqs, dtype=torch.int64, device=device),
             token_index=torch.arange(num_tokens, dtype=torch.int32, device=device),
+            flashinfer=(
+                None
+                if flashinfer is None
+                else FlashInferKDAPrefillGraphState.allocate(
+                    num_tokens=num_tokens,
+                    max_seqs=max_seqs,
+                    track=track,
+                    config=flashinfer,
+                    device=device,
+                )
+            ),
         )
 
     def can_fit(self, extend_seq_lens: list[int]) -> bool:
@@ -185,6 +224,13 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         self.has_initial_state[bs:].fill_(False)
         if track_rows is not None:
             self.track_dst[:bs].copy_(track_rows.dst[:bs])
+        if self.flashinfer is not None:
+            self.flashinfer.fill(
+                extend_seq_lens=extend_seq_lens,
+                cache_indices=self.cache_indices,
+                cu_seqlens=self.cu_seqlens,
+                checkpoint_rows=[] if track_rows is None else track_rows.chunk_rows,
+            )
 
     def _write_host_tables(
         self, *, lens: np.ndarray, track_rows: Optional[KDAPrefillTrackRows]
@@ -334,6 +380,15 @@ def kda_extend_in_graph(
         seq_lens_cpu=None,
         block_table=meta.conv_block_table,
     ).transpose(0, 1)
+    use_flashinfer = meta.flashinfer is not None
+    if use_flashinfer:
+        # FlashInfer's last tile reads q/k/v rows the conv never wrote;
+        # it bounds its gate and beta reads, so a and b need no zeroing.
+        zero_rows_past_batch(
+            qkv,
+            num_logical_tokens=meta.num_logical_tokens,
+            rows=FLASHINFER_KDA_PREFILL_TILE_TOKENS,
+        )
     q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
     q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
     k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
@@ -343,6 +398,65 @@ def kda_extend_in_graph(
     if gate_was_flat:
         a = a.unflatten(-1, (-1, layer.head_k_dim))
 
+    if use_flashinfer:
+        core_attn_out, h_track = kernel_dispatcher.extend_kernel.extend_in_graph(
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
+            ssm_states=ssm_states,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=layer.lower_bound,
+            graph_state=meta.flashinfer,
+            cu_seqlens=meta.cu_seqlens,
+            layer_id=layer.layer_id,
+        )
+    else:
+        core_attn_out, h_track = _triton_extend_in_graph(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            layer=layer,
+            meta=meta,
+            ssm_states=ssm_states,
+            kernel_dispatcher=kernel_dispatcher,
+            beta_is_raw=gate_was_flat,
+        )
+
+    if meta.track:
+        kda_track_ssm_state(
+            ssm_pool=ssm_states,
+            h_track=h_track,
+            track_mode=meta.track_mode,
+            track_dst=meta.track_dst,
+            cache_indices=meta.cache_indices,
+        )
+
+    # Rows past the batch belong to no sequence and were never written; keep the
+    # layer's padded output finite for the MoE and the collectives.
+    core_attn_out.masked_fill_(
+        (meta.token_index >= meta.num_logical_tokens).view(1, -1, 1, 1), 0
+    )
+    return core_attn_out
+
+
+def _triton_extend_in_graph(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer: RadixLinearAttention,
+    meta: KDAPrefillGraphMetadata,
+    ssm_states: torch.Tensor,
+    kernel_dispatcher: KDAKernelDispatcher,
+    beta_is_raw: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     h_track = None
     if meta.track:
         h_track = torch.empty(
@@ -362,7 +476,7 @@ def kda_extend_in_graph(
         A_log=layer.A_log,
         dt_bias=layer.dt_bias,
         lower_bound=layer.lower_bound,
-        beta_is_raw=gate_was_flat,
+        beta_is_raw=beta_is_raw,
         extend_seq_lens_cpu=None,
         is_spec_decode=False,
         return_intermediate_states=False,
@@ -371,19 +485,4 @@ def kda_extend_in_graph(
         chunk_indices=meta.chunk_indices,
         chunk_offsets=meta.chunk_offsets,
     )
-
-    if meta.track:
-        kda_track_ssm_state(
-            ssm_pool=ssm_states,
-            h_track=h_track,
-            track_mode=meta.track_mode,
-            track_dst=meta.track_dst,
-            cache_indices=meta.cache_indices,
-        )
-
-    # Rows past the batch belong to no sequence and were never written; keep the
-    # layer's padded output finite for the MoE and the collectives.
-    core_attn_out.masked_fill_(
-        (meta.token_index >= meta.num_logical_tokens).view(1, -1, 1, 1), 0
-    )
-    return core_attn_out
+    return core_attn_out, h_track

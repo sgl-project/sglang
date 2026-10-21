@@ -73,8 +73,8 @@ class MambaAttnBackendBase(AttentionBackend):
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
 
-    # Most sequences the prefill graph tables hold (larger batches replay no
-    # graph); set at init by backends whose supports_prefill_graph_extend holds.
+    # Most sequences the prefill graph tables hold; larger batches never replay them.
+    # Set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
 
     def __init__(self, model_runner: ModelRunner):
@@ -126,6 +126,14 @@ class MambaAttnBackendBase(AttentionBackend):
     def prefill_graph_extend_active(self) -> bool:
         """Whether the extend being captured or replayed runs on those tables."""
         return False
+
+    def prefill_graph_eager_metadata_fallback(self) -> bool:
+        """Whether buckets also capture an eager-metadata variant for larger batches."""
+        return False
+
+    def prefill_graph_bucket_max_seqs(self, num_tokens: int) -> Optional[int]:
+        """Most sequences one bucket's prefill graph tables hold (None: no bound)."""
+        return None
 
     def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
         raise NotImplementedError()
@@ -1217,10 +1225,19 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.prefill_cuda_graph_max_batch_size = (
                 linear_attn_backend.prefill_graph_max_seqs
             )
+            self.prefill_cuda_graph_eager_metadata_fallback = (
+                linear_attn_backend.prefill_graph_eager_metadata_fallback()
+            )
             logger.info(
                 "Breakable prefill CUDA graphs capture the %s extend.",
                 type(linear_attn_backend).__name__,
             )
+            if self.prefill_cuda_graph_eager_metadata_fallback:
+                logger.info(
+                    "Prefill CUDA graph buckets hold up to %d sequences; larger "
+                    "batches replay the eager-metadata variant.",
+                    linear_attn_backend.prefill_graph_max_seqs,
+                )
 
     @property
     def data_type(self):
@@ -1281,6 +1298,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not mode.is_target_verify()
             and not mode.is_draft_extend_v2()
         )
+
+    def prefill_cuda_graph_bucket_max_batch_size(
+        self, num_tokens: int
+    ) -> Optional[int]:
+        return self.linear_attn_backend.prefill_graph_bucket_max_seqs(num_tokens)
 
     def linear_extend_in_graph(self) -> bool:
         """Whether the linear layers of the prefill being captured run inside
