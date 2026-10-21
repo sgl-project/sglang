@@ -11,6 +11,7 @@ import errno
 import functools
 import glob
 import logging
+import math
 import mmap
 import os
 import re
@@ -45,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_local_info,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
@@ -62,6 +64,8 @@ logger = logging.getLogger(__name__)
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
+# Bound on the bf16 values one DP Engram lookup holds at once (see _dp_sharded_lookup).
+_DP_LOOKUP_CHUNK_BYTES = 256 << 20
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
@@ -964,28 +968,78 @@ class EngramEmbedding(nn.Module):
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
             return self._empty(indices)
-        values = self._owned_rows(ids_global).view(rows, -1)
+        width = math.prod(indices.shape[1:]) * self.dim
         local = torch.empty(
-            (indices.shape[0], values.shape[1]),
-            dtype=values.dtype,
-            device=values.device,
+            (indices.shape[0], width), dtype=torch.bfloat16, device=indices.device
         )
         padding = forward_batch.dp_padding_mode
-        if (
+        reduce_scatter = (
             padding is not None
             and padding.is_max_len()
             and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
-        ) or is_dp_gatherv_active():
-            if _is_hip and values.is_cuda:
-                dp_reduce_scatter_tensor(
-                    local.view(torch.int32), values.view(torch.int32)
-                )
+        )
+        # Every rank holds a bf16 row for every gathered token, so the buffer
+        # grows with the DP size; above the budget, look up and reduce it in
+        # slices so the peak stays bounded.
+        chunk_rows = max(1, _DP_LOOKUP_CHUNK_BYTES // (width * 2))
+        if rows > chunk_rows and get_parallel().attn_cp_size == 1:
+            if reduce_scatter and not is_dp_gatherv_active():
+                self._dp_lookup_reduce_scatter_chunked(ids_global, local, chunk_rows)
             else:
-                dp_reduce_scatter_tensor(local, values)
+                self._dp_lookup_all_reduce_chunked(
+                    ids_global, local, chunk_rows, forward_batch
+                )
+            return local.view(*indices.shape, self.dim)
+        values = self._owned_rows(ids_global).view(rows, -1)
+        if reduce_scatter or is_dp_gatherv_active():
+            self._reduce_scatter_owned_rows(local, values)
         else:
             dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
         return local.view(*indices.shape, self.dim)
+
+    def _reduce_scatter_owned_rows(self, local: torch.Tensor, values: torch.Tensor):
+        if _is_hip and values.is_cuda:
+            dp_reduce_scatter_tensor(local.view(torch.int32), values.view(torch.int32))
+        else:
+            dp_reduce_scatter_tensor(local, values)
+
+    def _dp_lookup_reduce_scatter_chunked(
+        self, ids_global: torch.Tensor, local: torch.Tensor, chunk_rows: int
+    ):
+        """MAX_LEN layout: the global rows are tp_size equal slots, so slice
+        every slot at the same offsets and reduce-scatter each slice."""
+        slot = local.shape[0]
+        ids = ids_global.view(self.tp_size, slot, *ids_global.shape[1:])
+        step = max(1, chunk_rows // self.tp_size)
+        for start in range(0, slot, step):
+            end = min(slot, start + step)
+            part = ids[:, start:end].reshape(-1, *ids_global.shape[1:])
+            values = self._owned_rows(part).view(part.shape[0], -1)
+            self._reduce_scatter_owned_rows(local[start:end], values)
+
+    def _dp_lookup_all_reduce_chunked(
+        self,
+        ids_global: torch.Tensor,
+        local: torch.Tensor,
+        chunk_rows: int,
+        forward_batch: ForwardBatch,
+    ):
+        """Any layout: reduce each slice of the global rows and keep the part
+        that falls in this rank's slot. Rows outside it land in a spare row,
+        so no host sync is needed to find the overlap."""
+        local_start, local_num = get_dp_local_info(forward_batch)
+        out = local.new_zeros((local.shape[0] + 1, local.shape[1]))
+        spare = local.shape[0]
+        rows = ids_global.shape[0]
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            values = self._owned_rows(ids_global[start:end]).view(end - start, -1)
+            values = self._reduce_owned_rows(values)
+            dest = torch.arange(start, end, device=values.device) - local_start
+            keep = (dest >= 0) & (dest < local_num)
+            out.index_copy_(0, torch.where(keep, dest, spare), values)
+        local.copy_(out[:spare])
 
 
 def engram_gate(
