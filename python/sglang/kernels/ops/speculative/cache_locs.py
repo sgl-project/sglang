@@ -800,3 +800,34 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def fill_front_out_cache_loc_func(
+    num_front: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    front_out_cache_loc: torch.Tensor,  # mutable
+):
+    """Pack the first ``num_front[i]`` slots of request i's window in ``out_cache_loc``."""
+    bs = num_front.numel()
+    window = out_cache_loc.view(bs, -1)
+    rows = torch.arange(bs, device=window.device)
+    starts = torch.zeros_like(num_front)
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            rows,
+            window.int(),
+            starts,
+            num_front,
+            front_out_cache_loc,
+            window.shape[1],
+        )
+        return
+    assign_extend_cache_locs[(bs,)](
+        rows,
+        window,
+        starts,
+        num_front,
+        front_out_cache_loc,
+        window.shape[1],
+        next_power_of_2(bs),
+    )
