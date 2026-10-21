@@ -275,35 +275,26 @@ def _qwen3_5_stage_facts(
     )
 
 
-# Single-launch fused QK-GemmaRMSNorm + partial-RoPE + gate-deinterleave kernel.
-# It replaces the HIP 2-kernel prepare (fused_qk_gemma_rmsnorm_with_gate +
-# rotary_emb). The kernel is Triton, not CUDA C++, and handles mrope + partial
-# rotary internally, so it is correct for Qwen3.5's decode path. (aiter's
-# fused_qk_norm_rope_gate_fp8_quant is NOT a fit here: it takes 1-D positions
-# only -> no mrope, and always emits an FP8 prefill suffix.) On gfx950 import it
-# defensively: a ROCm Triton that cannot import it (e.g. missing
-# triton.language.extra.cuda) falls back to the original 2-kernel path with no
-# regression. The kernel's only NVIDIA-specific bits (libdevice FMA, Hopper PDL)
-# are optional and default-off.
-_HIP_FUSED_PREP_AVAILABLE = False
+# Single-launch fused QK-GemmaRMSNorm + partial-RoPE + gate-deinterleave kernel,
+# the same Triton kernel the CUDA path uses. It replaces the aiter/HIP 2-kernel
+# prepare (fused_qk_gemma_rmsnorm_with_gate + rotary_emb). It is plain Triton and
+# handles mrope + partial rotary + the Gemma norm, so it is not gfx-specific.
+# Import it defensively on aiter: a ROCm Triton that cannot import it leaves the
+# name None, and _prepare_qkv_gate falls back to the 2-kernel path with no
+# regression. (aiter's fused_qk_norm_rope_gate_fp8_quant is NOT a fit: it takes
+# 1-D positions only -> no mrope, and always emits an FP8 prefill suffix.)
+fused_qk_gemma_rmsnorm_rope_gate = None
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
-elif _use_aiter and _is_gfx95:
+elif _use_aiter:
     try:
         from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
             fused_qk_gemma_rmsnorm_rope_gate,
         )
-
-        _HIP_FUSED_PREP_AVAILABLE = True
     except Exception:
-        fused_qk_gemma_rmsnorm_rope_gate = None
-
-# Internal A/B toggle (no env var, per the project's auto-gating convention):
-# default on wherever the fused kernel imported on gfx950. Set to False to force
-# the original fused_qk_gemma_rmsnorm_with_gate + rotary_emb baseline.
-_hip_fused_prep_enabled = _HIP_FUSED_PREP_AVAILABLE
+        pass
 
 if _is_cpu:
     _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
@@ -1606,15 +1597,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
             )
         if (
-            _is_hip
+            _use_aiter
             and self.attn_output_gate
-            and _hip_fused_prep_enabled
-            and _HIP_FUSED_PREP_AVAILABLE
             and fused_qk_gemma_rmsnorm_rope_gate is not None
         ):
-            # Reuse the backend-agnostic fused path: one Triton kernel
-            # (norm + partial RoPE + gate) in place of
-            # fused_qk_gemma_rmsnorm_with_gate + rotary_emb.
+            # One fused Triton kernel (norm + partial RoPE + gate) in place of
+            # fused_qk_gemma_rmsnorm_with_gate + rotary_emb. Enabled on any aiter
+            # HIP GPU; the import leaves the name None where it is unsupported.
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
