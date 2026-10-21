@@ -86,7 +86,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    make_layers,
+    print_warning_once,
+    set_weight_attrs,
+)
 
 _is_cuda = is_cuda()
 
@@ -348,7 +354,7 @@ class BeamMoE(nn.Module):
             and torch.cuda.get_device_capability() == (10, 3)
         )
         if envs.SGLANG_OPT_BEAM_DECODE_GEMV.get() and not self.use_decode_gemv:
-            logger.warning_once(
+            print_warning_once(
                 "SGLANG_OPT_BEAM_DECODE_GEMV is unused: it needs BF16 experts "
                 "with MoE TP4/EP1 on SM103."
             )
