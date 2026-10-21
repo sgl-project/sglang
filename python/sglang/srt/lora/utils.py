@@ -189,6 +189,9 @@ def get_default_hidden_dim(
             o_head_dim * config.num_attention_heads,
             config.hidden_size,
         )
+    elif module_name == "self_attn.gate_proj":
+        # Attention output gate: one gate per query-head channel.
+        return config.hidden_size, config.num_attention_heads * head_dim
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
@@ -295,6 +298,9 @@ def get_normalized_target_modules(
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
 
+    Names in PRESERVED_LORA_TARGET_NAMES are kept verbatim. The attention gate
+    must be named "self_attn.gate_proj"; "gate_proj" maps to the MLP gate_up_proj.
+
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
     {"all"} as a sentinel value.  Callers that need a concrete module set
     should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
@@ -336,6 +342,10 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
+        qualified_name = ".".join(name.split(".")[-2:])
+        if qualified_name in PRESERVED_LORA_TARGET_NAMES:
+            result.add(qualified_name)
+            continue
         # Models may fuse adapter projections differently from the common HF layout.
         if base_model is not None and hasattr(
             base_model, "get_lora_target_module_name"
@@ -345,6 +355,13 @@ def get_normalized_target_modules(
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
+
+
+def get_model_lora_modules(model: torch.nn.Module) -> frozenset[str]:
+    """The model's optional ``supported_lora_modules`` declaration."""
+    if hasattr(model, "supported_lora_modules"):
+        return frozenset(model.supported_lora_modules)
+    return frozenset()
 
 
 def get_stacked_multiply(
@@ -401,6 +418,9 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
+# Kept verbatim by target normalization, because the leaf alone names another
+# module in the same layer: the attention output gate shares gate_proj with the MLP.
+PRESERVED_LORA_TARGET_NAMES = frozenset({"self_attn.gate_proj"})
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
@@ -423,6 +443,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "self_attn.gate_proj",
     }
 )
 
@@ -450,6 +471,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "kv_b_proj",
     }
     | DSA_INDEXER_LORA_NAMES
+    | PRESERVED_LORA_TARGET_NAMES
 )
 
 
@@ -500,8 +522,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     # Allow models to declare additional LoRA-compatible modules that
     # cannot be auto-discovered or need to bypass normalization
     # (e.g. Mamba in_proj, non-gated up_proj).
-    if hasattr(model, "supported_lora_modules"):
-        result.update(set(model.supported_lora_modules) & _KNOWN_LORA_TARGET_MODULES)
+    result.update(get_model_lora_modules(model) & _KNOWN_LORA_TARGET_MODULES)
 
     return result
 
