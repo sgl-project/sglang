@@ -229,7 +229,7 @@ def test_backend_directories_register_their_backend():
     directory_backends = {
         "sglang.kernels.kda_kernels.": KernelBackend.KDA,
         "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
-        "sglang.kernels.low_latency_kernels.": KernelBackend.LOW_LATENCY,
+        "sglang.kernels.plugin_kernels.": KernelBackend.PLUGIN,
     }
     for spec in K.registry.all_specs():
         expected = next(

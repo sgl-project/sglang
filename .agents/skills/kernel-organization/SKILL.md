@@ -44,9 +44,9 @@ logical grouping and remove the old `_jit_` filename prefix.
   FlashInfer). They are backends, not groups: register their public ops in the
   logical group with a `KernelSpec` whose target points into them, and do not
   reorganize those directories.
-- External low-latency kernel libraries are integrated in
-  `kernels/low_latency_kernels/<hardware>/<model>/` (`KernelBackend.LOW_LATENCY`),
-  a backend like the agent ones. `nvidia/` and `amd/` hold the whole-step
+- External kernel libraries that load as SGLang plugins and replace a model's
+  step are integrated in `kernels/plugin_kernels/<hardware>/<model>/`
+  (`KernelBackend.PLUGIN`), a backend like the agent ones. `nvidia/` and `amd/` hold the whole-step
   interfaces behind `--enable-nvidia-megakernel` and `--enable-amd-monokernel`;
   the kernels stay in sgl-nvidia-mega and sgl-amd-mono. An op exposed from there
   registers in its logical group with a `KernelSpec` that points into it.
@@ -56,7 +56,7 @@ logical grouping and remove the old `_jit_` filename prefix.
   and buffer ownership in `srt` (`srt/layers/communication/` for the K3 and Muse
   Spark adapters); kernels must not import srt runtime modules to inspect
   model objects, so pass flags in. Adapters there need not pretend to be generic
-  interfaces. The whole-step interfaces in `low_latency_kernels/` are the one
+  interfaces. The whole-step interfaces in `plugin_kernels/` are the one
   exception: they replace a model's forward.
 
 ## Register the public entry point

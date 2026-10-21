@@ -9,16 +9,16 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.low_latency_kernels.amd import guards, runtime
-from sglang.kernels.low_latency_kernels.amd import spec as registry
-from sglang.kernels.low_latency_kernels.amd.guards import (
+from sglang.kernels.plugin_kernels.amd import guards, runtime
+from sglang.kernels.plugin_kernels.amd import spec as registry
+from sglang.kernels.plugin_kernels.amd.guards import (
     MAX_DEADLINE_S,
     covered_capture_sizes,
     deadline_s,
     features_in_use,
     monokernel_disable_reasons,
 )
-from sglang.kernels.low_latency_kernels.amd.spec import (
+from sglang.kernels.plugin_kernels.amd.spec import (
     DeviceLimits,
     Feature,
     MonoSpec,

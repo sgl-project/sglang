@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.low_latency_kernels.amd.guards import deadline_s, device_isa
-from sglang.kernels.low_latency_kernels.amd.spec import (
+from sglang.kernels.plugin_kernels.amd.guards import deadline_s, device_isa
+from sglang.kernels.plugin_kernels.amd.spec import (
     BACKEND,
     FLAG,
     BuildContext,

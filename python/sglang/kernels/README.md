@@ -28,8 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
-  low_latency_kernels/  # low-latency kernel backend: external low-latency
-                        # kernel libraries, as <hardware>/<model>/
+  plugin_kernels/  # plugin kernel backend: external kernel libraries,
+                   # as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -87,8 +87,8 @@ classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
 collective-GEMM communication adapters and workspaces live in
 `srt/layers/communication/`, while their callable kernels live in
 `kernels/ops/communication/` and take that state as arguments. The exception
-is the whole-step interfaces in `low_latency_kernels/` (see below), which
-replace a model's forward. Reference/test oracles belong in
+is the whole-step interfaces in `plugin_kernels/` (see below), which replace
+a model's forward. Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
@@ -131,14 +131,18 @@ agent_kernels = [
 ]
 ```
 
-## Low-latency kernel backend: `low_latency_kernels/`
+## Plugin kernel backend: `plugin_kernels/`
 
-This directory integrates external low-latency kernel libraries, whose kernels
-run small-batch decode where launch gaps and collective latency dominate a
-step; `KernelBackend.LOW_LATENCY` records them. It is organized by hardware,
-then model: `low_latency_kernels/<hardware>/` holds the whole-step interface to
-that hardware's library and `<hardware>/<model>/` its model-specific
-integration (details in `low_latency_kernels/README.md`).
+This directory integrates external kernel libraries that load as SGLang
+plugins (the `sglang.srt.plugins` entry point) and replace a model's step with
+kernels specialized for one model, configuration and platform: today the
+small-batch decode and verify steps, possibly prefill or high-throughput steps
+later. The kernels stay in the libraries; SGLang keeps the contract they plug
+into, and `KernelBackend.PLUGIN` records them. These are kernel plugins, not
+the platform plugins that add a device. The directory is organized by
+hardware, then model: `plugin_kernels/<hardware>/` holds the whole-step
+interface to that hardware's library and `<hardware>/<model>/` its
+model-specific integration (details in `plugin_kernels/README.md`).
 
 - `nvidia/` (`--enable-nvidia-megakernel`) integrates
   [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega).
@@ -146,12 +150,12 @@ integration (details in `low_latency_kernels/README.md`).
   [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono).
 
 Each interface checks the configuration at argument resolution, builds the
-library's spec once the model is prepared, and routes the covered decode and
-verify steps through it; the kernels stay in the libraries. Because they
+library's spec once the model is prepared, and routes the covered steps
+through it. Because they
 replace a model's forward, these interfaces read `srt` runtime state and `srt`
 imports them directly; operator kernels must not. An operator exposed from
 here registers into its logical group with
-`KernelSpec(op="<group>.<name>", backend=KernelBackend.LOW_LATENCY, target="sglang.kernels.low_latency_kernels.<hardware>.<model>.<mod>:<fn>")`;
+`KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
 `test_kernels_namespace.py` enforces the pairing.
 
 ## How it works
@@ -195,7 +199,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` / `forward_kda` / `forward_cake` / `forward_low_latency` /
+    `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared

@@ -25,10 +25,10 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.low_latency_kernels.amd.runtime import (
+from sglang.kernels.plugin_kernels.amd.runtime import (
     install_monokernel_forward,
 )
-from sglang.kernels.low_latency_kernels.nvidia.runtime import install_megakernel
+from sglang.kernels.plugin_kernels.nvidia.runtime import install_megakernel
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,

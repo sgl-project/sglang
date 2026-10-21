@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.kernels.low_latency_kernels.amd.spec import (
+from sglang.kernels.plugin_kernels.amd.spec import (
     BACKEND,
     FLAG,
     Feature,

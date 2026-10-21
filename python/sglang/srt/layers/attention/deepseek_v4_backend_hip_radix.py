@@ -20,8 +20,6 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.low_latency_kernels.amd.runtime import is_metadata_unread
-from sglang.kernels.low_latency_kernels.amd.spec import StepMetadata
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
@@ -63,6 +61,8 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.plugin_kernels.amd.runtime import is_metadata_unread
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend

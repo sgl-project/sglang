@@ -12,9 +12,9 @@ import msgspec
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.low_latency_kernels.nvidia.binding import MegakernelBinding
-from sglang.kernels.low_latency_kernels.nvidia.guards import deadline_s, device_isa
-from sglang.kernels.low_latency_kernels.nvidia.spec import (
+from sglang.kernels.plugin_kernels.nvidia.binding import MegakernelBinding
+from sglang.kernels.plugin_kernels.nvidia.guards import deadline_s, device_isa
+from sglang.kernels.plugin_kernels.nvidia.spec import (
     FLAG,
     BuildContext,
     BuiltMegakernel,
