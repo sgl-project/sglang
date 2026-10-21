@@ -266,6 +266,9 @@ async fn chat_completions(
             bootstrap_room,
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
+            // Python's thinking mode: the grammar starts after the reasoning,
+            // which the scheduler also counts.
+            require_reasoning: reasoning_options.force_reasoning == Some(true),
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
