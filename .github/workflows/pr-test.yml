@@ -301,6 +301,7 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
     secrets: inherit
 
   # =============================================== primary ====================================================

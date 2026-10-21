@@ -305,15 +305,21 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        cuda_graph_config=with_phase(
-                            cfg.cuda_graph_config,
-                            Phase.PREFILL,
-                            backend=Backend.DISABLED,
-                        ),
-                    )
+                    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+                    if not (
+                        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                        and supports_prefill_cp_bcg(server_args)
+                    ):
+                        declare_resolution(
+                            server_args,
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     attn_tp_size = derive_attn_tp_size(
@@ -1026,6 +1032,8 @@ def handle_model_capability_adjustments(server_args: Any):
         )
 
         validate_deepseek_v41_encoder_replay_budget(server_args)
+    elif cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError("--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1")
 
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
