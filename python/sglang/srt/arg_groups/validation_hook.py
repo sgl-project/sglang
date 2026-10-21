@@ -403,7 +403,7 @@ def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
             base = float(buckets_rule[2])
             count = int(buckets_rule[3])
         except (ValueError, IndexError):
-            assert False, (
+            raise ValueError(
                 f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
             )
         assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
@@ -422,7 +422,7 @@ def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
         try:
             bucket_values = [float(x) for x in buckets_rule[1:]]
         except ValueError:
-            assert False, f"{arg_name} custom rule bucket values must be numeric"
+            raise ValueError(f"{arg_name} custom rule bucket values must be numeric")
         assert len(set(bucket_values)) == len(bucket_values), (
             f"{arg_name} custom rule bucket values should not contain duplicates"
         )
