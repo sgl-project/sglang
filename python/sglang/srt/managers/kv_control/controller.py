@@ -115,6 +115,7 @@ class KVControl:
         self.index = LogicalIndex(namespace, self.registry.engine_epoch, limits=limits)
         self._pending: dict[str, _Pending] = {}
         self._requests: dict[tuple[str, str], set[str]] = {}
+        self.policy_runtime = None
 
     def context(
         self, caller_id: str, *, binding_id: str | None = None
@@ -307,6 +308,11 @@ class KVControl:
 
     def _dispatch(self, ref, payload, scope):
         if isinstance(payload, Signal):
+            if self.policy_runtime is not None and self.policy_runtime.consumes(
+                payload.signal
+            ):
+                self.policy_runtime.on_signal(ref, payload)
+                return
             # No consumer: do not resolve a session or build observations.
             self.registry.update(
                 ref,
@@ -333,6 +339,8 @@ class KVControl:
                 payload.session_id, expected_revision=payload.expected_revision
             )
             self._cancel_task_interests(change.removed_tasks)
+            if self.policy_runtime is not None:
+                self.policy_runtime.cleanup(change.removed_tasks)
             self.registry.update(
                 ref,
                 ExecutionUpdate(

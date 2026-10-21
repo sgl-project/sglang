@@ -25,6 +25,10 @@ from sglang.srt.managers.kv_control.contracts import (
 )
 from sglang.srt.managers.kv_control.controller import KVControl
 from sglang.srt.managers.kv_control.index import IndexCursor
+from sglang.srt.managers.kv_control.policy_runtime import (
+    PolicyDefinition,
+    validate_definitions,
+)
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.unified_cache.priority_claims import CacheControlConfig
 
@@ -42,6 +46,7 @@ class ServiceConfig(Value):
     engine_id: Identifier | None = None
     limits: Limits = Limits()
     cache_limits: CacheLimits = CacheLimits()
+    policies: tuple[PolicyDefinition, ...] = ()
 
     def cache_config(self):
         return CacheControlConfig(
@@ -54,6 +59,7 @@ def parse_config(value):
         return None
     config = validated(value, ServiceConfig)
     config.cache_config()
+    validate_definitions(config.policies)
     return config
 
 
@@ -183,6 +189,7 @@ class KVControlService:
         self.idle_check = idle_check
         self.cache_available = cache_available
         self.cache, self.config = cache, validated(config, ServiceConfig)
+        validate_definitions(self.config.policies)
         self.base_namespace = self.config.namespace
         if self.namespace_keys:
             self.cache_salt(None)  # Reject an unencodable namespace at startup.
@@ -203,6 +210,13 @@ class KVControlService:
                 "KV control cache is unsupported: " + capabilities["reason"]
             )
         cache.kv_control_service = self
+        self._bind_policy_runtime()
+
+    def _bind_policy_runtime(self):
+        from sglang.srt.managers.kv_control.policy_runtime import KVPolicyRuntime
+
+        self.policy_runtime = KVPolicyRuntime(self) if self.config.policies else None
+        self.control.policy_runtime = self.policy_runtime
 
     def _bind_executor(self, capacity=None):
         executor = self.cache.create_kv_control_executor(
@@ -267,6 +281,7 @@ class KVControlService:
         claims.config = replace(claims.config, namespace=namespace)
         claims.reset()
         self.control.executor = self._bind_executor(capacity)
+        self._bind_policy_runtime()
 
     def require_quiescent_cache(self):
         if threading.get_ident() != self.cache._kv_control_owner_thread:
@@ -317,7 +332,7 @@ class KVControlService:
             engine_epoch=registry.engine_epoch,
             namespace=registry.namespace,
             executor=self.control.executor.capabilities(),
-            policies=(),
+            policies=tuple(p.name for p in self.config.policies),
             topology="single_owner",
             attached_caller_id="request",
             weight_updates="guarded_transactions"
@@ -349,6 +364,7 @@ class KVControlService:
         capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(self.config.namespace)
         self.control.executor = self._bind_executor(capacity)
+        self._bind_policy_runtime()
 
     def attach(self, req, envelope, *, unsupported_request=False):
         if envelope is None or not any(

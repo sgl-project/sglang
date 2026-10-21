@@ -124,3 +124,26 @@ Storage 读取、跨分支冷存储操作、其他后端与策略/调度协作�
 `/tmp/sglang-kv-opt-file-storage-roundtrip-smoke/`。该结果用于验证接口与缓存行为，
 不代表模型质量或服务吞吐表现。内部 COPY 引用在操作完成后释放，等待未来请求
 admission 的保留行为仍需策略层实现。
+
+## 可配置的 retention 策略
+
+默认策略列表为空。启用 retention 后，importance/resume 信号通过只读接口生成有限
+优先级提议，组合器处理显式意图与依赖，控制核心登记子操作并执行。父信号返回
+解释结果和子操作引用，具体物理结果可单独查询。未消费的 tool_wait 不读取历史、
+不构造观察数据。任务结束仅清理对应 incarnation 的策略声明，保留共享任务和
+显式声明。策略不会取得 Pin 或改变 admission。
+
+新增 CPU 验证 16 项通过，覆盖真实缓存优先级、重放和 TTL、多策略组合、容量拒绝、
+任务清理、缓存重置、启动配置，以及暂不可执行请求中的清理行为。既有相关回归
+170 项、18 个子用例通过，Host/文件搬运回归 36 项通过。
+
+1 号卡服务验证通过：策略值 200 与显式值 90 冲突时，有效值为 90；经文件保存、
+物理缓存清空和恢复后，新副本接受策略值 55。两个策略子操作均可查询且完成，
+后续生成命中 3 个输入 token、输出 token 一致。使用 OPT-125m 配置与 dummy weights，
+不据此评价模型质量或吞吐。
+
+日志为 `/tmp/sglang-kv-retention-cpu-proof.log`、
+`/tmp/sglang-kv-retention-regressions.log`、
+`/tmp/sglang-kv-retention-movement-regressions.log`；服务结果在
+`/tmp/sglang-kv-opt-retention-storage-smoke/`。
+Tool-wait 成本判断、quota 调度指导和保留至实际 admission 的准备引用仍待实现。

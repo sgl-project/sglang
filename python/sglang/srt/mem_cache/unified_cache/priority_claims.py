@@ -289,6 +289,20 @@ class CopyPriorityClaims:
             "claims": sum(len(copy.claims) for copy in self._copies.values()),
         }
 
+    def drop_policy_claims(self, identities):
+        """Explicit task cleanup visits bounded claim metadata, preserving peers."""
+        changed = False
+        for (node_id, component), record in tuple(self._copies.items()):
+            for origin, caller, claim_id in tuple(record.claims):
+                if origin == "policy" and (caller, claim_id) in identities:
+                    del record.claims[origin, caller, claim_id]
+                    changed = True
+            if not record.claims:
+                self._copies.pop((node_id, component))
+                self._units -= record.units
+        if changed:
+            self.ordering_revision += 1
+
 
 class PriorityEvictionWalk:
     """One candidate heap per walk, refreshed on edits or a live TTL boundary.

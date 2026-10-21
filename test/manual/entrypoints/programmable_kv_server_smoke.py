@@ -27,6 +27,11 @@ def main():
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--hicache", action="store_true")
     parser.add_argument(
+        "--retention",
+        action="store_true",
+        help="Verify configured policy children and explicit priority precedence",
+    )
+    parser.add_argument(
         "--storage",
         action="store_true",
         help="Round-trip KV through file storage across a physical cache flush",
@@ -38,7 +43,7 @@ def main():
     )
     parser.add_argument("--output-dir")
     args = parser.parse_args()
-    if args.storage:
+    if args.storage or args.retention:
         args.hicache = True
     root = Path(__file__).resolve().parents[3]
     output = Path(args.output_dir or tempfile.mkdtemp(prefix="sglang-kv-server-smoke-"))
@@ -50,6 +55,11 @@ def main():
     identity = uuid.uuid4().hex
     engine_id = "smoke-" + identity
     namespace = "smoke-weights-" + identity
+    control_config = {"namespace": namespace, "engine_id": engine_id}
+    if args.retention:
+        control_config["policies"] = [
+            {"name": "retain", "options": {"priority": 50, "ttl_seconds": 60}}
+        ]
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -86,7 +96,7 @@ def main():
         "--dtype",
         "float16",
         "--kv-control-config",
-        json.dumps({"namespace": namespace, "engine_id": engine_id}),
+        json.dumps(control_config),
     ]
     if args.hicache:
         command += [
@@ -201,6 +211,7 @@ def main():
             ), results
             ref = results[0]["ref"]
             movements = []
+            policy_validation = []
             if args.hicache:
                 end = max(
                     o["coverage"]["end_token"]
@@ -256,6 +267,60 @@ def main():
                         )
                     raise TimeoutError("Control operation did not retire")
 
+                def retention(message, importance, expected):
+                    receipt = control(
+                        {
+                            "kind": "submit",
+                            "context": router,
+                            "envelope": {
+                                "protocol_version": "0.1",
+                                "message_id": message,
+                                "actions": [
+                                    {
+                                        "action_id": "signal",
+                                        "action_type": "sglang.signal",
+                                        "action_version": "1.0",
+                                        "payload": {
+                                            "target": target,
+                                            "signal": "importance",
+                                            "importance": importance,
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    parent = receipt["results"][0]
+                    assert parent["update"]["status"] == "completed", parent
+                    (child,) = parent["update"]["derived_operations"]
+                    result = control(
+                        {
+                            "kind": "query",
+                            "context": child["context"],
+                            "message_id": child["message_id"],
+                        }
+                    )
+                    assert result["results"][0]["update"]["status"] == "completed", (
+                        result
+                    )
+                    resident = control(
+                        {"kind": "residency", "context": router, "target": target}
+                    )
+                    assert resident["items"] and all(
+                        row["effective_priority"] == expected
+                        for row in resident["items"]
+                    ), resident
+                    policy_validation.append(
+                        {
+                            "signal": parent,
+                            "children": result,
+                            "effective_priority": expected,
+                        }
+                    )
+
+                if args.retention:
+                    assert owner["policies"] == ["retain"]
+                    retention("retain-before-move", 200, 90)
                 movements.append(
                     movement(
                         "move_to", "gpu", "storage" if args.storage else "host", "save"
@@ -299,6 +364,8 @@ def main():
                 assert all(i["effective_priority"] == 0 for i in loaded["items"]), (
                     loaded
                 )
+                if args.retention:
+                    retention("retain-after-load", 55, 55)
             repeated = requests.post(
                 base + "/generate",
                 json={k: v for k, v in body.items() if k != "kv_hints"},
@@ -407,6 +474,7 @@ def main():
                 "flush_epoch_rotated": True,
                 "stale_status": stale.status_code,
                 "weights_validation": weights_validation,
+                "policy_validation": policy_validation,
             }
             (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(

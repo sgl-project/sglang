@@ -747,3 +747,59 @@ parent result; acknowledgement retains a terminal summary rather than detailed
 child metadata. Physical executors cannot create child references in completion
 updates. The serving policy runtime still needs to connect this mechanism to
 signals and configured policies.
+
+## Configured retention policies
+
+The executable local-policy profile currently supports `retention`. Policies
+are absent by default. In the existing Linux CPU/CUDA single-owner serving
+profile, the `--kv-control-config` JSON can include:
+
+```json
+{
+  "namespace": "model-weights-v1",
+  "policies": [
+    {
+      "name": "retain",
+      "implementation": "retention",
+      "options": {"priority": 50, "ttl_seconds": 30}
+    }
+  ]
+}
+```
+
+Names must be unique (at most 16); options use signed finite priorities and
+positive finite TTLs. Unknown implementations/options are rejected at startup.
+Discovery lists configured policy names. Multiple retention policies compose
+independent claims with their own options/revisions/expiry and per-copy limits;
+capacity refusal remains visible in each registered child result.
+
+Retention consumes `importance` and `resume`. Importance supplied on the signal
+selects its priority; otherwise the configured value applies. The runtime
+resolves authoritative logical history, builds a read-only clock/owner view,
+composes the proposals, reserves every child before effects and dispatches them
+through the native core with private provenance. The parent signal's
+policy_context_updated result describes interpretation; derived child results
+report the actual priority changes, missing copies, unsupported layouts or
+capacity refusal. A conflicting pending explicit MOVE defers retention advice.
+Live explicit priorities remain authoritative over policy priorities.
+
+Task signals use incarnation-scoped claim identities. Task finish removes those
+private claims, preserving other tasks, explicit revision tombstones and all
+physical data/references. Cleanup scans bounded claim metadata rather than the
+request queue/cache tree. Token/content signals have target-scoped TTLs without
+inferring task ownership. Replaying a signal does not renew it; a fresh consumed
+signal submits a new revision. Claims apply to current copies and do not survive
+eviction/reload. Cache flush and namespace transitions rebuild the runtime for
+the new epoch. No retention policy acquires a pin or changes inference admission.
+
+Unconsumed signals return before history resolution or observation construction,
+including tool_wait/resume_prediction with only retention configured. Tool-wait
+movement, quota guidance and admission preparation are not enabled by this
+profile. A resume signal cannot set priority on a still-pending load; its child
+reports the actual unsupported/missing scope instead of claiming a future copy.
+
+The one-GPU manual server probe accepts `--retention` (implies `--hicache`), also
+with `--storage`. It checks policy-derived child queries, larger policy priority
+remaining subordinate to explicit priority, and a fresh policy claim on actual
+restored GPU KV before generation reuses it. Model-path, FP16 dummy-weight and
+other fixture limits are the same as the serving probe above.

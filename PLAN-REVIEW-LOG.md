@@ -588,3 +588,50 @@ and reran the complete relevant set. Final result: 135 passed plus 18 subtests,
 /tmp/sglang-kv-policy-children-final-cpu-proof.log. Ruff/isort/format/whitespace
 checks pass. Parent reviewed the full diff; approve local policy registration
 unit. Configured policy runtime and actual admission preparation remain pending.
+
+## Unit 7d — Configured retention runtime through serving
+
+Added typed startup policy definitions/options and an opt-in retention runtime.
+Default policies remain empty. Known consumers are checked before history or
+observation reads. Retention consumes importance/resume using a read-only owner/
+clock view; it proposes finite copy priorities. Runtime resolves authoritative
+snapshots, composes against pending explicit MOVE intent, atomically registers
+children, dispatches dependencies, and reports their queryable refs separately
+from signal interpretation. Physical priority actions retain private origin.
+No movement/guidance policy is advertised by this initial executable profile.
+
+Multiple named policies have independent revisions/TTLs/claim identities and
+visible per-copy capacity refusal. Task incarnation identities support one
+bounded claim-metadata cleanup pass on finish while preserving peer and explicit
+claims/tombstones. No cache/request scan or pin is added. Token/content signals
+use target TTLs without guessing a task owner. Flush/weight namespace rebinding
+rebuilds runtime state. Replay cannot refresh claims.
+
+Review caught a disabled-executor lifecycle edge: unsupported request profiles
+must return UNSUPPORTED without priority effects and still clean task claims.
+Runtime now retains the owner claim-table handle for cleanup and reuses native
+pre-dispatch error mapping when no child has been registered. A real-cache test
+covers that state. An initial test also attempted residency inspection during
+an intentionally unsupported pending-transfer window; corrected it to check
+claim state while the real MOVE still drains. Pending explicit MOVE wins policy
+competition and finishes without a policy-induced change.
+
+New CPU suites: 16 passed (7 actual-cache runtime cases, 2 actual-cache composed
+policy/capacity cases, 7 startup schema cases),
+/tmp/sglang-kv-retention-cpu-proof.log. Existing core/composition/children/cache/
+service/namespace/weight tests: 170 passed plus 18 subtests,
+/tmp/sglang-kv-retention-regressions.log. Host and file movement regressions:
+36 passed, /tmp/sglang-kv-retention-movement-regressions.log.
+
+Real GPU 1 OPT dummy-weight serving proof passed:
+/tmp/sglang-kv-opt-retention-storage-smoke/{server.log,result.json}. A policy
+importance=200 child completes but effective priority remains explicit 90;
+MOVE to real file storage, physical flush/new epoch and independent restore
+produce fresh GPU copies, then policy importance=55 gives effective 55. Both
+policy children are queryable COMPLETED results; repeated inference has 3 cached
+input tokens and equal output IDs. Only the owned server process group was
+terminated. No performance/model-quality claim. Strict Ruff, isort, formatting
+and whitespace checks pass; parent read the complete implementation/diff.
+Approve this local retention-runtime feature. Tool-wait cost/pressure policy,
+quota guidance and full preparation holds through actual admission remain
+ongoing work.
