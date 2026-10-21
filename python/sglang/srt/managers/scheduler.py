@@ -235,7 +235,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
-    RustServerIdleSleeper,
+    create_rust_server_idle_sleeper,
 )
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
@@ -2454,9 +2454,12 @@ class Scheduler(
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
-        self.idle_sleeper = RustServerIdleSleeper(
-            rust_server, can_empty_cache=lambda: not self._engine_paused
+        # Park idle on the request ring unless an attention-DP peer waits on it
+        self.idle_sleeper = create_rust_server_idle_sleeper(
+            rust_server=rust_server,
+            attn_dp_enabled=get_parallel().attn_dp_enabled,
+            sleep_on_idle=get_device().sleep_on_idle,
+            can_empty_cache=lambda: not self._engine_paused,
         )
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
