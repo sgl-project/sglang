@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils.arch import (
 from sglang.kernels.jit.utils.common import (
     aligned_new_empty,
     cache_once,
+    device_guard,
     empty_sentinel,
     get_ci_test_range,
     is_hip_runtime,
@@ -30,6 +31,7 @@ __all__ = [
     "should_run_full_tests",
     "get_ci_test_range",
     "cache_once",
+    "device_guard",
     "lazy_register_class",
     "is_hip_runtime",
     "is_musa_runtime",

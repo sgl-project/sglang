@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 from types import SimpleNamespace
@@ -78,6 +79,9 @@ def completion(text="Rewritten prompt", finish_reason="stop"):
         {"generation_kwargs": {"messages": []}},
         {"generation_kwargs": {"n": 2}},
         {"typo": True},
+        {"tasks": {"image": {"user_template": "no placeholder"}}},
+        {"tasks": {"image": {"generation_kwargs": {"messages": []}}}},
+        {"tasks": {"audio": {"system_prompt": "x"}}},
     ],
 )
 def test_config_rejects_invalid_or_conflicting_fields(override):
@@ -147,6 +151,155 @@ def test_upstream_failures_are_not_silent(upstream, status):
             await enhancer.close()
 
     asyncio.run(run())
+
+
+async def _captured_enhancer(config, calls):
+    """An enhancer whose requests land in ``calls``, answered with a canned completion."""
+    enhancer = PromptEnhancer(config)
+    await enhancer.client.aclose()
+    enhancer.client = httpx.AsyncClient(
+        base_url="http://localhost/v1/",
+        transport=httpx.MockTransport(
+            lambda request: (
+                calls.append(json.loads(request.content))
+                or httpx.Response(200, json=completion())
+            )
+        ),
+    )
+    return enhancer
+
+
+def test_tasks_override_prompt_template_image_order_and_sampling(tmp_path):
+    reference = tmp_path / "ref.png"
+    Image.new("RGB", (8, 8), "blue").save(reference)
+    config = PromptEnhancerConfig(
+        base_url="http://localhost/v1",
+        model="enhancer",
+        include_images=True,
+        generation_kwargs={"max_tokens": 3584, "presence_penalty": 1.5},
+        tasks={
+            "image": {"system_prompt": "t2i", "user_template": "{prompt}"},
+            "image_edit": {
+                "system_prompt": "i2i",
+                "user_template": "User request: {prompt}\nOutput the caption.",
+                "images_first": True,
+                "generation_kwargs": {"presence_penalty": 0},
+            },
+        },
+    )
+    calls = []
+
+    async def run():
+        enhancer = await _captured_enhancer(config, calls)
+        try:
+            await enhancer.enhance("a {braced} cat", task="image", image_paths=[])
+            await enhancer.enhance(
+                "add a hat", task="image_edit", image_paths=[str(reference)]
+            )
+            await enhancer.enhance("a dog", task="video", image_paths=[])
+        finally:
+            await enhancer.close()
+
+    asyncio.run(run())
+    image, edit, video = calls
+    assert image["messages"] == [
+        {"role": "system", "content": "t2i"},
+        {"role": "user", "content": "a {braced} cat"},
+    ]
+    assert (image["max_tokens"], image["presence_penalty"]) == (3584, 1.5)
+    system, user = edit["messages"]
+    assert system["content"] == "i2i" and edit["presence_penalty"] == 0
+    assert [part["type"] for part in user["content"]] == ["image_url", "text"]
+    assert user["content"][1]["text"] == "User request: add a hat\nOutput the caption."
+    # a task without overrides keeps the default system prompt and JSON envelope
+    assert video["messages"][0]["content"] == config.system_prompt
+    assert json.loads(video["messages"][1]["content"]) == {
+        "task": "video",
+        "prompt": "a dog",
+    }
+
+
+def test_flux3_pup_protocol_follows_the_reference_upsampler(tmp_path):
+    (tmp_path / "system_prompts.json").write_text(
+        json.dumps({"t2i": "T2I", "i2i": "I2I", "t2i_bbox": "-", "i2i_bbox": "-"})
+    )
+    reference = tmp_path / "ref.png"
+    Image.new("RGBA", (2000, 1000), (0, 0, 0, 0)).save(reference)
+    config = PromptEnhancerConfig(
+        base_url="http://localhost/v1",
+        model="flux-3-image-klein-pup",
+        protocol="flux3-klein-pup",
+        protocol_source=str(tmp_path),
+    )
+    calls = []
+
+    async def run():
+        enhancer = await _captured_enhancer(config, calls)
+        try:
+            await enhancer.enhance("a man and his dog", task="image", image_paths=[])
+            await enhancer.enhance(
+                "add a hat", task="image_edit", image_paths=[str(reference)]
+            )
+        finally:
+            await enhancer.close()
+
+    asyncio.run(run())
+    t2i, i2i = calls
+    assert t2i["messages"] == [
+        {"role": "system", "content": "T2I"},
+        {"role": "user", "content": "a man and his dog"},
+    ]
+    sampling = {
+        k: t2i[k] for k in ("max_tokens", "temperature", "top_p", "top_k", "min_p")
+    }
+    assert sampling == {
+        "max_tokens": 3584,
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+    }
+    assert t2i["chat_template_kwargs"] == {"enable_thinking": False}
+    assert (t2i["presence_penalty"], i2i["presence_penalty"]) == (1.5, 0.0)
+
+    system, user = i2i["messages"]
+    assert system["content"] == "I2I"
+    image, text = user["content"]
+    assert text["text"] == (
+        "Reference images follow in order (the first image, the second image, ...).\n"
+        "User request: add a hat\nOutput the caption."
+    )
+    header, payload = image["image_url"]["url"].split(",", 1)
+    assert header == "data:image/jpeg;base64"
+    sent = Image.open(io.BytesIO(base64.b64decode(payload)))
+    # one reference: at most 1 MP on a 32-pixel grid, transparency over white
+    assert sent.size == (1440, 704) and sent.getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_explicit_tasks_override_the_protocol(tmp_path):
+    (tmp_path / "system_prompts.json").write_text(
+        json.dumps({"t2i": "T2I", "i2i": "I2I"})
+    )
+    calls = []
+    config = PromptEnhancerConfig(
+        base_url="http://localhost/v1",
+        model="pup",
+        protocol="flux3-klein-pup",
+        protocol_source=str(tmp_path),
+        generation_kwargs={"max_tokens": 1024},
+        tasks={"image": {"system_prompt": "mine", "user_template": "{prompt}"}},
+    )
+
+    async def run():
+        enhancer = await _captured_enhancer(config, calls)
+        try:
+            await enhancer.enhance("a cat", task="image", image_paths=[])
+        finally:
+            await enhancer.close()
+
+    asyncio.run(run())
+    assert calls[0]["messages"][0]["content"] == "mine"
+    assert calls[0]["max_tokens"] == 1024 and calls[0]["top_k"] == 20
 
 
 @pytest.fixture
