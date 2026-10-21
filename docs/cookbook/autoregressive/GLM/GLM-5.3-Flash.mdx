@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and A5 NPU recipes."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
 tag: NEW
 ---
 
@@ -55,13 +55,13 @@ source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
 ```
 
 </Tab>
-<Tab title="A5">
+<Tab title="950PR/DT series">
 
-Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify an A5 image tag.
+Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify a 950PR/DT series image tag.
 
 ```bash Command
-A5_IMAGE="<your-compatible-a5-image>"
-docker pull "$A5_IMAGE"
+NPU_IMAGE="<your-compatible-950pr-dt-series-image>"
+docker pull "$NPU_IMAGE"
 ```
 
 ```bash Command
@@ -77,7 +77,7 @@ source /usr/local/memfabric_hybrid/set_env.sh
 
 Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
 
-Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for A5.
+Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for 950PR/DT series.
 
 </Accordion>
 
@@ -97,16 +97,6 @@ import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
-
-<Note>
-**Ascend NPU recipes:** select **A3** or **A5** in Hardware Platform. NPU recipes use the tutorial's fixed operating point, under **Low-Latency**, and are marked **Not Verified** until independently tested. No NVIDIA or AMD benchmark result applies to these configurations. CUDA-specific overlays and Playground presets are hidden for NPU selections.
-
-A3 uses W8A8 and TP16; A5 uses W8A8_MXFP8 and TP8. Each **Unified** recipe needs one node. For PD, select **Prefill** and **Decode** on two separate nodes of the same platform: A3 uses TP4 / PP4 / DP4 prefill and TP16 / DP16 decode, while A5 uses TP8 / DP2 for both roles. NEXTN is 3/1/4 on A3 decode and unified serving, and 4/1/5 on A5.
-
-For PD, choose **Router** to generate its command after both worker groups are ready. The cookbook uses prefill port **30000**, decode port **30100**, and bootstrap port **8998**. Set the router bind port in **Env** (default **30000**) and point cURL at the router host and port. These ports replace the tutorial's example ports consistently.
-
-Set **Env → HCCL / Gloo interface**, **This worker IP**, **Prefill head IP**, and **Decode head IP** for your cluster. For each multi-node worker group, set **Head node IP** and **This node rank** independently; ranks start at zero within that group.
-</Note>
 
 <Note>
 Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.

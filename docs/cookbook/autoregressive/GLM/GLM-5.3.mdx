@@ -72,9 +72,9 @@ export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/cust
 ```
 
 </Tab>
-<Tab title="A5">
+<Tab title="950PR/DT series">
 
-Use the compatible A5 SGLang checkout, CANN environment, and custom operators used for your deployment. Set `SGLANG_ROOT` to that checkout; these recipes do not prescribe an image tag.
+Use the compatible 950PR/DT series SGLang checkout, CANN environment, and custom operators used for your deployment. Set `SGLANG_ROOT` to that checkout; these recipes do not prescribe an image tag.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -88,7 +88,7 @@ export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 
 Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
 
-Use a locally prepared **W8A8** checkpoint for A3. On A5, **W8A8C8_MXFP8** selects the supplied two-node unified recipe, while **W8A8C8** selects the supplied PD recipe. Both A5 recipes explicitly use FP8 E4M3 KV cache and BF16 draft KV cache; select the checkpoint that matches the serving mode.
+Use a locally prepared **W8A8** checkpoint for A3. On 950PR/DT series, both unified serving and PD disaggregation use the same **W8A8C8_MXFP8** checkpoint. Both 950PR/DT series recipes explicitly use FP8 E4M3 KV cache and BF16 draft KV cache.
 
 </Accordion>
 
@@ -103,20 +103,6 @@ import { config }     from "/src/snippets/configs/zai-org/glm-5.3.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
-
-<Note>
-**Ascend NPU recipes:** select **A3** or **A5** in Hardware Platform. NPU recipes use the tutorial's fixed operating point, under **Low-Latency**, and are marked **Not Verified** until independently tested. No NVIDIA or AMD benchmark result applies to these configurations. CUDA-specific overlays and Playground presets are hidden for NPU selections.
-
-A3 uses W8A8: TP16 on one node (a GLM-5.2-derived reference) or TP32 / DP16 on two nodes. Under **Multi-Nodes**, select **NPU PD mode → Prefill / Decode** for two prefill nodes (TP8 / PP4 / CP8) plus two decode nodes (TP32 / DP32 / EP32).
-
-A5 uses two eight-device nodes per instance: the **W8A8C8_MXFP8 Unified** recipe is TP16 / DP1 with NEXTN 4/1/5. **W8A8C8 Prefill / Decode** uses two nodes per role, TP16 / DP4, prefill without speculation, and decode with NEXTN 4/1/5. The supplied A5 scripts set no explicit EP size.
-
-For PD, choose **Router** to generate its command after both worker groups are ready. The cookbook uses prefill port **30000**, decode port **30100**, and bootstrap port **8998**. Set the router bind port in **Env** (default **30000**) and point cURL at the router host and port. These ports replace the tutorial's example ports consistently.
-
-Set **Env → HCCL / Gloo interface**, **This worker IP**, **Prefill head IP**, and **Decode head IP** for your cluster. For each multi-node worker group, set **Head node IP** and **This node rank** independently; ranks start at zero within that group.
-
-On A5, set the separate **Gloo interface** as well as the HCCL interface. **A5 MemFabric store host** is an independent, reachable store endpoint on port **31001**; it need not be the prefill head. Use the same store for both roles.
-</Note>
 
 <Warning>
   The NVIDIA and AMD recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.3.

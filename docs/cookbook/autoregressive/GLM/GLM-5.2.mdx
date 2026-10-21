@@ -65,16 +65,24 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 ```
 
 </Tab>
-<Tab title="A5">
+<Tab title="950PR/DT series">
 
-A5 configuration is pending. The A5 hardware option displays this status without generating a deployment command.
+Use the compatible 950PR/DT series SGLang checkout, CANN environment, and custom operators used for your deployment. Set `SGLANG_ROOT` to that checkout; these recipes do not prescribe an image tag.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+unset HCCL_IF_IP HCCL_SOCKET_FAMILY RANK_TABLE_FILE
+SGLANG_ROOT=/path/to/sglang
+export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
+```
 
 </Tab>
 </Tabs>
 
 Set **Env → NPU checkpoint directory** to the mounted ModelSlim checkpoint. Include its configuration, tokenizer, quantization metadata, and MTP weights. The generator uses a local checkpoint path for NPU commands, rather than the CUDA checkpoint from Hugging Face.
 
-Use the locally prepared **GLM-5.2-w8a8** checkpoint described in the [model-weight prerequisites](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2#model-weights).
+For A3, use the locally prepared **GLM-5.2-w8a8** checkpoint described in the [model-weight prerequisites](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2#model-weights).
+For 950PR/DT series, use your locally prepared GLM-5.2 **W8A8C8_MXFP8** checkpoint, including MTP weights, and set **Env → NPU checkpoint directory** to its mounted path.
 
 </Accordion>
 
@@ -89,16 +97,6 @@ import { config }     from "/src/snippets/configs/zai-org/glm-5.2.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
-
-<Note>
-**Ascend NPU recipes:** select **A3** or **A5** in Hardware Platform. NPU recipes use the tutorial's fixed operating point, under **Low-Latency**, and are marked **Not Verified** until independently tested. No NVIDIA or AMD benchmark result applies to these configurations. CUDA-specific overlays and Playground presets are hidden for NPU selections.
-
-A3 uses W8A8: single-node TP16 or two-node TP32 unified serving. Select **Single Node → NPU PD mode → Prefill / Decode** for the two-node PD deployment (one TP16 node per role). **A5 is pending**, with no generated command.
-
-For PD, choose **Router** to generate its command after both worker groups are ready. The cookbook uses prefill port **30000**, decode port **30100**, and bootstrap port **8998**. Set the router bind port in **Env** (default **30000**) and point cURL at the router host and port. These ports replace the tutorial's example ports consistently.
-
-Set **Env → HCCL / Gloo interface**, **This worker IP**, **Prefill head IP**, and **Decode head IP** for your cluster. For each multi-node worker group, set **Head node IP** and **This node rank** independently; ranks start at zero within that group.
-</Note>
 
 <Warning>
   The NVIDIA and AMD recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.

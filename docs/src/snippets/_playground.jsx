@@ -2312,19 +2312,23 @@ export const Playground = ({ config }) => {
       borderLeft: `3px solid #ef4444`,
       paddingLeft: "8px", marginLeft: "-8px",
     },
-    // Two-state badge — matches _deployment.jsx's verified/unverified badge.
-    badge: (verified) => ({
+    // Match the Deployment badge, including an open verification round.
+    badge: (status) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px",
-      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
+      background: status === "in-progress" ? (isDark ? "#1e3a8a" : "#dbeafe")
+                           : status === "verified" ? (isDark ? "#064e3b" : "#d1fae5")
                            : (isDark ? "#78350f" : "#fef3c7"),
-      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
+      color:      status === "in-progress" ? (isDark ? "#bfdbfe" : "#1e40af")
+                           : status === "verified" ? (isDark ? "#a7f3d0" : "#065f46")
                            : (isDark ? "#fde68a" : "#92400e"),
       fontSize: "11px", fontWeight: 600,
+      ...(status === "in-progress" ? { whiteSpace: "nowrap" } : {}),
     }),
-    badgeDot: (verified) => ({
+    badgeDot: (status) => ({
       width: "8px", height: "8px", borderRadius: "50%",
-      background: verified ? "#10b981" : "#f59e0b",
+      background: status === "in-progress" ? "#3b82f6"
+        : status === "verified" ? "#10b981" : "#f59e0b",
     }),
     iconButton: {
       padding: "4px 10px",
@@ -2747,6 +2751,13 @@ export const Playground = ({ config }) => {
     ? findMatchingCell(config.cells, base, pgEnvLatest, pgFlagsLatest)
     : null;
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
+  // Opt in per config and selection; preserve other platforms' badge behavior.
+  const declaredVerification = matchedCell && typeof config.playgroundVerificationStatus === "function"
+    ? config.playgroundVerificationStatus(matchedCell, base) : undefined;
+  const playgroundStatus = declaredVerification == null
+    ? (playgroundVerified ? "verified" : "unverified")
+    : (["verified", "in-progress"].includes(declaredVerification)
+      ? declaredVerification : "unverified");
   const matchedSiblingCell = (matchedCell
     && DIMENSIONS.some((d) => matchedCell.match[d] !== base[d]))
     ? matchedCell : null;
@@ -2991,9 +3002,10 @@ export const Playground = ({ config }) => {
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
             <div style={s.headerLeft}>
-              <div style={s.badge(playgroundVerified)}>
-                <span style={s.badgeDot(playgroundVerified)} />
-                {playgroundVerified ? "Verified" : "Not Verified"}
+              <div style={s.badge(playgroundStatus)}>
+                <span style={s.badgeDot(playgroundStatus)} />
+                {playgroundStatus === "in-progress" ? "Final Verification In Progress"
+                  : playgroundStatus === "verified" ? "Verified" : "Not Verified"}
               </div>
               {/* Sibling-cell match: offer to switch the Deployment panel's base to it. */}
               {matchedSiblingCell && (

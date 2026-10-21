@@ -1,12 +1,13 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
+  playgroundVerificationStatus: (cell, s) => ["a3", "a5"].includes(s.hw) ? cell.verificationStatus : undefined,
 
   supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x", "tpu7x", "a3", "a5"],
 
   // One TPU7x (Ironwood) host: 4 chips, 8 TensorCores, served by sglang-torchtpu.
   hardware: [{ id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" },
     { id: "a3", label: "A3 Series", vram: "64GB/die", vendor: "npu", npuDevices: 16 },
-    { id: "a5", label: "950PR/DT Series", vram: "128GB", vendor: "npu", npuDevices: 8 },
+    { id: "a5", label: "950PR/DT series", vram: "128GB", vendor: "npu", npuDevices: 8 },
   ],
 
   matchDims: [
@@ -28,22 +29,22 @@ export const config = {
       id: "quant",
       title: "Quantization",
       options: [
-        { id: "w8a8", label: "W8A8 (ModelSlim)", disabled: (s) => s.hw !== "a3", disableReason: "The W8A8 checkpoint is the A3 recipe." },
-        { id: "w8a8-mxfp8", label: "W8A8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The W8A8_MXFP8 checkpoint is the A5 recipe." },
-        { id: "fp8", label: "FP8" },
-        {
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a3"].includes(s.hw), id: "w8a8", label: "W8A8 (ModelSlim)", disabled: (s) => s.hw !== "a3", disableReason: "The W8A8 checkpoint is the A3 recipe." },
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a5"].includes(s.hw), id: "w8a8-mxfp8", label: "W8A8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The W8A8_MXFP8 checkpoint is the 950PR/DT series recipe." },
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "fp8", label: "FP8" },
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw),
           id: "mxfp4",
           label: "MXFP4",
           disabled: (s) => s.hw !== "mi355x",
           disableReason: "The MXFP4 recipe is qualified on MI355X only.",
         },
-        {
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw),
           id: "nvfp4",
           label: "NVFP4 (RDXA)",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
           disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
         },
-        {
+        { showWhen: (s) => !["a3", "a5"].includes(s.hw),
           id: "nvfp4-nvda",
           label: "NVFP4 (NVDA)",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
@@ -1517,7 +1518,7 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // Ascend NPU: keep the tutorial's recipes unverified until measured.
+    // Ascend NPU: final verification of the tutorial recipes is in progress.
     {
       match: {
         hw: "a3",
@@ -1526,6 +1527,7 @@ sgl-eval run gsm8k \\
       },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "HCCL_BUFFSIZE=1536"
       ],
@@ -1565,6 +1567,7 @@ sgl-eval run gsm8k \\
       },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_NPU_PROFILING=0",
         "ASCEND_LAUNCH_BLOCKING=1",

@@ -3,6 +3,7 @@
 
 export const config = {
   modelName: "GLM-5.3",
+  playgroundVerificationStatus: (cell, s) => ["a3", "a5"].includes(s.hw) ? cell.verificationStatus : undefined,
 
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
@@ -11,7 +12,7 @@ export const config = {
 
   hardware: [
     { id: "a3", label: "A3 Series", vram: "64GB/die", vendor: "npu", npuDevices: 16 },
-    { id: "a5", label: "950PR/DT Series", vram: "128GB", vendor: "npu", npuDevices: 8 },
+    { id: "a5", label: "950PR/DT series", vram: "128GB", vendor: "npu", npuDevices: 8 },
   ],
 
   // Single released checkpoint — no size/mode split.
@@ -19,12 +20,11 @@ export const config = {
     { id: "default", label: "GLM-5.3", subtitle: "MoE · DSA" },
   ],
   quantizations: [
-    { id: "w8a8c8", label: "W8A8C8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The A5 PD recipe uses a W8A8C8 checkpoint." },
-    { id: "w8a8c8-mxfp8", label: "W8A8C8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The A5 unified recipe uses a W8A8C8_MXFP8 checkpoint." },
-    { id: "w8a8", label: "W8A8 (ModelSlim)" },
-    { id: "fp8", label: "FP8" },
-    { id: "bf16", label: "BF16" },
-    { id: "nvfp4", label: "NVFP4 (Experimental)" },
+    { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a5"].includes(s.hw), id: "w8a8c8-mxfp8", label: "W8A8C8_MXFP8 (ModelSlim)", disabled: (s) => s.hw !== "a5", disableReason: "The 950PR/DT series unified and PD recipes use the W8A8C8_MXFP8 checkpoint." },
+    { showWhen: (s) => !["a3", "a5"].includes(s.hw) || ["a3"].includes(s.hw), id: "w8a8", label: "W8A8 (ModelSlim)" },
+    { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "fp8", label: "FP8" },
+    { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "bf16", label: "BF16" },
+    { showWhen: (s) => !["a3", "a5"].includes(s.hw), id: "nvfp4", label: "NVFP4 (Experimental)" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -37,7 +37,6 @@ export const config = {
   ],
 
   modelNames: {
-    "a5|default|w8a8c8": "glm53",
     "a5|default|w8a8c8-mxfp8": "glm53",
     "a3|default|w8a8": "glm-5",
     "default|fp8": "zai-org/GLM-5.3",
@@ -52,7 +51,7 @@ export const config = {
     PREFILL_HOST: {"target":"command","label":"Prefill head IP","default":"<prefill-head-ip>"},
     DECODE_HOST: {"target":"command","label":"Decode head IP","default":"<decode-head-ip>"},
     GLOO_IFACE: {"target":"command","label":"Gloo interface","default":"<gloo-interface>"},
-    MF_STORE_IP: {"target":"command","label":"A5 MemFabric store host","default":"<memfabric-store-host>"},
+    MF_STORE_IP: {"target":"command","label":"950PR/DT series MemFabric store host","default":"<memfabric-store-host>"},
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"  },
     PORT:      { target: "command", label: "Bind port",         default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",      default: "<node0-ip>"   },
@@ -136,10 +135,10 @@ sgl-eval run aime25 \\
       id: "pdMode", title: "NPU PD mode", default: "unified",
       showWhen: (s) => ["a3", "a5"].includes(s.hw) && s.nodes === "multi-2",
       options: [
-        { id: "unified", label: "Unified", disabled: (s) => s.hw === "a5" && s.quant === "w8a8c8", disableReason: "W8A8C8 is the A5 PD recipe; select W8A8C8_MXFP8 for unified serving." },
-        { id: "prefill", label: "Prefill", disabled: (s) => s.hw === "a5" && s.quant === "w8a8c8-mxfp8", disableReason: "Select the W8A8C8 checkpoint for the A5 PD recipe." },
-        { id: "decode", label: "Decode", disabled: (s) => s.hw === "a5" && s.quant === "w8a8c8-mxfp8", disableReason: "Select the W8A8C8 checkpoint for the A5 PD recipe." },
-        { id: "router", label: "Router", disabled: (s) => s.hw === "a5" && s.quant === "w8a8c8-mxfp8", disableReason: "Select the W8A8C8 checkpoint for the A5 PD recipe." },
+        { id: "unified", label: "Unified" },
+        { id: "prefill", label: "Prefill" },
+        { id: "decode", label: "Decode" },
+        { id: "router", label: "Router" },
       ],
     },
 
@@ -333,8 +332,7 @@ sgl-eval run aime25 \\
   // worker topology; changing a GPU overlay must never rewrite these commands.
   resolveRecipe: (cell, s) => {
     if (!(["a3", "a5"].includes(s.hw) && s.nodes === "multi-2")) return cell;
-    if (s.hw === "a5" && s.quant !== "w8a8c8") return cell;
-    const role = s.hw === "a5" && !["prefill", "decode", "router"].includes(s.pdMode) ? "prefill" : s.pdMode;
+    const role = s.pdMode;
     if (!["prefill", "decode", "router"].includes(role)) return cell;
     const router = { port: 30000, command: s.hw === "a5" ? config.npuRouterCommand.replace("--policy round_robin", "--policy cache_aware") : config.npuRouterCommand };
     if (role === "router") return { ...cell, pd: true, pdMode: "router",
@@ -1365,7 +1363,7 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // Ascend NPU: keep the tutorial's recipes unverified until measured.
+    // Ascend NPU: final verification of the tutorial recipes is in progress.
     {
       match: {
         hw: "a3",
@@ -1375,6 +1373,7 @@ sgl-eval run aime25 \\
         nodes: "single"
       },
       verified: false,
+      verificationStatus: "in-progress",
       warn: "Reference adapted from GLM-5.2; not yet verified on GLM-5.3 hardware. See [the Ascend tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3#single-node-deployment).",
       env: [
         "SGLANG_SET_CPU_AFFINITY=1",
@@ -1418,6 +1417,7 @@ sgl-eval run aime25 \\
         nodes: "multi-2"
       },
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_SET_CPU_AFFINITY=1",
         "STREAMS_PER_DEVICE=32",
@@ -1462,6 +1462,7 @@ sgl-eval run aime25 \\
         nodes: "multi-2"
       },
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "DEEPEP_HCCL_BUFFSIZE=1024",
         "HCCL_CONNECT_TIMEOUT=300",
@@ -1512,69 +1513,5 @@ sgl-eval run aime25 \\
         "--port {{PORT}}"
       ]
     },
-    {
-      match: {
-        hw: "a5",
-        variant: "default",
-        quant: "w8a8c8",
-        strategy: "low-latency",
-        nodes: "multi-2"
-      },
-      verified: false,
-      pd: true,
-      pdMode: "prefill",
-      nnodes: 2,
-      env: [
-        "HCCL_CONNECT_TIMEOUT=300",
-        "HCCL_EXEC_TIMEOUT=68",
-        "HCCL_OP_EXPANSION_MODE=AIV",
-        "ACL_DEVICE_SYNC_TIMEOUT=60",
-        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        "MF_HYBM_USE_VMM_SEGMENT=1",
-        "STREAMS_PER_DEVICE=32",
-        "ASCEND_USE_FIA=1",
-        "SGLANG_NPU_USE_MLAPO=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35",
-        "TRANSFORMERS_VERBOSITY=error",
-        "HCCL_HOST_SOCKET_PORT_RANGE=auto",
-        "GLOO_SOCKET_IFNAME=\"{{GLOO_IFACE}}\"",
-        "ASCEND_MF_TRANSFER_PROTOCOL=device_urma",
-        "ASCEND_MF_STORE_URL=\"tcp://{{MF_STORE_IP}}:31001\"",
-        "ASCEND_MF_LOG_LEVEL=2",
-        "HCCL_SOCKET_IFNAME=\"{{NETWORK_IFACE}}\"",
-        "DEEPEP_HCCL_BUFFSIZE=2048",
-        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
-        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200"
-      ],
-      flags: [
-        "--model-path \"{{NPU_MODEL_PATH}}\"",
-        "--trust-remote-code",
-        "--tp-size 16",
-        "--dp 4",
-        "--served-model-name glm53",
-        "--enable-dp-attention",
-        "--enable-dp-lm-head",
-        "--load-balance-method round_robin",
-        "--disaggregation-mode prefill",
-        "--disaggregation-transfer-backend ascend",
-        "--disaggregation-bootstrap-port 8998",
-        "--attention-backend ascend",
-        "--device npu",
-        "--watchdog-timeout 9000",
-        "--max-running-requests 64",
-        "--mem-fraction-static 0.82",
-        "--quantization modelslim",
-        "--max-prefill-tokens 2048000",
-        "--chunked-prefill-size 16384",
-        "--kv-cache-dtype \"fp8_e4m3\"",
-        "--moe-a2a-backend deepep",
-        "--deepep-mode auto",
-        "--disable-cuda-graph",
-        "--enable-metrics",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}"
-      ]
-    },
-
   ],
 };
