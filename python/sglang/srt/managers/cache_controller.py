@@ -245,6 +245,7 @@ class StorageOperation:
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
         self.all_hash_values: Optional[List[str]] = None
+        self.restorable_prefix_pages: Optional[List[int]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
@@ -326,6 +327,11 @@ class HiCacheController:
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
+        self.cp_encoder_replay = (
+            getattr(mem_pool_device, "request_window", None) is not None
+            and attn_cp_group is not None
+            and torch.distributed.get_world_size(group=attn_cp_group) > 1
+        )
         self.mem_pool_host = mem_pool_host
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
@@ -573,6 +579,10 @@ class HiCacheController:
             # todo: load balancing
             and self.storage_config.tp_rank != 0
         )
+        if self.cp_encoder_replay and self.storage_config.attn_cp_rank != 0:
+            # Supported V4.1 replay pools are CP-replicated. Keep one writer
+            # even if the attention-local TP rank is zero on every CP rank.
+            self.backup_skip = True
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -1326,6 +1336,22 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
+        if self.cp_encoder_replay:
+            from sglang.srt.mem_cache.dsv41_replay_contract import (
+                sync_restorable_prefix,
+            )
+
+            return sync_restorable_prefix(
+                operation,
+                storage_hit_count,
+                page_size=self.page_size,
+                pools=list(PoolName),
+                reduce_min=lambda tensor: self._all_reduce(
+                    tensor,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_hits_sync_groups,
+                ),
+            )
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce(
             hit_count,

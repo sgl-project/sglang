@@ -317,6 +317,15 @@ class HybridCacheController(BaseHiCacheController):
                 f"Storage backend {storage_backend!r} requires separate host pools. "
                 "Restart with this backend selected to create compatible host pools."
             )
+        layout_tag = getattr(self.mem_pool_host, "storage_layout_tag", None)
+        if storage_backend == "mooncake" and layout_tag is not None:
+            from sglang.srt.mem_cache.dsv41_replay_contract import (
+                with_storage_layout_tag,
+            )
+
+            storage_backend_extra_config = with_storage_layout_tag(
+                storage_backend_extra_config, layout_tag
+            )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"
             and self.pp_group is not None
@@ -1398,6 +1407,8 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        if self.cp_encoder_replay:
+            operation.restorable_prefix_pages = hit_result.restorable_prefix_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         # Each pool's own boundary (the KV pool's where the backend reports
         # it, else the folded cut); the beliefs heal pool by pool. A pool the
@@ -1419,6 +1430,8 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
+        if self.cp_encoder_replay:
+            return super()._sync_prefetch_hit_query(operation, storage_hit_count)
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
         packed = torch.tensor(

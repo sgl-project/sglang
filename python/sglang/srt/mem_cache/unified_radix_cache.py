@@ -2085,6 +2085,28 @@ class UnifiedRadixCache(BasePrefixCache):
             last_hash,
             prefix_keys,
         )
+        if self.cp_encoder_replay:
+            from sglang.srt.mem_cache.dsv41_replay_contract import (
+                sync_restorable_prefix,
+            )
+
+            try:
+                _, storage_hit_count = self.cache_controller._storage_hit_query(
+                    operation
+                )
+            except Exception:
+                logger.exception("CP replay storage admission query failed")
+                storage_hit_count = 0
+            # The scheduler probe must not use the prefetch thread's groups.
+            return sync_restorable_prefix(
+                operation,
+                storage_hit_count,
+                page_size=self.page_size,
+                pools=list(PoolName),
+                reduce_min=lambda tensor: self._all_reduce_attn_groups(
+                    tensor, torch.distributed.ReduceOp.MIN
+                ),
+            )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
