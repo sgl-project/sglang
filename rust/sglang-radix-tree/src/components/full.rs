@@ -111,7 +111,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         let mut host_freed = 0;
         if target.contains(EvictLayer::Device) && node.has_device_value(FULL) {
             let value = node.device_value(FULL);
-            freed = node.device_value_len(FULL);
+            freed = node.device_reclaimable_value_len(FULL);
             device_frees
                 .entry(FULL)
                 .or_default()
@@ -320,7 +320,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             );
             let parent = node.parent();
             let newly_locked_len = if node.device_lock_ref(FULL) == 0 {
-                Some(node.device_value_len(FULL))
+                Some(node.device_reclaimable_value_len(FULL))
             } else {
                 None
             };
@@ -397,8 +397,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 old_lock_ref > 0,
                 "FULL segment release hit lock_ref=0 on node {cur}"
             );
-            let newly_unlocked_len = if old_lock_ref == 1 && node.has_device_value(FULL) {
-                Some(node.device_value_len(FULL))
+            let newly_unlocked_len = if old_lock_ref == 1 {
+                Some(node.device_reclaimable_value_len(FULL))
             } else {
                 None
             };
@@ -514,14 +514,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                         loaded
                             .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
                         let locked = loaded.device_lock_ref(FULL) > 0;
+                        let tokens = loaded.device_reclaimable_value_len(FULL);
                         offset += n_len;
                         // Full uses leaf sets, not LRU. A value materialized
                         // under lock is protected; the last release moves it
                         // to evictable.
                         if locked {
-                            tree_core.inc_protected_size(FULL, n_len as usize);
+                            tree_core.inc_protected_size(FULL, tokens);
                         } else {
-                            tree_core.inc_evictable_size(FULL, n_len as usize);
+                            tree_core.inc_evictable_size(FULL, tokens);
                         }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
                     }
