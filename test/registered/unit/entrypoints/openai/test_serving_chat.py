@@ -755,368 +755,6 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.tokenizer.decode.assert_not_called()
 
     def _use_delimited_response_template(
-        self, reasoning_parser, template=_DELIMITED_RESPONSE_TEMPLATE
-    ):
-        self.tm.tokenizer.response_template = template
-        self.tm.tokenizer.encode.side_effect = lambda text, **_: (
-            [7] if text == "</call>" else [1, 2, 3] if text else []
-        )
-        self.tm.model_config.is_multimodal = True
-        self.chat.tool_call_parser = "response_template"
-        self.chat.reasoning_parser = reasoning_parser
-        self.chat._reasoning_detector = (
-            ResponseTemplateReasoningDetector(response_template=template)
-            if reasoning_parser
-            else None
-        )
-        # Always-on reasoning: the output grammar starts after the reasoning.
-        self.template_manager.reasoning_config = (
-            ReasoningToggleConfig(special_case="always") if reasoning_parser else None
-        )
-
-    @staticmethod
-    def _stopped_on_token(text, token_id):
-        return {
-            "text": text,
-            "meta_info": {
-                "id": "chatcmpl-stopped",
-                "prompt_tokens": 5,
-                "completion_tokens": 9,
-                "cached_tokens": 0,
-                "weight_version": "default",
-                "finish_reason": {"type": "stop", "matched": token_id},
-            },
-            "index": 0,
-        }
-
-    def _convert_rendered_as(self, prompt, request):
-        rendered = MessageProcessingResult(
-            prompt=prompt,
-            prompt_ids=[],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
-        with patch.object(
-            self.chat, "_apply_conversation_template", return_value=rendered
-        ):
-            return self.chat._convert_to_internal_request(request)
-
-    def test_response_template_parser_context_records_grammar_start(self):
-        """JSON-schema output starts after the reasoning only when the grammar
-        backend waits for it, which a pattern-only reasoning closer cannot."""
-        named = {"type": "function", "function": {"name": "get_weather"}}
-        required = {"tools": [_WEATHER_TOOL], "tool_choice": "required"}
-        pattern_closed = {
-            **_DELIMITED_RESPONSE_TEMPLATE,
-            "fields": {
-                **_DELIMITED_RESPONSE_TEMPLATE["fields"],
-                "thinking": {"open": "<think>", "close_pattern": "</think>"},
-            },
-        }
-        cases = {
-            "auto tool choice": ("response_template", {"tools": [_WEATHER_TOOL]}, None),
-            "named tool after reasoning": (
-                "response_template",
-                {"tools": [_WEATHER_TOOL], "tool_choice": named},
-                GRAMMAR_AFTER_REASONING,
-            ),
-            "response_format after reasoning": (
-                "response_template",
-                {"response_format": {"type": "json_object"}},
-                GRAMMAR_AFTER_REASONING,
-            ),
-            "required tool without reasoning": (None, required, GRAMMAR_FROM_START),
-            "required tool, reasoning without an end token": (
-                "response_template",
-                required,
-                GRAMMAR_FROM_START,
-                pattern_closed,
-            ),
-        }
-        for name, (reasoning_parser, fields, grammar_start, *template) in cases.items():
-            with self.subTest(name):
-                self._use_delimited_response_template(reasoning_parser, *template)
-                _, request = self._convert_rendered_as(
-                    "<assistant>",
-                    ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Weather?"}],
-                        **fields,
-                    ),
-                )
-                self.assertEqual(request._response_parser_grammar_start, grammar_start)
-
-    def test_required_tool_json_is_parsed_under_delimited_template(self):
-        """Required-tool JSON after the reasoning becomes the call, also when it
-        ends on the tool closer that detokenization keeps."""
-        payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
-        for reasoning_parser in (None, "response_template"):
-            self._use_delimited_response_template(reasoning_parser)
-            reasoning = "Check the forecast." if reasoning_parser else ""
-            text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
-            text += "</call>"
-            for stream in (False, True):
-                with self.subTest(reasoning_parser=reasoning_parser, stream=stream):
-                    adapted, request = self._convert_rendered_as(
-                        "<assistant>",
-                        ChatCompletionRequest(
-                            model="x",
-                            messages=[{"role": "user", "content": "Weather?"}],
-                            tools=[_WEATHER_TOOL],
-                            tool_choice="required",
-                            stream=stream,
-                        ),
-                    )
-                    if stream:
-                        item = self._stopped_on_token(text, 7)
-
-                        async def generate(item=item):
-                            yield item
-
-                        self.tm.generate_request = Mock(return_value=generate())
-                        choices = [
-                            choice
-                            for chunk in self._parse_chunks(
-                                self._run_chat_stream(adapted, request)
-                            )
-                            for choice in chunk.get("choices", [])
-                        ]
-                        deltas = [choice.get("delta") or {} for choice in choices]
-                        calls = [
-                            call["function"]
-                            for delta in deltas
-                            for call in delta.get("tool_calls") or []
-                        ]
-                        name = "".join(call.get("name") or "" for call in calls)
-                        arguments = "".join(
-                            call.get("arguments") or "" for call in calls
-                        )
-                        got_reasoning = "".join(
-                            delta.get("reasoning_content") or "" for delta in deltas
-                        )
-                        content = "".join(
-                            delta.get("content") or "" for delta in deltas
-                        )
-                        finish_reasons = [
-                            choice["finish_reason"]
-                            for choice in choices
-                            if choice.get("finish_reason")
-                        ]
-                    else:
-                        choice = self.chat._build_chat_response(
-                            request, [self._stopped_on_token(text, 7)], 0
-                        ).choices[0]
-                        (call,) = choice.message.tool_calls
-                        name, arguments = call.function.name, call.function.arguments
-                        got_reasoning = choice.message.reasoning_content or ""
-                        content = choice.message.content or ""
-                        finish_reasons = [choice.finish_reason]
-
-                    self.assertEqual(name, "get_weather")
-                    self.assertEqual(json.loads(arguments), {"city": "Paris"})
-                    self.assertEqual(got_reasoning, reasoning)
-                    self.assertEqual(content, "")
-                    self.assertEqual(finish_reasons, ["tool_calls"])
-
-    def test_native_output_under_other_constraints_is_parsed_by_the_template(self):
-        """A structural tag, regex or EBNF can spell the template's own framing,
-        so its content and a call ending on the kept tool closer still parse."""
-        native = '<answer>Sunny</answer><call:get_weather>{"city": "Paris"}</call>'
-        structural_tag = {
-            "type": "structural_tag",
-            "structures": [
-                {
-                    "begin": "<call:get_weather>",
-                    "schema": _WEATHER_TOOL["function"]["parameters"],
-                    "end": "</call>",
-                }
-            ],
-            "triggers": ["<call:"],
-        }
-        regex = "<answer>[^<]+</answer><call:get_weather>[^<]+</call>"
-        ebnf = 'root ::= "<answer>" [^<]+ "</answer><call:get_weather>" [^<]+ "</call>"'
-        constraints = {
-            "structural_tag": {"response_format": structural_tag},
-            "regex": {"regex": regex},
-            "ebnf": {"ebnf": ebnf},
-        }
-        self._use_delimited_response_template("response_template")
-        for name, fields in constraints.items():
-            with self.subTest(name):
-                _, request = self._convert_rendered_as(
-                    "<assistant>",
-                    ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Weather?"}],
-                        tools=[_WEATHER_TOOL],
-                        **fields,
-                    ),
-                )
-                output = self._stopped_on_token("<think>Plan</think>" + native, 7)
-                choice = self.chat._build_chat_response(request, [output], 0).choices[0]
-                (call,) = choice.message.tool_calls
-                self.assertEqual(
-                    (choice.message.reasoning_content, choice.message.content),
-                    ("Plan", "Sunny"),
-                )
-                self.assertEqual(
-                    (call.function.name, json.loads(call.function.arguments)),
-                    ("get_weather", {"city": "Paris"}),
-                )
-                self.assertEqual(choice.finish_reason, "tool_calls")
-
-    def test_text_only_prompt_reuses_rendered_token_ids(self):
-        self.tm.model_config.is_multimodal = True
-        self.chat.chat_encoding_spec = None
-        self.template_manager.chat_template_name = None
-        self.chat._tokenizer_auto_adds_specials = False
-        self.chat._prompt_text_round_trip_is_lossy = False
-        processed = MessageProcessingResult(
-            prompt="rendered prompt",
-            prompt_ids=[11, 22, 33],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
-
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(adapted.input_ids, [11, 22, 33])
-        self.assertIsNone(adapted.text)
-
-    def test_prompt_reuse_keeps_media_path(self):
-        self.tm.model_config.is_multimodal = True
-        self.chat.chat_encoding_spec = None
-        self.template_manager.chat_template_name = None
-        self.chat._tokenizer_auto_adds_specials = False
-        self.chat._prompt_text_round_trip_is_lossy = False
-        processed = MessageProcessingResult(
-            prompt="rendered prompt",
-            prompt_ids=[11, 22, 33],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
-        processed.image_data = ["image"]
-
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(adapted.text, "rendered prompt")
-        self.assertIsNone(adapted.input_ids)
-
-    def test_prompt_reuse_keeps_always_on_processor_path(self):
-        self.tm.model_config.is_multimodal = True
-        self.tm.model_config.hf_config.architectures = [
-            "MossVLForConditionalGeneration"
-        ]
-        self.chat.chat_encoding_spec = None
-        self.template_manager.chat_template_name = None
-        self.chat._tokenizer_auto_adds_specials = False
-        self.chat._prompt_text_round_trip_is_lossy = False
-        processed = MessageProcessingResult(
-            prompt="rendered prompt",
-            prompt_ids=[11, 22, 33],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
-
-        with patch.object(self.chat, "_process_messages", return_value=processed):
-            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(adapted.text, "rendered prompt")
-        self.assertIsNone(adapted.input_ids)
-
-    def test_response_template_prefix_uses_prompt_token_ids(self):
-        class ResponseTemplateAlias(ResponseTemplateToolDetector):
-            pass
-
-        processed_messages = MessageProcessingResult(
-            "prompt decoded with default spacing",
-            [1, 2, 3],
-            None,
-            None,
-            [],
-            [],
-            None,
-            uses_response_template=True,
-        )
-        self.chat.tool_call_parser = "response-template-alias"
-        self.basic_req.input_ids = [1, 2, 3]
-        self.basic_req.tools = [
-            Tool(function=Function(name="get_weather", parameters={}))
-        ]
-        self.basic_req.tool_choice = "auto"
-        self.tm.tokenizer.decode.return_value = "<first><second>"
-
-        with (
-            patch.dict(
-                FunctionCallParser.ToolCallParserEnum,
-                {"response-template-alias": ResponseTemplateAlias},
-            ),
-            patch.object(
-                self.chat,
-                "_process_messages",
-                return_value=processed_messages,
-            ),
-        ):
-            self.assertTrue(
-                self.chat._requires_response_template_detokenization(self.basic_req)
-            )
-            _, request = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(request._response_parser_prefix, "<first><second>")
-        self.tm.tokenizer.decode.assert_called_once_with(
-            [1, 2, 3],
-            skip_special_tokens=False,
-            spaces_between_special_tokens=False,
-        )
-
-    def test_response_template_prefix_uses_engine_prompt_text(self):
-        processed_messages = MessageProcessingResult(
-            "exact engine prompt",
-            [],
-            None,
-            None,
-            [],
-            [],
-            None,
-        )
-        self.chat.reasoning_parser = "response_template"
-        self.chat._reasoning_detector = ResponseTemplateReasoningDetector(
-            response_template=_RESPONSE_TEMPLATE,
-            prefix="",
-        )
-        self.tm.model_config.is_multimodal = True
-
-        def render(request, _):
-            self.assertIsNone(request.chat_template_kwargs)
-            return processed_messages
-
-        with patch.object(
-            self.chat,
-            "_apply_conversation_template",
-            side_effect=render,
-        ):
-            adapted, request = self.chat._convert_to_internal_request(self.basic_req)
-
-        self.assertEqual(request._response_parser_prefix, "exact engine prompt")
-        self.assertFalse(request.skip_special_tokens)
-        self.assertFalse(adapted.sampling_params["spaces_between_special_tokens"])
-        self.tm.tokenizer.decode.assert_not_called()
-
-    def _use_delimited_response_template(
         self,
         reasoning_parser,
         template=_DELIMITED_RESPONSE_TEMPLATE,
@@ -1683,6 +1321,76 @@ class ServingChatTestCase(CustomTestCase):
                     ("get_weather", {"city": "Paris"}),
                 )
                 self.assertEqual(choice.finish_reason, "tool_calls")
+
+    def test_text_only_prompt_reuses_rendered_token_ids(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.input_ids, [11, 22, 33])
+        self.assertIsNone(adapted.text)
+
+    def test_prompt_reuse_keeps_media_path(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        processed.image_data = ["image"]
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.text, "rendered prompt")
+        self.assertIsNone(adapted.input_ids)
+
+    def test_prompt_reuse_keeps_always_on_processor_path(self):
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_config.architectures = [
+            "MossVLForConditionalGeneration"
+        ]
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        processed = MessageProcessingResult(
+            prompt="rendered prompt",
+            prompt_ids=[11, 22, 33],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(adapted.text, "rendered prompt")
+        self.assertIsNone(adapted.input_ids)
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
@@ -5899,7 +5607,6 @@ class ServingChatTestCase(CustomTestCase):
         "type": "function",
         "function": {"name": "lookup", "parameters": {"type": "object"}},
     }
-
     _K2_TOOL_TEXT = '<ifm|tool_call>{"name":"lookup","arguments":{}}</ifm|tool_call>'
 
     def test_empty_reasoning_response_replays(self):
