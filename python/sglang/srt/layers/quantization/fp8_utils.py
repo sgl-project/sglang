@@ -1412,6 +1412,18 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def _ue8m0_deepgemm_skips_block32(
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+) -> bool:
+    # UE8M0 DeepGEMM casts block32 fp32 scales itself: it takes only weights the
+    # load found power-of-two scaled, and no pre-quantized input, which nothing checks.
+    if list(block_size) != [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
+
+
 def _deepgemm_block_fp8_supported(
     weight_shape: Tuple[int, int], block_size: List[int], output_dtype: torch.dtype
 ) -> bool:
@@ -1436,7 +1448,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        # Block32 weight scales stay fp32, so UE8M0 DeepGEMM casts both itself.
+        # Block32 pre-quantized input reaches Triton below on UE8M0 DeepGEMM.
         assert (
             list(block_size) == [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         )
@@ -1444,7 +1456,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):
+    if not _deepgemm_block_fp8_supported(
+        weight.shape, block_size, output_dtype
+    ) or _ue8m0_deepgemm_skips_block32(block_size, weight_scale, input_scale):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
