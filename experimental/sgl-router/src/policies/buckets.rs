@@ -59,13 +59,42 @@ impl BucketSelector {
         workers: &[Arc<Worker>],
         request: BucketRequest,
     ) -> Vec<CandidateDomain> {
+        // With no cache hit, E equals L.
+        self.prefill_domains_for_extend(workers, request, request.input_tokens)
+    }
+
+    /// Prefill domains for a request whose uncached work is `extend_tokens`.
+    pub fn prefill_domains_for_extend(
+        &self,
+        workers: &[Arc<Worker>],
+        request: BucketRequest,
+        extend_tokens: u64,
+    ) -> Vec<CandidateDomain> {
+        self.prefill_domains_matching(workers, request, Some(extend_tokens))
+    }
+
+    /// Prefill domains that admit the request whatever its uncached work.
+    pub fn prefill_domains_for_any_extend(
+        &self,
+        workers: &[Arc<Worker>],
+        request: BucketRequest,
+    ) -> Vec<CandidateDomain> {
+        self.prefill_domains_matching(workers, request, None)
+    }
+
+    fn prefill_domains_matching(
+        &self,
+        workers: &[Arc<Worker>],
+        request: BucketRequest,
+        extend_tokens: Option<u64>,
+    ) -> Vec<CandidateDomain> {
         let Some(config) = &self.config else {
             return vec![CandidateDomain::global_prefill(workers)];
         };
         self.ordered_specs(
             BucketStage::Prefill,
             config.ttft_slo_policy,
-            |spec| prefill_compatible(spec, request.input_tokens),
+            |spec| prefill_compatible(spec, extend_tokens, request.input_tokens),
             |spec| ttft_eligible(spec, request.ttft_slo_ms),
         )
         .into_iter()
@@ -253,9 +282,9 @@ impl BucketSelector {
     }
 }
 
-fn prefill_compatible(spec: &BucketSpec, input_tokens: u64) -> bool {
-    // With no cache hit, E equals L.
-    within(input_tokens, spec.min_extend_tokens, spec.max_extend_tokens)
+fn prefill_compatible(spec: &BucketSpec, extend_tokens: Option<u64>, input_tokens: u64) -> bool {
+    extend_tokens
+        .is_none_or(|extend| within(extend, spec.min_extend_tokens, spec.max_extend_tokens))
         && spec
             .max_context_tokens
             .is_none_or(|max_context| input_tokens <= max_context)
