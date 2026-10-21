@@ -577,7 +577,12 @@ class Resampler4_5(BaseResampler):
 
 # 4.6+ ship their own ``model_type``; 4.7 checkpoints still carry a stale
 # numeric ``version``, so ``model_type`` must win.
-_MODEL_TYPE_VERSIONS = {"minicpmv4_6": (4, 6), "minicpmv4_7": (4, 7)}
+_MODEL_TYPE_VERSIONS = {
+    "minicpmv4_6": (4, 6),
+    "minicpmv4_7": (4, 7),
+    # OCR 1.0 is the 4.6 stack with 4x visual tokens.
+    "minicpm_ocr": (4, 6),
+}
 
 
 def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
@@ -1860,8 +1865,17 @@ class MiniCPMV4_7ForConditionalGeneration(MiniCPMV4_6ForConditionalGeneration):
     pass
 
 
+class MiniCPMOCR1_0ForConditionalGeneration(MiniCPMV4_6ForConditionalGeneration):
+    """MiniCPM-OCR 1.0. Same modules as 4.6; ``model_type`` selects 4x tokens."""
+
+
+class MiniCPMOcrForConditionalGeneration(MiniCPMOCR1_0ForConditionalGeneration):
+    """Checkpoint's ``architectures`` entry; the registry keys on ``__name__``."""
+
+
 EntryClass = [
     MiniCPMV,
     MiniCPMV4_6ForConditionalGeneration,
     MiniCPMV4_7ForConditionalGeneration,
+    MiniCPMOcrForConditionalGeneration,
 ]
