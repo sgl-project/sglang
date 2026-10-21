@@ -9,6 +9,7 @@ use super::deepseek_v4::{
     check_tool_arguments, drop_merged_tasks, engine_message, normalize_messages, pydantic_bool,
     renders_tools, split_continuation, thinking,
 };
+use super::schema_types::normalize_json_schema_types;
 use crate::render::reasoning::requested_effort;
 
 /// Render an SGLang chat request body. Returns the prompt and the
@@ -91,6 +92,10 @@ fn tool_payload(tool: &Value) -> Result<Value, String> {
         .into_iter()
         .filter_map(|key| Some((key.into(), f.get(key).filter(|v| !v.is_null())?.clone())))
         .collect();
+    // `_validate_request` normalizes the schema types before the encoder sees them.
+    if let Some(parameters) = function.get_mut("parameters") {
+        normalize_json_schema_types(parameters);
+    }
     if let Some(strict) = f.get("strict") {
         function.insert("strict".into(), pydantic_bool(strict)?.into());
     }
@@ -163,5 +168,22 @@ fn effort_budget(effort: &Value) -> Option<u8> {
                 .map(|effort| (effort * 100.0).round_ties_even().max(1.0) as u8),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool schema's DB-style types render as the JSON Schema types Python normalizes them to.
+    #[test]
+    fn tool_schema_types_are_normalized() {
+        let render_type = |kind: &str| {
+            let tool = json!({"type": "function", "function": {"name": "f",
+                "parameters": {"type": "object", "properties": {"x": {"type": kind}}}}});
+            let request = json!({"messages": [{"role": "user", "content": "hi"}], "tools": [tool]});
+            render(request, &HashMap::new()).unwrap()
+        };
+        assert_eq!(render_type("varchar"), render_type("string"));
     }
 }
