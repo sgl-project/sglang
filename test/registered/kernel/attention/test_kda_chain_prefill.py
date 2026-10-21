@@ -197,12 +197,15 @@ def test_graph_replay():
     inputs = _inputs([65, 127], heads=8, seed=29)
     args = _clone_inputs(inputs)
     state_seed = args["initial_state"].clone()
+    value_seed = args["v"].clone()
     for _ in range(3):
         args["initial_state"].copy_(state_seed)
+        args["v"].copy_(value_seed)
         chunk_kda_chain_fwd(**args, scale=128**-0.5)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         args["initial_state"].copy_(state_seed)
+        args["v"].copy_(value_seed)
         output = chunk_kda_chain_fwd(**args, scale=128**-0.5)
     graph.replay()
     torch.cuda.synchronize()
