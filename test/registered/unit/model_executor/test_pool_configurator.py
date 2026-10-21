@@ -1088,6 +1088,49 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
+    def test_non_arch35_npu_budget_uses_compact_indexer_capacity(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+            "shared",
+            "shared",
+        ]
+        available_bytes = 1_000_000
+
+        with (
+            mock_cpu_env(kv_size=2),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            pool_sizes = configurator.calculate_pool_sizes(
+                available_bytes,
+                page_size=1,
+            )
+
+        compact_cell_size = 576 * num_layers * 2 + 128 * 2 * 2
+        dense_cell_size = (576 + 128) * num_layers * 2
+        self.assertEqual(configurator._cell_size, compact_cell_size)
+        self.assertGreater(
+            pool_sizes.max_total_num_tokens,
+            available_bytes // dense_cell_size,
+        )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
     def test_resolved_hicache_override_prices_producer_layers_only(
         self,
         _mock_calculate_mla_kv_cache_dim,

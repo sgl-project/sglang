@@ -31,7 +31,10 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
-from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
+from sglang.kernels.ops.attention.dsv4.wo_a import (
+    can_use_fused_wo_a,
+    fused_rope_wo_a_bf16,
+)
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
@@ -173,6 +176,7 @@ from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
+    fused_boundary_attn_input,
 )
 from sglang.srt.models.deepseek_v4_replay_tail import (
     DecoderReplayTail,
@@ -1104,6 +1108,34 @@ class MqaAttentionBase(nn.Module):
         # Other FlashMLA implementations retain their existing padded shape.
         return 64 if self.n_local_heads <= 64 else self.n_heads
 
+    def _zero_padded_q(self, x, kernel_num_heads, attn_backend) -> torch.Tensor:
+        # One zeroed buffer per metadata, grown to the most rows it has served; each
+        # call takes a row slice. A graph that keeps the metadata keeps the buffer,
+        # so the buffer must not grow once a graph has captured it.
+        meta = getattr(attn_backend, "forward_metadata", None)
+        buf = getattr(meta, "q_pad_buffer", None)
+        if (
+            buf is None
+            or buf.shape[0] < x.shape[0]
+            or buf.shape[1:] != (kernel_num_heads, self.head_dim)
+            or buf.dtype != x.dtype
+        ):
+            assert not getattr(meta, "q_pad_captured", False), (
+                "the padded query buffer grew after a CUDA graph captured it"
+            )
+            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+            if meta is not None:
+                try:
+                    meta.q_pad_buffer = buf
+                except (AttributeError, TypeError):
+                    pass
+        if meta is not None and torch.cuda.is_current_stream_capturing():
+            try:
+                meta.q_pad_captured = True
+            except (AttributeError, TypeError):
+                pass
+        return buf[: x.shape[0]]
+
     def _wo_a_quant_freqs(
         self, forward_batch: ForwardBatch, q_rope: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -1146,9 +1178,18 @@ class MqaAttentionBase(nn.Module):
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
             sink = self.attn_sink.new_zeros(sink_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            self._attn_sink_local_slice = slice(
+                rank * num_heads, (rank + 1) * num_heads
+            )
+            sink[:num_heads] = self.attn_sink[self._attn_sink_local_slice]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def refresh_attn_sink_cache(self) -> None:
+        if self._attn_sink_local is None:
+            return
+        src = self.attn_sink.data[self._attn_sink_local_slice]
+        self._attn_sink_local[: src.numel()].copy_(src)
 
     def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
         """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
@@ -1365,7 +1406,7 @@ class MQALayer(MqaAttentionBase):
             and not self.use_npu_arch35_mxfp8_wo_a
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
-            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+            and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -2543,22 +2584,8 @@ class MQALayer(MqaAttentionBase):
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
-                    # V4.1 kernels read all padded heads, so the padding must be
-                    # zero. The buffer is reused per layer; no consumer may keep it.
-                    want = (x.shape[0], kernel_num_heads, self.head_dim)
-                    meta = getattr(attn_backend, "forward_metadata", None)
-                    q_padded = getattr(meta, "q_pad_buffer", None)
-                    if (
-                        q_padded is None
-                        or tuple(q_padded.shape) != want
-                        or q_padded.dtype != x.dtype
-                    ):
-                        q_padded = x.new_zeros(*want)
-                        if meta is not None:
-                            try:
-                                meta.q_pad_buffer = q_padded
-                            except (AttributeError, TypeError):
-                                pass
+                    # V4.1 kernels read all padded heads, so the padding must be zero.
+                    q_padded = self._zero_padded_q(x, kernel_num_heads, attn_backend)
                 elif _is_gfx942_supported:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
@@ -3324,7 +3351,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
     def _can_fuse_ffn_mhc(self) -> bool:
         """The MoE counterpart of `_can_fuse_attn_mhc`."""
         return (
-            self.mlp.tp_size == 4
+            mhc.fused_mhc_tp_ok(self.mlp.tp_size)
             and get_moe_a2a_backend().is_none()
             and not self.mlp._shared_expert_tp1
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
@@ -3446,7 +3473,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             self.post_attention_layernorm, accepts_mxfp8=False, hc=self.ffn_hc
         )
         return (
-            get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            get_parallel().tp_size == self.self_attn.attn_tp_size
+            and mhc.fused_mhc_tp_ok(self.self_attn.attn_tp_size)
             and boundary.norm_fusable
             and mhc.can_fuse_post(self.hc_cfg)
         )
@@ -3689,10 +3717,7 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
             last_source = max(config.kv_source_layer_ids)
-            # ROCm starts the tail after the source layer: the gfx950 fused boundary
-            # runs a whole layer in one call, and the ROCm backend carries the source
-            # layer's top-k and candidates into the tail itself.
-            self.tail_writes_source_kv = not _is_hip
+            self.tail_writes_source_kv = True
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
@@ -3903,9 +3928,14 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
+                    if _is_hip and source.hc_boundary_fused:
+                        # The previous FFN hc_post has not run yet, so run it here too.
+                        source_x = fused_boundary_attn_input(source, state)
+                    else:
+                        source_x = mhc.combine(source.attn_hc, state)
                     attn_backend.write_tail_source_kv(
                         layer=source.self_attn,
-                        x=mhc.combine(source.attn_hc, state),
+                        x=source_x,
                         positions=positions,
                         forward_batch=forward_batch,
                     )
@@ -4856,6 +4886,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            self_attn.refresh_attn_sink_cache()
             layer.refresh_mhc_norm_weight_cache()
         layers = self.model.layers
         for i, layer in enumerate(layers):
@@ -4870,7 +4901,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         # The only deployments whose fused-collective gates can fire; registration
         # must happen eagerly here, before graph capture.
-        if get_platform().is_blackwell and get_parallel().tp_size == 4:
+        if get_platform().is_blackwell and mhc.fused_mhc_tp_ok(get_parallel().tp_size):
             from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                 register_fused_all_reduce_comm,
             )
