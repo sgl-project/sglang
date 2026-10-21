@@ -2247,6 +2247,14 @@ class Scheduler(
             self.rust_server.push_control_output(recv_req, output)
         else:
             self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+        if isinstance(output, ObserveElasticEPMembershipReqOutput):
+            logger.info(
+                "[Elastic EP][membership] reply_sent submission_id=%s "
+                "responder_rank=%s accepted=%s",
+                output.submission_id,
+                output.responder_rank,
+                output.accepted,
+            )
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -6165,7 +6173,19 @@ class Scheduler(
         if responder_rank is None:
             responder_rank = 0
 
+        logger.info(
+            "[Elastic EP][membership] scheduler_entered submission_id=%s "
+            "responder_rank=%s",
+            recv_req.submission_id,
+            responder_rank,
+        )
         try:
+            logger.info(
+                "[Elastic EP][membership] store_started submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
             key = observe_recovery_membership(
                 runtime_instance_id=recv_req.runtime_instance_id,
                 topology_generation=recv_req.topology_generation,
@@ -6173,13 +6193,34 @@ class Scheduler(
                 failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
                 membership_epoch=recv_req.membership_epoch,
             )
+            logger.info(
+                "[Elastic EP][membership] store_completed submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
         except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "[Elastic EP][membership] store_failed submission_id=%s "
+                "responder_rank=%s error_type=%s",
+                recv_req.submission_id,
+                responder_rank,
+                type(exc).__name__,
+            )
             return ObserveElasticEPMembershipReqOutput(
                 accepted=False,
                 message=str(exc),
                 submission_id=recv_req.submission_id,
                 responder_rank=responder_rank,
             )
+        except Exception:
+            logger.exception(
+                "[Elastic EP][membership] store_failed submission_id=%s "
+                "responder_rank=%s error_type=unexpected",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            raise
         return ObserveElasticEPMembershipReqOutput(
             accepted=True,
             message="Elastic EP membership observation accepted.",

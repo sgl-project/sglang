@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.managers.communicator import FanOutCommunicator, FanOutTimeoutError
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -88,6 +88,37 @@ class TestQueueingCall(CustomTestCase):
             response = SimpleNamespace(submission_id="submission-2")
             comm.handle_recv(response)
             self.assertEqual(await retry, [response])
+
+        asyncio.run(scenario())
+
+    def test_timeout_preserves_partial_results_and_releases_queue(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=2,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+            request = SimpleNamespace(submission_id="submission-1")
+
+            task = asyncio.create_task(comm(request, timeout=0.01))
+            await asyncio.sleep(0)
+            response = SimpleNamespace(submission_id="submission-1", rank=0)
+            comm.handle_recv(response)
+
+            with self.assertRaises(FanOutTimeoutError) as raised:
+                await task
+            self.assertEqual(raised.exception.partial_results, [response])
+            self.assertEqual(raised.exception.correlation, "submission-1")
+            self.assertIsNone(comm._result_event)
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"), fan_out=1)
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-2"))
+            await retry
 
         asyncio.run(scenario())
 

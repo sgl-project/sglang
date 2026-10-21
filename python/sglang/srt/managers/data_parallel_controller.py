@@ -279,12 +279,21 @@ class DataParallelController:
         self, obj: ObserveElasticEPMembershipReqInput
     ):
         """Route one observation without committing the proposed membership."""
-        for i in self._active_workers[:: self.control_message_step]:
-            if i == obj.rank:
-                continue
+        targets = [
+            i
+            for i in self._active_workers[:: self.control_message_step]
+            if i != obj.rank and self.workers[i] is not None
+        ]
+        logger.info(
+            "[Elastic EP][membership] dpc_routed submission_id=%s "
+            "failed_rank=%s target_ranks=%s",
+            obj.submission_id,
+            obj.rank,
+            targets,
+        )
+        for i in targets:
             worker = self.workers[i]
-            if worker is not None:
-                sock_send(worker, obj)
+            sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if get_exec().moe.elastic_ep_backend is not None:

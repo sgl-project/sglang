@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+class FanOutTimeoutError(TimeoutError):
+    """A fan-out timed out before every expected response arrived."""
+
+    def __init__(self, partial_results: List[T], correlation: object):
+        super().__init__("Timed out waiting for fan-out responses.")
+        self.partial_results = list(partial_results)
+        self.correlation = correlation
+
+
 class FanOutCommunicator(Generic[T]):
     """Fan-out request + collect response primitive over zmq.
 
@@ -45,7 +54,12 @@ class FanOutCommunicator(Generic[T]):
         assert mode in ["queueing", "watching"]
         assert correlation_attr is None or mode == "queueing"
 
-    async def queueing_call(self, obj: T, fan_out: Optional[int] = None):
+    async def queueing_call(
+        self,
+        obj: T,
+        fan_out: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ):
         # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
         # callers are still waiting, so requests are strictly serialized in
         # arrival order. It also releases on exception/cancellation, so a
@@ -63,7 +77,13 @@ class FanOutCommunicator(Generic[T]):
             try:
                 if obj is not None:
                     self._send(obj)
-                await event.wait()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                except TimeoutError as exc:
+                    raise FanOutTimeoutError(
+                        partial_results=self._result_values,
+                        correlation=self._result_correlation,
+                    ) from exc
                 return self._result_values
             finally:
                 if self._result_event is event:
@@ -93,12 +113,17 @@ class FanOutCommunicator(Generic[T]):
             self._result_fan_out = None
         return result_values
 
-    async def __call__(self, obj, fan_out: Optional[int] = None):
+    async def __call__(
+        self,
+        obj,
+        fan_out: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ):
         if self._mode == "queueing":
-            return await self.queueing_call(obj, fan_out=fan_out)
+            return await self.queueing_call(obj, fan_out=fan_out, timeout=timeout)
         else:
-            if fan_out is not None:
-                raise ValueError("Per-call fan-out requires queueing mode.")
+            if fan_out is not None or timeout is not None:
+                raise ValueError("Per-call fan-out and timeout require queueing mode.")
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):

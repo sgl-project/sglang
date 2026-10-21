@@ -88,6 +88,28 @@ class TestMembershipObservationRouting(CustomTestCase):
         )
         self.assertEqual(controller.status, [True, True, True, True])
 
+    def test_route_log_correlates_submission_and_actual_targets(self):
+        controller = _make_controller(2)
+        request = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            rank=1,
+            failed_allocation_incarnation="pod-uid-5",
+            membership_epoch=4,
+            submission_id="submission-1",
+        )
+
+        with (
+            patch("sglang.srt.managers.data_parallel_controller.sock_send"),
+            self.assertLogs(
+                "sglang.srt.managers.data_parallel_controller", level="INFO"
+            ) as logs,
+        ):
+            controller.send_membership_observation_to_survivors(request)
+
+        self.assertIn("submission_id=submission-1", logs.output[0])
+        self.assertIn("target_ranks=[0]", logs.output[0])
+
 
 def _req(
     routed_dp_rank=None,
