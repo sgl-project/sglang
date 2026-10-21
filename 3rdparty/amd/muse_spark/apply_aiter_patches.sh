@@ -29,6 +29,7 @@ apply_patch "${ROOT}/patches/03-plan-b-aiter-unified-attention-3d.patch" \
   --include="aiter/**"
 apply_patch "${ROOT}/patches/04-aiter-muse-moe-flydsl.patch"
 apply_patch "${ROOT}/patches/05-aiter-unified-attention-muse.patch"
+apply_patch "${ROOT}/patches/06-aiter-muse-spark-bf16-tuned-gemm.patch"
 
 if [[ "${ENABLE_PLAN_C}" == "1" ]]; then
   apply_patch \
