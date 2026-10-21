@@ -1986,6 +1986,11 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Route the merged Kimi-K3 MoE front GEMM through AITER's tuned BF16 GEMM for
+    # batches in this token window.
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT = EnvBool(False)
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(48)
+    SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(192)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

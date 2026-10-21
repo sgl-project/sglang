@@ -237,6 +237,43 @@ def _k3_bf16_gemm(
     return torch.mm(x, weight.t(), out=out)
 
 
+# Merged MoE front [shared gate-up | router | latent down] at TP8; AITER's gfx950
+# tuned BF16 GEMM table has rows for this shape.
+_TUNED_FRONT_SHAPES = ((6016, 7168),)
+
+
+def _tuned_front_window() -> Optional[tuple[int, int]]:
+    if not (
+        _is_hip
+        and envs.SGLANG_USE_AITER.get()
+        and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
+    ):
+        return None
+    return (
+        envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get(),
+        envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get(),
+    )
+
+
+def _k3_front_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out_dtype: Optional[torch.dtype],
+    tuned_window: Optional[tuple[int, int]],
+) -> torch.Tensor:
+    if (
+        tuned_window is not None
+        and out_dtype is None
+        and tuned_window[0] <= x.shape[0] <= tuned_window[1]
+        and tuple(weight.shape) in _TUNED_FRONT_SHAPES
+    ):
+        from aiter.tuned_gemm import tgemm
+
+        return tgemm.mm(x, weight, None, otype=x.dtype)
+    return _k3_bf16_gemm(x, weight, out_dtype=out_dtype)
+
+
 # Fully fused KDA decode step (kernels/ops/attention/kda_fused_decode). The
 # model hands the output-norm gate to the KDA backend via an attempt-and-verify
 # stash on the attention layer; unconsumed stashes fall back to the unfused
@@ -475,6 +512,8 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
+        # Token window for AITER's tuned BF16 GEMM on the merged front, or None.
+        self._tuned_front_window = _tuned_front_window()
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -1365,10 +1404,11 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
+        fused = _k3_front_gemm(
             hidden_states,
             self._front_w,
             out_dtype=torch.float32 if self._front_fp32 else None,
+            tuned_window=self._tuned_front_window,
         )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
