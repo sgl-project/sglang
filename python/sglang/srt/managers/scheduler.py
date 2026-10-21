@@ -3252,6 +3252,11 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if (
+            self.enable_unified_cache_external_linker
+            and self.tree_cache.linker.load_mode == "prefetch"
+        ):
+            return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -4154,7 +4159,14 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker.load_mode == "prefetch"
+                )
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )

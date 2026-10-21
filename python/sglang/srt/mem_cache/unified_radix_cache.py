@@ -1060,6 +1060,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:
+        if (
+            self.linker is not None
+            and self.linker.load_mode == "prefetch"
+            and req.finished()
+        ):
+            self.linker.release_request(req.rid)
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -2255,6 +2261,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            return not self.linker.is_prefetching(request)
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -3523,6 +3531,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            self.linker.check_prefetch_events()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

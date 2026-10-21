@@ -1,11 +1,15 @@
+import ctypes
 import sys
 import threading
 import unittest
 from array import array
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import test_unified_radix_cache_unittest as shared_cache_suite
@@ -19,10 +23,15 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.scheduler import DisaggregationMode, Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    EvictParams,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -32,7 +41,16 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -49,7 +67,9 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -72,6 +92,9 @@ class _FakeLinker(UnifiedCacheLinker):
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
         return True
+
+    def prefetch(self, transfers):
+        return None
 
     def start_layer_wise_loading(self):
         return 3
@@ -100,6 +123,25 @@ class _FakeLinker(UnifiedCacheLinker):
 
     def close(self):
         self.closed = True
+
+
+class _PrefetchFakeLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.load_mode = "prefetch"
+        self.prefetch_loads = []
+        self.prefetch_futures = []
+        self.lookup_transfers = []
+
+    def lookup(self, rid, transfers):
+        self.lookup_transfers.append(transfers)
+        return super().lookup(rid, transfers)
+
+    def prefetch(self, transfers):
+        self.prefetch_loads.append(transfers)
+        future = Future()
+        self.prefetch_futures.append(future)
+        return future
 
 
 class _MappingRecorder:
@@ -163,6 +205,876 @@ def _swa_allocator(swa_req_ring):
     return allocator
 
 
+class TestMooncakePrefetch(CustomTestCase):
+    def _linker(self, read, read_ranges=None):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.load_mode = "prefetch"
+        linker.prefetch_future = None
+        linker.num_layers = 3
+        linker.layer_done_counter = LayerWiseLoadCounter(linker.num_layers)
+        linker.gc_frozen = True
+        linker.pending_loads = {}
+        linker.broadcast_loads = {}
+        linker.mla_broadcaster = None
+        linker.load_queue = Queue()
+        linker.offload_queue = Queue()
+        linker.offload_results = Queue()
+        linker.stats = {"lookup": 0, "load": 0, "offload": 0}
+        buffers = [torch.zeros((8, 2), dtype=torch.uint8) for _ in range(3)]
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[buffers],
+            layer_mapping={0: 0, 1: 1, 2: 2},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        linker.pools = {PoolName.KV: pool}
+        linker.pool_group = DevicePoolGroup([pool], linker.num_layers, page_size=2)
+        # Exercise the real full-page pointer packing and result conversion;
+        # replace only the external Mooncake transport with CPU byte writes.
+        linker.storage = MooncakeStore.__new__(MooncakeStore)
+        linker.storage.registered_pools = linker.pools
+        linker.storage.config_prefix = None
+        linker.storage.mla_suffix = "cp0_pp0"
+        linker.storage.store = SimpleNamespace(
+            batch_get_into_multi_buffers=read,
+            batch_get_into_multi_buffer_ranges=read_ranges,
+            batch_get_session_start=lambda keys: [0] * len(keys),
+            batch_get_session_end=lambda keys: None,
+        )
+        for name in ("load", "offload"):
+            thread = threading.Thread(target=getattr(linker, f"{name}_thread_func"))
+            setattr(linker, f"{name}_thread", thread)
+            thread.start()
+        self.addCleanup(
+            lambda: linker.close() if linker.load_thread.is_alive() else None
+        )
+        return linker, buffers
+
+    @staticmethod
+    def _write(pointer, size, layer):
+        ctypes.memmove(pointer, bytes([layer + 1]) * size, size)
+
+    def _prefetch(self, linker, synchronize=lambda: None, indices=(4, 5)):
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
+        )
+        event = SimpleNamespace(record=lambda: None, synchronize=synchronize)
+        with mock.patch.object(
+            mooncake_direct_linker,
+            "device_module",
+            SimpleNamespace(Event=lambda: event),
+        ):
+            future = linker.prefetch([transfer])
+        self.assertIsNotNone(future)
+        return future
+
+    def test_all_layers_and_scheduler_event_finish_before_ready(self):
+        """A first-layer success must not expose the remaining unwritten layers."""
+        ready, waiting, last_layer, release = (threading.Event() for _ in range(4))
+        self.addCleanup(ready.set)
+        self.addCleanup(release.set)
+
+        def synchronize():
+            waiting.set()
+            if not ready.wait(5):
+                raise RuntimeError("Scheduler event did not complete")
+
+        def read(keys, pointers, sizes):
+            self.assertIs(threading.current_thread(), linker.load_thread)
+            for layer, (pointer, size) in enumerate(zip(pointers[0], sizes[0])):
+                if layer == 2:
+                    last_layer.set()
+                    if not release.wait(5):
+                        raise RuntimeError("Last layer did not complete")
+                self._write(pointer, size, layer)
+            return [sum(sizes[0])]
+
+        linker, buffers = self._linker(read)
+        future = self._prefetch(linker, synchronize)
+        self.assertTrue(waiting.wait(5))
+        self.assertFalse(future.done())
+        self.assertFalse(future.cancel())
+        self.assertFalse(any(torch.any(buffer) for buffer in buffers))
+        self.assertIsNone(
+            linker.prefetch(
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page"],
+                        device_indices=torch.tensor([4, 5]),
+                    )
+                ]
+            )
+        )
+        ready.set()
+        self.assertTrue(last_layer.wait(5))
+        self.assertFalse(future.done())
+        self.assertEqual(buffers[0][4:6].tolist(), [[1, 1], [1, 1]])
+        self.assertEqual(buffers[2][4:6].tolist(), [[0, 0], [0, 0]])
+        release.set()
+        self.assertTrue(future.result(timeout=5))
+        for layer, buffer in enumerate(buffers):
+            self.assertEqual(buffer[4:6].tolist(), [[layer + 1] * 2] * 2)
+            self.assertFalse(torch.any(buffer[:4]))
+        self.assertEqual(linker.layer_done_counter.producer_index, -1)
+        self.assertTrue(linker.load_queue.empty())
+        self.assertTrue(self._prefetch(linker).result(timeout=5))
+
+    def test_cancelled_queued_prefetch_never_writes_or_blocks_later_loads(self):
+        """Cancellation cannot write freed slots or disturb a preceding layer load."""
+        waiting, release = threading.Event(), threading.Event()
+
+        def synchronize():
+            waiting.set()
+            if not release.wait(5):
+                raise RuntimeError("Layer-wise load was not released")
+
+        def read(keys, pointers, sizes):
+            for layer, (pointer, size) in enumerate(zip(pointers[0], sizes[0])):
+                self._write(pointer, size, layer)
+            return [sum(sizes[0])]
+
+        def read_ranges(keys, pointers, sizes, offsets):
+            for page_ptrs, page_sizes, page_offsets in zip(pointers, sizes, offsets):
+                for pointer, size, offset in zip(page_ptrs, page_sizes, page_offsets):
+                    self._write(pointer, size, offset // size)
+            return [sum(page_sizes) for page_sizes in sizes]
+
+        linker, buffers = self._linker(read, read_ranges)
+        self.addCleanup(release.set)
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["page"], device_indices=torch.tensor([0, 1])
+        )
+        self.assertTrue(linker.load("layer-wise", [transfer]))
+        event = SimpleNamespace(record=lambda: None, synchronize=synchronize)
+        with mock.patch.object(
+            mooncake_direct_linker,
+            "device_module",
+            SimpleNamespace(Event=lambda: event),
+        ):
+            counter = linker.start_layer_wise_loading()
+        self.assertTrue(waiting.wait(5))
+
+        cancelled = self._prefetch(linker, indices=(2, 3))
+        self.assertTrue(cancelled.cancel())
+        later = self._prefetch(linker)
+        self.assertFalse(later.done())
+        self.assertFalse(any(torch.any(buffer) for buffer in buffers))
+        release.set()
+        self.assertTrue(later.result(timeout=5))
+        self.assertTrue(linker.finish_layer_wise_loading(counter))
+        linker.load_queue.join()
+        self.assertTrue(cancelled.cancelled())
+        for layer, buffer in enumerate(buffers):
+            self.assertEqual(buffer[:2].tolist(), [[layer + 1] * 2] * 2)
+            self.assertFalse(torch.any(buffer[2:4]))
+            self.assertEqual(buffer[4:6].tolist(), [[layer + 1] * 2] * 2)
+
+    def test_partial_read_or_transport_error_never_publishes_private_slots(self):
+        """Earlier written layers do not turn a failed complete-page read into a hit."""
+        for failure in ("missing", "short", "empty", "exception"):
+            with self.subTest(failure=failure):
+
+                def read(keys, pointers, sizes):
+                    for layer in range(2):
+                        self._write(pointers[0][layer], sizes[0][layer], layer)
+                    if failure == "exception":
+                        raise RuntimeError("Store lost the final layer")
+                    if failure == "short":
+                        return [sum(sizes[0][:2])]
+                    return [-1] if failure == "missing" else []
+
+                linker, buffers = self._linker(read)
+                future = self._prefetch(linker)
+                self.assertFalse(future.result(timeout=5))
+                self.assertEqual(buffers[0][4:6].tolist(), [[1, 1], [1, 1]])
+                self.assertEqual(buffers[2][4:6].tolist(), [[0, 0], [0, 0]])
+                self.assertEqual(linker.layer_done_counter.producer_index, -1)
+                linker.reset()
+                self.assertIsNone(linker.prefetch_future)
+
+    def test_result_reset_and_close_wait_for_final_device_write(self):
+        """A caller cannot recycle private slots before the last store write ends."""
+        for operation in ("result", "reset", "close"):
+            with self.subTest(operation=operation):
+                started, release, stopped = (threading.Event() for _ in range(3))
+                self.addCleanup(release.set)
+
+                def read(keys, pointers, sizes):
+                    started.set()
+                    if not release.wait(5):
+                        raise RuntimeError("Store write was not released")
+                    for layer, (pointer, size) in enumerate(zip(pointers[0], sizes[0])):
+                        self._write(pointer, size, layer)
+                    return [sum(sizes[0])]
+
+                linker, buffers = self._linker(read)
+                future = self._prefetch(linker)
+                self.assertTrue(started.wait(5))
+
+                def stop():
+                    if operation == "result":
+                        future.result(timeout=5)
+                    else:
+                        getattr(linker, operation)()
+                    stopped.set()
+
+                stopper = threading.Thread(target=stop)
+                stopper.start()
+                try:
+                    self.assertFalse(stopped.wait(0.05))
+                finally:
+                    release.set()
+                    stopper.join(5)
+                self.assertFalse(stopper.is_alive())
+                self.assertTrue(stopped.is_set())
+                self.assertTrue(future.done())
+                if operation != "result":
+                    self.assertIsNone(linker.prefetch_future)
+                if operation == "close":
+                    self.assertFalse(linker.load_thread.is_alive())
+                    self.assertFalse(linker.offload_thread.is_alive())
+                for layer, buffer in enumerate(buffers):
+                    self.assertEqual(buffer[4:6].tolist(), [[layer + 1] * 2] * 2)
+
+
+class TestLinkerDevicePrefetch(CustomTestCase):
+    def _fixture(self, *, swa=False, eagle=False, request_ring=False, prefetch=True):
+        cfg = CacheConfig(
+            page_size=1 if swa else 2,
+            components=(ComponentType.FULL,) + ((ComponentType.SWA,) if swa else ()),
+            sliding_window_size=2 if swa else None,
+            is_eagle=eagle,
+            kv_size=32,
+            num_layers=2,
+            full_attention_layer_ids=(0,),
+        )
+        # Use real tree/components/allocators; no accelerator operations execute.
+        with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
+            cache, allocator, req_pool = build_fixture(cfg, tree_core_backend="python")
+        if request_ring:
+            allocator._swa_req_ring = True
+            allocator._req_to_token_pool = req_pool
+            allocator._swa_ring_cost = 2
+        backend = _PrefetchFakeLinker()
+        if not prefetch:
+            backend.load_mode = "layer_wise"
+        backend.restorable = list(range(1, 7))
+        cache.init_cache_linker(backend)
+        self.addCleanup(cache.linker.close)
+        self.addCleanup(
+            lambda: [
+                future.set_result(False)
+                for future in backend.prefetch_futures
+                if not future.done()
+            ]
+        )
+        req = SimpleNamespace(
+            rid="prefetch",
+            cache_request_handle=CacheRequestHandle("prefetch", 0),
+            kv=None,
+            swa_branching_seqlen=4,
+            extra_key=None,
+            cache_salt=None,
+            positional_embed_overrides=None,
+            init_next_round_input=MagicMock(),
+            _compute_max_prefix_len=lambda length: length - 1,
+        )
+        tokens = list(range(1, 8 if eagle else 7))
+        full = allocator.full_attn_allocator if swa else allocator
+        return cache.linker, backend, req, tokens, full, allocator
+
+    def _match(self, wrapper, req, tokens):
+        key = RadixKey(array("q", tokens))
+        result = wrapper.cache.match_prefix(MatchPrefixParams(key=key))
+        return wrapper.match(key, req, result) if req is not None else result
+
+    def _insert(self, wrapper, tokens, length):
+        value = wrapper.cache.token_to_kv_pool_allocator.alloc(length)
+        wrapper.cache.insert(
+            InsertParams(
+                key=RadixKey(
+                    array("q", tokens[: length + int(wrapper.cache.tree_core.is_eagle)])
+                ),
+                value=value,
+                inserted_len=length,
+            )
+        )
+        return value
+
+    def _submit(self, wrapper, req, tokens, *, device_hit_len=0):
+        req.full_untruncated_fill_ids = array("q", tokens + [99])
+        result = self._match(wrapper, req, tokens)
+        assert result.device_prefix_len == device_hit_len
+        req.last_node = result.last_device_node
+        req.prefix_len = device_hit_len
+        req.host_hit_length = result.host_hit_length
+        req.swa_host_hit_length = result.swa_host_hit_length
+        req.mamba_host_hit_length = result.mamba_host_hit_length
+        self._scheduler(wrapper)._prefetch_kvcache(req)
+        req.init_next_round_input.assert_called_once_with(
+            wrapper.cache, cow_mamba=False
+        )
+        return req.last_node
+
+    @staticmethod
+    def _scheduler(wrapper):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = wrapper.cache
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler._set_or_validate_priority = lambda req: True
+        scheduler._abort_on_queued_limit = lambda req: False
+        scheduler.waiting_queue = []
+        scheduler.processed_tokens_counter = 0
+        return scheduler
+
+    def _poll(self, wrapper, req, *, pending=False):
+        wrapper.check_prefetch_events()
+        assert wrapper.is_prefetching(req.cache_request_handle) == pending
+
+    def test_completed_swa_prefetch_is_shared_and_tree_owned(self):
+        for ring in (False, True):
+            with self.subTest(request_ring=ring):
+                wrapper, backend, req, tokens, full, allocator = self._fixture(
+                    swa=True, request_ring=ring
+                )
+                self._submit(wrapper, req, tokens)
+                cache = wrapper.cache
+                transfers = {t.name: t for t in backend.prefetch_loads[-1]}
+                loaded = transfers[PoolName.KV].device_indices.clone()
+                self._poll(wrapper, req, pending=True)
+                assert self._match(wrapper, req, tokens).device_prefix_len == 0
+                assert allocator.full_to_swa_index_mapping[loaded].tolist() == [0] * 6
+                backend.prefetch_futures[-1].set_result(True)
+                cache.check_hicache_events()
+                assert not wrapper.is_prefetching(req.cache_request_handle)
+                other = SimpleNamespace(
+                    rid="other",
+                    cache_request_handle=CacheRequestHandle("other", 0),
+                    positional_embed_overrides=None,
+                )
+                result = self._match(wrapper, other, tokens)
+                assert (result.device_prefix_len, result.host_hit_length) == (6, 0)
+                assert torch.equal(
+                    cache.path_device_indices(result.last_device_node), loaded
+                )
+                if ring:
+                    assert list(transfers) == [PoolName.KV]
+                    assert (
+                        _device_value(cache, result.last_device_node, ComponentType.SWA)
+                        is None
+                    )
+                else:
+                    assert torch.equal(
+                        allocator.translate_loc_from_full_to_swa(loaded[-2:]),
+                        transfers[PoolName.SWA].device_indices,
+                    )
+                    parent = cache.tree_core.get_parent_node_id(result.last_device_node)
+                    assert len(_device_value(cache, parent, ComponentType.FULL)) == 4
+                    assert _device_value(cache, parent, ComponentType.SWA) is None
+                assert req.kv is None
+                wrapper.release_request(req.rid)
+                assert full.available_size() == 26
+                assert allocator.swa_attn_allocator.available_size() == (
+                    32 if ring else 30
+                )
+                assert wrapper.finish_loads() == []
+                assert backend.queued_loads == {}
+                cache.sanity_check()
+                cache.evict(EvictParams(num_tokens=6, swa_num_tokens=2))
+                assert full.available_size() == 32
+                assert allocator.swa_attn_allocator.available_size() == 32
+
+    def test_local_or_peer_failure_falls_back_and_pending_peer_keeps_slots(self):
+        for outcome in (
+            "local-failure",
+            "local-exception",
+            "peer-failure",
+            "peer-pending",
+        ):
+            with self.subTest(outcome=outcome):
+                wrapper, backend, req, tokens, full, allocator = self._fixture(swa=True)
+                self._submit(wrapper, req, tokens)
+                cache = wrapper.cache
+                if outcome == "local-exception":
+                    backend.prefetch_futures[-1].set_exception(
+                        RuntimeError("injected prefetch read failure")
+                    )
+                else:
+                    backend.prefetch_futures[-1].set_result(outcome != "local-failure")
+
+                def reduce(verdict, op, outcome=outcome):
+                    if outcome == "peer-failure":
+                        verdict[1] = 0
+                    elif outcome == "peer-pending":
+                        verdict.zero_()
+
+                cache._all_reduce_attn_groups = MagicMock(side_effect=reduce)
+                # Admission queries must not poll or enter rank collectives.
+                with patch.object(backend.prefetch_futures[-1], "result") as result:
+                    assert not cache.check_prefetch_progress(req.cache_request_handle)
+                    result.assert_not_called()
+                cache._all_reduce_attn_groups.assert_not_called()
+                self._poll(wrapper, req, pending=outcome == "peer-pending")
+                assert self._match(wrapper, req, tokens).device_prefix_len == 0
+                assert req.kv is None
+                assert allocator.full_to_swa_index_mapping[:-1].tolist() == [0] * 33
+                if outcome == "peer-pending":
+                    assert full.available_size() == 26
+                    cache._all_reduce_attn_groups = lambda value, op: None
+                    self._poll(wrapper, req)
+                    assert self._match(wrapper, req, tokens).device_prefix_len == 6
+                else:
+                    assert wrapper.load_back(req) == (0, req.last_node)
+                    assert full.available_size() == 32
+                    assert allocator.swa_attn_allocator.available_size() == 32
+                cache.sanity_check()
+
+    def test_prefetch_uses_only_common_sparse_rank_prefix(self):
+        """Different lookup lengths must agree before allocating or publishing."""
+        for rank_hits, common_pages in (
+            (([1, 3], [1, 2]), 1),
+            (([2, 3], [1, 2]), 2),
+            (([1, 3], [2]), 0),
+        ):
+            for rank in (0, 1):
+                with self.subTest(rank_hits=rank_hits, rank=rank):
+                    wrapper, backend, req, tokens, full, _ = self._fixture()
+                    backend.restorable = rank_hits[rank]
+                    peer = torch.zeros(4, dtype=torch.int)
+                    peer[rank_hits[1 - rank]] = 1
+
+                    def reduce(value, op, peer=peer):
+                        assert op == torch.distributed.ReduceOp.MIN
+                        if value.numel() == peer.numel():
+                            value.copy_(torch.minimum(value, peer))
+
+                    wrapper.cache._all_reduce_attn_groups = reduce
+                    self._submit(wrapper, req, tokens)
+                    expected_tokens = common_pages * wrapper.cache.page_size
+                    assert full.available_size() == 32 - expected_tokens
+                    assert backend.queued_loads == {}
+                    if not common_pages:
+                        assert not backend.prefetch_loads
+                        assert not wrapper.prefetches
+                    else:
+                        transfer = backend.prefetch_loads[-1][0]
+                        assert len(transfer.keys) == common_pages
+                        assert len(transfer.device_indices) == expected_tokens
+                        assert len(wrapper.prefetches[req.rid].key) == expected_tokens
+                        backend.prefetch_futures[-1].set_result(True)
+                        self._poll(wrapper, req)
+                    result = self._match(wrapper, req, tokens)
+                    assert result.device_prefix_len == expected_tokens
+                    assert wrapper.cache.check_prefetch_progress(
+                        req.cache_request_handle
+                    )
+                    wrapper.cache.sanity_check()
+                    wrapper.cache.evict(EvictParams(num_tokens=expected_tokens))
+                    assert full.available_size() == 32
+
+    def test_eagle_hashes_duplicate_insert_and_pinned_anchor_ownership(self):
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        for eagle in (False, True):
+            with self.subTest(eagle=eagle):
+                wrapper, backend, req, tokens, full, _ = self._fixture(eagle=eagle)
+                prefix = self._insert(wrapper, tokens, 2)
+                anchor = self._submit(wrapper, req, tokens, device_hit_len=2)
+                cache = wrapper.cache
+                expected = get_storage_hash_str(
+                    RadixKey(array("q", tokens), is_bigram=eagle)[2:6],
+                    cache.get_last_hash_value(anchor),
+                    page_size=2,
+                )
+                assert backend.lookup_transfers[0][0].keys == expected
+                loaded = backend.prefetch_loads[-1][0].device_indices.clone()
+                assert _device_lock_ref(cache, anchor, ComponentType.FULL) == 1
+                cache.evict(EvictParams(num_tokens=32))
+                assert self._match(wrapper, req, tokens).device_prefix_len == 2
+                raced = self._insert(wrapper, tokens, 4)
+                assert full.available_size() == 24
+                backend.prefetch_futures[-1].set_result(True)
+                self._poll(wrapper, req)
+                self._poll(wrapper, req)
+                result = self._match(wrapper, req, tokens)
+                value = cache.path_device_indices(result.last_device_node)
+                assert len(value) == 6
+                assert torch.equal(value[:2], prefix)
+                assert torch.equal(value[2:4], raced[2:])
+                assert torch.equal(value[4:], loaded[2:])
+                assert _device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+                assert full.available_size() == 26
+                cache.sanity_check()
+                cache.evict(EvictParams(num_tokens=6))
+                assert full.available_size() == 32
+
+    def test_cancel_reset_close_and_reused_request_release_unpublished_slots(self):
+        for completed in (False, True):
+            for operation in ("release_request", "reset", "close", "reuse"):
+                with self.subTest(completed=completed, operation=operation):
+                    wrapper, backend, req, tokens, full, _ = self._fixture()
+                    self._insert(wrapper, tokens, 2)
+                    anchor = self._submit(wrapper, req, tokens, device_hit_len=2)
+                    cache = wrapper.cache
+                    assert not cache.check_prefetch_progress(req.cache_request_handle)
+                    future = backend.prefetch_futures[-1]
+                    if completed:
+                        future.set_result(True)
+
+                    def release(
+                        operation=operation, req=req, wrapper=wrapper, backend=backend
+                    ):
+                        if operation == "reuse":
+                            req.cache_request_handle = CacheRequestHandle(req.rid, 1)
+                            assert not wrapper.is_prefetching(req.cache_request_handle)
+                            backend.restorable = []
+                            wrapper.prefetch(req)
+                            assert not wrapper.is_prefetching(req.cache_request_handle)
+                        elif operation == "release_request":
+                            wrapper.release_request(req.rid)
+                        else:
+                            getattr(wrapper, operation)()
+
+                    if completed:
+                        release()
+                    else:
+                        # Cancellation must wait for the running writer before
+                        # freeing slots, even if this request will not publish.
+                        waiting = threading.Event()
+                        original_result = future.result
+
+                        def wait_for_writer(
+                            timeout=None,
+                            *,
+                            waiting=waiting,
+                            original_result=original_result,
+                        ):
+                            waiting.set()
+                            return original_result(timeout=timeout)
+
+                        with (
+                            patch.object(future, "result", wait_for_writer),
+                            ThreadPoolExecutor(max_workers=1) as executor,
+                        ):
+                            worker = executor.submit(release)
+                            try:
+                                assert waiting.wait(timeout=5)
+                                assert not worker.done()
+                                assert full.available_size() == 26
+                                assert (
+                                    _device_lock_ref(cache, anchor, ComponentType.FULL)
+                                    == 1
+                                )
+                            finally:
+                                future.set_result(False)
+                            worker.result(timeout=5)
+                    assert full.available_size() == 30
+                    assert not wrapper.prefetches
+                    if operation == "reuse":
+                        assert wrapper.prefetch_attempts == {
+                            req.rid: req.cache_request_handle
+                        }
+                    else:
+                        assert wrapper.prefetch_attempts == {}
+                    assert all(future.done() for future in backend.prefetch_futures)
+                    assert _device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+                    assert self._match(wrapper, req, tokens).device_prefix_len == 2
+                    cache.evict(EvictParams(num_tokens=2))
+                    assert full.available_size() == 32
+                    cache.sanity_check()
+
+    def _admission(self, wrapper, allocator, tokens, *, rid="admission"):
+        req = Req(
+            rid=rid,
+            origin_input_text=None,
+            origin_input_ids=array("q", tokens + [99]),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        req.init_next_round_input(wrapper.cache)
+        adder = PrefillAdder(
+            page_size=wrapper.cache.page_size,
+            tree_cache=wrapper.cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100,
+            rem_chunk_tokens=16,
+        )
+        return req, adder
+
+    @staticmethod
+    def _admission_budget(adder):
+        return (
+            adder.rem_input_tokens,
+            adder.rem_chunk_tokens,
+            adder.memory_budget.total_offset,
+            adder.memory_budget.current_offset,
+        )
+
+    def test_enqueue_prefetch_waits_for_all_ranks_before_ordinary_admission(self):
+        for success in (False, True):
+            with self.subTest(success=success):
+                wrapper, backend, _, tokens, full, allocator = self._fixture()
+                req, adder = self._admission(wrapper, allocator, tokens)
+                scheduler = self._scheduler(wrapper)
+                before = self._admission_budget(adder)
+                assert req.host_hit_length == 0
+                assert full.available_size() == 32
+                assert backend.lookup_transfers == []
+
+                # The request reserves private GPU slots on enqueue, before any
+                # admission/load-back call, and does not enter the host path.
+                scheduler.enable_hicache_storage = True
+                with patch.object(
+                    wrapper.cache,
+                    "prefetch_from_storage",
+                    side_effect=AssertionError("unexpected host-cache prefetch"),
+                ):
+                    scheduler._add_request_to_queue(req)
+                    scheduler._prefetch_kvcache(req)
+                scheduler.enable_hicache_storage = False
+                assert scheduler.waiting_queue == [req]
+                assert full.available_size() == 26
+                assert self._admission_budget(adder) == before
+                assert adder.can_run_list == []
+                assert len(backend.prefetch_futures) == 1
+                assert len(backend.lookup_transfers) == 1
+                assert (req.host_hit_length, wrapper.hit_markers) == (0, {})
+                assert backend.queued_loads == {}
+                capped = self._match(wrapper, req, tokens[:5])
+                assert (capped.device_prefix_len, capped.host_hit_length) == (0, 0)
+                assert len(backend.lookup_transfers) == 1
+
+                future = backend.prefetch_futures[-1]
+                for done in (False, True):
+                    if done:
+                        future.set_result(success)
+
+                    def peer_pending(verdict, op):
+                        verdict[0] = 0
+
+                    wrapper.cache._all_reduce_attn_groups = MagicMock(
+                        side_effect=peer_pending
+                    )
+                    wrapper.check_prefetch_events()
+                    wrapper.cache._all_reduce_attn_groups.reset_mock()
+                    # Admission only checks local consensus state. A finished
+                    # local writer must still wait for the pending peer.
+                    with patch.object(future, "result") as result:
+                        assert not wrapper.cache.check_prefetch_progress(
+                            req.cache_request_handle
+                        )
+                        result.assert_not_called()
+                    wrapper.cache._all_reduce_attn_groups.assert_not_called()
+                    assert adder.can_run_list == []
+                    assert self._admission_budget(adder) == before
+                    assert full.available_size() == 26
+
+                wrapper.cache._all_reduce_attn_groups = lambda value, op: None
+                wrapper.cache.check_hicache_events()
+                assert wrapper.cache.check_prefetch_progress(req.cache_request_handle)
+                assert full.available_size() == (26 if success else 32)
+                req.init_next_round_input(wrapper.cache)
+                adder.add_one_req(req, False, None)
+                assert adder.can_run_list == [req]
+                assert req.prefix_len == (6 if success else 0)
+                assert req.host_hit_length == 0
+                assert len(backend.prefetch_futures) == 1
+                assert len(backend.lookup_transfers) == 1
+                assert adder.rem_input_tokens < before[0]
+                assert backend.queued_loads == {}
+                wrapper.cache.unlock(req.lock)
+                wrapper.cache.sanity_check()
+
+    def test_enqueue_prefetch_refusal_or_capacity_failure_falls_back_once(self):
+        for no_capacity in (False, True):
+            with self.subTest(no_capacity=no_capacity):
+                wrapper, backend, _, tokens, full, allocator = self._fixture()
+                occupied = full.alloc(28) if no_capacity else None
+                req, adder = self._admission(wrapper, allocator, tokens)
+                scheduler = self._scheduler(wrapper)
+                before = self._admission_budget(adder)
+                available = full.available_size()
+                with patch.object(backend, "prefetch", return_value=None):
+                    scheduler._add_request_to_queue(req)
+                assert scheduler.waiting_queue == [req]
+                assert wrapper.cache.check_prefetch_progress(req.cache_request_handle)
+                assert self._admission_budget(adder) == before
+                assert full.available_size() == available
+                assert not wrapper.prefetches
+                assert backend.prefetch_futures == []
+                assert backend.queued_loads == {}
+                assert wrapper.hit_markers == {}
+                if occupied is not None:
+                    full.free(occupied)
+
+                scheduler._prefetch_kvcache(req)
+                req.init_next_round_input(wrapper.cache)
+                assert req.host_hit_length == 0
+                assert len(backend.lookup_transfers) == 1
+                adder.add_one_req(req, False, None)
+                assert adder.can_run_list == [req]
+                assert req.prefix_len == 0
+                assert req.extend_len == len(tokens) + 1
+                assert self._admission_budget(adder) != before
+                assert full.available_size() == 32
+                wrapper.cache.unlock(req.lock)
+                wrapper.cache.sanity_check()
+
+    def test_scheduler_skips_pending_prefetch_and_admits_later_hit_and_cold(self):
+        wrapper, backend, _, tokens, full, allocator = self._fixture()
+        pending, _ = self._admission(wrapper, allocator, tokens, rid="pending")
+        hit_tokens = list(range(11, 17))
+        self._insert(wrapper, hit_tokens, 2)
+        hit, _ = self._admission(wrapper, allocator, hit_tokens, rid="hit")
+        cold, _ = self._admission(wrapper, allocator, list(range(21, 27)), rid="cold")
+        scheduler = self._scheduler(wrapper)
+        for req in (pending, hit, cold):
+            scheduler._add_request_to_queue(req)
+        assert len(backend.prefetch_futures) == 1
+        assert len(backend.lookup_transfers) == 1
+        assert full.available_size() == 24
+        assert wrapper.cache.check_prefetch_progress(hit.cache_request_handle)
+        assert wrapper.cache.check_prefetch_progress(cold.cache_request_handle)
+
+        adders = []
+
+        def create_adder(*args, **kwargs):
+            adder = PrefillAdder(*args, **kwargs)
+            adders.append(adder)
+            return adder
+
+        # Exercise the real waiting-queue loop and PrefillAdder; only the
+        # subsequent GPU batch construction is outside this CPU test.
+        scheduler.__dict__.update(
+            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+            enable_priority_preemption=False,
+            is_hybrid_swa=False,
+            chunked_req=None,
+            min_free_slots_delayer=None,
+            get_num_allocatable_reqs=lambda *args, **kwargs: 32,
+            policy=SimpleNamespace(calc_priority=lambda *args, **kwargs: None),
+            chunked_prefill_size=16,
+            dynamic_chunk_sizer=None,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+            ),
+            get_prefill_adder_class=lambda: create_adder,
+            page_size=wrapper.cache.page_size,
+            token_to_kv_pool_allocator=allocator,
+            new_token_ratio_tracker=SimpleNamespace(current=1.0),
+            max_prefill_tokens=100,
+            is_mixed_chunk=False,
+            priority_scheduling_preemption_threshold=0,
+            max_prefill_bs=32,
+            max_running_requests=32,
+            dllm_config=None,
+            enable_lora=False,
+            req_to_token_pool=wrapper.cache.req_to_token_pool,
+            truncation_align_size=None,
+            model_config=SimpleNamespace(),
+            enable_overlap=False,
+            spec_algorithm=None,
+        )
+        running = SimpleNamespace(reqs=[], batch_is_full=False, is_empty=lambda: True)
+
+        class BatchConstructionReached(Exception):
+            pass
+
+        with patch(
+            "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+            side_effect=BatchConstructionReached,
+        ):
+            with self.assertRaises(BatchConstructionReached):
+                scheduler._get_new_batch_prefill_raw(None, running)
+        assert adders[0].can_run_list == [hit, cold]
+        assert scheduler.waiting_queue == [pending]
+        assert (hit.prefix_len, cold.prefix_len) == (2, 0)
+        assert backend.queued_loads == {}
+        assert len(backend.prefetch_futures) == 1
+        assert len(backend.lookup_transfers) == 1
+        for req in (hit, cold):
+            wrapper.cache.unlock(req.lock)
+        backend.prefetch_futures[-1].set_result(False)
+        wrapper.cache.check_hicache_events()
+        wrapper.cache.sanity_check()
+
+    def test_layer_wise_admission_uses_queued_loads_without_prefetch(self):
+        wrapper, backend, _, tokens, full, allocator = self._fixture(prefetch=False)
+        req, adder = self._admission(wrapper, allocator, tokens)
+        self._scheduler(wrapper)._add_request_to_queue(req)
+        assert req.host_hit_length == 6
+
+        adder.add_one_req(req, False, None)
+
+        assert adder.can_run_list == [req]
+        assert backend.prefetch_futures == []
+        assert len(backend.queued_loads) == 1
+        assert full.available_size() == 26
+        assert req.prefix_len == 6
+        assert wrapper.finish_loads() == []
+        wrapper.cache.unlock(req.lock)
+        wrapper.cache.sanity_check()
+
+    def test_finished_request_releases_attempt_before_session_row_claim(self):
+        for finished in (False, True):
+            for session_claims_row in (False, True):
+                with self.subTest(
+                    finished=finished, session_claims_row=session_claims_row
+                ):
+                    wrapper, _, req, _, _, _ = self._fixture()
+                    cache = wrapper.cache
+                    req.finished = lambda finished=finished: finished
+                    other = CacheRequestHandle("other", 0)
+                    wrapper.prefetch_attempts.update(
+                        {req.rid: req.cache_request_handle, other.rid: other}
+                    )
+                    expected = {other.rid: other}
+                    if not finished:
+                        expected[req.rid] = req.cache_request_handle
+
+                    def claim_session_row(
+                        request,
+                        *,
+                        expected=expected,
+                        wrapper=wrapper,
+                        session_claims_row=session_claims_row,
+                    ):
+                        # The session may keep the row and return early; its
+                        # finished request must already have dropped the ticket.
+                        assert wrapper.prefetch_attempts == expected
+                        return session_claims_row
+
+                    cache.session = SimpleNamespace(
+                        try_cache_finished_req=claim_session_row
+                    )
+                    assert cache.claim_kv_row(req) is session_claims_row
+                    assert wrapper.prefetch_attempts == expected
+
+    def test_streaming_session_virtual_node_is_not_a_prefetch_anchor(self):
+        from sglang.srt.session.streaming_session import SessionSlot
+
+        wrapper, backend, req, tokens, full, _ = self._fixture()
+        slot = SessionSlot()
+        req.last_node, req.kv = slot.virtual_node, slot.kv
+        result = self._match(wrapper, None, tokens)._replace(
+            last_device_node=slot.virtual_node
+        )
+        result = wrapper.match(RadixKey(array("q", tokens)), req, result)
+        assert result.host_hit_length == 0
+        wrapper.prefetch(req)
+        assert req.kv is slot.kv
+        assert (wrapper.prefetches, backend.lookup_transfers) == ({}, [])
+        assert full.available_size() == 32
+
+
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.tree_core = SimpleNamespace(
@@ -190,6 +1102,17 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type):
     with pytest.raises(ValueError, match=component_type.name):
         UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
+    assert not cache.tree_core.enable_external_cache_linker
+
+
+def test_pipeline_parallelism_rejects_only_prefetch_mode():
+    cache = _cache_for_wrapper(pp_size=2)
+    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    assert cache.tree_core.enable_external_cache_linker
+
+    cache = _cache_for_wrapper(pp_size=2)
+    with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
+        UnifiedCacheLinkerWrapper(cache, _PrefetchFakeLinker())
     assert not cache.tree_core.enable_external_cache_linker
 
 
@@ -260,6 +1183,9 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def load(self, rid, transfers):
         self.queued_loads[rid] = self._clone_transfers(transfers)
         return True
+
+    def prefetch(self, transfers):
+        return None
 
     def start_layer_wise_loading(self):
         if not self.queued_loads:
@@ -1108,6 +2034,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        check_prefetch_events=lambda: None,
     )
 
     reduce_calls = 0

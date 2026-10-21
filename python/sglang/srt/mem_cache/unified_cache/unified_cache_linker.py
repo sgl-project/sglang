@@ -12,12 +12,15 @@ each backend owns its device-pool layout and physical I/O.
 The tree only needs a handful of guarded hooks:
 
 * ``match_prefix``      -> :meth:`UnifiedCacheLinkerWrapper.match`
+* ``_prefetch_kvcache`` -> full-layer device prefetch before admission
 * ``init_load_back``    -> :meth:`UnifiedCacheLinkerWrapper.load_back`
+* ``check_hicache_events`` -> full-layer prefetch publication before admission
 * ``BackupKV`` actions  -> :meth:`UnifiedCacheLinkerWrapper.offload_nodes`
 
-A load lands in device slots private to the loading request and joins the tree
-only when that request inserts it like any computed KV. A failed load therefore
-reaches nothing but its own requests, which the scheduler aborts.
+A layer-wise load lands in request-private device slots and joins the tree
+after its forward succeeds; the scheduler aborts a failed batch. In prefetch
+mode every layer lands before admission, then the completed KV joins the tree.
+A failed prefetch falls back to recomputation without entering a forward.
 """
 
 from __future__ import annotations
@@ -26,13 +29,16 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
+    InsertParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -47,6 +53,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.session.streaming_session import is_virtual_node
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -132,6 +139,11 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    load_mode = "layer_wise"
+
+    @abstractmethod
+    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+        """Read all layers; the future completes after all device writes stop."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -200,6 +212,16 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+@dataclass
+class _ExternalCachePrefetch:
+    request: CacheRequestHandle
+    key: RadixKey
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    future: Future[bool] | None = None
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -226,6 +248,9 @@ class UnifiedCacheLinkerWrapper:
 
         self.cache = cache
         self.cache_linker = cache_linker
+        self.load_mode = cache_linker.load_mode
+        if self.load_mode == "prefetch" and cache.pp_size > 1:
+            raise ValueError("External linker prefetch currently requires PP=1.")
         swa = cache.components.get(ComponentType.SWA)
         self._skip_swa = swa is not None and is_swa_req_ring(
             cache.token_to_kv_pool_allocator
@@ -237,6 +262,8 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.prefetches: dict[str, _ExternalCachePrefetch] = {}
+        self.prefetch_attempts: dict[str, CacheRequestHandle] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -263,6 +290,9 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self.load_mode == "prefetch":
+            # Prefetch is issued on enqueue; only completed GPU KV is matchable.
+            return result
         if device_hit_len >= len(key):
             return result
 
@@ -311,6 +341,152 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def prefetch(self, req: Req) -> None:
+        """Load one queued request; publish only after all ranks succeed."""
+        request = req.cache_request_handle
+        if self.is_prefetching(request):
+            return
+        if self.prefetch_attempts.get(req.rid) == request:
+            return
+        self.prefetch_attempts[req.rid] = request
+        if self.cache.disable or self.prefetches:
+            return
+        req.init_next_round_input(self.cache, cow_mamba=False)
+        if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
+            return
+        page = self.cache.page_size
+        key = RadixKey(
+            req.full_untruncated_fill_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+        ).page_aligned(page)
+        start = req.prefix_len
+        last_hash = self.cache.get_last_hash_value(req.last_node)
+        if len(key) <= start or (start and last_hash is None):
+            return
+        hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
+        lookups = [
+            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
+            for c in self._components
+        ]
+        if any(t is None for t in lookups):
+            return
+        try:
+            restorable = self.cache_linker.lookup(req.rid, lookups)
+        except Exception:
+            logger.warning("Mooncake prefetch lookup failed", exc_info=True)
+            restorable = []
+        pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(hashes), device_hit_pages=0
+        )
+        if not pages:
+            return
+        end = start + pages * page
+        state = _ExternalCachePrefetch(
+            request,
+            key[:end],
+            req.last_node,
+            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            [],
+        )
+        self.prefetches[req.rid] = state
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hashes[:pages]
+                )
+                if transfer is None:
+                    break
+                state.component_transfers.append((component, transfer))
+            if len(state.component_transfers) == len(self._components):
+                state.future = self.cache_linker.prefetch(
+                    [t for _, t in state.component_transfers]
+                )
+        except Exception:
+            logger.warning("Mooncake prefetch submission failed", exc_info=True)
+        accepted = torch.tensor([state.future is not None], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item():
+            self._finish_prefetch(req.rid, publish=False)
+
+    def is_prefetching(self, request: CacheRequestHandle) -> bool:
+        state = self.prefetches.get(request.rid)
+        if state is not None and state.request != request:
+            self._finish_prefetch(request.rid, publish=False)
+            return False
+        return state is not None
+
+    def check_prefetch_events(self) -> None:
+        for rid in list(self.prefetches):
+            future = self.prefetches[rid].future
+            try:
+                landed = (
+                    future.result() if future is not None and future.done() else None
+                )
+            except Exception:
+                logger.warning("Mooncake prefetch failed", exc_info=True)
+                landed = False
+            verdict = torch.tensor(
+                [landed is not None, landed is True], dtype=torch.int
+            )
+            self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            if verdict[0].item():
+                self._finish_prefetch(rid, publish=bool(verdict[1].item()))
+
+    def _finish_prefetch(self, rid: str, *, publish: bool) -> None:
+        state = self.prefetches.pop(rid, None)
+        if state is None:
+            return
+        self.hit_markers.pop(rid, None)
+        # Quiesce the worker even on cancellation or a peer rank's failure.
+        if state.future is not None:
+            try:
+                state.future.result()
+            except Exception:
+                logger.warning("Mooncake prefetch failed", exc_info=True)
+                publish = False
+        end = len(state.key)
+        try:
+            if not publish:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, None, state.component_transfers, end
+                )
+                return
+            by_pool = {t.name: t for _, t in state.component_transfers}
+            full = by_pool[PoolName.KV].device_indices
+            start = end - len(full)
+            evicted = {}
+            if ComponentType.SWA in self.cache.components:
+                swa = by_pool.get(PoolName.SWA)
+                if swa is not None:
+                    self.cache.token_to_kv_pool_allocator.set_full_to_swa_mapping(
+                        full[-len(swa.device_indices) :], swa.device_indices
+                    )
+                page = self.cache.page_size
+                window = (self.cache.sliding_window_size + page - 1) // page * page
+                evicted[ComponentType.SWA] = (
+                    end if self._skip_swa else max(0, end - window)
+                )
+            prefix = self.cache.path_device_indices(state.anchor_node_id)
+            assert len(prefix) == start
+            # The normal insert protects the borrowed prefix and frees duplicate
+            # fetched slots. Avoid writing the just-fetched data back to storage.
+            self.cache.insert(
+                InsertParams(
+                    key=state.key,
+                    value=torch.cat([prefix, full]),
+                    prev_prefix_len=start,
+                    inserted_len=end,
+                    component_evicted_seqlens=evicted,
+                )
+            )
+            self.cache.prefetch_loaded_tokens_by_reqid[state.request] = len(full)
+            self.cache.prefetch_loaded_storage_start_by_reqid[state.request] = start
+        finally:
+            self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -441,7 +617,7 @@ class UnifiedCacheLinkerWrapper:
     def _update_load(
         self,
         phase: ExternalLinkerLoadPhase,
-        req: Req,
+        req: Optional[Req],
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
         prefix_len: int,
     ) -> list[PoolTransfer]:
@@ -561,7 +737,10 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        for rid in list(self.prefetches):
+            self._finish_prefetch(rid, publish=False)
         self.hit_markers.clear()
+        self.prefetch_attempts.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -577,6 +756,8 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.prefetch_attempts.pop(rid, None)
+        self._finish_prefetch(rid, publish=False)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
@@ -585,6 +766,10 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        for rid in list(self.prefetches):
+            self._finish_prefetch(rid, publish=False)
+        self.hit_markers.clear()
+        self.prefetch_attempts.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()

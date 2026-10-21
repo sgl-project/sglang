@@ -31,6 +31,24 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Direct linker prefetch
+
+Mooncake's external linker defaults to `layer_wise`. To enable full-layer
+prefetch, add this entry to your existing storage backend configuration:
+
+```bash
+--hicache-storage-backend-extra-config '{"linker_load_mode": "prefetch"}'
+```
+
+Prefetch starts when the scheduler enqueues a request through
+`_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV
+into the radix tree after all attention ranks confirm success.
+Failed reads release the slots and fall back to recomputation. It currently
+requires PP=1, reads on every attention TP rank, and stages one request at a
+time. Admission skips pending requests and can select later ready requests.
+Private GPU slots consume capacity while the I/O is pending. The default
+layer-wise queues, counters, and MLA broadcast stay unchanged.
+
 ## Install Mooncake
 
 **Method 1: with pip**

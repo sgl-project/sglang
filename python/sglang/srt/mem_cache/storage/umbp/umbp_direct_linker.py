@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 from collections import defaultdict
+from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -491,6 +492,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+        return None
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates
