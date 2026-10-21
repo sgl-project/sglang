@@ -170,11 +170,6 @@ def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
         # Same header-only trick as safetensors: tensor names and logical
         # (unpacked) shapes are all detect_unet_config looks at.
-        if not os.path.isfile(model_path):
-            raise ValueError(
-                f"Cannot detect architecture from GGUF {model_path!r}: it must be "
-                "a local file"
-            )
         from sglang.multimodal_gen.runtime.loader.gguf_weights import (
             read_gguf_tensor_meta,
         )
@@ -496,19 +491,11 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    raise ValueError(
-                        f"Could not build a model config for diffusers mmdit "
-                        f"checkpoint {model_path!r} (detected model type "
-                        f"{model_type!r})"
-                    )
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    raise ValueError(
-                        f"Could not build a model config for diffusers unet "
-                        f"checkpoint {model_path!r} (detected model type "
-                        f"{model_type!r})"
-                    )
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}
