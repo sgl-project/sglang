@@ -28,8 +28,8 @@ class _ChunkedReq:
     """Hashable stand-in for Req (the merge path stores it in a set)."""
 
     def __init__(self, *, extend_end, prefix_len):
-        self.extend_range = SimpleNamespace(end=extend_end)
-        self.prefix_indices = [0] * prefix_len
+        self.extend_end = extend_end
+        self.prefix_len = prefix_len
 
 
 def _make_chunked_req(*, extend_end, prefix_len):
@@ -693,7 +693,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once_with(
             split_batch, prefill_result
         )
-        split_batch.filter_batch.assert_called_once_with(chunked_req_to_exclude=[])
+        split_batch.filter_batch.assert_called_once_with(reqs_to_exclude=[])
         self.assertTrue(running_batch.batch_is_full)
         self.assertEqual(
             operations,
@@ -781,7 +781,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         scheduler.stash_chunked_request.assert_called_once_with(chunked_req)
         (filter_op,) = [op for op in operations if op[0] == "filter"]
-        self.assertEqual(filter_op[1]["chunked_req_to_exclude"], [chunked_req])
+        self.assertEqual(filter_op[1]["reqs_to_exclude"], [chunked_req])
         self.assertFalse(running_batch.batch_is_full)
         self.assertEqual(
             [op[0] for op in operations],
@@ -859,7 +859,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         scheduler.stash_chunked_request.assert_not_called()
         split_batch.filter_batch.assert_called_once_with(
-            chunked_req_to_exclude=[chunked_req]
+            reqs_to_exclude=[chunked_req]
         )
 
     def test_update_split_prefill_batch_processes_pending_chunked_abort(self):
