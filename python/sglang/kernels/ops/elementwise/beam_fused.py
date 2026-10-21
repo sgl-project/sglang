@@ -52,6 +52,12 @@ def _fake_attention_gate(attention_output, gate, gate_bias, head_dim):
     return torch.empty_like(attention_output, memory_format=torch.contiguous_format)
 
 
+@torch.compiler.disable
+def _eager_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    # Inductor's sigmoid can round FP16 one ULP away from ATen's.
+    return torch.sigmoid(x)
+
+
 @register_custom_op(fake_impl=_fake_attention_gate)
 def fused_attention_gate(
     attention_output: torch.Tensor,
@@ -114,7 +120,7 @@ class BeamAttentionGateOp(BaseFusedOp):
         head_dim: int,
     ) -> torch.Tensor:
         heads = gate_bias.numel()
-        multiplier = torch.sigmoid(
+        multiplier = _eager_sigmoid(
             gate.reshape(-1, heads, head_dim) + gate_bias[None, :, None]
         )
         return (attention_output.reshape(-1, heads, head_dim) * multiplier).reshape_as(
