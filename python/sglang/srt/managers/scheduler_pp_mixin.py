@@ -349,7 +349,7 @@ class SchedulerPPMixin:
                     )
                 if not async_admission:
                     send_return_control_work, returned_control = (
-                        self._pp_pd_send_prefill_return(
+                        self._pp_pd_send_consensus_release(
                             control_slots,
                             next_first_rank_mb_id,
                             returned_control,
@@ -381,7 +381,7 @@ class SchedulerPPMixin:
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs, async_send=True
                         )
-                        send_forward_control_work = self._pp_send_prefill_control(
+                        send_forward_control_work = self._pp_send_pd_control(
                             forward_control
                         )
                     if cur_batch:
@@ -513,10 +513,8 @@ class SchedulerPPMixin:
                     )
                 )
 
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
+                send_release_work, release_rids = self._pp_pd_send_consensus_release(
+                    tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                 )
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
@@ -650,14 +648,14 @@ class SchedulerPPMixin:
             return PrefillControl(wire)
         return wire[0]
 
-    def _pp_send_prefill_control(self: Scheduler, control: PrefillControl):
-        if self.pp_prefetch_admission is None:
-            wire = control.transferred_rids
-        else:
-            # The native P2P/TP helper requires a nonempty List. Only this
-            # transport boundary exposes the wrapper; business code uses types.
-            wire = [control]
-        return self._pp_send_pyobj_to_next_stage(wire, async_send=True)
+    def _pp_send_pd_control(self: Scheduler, control: PrefillControl | List[str]):
+        # Decode keeps its RID list. Prefill frames admission only on the async
+        # path; native A/B payloads and the P2P/TP helper's List contract stay intact.
+        if isinstance(control, PrefillControl):
+            control = (
+                [control] if control.admission is not None else control.transferred_rids
+            )
+        return self._pp_send_pyobj_to_next_stage(control, async_send=True)
 
     def _pp_pd_get_prefill_transferred_ids(
         self: Scheduler, previous_rids: Optional[List[str]] = None
@@ -695,23 +693,6 @@ class SchedulerPPMixin:
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
 
-    def _pp_pd_send_prefill_return(
-        self: Scheduler,
-        control_slots: List[Optional[PrefillControl]],
-        next_first_rank_mb_id: int,
-        returned_control: Optional[PrefillControl],
-        forward_control: PrefillControl,
-    ):
-        """Return the last stage's control, or relay an earlier returned control."""
-        work = []
-        if self.pp_group.is_last_rank:
-            if control_slots[next_first_rank_mb_id] is not None:
-                returned_control = forward_control
-                work = self._pp_send_prefill_control(returned_control)
-        elif returned_control is not None:
-            work = self._pp_send_prefill_control(returned_control)
-        return work, returned_control
-
     def _pp_pd_post_prefill_control(
         self,
         control_slots,
@@ -725,7 +706,7 @@ class SchedulerPPMixin:
         No receive/work wait is moved. The shared ordered CPU stream remains:
         return release/control, forward requests, forward transfer/control.
         """
-        return_control_work, returned_control = self._pp_pd_send_prefill_return(
+        return_control_work, returned_control = self._pp_pd_send_consensus_release(
             control_slots,
             next_first_rank_mb_id,
             returned_control,
@@ -734,7 +715,7 @@ class SchedulerPPMixin:
         request_work, forward_control_work = [], []
         if not self.pp_group.is_last_rank:
             request_work = self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
-            forward_control_work = self._pp_send_prefill_control(forward_control)
+            forward_control_work = self._pp_send_pd_control(forward_control)
         return (
             return_control_work,
             returned_control,
@@ -742,27 +723,22 @@ class SchedulerPPMixin:
             forward_control_work,
         )
 
-    def _pp_pd_send_consensus_release_ids(
+    def _pp_pd_send_consensus_release(
         self: Scheduler,
-        tmbs: List[List[str]],
+        control_slots: List[Optional[List[str] | PrefillControl]],
         next_first_rank_mb_id: int,
-        release_rids: List[str],
-        transferred_rids: List[str],
+        returned_control: Optional[List[str] | PrefillControl],
+        forward_control: List[str] | PrefillControl,
     ):
-        send_release_work = []
+        """Native release ring for both Decode RIDs and Prefill control."""
+        work = []
         if self.pp_group.is_last_rank:
-            if tmbs[next_first_rank_mb_id] is not None:
-                release_rids = transferred_rids
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        # 4 (Release): send the release rids from non last rank to the next rank
-        else:
-            if release_rids is not None:
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        return send_release_work, release_rids
+            if control_slots[next_first_rank_mb_id] is not None:
+                returned_control = forward_control
+                work = self._pp_send_pd_control(returned_control)
+        elif returned_control is not None:
+            work = self._pp_send_pd_control(returned_control)
+        return work, returned_control
 
     def _pp_record_comm_event(self: Scheduler) -> Optional[torch.Event]:
         """Mark the tail of the PP comm stream; None when not overlapping."""

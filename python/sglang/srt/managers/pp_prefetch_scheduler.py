@@ -68,7 +68,6 @@ class _Entry:
     generation: int = 0
     credit: int = 0
     lease: object = None
-    cap: int | None = None
     storage_span: tuple | None = None
 
 
@@ -92,12 +91,12 @@ class PrefillAdmissionSelection:
 
     def prepare_request(self, req, cache):
         entry = self.entries[req.rid]
-        req.init_next_round_input(cache, max_cache_prefix_tokens=entry.cap)
+        req.init_next_round_input(cache, max_cache_prefix_tokens=entry.lease.cap)
         span = entry.storage_span
         req.storage_hit_length = span[1] - span[0] if span else 0
         req.storage_hit_start = span[0] if span else None
         req.host_hit_is_storage = False
-        return entry.cap
+        return entry.lease.cap
 
 
 def batch_layout(batch):
@@ -175,7 +174,7 @@ class PPAdmissionGate:
             )
         ):
             self._release_prepare(entry)
-            self.s.tree_cache.release_admission_storage_span(req.cache_request_handle)
+            self.s.tree_cache.pop_prefetch_loaded_span(req.cache_request_handle)
             del self.entries[req.rid]
 
     def reject_unsupported(self, req):
@@ -340,7 +339,6 @@ class PPAdmissionGate:
             entry.lease.release()
             entry.lease = None
         entry.credit = 0
-        entry.cap = None
 
     def _commit(self, result: Prepare) -> bool:
         """Settle a live prepare once; PP0 relays only accepted return results."""
@@ -359,7 +357,6 @@ class PPAdmissionGate:
             entry.phase = Phase.PENDING
         else:
             entry.lease = entry.lease.restrict(result.cap)
-            entry.cap = result.cap
             entry.phase = Phase.CERTIFIED
         return True
 

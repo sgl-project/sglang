@@ -4,23 +4,21 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import msgspec
-from pp_cache_test_support import (
-    CacheRequestHandle,
-    functions,
-    lease,
-    load,
-    m,
-    method,
-    register_cpu_ci,
-)
+from sglang.srt.managers import pp_prefetch_scheduler as m
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.pp_cache_prefix import CachePrefixLease
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+from sglang.srt.utils.poll_timer import PollTimer
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def stage(rank, cap, *, rows=8):
     req = Mock(rid="r", origin_input_ids=list(range(1025)))
-    req.cache_request_handle = NS(attempt_id=0)
+    req.cache_request_handle = CacheRequestHandle("r", 0)
     req.sampling_params.max_new_tokens = 1
     cache = Mock(page_size=64)
     cache.prefetch_ready_to_finalize.return_value = [True]
@@ -62,17 +60,8 @@ class AdmissionTests(unittest.TestCase):
         class LimitObserved(Exception):
             pass
 
-        select = method(
-            "managers/scheduler.py",
-            "Scheduler",
-            "_get_new_batch_prefill_raw",
-            {
-                "TEST_RETRACT": False,
-                "get_schedule": lambda: NS(prefill_max_requests=8),
-            },
-        )
         for layout, candidates in ((None, [object()]), ((("R", 1024, 1472),), [])):
-            with self.subTest(layout=layout):
+            with self.subTest(layout=layout), published_topology(role="scheduler"):
                 adder = Mock(rem_chunk_tokens=1024)
                 adder.add_chunked_req.side_effect = LimitObserved
                 s = Mock(
@@ -93,64 +82,14 @@ class AdmissionTests(unittest.TestCase):
                     candidates=candidates, reserved_tokens=0, expected_layout=layout
                 )
                 with self.assertRaises(LimitObserved):
-                    select(s, None, Mock(reqs=[], batch_is_full=False), selection)
+                    Scheduler._get_new_batch_prefill_raw(
+                        s, None, Mock(reqs=[], batch_is_full=False), selection
+                    )
                 self.assertEqual(adder.chunked_req_limit, 448)
                 self.assertEqual(
                     s.policy.shortest_prefill_chunk_limit.call_count,
                     int(layout is None),
                 )
-
-    def test_timeout_uses_native_poll_budget_and_suppresses_deadline_retry(self):
-        timer = load("_pp_deadline_timer", "utils/poll_timer.py")
-        scope = {"msgspec": msgspec, "PollTimer": timer.PollTimer}
-        functions("mem_cache/unified_radix_cache.py", {"_StoragePrefetchWait"}, scope)
-        import torch
-
-        scope["torch"] = torch
-        names = {
-            "_start_storage_prefetch_wait",
-            "_prefetch_deadline_expired",
-            "_mark_prefetch_deadline_expired",
-            "prefetch_ready_to_finalize",
-            "finalize_prefetch",
-        }
-        functions(
-            "mem_cache/unified_radix_cache.py", names, scope, cls="UnifiedRadixCache"
-        )
-        cache = NS(
-            prefetch_stop_policy="timeout",
-            page_size=64,
-            prefetch_timeout_base=2,
-            prefetch_timeout_per_page=0,
-            _storage_prefetch_wait={},
-            _all_reduce_attn_groups=Mock(),
-            storage_prefetch_retries=Mock(),
-            cache_controller=Mock(),
-            _finish_storage_prefetch=Mock(),
-            revoke_pending_prefetch=Mock(),
-        )
-        for name in names:
-            setattr(cache, name, lambda *a, fn=scope[name]: fn(cache, *a))
-        handle = CacheRequestHandle("r")
-        op = NS(
-            handle=handle,
-            stats_requested_tokens=1024,
-            host_indices=None,
-            is_terminated=lambda: False,
-            deadline_expired=False,
-        )
-        cache.ongoing_prefetch = {handle: NS(operation=op)}
-        with patch.object(timer.time, "perf_counter", return_value=10.0) as clock:
-            self.assertEqual(cache.prefetch_ready_to_finalize([handle]), [False])
-            clock.return_value = 13.0
-            self.assertEqual(cache.prefetch_ready_to_finalize([handle]), [True])
-        self.assertTrue(op.deadline_expired)
-        cache.storage_prefetch_retries.cancel.assert_called_once_with("r")
-        cache.finalize_prefetch(handle)
-        cache.storage_prefetch_retries.poll_miss.assert_not_called()
-        cache._finish_storage_prefetch.assert_called_once_with(
-            handle, 0, reason="deadline"
-        )
 
     def test_readiness_then_full_prefix_min_and_native_handoff(self):
         gates = self.stages()
@@ -165,10 +104,13 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(beat(gates).prepare[0].cap, 960)
         beat(gates)
         for g in gates:
-            self.assertEqual(g.entries["r"].cap, 960)
+            self.assertEqual(g.entries["r"].lease.cap, 960)
             self.assertEqual(g.entries["r"].phase, m.Phase.CERTIFIED)
             queue = g.s.waiting_queue
             req = queue.pop()  # Native selection removes its selected request.
+            selection = m.PrefillAdmissionSelection({req.rid: g.entries[req.rid]})
+            self.assertEqual(selection.prepare_request(req, g.s.tree_cache), 960)
+            self.assertEqual(req.prefix_len, 960)
             g.finish_selection(NS(reqs=[req]))
             self.assertNotIn("r", g.entries)
             self.assertIs(g.s.waiting_queue, queue)
@@ -195,7 +137,7 @@ class AdmissionTests(unittest.TestCase):
     def test_device_only_lease_does_not_touch_backup_host_reference(self):
         gate = stage(0, 1024)
         req, cache = gate.s.waiting_queue[0], gate.s.tree_cache
-        hold = lease.CachePrefixLease.acquire(cache, req, 1024)
+        hold = CachePrefixLease.acquire(cache, req, 1024)
         cache.inc_host_lock_ref.assert_not_called()
         hold = hold.restrict(960)
         self.assertEqual(hold.cap, 960)
@@ -205,22 +147,13 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(cache.unlock.call_count, 2)
 
     def test_wait_timer_stops_at_local_readiness_once(self):
-        timer_module = load("_pp_wait_timer", "utils/poll_timer.py")
         g = stage(0, 1024)
-        stats = NS(
-            storage_prefetch_wait_s=0.0, _storage_prefetch_wait=timer_module.PollTimer()
+        stats = SchedulerReqTimeStats(
+            storage_prefetch_wait_s=0.0, _storage_prefetch_wait=PollTimer()
         )
-        observe = method(
-            "observability/req_time_stats.py",
-            "SchedulerReqTimeStats",
-            "observe_storage_prefetch_ready",
-        )
-        stats.observe_storage_prefetch_ready = lambda ready: observe(stats, ready)
         g.s.waiting_queue[0].time_stats = stats
         g._watch_waiting()
-        with patch.object(
-            timer_module.time, "perf_counter", return_value=10.0
-        ) as clock:
+        with patch("time.perf_counter", return_value=10.0) as clock:
             g.s.tree_cache.prefetch_ready_to_finalize.return_value = [False]
             g._report_readiness()
             clock.return_value = 13.0

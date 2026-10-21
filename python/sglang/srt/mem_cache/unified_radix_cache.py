@@ -2308,9 +2308,6 @@ class UnifiedRadixCache(BasePrefixCache):
         start = self.prefetch_loaded_storage_start_by_reqid.get(request)
         return (start, start + count) if count > 0 and start is not None else None
 
-    def release_admission_storage_span(self, request: CacheRequestHandle) -> None:
-        self.pop_prefetch_loaded_span(request)
-
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:

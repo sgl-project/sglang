@@ -7,6 +7,7 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import Mock, call, patch
@@ -37,7 +38,68 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+
+
+def _cache_query_ranks(rank, rendezvous):
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=3,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        case = TestPPPrefetchTicket()
+        case.setUp()
+        case.doCleanups()  # Use real ranks/groups, not the unit fixture's mocks.
+        c = case.c
+        c.host_memory_mode = "cache"
+        c.storage_config = replace(
+            c.storage_config, pp_rank=rank, pp_size=3, tp_rank=0, tp_size=1
+        )
+        c.pp_prefetch_command_group = torch.distributed.group.WORLD
+        c.prefetch_hits_sync_groups = [torch.distributed.group.WORLD]
+        c._all_reduce.side_effect = lambda tensor, op, groups: (
+            torch.distributed.all_reduce(tensor, op=op, group=groups[0])
+        )
+        c._storage_hit_query.side_effect = lambda op: case.query_hits(
+            op, 0 if op.request_id == "miss" and rank == 1 else 20 if rank == 2 else 32
+        )
+        with patch(
+            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
+            return_value=True,
+        ):
+            if rank == 0:
+                for rid in ("hit", "miss"):
+                    case.register_cache_query(rid)
+                local = case.bind_cache_query("hit")
+                missed = case.bind_cache_query("miss")
+                c.pp_prefetch_command_queue.put(None)
+            c.pp_prefetch_command_thread_func()
+            if rank != 0:
+                # The shared query arrived before this stage's native request.
+                case.register_cache_query("hit")
+                local = case.bind_cache_query("hit")
+                if rank != 2:
+                    missed = case.bind_cache_query("miss")
+            assert c.prefetch_hit_queue.get_nowait() is local
+            assert local.storage_hit_count == 12  # root MIN20 - local anchor8
+            assert (
+                local.all_hash_values
+                == c.pp_prefetch_states["hit"].operation.all_hash_values[2:]
+            )
+            assert local.hash_value == local.all_hash_values[:3]
+            if rank != 2:
+                assert c.prefetch_hit_queue.get_nowait() is missed
+                assert missed.storage_hit_count == 0
+            # Rank2 joined the second query without needing a local GET.
+            assert c.prefetch_hit_queue.empty()
+            assert c.pp_prefetch_states["miss"].ready_event.is_set()
+            c.mem_pool_host.alloc.assert_not_called()
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 class TestPPPrefetchTicket(unittest.TestCase):
@@ -64,6 +126,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.pp_prefetch_state_lock = threading.Lock()
         c.pp_prefetch_command_queue = Queue()
         c.prefetch_queue = Queue()
+        c.prefetch_hit_queue = Queue()
         c.prefetch_sync_queue = Queue()
         c.ack_prefetch_queue = Queue()
         c.host_mem_release_queue = Queue()
@@ -130,7 +193,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
     def run_commands(self, *tickets):
         commands = iter((*tickets, None))
-        self.c.pp_prefetch_command_queue.put(None)
+        if self.c.storage_config.pp_rank == 0:
+            self.c.pp_prefetch_command_queue.put(None)
 
         def broadcast(objects, *args, **kwargs):
             return [next(commands)] if self.c.storage_config.pp_rank else objects
@@ -162,6 +226,112 @@ class TestPPPrefetchTicket(unittest.TestCase):
         while not self.c.prefetch_sync_queue.empty():
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
+
+    def register_cache_query(self, rid="hit"):
+        self.c.register_cache_query(
+            CacheRequestHandle(rid, 0), RadixKey(array("q", range(32))), []
+        )
+        return self.c.pp_prefetch_states[rid].ticket
+
+    def bind_cache_query(self, rid="hit"):
+        return self.c.submit_prefetch(
+            CacheRequestHandle(rid, 0),
+            RadixKey(array("q", range(8, 32))),
+            "anchor",
+            None,
+            list(range(8)),
+            [],
+            assume_stored=True,
+        ).operation
+
+    def test_cache_query_binding_in_either_arrival_order(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        c._storage_hit_query.side_effect = lambda op: self.query_hits(op, 20)
+        with patch(
+            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
+            return_value=True,
+        ):
+            for query_first in (False, True):
+                with self.subTest(query_first=query_first):
+                    rid = str(query_first)
+                    c.storage_config.pp_rank = 0
+                    ticket = self.register_cache_query(rid)
+                    self.register_cache_query(rid)
+                    self.assertIs(c.pp_prefetch_command_queue.get_nowait(), ticket)
+                    self.assertTrue(c.pp_prefetch_command_queue.empty())
+                    c.storage_config.pp_rank = 1
+                    if query_first:
+                        self.run_commands(ticket)
+                    self.register_cache_query(rid)
+                    local = self.bind_cache_query(rid)
+                    if not query_first:
+                        self.run_commands(ticket)
+                    self.assertIs(c.prefetch_hit_queue.get_nowait(), local)
+                    self.assertEqual(local.storage_hit_count, 12)
+                    self.assertEqual(
+                        local.all_hash_values,
+                        c.pp_prefetch_states[rid].operation.all_hash_values[2:],
+                    )
+                    self.assertEqual(local.hash_value, local.all_hash_values[:3])
+                    self.assertFalse(local.assume_stored)
+                    c._publish_cache_query(c.pp_prefetch_states[rid])
+                    self.assertTrue(c.prefetch_hit_queue.empty())
+                    self.assertTrue(c.pp_prefetch_command_queue.empty())
+            c.mem_pool_host.alloc.assert_not_called()
+
+    def test_cache_cancel_and_query_error_preserve_next_query(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        with patch(
+            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
+            return_value=True,
+        ):
+            for rid in ("cancelled", "failed", "next"):
+                self.register_cache_query(rid)
+            self.bind_cache_query("cancelled")
+            self.assertFalse(c.release_pp_prefetch("cancelled"))
+            failed, following = (
+                self.bind_cache_query("failed"),
+                self.bind_cache_query("next"),
+            )
+
+            def query(op):
+                if op.request_id == "failed":
+                    raise RuntimeError("query failed")
+                return self.query_hits(op, 20)
+
+            c._storage_hit_query.side_effect = query
+            self.run_commands()
+            self.assertNotIn("cancelled", c.pp_prefetch_states)
+            self.assertIs(c.prefetch_hit_queue.get_nowait(), failed)
+            self.assertEqual(failed.storage_hit_count, 0)
+            self.assertIs(c.prefetch_hit_queue.get_nowait(), following)
+            self.assertTrue(c.prefetch_hit_queue.empty())
+            self.assertEqual(c._all_reduce.call_count, 3)
+            self.assertEqual(c._storage_hit_query.call_count, 2)
+
+    def test_cache_query_real_broadcast_min_and_late_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _cache_query_ranks,
+                args=(str(Path(directory) / "query"),),
+                nprocs=3,
+            )
+
+    def test_query_and_completion_sync_scopes(self):
+        c = self.c
+        c.attn_cp_group = None
+        c.attn_tp_group = c.tp_group = "tp"
+        with (
+            patch.object(torch.distributed, "get_world_size", return_value=2),
+            patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                side_effect=lambda group_ranks, backend: tuple(group_ranks),
+            ),
+        ):
+            self.assertEqual(c._create_sync_groups(), [(0, 1), (0, 2, 4, 6)])
+            self.assertEqual(c._create_sync_groups(include_pp=False), [(0, 1)])
 
     def test_hit_and_miss_are_reused_across_enqueue_retract_and_retry(self):
         c, cache = self.c, self.cache

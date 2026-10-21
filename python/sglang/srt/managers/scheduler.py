@@ -3266,7 +3266,10 @@ class Scheduler(
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
-        if self._reject_unsupported_pp_admission(req):
+        if (
+            self.pp_prefetch_admission is not None
+            and self.pp_prefetch_admission.reject_unsupported(req)
+        ):
             return
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -3426,10 +3429,6 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
-
-    def _reject_unsupported_pp_admission(self, req: Req) -> bool:
-        admission = self.pp_prefetch_admission
-        return admission is not None and admission.reject_unsupported(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

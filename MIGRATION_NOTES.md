@@ -34,8 +34,9 @@ The buffer-mode ticket allocation/trim/GET path is retained.
 ## Scope and validation
 
 - Keep native main timeout deadlines, deadline accounting and retry suppression.
-- Replace five large gate-specific test modules with focused admission/query
-  regressions and a small shared CPU loader. Keep upstream ticket tests.
+- Reuse the upstream ticket and storage-lifecycle fixtures for cache queries
+  and timeout integration. Keep one focused gate test module; no AST extraction,
+  private CPU loader, or duplicate controller fixture remains.
 - Cover local-before-query / query-before-local arrival, PP0-only enqueue,
   unequal/missing hits with real three-process Gloo broadcast/MIN, cancellation,
   buffer allocation/trim, sync-group scopes, full-prefix admission/NACK, host
@@ -43,10 +44,15 @@ The buffer-mode ticket allocation/trim/GET path is retained.
 - Root queries are conservative when L3 has prefix holes that resident caches
   cover. They can query already-resident pages; this update does not claim an
   optimal query budget or a measured performance improvement.
-- Validation: 12 focused tests passed, including real three-process Gloo, and
-  both registered test files passed their executable unittest entry points.
-  Changed Python files compile; repository-selected Ruff and formatting pass.
-  The upstream full-import ticket suite cannot collect locally because IPython
-  is missing and is not counted as passed.
+- Cleanup keeps the protocol unchanged: Prefill and Decode share the native
+  release-ring sender, with native RID lists / async admission framing preserved.
+  The lease owns the certified cap; native cache methods handle span retirement.
+- Validation uses normal module imports in an isolated v0.5.21-cu130 container
+  (Python 3.12.3, Torch 2.13.0, Transformers 5.12.1), with current source mounted
+  read-only. Nine relevant suites passed: 142 tests and 194 subtests, including
+  real three-process Gloo and native PrefillAdder/budget/PP-drain regressions.
+  Gate, ticket and storage-lifecycle unittest entry points also passed (46 tests,
+  reruns rather than additional coverage); compile, Ruff and diff checks passed.
+  This is CPU regression coverage, not a full main dependency-matrix or GPU qualification.
 - No GPU, storage-service deployment or benchmark was run for this update.
   Earlier v0.5.22 performance/accuracy numbers do not validate this rebased code.
