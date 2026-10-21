@@ -352,17 +352,6 @@ class AscendAttnBackend(AttentionBackend):
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
         self.dcp_interleave_size = self.page_size
-        if self._use_dense_mla_dcp_target():
-            if model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16):
-                raise NotImplementedError(
-                    "Kimi-K3 Ascend DCP currently supports only FP16/BF16 MLA "
-                    f"KV cache, got kv_cache_dtype={model_runner.kv_cache_dtype}."
-                )
-            if is_fia_nz():
-                raise NotImplementedError(
-                    "Ascend DCP currently requires ND MLA KV storage; "
-                    "set SGLANG_USE_FIA_NZ=0."
-                )
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -417,10 +406,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        if self._dense_mla_dcp_enabled() and not self.use_fia:
-            raise NotImplementedError(
-                "Kimi-K3 NPU DCP requires Ascend FIA. Set ASCEND_USE_FIA=1."
-            )
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -2744,18 +2729,32 @@ class AscendAttnBackend(AttentionBackend):
             attn_mask = self.forward_metadata.dcp_mtp_attn_mask[:batch_size]
 
             c_kv, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            k_rope_cache = k_rope_cache.view(
-                -1,
-                layer.tp_k_head_num,
-                self.page_size,
-                self.qk_rope_head_dim,
-            )
-            c_kv = c_kv.view(
-                -1,
-                layer.tp_v_head_num,
-                self.page_size,
-                self.kv_lora_rank,
-            )
+            if is_fia_nz():
+                k_rope_cache = _reshape_kv_for_fia_nz(
+                    k_rope_cache,
+                    layer.tp_k_head_num,
+                    self.qk_rope_head_dim,
+                    self.page_size,
+                )
+                c_kv = _reshape_kv_for_fia_nz(
+                    c_kv,
+                    layer.tp_v_head_num,
+                    self.kv_lora_rank,
+                    self.page_size,
+                )
+            else:
+                k_rope_cache = k_rope_cache.view(
+                    -1,
+                    layer.tp_k_head_num,
+                    self.page_size,
+                    self.qk_rope_head_dim,
+                )
+                c_kv = c_kv.view(
+                    -1,
+                    layer.tp_v_head_num,
+                    self.page_size,
+                    self.kv_lora_rank,
+                )
 
             attn_output, softmax_lse = self._forward_mla_fia(
                 q,
@@ -3731,8 +3730,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 if return_softmax_lse:
                     raise NotImplementedError(
-                        "Kimi-K3 NPU DCP requires the FIA MLA decode path to "
-                        "return softmax LSE."
+                        "MLA DCP requires softmax LSE; the selected non-FIA "
+                        "MLA decode operator only returns attention output."
                     )
                 assert (
                     not self.graph_mode

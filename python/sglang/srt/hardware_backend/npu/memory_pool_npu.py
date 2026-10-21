@@ -1097,11 +1097,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Read token-level MLA KV rows in the requested dtype."""
         dst_dtype = dst_dtype or self.dtype
         layer_id = layer.layer_id
-        cache_k = self.get_key_buffer(layer_id).view(-1, 1, self.kv_lora_rank)
-        cache_v = self.get_value_buffer(layer_id).view(-1, 1, self.qk_rope_head_dim)
-        cache_k = torch.index_select(cache_k, 0, loc).to(dst_dtype)
-        cache_v = torch.index_select(cache_v, 0, loc).to(dst_dtype)
-        return cache_k, cache_v
+
+        def read(cache: torch.Tensor, head_dim: int):
+            if self.use_fia_nz:
+                rows = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
+                values = torch.index_select(cache.view(-1, 16), 0, rows.reshape(-1))
+            else:
+                values = torch.index_select(cache.flatten(0, -2), 0, loc)
+            return values.view(loc.numel(), 1, head_dim).to(dst_dtype)
+
+        return (
+            read(self.get_key_buffer(layer_id), self.kv_lora_rank),
+            read(self.get_value_buffer(layer_id), self.qk_rope_head_dim),
+        )
 
     def _set_fia_nz_kv_buffer(
         self,
