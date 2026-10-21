@@ -53,7 +53,7 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
-/// A node's position and FULL value length on a root-to-node path.
+/// A node's position, topology, and FULL value length on a root-to-node path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreePathNodeInfo {
     pub node_id: NodeId,
@@ -63,6 +63,8 @@ pub struct TreePathNodeInfo {
     pub path_end: usize,
     /// Logical FULL device indices; None when absent.
     pub full_value_len: Option<usize>,
+    /// Number of immediate children at the time of the snapshot.
+    pub num_children: usize,
 }
 
 /// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
@@ -307,13 +309,14 @@ pub enum CacheAction {
     FreeDeviceKVFullOnly(Vec<Tensor>),
     /// A device->host backup work item (the write-through threshold fired).
     BackupKV(BackupKV),
-    /// Replace the pending write-through node on a node split:
+    /// Update cache-side write bookkeeping after a node split:
     ///
     ///     parent -> node    =>    parent -> new_node -> new_child
     ///
     /// old_node_id (the pre-split node) is replaced by new_node_id + new_child_node_id.
-    ReplaceWriteThroughOnNodeSplit {
-        ack_id: usize,
+    UpdatePendingBackupOnNodeSplit {
+        /// None when buffer-only bookkeeping has no tree-tracked write.
+        ack_id: Option<usize>,
         old_node_id: NodeId,
         new_node_id: NodeId,
         new_child_node_id: NodeId,
@@ -395,6 +398,7 @@ pub enum PoolName {
     Kv,
     Mamba,
     Swa,
+    AuxiliarySwa,
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
@@ -673,7 +677,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Adjust the component's evictable or protected count of reclaimable tokens.
-    /// The caller updates backing and size together, and restores backing on error.
+    /// Counters are unchanged on error; the caller keeps backing consistent.
     /// This changes counters only; roots and device tombstones are ignored.
     pub fn adjust_component_size(
         &mut self,
@@ -741,6 +745,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         full_value_len: node
                             .has_device_value(FULL)
                             .then(|| node.device_value_len(FULL)),
+                        num_children: node.children.len(),
                     });
                     current = parent;
                 }
@@ -1846,7 +1851,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             action,
             CacheAction::FreeDeviceKV(_)
                 | CacheAction::FreeDeviceKVFullOnly(_)
-                | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
+                | CacheAction::UpdatePendingBackupOnNodeSplit { .. }
         )
     }
 
@@ -2074,10 +2079,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
         self.components.iter().any(|component| {
             let component_type = component.component_type();
-            // Write-back defers Full and Mamba to eviction; SWA still publishes
-            // its window here because out-of-window frees never reach eviction.
             component_type != BASE_COMPONENT_TYPE
-                && (!self.is_write_back || component_type == SWA)
                 && component.needs_incremental_backup(self, node_id)
         })
     }
@@ -2088,6 +2090,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state: &InsertWalkState<K>,
         target_node_id: NodeIdx_,
     ) -> bool {
+        if self.is_write_back {
+            return false;
+        }
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
             return state.aligned_key_len > state.inserted_len
@@ -2209,10 +2214,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.arena.node_mut(new_node_id).load_back_pending_id =
             self.arena.node(child_id).load_back_pending_id;
 
-        // A split of a backuped node tells the cache to fix its publish list.
-        let action = if let Some(ack_id) = self.arena.node(child_id).write_through_pending_id {
+        let ack_id = self.arena.node(child_id).write_through_pending_id;
+        if let Some(ack_id) = ack_id {
             self.arena.node_mut(new_node_id).write_through_pending_id = Some(ack_id);
-            Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+        }
+        // Buffer-only writes are tracked by the cache rather than a node ack.
+        let action = if ack_id.is_some() || self.is_host_memory_buffer_only {
+            Some(CacheAction::UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 old_node_id: self.arena.node(child_id).id,
                 new_node_id: self.arena.node(new_node_id).id,
@@ -2307,7 +2315,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             displaced.is_none(),
             "add_new_node_: parent {parent_id} already has a child on the new node's page"
         );
-        self.inc_evictable_size(FULL, value.size()[0] as usize);
+        let tokens = self
+            .arena
+            .node(new_node_id)
+            .device_reclaimable_value_len(FULL);
+        self.inc_evictable_size(FULL, tokens);
         if self.enable_storage || self.enable_external_cache_linker {
             let hash_values = self.arena.compute_node_hash_values(new_node_id, page_size);
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
@@ -2329,7 +2341,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
-        let tokens = fresh_value.size()[0] as usize;
+        let tokens = self.arena.node(node_id).device_reclaimable_value_len(FULL);
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
         if self.arena.device_lock_ref(node_id, FULL) > 0 {
@@ -3256,13 +3268,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -3276,12 +3281,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
                     medium: tail_medium,
+                    extra_key: tail_extra_key,
                 }),
                 KvCacheEvent::BlockRemoved {
                     mut block_hashes,
                     medium,
+                    extra_key,
                 },
-            ) if *tail_medium == medium => tail_hashes.append(&mut block_hashes),
+            ) if *tail_medium == medium && *tail_extra_key == extra_key => {
+                tail_hashes.append(&mut block_hashes)
+            }
             (
                 Some(KvCacheEvent::BlockStored {
                     block_hashes: tail_hashes,
@@ -3290,6 +3299,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
                     session_id: tail_session_id,
+                    extra_key: tail_extra_key,
                     ..
                 }),
                 KvCacheEvent::BlockStored {
@@ -3300,12 +3310,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     session_id,
-                    ..
+                    extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
                 && *tail_session_id == session_id
+                && *tail_extra_key == extra_key
                 && !tail_hashes.is_empty()
                 && parent_block_hash == tail_hashes.last().copied() =>
             {
@@ -3386,11 +3397,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        // Python reads the LoRA adapter name from extra_key in the dynamo format.
-        let extra_key = self
-            .dynamo_kv_event_format
-            .then(|| self.arena.node(node_id).namespace.extra_key_arc())
-            .flatten();
+        let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
@@ -3491,9 +3498,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map(|hash| namespaced_block_hash(namespace_seed.as_ref(), hash))
             .collect();
         if !block_hashes.is_empty() {
+            let extra_key = node.namespace.extra_key_arc();
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
+                extra_key,
             });
         }
     }
@@ -4674,8 +4683,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             component_type != BASE_COMPONENT_TYPE,
             "set_component_device_value: auxiliary components only"
         );
-        let tokens = value.size()[0] as usize;
         self.arena.set_device_value(node_id, component_type, value);
+        let tokens = self
+            .arena
+            .node(node_id)
+            .device_reclaimable_value_len(component_type);
         let host_lru = self.host_lru_list_mut(component_type);
         if host_lru.in_list(Some(node_id)) {
             host_lru.remove_node(node_id);
@@ -5135,17 +5147,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let mut evictable = 0usize;
             let mut protected = 0usize;
             for &node_id in &all_nodes {
-                if self.arena.node(node_id).is_root() {
-                    continue;
-                }
-                let state = &self.arena.node(node_id).values[ct.idx()];
-                if let Some(value) = &state.value {
-                    let tokens = value.size()[0] as usize;
-                    if state.lock_ref > 0 {
-                        protected += tokens;
-                    } else {
-                        evictable += tokens;
-                    }
+                let node = self.arena.node(node_id);
+                let tokens = node.device_reclaimable_value_len(ct);
+                if node.device_lock_ref(ct) > 0 {
+                    protected += tokens;
+                } else {
+                    evictable += tokens;
                 }
             }
             let recorded = self.component_state(ct);
@@ -5927,13 +5934,13 @@ pub enum KvCacheEvent<A> {
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
         session_id: Option<Arc<str>>,
-        /// Set only in the dynamo format, and not published. Python uses it to
-        /// find the LoRA adapter name.
+        /// Not published; Python maps it to the LoRA name that namespaces the hashes.
         extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,
         medium: StorageMedium,
+        extra_key: Option<Arc<str>>,
     },
     AllBlocksCleared,
 }

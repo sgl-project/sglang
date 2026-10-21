@@ -15,10 +15,10 @@ from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
 )
-from sglang.kernels.ops.attention.utils import assert_buffer_fits
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
@@ -463,7 +463,39 @@ class FlashAttentionBackend(AttentionBackend):
         k_sf, v_sf = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
+    def _capture_unified_verify_metadata(self, forward_batch: ForwardBatch) -> bool:
+        # Fixed-width verify uses only capture-stable request/length buffers.
+        # Ragged layouts and encoder offsets still use their eager builders.
+        return (
+            forward_batch.forward_mode.is_target_verify()
+            and self.fa_impl_ver == 4
+            and self.kv_index_translator.reads_are_translated
+            and self.topk <= 1
+            and forward_batch.encoder_lens is None
+            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self._capture_unified_verify_metadata(forward_batch):
+            metadata = self.target_verify_metadata[forward_batch.batch_size]
+            translator = self.kv_index_translator
+            swa = translator.space(IdSpaceKind.SLIDING_WINDOW)
+            normal_decode_set_metadata(
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                self.max_num_pages,
+                forward_batch.seq_lens,
+                self.speculative_num_draft_tokens,
+                self.page_size,
+                metadata.swa_page_table,
+                full_v2p=translator.space(IdSpaceKind.FULL).read_v2p,
+                swa_v2p=None if swa is None else swa.read_v2p,
+                zero_tail=True,
+            )
+            return
         # Single-CG has no Python between steps, so one capturable kernel updates
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
@@ -593,6 +625,23 @@ class FlashAttentionBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_out_cache_loc)
+
+        if self._capture_unified_verify_metadata(forward_batch):
+            if in_capture:
+                self._bind_metadata_buffers(
+                    bs,
+                    forward_batch.positions.numel(),
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                    seq_lens.device,
+                )
+            self.forward_metadata = self.target_verify_metadata[bs]
+            self.forward_metadata_spec_decode_expand = None
+            # The runner records the device-side update at the start of the
+            # model graph. Do not populate a live plan's read-table cache with
+            # this graph-owned buffer: another bucket can overwrite it later.
+            return
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -1389,6 +1438,41 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        if (
+            self.kv_cache_dtype != torch.bfloat16
+            or self.use_mla
+            or layer.is_cross_attention
+            or self.kv_index_translator.is_translating
+            or self._kv_shard_pool is not None
+            or self.fa_skip_kv_cache
+            or layer.tp_k_head_num != layer.tp_v_head_num
+            or is_cp_active(forward_batch)
+            or forward_batch.dcp_kv_mask is not None
+        ):
+            return None
+        write_loc = KVWriteLoc.for_layer(
+            forward_batch,
+            layer,
+            swa_loc=self.forward_metadata.swa_out_cache_loc,
+        )
+        locations = (
+            write_loc.swa_loc
+            if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
+            else write_loc.loc
+        )
+        if locations is None:
+            return None
+        buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        shapes = (
+            (layer.tp_k_head_num, layer.head_dim),
+            (layer.tp_v_head_num, layer.v_head_dim),
+        )
+        for buffer, shape in zip(buffers, shapes):
+            if buffer.shape[1:] != shape or buffer.stride()[-2:] != (shape[-1], 1):
+                return None
+        return (*buffers, locations)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1685,7 +1769,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -2891,7 +2975,11 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            full_to_swa_index_mapping=(
+                self.token_to_kv_pool.full_to_swa_index_mapping
+                if self.use_sliding_window_kv_pool
+                else None
+            ),
             skip_page_table=translated,
         )
         if translated:
