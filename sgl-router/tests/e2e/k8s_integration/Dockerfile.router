@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 # Build sgl-router binary for k8s integration E2E.
-# Context root: repo root (one level above experimental/sgl-router/).
+# Context root: repo root (one level above sgl-router/).
 
 # Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
 FROM rust:1.92-bookworm AS builder
@@ -19,15 +19,15 @@ RUN apt-get update \
 WORKDIR /build
 
 # Copy the sgl-router crate and its sglang-processor path dependency (context is the repo root)
-COPY experimental/sgl-router /build/experimental/sgl-router
+COPY sgl-router /build/sgl-router
 COPY rust/Cargo.toml /build/rust/Cargo.toml
 COPY rust/sglang-api-types /build/rust/sglang-api-types
 COPY rust/sglang-processor /build/rust/sglang-processor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/experimental/sgl-router/target \
-    cd /build/experimental/sgl-router \
+    --mount=type=cache,target=/build/sgl-router/target \
+    cd /build/sgl-router \
     && cargo build --locked --release --bin sgl-router \
     && cp target/release/sgl-router /usr/local/bin/sgl-router
 
@@ -39,7 +39,7 @@ RUN apt-get update && apt-get install -y ca-certificates \
 COPY --from=builder /usr/local/bin/sgl-router /usr/local/bin/sgl-router
 
 # Tiny tokenizer fixture used by the E2E config
-COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/tiny.json
+COPY sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/tiny.json
 
 EXPOSE 8090
 
