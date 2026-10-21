@@ -25,8 +25,9 @@ The two coincide on a plain pool, so nothing here does any work there.
 
 A pool can hold several sub-pools (full attention, sliding window), each with
 its own physical ids and named by an `IdSpace` (`space`). Writes are translated
-once per sub-pool, by the iteration's `KVLocPlan`. A read is translated exactly
-once, by the readers below and nowhere else; a backend never translates. The
+once per sub-pool, by the iteration's `KVLocPlan` or its fused producer.
+A read is translated exactly once, by the readers below or a captured gather
+using the `IdSpace`'s live mapping. The
 plan's read table exists only once a table reader asks for it (`read_table`,
 `copy_page_table`), built into that reader's own capture-stable table when it
 is the first; later readers take it, earlier ones translate in their own
@@ -66,7 +67,7 @@ from typing import Dict, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
@@ -276,12 +277,15 @@ class KVIndexTranslator:
         write_virtual: Optional[torch.Tensor],
         read_extent: int = 0,
         write_slots: Optional[torch.Tensor] = None,
+        translated_writes: Optional[Dict[IdSpaceKind, torch.Tensor]] = None,
     ) -> KVLocPlan:
         """This iteration's ids, translated once. ``write_virtual`` is the
         iteration's write window (``[batch, window]`` flattened when its
         forwards write columns of it); ``read_extent`` is how far past
         ``seq_lens`` the iteration's reads reach. ``write_slots`` replaces
-        ``write_virtual`` for a runner's own buffer (`bind_runner_slots`)."""
+        ``write_virtual`` for a runner's own buffer (`bind_runner_slots`).
+        ``translated_writes`` supplies physical outputs already computed by
+        the producer, keyed by this source's sub-pools."""
         return KVLocPlan(
             source=self,
             req_pool_indices=req_pool_indices,
@@ -290,6 +294,61 @@ class KVIndexTranslator:
             write_virtual=write_virtual,
             read_extent=read_extent,
             write_slots=write_slots,
+            translated_writes=translated_writes,
+        )
+
+    def plan_uniform_extend(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        width: int,
+    ) -> KVLocPlan:
+        """Gather one fixed-width speculative window, translating at its producer.
+
+        The virtual window stays available for accept/reclaim bookkeeping;
+        draft, target and direct writers share the physical outputs. DCP and
+        non-CUDA devices retain the plan's ordinary write translation.
+        """
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+
+        translated = None
+        mappings = {}
+        if req_pool_indices.is_cuda and self.reads_are_translated:
+            translated = {}
+            for kind in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW):
+                space = self.space(kind)
+                if space is not None and space.read_v2p is not None:
+                    mappings[kind] = space.read_v2p
+                    translated[kind] = torch.empty(
+                        req_pool_indices.numel() * width,
+                        dtype=torch.int64,
+                        device=req_pool_indices.device,
+                    )
+        writes = translated or {}
+        virtual = assign_extend_cache_locs_uniform_func(
+            req_pool_indices=req_pool_indices,
+            req_to_token=self.req_to_token,
+            start_offset=seq_lens,
+            batch_size=req_pool_indices.numel(),
+            draft_token_num=width,
+            device=req_pool_indices.device,
+            full_v2p=mappings.get(IdSpaceKind.FULL),
+            swa_v2p=mappings.get(IdSpaceKind.SLIDING_WINDOW),
+            full_out=writes.get(IdSpaceKind.FULL),
+            swa_out=writes.get(IdSpaceKind.SLIDING_WINDOW),
+            page_size=self.page_size,
+        )
+        return self.plan(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            write_virtual=virtual,
+            read_extent=width,
+            translated_writes=translated,
         )
 
     def own_plan(self, forward_batch, *, runner_slots: bool = False) -> KVLocPlan:

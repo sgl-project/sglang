@@ -322,7 +322,7 @@ framework-specific optimization workflow.
   layouts (B > 1, SP > 1, LoRA-wrapped or quantized projections,
   head_dim != 128) and first-sight mismatches keep the Triton
   `qknorm_complex_rope` / `qknorm_complex_rope_kv` chain.
-- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_complex_rope.py`,
+- Validation: `test/registered/kernels/ops/diffusion/test_complex_rope.py`,
   the `test_qwen21_cuda_qk_rope_*` cases in `test_model_fast_paths.py`, and
   `python/sglang/multimodal_gen/test/unit/test_qwen_image21_cuda.py`.
 - Workflow rule: if a Qwen-Image 2.1 trace still shows
@@ -403,7 +403,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py` and `test/registered/kernels/ops/layernorm/test_qknorm_across_heads.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -520,7 +520,7 @@ framework-specific optimization workflow.
   `group_limited_topk` through the diffusion facade when the CUDA layout guard
   passes, otherwise it retains the eager reference chain.
 - LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="lossless"` and `quality="high"`:
-  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `LTX2_RMS_NORM_MODULATE.mark` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),

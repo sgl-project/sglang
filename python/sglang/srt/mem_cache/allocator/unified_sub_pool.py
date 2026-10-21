@@ -280,7 +280,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`.
 
     ``need_sort`` applies to transfer-facing physical ids, not virtual ids.
-    Physical free pages are sorted during compaction.
+    Physical free pages are sorted during compaction, and allocation hands out
+    the free pages nearest the pool's own end first (`take_physical`).
     """
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
@@ -396,6 +397,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._free_phys_pages: torch.Tensor = torch.empty(
             0, dtype=torch.int64, device=device
         )
+        # The `_free_phys_pages` tensor last known to be ascending. Frees and
+        # pending-reuse returns rebind the list unsorted, so identity tells
+        # `_sorted_free_phys_pages` whether a sort is due.
+        self._free_phys_sorted: Optional[torch.Tensor] = None
         # One entry per event, shared by its pending batches: `cpu_list` drives
         # the Set update (no sync); batch tensors stay alive so drain cats them
         # without an H2D.
@@ -836,8 +841,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     return None
 
             if n_drain > 0:
-                drained_t = self._free_phys_pages[:n_drain]
-                self._free_phys_pages = self._free_phys_pages[n_drain:]
+                drained_t = self._take_free_pages_from_end(
+                    n_drain, "low" if self.grow_direction == "up" else "high"
+                )
             else:
                 drained_t = None
 
@@ -942,6 +948,39 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Page-granular wrapper around ``take_physical``."""
         with record_function("MultiEndedAlloc.take_physical_pages"):
             return self.take_physical(num_pages * self.page_size)
+
+    def _sorted_free_phys_pages(self) -> torch.Tensor:
+        """`_free_phys_pages` in ascending order. Sorts on the device, and only
+        when the list was rebound since it was last known sorted; there is no host
+        sync, because the length is tensor metadata.
+        """
+        free = self._free_phys_pages
+        if free is not self._free_phys_sorted:
+            if free.numel() > 1:
+                free, _ = torch.sort(free)
+                self._free_phys_pages = free
+            self._free_phys_sorted = free
+        return free
+
+    def _take_free_pages_from_end(self, n: int, end: str) -> torch.Tensor:
+        """Remove and return ``n`` free pages from the ``end`` ("low" or "high")
+        of the ascending free list; the rest stays ascending. Taking the whole
+        list needs no sort. ``0 < n <= len(_free_phys_pages)``.
+        """
+        n_free = int(self._free_phys_pages.shape[0])
+        assert 0 < n <= n_free, f"take {n} of {n_free} free pages"
+        if n == n_free:
+            taken = self._free_phys_pages
+            rest = taken[:0]
+        else:
+            free = self._sorted_free_phys_pages()
+            if end == "low":
+                taken, rest = free[:n], free[n:]
+            else:
+                taken, rest = free[n_free - n :], free[: n_free - n]
+        self._free_phys_pages = rest
+        self._free_phys_sorted = rest
+        return taken
 
     def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Bind page-granular virtual ids to physical ids."""
@@ -1187,10 +1226,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
-            # Snapshot the virtual pages the kernel will consume, to bind them
-            # to physical pages afterward.
+            # The free list is only rebound, not mutated in place. Retain its
+            # consumed slice for binding without launching a redundant copy.
             if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
+                new_virtual_pages = self.free_virtual_ids[:num_new_pages]
             else:
                 new_virtual_pages = None
 
@@ -2189,6 +2228,12 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     # boundaries are live and the deferred absorb can skip its D2H.
     _holes_dirty: bool = False
 
+    # A middle pool has no origin of its own, so its requests take holes from the
+    # two ends of the ascending hole list in turn: the whole request from one end,
+    # the next request from the other, whatever their sizes. Only a request that
+    # drains holes and succeeds flips it.
+    _next_hole_end: str = "low"
+
     def __init__(self, **kwargs):
         assert not kwargs.get("lazy_compaction", False), (
             "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
@@ -2361,8 +2406,10 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 )
 
         if n_drain > 0:
-            drained = self._free_phys_pages[:n_drain].clone()
-            self._free_phys_pages = self._free_phys_pages[n_drain:]
+            drained = self._take_free_pages_from_end(
+                n_drain, self._next_hole_end
+            ).clone()
+            self._next_hole_end = "high" if self._next_hole_end == "low" else "low"
         else:
             drained = None
 
@@ -2424,10 +2471,13 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # `index_fill_`, never `t[idx] = -1`: see the END free path.
-            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
-            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
+            # The same fused lookup + tombstones as the END free path avoids
+            # three separate launches on each sliding-window retirement.
+            freed_p_pages = free_unbind_inplace(
+                free_v_pages.contiguous(),
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+            )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Optional
 
 import torch
 import triton
@@ -619,6 +620,13 @@ def assign_extend_cache_locs_uniform(
     out_cache_loc,
     pool_len: tl.constexpr,
     draft_token_num: tl.constexpr,
+    full_v2p=None,
+    swa_v2p=None,
+    full_out=None,
+    swa_out=None,
+    PAGE_SIZE: tl.constexpr = 1,
+    num_v_pages=0,
+    num_swa_pages=0,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -637,6 +645,21 @@ def assign_extend_cache_locs_uniform(
         mask = o < draft_token_num
         data = tl.load(token_pool + kv_start + o, mask=mask)
         tl.store(out_cache_ptr + o, data, mask=mask)
+        if full_v2p is not None:
+            page = data // PAGE_SIZE
+            valid = mask & (data >= 0) & (page < num_v_pages)
+            physical = tl.load(
+                full_v2p + tl.where(valid, page, 0), mask=valid, other=-1
+            )
+            full_loc = tl.maximum(physical * PAGE_SIZE + data % PAGE_SIZE, 0)
+            tl.store(full_out + pid * draft_token_num + o, full_loc, mask=mask)
+            if swa_v2p is not None:
+                swa_valid = mask & (data >= 0) & (page < num_swa_pages)
+                physical = tl.load(
+                    swa_v2p + tl.where(swa_valid, page, 0), mask=swa_valid, other=-1
+                )
+                swa_loc = tl.maximum(physical * PAGE_SIZE + data % PAGE_SIZE, 0)
+                tl.store(swa_out + pid * draft_token_num + o, swa_loc, mask=mask)
 
 
 def assign_extend_cache_locs_uniform_func(
@@ -646,11 +669,30 @@ def assign_extend_cache_locs_uniform_func(
     batch_size: int,
     draft_token_num: int,
     device,
+    *,
+    full_v2p: Optional[torch.Tensor] = None,
+    swa_v2p: Optional[torch.Tensor] = None,
+    full_out: Optional[torch.Tensor] = None,
+    swa_out: Optional[torch.Tensor] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
     offsets inside the kernel, removing the eager `seq_lens + draft_token_num`
-    add from the host critical path."""
+    add from the host critical path. Optional v2p tables fill physical FULL
+    and SWA write windows in the same launch; the returned ids stay virtual.
+    Mapping tables and output buffers must be contiguous, with one output
+    per gathered token. Translation is rank-local (no DCP widening).
+    """
+    if full_v2p is not None:
+        assert full_out is not None and full_out.numel() == batch_size * draft_token_num
+        assert full_v2p.is_contiguous() and full_out.is_contiguous()
+        assert swa_v2p is None or (
+            swa_out is not None
+            and swa_out.numel() == full_out.numel()
+            and swa_out.is_contiguous()
+            and swa_v2p.is_contiguous()
+        )
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
@@ -664,10 +706,18 @@ def assign_extend_cache_locs_uniform_func(
             out_cache_loc,
             req_to_token.shape[1],
             draft_token_num,
+            full_v2p=full_v2p,
+            swa_v2p=swa_v2p,
+            full_out=full_out,
+            swa_out=swa_out,
+            PAGE_SIZE=page_size,
+            num_v_pages=0 if full_v2p is None else full_v2p.numel(),
+            num_swa_pages=0 if swa_v2p is None else swa_v2p.numel(),
         )
         return out_cache_loc
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
+    assert full_v2p is None, "fused write translation requires a Triton device"
     return assign_extend_cache_locs_func(
         req_pool_indices=req_pool_indices,
         req_to_token=req_to_token,
