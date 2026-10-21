@@ -23,6 +23,133 @@ _RTOL = 1.6e-2
 _ATOL = 1e-3
 
 
+@pytest.mark.skipif(not _CUDA_BF16_AVAILABLE, reason="CUDA BF16 required")
+@pytest.mark.parametrize("mapping_dtype", [torch.int32, torch.int64])
+def test_gate_delta_activation_skips_unwritten_routes_and_adapters(mapping_dtype):
+    """Private poisoned rows stay unread; adapter0 remains a real adapter slot."""
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.moe_runner.triton_utils import override_config
+    from sglang.srt.lora.marlin_lora_temp.activation import silu_and_mul_add_delta
+
+    device, dtype = "cuda", torch.bfloat16
+    tokens, topk, experts, rank, hidden, width = 6, 2, 2, 8, 32, 144
+    producer_ids = torch.tensor([[0, 1]] * tokens, device=device, dtype=torch.int32)
+    producer_mapping = torch.tensor(
+        [0, 1, 2, 0, 1, 0], device=device, dtype=torch.int32
+    )
+    a = torch.zeros((3, 1, 2 * rank, hidden), device=device, dtype=dtype)
+    b = torch.zeros((3, experts, 2 * width, rank), device=device, dtype=dtype)
+    for slot in range(2):
+        a[slot, 0, 0, 0], a[slot, 0, rank, 0] = 2 + slot, 4 + slot
+        b[slot, :, :width, 0], b[slot, :, width:, 0] = 3 + slot, 5 + slot
+    hidden_states = torch.zeros((tokens, hidden), device=device, dtype=dtype)
+    hidden_states[:, 0] = 0.125
+    delta = torch.full(
+        (tokens, topk, 2 * width), float("nan"), device=device, dtype=dtype
+    )
+    weights = torch.ones((tokens, topk), device=device)
+    config = dict(
+        BLOCK_SIZE_M=16,
+        BLOCK_SIZE_N=32,
+        BLOCK_SIZE_K=32,
+        GROUP_SIZE_M=1,
+        num_warps=4,
+        num_stages=2,
+    )
+    with override_config(config):
+        merged_experts_fused_moe_lora_add(
+            output=delta,
+            hidden_states=hidden_states,
+            lora_a=a,
+            lora_b=b,
+            topk_ids=producer_ids,
+            topk_weights=weights,
+            token_lora_mapping=producer_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=True,
+            experts_shared_outer_loras_b=False,
+            fuse_add_to_output=False,
+            use_direct_expand_add=True,
+        )
+    shrunk = torch.einsum(
+        "mh,mrh->mr", hidden_states.float(), a[producer_mapping.long(), 0].float()
+    )
+    selected_b = b[producer_mapping[:, None].long(), producer_ids.long()]
+    expected_delta = (
+        torch.einsum(
+            "mpr,mkpir->mkpi",
+            shrunk.view(tokens, 2, rank),
+            selected_b.float().view(tokens, topk, 2, width, rank),
+        )
+        .flatten(2)
+        .to(dtype)
+    )
+    torch.testing.assert_close(delta, expected_delta, rtol=0, atol=0)
+    assert bool((delta[0] != 0).all()), "valid adapter0 must be expanded"
+
+    base_saved, delta_saved = torch.full_like(delta, 0.5), delta.clone()
+    base = base_saved.clone()
+    ids = torch.empty((tokens, topk * 2), device=device, dtype=torch.int32)[:, ::2]
+    ids.copy_(producer_ids)
+    mapping = torch.empty(tokens * 2, device=device, dtype=mapping_dtype)[::2]
+    mapping.copy_(producer_mapping)
+    enabled = torch.ones(6, device=device, dtype=torch.int32)[::2]
+    output = torch.empty((tokens * topk, width), device=device, dtype=dtype)
+
+    def run():
+        silu_and_mul_add_delta(
+            base.view(-1, 2 * width),
+            delta.view(-1, 2 * width),
+            output,
+            topk_ids=ids,
+            token_lora_mapping=mapping,
+            adapter_enabled=enabled,
+        )
+
+    run()
+    default_output = torch.empty_like(output)
+    silu_and_mul_add_delta(
+        base.view(-1, 2 * width), delta.view(-1, 2 * width), default_output
+    )
+    torch.testing.assert_close(output, default_output, rtol=0, atol=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for state in ("mixed", "all-inactive", "valid"):
+        ids.copy_(torch.tensor([[0, 1]] * tokens, device=device, dtype=ids.dtype))
+        mapping.copy_(producer_mapping)
+        enabled.fill_(1)
+        if state == "mixed":
+            ids[0, 0], ids[2, 0], ids[3, 1], ids[5] = -1, -1, -1, -1
+            mapping[3], mapping[4], enabled[2] = -1, 3, 0
+        elif state == "all-inactive":
+            ids.fill_(-1)
+        active_route = ids >= 0
+        safe_slots = mapping.clamp(0, enabled.numel() - 1).long()
+        active_adapter = (
+            (mapping >= 0) & (mapping < enabled.numel()) & (enabled[safe_slots] != 0)
+        )
+        base.copy_(base_saved).masked_fill_(~active_route.unsqueeze(-1), float("nan"))
+        delta.copy_(delta_saved).masked_fill_(
+            ~(active_route & active_adapter[:, None]).unsqueeze(-1), float("nan")
+        )
+        output.fill_(7)
+        graph.replay()
+        reference_delta = delta_saved.masked_fill(
+            ~active_adapter[:, None, None], 0
+        ).float()
+        gate = base_saved[..., :width].float() + reference_delta[..., :width]
+        up = base_saved[..., width:].float() + reference_delta[..., width:]
+        expected = (torch.nn.functional.silu(gate) * up).to(dtype)
+        expected = expected.masked_fill(~active_route.unsqueeze(-1), 7)
+        torch.testing.assert_close(
+            output.view_as(expected), expected, rtol=_RTOL, atol=_ATOL
+        )
+
+
 def _reference_reduce(
     routed_base: torch.Tensor,
     routed_rank: torch.Tensor,

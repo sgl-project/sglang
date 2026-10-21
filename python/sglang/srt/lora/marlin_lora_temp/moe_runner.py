@@ -345,7 +345,7 @@ def fused_experts_experimental_sgl_marlin_lora(
             != lora_info.gate_up_lora_b_weights.shape[-1]
         )
         # Allocate and prewarm on main; side streams launch kernels only.
-        gate_up_delta = hidden_states.new_zeros((M, topk, 2 * N))
+        gate_up_delta = hidden_states.new_empty((M, topk, 2 * N))
         if not direct_decode:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
@@ -572,13 +572,9 @@ def fused_experts_experimental_sgl_marlin_lora(
     )
 
     # Stage 1: gate_up (marlin) — concurrent with the side-stream delta above.
-    projection_cache = torch.empty(
-        (M * topk * (2 * N + K),),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    intermediate_cache1 = torch.empty(
+        (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
-    intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
@@ -621,6 +617,9 @@ def fused_experts_experimental_sgl_marlin_lora(
             intermediate_cache1.view(-1, 2 * N),
             gate_up_delta.view(-1, 2 * N),
             intermediate_cache2,
+            topk_ids=topk_ids,
+            token_lora_mapping=lora_info.token_lora_mapping,
+            adapter_enabled=lora_info.adapter_enabled,
         )
         if staged_down_shrink:
             # Overlap down shrink with the Marlin down GEMM and base reduction.
@@ -684,6 +683,9 @@ def fused_experts_experimental_sgl_marlin_lora(
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     # Stage 3: down (marlin).
+    intermediate_cache3 = torch.empty(
+        (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
