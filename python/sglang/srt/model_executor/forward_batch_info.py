@@ -1143,14 +1143,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
-        num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded():
-            ret.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
-        ret.global_num_token_non_padded_cpu = num_tokens
+        ret._init_num_token_non_padded(
+            device=device, is_draft_worker=model_runner.is_draft_worker
+        )
 
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
@@ -1340,6 +1335,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
+
+    def _init_num_token_non_padded(self, *, device, is_draft_worker: bool) -> None:
+        if self.input_ids is not None:
+            num_tokens = len(self.input_ids)
+        elif (
+            is_draft_worker
+            and self.spec_info is not None
+            and self.forward_mode.is_decode()
+        ):
+            assert self.spec_info.num_tokens_per_req > 0
+            num_tokens = self.batch_size * self.spec_info.num_tokens_per_req
+        else:
+            num_tokens = 0
+        if enable_num_token_non_padded():
+            self.global_num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(device),
+            ).to(device, non_blocking=True)
+        self.global_num_token_non_padded_cpu = num_tokens
 
     def set_local_num_token_non_padded(self, *, sharded: bool) -> None:
         """Derive the LOCAL num_token_non_padded from the invariant GLOBAL scalar.

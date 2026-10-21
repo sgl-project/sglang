@@ -1400,6 +1400,7 @@ class SchedulerBatchResultProcessor:
                 and lookahead == 1
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
             ):
                 req.mamba_lazy_checkpoint = False
 
