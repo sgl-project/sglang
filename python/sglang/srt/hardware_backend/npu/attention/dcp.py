@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.dcp.comm import (
-    all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla_npu,
     dcp_a2a_lse_reduce,
 )
@@ -16,16 +15,6 @@ def get_mla_dcp_backend(backend):
     """Find the full-attention backend behind TBO and hybrid dispatchers."""
     backend = getattr(backend, "primary", backend)
     return getattr(backend, "full_attn_backend", backend)
-
-
-def gather_mla_dcp_q_npu(backend, forward_batch, q_nope_out, q_pe):
-    """Gather the query heads required by rank-local MLA or DSA attention."""
-    if backend.is_dcp_mla_decode_phase(forward_batch):
-        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
-        # The common gather returns transposed views; Ascend kernels consume
-        # contiguous token-major queries.
-        return q_nope_out.contiguous(), q_pe.contiguous()
-    return q_nope_out, q_pe
 
 
 def forward_mla_attention_npu(
@@ -43,7 +32,7 @@ def forward_mla_attention_npu(
     Device-specific arguments stay with the caller. DSA retains its Ascend
     attention-update merge; dense MLA retains the compact Triton A2A merge.
     """
-    use_dcp = backend.is_dcp_mla_decode_phase(forward_batch)
+    use_dcp = backend.uses_dcp_partial_attention(forward_batch)
     attn = module.attn_mqa_for_dcp_decode if use_dcp else module.attn_mqa
     if use_dcp and not backend.use_dsa:
         attn_kwargs["return_softmax_lse"] = True
@@ -67,12 +56,8 @@ def forward_mla_attention_npu(
             attn_output = cp_lse_ag_out_rs_mla_npu(
                 attn_output, lse, get_parallel().dcp_group
             )
-        elif attn_output.shape[0] == 0:
-            # An idle DCP group has no partials to exchange.
-            attn_output = attn_output.new_empty(
-                (0, module.num_local_heads, module.kv_lora_rank)
-            )
-        else:
+        # An idle DCP group has no partials to exchange.
+        elif attn_output.shape[0] > 0:
             attn_output = dcp_a2a_lse_reduce(
                 attn_output,
                 lse,

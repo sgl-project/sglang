@@ -1095,17 +1095,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # This applies to DSA; dense MLA localizes global slots in its KV writer.
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
         # and so does the plan's window. An NPU DCP target writes rank-local
         # slots, which its translator maps the window to at `bind` below; keep
         # the global view for the consumers that read it.
-        if (
-            _is_npu
-            and get_parallel().dcp_enabled
-            and not model_runner.is_draft_worker
-            and getattr(model_runner.model_config, "index_head_dim", None) is not None
-        ):
+        if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret._maybe_init_non_generation_fields(batch)
 

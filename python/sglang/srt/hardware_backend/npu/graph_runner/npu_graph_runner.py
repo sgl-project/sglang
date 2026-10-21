@@ -413,10 +413,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens_cpu = forward_batch.seq_lens.cpu()
-                if forward_batch.forward_mode.is_target_verify():
-                    seq_lens_cpu = seq_lens_cpu + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                    self.bs - self.raw_bs
+                )
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

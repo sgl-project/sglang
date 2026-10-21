@@ -524,32 +524,14 @@ class AscendKVManager(MooncakeKVManager):
                             raise ValueError(
                                 "Invalid PD DCP draft destination token width"
                             )
-                        if self.is_mla_backend:
-                            raise ValueError(
-                                "PD DCP draft head slicing is unsupported for pure MLA"
-                            )
-                        copy_width = min(src_width, dst_width)
-                        if max(src_width, dst_width) % copy_width:
-                            raise ValueError(
-                                "PD DCP draft KV head shards must divide evenly"
-                            )
-                        if dst_attn_tp_size is None:
-                            raise ValueError(
-                                "PD DCP draft head slicing requires destination TP size"
-                            )
-                        src_span = src_width * self.attn_tp_size
-                        dst_span = dst_width * dst_attn_tp_size
-                        src_rank = (
-                            self.kv_args.engine_rank % self.attn_tp_size
-                        ) // max(1, src_span // dst_span)
-                        dst_rank = dst_tp_rank // max(1, dst_span // src_span)
                         sliced_draft_params.append(
-                            (
-                                src_kv_ptrs[entry] + (dst_rank * dst_width) % src_width,
-                                dst_kv_ptrs[entry] + (src_rank * src_width) % dst_width,
+                            self._get_dcp_draft_slice(
+                                src_kv_ptrs[entry],
+                                dst_kv_ptrs[entry],
                                 src_width,
                                 dst_width,
-                                copy_width,
+                                dst_tp_rank,
+                                dst_attn_tp_size,
                             )
                         )
                         continue
@@ -581,28 +563,9 @@ class AscendKVManager(MooncakeKVManager):
         dst_tokens = (global_dst[:, None] * self.kv_args.page_size + offsets).reshape(
             -1
         )
-        batch_size = self.max_transfer_batch_indices
-        if batch_size <= 0:
-            batch_size = 4096
-        for start in range(0, src_tokens.size, batch_size):
-            blocks = []
-            for (
-                src_ptr,
-                dst_ptr,
-                src_width,
-                dst_width,
-                copy_width,
-            ) in sliced_draft_params:
-                src_addrs = src_ptr + src_tokens[start : start + batch_size] * src_width
-                dst_addrs = dst_ptr + dst_tokens[start : start + batch_size] * dst_width
-                blocks.extend(
-                    (int(src), int(dst), copy_width)
-                    for src, dst in zip(src_addrs, dst_addrs)
-                )
-            ret = self._transfer_data(mooncake_session_id, blocks)
-            if ret != 0:
-                return ret
-        return 0
+        return self._send_dcp_draft_slices(
+            mooncake_session_id, sliced_draft_params, src_tokens, dst_tokens
+        )
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

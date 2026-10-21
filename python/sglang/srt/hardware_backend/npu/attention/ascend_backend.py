@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
     mask_empty_mla_dcp_shards_npu,
 )
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+    build_mla_dcp_local_block_tables,
     init_mla_dcp_graph_state,
     init_mla_dcp_metadata,
     update_mla_dcp_graph_metadata,
@@ -37,16 +38,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
-)
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import (
-    get_dcp_chain_spec_lens,
-    get_dcp_lens,
-)
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -519,13 +514,13 @@ class AscendAttnBackend(AttentionBackend):
         """DSA target attention uses page-interleaved KV and a replicated indexer."""
         return self.use_dsa and self.dcp_size > 1
 
-    def is_dcp_mla_decode_phase(self, forward_batch: ForwardBatch) -> bool:
+    def uses_dcp_partial_attention(self, forward_batch: ForwardBatch) -> bool:
         """Whether this worker returns partial MLA attention for a DCP merge."""
         if self.dcp_size <= 1:
             return False
         mode = forward_batch.forward_mode
         if self.use_dsa:
-            return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
+            return not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
     def get_mla_dcp_graph_replay_lengths(
@@ -550,30 +545,18 @@ class AscendAttnBackend(AttentionBackend):
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP."""
-        if is_spec:
-            local_kv_lens = get_dcp_chain_spec_lens(
-                kv_lens_cpu,
-                self.speculative_num_draft_tokens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.dcp_interleave_size,
-            )
-        else:
-            local_kv_lens = get_dcp_lens(
-                kv_lens_cpu,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.dcp_interleave_size,
-            ).int()
         page_stride = self.dcp_interleave_size * self.dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
-        block_tables = (
-            self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
-        ).to(torch.int32)
-        if is_spec:
-            block_tables = block_tables.repeat_interleave(
-                self.speculative_num_draft_tokens, dim=0
-            )
+        block_tables, local_kv_lens = build_mla_dcp_local_block_tables(
+            self.req_to_token,
+            req_pool_indices,
+            kv_lens_cpu,
+            self.dcp_interleave_size,
+            self.dcp_size,
+            self.dcp_rank,
+            num_pages=(max_len + page_stride - 1) // page_stride,
+            query_len=self.speculative_num_draft_tokens if is_spec else None,
+        )
         return local_kv_lens, block_tables
 
     def _init_dsa_dcp_metadata(self, forward_batch: ForwardBatch) -> None:
@@ -656,10 +639,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
             ):
-                seq_lens_max = forward_batch.seq_lens.max()
                 seq_lens_max += self.speculative_step_id + 1
-            else:
-                seq_lens_max = forward_batch.seq_lens.max()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :seq_lens_max
@@ -714,7 +694,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self._use_dense_mla_dcp_target() and self.is_dcp_mla_decode_phase(
+        if self._use_dense_mla_dcp_target() and self.uses_dcp_partial_attention(
             forward_batch
         ):
             init_mla_dcp_metadata(
@@ -2764,32 +2744,18 @@ class AscendAttnBackend(AttentionBackend):
             attn_mask = self.forward_metadata.dcp_mtp_attn_mask[:batch_size]
 
             c_kv, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if is_fia_nz():
-                k_rope_cache = _reshape_kv_for_fia_nz(
-                    k_rope_cache,
-                    layer.tp_k_head_num,
-                    self.qk_rope_head_dim,
-                    self.page_size,
-                )
-                c_kv = _reshape_kv_for_fia_nz(
-                    c_kv,
-                    layer.tp_v_head_num,
-                    self.kv_lora_rank,
-                    self.page_size,
-                )
-            else:
-                k_rope_cache = k_rope_cache.view(
-                    -1,
-                    layer.tp_k_head_num,
-                    self.page_size,
-                    self.qk_rope_head_dim,
-                )
-                c_kv = c_kv.view(
-                    -1,
-                    layer.tp_v_head_num,
-                    self.page_size,
-                    self.kv_lora_rank,
-                )
+            k_rope_cache = k_rope_cache.view(
+                -1,
+                layer.tp_k_head_num,
+                self.page_size,
+                self.qk_rope_head_dim,
+            )
+            c_kv = c_kv.view(
+                -1,
+                layer.tp_v_head_num,
+                self.page_size,
+                self.kv_lora_rank,
+            )
 
             attn_output, softmax_lse = self._forward_mla_fia(
                 q,

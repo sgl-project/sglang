@@ -9,7 +9,6 @@ import sglang.srt.model_executor.forward_context as forward_context
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import (
     forward_mla_attention_npu,
-    gather_mla_dcp_q_npu,
     get_mla_dcp_backend,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -22,6 +21,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg, get_parallel
@@ -280,7 +280,12 @@ def forward_mla_prepare_npu(
             )
 
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    q_nope_out, q_pe = gather_mla_dcp_q_npu(backend, forward_batch, q_nope_out, q_pe)
+    if backend.uses_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        # The common gather returns transposed views; Ascend kernels consume
+        # contiguous token-major queries.
+        q_nope_out = q_nope_out.contiguous()
+        q_pe = q_pe.contiguous()
 
     return (
         q_pe,
@@ -506,7 +511,7 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
-        if backend.is_dcp_mla_decode_phase(forward_batch):
+        if backend.uses_dcp_partial_attention(forward_batch):
             topk_indices = dcp_layout.remap_dcp_sparse_indices(
                 topk_indices,
                 backend.dcp_size,
@@ -516,7 +521,10 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
-    q_nope_out, q_pe = gather_mla_dcp_q_npu(backend, forward_batch, q_nope_out, q_pe)
+    if backend.uses_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        q_nope_out = q_nope_out.contiguous()
+        q_pe = q_pe.contiguous()
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 

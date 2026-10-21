@@ -34,10 +34,8 @@ def _jit_mla_output_gate_module() -> Module:
 
 
 def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
-    # transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu; this JIT is CUDA-only.
     return (
-        not _is_npu
-        and x.is_cuda
+        x.is_cuda
         and gate.is_cuda
         and not _is_npu
         and x.dtype == torch.bfloat16

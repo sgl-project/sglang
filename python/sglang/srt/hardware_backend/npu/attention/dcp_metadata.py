@@ -214,15 +214,21 @@ def build_mla_dcp_local_block_tables(
     *,
     num_pages: int | None = None,
     block_tables: torch.Tensor | None = None,
+    query_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate or fill FIA's page-interleaved rank-local block table.
 
     Lengths must fit req_to_token; an explicit num_pages must cover every
     local sequence. The graph caller sizes it from the CPU length upper bound.
     """
-    local_seq_lens = get_dcp_lens(
-        seq_lens, dcp_size, dcp_rank, interleave_size=physical_page_size
-    ).to(torch.int32)
+    if query_len is None:
+        local_seq_lens = get_dcp_lens(
+            seq_lens, dcp_size, dcp_rank, interleave_size=physical_page_size
+        ).to(torch.int32)
+    else:
+        local_seq_lens = get_dcp_chain_spec_lens(
+            seq_lens, query_len, dcp_size, dcp_rank, interleave_size=physical_page_size
+        )
     if num_pages is None:
         max_len = int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
         num_pages = max(1, (max_len + physical_page_size - 1) // physical_page_size)
@@ -241,6 +247,8 @@ def build_mla_dcp_local_block_tables(
         rounding_mode="floor",
         out=block_tables,
     )
+    if query_len is not None:
+        block_tables = block_tables.repeat_interleave(query_len, dim=0)
     return block_tables, local_seq_lens
 
 

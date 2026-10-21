@@ -80,10 +80,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         if get_platform().is_npu:
-            logger.info(
-                "Kimi-K3 NPU DCP selects the HCCL A2A communication path and "
-                "disables replicated Q projection."
-            )
             overrides.update(
                 dcp_comm_backend="a2a",
                 dcp_replicate_q_proj=False,
