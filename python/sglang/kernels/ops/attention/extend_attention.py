@@ -1561,6 +1561,12 @@ def extend_attention_fwd_unified(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if _is_gfx95 and Lq <= 128 and Lv <= 128 and BLOCK_N == 64:
+        # gfx950, head_dim <= 128: each workgroup streams the whole prefix, so a 256-row query tile
+        # cuts the KV bytes read per query row 4x. BLOCK_N, and so the reduction order, is unchanged:
+        # outputs are bitwise identical. Measured on MI350X (head_dim 128 and 64, 8k-token chunks after
+        # 0-56k-token prefixes): 2.0-2.6x kernel speed.
+        BLOCK_M, num_warps = 256, 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
