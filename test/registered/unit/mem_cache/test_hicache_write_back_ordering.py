@@ -5,25 +5,23 @@ from array import array
 from unittest.mock import patch
 
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    UnifiedRadixCacheSuite,
-    build_fixture,
-)
 
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, EvictParams
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.fixtures import (
+    build_fixture,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestHiCacheWriteBackOrdering(unittest.TestCase):
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
-    _make_req = UnifiedRadixCacheSuite._make_req
-    _rid = 0
-
+class TestHiCacheWriteBackOrdering(UnifiedRadixCacheFixtures, unittest.TestCase):
     def _request(self, cache, allocator, req_pool, start, length=8):
         req = self._make_req(req_pool)
         req.origin_input_ids = array("q", range(start, start + 2 * length))
