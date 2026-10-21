@@ -631,6 +631,71 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_checkpoint_unshared_chunk_preserves_indices(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 3)
+        req, indices = self._make_inflight_req(cache, allocator, pool, tokens)
+        if self.cfg.has_mamba:
+            req.kv.mamba_last_track_seqlen = len(tokens)
+        with mock.patch.object(
+            cache, "path_device_indices", wraps=cache.path_device_indices
+        ) as collect:
+            cache.checkpoint(req, up_to=req.extend_end)
+            collect.assert_not_called()
+        protected = req.kv.cache_protected_len
+        self.assertGreater(protected, 0)
+        torch.testing.assert_close(
+            pool.req_to_token[req.kv.req_pool_idx, :protected].to(torch.int64),
+            indices[:protected],
+        )
+        torch.testing.assert_close(
+            cache.path_device_indices(req.last_node), indices[:protected]
+        )
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
+    @requires(lambda cfg: not cfg.has_mamba, "Mamba uses tracked checkpoint lengths")
+    def test_checkpoint_incremental_chunks_preserve_indices(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 3)
+        req, indices = self._make_inflight_req(cache, allocator, pool, tokens)
+        with mock.patch.object(
+            cache, "path_device_indices", wraps=cache.path_device_indices
+        ) as collect:
+            for end in range(self.cfg.page_size, len(tokens) + 1, self.cfg.page_size):
+                cache.checkpoint_into_tree(req, up_to=end)
+                self.assertEqual(req.kv.cache_protected_len, end)
+            collect.assert_not_called()
+        torch.testing.assert_close(
+            pool.req_to_token[req.kv.req_pool_idx, : len(tokens)].long(), indices
+        )
+        torch.testing.assert_close(cache.path_device_indices(req.last_node), indices)
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_checkpoint_duplicate_chunk_adopts_existing_indices(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 3)
+        first, _ = self._make_inflight_req(cache, allocator, pool, tokens)
+        second, _ = self._make_inflight_req(cache, allocator, pool, tokens)
+        if self.cfg.has_mamba:
+            first.kv.mamba_last_track_seqlen = len(tokens)
+            second.kv.mamba_last_track_seqlen = len(tokens)
+        cache.checkpoint(first, up_to=first.extend_end)
+        with mock.patch.object(
+            cache, "path_device_indices", wraps=cache.path_device_indices
+        ) as collect:
+            cache.checkpoint(second, up_to=second.extend_end)
+            collect.assert_called_once()
+        protected = second.kv.cache_protected_len
+        torch.testing.assert_close(
+            pool.req_to_token[second.kv.req_pool_idx, :protected].to(torch.int64),
+            cache.path_device_indices(second.last_node),
+        )
+        cache.unlock(first.lock)
+        cache.unlock(second.lock)
+        cache.sanity_check()
+
     @requires_swa_only
     @requires_ps1_window4
     def test_swa_unfinished_req_repoints_whole_insert_below_window(self):

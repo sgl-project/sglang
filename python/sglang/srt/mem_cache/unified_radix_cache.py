@@ -1243,21 +1243,39 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # With PD decode radix caching, SWA matching can stop short of the inserted path.
-        # Repoint from that path to protect all tree-owned KV.
+        # An unfinished request already points at its protected prefix. If the
+        # insert matched no new prefix, the tree adopted its remaining indices,
+        # so rebuilding the path and writing the same row is unnecessary.
         new_last_node = result.last_device_node
-        new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        keep_request_indices = (
+            not is_finished
+            and not self.enable_session_radix_cache
+            and new_prefix_len <= insert_params.prev_prefix_len
         )
-        assert (
-            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
-        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        self.req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
-            new_indices[req.kv.cache_protected_len :],
+        if keep_request_indices:
+            # A successful insert owns the entire page-aligned key, including
+            # nodes whose auxiliary components contain only tombstones.
+            new_protected_len = page_aligned_len
+        else:
+            # SWA matching can stop short of the inserted path. Protect the
+            # entire path even when its live SWA tail is below the window.
+            new_indices = self.path_device_indices(new_last_node)
+            new_protected_len = len(new_indices)
+        assert req.kv.cache_protected_len <= new_protected_len + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {new_protected_len=}, {page_aligned_len=}"
         )
+        assert new_prefix_len <= new_protected_len == page_aligned_len, (
+            f"{new_prefix_len=}, {new_protected_len=}, {page_aligned_len=}"
+        )
+        if not keep_request_indices:
+            self.req_to_token_pool.write(
+                (
+                    req.kv.req_pool_idx,
+                    slice(req.kv.cache_protected_len, new_protected_len),
+                ),
+                new_indices[req.kv.cache_protected_len :],
+            )
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
@@ -1276,7 +1294,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = new_protected_len
         req.last_node = new_last_node
 
         # cleanup
