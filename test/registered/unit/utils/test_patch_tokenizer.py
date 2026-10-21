@@ -174,6 +174,7 @@ class TestPadPaddingSideShimUnitTest(unittest.TestCase):
         original_pad = cls._pad
 
         _PadPaddingSideShim.patch(tokenizer)
+        self.addCleanup(unpatch_tokenizer, tokenizer)
         self.assertTrue(getattr(cls, "_sglang_pad_padding_side_patched", False))
         self.assertIsNot(cls._pad, original_pad)
 
@@ -186,12 +187,12 @@ class TestPadPaddingSideShimUnitTest(unittest.TestCase):
         cls = type(tokenizer)
 
         _PadPaddingSideShim.patch(tokenizer)
+        self.addCleanup(unpatch_tokenizer, tokenizer)
         patched_once = cls._pad
         _PadPaddingSideShim.patch(tokenizer)
 
         self.assertIs(cls._pad, patched_once)
         self.assertTrue(getattr(cls, "_sglang_pad_padding_side_patched", False))
-        unpatch_tokenizer(tokenizer)
 
     def test_patch_applies_to_all_instances_of_the_class(self):
         tokenizer_a = _FakeStaleTokenizer(padding_side="left")
