@@ -1,5 +1,6 @@
 """Full-device decode may overlap a capped PDMux prefill Green Context."""
 
+import os
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,7 @@ class TestPDMuxOverlapStreams(unittest.TestCase):
         kernel.spatial = spatial
         self.spatial = spatial
         self.patches = [
+            patch.dict(os.environ, {}, clear=True),
             patch.dict(sys.modules, {"sgl_kernel": kernel}),
             patch.object(pdmux_context.torch.cuda, "current_device", return_value=0),
             patch.object(
@@ -52,6 +54,7 @@ class TestPDMuxOverlapStreams(unittest.TestCase):
             patch.object(pdmux_context, "SM_COUNTS", []),
             patch.object(pdmux_context, "_RESERVED_GREEN_STREAMS", []),
             patch.object(pdmux_context, "_FULL_DEVICE_DECODE_STREAMS", set()),
+            patch.object(pdmux_context, "_GREEN_CONTEXT_STREAMS", set()),
             patch.object(pdmux_context, "CURRENT_STREAM_IDX", 0),
             patch.object(pdmux_context, "CURRENT_STREAM_GROUP", None),
         ]
@@ -71,6 +74,7 @@ overlap_decode_full_sm: true
 
         self.spatial.create_greenctx_stream_by_value.assert_called_once_with(104, 28, 0)
         self.assertEqual(pdmux_context.get_sm_counts()[1], (104, 132))
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "28")
         self.assertEqual(
             pdmux_context.get_stream_groups()[1][0].cuda_stream, "prefill-green"
         )
@@ -98,6 +102,9 @@ overlap_decode_full_sm: true
                 self.assertIs(
                     pdmux_context.get_pdmux_decode_alt_stream(helper), expected
                 )
+                self.assertEqual(
+                    pdmux_context.is_pdmux_green_context_stream(), lane == 0
+                )
 
         # An unrelated full-device stream is not a decode lane.
         with patch.object(
@@ -113,6 +120,7 @@ overlap_decode_full_sm: true
         )
         pdmux_context.initialize_stream_groups(0, config)
         helper = object()
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "104")
         for idx, expected in ((1, None), (2, helper)):
             with patch.object(
                 pdmux_context.torch.cuda,
@@ -122,6 +130,43 @@ overlap_decode_full_sm: true
                 self.assertIs(
                     pdmux_context.get_pdmux_decode_alt_stream(helper), expected
                 )
+                self.assertEqual(
+                    pdmux_context.is_pdmux_green_context_stream(), idx == 1
+                )
+
+    def test_green_detection_without_pdmux_does_not_access_cuda(self):
+        with patch.object(pdmux_context.torch.cuda, "current_stream") as current:
+            self.assertFalse(pdmux_context.is_pdmux_green_context_stream())
+        current.assert_not_called()
+
+    def test_cooperative_routing_fits_every_group(self):
+        pdmux_context._configure_flashinfer_moe_sm_reservation(
+            148, [(148, 0), (128, 148), (112, 148), (0, 148)]
+        )
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "36")
+
+    def test_cooperative_routing_preserves_safer_user_reservation(self):
+        os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS] = "40"
+        pdmux_context._configure_flashinfer_moe_sm_reservation(148, [(128, 148)])
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "40")
+
+    def test_cooperative_routing_increases_unsafe_user_reservation(self):
+        os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS] = "0"
+        pdmux_context._configure_flashinfer_moe_sm_reservation(148, [(128, 148)])
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "20")
+
+    def test_cooperative_routing_keeps_default_when_it_fits(self):
+        pdmux_context._configure_flashinfer_moe_sm_reservation(148, [(144, 148)])
+        self.assertEqual(os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS], "8")
+
+    def test_cooperative_routing_rejects_invalid_reservation(self):
+        for value in ("-1", "148", "149", "1.5", "invalid"):
+            with self.subTest(value=value):
+                os.environ[pdmux_context._FLASHINFER_MOE_RESERVED_SMS] = value
+                with self.assertRaisesRegex(ValueError, "FLASHINFER_TRTLLM_MOE"):
+                    pdmux_context._configure_flashinfer_moe_sm_reservation(
+                        148, [(128, 148)]
+                    )
 
     def test_layer_cap_loads_and_defaults_to_zero(self):
         config_body = """sm_group_num: 3

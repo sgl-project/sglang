@@ -1,8 +1,12 @@
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import List
 
 import torch
 import yaml
+
+logger = logging.getLogger(__name__)
 
 STREAM_GROUPS = []
 SM_COUNTS = []
@@ -11,8 +15,44 @@ CURRENT_STREAM_IDX = 0
 CURRENT_STREAM_GROUP = None
 _RESERVED_GREEN_STREAMS = []
 _FULL_DEVICE_DECODE_STREAMS = set()
+_GREEN_CONTEXT_STREAMS = set()
 
 _OVERLAP_DECODE_STREAM_PRIORITY = -1
+_FLASHINFER_MOE_RESERVED_SMS = "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS"
+
+
+def _configure_flashinfer_moe_sm_reservation(total_sm_count, divisions):
+    """Bound cooperative routing grids by the smallest active SM partition.
+
+    FlashInfer's TRTLLM MoE router sizes its cooperative launch from the whole
+    device, even on a Green Context stream. Its reserved-SM environment option
+    is cached on first use, so configure it before model warmup/graph capture,
+    once for all prefill and decode streams (not when switching streams).
+    """
+    min_sm_count = min(sm for pair in divisions for sm in pair if sm > 0)
+    raw_reserved = os.environ.get(_FLASHINFER_MOE_RESERVED_SMS, "8")
+    try:
+        reserved = int(raw_reserved)
+    except ValueError as exc:
+        raise ValueError(f"{_FLASHINFER_MOE_RESERVED_SMS} must be an integer") from exc
+    if not 0 <= reserved < total_sm_count:
+        raise ValueError(
+            f"{_FLASHINFER_MOE_RESERVED_SMS} must satisfy "
+            f"0 <= value < {total_sm_count}; got {reserved}"
+        )
+    # Preserve a user's more conservative setting, as well as FlashInfer's
+    # default reservation of eight SMs when it already fits the partitions.
+    reserved = max(reserved, total_sm_count - min_sm_count)
+    os.environ[_FLASHINFER_MOE_RESERVED_SMS] = str(reserved)
+    logger.info(
+        "PDMux sets %s=%d: TRTLLM MoE cooperative routing uses at most %d "
+        "SMs (smallest active partition: %d, device: %d).",
+        _FLASHINFER_MOE_RESERVED_SMS,
+        reserved,
+        total_sm_count - reserved,
+        min_sm_count,
+        total_sm_count,
+    )
 
 
 @dataclass
@@ -174,7 +214,7 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
         SM_GROUP_NUM, \
         CURRENT_STREAM_IDX, \
         CURRENT_STREAM_GROUP
-    global _RESERVED_GREEN_STREAMS, _FULL_DEVICE_DECODE_STREAMS
+    global _RESERVED_GREEN_STREAMS, _FULL_DEVICE_DECODE_STREAMS, _GREEN_CONTEXT_STREAMS
     # for pd_multiplexing, Init stream_groups
     device = torch.cuda.current_device()
     total_sm_count = spatial.get_sm_available(gpu_id)
@@ -211,6 +251,8 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
                     "Use overlap_decode_full_sm for full-device decode."
                 )
 
+    _configure_flashinfer_moe_sm_reservation(total_sm_count, divisions)
+
     SM_COUNTS = []
     SM_COUNTS.append((total_sm_count, 0))  # Normal stream for prefill
     SM_COUNTS.extend(divisions)  # Add the divided SM counts
@@ -218,6 +260,7 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     STREAM_GROUPS = []
     _RESERVED_GREEN_STREAMS = []
     _FULL_DEVICE_DECODE_STREAMS = set()
+    _GREEN_CONTEXT_STREAMS = set()
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
@@ -227,14 +270,19 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
                 prefill_sm, total_sm_count - prefill_sm, gpu_id
             )
             _RESERVED_GREEN_STREAMS.append(reserved_stream)
+            _GREEN_CONTEXT_STREAMS.add(prefill_stream.cuda_stream)
             decode_stream = torch.cuda.Stream(
                 gpu_id, priority=_OVERLAP_DECODE_STREAM_PRIORITY
             )
             STREAM_GROUPS.append((prefill_stream, decode_stream))
             _FULL_DEVICE_DECODE_STREAMS.add(decode_stream.cuda_stream)
         else:
-            STREAM_GROUPS.append(
-                (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
+            prefill_stream, decode_stream = spatial.create_greenctx_stream_by_value(
+                prefill_sm, decode_sm, gpu_id
+            )
+            STREAM_GROUPS.append((prefill_stream, decode_stream))
+            _GREEN_CONTEXT_STREAMS.update(
+                (prefill_stream.cuda_stream, decode_stream.cuda_stream)
             )
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
@@ -266,6 +314,13 @@ def get_sm_counts() -> list[tuple[int, int]]:
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
     return CURRENT_STREAM_IDX
+
+
+def is_pdmux_green_context_stream() -> bool:
+    """Use the actual stream, including during graph capture, to detect SM caps."""
+    return bool(_GREEN_CONTEXT_STREAMS) and (
+        torch.cuda.current_stream().cuda_stream in _GREEN_CONTEXT_STREAMS
+    )
 
 
 def get_pdmux_decode_alt_stream(alt_stream):

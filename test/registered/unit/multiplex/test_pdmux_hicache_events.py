@@ -96,7 +96,7 @@ class _SplitBatch:
     def batch_size(self):
         return 1
 
-    def filter_batch(self, chunked_req_to_exclude=None):
+    def filter_batch(self, reqs_to_exclude=None):
         pass
 
 

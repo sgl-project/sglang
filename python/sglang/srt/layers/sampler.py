@@ -21,6 +21,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.multiplex.pdmux_context import is_pdmux_green_context_stream
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -148,6 +149,15 @@ class Sampler(nn.Module):
             apply_custom_logit_processor(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
+
+    def _softmax(self, logits: torch.Tensor) -> torch.Tensor:
+        # Blackwell Cake softmax uses cluster/cooperative launches sized for a
+        # full device. Green Context partitions cannot satisfy those launch
+        # requirements. Keep sampling on its current stream with Torch's
+        # non-cluster kernel; ordinary decode streams retain the fast path.
+        if self.enable_deterministic or is_pdmux_green_context_stream():
+            return torch.softmax(logits, dim=-1)
+        return sampler_softmax(logits)
 
     def forward(
         self,
@@ -295,11 +305,7 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = (
-                    torch.softmax(logits, dim=-1)
-                    if self.enable_deterministic
-                    else sampler_softmax(logits)
-                )
+                logits[:] = self._softmax(logits)
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
