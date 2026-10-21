@@ -107,6 +107,8 @@ def _rel_l2(a, b):
     "vendor,rows",
     [
         ("triton", "route_major"),
+        ("cutedsl", "expert_major"),
+        ("cutedsl", "route_major"),
     ],
 )
 def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
@@ -171,6 +173,28 @@ def test_fp8_admission_rejects_bad_geometry():
 
     with pytest.raises(NotImplementedError, match=r"\[128, 128\]"):
         _admit_fp8_block_weights(SimpleNamespace(block_shape=(64, 64)))
+
+
+def test_fp8_kernel_rejects_tiles_the_scale_epilogue_cannot_index():
+    """The SM100 FP8 epilogue indexes weight scales per 128-wide output tile and
+    stages one column scale per epilogue thread (128 threads)."""
+    cutlass = pytest.importorskip("cutlass")
+    from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm100_fp8 import (
+        GroupedGemmKernelSm100Fp8,
+    )
+
+    def build(mma_tiler_mn):
+        return GroupedGemmKernelSm100Fp8(
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=False,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=(1, 1),
+            swap_ab=True,
+        )
+
+    for mma_tiler_mn in ((64, 128), (128, 256)):
+        with pytest.raises(ValueError, match="mma_tiler_mn"):
+            build(mma_tiler_mn)
 
 
 if __name__ == "__main__":
