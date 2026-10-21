@@ -136,6 +136,10 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+    # page_table / swa_page_table with rows duplicated prev-then-next, so zigzag
+    # CP can run both halves of a request as one launch. None outside CP.
+    zigzag_page_table: torch.Tensor = None
+    zigzag_swa_page_table: torch.Tensor = None
 
     pa_swa_page_table: torch.Tensor = None
     pa_swa_cache_seqlens: torch.Tensor = None
@@ -1435,6 +1439,14 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
+        if is_cp_active(forward_batch):
+            metadata.zigzag_page_table = torch.cat(
+                (metadata.page_table, metadata.page_table), dim=0
+            )
+            if metadata.swa_page_table is not None:
+                metadata.zigzag_swa_page_table = torch.cat(
+                    (metadata.swa_page_table, metadata.swa_page_table), dim=0
+                )
         self.forward_metadata = metadata
 
     def get_paged_mha_kv_cache(
@@ -1769,6 +1781,15 @@ class FlashAttentionBackend(AttentionBackend):
                 window_size = (-1, -1)
 
             if cp_active:
+                assert not use_local_attn and not layer.is_cross_attention, (
+                    "Context parallel prefill does not support local or cross "
+                    "attention."
+                )
+                cp_page_table = (
+                    metadata.zigzag_swa_page_table
+                    if is_swa_layer and self.use_sliding_window_kv_pool
+                    else metadata.zigzag_page_table
+                )
 
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
@@ -1777,10 +1798,9 @@ class FlashAttentionBackend(AttentionBackend):
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
-                        page_table=page_table,
+                        page_table=cp_page_table,
                         cache_seqlens=cache_seqlens_cp,
                         cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
                         causal=False if use_cascade_attn else causal,
@@ -2032,9 +2052,9 @@ class FlashAttentionBackend(AttentionBackend):
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
                 if cp_active:
-                    # MLA CP: q is rank-local zigzag-split; run the
-                    # absorbed-MLA kernel twice (prev/next halves) against
-                    # the full latent KV pool through the selected strategy.
+                    # MLA CP: run both zigzag halves in one launch against the
+                    # full latent KV pool. Pass query components separately so
+                    # the strategy can slice them without concatenating.
                     assert not use_cascade_attn, (
                         "Cascade attention under MLA CP is not supported."
                     )
@@ -2051,12 +2071,9 @@ class FlashAttentionBackend(AttentionBackend):
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
-                            page_table=page_table,
+                            page_table=metadata.zigzag_page_table,
                             cache_seqlens=cache_seqlens_cp,
                             cu_seqlens_q=cu_seqlens_q_cp,
-                            cu_seqlens_k_new=(
-                                cu_seqlens_k if not use_local_attn else None
-                            ),
                             max_seqlen_q=max_seqlen_q_cp,
                             softmax_scale=layer.scaling,
                             causal=causal,

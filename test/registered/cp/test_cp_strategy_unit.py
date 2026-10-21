@@ -679,39 +679,29 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(written_value, value))
         self.assertEqual((k_scale, v_scale), ("key-scale", "value-scale"))
 
-    def test_zigzag_attention_dispatch_runs_prev_then_next(self):
-        cp_size = 2
-        seq_lens = [8]
-        extend_seq_lens = [8]
-        metadata = self._metadata_for_rank(
-            0,
-            cp_size=cp_size,
-            seq_lens=seq_lens,
-            extend_seq_lens=extend_seq_lens,
+    def test_zigzag_attention_is_one_launch_over_combined_geometry(self):
+        meta = self._metadata_for_rank(
+            1, cp_size=4, seq_lens=[19, 27], extend_seq_lens=[19, 27]
         )
-        fb = SimpleNamespace(attn_cp_metadata=metadata)
-        q = torch.arange(4 * 2).view(4, 2)
+        logical = meta.total_q_prev_tokens + meta.total_q_next_tokens
+        q = torch.arange((logical + 3) * 6).view(-1, 2, 3)  # 3 padded rows
         calls = []
 
         def attn_fn(q_chunk, cu_seqlens_q, cache_seqlens, max_seqlen_q):
-            calls.append(
-                (
-                    q_chunk.clone(),
-                    cu_seqlens_q.clone(),
-                    cache_seqlens.clone(),
-                    max_seqlen_q,
-                )
-            )
+            calls.append((q_chunk, cu_seqlens_q, cache_seqlens, max_seqlen_q))
             return q_chunk + 100
 
-        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
-            q, fb, device=torch.device("cpu"), attn_fn=attn_fn
+        out = ZigzagCPStrategy(cp_size=4).run_attention(
+            q, SimpleNamespace(attn_cp_metadata=meta), torch.device("cpu"), attn_fn
         )
-
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(torch.equal(calls[0][0], q[:2]))
-        self.assertTrue(torch.equal(calls[1][0], q[2:]))
-        self.assertTrue(torch.equal(out, q + 100))
+        self.assertEqual(len(calls), 1)
+        q_chunk, cu_seqlens_q, cache_seqlens, max_seqlen_q = calls[0]
+        self.assertTrue(torch.equal(q_chunk, q[:logical]))
+        self.assertIs(cu_seqlens_q, meta.cu_seqlens_q_combined_tensor)
+        self.assertIs(cache_seqlens, meta.kv_len_combined_tensor)
+        self.assertEqual(max_seqlen_q, meta.max_seqlen_q_combined)
+        self.assertTrue(torch.equal(out[:logical], q[:logical] + 100))
+        self.assertFalse(out[logical:].any())
 
     def test_zigzag_attention_slices_query_components_without_copying(self):
         metadata = self._metadata_for_rank(
@@ -724,6 +714,9 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         def attn_fn(components, cu_seqlens_q, cache_seqlens, max_seqlen_q):
             calls.append(components)
+            self.assertIs(cu_seqlens_q, metadata.cu_seqlens_q_combined_tensor)
+            self.assertIs(cache_seqlens, metadata.kv_len_combined_tensor)
+            self.assertEqual(max_seqlen_q, metadata.max_seqlen_q_combined)
             for chunk, original in zip(components, (q_nope, q_rope)):
                 self.assertEqual(
                     chunk.untyped_storage().data_ptr(),
@@ -734,10 +727,9 @@ class TestCPZigzagStrategy(CustomTestCase):
         out = ZigzagCPStrategy(cp_size=2).run_attention(
             (q_nope, q_rope), fb, device=torch.device("cpu"), attn_fn=attn_fn
         )
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         for i, original in enumerate((q_nope, q_rope)):
-            self.assertTrue(torch.equal(calls[0][i], original[:2]))
-            self.assertTrue(torch.equal(calls[1][i], original[2:4]))
+            self.assertTrue(torch.equal(calls[0][i], original[:4]))
         expected = torch.cat((q_nope[:4], q_rope[:4]), dim=-1)
         expected = torch.cat((expected, torch.zeros_like(expected[:1])), dim=0)
         self.assertTrue(torch.equal(out, expected))

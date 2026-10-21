@@ -430,38 +430,26 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         if attention_backend == CPAttentionBackendKind.FLASHINFER:
             assert not isinstance(q, tuple)
             result = attn_fn(q[:logical_tokens])
-        elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
-            assert not isinstance(q, tuple)
+        else:
+            kwargs = {}
+            if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+                assert not isinstance(q, tuple)
+                kwargs = dict(
+                    cu_seqlens_kv=meta.cu_seqlens_kv_combined_tensor,
+                    use_zigzag_page_table=True,
+                )
+            # One launch: the prev and next halves are separate batch entries.
+            # Slice MLA query components identically without concatenating them.
+            q_combined = tuple(t[:logical_tokens] for t in queries)
+            if not isinstance(q, tuple):
+                q_combined = q_combined[0]
             result = attn_fn(
-                q[:logical_tokens],
+                q_combined,
                 meta.cu_seqlens_q_combined_tensor,
                 meta.kv_len_combined_tensor,
                 meta.max_seqlen_q_combined,
-                cu_seqlens_kv=meta.cu_seqlens_kv_combined_tensor,
-                use_zigzag_page_table=True,
+                **kwargs,
             )
-        else:
-            # MLA passes separate query components to avoid concatenating them just
-            # to split the token dimension. Slice every component identically.
-            q_prev = tuple(t[: meta.total_q_prev_tokens] for t in queries)
-            q_next = tuple(
-                t[meta.total_q_prev_tokens : logical_tokens] for t in queries
-            )
-            if not isinstance(q, tuple):
-                q_prev, q_next = q_prev[0], q_next[0]
-            result_prev = attn_fn(
-                q_prev,
-                meta.cu_seqlens_q_prev_tensor,
-                meta.kv_len_prev_tensor,
-                meta.max_seqlen_q_prev,
-            )
-            result_next = attn_fn(
-                q_next,
-                meta.cu_seqlens_q_next_tensor,
-                meta.kv_len_next_tensor,
-                meta.max_seqlen_q_next,
-            )
-            result = torch.cat([result_prev, result_next], dim=0)
 
         pad_size = queries[0].shape[0] - logical_tokens
         assert pad_size >= 0
