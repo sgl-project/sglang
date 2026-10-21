@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 
 class DevicePoolEntry:
@@ -263,6 +264,7 @@ def _build_deepseek_v4_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_compressed_region_buffers,
         _dsv4_indexer_regions,
+        _dsv4_low_ratio_regions,
         _require_single_row_dsv4_swa_pages,
         _resolve_deepseek_v4_layer_mappings,
     )
@@ -272,8 +274,11 @@ def _build_deepseek_v4_device_pool_group(
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    # Encoder SWA replay keeps the target window per request; the draft SWA is
+    # dropped with it, a known draft accept-length cost.
+    has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
     entries = []
-    if not is_unified_kv:
+    if has_paged_swa:
         _require_single_row_dsv4_swa_pages(
             logical_page_size=kvcache.swa_page_size,
             physical_page_size=kvcache.swa_kv_pool.page_size,
@@ -320,31 +325,36 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
-    c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
-    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
-
-    add(
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.KV,
-        kvcache.c4_kv_pool,
-        c4_buffers,
-        mappings.c4,
-    )
-    for region in _dsv4_indexer_regions(kvcache, page_size):
+    if mappings.c4:
+        c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
         add(
-            region.name,
+            PoolName.DEEPSEEK_V4_C4,
             PoolName.KV,
-            kvcache.c4_indexer_kv_pool,
-            region.device_buffers,
+            kvcache.c4_kv_pool,
+            c4_buffers,
             mappings.c4,
         )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        c128_buffers,
-        mappings.c128,
-    )
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add(
+                region.name,
+                PoolName.KV,
+                kvcache.c4_indexer_kv_pool,
+                region.device_buffers,
+                mappings.c4,
+            )
+    if mappings.c128:
+        c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+        add(
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.KV,
+            kvcache.c128_kv_pool,
+            c128_buffers,
+            mappings.c128,
+        )
+    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, page_size
+    ):
+        add(name, PoolName.KV, device_pool, buffers, layer_mapping)
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
@@ -382,6 +392,13 @@ def _build_deepseek_v4_device_pool_group(
                 mappings.c4_state_global_layers,
             ),
             mappings.c4_state,
+        )
+    if not has_paged_swa and any(
+        entry.indices_from_pool == PoolName.SWA for entry in entries
+    ):
+        raise ValueError(
+            "DeepSeek-V4 compress state pools take SWA page indices, which "
+            "encoder SWA replay does not keep."
         )
     return DevicePoolGroup(
         entries,
@@ -442,6 +459,156 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _mha_device_pool_entry(
+    name: PoolName,
+    pool: Any,
+    layer_mapping: dict[int, int],
+    page_size: int,
+    indices_from_pool: PoolName | None = None,
+) -> DevicePoolEntry:
+    # TODO(alphabetc1): support mxfp8.
+    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+        raise ValueError(
+            "The direct external linker does not support scaled KV caches yet."
+        )
+    num_layers = len(pool.k_buffer)
+    return DevicePoolEntry(
+        name=name,
+        indices_from_pool=indices_from_pool or name,
+        device_pool=pool,
+        components=[[*pool.k_buffer, *pool.v_buffer]],
+        layer_mapping={
+            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
+        },
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+
+
+def _mamba_device_pool_entry(
+    req_to_token_pool: Any, start_layer: int
+) -> DevicePoolEntry:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+
+    # TODO(alphabetc1): support unified memory for hybrid Mamba models.
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The direct external linker does not support --enable-unified-memory "
+            "on hybrid Mamba models yet."
+        )
+    # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
+    if (
+        req_to_token_pool.mamba_ckpt_pool is not None
+        or req_to_token_pool.short_conv_pool.enabled
+        or req_to_token_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+
+    mamba_pool = req_to_token_pool.mamba_pool
+    mamba_cache = mamba_pool.mamba_cache
+    layers = range(mamba_pool.num_mamba_layers)
+    # One row per state slot; conv-only models carry an empty temporal state.
+    components = [
+        [state[layer] for layer in layers]
+        for state in (mamba_cache.temporal, *mamba_cache.conv)
+        if state.numel() > 0
+    ]
+    return DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=mamba_pool,
+        components=components,
+        layer_mapping=_stage_local_layer_mapping(
+            req_to_token_pool.mamba_map, start_layer
+        ),
+        page_size=1,
+        rows_are_pages=True,
+    )
+
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV, kvcache.full_kv_pool, full_mapping, page_size
+        ),
+        _mha_device_pool_entry(
+            PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
+        ),
+        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+    ]
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
+
+    # TODO(alphabetc1): support other full-attention pools, DCP and packed draft KV.
+    full_kv_pool = kvcache.full_kv_pool
+    if (
+        type(kvcache) is not HybridLinearKVPool
+        or type(full_kv_pool) is not MLATokenToKVPool
+        or get_parallel().attn_dcp_size > 1
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + MAMBA models only with a "
+            "plain MLA pool, without DCP or packed draft KV."
+        )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_kv_pool,
+            components=[full_kv_pool.kv_buffer],
+            layer_mapping=_stage_local_layer_mapping(
+                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+            ),
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+    ]
+    for draft_pool in params.sidecar_draft_device_pools:
+        if draft_pool.page_size != page_size:
+            raise ValueError("Draft KV page size must match the tree page size.")
+        # Draft layer i rides transfer layer i; the draft reads it only after
+        # the batch's loads finish.
+        entries.append(
+            _mha_device_pool_entry(
+                PoolName.DRAFT,
+                draft_pool,
+                {layer: layer for layer in range(draft_pool.layer_num)},
+                page_size,
+                indices_from_pool=PoolName.KV,
+            )
+        )
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    # Not rank_replicated: the Mamba state is TP-sharded.
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
@@ -454,8 +621,15 @@ def resolve_hybrid_device_pool_group(
         _select_strategy,
     )
 
-    return _select_strategy(kvcache, components).build_direct_linker_pool_group(
+    group = _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
         params=params,
         page_size=page_size,
     )
+    if getattr(params, "sidecar_draft_device_pools", ()) and (
+        PoolName.DRAFT not in group.entry_map
+    ):
+        raise ValueError(
+            "The direct external linker does not support this model's draft KV."
+        )
+    return group

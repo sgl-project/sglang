@@ -398,6 +398,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
+| `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 

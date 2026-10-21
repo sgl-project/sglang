@@ -259,6 +259,206 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[3, 17]])
         self.assertEqual(offsets, [[3, 22]])
 
+    def test_deepseek_v41_shared_kv_and_split_indexer_pages(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4LayerItem,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        def index_pool(layers, rows, width):
+            return SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=None,
+                index_k_payload_buffer=[
+                    torch.arange(rows * width, dtype=torch.uint8).reshape(rows, width)
+                    for _ in range(layers)
+                ],
+                index_k_scale_buffer=[
+                    torch.zeros((rows, 2), dtype=torch.uint8) for _ in range(layers)
+                ],
+            )
+
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.start_layer, pool.end_layer = 1, 7
+        pool.swa_page_size = 8
+        pool.swa_kv_pool = SimpleNamespace(
+            page_size=8,
+            kv_buffer=[torch.zeros((5, 3), dtype=torch.uint8) for _ in range(6)],
+        )
+        pool.c4_kv_pool = pool.c128_kv_pool = pool.c4_indexer_kv_pool = None
+        pool.sources_by_ratio = {1: [4], 2: [2, 6]}
+        pool.kv_pools = {
+            1: SimpleNamespace(kv_buffer=[torch.zeros((5, 7), dtype=torch.uint8)]),
+            2: SimpleNamespace(
+                kv_buffer=[torch.zeros((5, 11), dtype=torch.uint8) for _ in range(2)]
+            ),
+        }
+        pool.index_pools = {1: index_pool(1, 23, 4), 2: index_pool(2, 13, 6)}
+        pool.layer_mapping = [
+            DeepSeekV4LayerItem(ratio, layer)
+            for ratio, layer in [
+                (0, -1),
+                (0, -1),
+                (2, 0),
+                (2, 0),
+                (1, 0),
+                (1, 0),
+                (2, 1),
+            ]
+        ]
+        pool.compress_state_pools = [None] * 7
+        pool.indexer_compress_state_pools = [None] * 7
+        draft = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros((5, 13), dtype=torch.uint8) for _ in range(2)]
+            )
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=8,
+            params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
+            components={ComponentType.FULL, ComponentType.SWA},
+        )
+        self.assertEqual(
+            set(group.entry_map),
+            {
+                PoolName.SWA,
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            },
+        )
+        self.assertEqual(group.entry_map[PoolName.DEEPSEEK_V4_C1].layer_mapping, {3: 0})
+        c2 = group.entry_map[PoolName.DEEPSEEK_V4_C2]
+        self.assertEqual(c2.layer_mapping, {1: 0, 5: 1})
+        self.assertIsNone(c2.get_prepared_layer_range_meta([1], 2))
+        self.assertEqual(
+            c2.get_prepared_layer_range_meta([1], 5),
+            ([[pool.kv_pools[2].kv_buffer[1][1].data_ptr()]], [[11]], [[11]]),
+        )
+        full = PoolTransfer(
+            name=PoolName.KV, keys=["page"], device_indices=torch.arange(8, 16)
+        )
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            keys=["tail"],
+            device_indices=torch.arange(8, 16),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        transfers = {t.name: t for t in group.resolve_transfers([full, swa])}
+        self.assertEqual(transfers[PoolName.DEEPSEEK_V4_C2].keys, ["page"])
+        self.assertEqual(
+            transfers[PoolName.DEEPSEEK_V4_C2].hit_policy, PoolHitPolicy.ALL_PAGES
+        )
+        self.assertEqual(transfers[PoolName.SWA].keys, ["tail"])
+        for ratio, name, width, raw_row in [
+            (1, PoolName.DEEPSEEK_V4_C1_INDEXER, 16, 4),
+            (2, PoolName.DEEPSEEK_V4_C2_INDEXER, 12, 2),
+        ]:
+            entry = group.entry_map[name]
+            pointers, sizes = entry.get_page_buffer_meta(torch.arange(8, 16))
+            original = pool.index_pools[ratio].index_k_payload_buffer
+            self.assertEqual(pointers, [b[raw_row].data_ptr() for b in original])
+            self.assertEqual(sizes, [width] * len(original))
+            self.assertTrue(
+                torch.equal(
+                    entry.components[0][0][1],
+                    original[0][raw_row : raw_row * 2].flatten(),
+                )
+            )
+        self.assertEqual(
+            group.entry_map[PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE].get_page_buffer_meta(
+                torch.arange(8, 16)
+            )[1],
+            [8],
+        )
+        self.assertEqual(
+            group.entry_map[PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE].get_page_buffer_meta(
+                torch.arange(8, 16)
+            )[1],
+            [4, 4],
+        )
+        _, sizes, offsets = group.entry_map[PoolName.SWA].get_prepared_layer_range_meta(
+            [1], 0
+        )
+        self.assertEqual(sizes, [[3, 13]])
+        self.assertEqual(offsets, [[0, 18]])
+
+    def test_deepseek_v41_request_window_drops_swa(self):
+        """Encoder replay leaves no target SWA pool: skip SWA and the draft SWA
+        rather than dereference them, and refuse pools that take SWA indices."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4LayerItem,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        def state_pool():
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((4, 3))),
+            )
+
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.start_layer, pool.end_layer = 0, 2
+        pool.swa_page_size = 8
+        pool.swa_kv_pool = None
+        pool.c4_kv_pool = pool.c128_kv_pool = pool.c4_indexer_kv_pool = None
+        pool.sources_by_ratio = {1: [1]}
+        pool.kv_pools = {
+            1: SimpleNamespace(kv_buffer=[torch.zeros((3, 7), dtype=torch.uint8)])
+        }
+        pool.index_pools = {
+            1: SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=[torch.zeros((9, 4), dtype=torch.uint8)],
+            )
+        }
+        pool.layer_mapping = [DeepSeekV4LayerItem(0, -1), DeepSeekV4LayerItem(1, 0)]
+        pool.compress_state_pools = [None, None]
+        pool.indexer_compress_state_pools = [None, None]
+        draft = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros((3, 5), dtype=torch.uint8)]
+            )
+        )
+        params = SimpleNamespace(mtp_draft_device_pools=(draft,))
+        group = resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=8,
+            params=params,
+            components={ComponentType.FULL, ComponentType.SWA},
+        )
+        self.assertEqual(
+            set(group.entry_map),
+            {PoolName.DEEPSEEK_V4_C1, PoolName.DEEPSEEK_V4_C1_INDEXER},
+        )
+        indexer = group.entry_map[PoolName.DEEPSEEK_V4_C1_INDEXER]
+        _, sizes = indexer.get_page_buffer_meta(torch.arange(8, 16))
+        self.assertEqual(sizes, [16])
+
+        pool.layer_mapping[0] = DeepSeekV4LayerItem(4, 0)
+        pool.c4_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((3, 5), dtype=torch.uint8)],
+            bytes_per_page_padded=5,
+        )
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[torch.zeros((3, 6), dtype=torch.uint8)]
+        )
+        pool.compress_state_pools[0] = state_pool()
+        pool.indexer_compress_state_pools[0] = state_pool()
+        with self.assertRaisesRegex(ValueError, "SWA page indices"):
+            resolve_hybrid_device_pool_group(
+                kvcache=pool,
+                page_size=8,
+                params=params,
+                components={ComponentType.FULL, ComponentType.SWA},
+            )
+
     def test_unified_deepseek_v4_uses_only_compressed_pools(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 
@@ -445,6 +645,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
             components={ComponentType.FULL},
         )
+        with self.assertRaisesRegex(ValueError, "draft KV"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(
+                    mtp_draft_device_pools=(), sidecar_draft_device_pools=(object(),)
+                ),
+                components={ComponentType.FULL},
+            )
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
@@ -472,8 +681,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
-    def test_linker_requires_packed_draft(self):
-        """Do not accept draft state that the linker would omit from storage."""
+    def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -510,39 +718,109 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     ),
                 ),
             ):
-                if linker_enabled and not nextn_layers:
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "only supports packed"
-                    ):
-                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-                    self.assertEqual(target.mtp_draft_device_pools, ())
-                else:
-                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-                    self.assertEqual(
-                        plan.mode,
-                        spec.HiCacheDraftMode.PACKED
-                        if nextn_layers
-                        else spec.HiCacheDraftMode.SIDECAR,
-                    )
-                    self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
-                    self.assertEqual(
-                        target.mtp_draft_device_pools,
-                        plan.device_pools if nextn_layers else (),
-                    )
+                plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                self.assertEqual(
+                    plan.mode,
+                    spec.HiCacheDraftMode.PACKED
+                    if nextn_layers
+                    else spec.HiCacheDraftMode.SIDECAR,
+                )
+                self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
+                self.assertEqual(
+                    target.mtp_draft_device_pools,
+                    plan.device_pools if nextn_layers else (),
+                )
 
-    def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    def test_mla_mamba_maps_kv_pages_and_state_slots(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache.start_layer = 0
+        kvcache.full_attention_layer_id_mapping = {1: 0, 3: 1}
+        kvcache.full_kv_pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kvcache.full_kv_pool.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        mamba_cache = SimpleNamespace(
+            temporal=torch.zeros((2, 4, 3), dtype=torch.uint8),
+            conv=[torch.zeros((2, 4, 2), dtype=torch.uint8)],
+        )
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.layer_num = 2, 1
+        draft.k_scale_buffer = draft.native_k_scale_buffer = None
+        draft.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        draft.v_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(),
+            sidecar_draft_device_pools=(draft,),
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
+                mamba_map={0: 0, 2: 1},
+                mamba_ckpt_pool=None,
+                short_conv_pool=SimpleNamespace(enabled=False),
+                ngram_pool=SimpleNamespace(enabled=False),
+            ),
+        )
+
+        def resolve(dcp_size=1):
+            with (
+                patch.object(
+                    linker_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ),
+                patch.object(
+                    linker_pool_assembler,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                ),
+            ):
+                return resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=params,
+                    components={ComponentType.FULL, ComponentType.MAMBA},
+                )
+
+        group = resolve()
+        self.assertEqual(group.num_layers, 4)
+        self.assertFalse(group.rank_replicated)
+        kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        self.assertEqual(kv.layer_mapping, {1: 0, 3: 1})
+        self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+        self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
+        self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
+        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
+            resolve(dcp_size=2)
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
+            resolve()
+        params.mtp_draft_device_pools = ()
+        kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
+            resolve()
+
+    def test_unsupported_strategy_fails_with_context(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        kvcache = SWAKVPool.__new__(SWAKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "does not support the direct external linker: _SwaStrategy",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
+                components={ComponentType.FULL, ComponentType.SWA},
             )
 
 
