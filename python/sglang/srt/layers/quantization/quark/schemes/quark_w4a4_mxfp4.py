@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import logging
 import threading
 from typing import Any, Callable, Optional
@@ -36,6 +37,25 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
+
+# Workaround: AITER's Triton gemm_afp4wfp4 returns wrong outputs on gfx950 when K
+# is not a whole number of BLOCK_SIZE_K blocks, i.e. on its masked K-tail path
+# (measured on ROCm/aiter@2bb549102, MI355X; kernel unchanged through @285579b62).
+# Drop once that path is correct in the pinned AITER.
+# Smallest block validated against a dequantized reference on MI355X.
+_AFP4WFP4_MIN_BLOCK_K = 128
+
+
+def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
+    """Narrowed BLOCK_SIZE_K for ``k`` FP4 elements, or None to keep ``block_k``."""
+    # gemm_afp4wfp4 itself shrinks a block wider than K to K's next power of two.
+    block_k = min(block_k, 1 << (k - 1).bit_length())
+    if k % block_k == 0:
+        return None
+    while block_k > _AFP4WFP4_MIN_BLOCK_K and k % block_k:
+        block_k //= 2
+    return block_k if k % block_k == 0 else None
+
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
 # Quark model matrix. Unlike the Triton fallback, it consumes AITER's
@@ -166,11 +186,24 @@ if _is_hip:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
+    from aiter.ops.triton.gemm_afp4wfp4 import _get_config as _afp4wfp4_config
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+
+    @functools.lru_cache(maxsize=None)
+    def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
+        # None keeps AITER's own config selection.
+        if not is_gfx95_supported():
+            return None
+        config, _ = _afp4wfp4_config(m, n, k_packed)
+        # Split-K configs go through AITER's get_splitk, which picks an even K split.
+        if config["NUM_KSPLIT"] != 1:
+            return None
+        block_k = _afp4wfp4_even_k_block(config["BLOCK_SIZE_K"], 2 * k_packed)
+        return None if block_k is None else {**config, "BLOCK_SIZE_K": block_k}
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -179,7 +212,16 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
-        _gemm_afp4wfp4_orig(x, w, x_scales, w_scales, y.dtype, y)
+        config = _afp4wfp4_even_k_config(x.shape[0], w.shape[0], x.shape[1])
+        _gemm_afp4wfp4_orig(
+            x,
+            w,
+            x_scales,
+            w_scales,
+            y.dtype,
+            y,
+            config=None if config is None else dict(config),
+        )
 
     def _aiter_gemm_afp4wfp4_fake(
         x: torch.Tensor,
