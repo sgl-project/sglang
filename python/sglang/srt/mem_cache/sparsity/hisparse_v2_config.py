@@ -36,6 +36,13 @@ def resolve_hisparse_v2_query_steps(
     return num_draft_tokens
 
 
+def hisparse_v2_dsv4_host_tokens(full_size: int, page_size: int) -> int:
+    """Host tokens HiCache gives a DeepSeek-V4 pool: the device FULL pages times
+    --hicache-ratio, as _deepseek_v4_num_host_pages sizes it."""
+    device_pages = (full_size + page_size - 1) // page_size
+    return int(device_pages * get_memory().hicache_ratio) * page_size
+
+
 def parse_hisparse_v2_config(*, model_top_k: int = 2048) -> HiSparseV2Config:
     memory = get_memory()
     return resolve_hisparse_v2_config(

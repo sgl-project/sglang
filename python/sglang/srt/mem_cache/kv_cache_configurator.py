@@ -1916,6 +1916,14 @@ class KVCacheConfigurator:
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
         )
+        if get_memory().enable_hisparse_v2 and not self.is_draft_worker:
+            from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+                hisparse_v2_dsv4_host_tokens,
+            )
+
+            kv_layout_kwargs["hisparse_v2_host_tokens"] = hisparse_v2_dsv4_host_tokens(
+                full_max_total_num_tokens, self.pool_page_size
+            )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,

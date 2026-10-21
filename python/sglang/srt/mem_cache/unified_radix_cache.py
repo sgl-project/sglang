@@ -1124,8 +1124,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
-        if self.hisparse_v2_coordinator is not None and req.hisparse_v2_active:
-            return
+        if self.hisparse_v2_coordinator is not None:
+            if req.hisparse_v2_active:
+                return
+            if not req.finished():
+                up_to = self.hisparse_v2_coordinator.checkpoint_up_to(req, up_to)
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)

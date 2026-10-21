@@ -81,6 +81,10 @@ class HiSparseV2Coordinator:
         tree_cache.hisparse_v2_coordinator = self
         tree_cache.tree_core.hisparse_v2_coordinator = self
 
+    def checkpoint_up_to(self, req, up_to: int) -> int:
+        """How far a running request's checkpoint may publish into the tree."""
+        return up_to
+
     def _wait_for_forward(self) -> None:
         if self.forward_stream is not None:
             torch.cuda.current_stream().wait_stream(self.forward_stream)

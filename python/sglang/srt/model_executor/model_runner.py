@@ -1020,6 +1020,17 @@ class ModelRunner:
         """Build the DSA HiCache coordinator before graph capture."""
         if not get_memory().enable_hisparse_v2:
             return
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if is_deepseek_v4(self.model_config.hf_config):
+            if self.is_draft_worker:
+                return
+            from sglang.srt.managers.hisparse_v2_dsv41 import build_hisparse_v2_dsv41
+
+            self.hisparse_v2_cache, self.hisparse_v2_coordinator = (
+                build_hisparse_v2_dsv41(model_runner=self)
+            )
+            return
         from sglang.srt.managers.hisparse_v2_coordinator import (
             HiSparseV2Coordinator,
             build_hisparse_v2_cache,

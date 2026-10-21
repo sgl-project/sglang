@@ -1159,6 +1159,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+        # HiSparse V2 also keeps the index keys of every host token on GPU.
+        if get_memory().enable_hisparse_v2:
+            self.low_ratio_index_bytes *= 1 + get_memory().hicache_ratio
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
