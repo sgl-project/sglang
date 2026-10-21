@@ -8,9 +8,10 @@ are no configured policies.
 With no executor, cache primitives return `unsupported`. The optional
 `UnifiedCacheExecutor` now applies copy-scoped priorities to real
 `UnifiedRadixCache` copies and inspects their current residency. The HTTP/Engine
-control APIs and attached request lifecycle use that executor. Transfer
-integration remains a separate feature. Verification uses real CPU pools and a
-small real-CUDA cache smoke test. Model inference has not passed validation.
+control APIs and attached request lifecycle use that executor. A persistent-host
+HiCache adapter also executes FULL-prefix COPY/MOVE on its actual data path.
+Verification includes CPU pools, real CUDA byte checks and an OPT dummy-weight
+server smoke test with loaded-prefix reuse.
 
 The design follows the accepted
 [SGLang RFC](../../../../../docs/programmable-kvc/RFC-programmable-kv-cache.md)
@@ -212,10 +213,10 @@ Cancelling a logical interest never authorizes freeing a buffer still accessed
 by a worker or another waiter. Serving integration must continue progress until
 those obligations end, even after a task's finish action completes.
 
-Transfers, shared-load joining, whole-scope preparation and all-rank publication
-remain pending. Policies and event feeds are later units. The CPU suite validates
-in-process HTTP/IPC and cache/request behavior. It does not validate model
-inference, production GPU kernels or serving performance.
+Multi-rank publication, storage/linker transfers, policies and event feeds remain
+pending. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
+tests cover the explicitly described one-owner FULL profile. No serving
+performance or model-quality claim follows from these smoke tests.
 
 ## Serving entry points
 
@@ -228,10 +229,16 @@ python -m sglang.launch_server --model-path MODEL \
 
 The current executable profile requires TP=PP=CP=DP=1 on one node, the enabled
 built-in unified cache and ordinary text generation. Speculative decoding, PD
-disaggregation and alternate caches are rejected at startup. HiCache/linker
-execution is not enabled by this feature. Python backend fallback is deliberate.
+disaggregation and alternate caches are rejected at startup. Persistent-host
+HiCache requires FULL-only state and `--disable-overlap-schedule`; storage,
+buffer-only and direct-linker control paths remain unsupported. Python backend
+fallback is deliberate.
 LoRA, multimodal and StreamingSession primitive execution returns unsupported;
 ordinary inference and opaque action consumers retain their existing behavior.
+Weight mutation APIs return a typed refusal while this control profile is
+enabled, before accessing runners or collectives. Epoch rotation alone does not
+provide weight-namespace isolation; that integration remains pending and is
+reported as `weight_updates: unsupported` in discovery.
 
 GET `/v1/kv/capabilities` returns `{success, data}` with `engine_id`,
 `engine_epoch`, `namespace`, executable actions/components/layout and the selected
@@ -244,7 +251,7 @@ topology. POST `/v1/kv/control` accepts a strict tagged command:
 | `query`, `ack` | `context`, `message_id` |
 | `lookup` | `context`, `message_id`, optional bounded `limit` |
 | `cancel` | exact operation `ref` returned in a submission/query |
-| `residency` | `context`, logical `target`, optional `limit` |
+| `residency` | `context`, logical `target`, optional `limit` and `location` (default GPU) |
 | `associations` | `context`, optional `session_id`, `cursor`, `limit` |
 | `capacity` | `context` |
 
@@ -353,13 +360,13 @@ honors the controller's `ExecutionRequest.max_result_targets` budget.
 | Current capability | Supported scope |
 | --- | --- |
 | Executor operation | Synchronous `sglang.set_priority`, local device tier (`gpu` in the protocol, backed by CPU pools in these tests) |
-| Components | Built-in FULL, FULL+SWA, FULL+Mamba and FULL+SWA+Mamba |
+| Components | Without HiCache: built-in FULL, FULL+SWA, FULL+Mamba and FULL+SWA+Mamba; persistent-host control currently requires FULL |
 | Addressing | Tokens, frozen session/continuation targets, authoritative `request_cached` completion content, and descriptors returned by residency inspection |
 | FULL coverage | Page-aligned token ranges, including boundaries inside radix nodes |
 | SWA coverage | Actual page-aligned trailing-window spans, with the physical window size reported; explicit window/token descriptors also resolve current copies |
 | Mamba coverage | An existing sequence-end checkpoint, reported as a point; absent intermediate checkpoints produce missing/partial results |
 | Ingress/ownership | HTTP/Engine or callable core, typed IPC, one scheduler/cache owner and epoch |
-| Unsupported | COPY/MOVE, host/storage priority, HiCache/direct-linker execution, in-flight transfers, TP/PP/CP/sharded execution, speculative/bigram/draft/extra-buffer layouts, LoRA/extra-key and multimodal targeting, custom components/backends |
+| Unsupported priority scope | Host/storage priority, priority on pending transfers, TP/PP/CP/sharded execution, speculative/bigram/draft/extra-buffer layouts, LoRA/extra-key and multimodal targeting, custom components/backends |
 
 Tokens are matched through actual namespace-aware `RadixKey` traversal without
 touching recency or creating cache hits. Prefix descriptor IDs hash the compatible
@@ -397,6 +404,63 @@ Native `finish_task` continues to abandon pending operation interests. Completed
 explicit copy claims retain their caller-controlled lifetime, so task cleanup
 cannot revoke another caller's declaration or delete shared bytes. Policy-owned
 claim ownership and cleanup remain a unit 2/4 integration obligation.
+
+## Persistent-host movement
+
+Enable the supported serving profile with the ordinary HiCache options:
+
+```bash
+python -m sglang.launch_server --model-path MODEL \
+  --kv-control-config '{"namespace":"model-weights-v1","engine_id":"worker-a"}' \
+  --enable-hierarchical-cache --hicache-write-policy write_back \
+  --hicache-host-memory-mode cache --disable-overlap-schedule
+```
+
+This adapter supports COPY GPU→host, COPY host→GPU, and MOVE GPU→host.
+Discovery lists these directions only when the actual cache/controller supports
+them. Transfers address whole page-aligned prefixes at existing radix boundaries
+using tokens, token-backed session snapshots or `request_cached`. Other ranges,
+descriptor-only transfers, hybrid state, storage/buffer/draft/sidecar paths,
+host→GPU MOVE and direct-linker publication are unsupported in this stage.
+
+Approval counts each selected physical fragment once, including shared branch
+prefixes. It protects already-resident members and checks the complete reusable
+scope before queuing any allocation/transfer. The scheduler supplies a fresh
+allocator prefill budget with its existing running-decode growth estimate;
+subsequent branch loads recheck current capacity and allocations. That estimate
+is not an additional memory reservation carried into request admission. The
+callable cache API without a scheduler uses allocator capacity; its owner remains
+responsible for admission headroom.
+
+Temporary source/capacity waits remain `queued`, hold no buffers and can be
+cancelled. A known scope larger than the entire destination pool returns terminal
+`deferred`, so an impossible scope cannot leave the engine indefinitely active.
+`max_query_nodes` bounds worst-case prefix pages across branches, preserving room
+to inspect completion even if ordinary requests split every page during DMA.
+Per-caller result budgets cover partial destination runs and source retention
+before execution. Adjacent equivalent results are merged into logical ranges.
+
+Compatible interests share the transfer and allocator work, with separate
+contexts and results. Cancelling one interest does not release the job's holds.
+The last cancellation drains queued/active copies to a real completion fence
+before retiring its buffers. Partial submission failures retain their first
+cause, observed published ranges and failed status through cancellation,
+ACK/replay and a subsequent independent retry.
+
+COPY completes after the required HiCache fences and publication. MOVE then
+releases only eligible device residency; request references or external branches
+produce `partial` with `destination_ready` and `source_busy` for retained ranges.
+Successful reclamation additionally reports `source_reclaimed`. Host inspection
+uses `location: {"tier": "host"}` and identifies that location per entry. It does
+not treat pending DMA indices as ready data. Fresh GPU copies have no inherited
+priority claims.
+
+Native H2D uses HiCache's existing allocation/commit/load machinery. Its installed
+indices are not ready until the fence. While such a native load is pending,
+fresh prefill admission waits; running decode continues under the supported
+non-overlap scheduler. Idle control progress drives the fences and removes the
+barrier on completion. The normal request-driven load threshold stays unchanged;
+an explicit approved prefix can load below that heuristic threshold.
 
 Run from the repository root:
 
@@ -438,8 +502,25 @@ PYTHONPATH=python CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
 ```
 
 It verifies actual CUDA KV bytes, victims, request locks, soft-priority reclaim,
-copy-lifetime/replay and allocator balance on one A100. A tiny-Llama server
-attempt has not passed: startup currently fails before cache initialization at
-the existing DualGemm import (`cutlass.cute` unavailable in the locally installed
-4.8.0 DSL distribution). No model output, service latency or throughput claim is
-derived from the cache proof.
+copy-lifetime/replay and allocator balance on one A100. The corresponding real
+HiCache proof is `test/manual/entrypoints/programmable_kv_hicache_smoke.py`; it
+checks actual host/CUDA K/V bytes, MOVE reclamation, COPY restoration and final
+references/pool balances using the direct I/O backend.
+
+The reusable server proof is:
+
+```bash
+PYTHONPATH=python CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  test/manual/entrypoints/programmable_kv_server_smoke.py \
+  --model-path LOCAL_OPT_CONFIG --load-format dummy --hicache
+```
+
+It launches an owned server, completes generation with attached priority,
+discovers the result, independently demotes the committed prefix, verifies its
+GPU absence and host presence, restores it, and observes cache hits on a repeated
+generation with equal output tokens. It also checks fresh-copy priority, flush
+epoch rotation and stale-reference rejection, retaining logs/results. Dummy
+weights validate the interface and execution path. A local tiny-Llama checkpoint
+attempt still fails before cache initialization at the existing DualGemm
+`cutlass.cute` import in this environment; that unsuccessful path is retained in
+the validation record. Neither fixture establishes model quality or throughput.

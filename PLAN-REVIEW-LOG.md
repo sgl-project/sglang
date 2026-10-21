@@ -195,3 +195,111 @@ model result. Further model validation remains necessary.
 
 Verdict: approve the serving/priority entry-point feature with this explicit
 model-validation limitation. Real transfers and composable policies remain work.
+
+### Unit 3a — Persistent-host HiCache execution
+
+Implemented actual FULL-prefix GPU→host COPY/MOVE and host→GPU COPY using the
+existing cache/controller allocation, queue, fence and publication paths. Jobs
+coalesce compatible logical scopes and retain independent cancellation/results.
+Whole-scope holds protect both pre-existing and arriving prefix members. Unique
+physical fragments are charged once across branches; per-branch allocation
+rechecks actual remaining capacity. A scheduler callback uses its existing
+prefill budget and decode-growth estimate, including fixed-length requests and
+chunked-request identity deduplication, without carrying a second reservation into
+normal request admission.
+
+Native loads install indices before DMA completion in the existing HiCache path.
+The supported non-overlap scheduler therefore waits for native H2D completion
+before fresh prefill matching. Idle progress drains the real completion queues.
+Normal request load thresholds remain unchanged; explicitly approved loads use a
+separate minimum threshold. COPY publishes after fences; MOVE reclaims only
+eligible source leaves and reports retained ranges as partial. Last-waiter cancel
+retains buffers until quiescence. Partial-submit failure causes and actual effects
+survive cancellation, ACK/replay and independent retry. Completed outcomes merge
+adjacent logical ranges and hash only the final runs.
+
+Review corrections included: distinguish terminal DEFERRED from resource QUEUED;
+reject scopes larger than the entire pool without leaving an active idle record;
+reserve traversal budget for ordinary page splits during DMA; validate every
+joiner's result budget; normalize equivalent local tier addresses for coalescing;
+record reclamation only after allocator release; preserve failure over cancel;
+and retain observed destination effects if cancellation races with completion.
+The real request/host locks and tree split fixups were exercised, not simulated
+as an independent residency database.
+
+Current capabilities are explicit: one owner, built-in FULL, persistent local
+host, token-backed complete prefixes at page/radix boundaries, and no overlap.
+Hybrid transfers, descriptor-only/range transfers, L3/linker paths and multi-rank
+publication remain pending. Existing weight update entry points can mutate before
+checking idleness, so this profile now returns a typed refusal before accessing
+runners/collectives. Proper weight-namespace isolation is a required later unit;
+weight updates are not advertised as supported.
+
+Parent CPU proof ran each file separately with accelerators hidden and Python
+TreeCore, preserving full output in /tmp/sglang-kv-host-cpu-proof.txt:
+
+- control: 78 passed;
+- real-cache priority: 21 passed, 18 subtests;
+- serving/request lifecycle: 12 passed;
+- native host transfer: 13 passed;
+- existing HiCache transfer lifecycle: 8 passed;
+- existing prefill adder: 53 passed, 54 subtests;
+- existing schedule policy: 11 passed, 4 subtests;
+- weight-update runner selection: 1 passed, 9 subtests;
+- scheduler weight-version tracking: 20 passed.
+
+Total: 217 passed. After strengthening the byte fixtures, the 13 host cases
+passed again. The host suite uses actual CPU pools and HybridCacheController;
+only the L2 DMA/fence boundary is controlled. It verifies ordinary splits during
+DMA, independent shared cancellation, complete-scope capacity, partial MOVE,
+partial submission failure and result/replay preservation, no-allocation rejection,
+terminal impossible-scope deferral, and running-growth accounting. Recovery tests
+poison freed device buffers before restoring, so stale contents cannot satisfy
+the byte checks. Default prefill behavior keeps the same growth formula.
+
+Real GPU 1 HiCache direct I/O passed on A100-SXM4-80GB with PyTorch 2.14.1+cu130:
+GPU→host MOVE stored nonzero K/V before reclaim; host→GPU COPY restored them
+after all free GPU rows were poisoned. Pool availability was 64 after MOVE and
+60 after COPY (four valid cached tokens); references, pending queues and native
+jobs/interests retired. Peak fixture tensor allocation was 9,728 bytes. The tiny
+head emits an optional JIT-row-size diagnostic; this proof explicitly uses the
+direct backend and makes no claim about the kernel backend.
+
+A model execution path now passes as well. A local OPT-125m configuration with
+--load-format dummy avoids the separate tiny-Llama CUTLASS import failure and
+executes real GPU forward/cache/control code. The reusable server smoke covers
+attached priority, bounded result discovery, independent full-prefix MOVE,
+GPU-absence/host-presence inspection, independent COPY, fresh priority zero,
+loaded-prefix reuse on repeated generation (3 cached tokens, equal outputs),
+flush epoch rotation and HTTP 409 for stale references. Dummy outputs are not a
+model-quality or throughput result. The failed Llama attempt remains recorded.
+
+GPU proof artifacts include /tmp/sglang-kv-gpu-hicache-poison-smoke.log and
+/tmp/sglang-kv-opt-hicache-final-smoke/{server.log,result.json}. The manual server
+harness uses an owned process group, checks its generated owner identity and
+retains separate run artifacts. Only its own processes are terminated. A final
+identity-isolated harness run is recorded in the validation report.
+
+### Unit 3a — Final review additions
+
+The byte fixtures now seed canonical overlapping prefixes before insertion and
+poison freed device buffers before H2D. CPU host cases passed again. Review also
+found that rebuilding an executor after cache flush could drop its scheduler
+capacity callback. The service preserves that callback across epoch rebind;
+a regression calls it after reset and the server harness checks the approval
+capability after flush. The host suite is now 14 tests; host plus service passed
+26 tests. Unique test count across this unit's nine relevant suites is 218.
+The validation record is docs/programmable-kvc/validation-host-control.md.
+
+The default prefill growth formula is unchanged. New files pass strict Ruff
+E4/E7/E9/F/UP037; changed existing files have no added findings against HEAD under
+identical rules. Repository isort/format, AST syntax and diff-whitespace checks
+are required before the local feature commit. Storage and policies remain the
+next implementation units; this entry does not declare the full RFC complete.
+
+Final identity-isolated GPU server run passed in
+/tmp/sglang-kv-opt-hicache-rebind-smoke/. It additionally asserts scheduler-budget
+approval before and after flush. The poisoned-byte CUDA test passed in
+/tmp/sglang-kv-gpu-hicache-poison-smoke.log. Final isort, formatting, whitespace,
+and no-added-Ruff-finding checks passed. Verdict: approve this bounded
+persistent-host transfer feature for its local commit.

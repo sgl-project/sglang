@@ -135,8 +135,21 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    def _native_kv_weight_guard(self, response_type):
+        service = getattr(getattr(self, "scheduler", None), "kv_control_service", None)
+        if getattr(getattr(service, "control", None), "enabled", False) is True:
+            return response_type(
+                success=False,
+                message="Weight updates require KV weight-namespace isolation, which is not integrated with this control profile",
+            )
+        return None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if (
+            rejected := self._native_kv_weight_guard(UpdateWeightFromDiskReqOutput)
+        ) is not None:
+            return rejected
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -189,6 +202,12 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
+        if (
+            rejected := self._native_kv_weight_guard(
+                UpdateWeightsFromDistributedReqOutput
+            )
+        ) is not None:
+            return rejected
         if self._session is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
@@ -231,6 +250,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
+        if (
+            rejected := self._native_kv_weight_guard(UpdateWeightsFromTensorReqOutput)
+        ) is not None:
+            return rejected
         if self._session is None:
             return UpdateWeightsFromTensorReqOutput(
                 success=False,
@@ -264,6 +287,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if (
+            rejected := self._native_kv_weight_guard(UpdateWeightsFromIPCReqOutput)
+        ) is not None:
+            return rejected
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -308,6 +335,10 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        if (
+            rejected := self._native_kv_weight_guard(BeginWeightUpdateReqOutput)
+        ) is not None:
+            return rejected
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,

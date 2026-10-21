@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Synchronous native priority execution against actual Python radix copies."""
+"""Native priority and persistent-host execution on Python radix copies."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from sglang.srt.managers.kv_control.contracts import (
     TokensTarget,
     Value,
     cache_compatibility,
+    validated,
 )
 from sglang.srt.managers.kv_control.controller import ExecutionRequest
 from sglang.srt.managers.kv_control.index import ResolvedTarget
@@ -37,6 +38,7 @@ class ResidencyEntry(Value):
     window_size: int | None
     effective_priority: int
     lock_ref: int
+    location: Location = Location(tier="gpu")
 
 
 class ResidencySnapshot(Value):
@@ -62,7 +64,7 @@ class _Row:
 
 
 class UnifiedCacheExecutor:
-    """One cache, namespace, epoch and owner thread; no transfer implementation.
+    """One cache, namespace, epoch and owner thread with explicit capabilities.
 
     Cache reconstruction/reset invalidates this adapter. Construct a new adapter
     with the owner's new epoch after reset. Namespace changes also need a new
@@ -89,6 +91,26 @@ class UnifiedCacheExecutor:
         )
         self.generation = self.claims.generation
         self._thread = threading.get_ident()
+        self.gpu_copy_capacity = None
+        self.transfers = None
+        if self.core.enable_hicache and not self._transfer_unsupported_reason():
+            from sglang.srt.mem_cache.unified_cache.control_transfers import (
+                HostCacheTransfers,
+            )
+
+            self.transfers = HostCacheTransfers(self)
+
+    def _transfer_unsupported_reason(self):
+        if self.core.component_types != (ComponentType.FULL,):
+            return "Host control transfers require the built-in FULL component"
+        if (
+            getattr(self.cache, "buffer_pipeline", None) is not None
+            or self.cache.sidecar_pool_specs
+        ):
+            return "Buffer/draft/sidecar transfers are not integrated"
+        if self.cache.enable_storage:
+            return "Storage-backed control transfers are not integrated"
+        return ""
 
     def _check(self, target):
         if threading.get_ident() != self._thread:
@@ -103,34 +125,54 @@ class UnifiedCacheExecutor:
         if target.namespace != self.config.namespace:
             raise ControlError("incompatible_namespace", "Cache namespace differs")
         reason = self.cache._kv_control_unsupported_reason
-        if reason or self.core.enable_hicache or self.core.enable_external_cache_linker:
+        if self.core.enable_hicache:
+            reason = reason or self._transfer_unsupported_reason()
+        if reason or self.core.enable_external_cache_linker:
             raise ControlError(
                 "unsupported",
-                reason or "HiCache/linker priority execution is not integrated",
+                reason or "Direct linker control is not integrated",
             )
 
     def capabilities(self):
         reason = self.cache._kv_control_unsupported_reason
+        if self.core.enable_hicache:
+            reason = reason or self._transfer_unsupported_reason()
         if self.claims.generation != self.generation:
             reason = "Cache generation changed; construct a new epoch-bound executor"
-        supported = (
-            not reason
-            and not self.core.enable_hicache
-            and not self.core.enable_external_cache_linker
-        )
+        supported = not reason and not self.core.enable_external_cache_linker
         return {
             "namespace": self.config.namespace,
             "engine_epoch": self.engine_epoch,
             "cache_generation": self.generation,
             "tree_core": "python",
             "layout_id": self.layout_id,
-            "actions": ("sglang.set_priority",) if supported else (),
+            "actions": (
+                ("sglang.set_priority", "sglang.copy_to", "sglang.move_to")
+                if self.transfers is not None
+                else ("sglang.set_priority",)
+            )
+            if supported
+            else (),
             "components": tuple(ct.name.lower() for ct in self.core.component_types)
             if supported
             else (),
             "tier": "gpu",
-            "directions": (),
-            "reason": reason or ("" if supported else "HiCache/linker is unsupported"),
+            "directions": (
+                {
+                    "copy_to": (("gpu", "host"), ("host", "gpu")),
+                    "move_to": (("gpu", "host"),),
+                    "granularity": "whole_token_prefix_at_existing_radix_boundary",
+                    "page_alignment": self.core.page_size,
+                    "native_load_prefill_barrier": True,
+                    "gpu_copy_approval": "scheduler_prefill_budget"
+                    if self.gpu_copy_capacity is not None
+                    else "allocator_capacity",
+                    "max_scope_pages": self.config.max_query_nodes,
+                }
+                if supported and self.transfers is not None
+                else {}
+            ),
+            "reason": reason or ("" if supported else "Linker is unsupported"),
         }
 
     def _compatibility(self, content):
@@ -196,6 +238,7 @@ class UnifiedCacheExecutor:
         *,
         window=True,
         content_id=None,
+        tier="gpu",
     ):
         rows, missing = [], []
         path = self._walk(prefix[:end], compatibility)
@@ -256,14 +299,20 @@ class UnifiedCacheExecutor:
                 if (
                     node.load_back_pending_id is not None
                     or node.write_through_pending_id is not None
+                    or (
+                        tier == "gpu"
+                        and self.transfers is not None
+                        and self.transfers._load_pending(node)
+                    )
                 ):
                     raise ControlError(
                         "unsupported",
                         "In-flight cache copies need transfer integration",
                     )
                 cd = node.component_data[component]
-                if cd.value is not None:
-                    if len(cd.value) != len(node.key):
+                value = cd.value if tier == "gpu" else cd.host_value
+                if value is not None:
+                    if len(value) != len(node.key):
                         raise ControlError(
                             "unsupported",
                             "Component has an unsupported physical span layout",
@@ -324,7 +373,7 @@ class UnifiedCacheExecutor:
             raise ControlError("unsupported", "Component is not configured")
         return component
 
-    def _resolve(self, target, limit):
+    def _resolve(self, target, limit, *, tier="gpu"):
         self._check(target)
         if type(limit) is not int or not 1 <= limit <= self.config.max_result_targets:
             raise ControlError("capacity", "Invalid cache result budget")
@@ -372,6 +421,7 @@ class UnifiedCacheExecutor:
                         clipped_start,
                         clipped_end,
                         self.core.component_types,
+                        tier=tier,
                     )
                     rows.extend(selected)
                     missing.extend(gaps)
@@ -426,6 +476,7 @@ class UnifiedCacheExecutor:
                             (component,),
                             window=False,
                             content_id=span.content_id,
+                            tier=tier,
                         )
                         rows.extend(
                             replace(
@@ -554,6 +605,8 @@ class UnifiedCacheExecutor:
                 or work.ref.context.engine_epoch != self.engine_epoch
             ):
                 raise ControlError("stale_epoch", "Executor owner identity differs")
+            if not isinstance(work.payload, SetPriority) and self.transfers is not None:
+                return self.transfers.start(work)
             if not isinstance(work.payload, SetPriority):
                 raise ControlError(
                     "unsupported", "Cache movement has no executable adapter"
@@ -627,23 +680,49 @@ class UnifiedCacheExecutor:
                 target_outcomes=tuple(outcomes + missing),
             )
         except ControlError as error:
-            status = (
-                Status.UNSUPPORTED if error.code == "unsupported" else Status.REJECTED
+            status = {"unsupported": Status.UNSUPPORTED, "missing": Status.MISSING}.get(
+                error.code, Status.REJECTED
             )
             return ExecutionUpdate(
                 status=status, quiescent=True, code=error.code, reason=str(error)
             )
 
     def poll(self, ref):
-        return None  # All supported priority work completes in start().
+        return self.transfers.poll(ref) if self.transfers is not None else None
+
+    def begin_poll(self, *, limit=64):
+        if self.transfers is not None:
+            self.transfers.begin_poll(limit=limit)
 
     def cancel(self, ref):
-        return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
+        return (
+            self.transfers.cancel(ref)
+            if self.transfers is not None
+            else ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
+        )
 
     def residency(
-        self, target: ResolvedTarget, *, limit: int = 256
+        self,
+        target: ResolvedTarget,
+        *,
+        limit: int = 256,
+        location: Location | None = None,
     ) -> ResidencySnapshot:
-        rows, missing = self._resolve(target, limit)
+        location = validated(location or Location(tier="gpu"), Location)
+        if (
+            location.engine_id not in (None, self.engine_id)
+            or location.backend is not None
+            or location.tier not in ("gpu", "host")
+        ):
+            raise ControlError(
+                "unsupported", "Residency inspection supports local GPU/host tiers"
+            )
+        if location.tier == "host" and self.transfers is None:
+            raise ControlError(
+                "unsupported", "Host residency inspection is not configured"
+            )
+        location = msgspec.structs.replace(location, engine_id=self.engine_id)
+        rows, missing = self._resolve(target, limit, tier=location.tier)
         return ResidencySnapshot(
             namespace=self.config.namespace,
             engine_epoch=self.engine_epoch,
@@ -655,15 +734,23 @@ class UnifiedCacheExecutor:
                     descriptor=self._descriptor(row),
                     coverage_kind=row.kind,
                     window_size=row.window,
-                    effective_priority=self.claims.effective(
-                        row.selection.node, row.selection.component
+                    effective_priority=(
+                        self.claims.effective(
+                            row.selection.node, row.selection.component
+                        )
+                        or 0
                     )
-                    or 0,
-                    lock_ref=row.selection.node.component_data[
-                        row.selection.component
-                    ].lock_ref,
+                    if location.tier == "gpu"
+                    else 0,
+                    lock_ref=getattr(
+                        row.selection.node.component_data[row.selection.component],
+                        "lock_ref" if location.tier == "gpu" else "host_lock_ref",
+                    ),
+                    location=location,
                 )
                 for row in rows
             ),
-            missing=tuple(missing),
+            missing=tuple(
+                msgspec.structs.replace(gap, location=location) for gap in missing
+            ),
         )

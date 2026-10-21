@@ -682,6 +682,16 @@ class KVControl:
     def progress(self, *, limit: int = 64) -> tuple[OperationResult, ...]:
         if type(limit) is not int or not 1 <= limit <= 4096:
             raise ControlError("invalid_payload", "Progress batch exceeds limit")
+        if (
+            self._pending
+            and (begin_poll := getattr(self.executor, "begin_poll", None)) is not None
+        ):
+            try:
+                begin_poll(limit=limit)
+            except Exception as error:
+                for pending in tuple(self._pending.values()):
+                    if pending.started:
+                        self._executor_error(pending, error)
         results = []
         # Rotate polled entries for bounded fair progress, including idle serving.
         for operation_id in tuple(self._pending):

@@ -14,6 +14,7 @@ from sglang.srt.managers.kv_control.contracts import (
     ControlError,
     Identifier,
     Limits,
+    Location,
     LogicalTarget,
     OperationRef,
     TokensTarget,
@@ -58,6 +59,7 @@ def runtime_config():
         get_disagg,
         get_memory,
         get_parallel,
+        get_schedule,
         get_spec,
     )
 
@@ -83,6 +85,10 @@ def runtime_config():
             "KV control does not support speculative decoding or PD disaggregation"
         )
     memory = get_memory()
+    if memory.enable_hierarchical_cache and not get_schedule().disable_overlap_schedule:
+        raise ValueError(
+            "Native host transfers currently require --disable-overlap-schedule"
+        )
     if (
         memory.disable_radix_cache
         or memory.radix_cache_backend
@@ -129,6 +135,7 @@ class Residency(Value, tag="residency", tag_field="kind"):
     context: ControlContext
     target: LogicalTarget
     limit: PageSize = 256
+    location: Location = Location(tier="gpu")
 
 
 class Associations(Value, tag="associations", tag_field="kind"):
@@ -187,22 +194,30 @@ class KVControlService:
             policies=(),
             topology="single_owner",
             attached_caller_id="request",
+            weight_updates="unsupported",
         )
 
     @property
     def has_pending(self):
         return self.control.registry.capacity()["active"] != 0
 
+    @property
+    def blocks_prefill(self):
+        transfers = self.control.executor.transfers
+        return transfers is not None and transfers.blocks_prefill
+
     def progress(self):
         if self.has_pending:
             self.control.progress()
 
     def reset_after_cache_flush(self):
+        capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(self.config.namespace)
         self.control.executor = self.cache.create_kv_control_executor(
             engine_id=self.control.registry.engine_id,
             engine_epoch=self.control.registry.engine_epoch,
         )
+        self.control.executor.gpu_copy_capacity = capacity
 
     def attach(self, req, envelope, *, unsupported_request=False):
         if envelope is None or not any(
@@ -292,7 +307,9 @@ class KVControlService:
             return control.cancel(command.ref)
         if isinstance(command, Residency):
             return control.executor.residency(
-                control.index.resolve(command.target), limit=command.limit
+                control.index.resolve(command.target),
+                limit=command.limit,
+                location=command.location,
             )
         if isinstance(command, Associations):
             return control.index.query(

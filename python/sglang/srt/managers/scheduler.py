@@ -221,6 +221,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    running_request_token_offset,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -705,6 +706,9 @@ class Scheduler(
 
             self.kv_control_service = KVControlService(
                 self.tree_cache, runtime_config()
+            )
+            self.kv_control_service.control.executor.gpu_copy_capacity = (
+                self._kv_control_gpu_copy_capacity
             )
 
         # Init request dispatcher
@@ -2915,6 +2919,24 @@ class Scheduler(
             result=dispatch(self.kv_control_service, recv_req.command),
         )
 
+    def _kv_control_gpu_copy_capacity(self):
+        # Called only for explicit H2D approval, after holding selected cache
+        # prefixes. Reuse the allocator budget and the prefill growth estimate;
+        # no extra reservation is carried into ordinary request admission.
+        budget = self.token_to_kv_pool_allocator.create_prefill_budget(self.tree_cache)
+        requests = list(self.running_batch.reqs)
+        if self.chunked_req is not None and not any(
+            req is self.chunked_req for req in requests
+        ):
+            requests.append(self.chunked_req)
+        ratio = self.new_token_ratio_tracker.current
+        budget.total_offset += sum(
+            max(0, running_request_token_offset(req, ratio))
+            for req in requests
+            if not req.finished()
+        )
+        return max(0, int(budget.remaining_total))
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -4062,6 +4084,13 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        if (
+            getattr(self, "kv_control_service", None) is not None
+            and self.kv_control_service.blocks_prefill
+        ):
+            # Native H2D has no inference-batch consumer index. Admit fresh
+            # prefix matches only after its required completion fence.
+            return None, running_batch
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
