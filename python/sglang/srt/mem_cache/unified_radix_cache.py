@@ -197,6 +197,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    cp_encoder_replay = False
+
     def __init__(
         self,
         params: CacheInitParams,

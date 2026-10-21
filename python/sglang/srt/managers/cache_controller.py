@@ -245,7 +245,6 @@ class StorageOperation:
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
         self.all_hash_values: Optional[List[str]] = None
-        self.restorable_prefix_pages: Optional[List[int]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
@@ -294,6 +293,8 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    cp_encoder_replay = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -579,11 +580,6 @@ class HiCacheController:
             # todo: load balancing
             and self.storage_config.tp_rank != 0
         )
-        if self.cp_encoder_replay and self.storage_config.attn_cp_rank != 0:
-            # Supported V4.1 replay pools are CP-replicated. Keep one writer
-            # even if the attention-local TP rank is zero on every CP rank.
-            self.backup_skip = True
-
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 

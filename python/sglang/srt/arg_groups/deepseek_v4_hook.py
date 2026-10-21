@@ -221,6 +221,15 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "context parallelism is enabled."
         )
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+    if cfg.enable_encoder_swa_bounded_replay:
+        from sglang.srt.mem_cache.dsv41_replay_contract import (
+            validate_cp_encoder_replay,
+        )
+
+        # The effective CP size may have been implicit in the user's arguments.
+        validate_cp_encoder_replay(
+            cfg, is_cuda=get_platform().is_cuda, is_sm90=get_platform().is_sm90
+        )
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"strategy={cfg.cp_strategy}, "
@@ -271,6 +280,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        # validate_deepseek_v4_cp checks the new envelope after resolving CP.
+        if cfg.attn_cp_size > 1 and not cfg.enable_prefill_cp:
+            raise ValueError("encoder replay requires interleave prefill CP")
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -290,7 +302,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and get_platform().is_hip,
             ),
-            ("context parallelism", cfg.attn_cp_size > 1),
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
             ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),

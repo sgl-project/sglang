@@ -29,10 +29,11 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
         return None
     from sglang.srt.runtime_context import get_parallel
 
+    folded = _fold_batch(batch=batch, runner=runner, rows=rows)
     if get_parallel().attn_cp_size > 1:
         for i, _, _ in rows:
             batch.reqs[i].kv.encoder_swa_replayed = True
-    return _fold_batch(batch=batch, runner=runner, rows=rows)
+    return folded
 
 
 def resets_swa_window(req) -> bool:

@@ -1,7 +1,6 @@
-"""CPU/Gloo tests of CP cache namespaces and sparse restore endpoints."""
+"""CPU/Gloo regressions for CP cache identity, restore endpoints and ownership."""
 
 import datetime
-import importlib.util
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -11,18 +10,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from test_dsv41_cp_replay_layout import contract, definitions
 
-from test_dsv41_cp_replay_layout import ROOT, definitions
+from sglang.test.ci.ci_register import register_cpu_ci
 
-
-def contract():
-    spec = importlib.util.spec_from_file_location(
-        "storage_contract",
-        ROOT / "python/sglang/srt/mem_cache/dsv41_replay_contract.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def pool(**changes):
@@ -195,3 +187,154 @@ def test_sparse_endpoint_intersection_and_failure_collective_order():
             nprocs=2,
             join=True,
         )
+
+
+@pytest.mark.parametrize("backend", ["file", "mori"])
+def test_dynamic_cp_storage_attach_does_not_bypass_mooncake_envelope(backend):
+    attach = Mock()
+    functions = definitions(
+        "srt/mem_cache/hybrid_cache/hybrid_cache_controller.py",
+        ["attach_storage_backend"],
+        {
+            "UnifiedPageEnvelopeHostPool": type("Envelope", (), {}),
+            "super": lambda: NS(attach_storage_backend=attach),
+        },
+        klass="HybridCacheController",
+        strip_imports=True,
+    )
+    controller = NS(
+        cp_encoder_replay=True,
+        storage_host_pool=object(),
+        mem_pool_host=NS(),
+        host_memory_mode="cache",
+        pp_group=None,
+        pp_prefetch_command_group=None,
+        storage_backend=NS(on_host_pools_registered=Mock()),
+    )
+    with pytest.raises(ValueError, match="CP encoder replay L3.*Mooncake"):
+        functions["attach_storage_backend"](controller, backend)
+    attach.assert_not_called()
+
+
+@pytest.mark.parametrize("cp_enabled,replayed", [(False, True), (True, False)])
+def test_legacy_cache_does_not_match_or_reduce_for_cp_replay(cp_enabled, replayed):
+    functions = definitions(
+        "srt/mem_cache/unified_radix_cache.py",
+        ["_replay_overlaps_unadopted_cache"],
+        klass="UnifiedRadixCache",
+    )
+    cache = NS(
+        cp_encoder_replay=cp_enabled,
+        tree_core=NS(match_prefix=Mock()),
+        _all_reduce=Mock(),
+    )
+    assert not functions["_replay_overlaps_unadopted_cache"](
+        cache, NS(kv=NS(encoder_swa_replayed=replayed)), object()
+    )
+    cache.tree_core.match_prefix.assert_not_called()
+    cache._all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "local_hit,peer_overlap,expected",
+    [(4, False, False), (8, False, True), (4, True, True)],
+)
+def test_unadopted_snapshot_overlap_is_a_group_decision(
+    local_hit, peer_overlap, expected
+):
+    functions = definitions(
+        "srt/mem_cache/unified_radix_cache.py",
+        ["_replay_overlaps_unadopted_cache"],
+        {"MatchPrefixParams": NS},
+        klass="UnifiedRadixCache",
+    )
+    actions = object()
+
+    def reduce(value, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        if peer_overlap:
+            value.fill_(1)
+
+    cache = NS(
+        cp_encoder_replay=True,
+        tree_core=NS(
+            match_prefix=Mock(
+                return_value=NS(full_kv_hit_length=local_hit, cache_actions=actions)
+            )
+        ),
+        _apply_cache_actions=Mock(),
+        _all_reduce=reduce,
+    )
+    req = NS(kv=NS(encoder_swa_replayed=True, cache_protected_len=4))
+    assert (
+        functions["_replay_overlaps_unadopted_cache"](cache, req, object()) is expected
+    )
+    cache._apply_cache_actions.assert_called_once_with(actions)
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_declined_cache_adoption_keeps_request_pages_lock_and_insert_cursor(finished):
+    class Key:
+        def __init__(self, tokens, *args, **kwargs):
+            self.tokens = tokens
+
+        def __len__(self):
+            return len(self.tokens)
+
+        def page_aligned(self, size):
+            return self
+
+    functions = definitions(
+        "srt/mem_cache/unified_radix_cache.py",
+        ["checkpoint_into_tree"],
+        {
+            "InsertParams": NS,
+            "RadixKey": Key,
+            "envs": NS(
+                SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=NS(get=lambda: False)
+            ),
+        },
+        klass="UnifiedRadixCache",
+    )
+    table = torch.arange(24).reshape(3, 8)
+    before = table.clone()
+    component = NS(
+        prepare_for_caching_req=Mock(return_value=None),
+        floor_cache_len=lambda n: n,
+        cleanup_after_caching_req=Mock(),
+    )
+    lock = object()
+    kv = NS(req_pool_idx=2, cache_protected_len=2, cache_inserted_len=2)
+    req = NS(
+        finished=lambda: finished,
+        full_untruncated_fill_ids=list(range(8)),
+        kv=kv,
+        priority=None,
+        session_id=None,
+        kv_rotation_base=None,
+        extra_key=None,
+        cache_salt=None,
+        lock=lock,
+    )
+    cache = NS(
+        disable=False,
+        req_to_token_pool=NS(req_to_token=table),
+        _components_tuple=[component],
+        tree_core=NS(is_eagle=False),
+        page_size=2,
+        _replay_overlaps_unadopted_cache=Mock(return_value=True),
+        insert=Mock(),
+    )
+    functions["checkpoint_into_tree"](cache, req, up_to=8)
+    cache.insert.assert_not_called()
+    component.cleanup_after_caching_req.assert_called_once()
+    assert (
+        component.cleanup_after_caching_req.call_args.kwargs["is_finished"] is finished
+    )
+    assert torch.equal(table, before)
+    assert req.lock is lock
+    assert kv.cache_inserted_len == kv.cache_protected_len == 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

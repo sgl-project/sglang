@@ -175,6 +175,7 @@ class PrefetchOperation(StorageOperation):
         # pages) up to which the pool is present; rank-reduced with the
         # folded hit count. Empty until the query ran on this rank.
         self.query_pool_hit_pages: dict[PoolName, int] = {}
+        self.restorable_prefix_pages: Optional[List[int]] = None
         self.buffer_host_occupied_units: Optional[int] = None
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
         # a controller that releases it itself must set this False.
@@ -309,6 +310,10 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.cp_encoder_replay and storage_backend != "mooncake":
+            # The administrative attach endpoint can switch backends after
+            # launch; keep the CP producer namespace and restore contract.
+            raise ValueError("CP encoder replay L3 currently requires Mooncake Store")
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -317,7 +322,11 @@ class HybridCacheController(BaseHiCacheController):
                 f"Storage backend {storage_backend!r} requires separate host pools. "
                 "Restart with this backend selected to create compatible host pools."
             )
-        layout_tag = getattr(self.mem_pool_host, "storage_layout_tag", None)
+        layout_tag = (
+            self.mem_pool_host.storage_layout_tag
+            if isinstance(self.mem_pool_host, HostPoolGroup)
+            else None
+        )
         if storage_backend == "mooncake" and layout_tag is not None:
             from sglang.srt.mem_cache.dsv41_replay_contract import (
                 with_storage_layout_tag,
@@ -325,6 +334,12 @@ class HybridCacheController(BaseHiCacheController):
 
             storage_backend_extra_config = with_storage_layout_tag(
                 storage_backend_extra_config, layout_tag
+            )
+            logger.info(
+                "CP replay Mooncake namespace: %s; numerical recipe changes "
+                "require a new namespace and cache warmup. Pin autotune tactics "
+                "and change extra_backend_tag when tactics change.",
+                storage_backend_extra_config["extra_backend_tag"],
             )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"

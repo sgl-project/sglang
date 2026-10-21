@@ -1,21 +1,19 @@
 """Contracts for the CP>1 extension of upstream V4.1 encoder replay.
 
-CP1 keeps the upstream folded extend, kernels, and cache identity. Resolve
-parallelism before using these predicates; target and draft runners must not
-share a process-global replay policy.
+CP1 keeps the upstream folded extend, model dispatch, and cache identity.
+Resolve parallelism before validation; target and draft runners must not share
+a process-global replay policy. Shared kernel fixes are independent of it.
 """
 
 import hashlib
 import json
 
-
-def is_cp_encoder_replay(cfg) -> bool:
-    return cfg.enable_encoder_swa_bounded_replay and cfg.attn_cp_size > 1
+from sglang.srt.model_executor.cuda_graph_config import Backend
 
 
 def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
     """Constrain the new path without changing any upstream CP1 recipe."""
-    if not is_cp_encoder_replay(cfg):
+    if not cfg.enable_encoder_swa_bounded_replay or cfg.attn_cp_size <= 1:
         return
     if not is_cuda or not is_sm90:
         raise ValueError("CP encoder replay currently requires SM90 CUDA")
@@ -28,7 +26,7 @@ def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
         raise ValueError("CP encoder replay requires interleave prefill CP")
     if cfg.attn_cp_size != cfg.tp_size:
         raise ValueError("CP encoder replay requires attention TP=1")
-    if cfg.cuda_graph_config.prefill.backend != "disabled":
+    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
         raise ValueError("CP encoder replay requires disabled prefill CUDA graphs")
     if cfg.disaggregation_mode == "decode":
         raise ValueError("encoder replay is a Prefill feature; Decode requires CP=1")
@@ -44,6 +42,8 @@ def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
         raise ValueError("CP encoder replay does not support KV cache sharding yet")
     if cfg.enable_dsa_cache_layer_split or cfg.enable_cp_tp_group_sharing:
         raise ValueError("CP encoder replay requires replicated per-layer KV pools")
+    if cfg.enable_unified_cache_external_linker:
+        raise ValueError("CP encoder replay does not support the direct L3 linker yet")
     if cfg.enable_hierarchical_cache:
         if cfg.hicache_host_memory_mode != "cache":
             raise ValueError("CP encoder replay requires cache host memory mode")
@@ -62,8 +62,8 @@ def sync_restorable_prefix(
     """
     import torch
 
-    restorable = getattr(operation, "restorable_prefix_pages", None)
-    local = getattr(operation, "query_pool_hit_pages", {})
+    restorable = operation.restorable_prefix_pages
+    local = operation.query_pool_hit_pages
     header = torch.tensor(
         [storage_hit_count, int(restorable is None)]
         + [local.get(pool, -1) for pool in pools],
@@ -71,12 +71,9 @@ def sync_restorable_prefix(
     )
     reduce_min(header)
     count, all_legacy, *verdicts = header.tolist()
-    if hasattr(operation, "query_pool_hit_pages"):
-        operation.query_pool_hit_pages = {
-            pool: pages
-            for pool, pages in zip(pools, verdicts, strict=True)
-            if pages >= 0
-        }
+    operation.query_pool_hit_pages = {
+        pool: pages for pool, pages in zip(pools, verdicts, strict=True) if pages >= 0
+    }
     if count <= 0 or all_legacy:
         return count
     upper = count // page_size

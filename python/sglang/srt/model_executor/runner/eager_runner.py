@@ -412,17 +412,9 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
         tail = None
-        if (
-            isinstance(model, DeepseekV4ForCausalLM)
-            and model.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            # Compact CP tails need their own ownership map even without DSpark
-            # auxiliary capture (for example, ordinary target-only replay).
-            tail = self.model_runner.attn_backend.tail_forward_metadata.late_layer_tail
+        if get_output_tail := getattr(model, "get_cp_output_tail", None):
+            tail = get_output_tail(forward_batch)
 
         stream = torch.cuda.current_stream()
         full_cp_metadata = forward_batch.attn_cp_metadata
@@ -484,7 +476,9 @@ class EagerRunner(BaseRunner):
             aux_hidden_states,
             **logits_kwargs,
         )
-        if tail is not None:
+        if tail is not None and forward_batch.capture_hidden_mode.is_full():
+            # LAST capture has already pruned hidden to one row per request;
+            # the fold must not index it with the full compact-tail row map.
             output.hidden_states_token_indices = tail.output_token_indices
         return output
 
