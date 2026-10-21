@@ -657,6 +657,11 @@ class Scheduler(
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
 
+        # The Rust frontend snapshots local KV-event discovery metadata while it
+        # builds its typed server info, so the publisher must exist before the
+        # frontend starts.
+        self.init_kv_events_publisher()
+
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
 
@@ -712,8 +717,6 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
-
-        self.init_kv_events_publisher()
 
         self.init_load_publisher()
 
@@ -2560,6 +2563,7 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
     def init_output_streamer(self) -> None:
@@ -3914,7 +3918,6 @@ class Scheduler(
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.

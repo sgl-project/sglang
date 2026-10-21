@@ -74,6 +74,13 @@ pub struct ServerInfo {
     pub openai: Option<OpenAiSettings>,
     /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
     pub grpc_port: Option<u16>,
+    /// Whether a prefill engine computes a request before its decode peer
+    /// bootstraps: `--optimistic-prefill-attempts` above 0 or
+    /// `--disaggregation-decode-allocation-policy prefill_complete`.
+    /// `--decode-dispatch-limit` holds decode back until earlier KV has
+    /// arrived, so a prefill without either never starts. `None` when
+    /// `/server_info` predates the field or did not answer.
+    pub prefill_before_bootstrap: Option<bool>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -200,6 +207,11 @@ impl WorkerIntrospector {
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
             openai,
             grpc_port: parsed.grpc_port,
+            prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
+                attempts > 0
+                    || parsed.disaggregation_decode_allocation_policy.as_deref()
+                        == Some("prefill_complete")
+            }),
         }
     }
 
@@ -416,6 +428,14 @@ struct ServerInfoBody {
     attn_dp_size: Option<u32>,
     #[serde(default)]
     grpc_port: Option<u16>,
+    /// `ServerArgs.optimistic_prefill_attempts`; absent on engines that predate it.
+    /// Signed like the engine's unvalidated `int`, so a negative value reads as
+    /// no optimistic prefill instead of failing the whole body.
+    #[serde(default)]
+    optimistic_prefill_attempts: Option<i64>,
+    /// `ServerArgs.disaggregation_decode_allocation_policy`.
+    #[serde(default)]
+    disaggregation_decode_allocation_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -859,6 +879,33 @@ mod tests {
         ] {
             let (url, _shutdown) = spawn_fake_worker(body).await;
             assert_eq!(fast_introspector().fetch(&url).await.dp_ranks, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_whether_prefill_runs_before_bootstrap() {
+        for (body, want) in [
+            (json!({"optimistic_prefill_attempts": 2}), Some(true)),
+            (
+                json!({
+                    "optimistic_prefill_attempts": 0,
+                    "disaggregation_decode_allocation_policy": "prefill_complete",
+                }),
+                Some(true),
+            ),
+            (
+                json!({
+                    "optimistic_prefill_attempts": 0,
+                    "disaggregation_decode_allocation_policy": "early",
+                }),
+                Some(false),
+            ),
+            (json!({"optimistic_prefill_attempts": -1}), Some(false)),
+            (json!({}), None),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.prefill_before_bootstrap, want);
         }
     }
 

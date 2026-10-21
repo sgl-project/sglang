@@ -1909,6 +1909,9 @@ class UnifiedSWAKVPool(SWAKVPool):
             end_layer=end_layer,
         )
 
+        self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
+        self.swa_kv_pool.model_layer_ids = tuple(swa_attention_layer_ids)
+
         # disagg/nvlink disabled; keep attrs present to avoid AttributeError.
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None

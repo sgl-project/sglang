@@ -440,7 +440,8 @@ ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 # gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
 ARG ENABLE_SGL_AMD_MONO=1
 ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
-ARG SGL_AMD_MONO_COMMIT="815b104f483d180027054a8f44bad0c2a3f895fd"
+# empty: the commit pip installed through the monokernels_hip extra
+ARG SGL_AMD_MONO_COMMIT=""
 
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
@@ -895,9 +896,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 RUN /bin/bash -lc 'set -euo pipefail; \
     [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
     case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
+    python3 -m pip show sgl-amd-mono > /dev/null || { echo "[sgl-amd-mono] skip (this SGLang does not install it)"; exit 0; }; \
+    commit="${SGL_AMD_MONO_COMMIT:-$(python3 -c "import json, importlib.metadata as md; print(json.loads(md.distribution(\"sgl-amd-mono\").read_text(\"direct_url.json\"))[\"vcs_info\"][\"commit_id\"])")}"; \
     git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
     cd /sgl-workspace/sgl-amd-mono; \
-    git checkout -f "${SGL_AMD_MONO_COMMIT}"; \
+    git checkout -f "${commit}"; \
     python3 -m pip install --no-cache-dir --no-deps -e .; \
     python3 -c "from importlib.metadata import entry_points; \
 assert any(e.name == \"sgl_amd_mono\" for e in entry_points(group=\"sglang.srt.plugins\")), \"sgl-amd-mono plugin not registered\""'

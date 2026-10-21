@@ -7,11 +7,13 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
 
@@ -219,7 +221,7 @@ class TestDirectBackendTranslation(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([6, 9]))
 
 
-class TestTriPoolAssembly(unittest.TestCase):
+class TestTriPoolAssembly(CustomTestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
         from sglang.srt.mem_cache.allocator.unified_sub_pool import (
             MultiEndedAllocator,
@@ -258,10 +260,22 @@ class TestTriPoolAssembly(unittest.TestCase):
                         params=params,
                         full_kv_pool=object(),
                         swa_kv_pool=object(),
-                        mamba_pool=SimpleNamespace(num_mamba_layers=1),
+                        mamba_pool=SimpleNamespace(
+                            get_device_pool_infos=lambda: (
+                                DevicePoolInfo(
+                                    pool_name=PoolName.MAMBA,
+                                    indices_from_pool=PoolName.MAMBA,
+                                    layer_ids=(2,),
+                                    buffer_info=MambaStateBufferInfo(
+                                        temporal=torch.zeros(1, 2, 1),
+                                        conv=(torch.zeros(1, 2, 1),),
+                                    ),
+                                ),
+                            )
+                        ),
                         full_layer_mapping={0: 0},
                         swa_layer_mapping={1: 0},
-                        mamba_layer_mapping={2: 0},
+                        start_layer=0,
                         page_size=1,
                         tp_group=None,
                         load_cache_event=None,
