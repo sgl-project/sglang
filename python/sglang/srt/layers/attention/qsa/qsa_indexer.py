@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -553,7 +553,6 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         global_rope_positions: torch.Tensor,
-        on_key_gather_issued: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         """Prefill CP: score only this rank's zigzag query rows.
 
@@ -565,10 +564,7 @@ class QSAIndexer(MultiPlatformOp):
         cache). Selection then scores the local rows against all compressed
         blocks of their request, position-driven, so the output rows line up
         with the local query rows the sparse attention consumes.
-
-        ``on_key_gather_issued`` runs right after the key gather is enqueued: a
-        collective that must follow it on the CP group (the attention's K/V
-        gather) starts there and overlaps compression and selection."""
+        """
         strategy = get_cp_strategy()
         if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
             strategy_name = strategy.name if strategy is not None else "none"
@@ -609,8 +605,6 @@ class QSAIndexer(MultiPlatformOp):
         token_k_full = cp_materialize_global_token_order(
             token_k_local, forward_batch
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)
-        if on_key_gather_issued is not None:
-            on_key_gather_issued()
         global_rope = (
             global_rope_positions[:, :num_global]
             if global_rope_positions.ndim == 2
@@ -648,7 +642,6 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
-        cp_on_key_gather_issued: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         """Portable orchestration shared by different platforms.
         Fast paths are gated per platforms inside kernel calls.
@@ -665,7 +658,6 @@ class QSAIndexer(MultiPlatformOp):
                 forward_batch,
                 indexer_metadata,
                 cp_global_rope_positions,
-                on_key_gather_issued=cp_on_key_gather_issued,
             )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
@@ -774,7 +766,6 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
-        cp_on_key_gather_issued: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         return self._forward_impl(
             hidden_states,
@@ -782,7 +773,6 @@ class QSAIndexer(MultiPlatformOp):
             forward_batch,
             indexer_metadata,
             cp_global_rope_positions,
-            cp_on_key_gather_issued,
         )
 
     def forward_xpu(

@@ -1566,8 +1566,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
         forward_extend then joins it instead of gathering inline.
 
-        Call it from the indexer's ``cp_on_key_gather_issued`` hook, so every
-        rank issues the CP group's collectives in the same order. ``k``/``v``
+        Call it before the CP indexer on every rank, so the K/V gather precedes
+        the index-key gather on the CP group. ``k``/``v``
         must be the tensors later passed to the layer's attention, unmodified:
         the side stream reads them until that join. Stream waits in both
         directions around the gathered K/V's reads replace record_stream."""

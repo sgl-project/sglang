@@ -62,7 +62,7 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
         (False, True, False, True),
     ],
 )
-def test_qsa_model_forward_prefetches_exact_kv_after_index_key_gather(
+def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
     monkeypatch, cp_enabled, hybrid_backend, breakable, capture_mode
 ):
     from sglang.srt.models import qwen4_exp
@@ -116,12 +116,8 @@ def test_qsa_model_forward_prefetches_exact_kv_after_index_key_gather(
         assert ("cp_global_rope_positions" in kwargs) == cp_enabled
         if cp_enabled:
             assert kwargs["cp_global_rope_positions"] is batch.positions
-        hook = kwargs.get("cp_on_key_gather_issued")
-        assert (hook is not None) == prefetch_expected
-        events.append("index_key_gather")
-        if hook is not None:
-            hook()
-        events.append("index_compression_and_selection")
+        assert set(kwargs) == ({"cp_global_rope_positions"} if cp_enabled else set())
+        events.append("indexer")
         return topk
 
     def attention(actual_q, actual_k, actual_v, actual_batch, **kwargs):
@@ -154,16 +150,15 @@ def test_qsa_model_forward_prefetches_exact_kv_after_index_key_gather(
     assert decoder.forward(layer, positions, hidden, batch) is expected
     assert events == [
         "prepare",
-        "index_key_gather",
         *(["prefetch"] if prefetch_expected else []),
-        "index_compression_and_selection",
+        "indexer",
         "attention",
     ]
     assert sparse_backend.prefetch_cp_kv.call_count == int(prefetch_expected)
 
 
 def test_cuda_indexer_forwards_global_rope_to_cp_path():
-    hidden, local_rope, metadata, global_rope, hook = (object() for _ in range(5))
+    hidden, local_rope, metadata, global_rope = (object() for _ in range(4))
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
     expected = object()
     indexer = SimpleNamespace(forward_cuda_cp=Mock(return_value=expected))
@@ -176,12 +171,11 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
         batch,
         metadata,
         cp_global_rope_positions=global_rope,
-        cp_on_key_gather_issued=hook,
     )
 
     assert actual is expected
     indexer.forward_cuda_cp.assert_called_once_with(
-        hidden, local_rope, batch, metadata, global_rope, on_key_gather_issued=hook
+        hidden, local_rope, batch, metadata, global_rope
     )
 
 
@@ -261,11 +255,9 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         batch,
         metadata,
         positions,
-        on_key_gather_issued=lambda: events.append("hook"),
     )
-    # The hook issues the next CP-group collective (the attention's K/V gather):
-    # it must follow the key gather on every rank, and precede the work it overlaps.
-    assert events == ["key_gather", "hook", "compress"]
+    # Compression needs the globally ordered raw keys on every rank.
+    assert events == ["key_gather", "compress"]
     expected = torch_qsa_mqa_prefill(
         hidden[local_rows].unsqueeze(1).to(compressed_dtype),
         compressed_keys,
