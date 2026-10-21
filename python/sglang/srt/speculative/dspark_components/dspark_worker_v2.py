@@ -811,7 +811,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     # 每轮decode生成的主函数： 1调用草稿模型输出待验证的token和对应的condifence-》2规划（compact紧凑表示，分配内存地址等预算）-》3compact验证（第）-》4接受和提交
-    # 1alloc_verify_window + propose - ---> 2resovle_verify_token_budget + scheule_layout - ---> 3run_compact -----> 4accept_and_finalize + commithidden
+    # alloc_verify_window + propose - ---> 2resovle_verify_token_budget + scheule_layout - ---> 3run_compact -----> 4accept_and_finalize + commithidden
     def _forward_decode(
         self,
         batch: ScheduleBatch,
@@ -868,8 +868,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+        """
+        00993641
+        步骤1：准备验证窗口。
+        alloc_verify_window：给本轮 token 准备位置和 KV 存储地址，给dfaft模型等环节使用。
+        例如bs=3, draft_token_num=6 ,它会先为3个请求准备 3×6=18 个位置:
+        1.token 在各自序列中的位置, 
+        2.每个位置的 KV 写入槽位:准备这些位置对应的 KV 写入索引，保存在 verify_cache_loc_2d，形状同样是 (3,6),告诉后续计算：“这个 token 的 KV 应该写到缓存的哪个槽位。”
+        """
 
-        # alloc_verify_window： 为完整的窗口准备位置和KV访问计划，给dfaft模型等环节使用
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -900,7 +907,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT): #这里就是dspark并行生成草稿token的代码
+
+        """
+        0093641
+        self._proposer.propose： dspark draft模型并行生成草稿token，以及对应的confidence。
+        """
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -926,7 +938,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         """
         00993641
-        resolve_verify_token_budget函数：这里面会调用compute_budget_sync用condfience和SPS计算筛选的token
+        resolve_verify_token_budget函数：这里面会调用compute_budget_sync用condfience(历史)和SPS计算筛选的token
         例如 bs=3, 那最低的验证token_num=3, 假设根据confidence和SPS-table计算需要再额外再多分配6行位置。那最终验证的token_num=9
         
         confidence 决定“哪些token更有希望”，SPS 决定“多验证这些草稿要付出多少时间”，两者一起决定总共验证多少个。
@@ -941,7 +953,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         """
         00993641
         SparkVerifyPlanner.schedule_layout函数：
-        这里会调用 ScheduleVerifyLensTopk.execute，把计算得到额外6个名额按照surival的值，优先分配给更可能连续接受的请求，比如bs=3， 分别分配得到【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
+        这里会调用 ScheduleVerifyLensTopk.execute，把额外的6个名额按照onfidence（本轮）累乘得到的surival的值，优先分配给更可能连续接受的请求，比如bs=3， 分别分配得到【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
         它把每请求的验证长度和本轮需要的执行容量，封装一下 layout 交给后端
         """
         layout = self._verify_planner.schedule_layout(
@@ -953,7 +965,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+        """
+        00993641
+        #返回值为True 判断走compact模式路径
+        """
+        run_compact = self._verify_planner.should_run_compact(layout=layout) #返回值为True 判断走compact模式路径
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -981,6 +997,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_executor.begin_simulated_step()
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
+            """
+            00993641
+            执行打包输入、运行目标模型、整理输出。例如bs=3，即使verify_lens=[4,2,3]，虽然只有 9 个有效验证位置， 返回还是会padding成3*6=18的大小
+            target_verify [3*6, vocab_size] ：目标模型验证的概率输出
+            （vocab_size 就是模型词表中 token 的总数量，模型预测下一个 token 时，会给词表中的每个 token 打一个分数）
+            hidden_strided [18, hidden_dim]:隐藏特征
+            """
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
@@ -1005,7 +1028,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
-                )
+                ) #target_verify： [B*draft_token_num, hidden_dim], [B*draft_token_num, vocab_size]
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
@@ -1028,11 +1051,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
+        """
+        0993641
+        accept_and_finalize: 确定接受几个草稿、确定bonus 是什么，
+        （bonus 就是本轮在已接受草稿后，由目标模型确定的下一个 token。）
+        """
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
             verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
+            target_logits=logits_output.next_token_logits,#【18，vocab_size】 预测token的接受分数
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
@@ -1080,10 +1108,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
+
+        """
+        folded_commit：判断缓存写入是否已经在图内完成
+        """
         folded_commit = folded_accept and epilogue.folds_commit
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
+            """
+            self._verify_executor.commit_hidden:表示：图内没有完成的，这里补做一次。
+            目标模型验证时，除了产生 logits，也产生了 hidden_states。草稿模型下一轮生成草稿时，需要利用这些目标模型特征。
+            所以需要将
+            """
             self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,

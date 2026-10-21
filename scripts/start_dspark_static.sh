@@ -62,7 +62,7 @@ export SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER=0 # 1-》打印, debug时
 #export SGLANG_SIMULATE_ACC_LEN=1.0
 
 #PR 里已经内置了 DSpark 的调度观测功能。最适合你现在做的是打开 SGLANG_DSPARK_DEBUG_DUMP，把每一步到底 verify 了多少 token 记录下来，再从 /server_info 读取
-export SGLANG_DSPARK_DEBUG_DUMP=core,reqs
+#export SGLANG_DSPARK_DEBUG_DUMP=core,reqs
 #unset  SGLANG_DSPARK_DEBUG_DUMP=core,reqs
 
 
@@ -100,11 +100,11 @@ python3 -m sglang.launch_server \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path "${MODEL_PATH}" \
     --speculative-draft-model-quantization modelslim \
-    --speculative-draft-attention-backend ascend \
+    --speculative-draft-attention-backend dsv4 \
     --speculative-num-draft-tokens 6 \
     --speculative-dspark-block-size 5 \
-    --speculative-dspark-sps-table-path /home/l00993641/sglang/scripts/dspark_graph_additive.json \
     --cuda-graph-bs-decode 1 2 4 8 10 \
+#    --speculative-dspark-sps-table-path /home/l00993641/sglang/scripts/dspark_graph_additive.json \
 
 
 #    --speculative-algorithm EAGLE \
