@@ -482,6 +482,56 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
     concat.assert_called_once()
 
 
+def _bound_encoder(class_name, encoder):
+    """A ``get_image_feature`` bound to an instance of a class named ``class_name``."""
+
+    def get_image_feature(self, items):
+        return encoder(items)
+
+    owner_cls = type(class_name, (), {"get_image_feature": get_image_feature})
+    return owner_cls().get_image_feature
+
+
+def _set_platform(monkeypatch, **flags):
+    for flag in ("_is_hip", "_is_npu", "_is_xpu"):
+        monkeypatch.setattr(mm_schedule, flag, flags.get(flag, False))
+
+
+@pytest.mark.parametrize(
+    "platform, class_name, expected_encoder_calls",
+    [
+        ({"_is_hip": True}, "Lfm2VlForConditionalGeneration", 1),
+        ({"_is_hip": True}, "OtherVlForConditionalGeneration", 2),
+        ({}, "OtherVlForConditionalGeneration", 1),
+    ],
+)
+def test_hip_cross_request_encode_batches_allowlisted_models(
+    monkeypatch, platform, class_name, expected_encoder_calls
+):
+    _set_platform(monkeypatch, **platform)
+    encoder = Mock(side_effect=_encoder_list)
+    func = _bound_encoder(class_name, encoder)
+    assert _run_two_single_image_requests_with(func, encoder) == expected_encoder_calls
+
+
+def _run_two_single_image_requests_with(func, encoder):
+    """Encoder calls for two one-image requests: 1 if batched, 2 if per request."""
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    input_ids = torch.zeros(2 * TOTAL_LEN, dtype=torch.long)
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        func,
+        items,
+        items_size=[0, 1, 2],
+        prefix_length=[0, 0],
+        extend_length=[TOTAL_LEN, TOTAL_LEN],
+        items_offset_list=[[ITEM_OFFSETS[0]], [ITEM_OFFSETS[1]]],
+        input_ids=input_ids,
+    )
+    assert embedding.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
+    return encoder.call_count
+
+
 if __name__ == "__main__":
     import sys
 
