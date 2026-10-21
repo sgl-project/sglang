@@ -2027,6 +2027,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
             ),
+            # The outer tail runs eagerly on the replayed hidden states, so the
+            # per-request prefill-only readout metadata it consumes must survive
+            # the field-by-field rebuild: joint schema layouts and setwise pool
+            # positions.
+            token_indices_to_pool=forward_batch.token_indices_to_pool,
+            decision_layouts=forward_batch.decision_layouts,
             max_seq_len_override=self.max_context_size,
         )
         forward_batch.kv_loc_plan.bind_replay(
