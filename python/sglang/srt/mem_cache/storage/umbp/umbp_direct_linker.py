@@ -91,8 +91,8 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
-# One queued offload: the pools it resolved to, and the event guarding its KV.
-_OffloadTask = tuple[list[PoolTransfer], object]
+# One queued offload: the pools it resolved to, and the events guarding its KV.
+_OffloadTask = tuple[list[PoolTransfer], list[object]]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -858,8 +858,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = self.record_offload_ready()
-        self._offload_queue.put((expanded, ready_event))
+        ready_events = self.record_offload_ready()
+        self._offload_queue.put((expanded, ready_events))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -913,8 +913,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.put(success)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready_event in tasks:
-            ready_event.synchronize()
+        for _, ready_events in tasks:
+            for event in ready_events:
+                event.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
