@@ -41,6 +41,7 @@ def hooked_scheduler(monkeypatch):
         ("GET_NEW_BATCH_PREFILL_TIME_COST", 0),
         ("SIM_MODE", SimulationMode.OFFLINE),
         ("OVERLAP_SCHEDULE", False),
+        ("COORDINATOR", None),
     ):
         monkeypatch.setattr(hook, attr, value)
 
@@ -75,6 +76,9 @@ def hooked_scheduler(monkeypatch):
             advance(0.01)
 
         def event_loop_normal(self):
+            pass
+
+        def on_idle(self):
             pass
 
         def init_request_dispatcher(self):

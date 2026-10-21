@@ -111,8 +111,10 @@ else:
     raise AssertionError('missing declared capacity must still fail')
 try:
     profile_device_available_bytes(None, SimpleNamespace(hbm_capacity_gb=80), None)
-except ModuleNotFoundError as error:
-    assert error.name == 'aiconfigurator'
+except RuntimeError as error:
+    assert 'sglang-simulator[aic]' in str(error)
+    assert isinstance(error.__cause__, ModuleNotFoundError)
+    assert error.__cause__.name == 'aiconfigurator'
 else:
     raise AssertionError('automatic memory sizing must not invent a fallback')
 """
