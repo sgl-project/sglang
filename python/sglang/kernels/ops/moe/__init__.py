@@ -70,6 +70,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="moe.apply_gguf_moe_weights",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.gguf_moe_weights:apply_gguf_moe_weights",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,

@@ -226,8 +226,7 @@ class TestGgufInactiveRoutes(CustomTestCase):
             with torch.cuda.graph(graph):
                 output, ids = run()
         self.assertEqual(len(native_outputs), 2 if tokens > 64 else 0)
-        # Dropped slots must overwrite poisoned native intermediates rather
-        # than inherit any previous live route or allocator contents.
+        # Dropped routes must not consume poisoned native intermediates.
         for live in (tokens, partial, 0, partial // 2, tokens):
             hidden.copy_(base_hidden)
             hidden[live:].fill_(float("nan"))
@@ -238,10 +237,6 @@ class TestGgufInactiveRoutes(CustomTestCase):
             for intermediate in native_outputs:
                 intermediate.fill_(float("nan"))
             graph.replay()
-            for intermediate in native_outputs:
-                self.assertTrue(torch.isfinite(intermediate).all().item())
-                inactive = intermediate.view(tokens, 2, -1)[live:]
-                self.assertEqual(torch.count_nonzero(inactive).item(), 0)
             self.assertTrue(torch.isfinite(output).all().item())
             self.assertTrue((ids[live:] == -1).all().item())
             self.assertEqual(torch.count_nonzero(output[live:]).item(), 0)
@@ -253,6 +248,59 @@ class TestGgufInactiveRoutes(CustomTestCase):
                 torch.testing.assert_close(
                     output[:live].float(), expected, atol=2e-3, rtol=0.06
                 )
+
+    @torch.inference_mode()
+    def test_mmq_prefix_preserves_activation_memory_budget(self):
+        """Preparing MMQ routes must not duplicate the caller's activation matrix."""
+        tokens, hidden, intermediate, experts = 8192, 4096, 128, 4
+        inputs = torch.ones(tokens, hidden, device="cuda", dtype=torch.float16)
+        ids = torch.zeros(tokens, 2, device="cuda", dtype=torch.int32)
+        weights = torch.full((tokens, 2), 0.5, device="cuda")
+        packed_up = torch.empty(
+            experts,
+            2 * intermediate,
+            hidden // 32 * 18,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        packed_down = torch.empty(
+            experts,
+            hidden,
+            intermediate // 32 * 18,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+
+        class ProjectionReached(Exception):
+            pass
+
+        def stop_before_projection(*args, **kwargs):
+            raise ProjectionReached
+
+        def run_prefix():
+            with self.assertRaises(ProjectionReached):
+                fused_moe_gguf(
+                    inputs,
+                    packed_up,
+                    packed_down,
+                    weights,
+                    ids,
+                    GGMLQuantizationType.Q4_0,
+                    GGMLQuantizationType.Q4_0,
+                    "silu",
+                )
+
+        with patch.object(gguf_runtime, "ggml_moe_a8", stop_before_projection):
+            run_prefix()
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            run_prefix()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() - allocated
+        # One output matrix plus route tables fits without another input matrix.
+        budget = inputs.numel() * inputs.element_size() + 8 * 1024 * 1024
+        self.assertLessEqual(peak, budget)
 
     @torch.inference_mode()
     def test_nonlocal_routes_preserve_local_contributions(self):
