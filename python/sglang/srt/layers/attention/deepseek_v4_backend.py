@@ -2738,7 +2738,6 @@ class DeepseekV4AttnBackend(
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
-            and self.token_to_kv_pool.request_window is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
