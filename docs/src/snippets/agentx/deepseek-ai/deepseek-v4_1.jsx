@@ -35,7 +35,7 @@ export const agentx = {
    },
    "4303": {
     "run": null,
-    "sha": "3242b1059b969f582bc8234999482dd3819f7f51",
+    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
     "status": "in-progress"
    }
   }
@@ -1121,7 +1121,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "3242b1059b969f582bc8234999482dd3819f7f51",
+    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1253,7 +1253,6 @@ export const agentx = {
         ["--enable-unified-cache-external-linker"],
         ["--unified-cache-external-linker-backend", "mooncake"],
         ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
-        ["--hicache-write-policy", "write_back"],
         ["--hicache-ratio", "1.02"],
         ["--hicache-mem-layout", "page_first_direct"],
         ["--mem-fraction-static", "0.85"],
@@ -1389,7 +1388,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "3242b1059b969f582bc8234999482dd3819f7f51",
+    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1521,7 +1520,6 @@ export const agentx = {
         ["--enable-unified-cache-external-linker"],
         ["--unified-cache-external-linker-backend", "mooncake"],
         ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
-        ["--hicache-write-policy", "write_back"],
         ["--hicache-ratio", "1.02"],
         ["--hicache-mem-layout", "page_first_direct"],
         ["--mem-fraction-static", "0.85"],
@@ -4603,7 +4601,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "3242b1059b969f582bc8234999482dd3819f7f51",
+    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -4735,7 +4733,6 @@ export const agentx = {
         ["--enable-unified-cache-external-linker"],
         ["--unified-cache-external-linker-backend", "mooncake"],
         ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
-        ["--hicache-write-policy", "write_back"],
         ["--hicache-ratio", "1.02"],
         ["--hicache-mem-layout", "page_first_direct"],
         ["--mem-fraction-static", "0.85"],
