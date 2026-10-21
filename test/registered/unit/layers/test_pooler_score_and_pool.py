@@ -173,6 +173,20 @@ class TestScoreAndPool(CustomTestCase):
 
         torch.testing.assert_close(pooled, torch.tensor([[2.0], [9.0]]))
 
+    def test_mean_pooling_short_request_after_long_one_in_half_precision(self):
+        """In fp16/bf16, a short request after a long one pools as it would alone."""
+        torch.manual_seed(0)
+        # Nonzero mean, like real encoder outputs, so the running sum grows large.
+        hidden = torch.randn(2048 + 8, 16) + 3.0
+        fb = _make_forward_batch(extend_seq_lens=[2048, 8])
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+
+        for dtype in (torch.float16, torch.bfloat16):
+            hidden_lp = hidden.to(dtype)
+            pooled = pooler(hidden_lp, fb).embeddings
+            expected = hidden_lp[2048:].float().mean(dim=0)
+            torch.testing.assert_close(pooled[1].float(), expected, atol=0.05, rtol=0)
+
     def test_empty_delimiter_indices(self):
         """Empty delimiter tensor per request -> returns list with empty tensor."""
         input_ids = torch.arange(6)
