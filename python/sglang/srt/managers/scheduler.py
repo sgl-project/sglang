@@ -1972,12 +1972,17 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def increment_scheduler_iterations(self) -> None:
+        if get_observability().enable_metrics:
+            self.metrics_collector.increment_scheduler_iterations()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -2023,6 +2028,7 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()

@@ -3040,6 +3040,7 @@ class SchedulerDisaggregationDecodeMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
@@ -3087,6 +3088,7 @@ class SchedulerDisaggregationDecodeMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
