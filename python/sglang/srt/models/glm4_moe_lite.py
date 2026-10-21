@@ -30,7 +30,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -237,6 +236,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
             **({"scoring_func": "sigmoid"} if _is_npu else {}),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -376,10 +376,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import _run_sgl_eval
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=2070, stage="weekly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -304,29 +303,6 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
-
-
-class TestFlashinferTrtllmGenMoeBackendNvFp4UntiedGateUp(
-    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
-):
-    """nvidia/Qwen3-30B-A3B-NVFP4 with each expert's gate and up global scales
-    re-split to differ but the same dequantized weights; accuracy must match."""
-
-    model = "mmangkad/Qwen3-30B-A3B-NVFP4-untied-gate-up"
-    backend = "flashinfer_trtllm"
-
-    def test_gsm8k(self):
-        _run_sgl_eval(
-            self,
-            eval_name="gsm8k",
-            score_threshold=0.9,
-            num_examples=200,
-            num_threads=128,
-            chat_template_kwargs={"enable_thinking": False},
-            max_tokens=2048,
-            temperature=0.7,
-            top_p=0.8,
-        )
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(

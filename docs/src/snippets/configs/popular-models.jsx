@@ -97,5 +97,4 @@ export const popularModels = [
       caption: "MiniMax-H3 deployment guide",
     },
   },
-  },
 ];
