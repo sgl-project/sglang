@@ -81,25 +81,30 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         num_experts = 16
         max_loras = 4
 
-        virtual_ids, _, _ = _fused_virtual_topk_ids(
-            topk_ids,
-            token_lora_mapping,
-            num_experts,
-            shared_outer=False,
-            max_loras=max_loras,
-        )
+        original_ids = topk_ids.clone()
+        for shared_outer in (False, True):
+            with self.subTest(shared_outer=shared_outer):
+                virtual_ids, _, _ = _fused_virtual_topk_ids(
+                    topk_ids,
+                    token_lora_mapping,
+                    num_experts,
+                    shared_outer=shared_outer,
+                    max_loras=max_loras,
+                )
 
-        # Every negative input must stay negative (and equal) in the output.
-        for m in range(topk_ids.shape[0]):
-            for k in range(topk_ids.shape[1]):
-                base = topk_ids[m, k].item()
-                if base < 0:
-                    self.assertEqual(
-                        virtual_ids[m, k].item(),
-                        base,
-                        f"negative sentinel at ({m},{k}) was remapped: "
-                        f"{base} -> {virtual_ids[m, k].item()}",
-                    )
+                # Shared weights still follow each original route's validity,
+                # including a dropped first slot followed by a live slot.
+                for m in range(topk_ids.shape[0]):
+                    lora = max(token_lora_mapping[m].item(), 0)
+                    for k in range(topk_ids.shape[1]):
+                        base = topk_ids[m, k].item()
+                        expected = base
+                        if base >= 0:
+                            expected = (
+                                lora if shared_outer else base + lora * num_experts
+                            )
+                        self.assertEqual(virtual_ids[m, k].item(), expected)
+                torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
 
     def test_positive_topk_remapped_correctly(self):
         """Sanity: valid (non-negative) IDs follow the
