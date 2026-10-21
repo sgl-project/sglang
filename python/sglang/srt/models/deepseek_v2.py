@@ -212,7 +212,6 @@ from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
     get_device,
-    get_disagg,
     get_exec,
     get_forward,
     get_lora,

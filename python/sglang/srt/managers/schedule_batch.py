@@ -122,7 +122,6 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (

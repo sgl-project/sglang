@@ -504,6 +504,7 @@ class TestPDMuxScheduler(unittest.TestCase):
                 scheduler.disaggregation_mode = DisaggregationMode.NULL
                 scheduler.is_generation = True
                 scheduler.enable_overlap = False
+                scheduler.enable_unified_cache_external_linker = False
                 scheduler.enable_pdmux = pdmux
                 scheduler.split_prefill_batch = None
                 scheduler.pp_group = SimpleNamespace(is_last_rank=True)

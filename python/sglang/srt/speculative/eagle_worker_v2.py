@@ -1498,7 +1498,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         batch_output = self.target_worker.forward_batch_split_prefill(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=self._draft_worker is not None,
         )
         forward_batch = batch.split_forward_batch
         if (

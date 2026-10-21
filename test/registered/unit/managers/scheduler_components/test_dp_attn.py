@@ -337,6 +337,9 @@ class TestDPBalanceStats(CustomTestCase):
         )
         with (
             clock,
+            patch.object(
+                dp_attn, "get_disagg", return_value=SimpleNamespace(enable_pdmux=False)
+            ),
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", True),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),

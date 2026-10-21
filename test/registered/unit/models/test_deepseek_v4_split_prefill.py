@@ -11,6 +11,8 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,36 +52,21 @@ class _PrevLayer:
         self.engram = None
         self.calls = []
         self.input_layernorm = object()
+        self.hc_cfg = object()
 
-    def forward_hc_pre_from_prev(
-        self,
-        *,
-        hidden_states,
-        prev_pre,
-        combined_attn,
-        normalized_attn,
-        next_combined,
-        input_ids,
-        positions,
-        **kwargs,
-    ):
-        self.calls.append(
-            (prev_pre, combined_attn, normalized_attn, input_ids, positions)
-        )
-        value = self.index + 1
-        hidden = hidden_states + value
-        if combined_attn is not None:
-            hidden = hidden + combined_attn[:, None, :] * 0.01
-        if normalized_attn is not None:
-            hidden = hidden + normalized_attn[:, None, :] * 0.02
-        if next_combined is not None:
-            next_combined.append((hidden.mean(dim=1), hidden.mean(dim=1) + 10))
-        pre = hidden.new_full((hidden.shape[0], 1), value)
-        return hidden, pre
+    def forward_hc_pre_from_prev(self, *, state, input_ids, positions, **kwargs):
+        self.calls.append((state.pre, state.input, state.stats, input_ids, positions))
+        hidden = state.residual + self.index + 1
+        if state.input is not None:
+            hidden = hidden + state.input.rows[:, None, :] * 0.01
+        pre = hidden.new_full((hidden.shape[0], 1), self.index + 1)
+        return mhc.HcState(hidden, pre, mhc.HcNormed(hidden.mean(dim=1)))
 
 
 class _Tail:
     def __init__(self):
+        self.scatter_indices = None
+        self.contiguous_start = None
         self.token_indices = torch.tensor([1, 3])
         self.positions = torch.tensor([1, 3])
         self.extend_seq_lens = torch.tensor([2], dtype=torch.int32)
@@ -104,18 +91,20 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             ("check_cuda_graph_backend", True),
             ("get_attn_backend", self.backend),
             ("get_platform", SimpleNamespace(is_blackwell=False)),
+            ("get_forward", SimpleNamespace(sp_active=False)),
         ):
             self.stack.enter_context(
                 patch("sglang.srt.models.deepseek_v4." + name, return_value=value)
             )
         self.stack.enter_context(
             patch(
-                "sglang.kernels.ops.layernorm.mhc.hc_combine",
+                "sglang.kernels.ops.layernorm.mhc.mhc_combine",
                 side_effect=lambda x, pre, *_: (
                     x.reshape(x.shape[0], 2, x.shape[1] // 2).sum(dim=1) + pre
                 ),
             )
         )
+        self.stack.enter_context(patch("sglang.srt.models.deepseek_v4._is_cuda", False))
         self.addCleanup(self.stack.close)
 
     def model(self, *, predecessor=False, count=4):
@@ -139,11 +128,17 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
             dspark_layers_to_capture=None,
             engram_hasher=None,
             late_layer_start=None,
+            tail_writes_source_kv=False,
+            decoder_replay_tail=None,
             config=SimpleNamespace(model_type="deepseek_v41", vision_n_layers=0),
             _can_run_tbo=lambda batch: False,
-            _check_late_layer_tail_readers=lambda batch: None,
+            _check_late_layer_tail_readers=lambda batch, tail: None,
         )
-        for method in ("_forward_layers_hc_pre_from_prev", "_finalize_hidden_states"):
+        for method in (
+            "_forward_impl",
+            "_forward_layers_hc_pre_from_prev",
+            "_finalize_hidden_states",
+        ):
             setattr(model, method, MethodType(getattr(DeepseekV4Model, method), model))
         return model
 
@@ -224,14 +219,13 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         model.hc_head.assert_called_once()
         self.assert_results_equal(result, self.normal(self.model(), self.batch()))
 
-    def test_predecessor_combined_and_normalized_inputs_cross_slice(self):
+    def test_predecessor_state_and_normalized_input_cross_slice(self):
         model = self.model(predecessor=True)
         batch = self.batch(128)
         self.assertIsNone(self.split(model, batch, (0, 1)))
         result = self.split(model, batch, (1, 4))
         self.assertIsNotNone(model.layers[1].calls[0][0])
         self.assertIsNotNone(model.layers[1].calls[0][1])
-        self.assertIsNotNone(model.layers[1].calls[0][2])
         self.assert_results_equal(
             result, self.normal(self.model(predecessor=True), self.batch(128))
         )
@@ -306,6 +300,97 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         self.assert_results_equal(
             result_b, self.normal(self.model(predecessor=True), self.batch(offset=20))
         )
+
+    def test_cuda_residual_stream_survives_interleaved_slices(self):
+        class CudaLayer(_PrevLayer):
+            def __call__(
+                self, *, hidden_states, forward_batch, input_ids, positions, **kwargs
+            ):
+                assert residual_batch.written_residual(forward_batch) is hidden_states
+                state = self.forward_hc_pre_from_prev(
+                    state=hidden_states, input_ids=input_ids, positions=positions
+                )
+                return residual_batch.set_written(state, forward_batch)
+
+        def make_model():
+            model = self.model(predecessor=True)
+            model.layers = [CudaLayer(i) for i in range(4)]
+            return model
+
+        model = make_model()
+        a, b = self.batch(), self.batch(offset=20)
+        with patch("sglang.srt.models.deepseek_v4._is_cuda", True):
+            self.assertIsNone(self.split(model, a, (0, 1)))
+            a_stream = a.residual_stream
+            self.assertIsNone(self.split(model, b, (0, 2)))
+            self.assertIs(a.residual_stream, a_stream)
+            self.assertIsNot(a.residual_stream, b.residual_stream)
+            expected_a = self.normal(make_model(), self.batch())
+            self.assertIs(a.residual_stream, a_stream)
+            result_a = self.split(model, a, (1, 4))
+            result_b = self.split(model, b, (2, 4))
+            self.assert_results_equal(result_a, expected_a)
+            self.assert_results_equal(
+                result_b, self.normal(make_model(), self.batch(offset=20))
+            )
+            self.assertIsNone(a.residual_stream)
+            self.assertIsNone(b.residual_stream)
+
+    def test_compact_dp_geometry_is_restored_at_every_yield(self):
+        tail = _Tail()
+        self.backend.tail_forward_metadata = SimpleNamespace(late_layer_tail=tail)
+        self.backend.enter_late_layer_tail = Mock(return_value=object())
+        self.backend.exit_late_layer_tail = Mock()
+        model = self.model(predecessor=True)
+        model.late_layer_start = 1
+        model.late_layer_vl_routing = False
+        batch = self.batch()
+        batch.is_extend_in_batch = True
+        batch.global_dp_buffer_len = 8
+        counts = [2, 2]
+
+        def enter(batch, counts):
+            old = batch.global_dp_buffer_len
+            batch.global_dp_buffer_len = sum(counts)
+            return (old,)
+
+        def leave(batch, saved):
+            batch.global_dp_buffer_len = saved[0]
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.get_parallel",
+                return_value=SimpleNamespace(attn_dp_size=2),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: False),
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.late_layer_dp_counts",
+                return_value=counts,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.enter_late_layer_dp", side_effect=enter
+            ) as enter_dp,
+            patch(
+                "sglang.srt.models.deepseek_v4.exit_late_layer_dp", side_effect=leave
+            ) as leave_dp,
+            patch(
+                "sglang.srt.models.deepseek_v4._scatter_tail_rows",
+                side_effect=lambda *, tail, rows, num_tokens: tail.scatter(
+                    rows, num_tokens
+                ),
+            ),
+        ):
+            self.assertIsNone(self.split(model, batch, (0, 2)))
+            self.assertEqual(batch.global_dp_buffer_len, 8)
+            self.assertIsNone(self.split(model, batch, (2, 3)))
+            self.assertEqual(batch.global_dp_buffer_len, 8)
+            self.split(model, batch, (3, 4))
+            self.assertEqual(batch.global_dp_buffer_len, 8)
+            self.assertEqual(enter_dp.call_count, 3)
+            self.assertEqual(leave_dp.call_count, 3)
 
     def test_wrapper_prepares_multimodal_embedding_once_and_emits_final_logits(self):
         ids = torch.tensor([1, 2**30])

@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     prefill_requests,
     write_prefill,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs, Selection
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4IndexerPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -71,14 +71,15 @@ def _fixture(*, ratio, rows, seq_lens, padding=0, device="cpu", cpu_slots=True):
         seq_lens_cpu=seq_lens,
         rows_per_request=rows,
         rows_per_request_device=None,
+        out_page_indices=torch.empty((n, 3), dtype=torch.int32, device=device),
+        out_raw_indices=torch.empty((n, 3), dtype=torch.int32, device=device),
     )
     req_to_token = (
         torch.arange(9, device=device)[:, None] * 32
         + torch.arange(32, device=device)[None, :]
     )
-    out = Selection(
-        torch.empty((n, 3), dtype=torch.int32, device=device),
-        torch.empty((n, 3), dtype=torch.int32, device=device),
+    out = SimpleNamespace(
+        page_indices=inputs.out_page_indices, raw_indices=inputs.out_raw_indices
     )
     wrapper = SimpleNamespace(get_low_ratio_index_k_dequant=pool.get_index_k_dequant)
     return inputs, out, wrapper, req_to_token
@@ -86,11 +87,11 @@ def _fixture(*, ratio, rows, seq_lens, padding=0, device="cpu", cpu_slots=True):
 
 def _select(inputs, out, pool, req_to_token):
     for request, chunks in prefill_requests(
-        inputs=inputs, out=out, token_to_kv_pool=pool, req_to_token=req_to_token
+        inputs=inputs, token_to_kv_pool=pool, req_to_token=req_to_token
     ):
         for chunk in chunks:
             idx = chunk.scores.topk(request.k, dim=-1).indices
-            write_prefill(out, request, chunk, idx)
+            write_prefill(inputs, request, chunk, idx)
     return out
 
 

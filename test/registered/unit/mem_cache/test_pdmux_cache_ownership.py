@@ -193,7 +193,9 @@ class TestHiCacheDeviceWorkReporting(unittest.TestCase):
         )
         cache._all_reduce_attn_groups = Mock()
         self.assertFalse(cache.check_hicache_events())
-        cache.linker.drain_loads.assert_called_once_with(1)
+        # Main now finishes external loads at the batch boundary, not polling.
+        cache.linker.drain_loads.assert_not_called()
+        cache.linker.take_completed_offloads.assert_called_once_with(1)
         cache.linker.commit_completed_offloads.assert_called_once_with([True])
         cache._sync_hicache_ready_counts.assert_not_called()
 

@@ -672,7 +672,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
 
         batch_output = self.target_worker.forward_batch_split_prefill(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=True,
         )
         if batch_output.logits_output is None:
             return batch_output

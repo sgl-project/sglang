@@ -98,7 +98,10 @@ class TestDSparkPDMux(unittest.TestCase):
         decode.wait_event.assert_not_called()
         self.assertEqual(
             worker.target_worker.forward_batch_split_prefill.call_args.kwargs,
-            {"capture_hidden_mode": CaptureHiddenMode.FULL},
+            {
+                "capture_hidden_mode": CaptureHiddenMode.FULL,
+                "return_kv_loc_plan": True,
+            },
         )
         if idle:
             worker._decode_idle_result.assert_not_called()
@@ -176,6 +179,8 @@ class TestDSparkPDMux(unittest.TestCase):
         worker._target_hidden_projection_enabled = False
         worker._tp_sync = Mock()
         worker._kv_injector = Mock()
+        worker._kv_injector.swa_ring_size = 256
+        worker._kv_injector.draft_model_runner.token_to_kv_pool.swa_valid_from = None
         worker.model_runner = SimpleNamespace(prefill_attention_backend_str="dsv4")
         batch = SimpleNamespace(
             forward_mode=ForwardMode.SPLIT_PREFILL,
@@ -191,20 +196,22 @@ class TestDSparkPDMux(unittest.TestCase):
             hidden_states=hidden, hidden_states_token_indices=indices
         )
         result = SimpleNamespace(
-            logits_output=logits, next_token_ids=torch.tensor([12, 13])
+            logits_output=logits,
+            next_token_ids=torch.tensor([12, 13]),
+            kv_loc_plan=object(),
         )
+        plan = result.kv_loc_plan
+        worker._kv_injector.ids_for.return_value = batch.out_cache_loc
         publish = Mock()
         with (
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_unified_kv_triton",
-                return_value=True,
-            ),
             patch(
                 "sglang.srt.speculative.dspark_components.dspark_worker_v2.compute_position",
                 return_value=(torch.tensor([4, 5, 6, 9, 10]), None),
             ),
         ):
             self.assertIs(worker._finalize_prefill(batch, result, publish), result)
+        worker._kv_injector.ids_for.assert_called_once_with(plan)
+        self.assertIsNone(result.kv_loc_plan)
         args = worker._kv_injector.inject_target_hidden.call_args.kwargs
         self.assertIs(args["target_hidden"], hidden)
         torch.testing.assert_close(args["cache_loc"], torch.tensor([21, 22, 24]))

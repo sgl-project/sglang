@@ -1175,7 +1175,6 @@ class TestPrefillAdder(CustomTestCase):
         first.sampling_params.ignore_eos = True
         first.origin_input_ids = list(range(60))
         first.full_untruncated_fill_ids = list(range(60))
-        first.extend_range = Range(0, 60)
         second = self.create_mock_req("second", priority=0, max_new_tokens=1)
         second.sampling_params.ignore_eos = True
         second.origin_input_ids = list(range(60))

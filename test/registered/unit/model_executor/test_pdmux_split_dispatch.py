@@ -1,6 +1,7 @@
 """An IDLE attention-DP rank must execute the same PDMux layer slices."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -14,9 +15,22 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestPDMuxSplitDispatch(unittest.TestCase):
+    def setUp(self):
+        for name, value in (
+            ("get_model", SimpleNamespace(override=lambda **_: nullcontext())),
+            ("get_forward_context", object()),
+            ("forward_context", nullcontext()),
+        ):
+            patcher = patch(
+                "sglang.srt.model_executor.model_runner." + name, return_value=value
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _runner(self):
         runner = object.__new__(ModelRunner)
         runner.device = "cuda"
+        runner.model = SimpleNamespace(shared_experts_config=None)
         runner.is_draft_worker = False
         runner.hisparse_coordinator = None
         runner.decode_cuda_graph_runner = SimpleNamespace(
@@ -69,7 +83,9 @@ class TestPDMuxSplitDispatch(unittest.TestCase):
         runner.model_config = SimpleNamespace(num_hidden_layers=6)
         runner.attn_backend = SimpleNamespace(init_forward_metadata=Mock())
         runner.device_timer = None
-        runner.model = SimpleNamespace(forward_split_prefill=Mock(return_value=None))
+        runner.model = SimpleNamespace(
+            forward_split_prefill=Mock(return_value=None), shared_experts_config=None
+        )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.IDLE,
             split_index=0,

@@ -761,6 +761,7 @@ class TpModelWorker(BaseTpWorker):
         batch: ScheduleBatch,
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
     ):
         # Decode resets the consumer between slices; restore load-back fences.
         self.set_hicache_consumer(batch.hicache_consumer_index)
@@ -789,6 +790,11 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            kv_loc_plan=(
+                batch.split_forward_batch.kv_loc_plan
+                if return_kv_loc_plan and logits_output is not None
+                else None
+            ),
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

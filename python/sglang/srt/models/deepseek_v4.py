@@ -3851,6 +3851,8 @@ class DeepseekV4Model(nn.Module):
             tail_sentinel = split_state["tail_sentinel"]
             saved_full = split_state["saved_full"]
             state = split_state["state"]
+            if split_state.get("late_dp_active", False):
+                saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
         else:
             hash_ids = None
             cp_extend = (
@@ -3868,10 +3870,14 @@ class DeepseekV4Model(nn.Module):
                     pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                     if pad_rows > 0:
                         hash_ids = torch.cat(
-                            [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
+                            [
+                                hash_ids,
+                                hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:]),
+                            ]
                         )
                 elif (
-                    forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+                    forward_batch.forward_mode.is_extend()
+                    and is_in_breakable_cuda_graph()
                 ):
                     hash_ids = bcg_deepseek_v4_engram_hash_ids(
                         self.engram_hasher, input_ids
@@ -4129,6 +4135,11 @@ class DeepseekV4Model(nn.Module):
                 }
             )
         if end != self.end_layer:
+            if saved_dp is not None:
+                # Do not leave compact MoE row counts installed between slices.
+                exit_late_layer_dp(forward_batch, saved_dp)
+                split_state["saved_dp"] = None
+                split_state["late_dp_active"] = True
             return hidden_states, None, tail
         if _is_cuda:
             state = residual_batch.read_output(

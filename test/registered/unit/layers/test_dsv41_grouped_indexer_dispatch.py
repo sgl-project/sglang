@@ -9,7 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
-from sglang.srt.layers.attention.dsv4.v41_indexer.types import DecodeInputs, Selection
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import DecodeInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,7 +42,14 @@ def test_only_fixed_request_major_target_rows_are_grouped(
     backend = SimpleNamespace(
         is_dspark_target=target,
         speculative_num_draft_tokens=group,
-        forward_metadata=SimpleNamespace(c1_indexer_metadata=metadata),
+        forward_metadata=SimpleNamespace(
+            c1_indexer_metadata=metadata,
+            core_metadata=SimpleNamespace(
+                sparse_page_indices=lambda ratio: torch.empty(
+                    rows, 8, dtype=torch.int32
+                )
+            ),
+        ),
     )
     layer = SimpleNamespace(compress_ratio=1, indexer=None, freqs_cis=None, layer_id=20)
     batch = SimpleNamespace(forward_mode=mode, batch_size=2)
@@ -115,15 +122,13 @@ def test_dispatch_preserves_candidates_and_fallbacks(
         paged_metadata=SimpleNamespace(max_compressed_seq_len=width),
         is_verify=verify,
         verify_group_size=group,
+        out_page_indices=torch.empty(rows, 8, dtype=torch.int32),
     )
     pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda _: cache)
     blocks = (
         torch.zeros(rows, 2, dtype=torch.int32) if candidates == "compact" else None
     )
     mask = torch.zeros(rows, width, dtype=torch.bool) if candidates == "mask" else None
-    out = Selection(
-        page_indices=torch.empty(rows, 8, dtype=torch.int32), raw_indices=None
-    )
     with (
         envs.SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER.override(enabled),
         patch.object(
@@ -141,7 +146,6 @@ def test_dispatch_preserves_candidates_and_fallbacks(
     ):
         result = scoring.decode_scores(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=pool,
             req_to_token=req_to_token,
             candidate_mask=mask,
