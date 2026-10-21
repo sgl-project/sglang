@@ -406,6 +406,15 @@ jobs:
           if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
             set -euo pipefail
             pip install coverage==7.8.*
+            # Coverage tracing slows down the Python glue, which shows up in
+            # wall-clock assertions. Relax only the timing tolerances for the
+            # collection run; PR runs (no coverage) keep the strict profile and
+            # the memory/VRAM checks are untouched.
+            export SGLANG_E2E_TOLERANCE=1.0
+            export SGLANG_STAGE_TIME_TOLERANCE=1.0
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=2.0
+            export SGLANG_DENOISE_STEP_TOLERANCE=1.0
+            export SGLANG_DENOISE_AGG_TOLERANCE=1.0
             python3 scripts/ci/npu/precise-test/list_multimodal_tests.py \
               --suite 1-npu \
               --partition-id ${{ matrix.part }} \
@@ -500,6 +509,15 @@ jobs:
           if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
             set -euo pipefail
             pip install coverage==7.8.*
+            # Coverage tracing slows down the Python glue, which shows up in
+            # wall-clock assertions. Relax only the timing tolerances for the
+            # collection run; PR runs (no coverage) keep the strict profile and
+            # the memory/VRAM checks are untouched.
+            export SGLANG_E2E_TOLERANCE=1.0
+            export SGLANG_STAGE_TIME_TOLERANCE=1.0
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=2.0
+            export SGLANG_DENOISE_STEP_TOLERANCE=1.0
+            export SGLANG_DENOISE_AGG_TOLERANCE=1.0
             python3 scripts/ci/npu/precise-test/list_multimodal_tests.py \
               --suite 2-npu \
               --partition-id ${{ matrix.part }} \
