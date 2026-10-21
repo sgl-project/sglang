@@ -36,6 +36,28 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
 
 
+def bind_thread_to_device(gpu_id: int) -> None:
+    """Make ``gpu_id`` the calling thread's current device.
+
+    A new thread starts on device 0, so a KV-transfer worker's first device call
+    (e.g. ``TransferKVChunk.wait_event.synchronize()``) would create device 0's
+    primary context in this process: an extra ~1 GiB context on another rank's GPU
+    for every worker whose ``gpu_id`` is not 0.
+    """
+    from sglang.srt.platforms import current_platform
+
+    try:
+        current_platform.set_device(current_platform.get_device(gpu_id))
+    except NotImplementedError:
+        pass
+
+
+def run_on_device(gpu_id: int, fn, *args) -> None:
+    """Thread target: bind the thread to ``gpu_id``, then run ``fn(*args)``."""
+    bind_thread_to_device(gpu_id)
+    fn(*args)
+
+
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     if not buffers:
         return b""
