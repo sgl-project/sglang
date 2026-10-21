@@ -1036,6 +1036,7 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&workers[1]).await;
     let dispatched: Vec<_> = workers
         .iter()
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
@@ -1103,11 +1104,12 @@ async fn version_group_capacity_fallback_preserves_decode_limits() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let use_first = second_full && !short_first;
+        wait_for_prefill(&workers[if use_first { 0 } else { 1 }]).await;
         let dispatched: Vec<_> = workers
             .iter()
             .map(|w| w.captured.lock().unwrap().last_body.is_some())
             .collect();
-        let use_first = second_full && !short_first;
         assert_eq!(
             dispatched,
             [use_first, !use_first, use_first, !use_first],
