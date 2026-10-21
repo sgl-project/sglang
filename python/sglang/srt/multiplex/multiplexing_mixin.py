@@ -5,6 +5,7 @@ Mixin class providing multiplexing scheduling logic
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -67,10 +68,25 @@ class SchedulerMultiplexMixin:
         initialize_stream_groups(get_device().gpu_id, self.pdmux_config)
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
+        self._limit_pdmux_collective_grids()
         self.real_sm_group_num = len(self.stream_groups)
         logger.info(
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
+
+    def _limit_pdmux_collective_grids(self):
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
+
+        # Each lane owns a communicator and must keep one fixed grid across
+        # all its stream groups. Full-device decode retains its original grid.
+        for lane in (0, 1):
+            context = pdmux_prefill_tp_group() if lane == 0 else nullcontext()
+            with context:
+                comm = get_parallel().tp_group.ca_comm
+                if isinstance(comm, CustomAllReduceV2):
+                    comm.limit_sm_count(min(s[lane] for s in self.sm_counts if s[lane]))
 
     def _retire_pdmux_seq_lens(self: Scheduler, batch, result) -> None:
         """Publish a staged CPU mirror after the lane's completion fence."""
