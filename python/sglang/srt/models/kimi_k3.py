@@ -551,6 +551,10 @@ class KimiK3MoE(nn.Module):
                 else None
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
         # the routed experts call below. K3 routes ALL batches through it when
@@ -2287,7 +2291,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate = self._compute_output_gate(gate_input)
-                    from sglang.kernels.ops.attention import mla_output_gate
+                    from sglang.kernels.ops.elementwise import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding

@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.kvcache.cache_ops import q8kv8_topk_length_from_indices
+from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported
 

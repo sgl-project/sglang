@@ -2671,6 +2671,12 @@ groups:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override policy for decode nodes</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-dispatch-limit`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>None</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requests per prefill worker sent to decode before decode answers or prefill finishes; the rest pick their decode worker when sent. Needs prefill `--optimistic-prefill-attempts` above 0</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--worker-startup-timeout-secs`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>600</td>
