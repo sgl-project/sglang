@@ -156,7 +156,9 @@ def _run_case(
         rank,
         args.num_experts,
         x_active_mask=mask,
-        expand_scales=(expand_scales if expand_scales.numel() else None),
+        # Dispatch is never given top-k weights, so the returned expand_scales is
+        # filler: empty on some builds, uninitialised ``(a,)`` memory on A3.
+        expand_scales=None,
         global_bs=0,
         comm_quant_mode=0,
         comm_alg=args.combine_comm_alg,

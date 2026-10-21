@@ -274,7 +274,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             expert_token_nums,
             ep_recv_counts,
             _tp_recv_counts,
-            expand_scales,
+            _expand_scales,
         ) = torch_npu.npu_moe_distribute_dispatch_v2(
             hidden_states,
             topk_ids,
@@ -297,9 +297,10 @@ class AscendOpsDispatcher(BaseDispatcher):
                 dynamic_scales.shape[0], hidden_states.shape[1] // 64, 2
             )
 
-        if expand_scales.numel() == 0:
-            # Empty unless top-k weights were handed to dispatch.
-            expand_scales = None
+        # Only meaningful when top-k weights were handed to dispatch, which we
+        # never do. Some torch_npu builds return an empty (0,) tensor here, but
+        # A3 returns an uninitialised ``(a,)`` one, so never forward it.
+        expand_scales = None
 
         self._ds_state = _DSv2State(
             num_tokens=num_tokens,
