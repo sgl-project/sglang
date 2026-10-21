@@ -264,10 +264,11 @@ class Step5MTP(nn.Module):
             expected.update(prefix + source for source in (shards or [local]))
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
         seen = set()
+        duplicates = Step5ForCausalLM._checkpoint_duplicate_owners(
+            expected, self.checkpoint_path
+        )
         weights = Step5ForCausalLM._indexed_duplicate_weights(
-            weights,
-            expected,
-            getattr(self, "checkpoint_path", None),
+            weights, duplicates, self.checkpoint_path
         )
         for name, loaded_weight in weights:
             if name.startswith("vision_model.") or name in (

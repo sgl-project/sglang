@@ -277,6 +277,15 @@ def _step5_keep_bf16_experts(quant_config, prefix: str) -> bool:
     return w13_skipped and not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get()
 
 
+def _step5_bf16_trtllm_supported() -> bool:
+    if not get_platform().is_sm100:
+        return False
+    from flashinfer.fused_moe import core as fi_moe
+
+    # Only FlashInfer builds with the SwigluStep patch apply the post-SiLU clamp.
+    return getattr(fi_moe, "TRTLLM_BF16_SWIGLU_STEP_SUPPORTED", False)
+
+
 _STEP5_EXPERT_LAYER = re.compile(r"layers\.(\d+)\.moe\.experts")
 _STEP5_EXPERT_TENSOR = re.compile(r"(?:^|\.)layers\.(\d+)\.moe\.experts\.\d+\.")
 _STEP5_PACKED_NVFP4_TENSOR = re.compile(
@@ -320,6 +329,46 @@ _STEP5_NVFP4_PARAM_SOURCES = {
         target for target, _ in _STEP5_NVFP4_EXPERT_SOURCES.values()
     )
 }
+
+
+def _step5_routed_expert_row(name: str, num_experts: int) -> tuple[str, int] | None:
+    # Trainers send `model.layers.L.moe.experts.E.<proj>`, one row of the packed `moe.<proj>`.
+    head, marker, tail = name.rpartition(".moe.experts.")
+    expert, _, projection = tail.partition(".")
+    if (
+        not marker
+        or not projection
+        or not expert.isdecimal()
+        or str(int(expert)) != expert
+    ):
+        return None
+    if not 0 <= int(expert) < num_experts:
+        return None
+    return f"{head}.moe.{projection}", int(expert)
+
+
+_STEP5_ROUTED_EXPERT_WEIGHTS = {
+    "gate_proj.weight": "w13_weight",
+    "up_proj.weight": "w13_weight",
+    "down_proj.weight": "w2_weight",
+}
+
+
+def _step5_refuse_fp8_into_bf16_expert(
+    name: str, weight: torch.Tensor, params_dict: Mapping, num_experts: int
+) -> None:
+    # The weight loader would cast it to BF16 without its scales.
+    if weight.dtype != torch.float8_e4m3fn:
+        return
+    row = _step5_routed_expert_row(name, num_experts)
+    head, marker, source = (name if row is None else row[0]).rpartition(".moe.")
+    if not marker or source not in _STEP5_ROUTED_EXPERT_WEIGHTS:
+        return
+    param_name = f"{head}.moe.experts.{_STEP5_ROUTED_EXPERT_WEIGHTS[source]}"
+    if param_name in params_dict and params_dict[param_name].dtype == torch.bfloat16:
+        raise ValueError(
+            f"Refusing FP8 weight {name} for BF16 expert parameter {param_name}"
+        )
 
 
 def _step5_indexed_nvfp4_layers(checkpoint_path) -> dict[int, str] | None:
@@ -473,14 +522,7 @@ class Step5MoE(nn.Module):
             not self.use_nvfp4_experts
             and _step5_keep_bf16_experts(quant_config, f"{self.prefix}.experts")
         )
-        self.bf16_trtllm = self.keep_bf16_experts and get_platform().is_sm100
-        if self.bf16_trtllm:
-            from flashinfer.fused_moe import core as fi_moe
-
-            if not getattr(fi_moe, "TRTLLM_BF16_SWIGLU_STEP_SUPPORTED", False):
-                raise RuntimeError(
-                    "Step5 BF16 TRTLLM requires the FlashInfer SwigluStep patch"
-                )
+        self.bf16_trtllm = self.keep_bf16_experts and _step5_bf16_trtllm_supported()
         self.use_mega_moe = (
             get_moe_a2a_backend().is_megamoe() and not self.keep_bf16_experts
         )
@@ -517,8 +559,8 @@ class Step5MoE(nn.Module):
         if self.use_nvfp4_experts:
             quant_method = ModelOptNvFp4FusedMoEMethod(quant_config)
         elif self.keep_bf16_experts:
-            # Checkpoint BF16 experts use the TRTLLM post-SiLU clamp on Blackwell
-            # and the global runner elsewhere; they never route to CUTLASS.
+            # Checkpoint BF16 experts apply the post-SiLU clamp in TRTLLM when FlashInfer
+            # has SwigluStep, else in the CUDA Triton runner; never in CUTLASS.
             quant_method = UnquantizedFusedMoEMethod(
                 use_flashinfer_trtllm_moe=self.bf16_trtllm,
                 use_flashinfer_cutlass=False,
@@ -601,9 +643,7 @@ class Step5MoE(nn.Module):
             logging.getLogger(__name__).info(
                 "Step5 layer %d: preserving checkpoint BF16 MoE experts (%s)",
                 layer_id,
-                "flashinfer_trtllm"
-                if self.bf16_trtllm
-                else get_moe_runner_backend().value,
+                "flashinfer_trtllm" if self.bf16_trtllm else "triton",
             )
         # DP shared reduction must finish before the in-place gather.
         # TODO(yhyang201): frozen SGLANG_STEP5_SHARED_OVERLAP_MAX_ROWS; prune dead paths.
@@ -1523,6 +1563,10 @@ class Step5ForCausalLM(nn.Module):
         self.nvfp4_expert_layouts = self.model.nvfp4_expert_layouts
         self.tie_word_embeddings = False
         self.num_fused_shared_experts = 0
+        # Only the checkpoint load must cover every target weight; once a loader has filled
+        # the weights, load_weights calls are updates and may stream any subset.
+        self._checkpoint_loaded = False
+        self._checkpoint_duplicate_names = frozenset()
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1549,20 +1593,21 @@ class Step5ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def post_load_weights(self) -> None:
+        # Loaders that never call load_weights (dummy, sharded state, remote instance) call this.
+        self._checkpoint_loaded = True
+
     @staticmethod
-    def _indexed_duplicate_weights(weights, expected, model_path):
-        # Native iterators do not retain shard provenance. For duplicate names,
-        # read the indexed owner explicitly rather than depend on arrival order.
+    def _checkpoint_duplicate_owners(expected, model_path) -> dict[str, str]:
+        # names stored in more than one shard -> the shard the index names
         from safetensors import safe_open
 
         if not model_path:
-            yield from weights
-            return
+            return {}
         root = Path(model_path)
         index_path = root / "model.safetensors.index.json"
         if not index_path.is_file():
-            yield from weights
-            return
+            return {}
         owners = json.loads(index_path.read_text())["weight_map"]
         occurrences = {}
         for filename in set(owners.values()):
@@ -1585,6 +1630,15 @@ class Step5ForCausalLM(nn.Module):
                 if owners.get(name) not in files:
                     raise ValueError(f"Step5 duplicate has no indexed owner: {name}")
                 duplicates[name] = owners[name]
+        return duplicates
+
+    @staticmethod
+    def _indexed_duplicate_weights(weights, duplicates, model_path):
+        # Native iterators do not retain shard provenance. For duplicate names,
+        # read the indexed owner explicitly rather than depend on arrival order.
+        from safetensors import safe_open
+
+        root = Path(model_path) if model_path else None
         emitted = set()
         for name, weight in weights:
             if name not in duplicates:
@@ -1690,13 +1744,30 @@ class Step5ForCausalLM(nn.Module):
             expected.update(sources or [name])
         seen, original_names = set(), set()
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
-        weights = self._indexed_duplicate_weights(
-            weights, expected, getattr(self, "checkpoint_path", None)
-        )
+        checkpoint_load = not self._checkpoint_loaded
+        if checkpoint_load:
+            duplicates = self._checkpoint_duplicate_owners(
+                expected, self.checkpoint_path
+            )
+            # a disk reload streams both copies again, with no shard provenance
+            self._checkpoint_duplicate_names = frozenset(duplicates)
+            weights = self._indexed_duplicate_weights(
+                weights, duplicates, self.checkpoint_path
+            )
+        if isinstance(weights, list):
+            # Refuse a tensor/distributed bucket before writing any of it.
+            for original_name, loaded_weight in weights:
+                _step5_refuse_fp8_into_bf16_expert(
+                    original_name, loaded_weight, params_dict, config.moe_num_experts
+                )
+        first_copies = {}
         for original_name, loaded_weight in weights:
             name = original_name
             if name.startswith("vision_model.") or name == "vit_large_projector.weight":
                 continue
+            _step5_refuse_fp8_into_bf16_expert(
+                name, loaded_weight, params_dict, config.moe_num_experts
+            )
             if name.startswith("model.layers."):
                 _, _, index, local = name.split(".", 3)
                 if (
@@ -1709,11 +1780,26 @@ class Step5ForCausalLM(nn.Module):
                     continue
                 if local.startswith("share_expert."):
                     name = f"model.layers.{index}.moe.{local}"
+            expert_ids, seen_key = range(config.moe_num_experts), name
+            if name not in expected and not checkpoint_load:
+                row = _step5_routed_expert_row(name, config.moe_num_experts)
+                if row is not None and row[0] in expected:
+                    # one expert's row of the packed tensor; duplicates are per expert
+                    name, expert_ids, seen_key = row[0], (row[1],), original_name
+                    loaded_weight = loaded_weight.unsqueeze(0)
             if name not in expected:
                 raise ValueError(f"Unknown Step5 target weight: {name}")
-            if name in seen:
+            if not checkpoint_load and seen_key in self._checkpoint_duplicate_names:
+                if seen_key in first_copies:
+                    if not torch.equal(first_copies[seen_key], loaded_weight):
+                        raise ValueError(
+                            f"Step5 duplicate copies differ: {original_name}"
+                        )
+                    continue
+                first_copies[seen_key] = loaded_weight
+            if seen_key in seen:
                 raise ValueError(f"Duplicate Step5 target weight: {original_name}")
-            seen.add(name)
+            seen.add(seen_key)
             original_names.add(original_name)
             nvfp4_source = step5_nvfp4_expert_source(name)
             if nvfp4_source is not None:
@@ -1753,7 +1839,12 @@ class Step5ForCausalLM(nn.Module):
                     and param.dtype == torch.float8_e4m3fn
                 )
                 if quantize_bf16:
-                    if not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get():
+                    # Only a checkpoint needs the opt-in; BF16 updates into FP8 experts
+                    # are always requantized.
+                    if (
+                        checkpoint_load
+                        and not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get()
+                    ):
                         raise ValueError(
                             f"Refusing implicit BF16-to-FP8 expert quantization: {original_name}. "
                             "Declare the BF16 experts in quantization_config.ignored_layers "
@@ -1769,8 +1860,8 @@ class Step5ForCausalLM(nn.Module):
                             f"BF16 expert weight has checkpoint scales: {original_name}"
                         )
                     seen.add(generated_scale)
-                for expert_id in range(config.moe_num_experts):
-                    weight = loaded_weight[expert_id]
+                for row, expert_id in enumerate(expert_ids):
+                    weight = loaded_weight[row]
                     if quantize_bf16:
                         local_id = experts._map_global_expert_id_to_local_expert_id(
                             expert_id
@@ -1827,10 +1918,11 @@ class Step5ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
         missing = expected - seen
-        if missing:
+        if checkpoint_load and missing:
             raise ValueError(
                 f"Step5 target is missing {len(missing)} weights: {sorted(missing)[:16]}"
             )
+        self.post_load_weights()
         for layer in self.model.layers:
             if layer.use_moe and layer.moe.use_nvfp4_experts:
                 step5_check_nvfp4_expert_scales(layer.moe.experts, layer.moe.prefix)
