@@ -72,7 +72,7 @@ class FullTopKIndexer:
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
@@ -85,7 +85,6 @@ class FullTopKIndexer:
         requests = prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         )
         for request, chunks in requests:
             for chunk in chunks:
