@@ -52,7 +52,7 @@ from sglang.srt.utils import (
     is_xpu,
     offloader,
 )
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import print_warning_once, torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -713,11 +713,15 @@ def dispatch_w8a8_block_fp8_linear(
     2. Auto-detection based on hardware capabilities
     """
     backend = get_fp8_gemm_runner_backend()
+    # Native block32 DeepGEMM is the default on SM90. SM100 DeepGEMM casts the
+    # weight scales to UE8M0, so it takes only UE8M0 checkpoints, on request.
     if (
         weight_block_size == [32, 32]
-        and get_platform().is_sm90
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        and (backend.is_auto() or backend.is_deep_gemm())
+        and (
+            (get_platform().is_sm90 and (backend.is_auto() or backend.is_deep_gemm()))
+            or (get_platform().is_sm100 and backend.is_deep_gemm() and act_scale_ue8m0)
+        )
     ):
         return partial(
             deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -726,6 +730,12 @@ def dispatch_w8a8_block_fp8_linear(
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
     if weight_block_size is not None and weight_block_size[1] != 128:
+        if backend.is_deep_gemm():
+            print_warning_once(
+                f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
+                "block FP8 weights on this setup; using Triton. DeepGEMM takes "
+                "[32, 32] blocks on SM90, and on SM100 with UE8M0 scales."
+            )
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     # Handle explicit backend selection via --fp8-gemm-backend
@@ -1402,13 +1412,27 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def _ue8m0_deepgemm_skips_block32(
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+) -> bool:
+    # UE8M0 DeepGEMM casts block32 fp32 scales itself: it takes only weights the
+    # load found power-of-two scaled, and no pre-quantized input, which nothing checks.
+    if list(block_size) != [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
+
+
 def _deepgemm_block_fp8_supported(
     weight_shape: Tuple[int, int], block_size: List[int], output_dtype: torch.dtype
 ) -> bool:
     if output_dtype != torch.bfloat16:
         return False
     n, k = weight_shape
-    if list(block_size) == [32, 32] and get_platform().is_sm90:
+    if list(block_size) == [32, 32] and (
+        get_platform().is_sm90 or get_platform().is_sm100
+    ):
         return n % 8 == 0 and k % 32 == 0
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 
@@ -1424,12 +1448,17 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # Block32 pre-quantized input reaches Triton below on UE8M0 DeepGEMM.
+        assert (
+            list(block_size) == [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
         assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):
+    if not _deepgemm_block_fp8_supported(
+        weight.shape, block_size, output_dtype
+    ) or _ue8m0_deepgemm_skips_block32(block_size, weight_scale, input_scale):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
