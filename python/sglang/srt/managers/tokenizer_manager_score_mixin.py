@@ -942,7 +942,8 @@ class TokenizerManagerScoreMixin:
         [N, hidden] tensor per sequence (per item, or one under --enable-mis), query rows first.
 
         rid, when set, is the base request id: every sub-request is sent as ``<rid>_<i>``
-        so the call can be correlated across tokenizer, scheduler and detokenizer logs.
+        (``i`` zero-padded) so the call can be correlated across tokenizer, scheduler and
+        detokenizer logs.
         """
         is_generation = self.is_generation
 

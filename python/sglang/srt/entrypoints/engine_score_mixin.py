@@ -80,7 +80,8 @@ class EngineScoreMixin:
                 (``len(scores) == len(items)``), where ``Ni`` is the number of
                 extraction tokens (candidates) in item ``i``.
             rid: Optional base request id. A scoring call fans out into one
-                sub-request per item, so it is expanded to ``<rid>_<i>`` and used
+                sub-request per item, so it is expanded to ``<rid>_<i>`` (``i``
+                zero-padded to a common width) and used
                 as the cross-process correlation key that appears in
                 TokenizerManager / scheduler / detokenizer logs. Auto-generated
                 when None.

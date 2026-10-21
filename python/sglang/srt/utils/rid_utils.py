@@ -9,7 +9,7 @@ def expand_base_rid(rid: str, num: int) -> List[str]:
     The scheduler aborts by rid prefix, so unpadded ``<rid>_1`` would also abort
     ``<rid>_10``.
     """
-    if not isinstance(rid, str) or not rid:
+    if not rid:
         raise ValueError("The rid should be a non-empty string.")
     # Sub-rids keep the base prefix, so a health-check prefix would make every
     # sub-request look internal.

@@ -60,10 +60,10 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
         if isinstance(self.embeds, torch.Tensor):
-            # Enforce rank here rather than in validate_hidden_dim: that method only
-            # inspects the last dim, so a [N, 1, hidden_dim] input would satisfy both
-            # the length check below and the hidden-dim check, then fail deep inside
-            # the scheduler's scatter and abort every co-batched request.
+            # Enforce rank here: validate_positional_embed_overrides only inspects
+            # the last dim, so a [N, 1, hidden_dim] input would satisfy both the
+            # length check below and the hidden-dim check, then fail deep inside the
+            # scheduler's scatter and abort every co-batched request.
             if self.embeds.dim() != 2:
                 raise ValueError(
                     f"positional_embed_overrides embeds must be 2-D [N, hidden_dim], "
@@ -89,16 +89,24 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
         if isinstance(self.embeds, CudaIpcTensorTransportProxy):
             self.embeds = self.embeds.reconstruct_on_target_device(target_device)
 
-    def validate_hidden_dim(self, expected_hidden_dim: int) -> None:
-        """Raise ValueError if the stacked embeds tensor's last dim != model hidden_dim.
 
-        Called from the request-ingestion path so callers get an actionable error
-        instead of an opaque scatter failure inside the scheduler process.
-        """
-        actual = self.embeds.shape[-1]
-        if actual != expected_hidden_dim:
-            raise ValueError(
-                f"positional_embed_overrides hidden_dim ({actual}) does not match "
-                f"model hidden_size ({expected_hidden_dim}). Each embed tensor must "
-                f"have shape [hidden_size] or [1, hidden_size]."
-            )
+def validate_positional_embed_overrides(value: object, *, hidden_size: int) -> None:
+    """Reject a malformed ``positional_embed_overrides`` at request ingestion.
+
+    A bad value would otherwise fail msgpack decode or the embed scatter inside the
+    scheduler and abort every co-batched request; raising here surfaces as HTTP 400.
+    """
+    if value is None:
+        return
+    if not isinstance(value, PositionalEmbeds):
+        raise ValueError(
+            "positional_embed_overrides must be a PositionalEmbeds or null, got "
+            f"{type(value).__name__}."
+        )
+    actual = value.embeds.shape[-1]
+    if actual != hidden_size:
+        raise ValueError(
+            f"positional_embed_overrides hidden_dim ({actual}) does not match "
+            f"model hidden_size ({hidden_size}). Each embed tensor must have shape "
+            f"[hidden_size] or [1, hidden_size]."
+        )
