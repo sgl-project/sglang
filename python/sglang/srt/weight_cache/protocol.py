@@ -266,11 +266,10 @@ def compute_env_stamp() -> Dict[str, str]:
     except Exception:
         pass
 
-    stamp = {
+    return {
         "device_capability": device_capability,
         "torch_version": torch_version,
     }
-    return stamp
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:

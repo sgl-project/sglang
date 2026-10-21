@@ -411,7 +411,6 @@ class WeightCacheDaemon:
         The expandable-segments allocator returns memory that cannot be shared
         through torch's _share_cuda_ handle, which would make the export fail
         partway with an opaque error. Detect it up front and fail loud.
-
         """
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
             conf = os.environ.get(var, "")
