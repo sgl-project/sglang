@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
