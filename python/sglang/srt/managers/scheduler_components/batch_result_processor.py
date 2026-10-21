@@ -793,6 +793,8 @@ class SchedulerBatchResultProcessor:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
+        self.metrics_reporter.snapshot_spec_decode_metrics(batch, result)
+
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         stride = _get_speculative_output_stride(result)
@@ -1421,6 +1423,7 @@ class SchedulerBatchResultProcessor:
                 and lookahead == 1
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
             ):
                 req.mamba_lazy_checkpoint = False
 
