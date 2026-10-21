@@ -2229,6 +2229,13 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 )
                 self.register_parameter(f"{role}_b_qweight_type", qweight_type)
             self._kimi_split_gguf_kv_b = True
+        if _is_hip and envs.SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION.get():
+            from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
+
+            self.rocm_mla_q_cache_writer = KimiK3RocmMlaQCacheWriter(
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):

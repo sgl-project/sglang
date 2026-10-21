@@ -972,7 +972,32 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            fused_q_cache = None
+            if (
+                self.rocm_mla_q_cache_writer is not None
+                and not get_parallel().dcp_enabled
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+            ):
+                fused_q_cache = self.rocm_mla_q_cache_writer.write(
+                    q_nope=q_nope_out,
+                    q_pe=q_pe,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    out_cache_loc=forward_batch.out_cache_loc,
+                    kv_cache=get_token_to_kv_pool().get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    k_scale=self.attn_mqa.k_scale,
+                    attention_backend=self.current_attention_backend,
+                )
+
+            if fused_q_cache is not None:
+                q, k = fused_q_cache
+                save_kv_cache = False
+            elif self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,

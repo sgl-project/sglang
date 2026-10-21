@@ -2226,6 +2226,8 @@ class DeepseekV2AttentionMLA(
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
+        # Model-installed writer for the ROCm absorbed decode Q and latent KV cache.
+        self.rocm_mla_q_cache_writer = None
 
         self.has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
         self.is_packed_weight = (
