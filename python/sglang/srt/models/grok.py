@@ -59,11 +59,10 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
+from sglang.srt.utils import add_prefix, is_cpu, is_npu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,7 @@ class Grok1MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        if _is_cpu and _is_cpu_amx_available:
+        if _is_cpu:
             x = torch.ops.sgl_kernel.gelu_and_mul_cpu(gate_up)
         else:
             x, _ = gelu_and_mul_triton(gate_up)
@@ -584,7 +583,7 @@ class Grok1DecoderLayer(nn.Module):
         if deferred_norm is not None:
             assert residual is not None
             # here hidden_states is output of ffn, residual is residual from after previous attn layer
-            if _is_cpu and _is_cpu_amx_available:
+            if _is_cpu:
                 hidden_states, residual = (
                     torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
                         hidden_states,
@@ -605,7 +604,7 @@ class Grok1DecoderLayer(nn.Module):
         else:
             # here hidden_states is the residual
             residual = hidden_states
-            if _is_cpu and _is_cpu_amx_available:
+            if _is_cpu:
                 hidden_states = torch.ops.sgl_kernel.rmsnorm_cpu(
                     hidden_states,
                     self.pre_attn_norm.weight,
@@ -627,7 +626,7 @@ class Grok1DecoderLayer(nn.Module):
         if get_parallel().tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        if _is_cpu and _is_cpu_amx_available:
+        if _is_cpu:
             hidden_states, residual = (
                 torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
                     hidden_states,
