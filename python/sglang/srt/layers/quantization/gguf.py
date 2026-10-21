@@ -42,6 +42,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_musa_apply_gguf_moe_weights = None
 
 if _is_cuda:
     from sgl_kernel import moe_sum
@@ -64,6 +65,10 @@ elif _is_musa:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
+
+    from sglang.kernels.ops.moe.gguf_moe_weights_aot import resolve_gguf_moe_weights
+
+    _musa_apply_gguf_moe_weights = resolve_gguf_moe_weights("musa")
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:
@@ -274,20 +279,23 @@ def fused_moe_gguf(
             activation_fn = gelu_and_mul
         else:
             raise ValueError(f"Unsupported activation: {activation}")
-        if routed and _is_musa:
+        if routed and _is_musa and not native_musa:
             x.masked_fill_(inactive.reshape(-1, 1), 0.0)
         return activation_fn(x)
 
     def sum_expert_outputs(out: torch.Tensor):
         if _is_cuda:
             apply_gguf_moe_weights(out, topk_weights, topk_ids)
+        elif native_musa:
+            _musa_apply_gguf_moe_weights(out, topk_weights, topk_ids)
         else:
             out.masked_fill_(inactive.reshape(-1, 1), 0.0)
             valid_weights = topk_weights.masked_fill(inactive, 0.0)
             out.view(*topk_ids.shape, -1).mul_(valid_weights.unsqueeze(-1))
         moe_sum(out.view(*topk_ids.shape, -1), out_hidden_states)
 
-    if _is_musa:
+    native_musa = _is_musa and _musa_apply_gguf_moe_weights is not None
+    if _is_musa and not native_musa:
         inactive = topk_ids < 0
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
@@ -304,11 +312,12 @@ def fused_moe_gguf(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
         )
-        # Released MMQ kernels inspect one slack block before their bound check.
-        block_starts = (
-            torch.arange(expert_ids.numel(), device=expert_ids.device) * BLOCK_SIZE
-        )
-        expert_ids.masked_fill_(block_starts >= num_tokens_post_padded, -1)
+        if not native_musa:
+            # Released MMQ kernels inspect a slack block before their bound check.
+            block_starts = (
+                torch.arange(expert_ids.numel(), device=expert_ids.device) * BLOCK_SIZE
+            )
+            expert_ids.masked_fill_(block_starts >= num_tokens_post_padded, -1)
         out = ggml_moe_a8(
             x,
             w1,
@@ -339,9 +348,17 @@ def fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        # Older vector kernels form weight addresses before checking -1.
-        # They have no per-expert capacity buffer; discard their dummy slots.
-        safe_ids = _prepare_gguf_moe_safe_ids(topk_ids, out_hidden_states)
+        if native_musa:
+            # The vector ABI reads compact int32 IDs. Normal routes keep their
+            # storage; exceptional int64 routes canonicalize negative IDs.
+            safe_ids = (
+                topk_ids.contiguous()
+                if topk_ids.dtype == torch.int32
+                else topk_ids.clamp_min(-1).to(torch.int32).contiguous()
+            )
+        else:
+            # Older vector kernels form weight addresses before checking -1.
+            safe_ids = _prepare_gguf_moe_safe_ids(topk_ids, out_hidden_states)
         out = ggml_moe_a8_vec(x, w1, safe_ids, top_k, qweight_type, N, num_tokens)
         out = act(out, routed=True)
 
@@ -357,7 +374,7 @@ def fused_moe_gguf(
         )
         for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
             inp = x[tok].reshape((1,) + x.shape[1:])
-            current_hidden_state = torch.zeros_like(inp)
+            current_hidden_state = None
             for ww, ii in zip(w, idx):
                 if ii < 0:
                     continue
@@ -370,8 +387,14 @@ def fused_moe_gguf(
                 current_state = fused_mul_mat_gguf(
                     out, expert_down, qweight_type2
                 ).mul_(ww)
-                current_hidden_state.add_(current_state)
-            out_hidden_states[tok] = current_hidden_state
+                if current_hidden_state is None:
+                    current_hidden_state = current_state
+                else:
+                    current_hidden_state.add_(current_state)
+            if current_hidden_state is None:
+                out_hidden_states[tok].zero_()
+            else:
+                out_hidden_states[tok] = current_hidden_state
     return out_hidden_states
 
 

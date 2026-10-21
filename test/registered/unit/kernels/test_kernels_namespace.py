@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
+_MUSA = PlatformInfo(device_type="musa")
 
 
 def test_single_backend_resolves_without_backend():
@@ -55,6 +57,7 @@ def test_unknown_op_or_backend_raises():
         (PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=0), False),
         (_CPU, False),
         (_HIP, False),
+        (_MUSA, False),
     ],
 )
 def test_qwen_qkv_registry_accepts_hopper(platform, eligible):
@@ -90,6 +93,12 @@ def test_activation_default_backend(monkeypatch, device, expect):
         (Cap.CUDA, _SM90, True),
         (Cap.CUDA, _HIP, False),
         (Cap.HIP, _HIP, True),
+        (Cap.MUSA, _MUSA, True),
+        (Cap.MUSA, _CPU, False),
+        (Cap.MUSA, _SM90, False),
+        (Cap.MUSA, _HIP, False),
+        (Cap.CUDA, _MUSA, False),
+        (Cap.HIP, _MUSA, False),
         (Cap.cuda(min_sm=(10, 0)), _SM90, False),
         (Cap.cuda(min_sm=(10, 0)), _SM100, True),
         (Cap.cuda(max_sm=(9, 0)), _SM100, False),
@@ -97,6 +106,24 @@ def test_activation_default_backend(monkeypatch, device, expect):
 )
 def test_capability_is_satisfied_by(req, plat, ok):
     assert req.is_satisfied_by(plat) is ok
+
+
+@pytest.mark.parametrize(
+    "musa_version, available, expected_device",
+    [("4.0", True, "musa"), (None, True, "cuda"), ("4.0", False, "cpu")],
+)
+def test_platform_detection_distinguishes_musa_cuda_alias(
+    monkeypatch, musa_version, available, expected_device
+):
+    torch = SimpleNamespace(
+        version=SimpleNamespace(hip=None, musa=musa_version),
+        cuda=SimpleNamespace(
+            is_available=lambda: available,
+            get_device_capability=lambda: (9, 0),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    assert PlatformInfo.detect().device_type == expected_device
 
 
 def test_capabilities_or_semantics():
