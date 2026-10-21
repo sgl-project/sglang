@@ -146,10 +146,8 @@ class Grok1MoE(nn.Module):
         )
 
         self.router_logit_softcapping = 30.0
-
         custom_routing_function = functools.partial(
-            fused_moe_router_shim,
-            self.router_logit_softcapping,
+            fused_moe_router_shim, self.router_logit_softcapping
         )
 
         self.topk = TopK(
