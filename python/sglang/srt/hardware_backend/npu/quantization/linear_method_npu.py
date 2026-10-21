@@ -157,6 +157,86 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         )
 
 
+class NPUW8A8Int8StaticLinearMethod(_NPULinearMethodBase):
+    """Calibrated symmetric INT8 activations with compressed-tensors weights."""
+
+    def __init__(self, strategy):
+        super().__init__()
+        self.strategy = strategy
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        widths = layer.logical_widths
+        input_scale = layer.input_scale.detach().flatten().float()
+        weight_scale = layer.weight_scale.detach().flatten().float()
+        if input_scale.numel() != len(widths):
+            raise ValueError("Expected one static input scale per logical shard")
+        if not torch.all(torch.isfinite(input_scale) & (input_scale > 0)):
+            raise ValueError("Static input scales must be finite and positive")
+        if not torch.all(input_scale == input_scale[0]):
+            raise ValueError(
+                "NPU static INT8 requires identical input scales for fused shards"
+            )
+        if not torch.all(torch.isfinite(weight_scale) & (weight_scale > 0)):
+            raise ValueError("Static weight scales must be finite and positive")
+        if self.strategy == "tensor":
+            if weight_scale.numel() != len(widths):
+                raise ValueError("Expected one tensor weight scale per logical shard")
+            # Keep the exported integer codes: each shard's scale can be
+            # expanded to its output channels without requantizing the weight.
+            weight_scale = torch.cat(
+                [scale.expand(width) for scale, width in zip(weight_scale, widths)]
+            )
+        elif self.strategy != "channel" or weight_scale.numel() != sum(widths):
+            raise ValueError("Expected one channel weight scale per output feature")
+
+        input_size = layer.weight.shape[1]
+        layer.weight = Parameter(
+            npu_format_cast(layer.weight.detach().T.contiguous()), requires_grad=False
+        )
+        layer.weight_scale = Parameter(weight_scale.contiguous(), requires_grad=False)
+        layer.input_scale = Parameter(input_scale[:1].clone(), requires_grad=False)
+        layer.register_buffer(
+            "npu_static_quant_scale",
+            layer.input_scale.expand(input_size).contiguous(),
+        )
+        layer.register_buffer(
+            "npu_static_quant_offset",
+            torch.zeros_like(layer.npu_static_quant_scale, dtype=torch.int32),
+        )
+
+    def apply(self, layer, x, bias=None):
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("NPU static INT8 expects float16 or bfloat16 activations")
+        if x.ndim < 2 or x.shape[-1] != layer.weight.shape[0]:
+            raise ValueError("NPU static INT8 input must end in the weight input size")
+        output_shape = (*x.shape[:-1], layer.weight.shape[1])
+        x_2d = x.reshape(-1, x.shape[-1])
+        if x_2d.shape[0] == 0:
+            return x.new_empty(output_shape)
+        quant_out = torch.ops.npu.npu_quantize(
+            x_2d,
+            layer.npu_static_quant_scale,
+            layer.npu_static_quant_offset,
+            torch.qint8,
+            -1,
+            True,
+        )
+        # This is one fixed calibration scale repeated across rows, not
+        # per-token dynamic quantization. The API's pertoken_scale form also
+        # supports floating-point bias and FP16 graph capture without packing
+        # a dequantization scale on each forward call.
+        static_scale = layer.input_scale.expand(x_2d.shape[0]).contiguous()
+        output = torch.ops.npu.npu_quant_matmul(
+            quant_out,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=static_scale,
+            bias=bias.float() if bias is not None else None,
+            output_dtype=x.dtype,
+        )
+        return output.reshape(output_shape)
+
+
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     """NPU MXFP8 linear method for LLM (SRT) models.
 
