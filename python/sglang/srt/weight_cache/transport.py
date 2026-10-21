@@ -198,8 +198,8 @@ def choose_daemon_transport_backend(
         # back to a CPU copy instead of zero-copy IPC. Probe once and warn (rather
         # than error) if zero-copy is unavailable, so weight caching still works
         # by copying the weights through the CPU.
-        import torch_npu  # noqa: F401
         import torch.multiprocessing.reductions as _reductions
+        import torch_npu  # noqa: F401
 
         first = next(iter(state_tensors.values()), None)
         if first is not None:
