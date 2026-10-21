@@ -168,6 +168,9 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
+    # Registered DiT class to load instead of the checkpoint's ``_class_name``,
+    # for pipelines that drive shared weights with a different forward.
+    transformer_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -1131,8 +1134,8 @@ class PipelineConfig:
                 # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
                 # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
                 # config so realtime-only wiring (the /v1/realtime_video adapter) is
-                # selected. Only applies when the explicit config strictly subclasses
-                # the model default, so non-realtime pipelines are unaffected.
+                # selected. A registered explicit config also replaces the generic
+                # Diffusers fallback used for package roots without model_index.json.
                 if pipeline_class_name:
                     explicit_config_classes = get_pipeline_config_classes(
                         pipeline_class_name
@@ -1143,7 +1146,11 @@ class PipelineConfig:
                             isinstance(explicit_config_cls, type)
                             and isinstance(pipeline_config_cls, type)
                             and explicit_config_cls is not pipeline_config_cls
-                            and issubclass(explicit_config_cls, pipeline_config_cls)
+                            and (
+                                issubclass(explicit_config_cls, pipeline_config_cls)
+                                or pipeline_config_cls.__name__
+                                == "DiffusersGenericPipelineConfig"
+                            )
                         ):
                             logger.info(
                                 f"Refining pipeline config {pipeline_config_cls.__name__} "
@@ -1341,24 +1348,6 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return self._gather_sp_tensor(latents, dim=2)
-
-
-@dataclass
-class SlidingTileAttnConfig(PipelineConfig):
-    """Configuration for sliding tile attention."""
-
-    # Override any BaseConfig defaults as needed
-    # Add sliding tile specific parameters
-    window_size: int = 16
-    stride: int = 8
-
-    # You can provide custom defaults for inherited fields
-    height: int = 576
-    width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
 
 
 def parse_int_list(value: str) -> list[int]:

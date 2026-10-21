@@ -1,7 +1,7 @@
 """FlashInfer KDA decode/verify wrapper.
 
-Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100 / Blackwell). KDA prefill
-uses a separate adapter in ``kda_flashinfer_prefill``.
+Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100+). KDA prefill uses a
+separate SM100/SM103-only adapter in ``kda_flashinfer_prefill``.
 
 Contract with the Triton KDA reference:
   - raw per-K gate ``a`` is activated in-kernel as
@@ -44,7 +44,8 @@ def _get_flashinfer_kda_kernel():
             from flashinfer.kda_decode import recurrent_kda
 
             _flashinfer_recurrent_kda = recurrent_kda
-            # recurrent_kda is SM100-only (CuTe DSL, Blackwell).
+            # SM100/SM103 get frozen fast paths; the generic CuTe DSL path
+            # also runs on SM120.
             _flashinfer_kda_available = (
                 is_cuda() and torch.cuda.get_device_capability()[0] >= 10
             )
@@ -85,14 +86,14 @@ def build_fused_accept_indices(
 
 
 class FlashInferKDAKernel(LinearAttnKernelBase):
-    """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1."""
+    """FlashInfer KDA kernel: decode + MTP (target_verify), topk=1."""
 
     def __init__(self):
         available, self._recurrent_kda = _get_flashinfer_kda_kernel()
         if not available or self._recurrent_kda is None:
             raise RuntimeError(
                 "FlashInfer KDA kernel (recurrent_kda) is not available. "
-                "Requires SM100 (Blackwell) and a FlashInfer build with KDA support."
+                "Requires SM100+ and a FlashInfer build with KDA support."
             )
         # Cache the per-layer constant gate-param prep (A_log/dt_bias reshape+cast),
         # keyed by tensor identity. Layer params are persistent weights so id() is

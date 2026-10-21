@@ -562,6 +562,50 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
+_LLADA_IMAGE_SERVER_ARGS = DiffusionServerArgs(
+    model_path="inclusionAI/LLaDA-Image",
+    modality="image",
+    num_gpus=1,
+    tp_size=1,
+    ulysses_degree=1,
+    ring_degree=1,
+    cfg_parallel=False,
+    extras=[
+        "--trust-remote-code",
+        "--revision",
+        "e4e2703f410f7ddb6ee8d6b09dac6a8ec5093039",
+    ],
+)
+_LLADA_IMAGE_SAMPLING = {"num_inference_steps": 50, "guidance_scale": 5.0, "seed": 42}
+if not current_platform.is_hip() and not current_platform.is_xpu():
+    ONE_GPU_CASES += [
+        DiffusionTestCase(
+            "llada_image_bf16_t2i",
+            _LLADA_IMAGE_SERVER_ARGS,
+            DiffusionSamplingParams(
+                prompt="A red fox sitting on a snowy hill",
+                output_size="512x512",
+                extras=_LLADA_IMAGE_SAMPLING,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+        DiffusionTestCase(
+            "llada_image_bf16_edit",
+            _LLADA_IMAGE_SERVER_ARGS,
+            DiffusionSamplingParams(
+                prompt="Convert 2D style to 3D style",
+                image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+                output_size="512x512",
+                extras=_LLADA_IMAGE_SAMPLING,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+    ]
+
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
     ONE_GPU_CASES.append(
@@ -645,6 +689,7 @@ else:
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -654,6 +699,7 @@ else:
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "ideogram4_nvfp4_t2i",
@@ -663,6 +709,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "qwen_image_2512_modelopt_nvfp4_t2i",
@@ -672,6 +719,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
@@ -681,6 +729,7 @@ else:
             extras=[],
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
     ]
 
@@ -1562,6 +1611,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_ipc_a2a_multi_gpu.py",
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py",
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
         "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
@@ -1569,21 +1619,28 @@ STANDALONE_FILES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
+        "../unit/test_async_output_save.py",
+        "../unit/test_kandinsky6_sequence_parallel.py",
+        "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_qwen_image21_distributed.py",
     ],
 }
 
 # test_update_weights_from_disk fails deterministically on ROCm: the diffusion
 # weight-update-from-disk reload path does not reconcile the diffusers
 # checkpoint layout with the sglang transformer parameters (shape mismatch ->
-# HTTP 400). Tracked in #31924. NVIDIA does not run standalone files, so this
-# test is AMD-only; skip it on ROCm until the reload path is fixed. Remove
-# this block (keeping the STANDALONE_FILES / est-time entry above) to
-# re-enable once #31924 lands.
+# HTTP 400). Tracked in #31924. Skip it on ROCm until the reload path is
+# fixed. Remove this block (keeping the STANDALONE_FILES / est-time entry
+# above) to re-enable once #31924 lands.
 if current_platform.is_hip():
     STANDALONE_FILES["1-gpu"] = [
         f
         for f in STANDALONE_FILES["1-gpu"]
         if f != "../single_test_file/test_update_weights_from_disk.py"
+    ]
+    # The 2-GPU unit/ cases are only validated on CUDA.
+    STANDALONE_FILES["2-gpu"] = [
+        f for f in STANDALONE_FILES["2-gpu"] if not f.startswith("../unit/")
     ]
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
@@ -1594,6 +1651,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
     },
     "1-gpu": {
+        "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
     "2-gpu": {
@@ -1605,6 +1663,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
         "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
+        # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 120.0,
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
         "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
@@ -1618,6 +1678,11 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
+        # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
+        "../unit/test_async_output_save.py": 30.0,
+        "../unit/test_kandinsky6_sequence_parallel.py": 150.0,
+        "../unit/test_kandinsky6_sr_sequence_parallel.py": 150.0,
+        "../unit/test_qwen_image21_distributed.py": 90.0,
     },
 }
 
