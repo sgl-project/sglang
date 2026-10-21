@@ -22,15 +22,30 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.gemm.bf16_gemm_hipblaslt_tuned import (
+    bf16_gemm_hipblaslt,
+    hipblaslt_tuned_solution,
+)
+from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import LAYOUT as TILED_GEMM_LAYOUT
+from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+    prepare_tiled_weight,
+    tiled_gemm,
+    tiled_gemm_applies,
+)
 from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+    router_gemm_tuned,
     router_gemv_fp32,
     router_gemv_fp32_supported,
+)
+from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
+    unpool_gemm_norm_residual,
 )
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -38,6 +53,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import (
+    register_gfx950_unquantized_gemm_shapes,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -47,6 +65,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.rocm_muse_spark import mxfp4_moe, router_pooler
+from sglang.srt.rocm_muse_spark.attention_kv_write import (
+    FUSED_QKV_CACHE,
+    QK_ROPE_CACHE,
+    qk_norm_rope_kv_write,
+    qkv_proj_norm_rope_kv_write,
+)
 from sglang.srt.rocm_muse_spark.fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.rocm_muse_spark.fused_muse_spark_routing import FusedMuseSparkRouting
 from sglang.srt.rocm_muse_spark.fused_norm_gate import FusedRMSNormGate
@@ -58,6 +83,16 @@ from sglang.srt.rocm_muse_spark.layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
+from sglang.srt.rocm_muse_spark.sequence_parallel import (
+    SPShape,
+    prepare_ulysses,
+    sp_gather,
+    sp_reduce_scatter,
+    sp_shape,
+    sp_shard,
+    ulysses_attention,
+    ulysses_enabled,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -282,9 +317,37 @@ _USE_AITER_DENSE = (
 )
 _tgemm = None
 
+# MI355X AgentX fast paths (switches in sglang.srt.environ, all on by default).
+# Pooler / unpooler at verify widths (M > 64) on searched hipBLASLt solutions and
+# the FP32 router on a tuned split-K GEMM (exact-M tables in kernels/ops/gemm/configs).
+_DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
+# Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
+# register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
+_DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
+# The DFlash draft's gate/up and down GEMMs at the measured M = 24 (TP8) on the
+# aiter Triton a16w16 kernel instead of the tuned table's padded-M pick.
+_DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
+# Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
+_FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+_dense_tuned_logged: set = set()
+
+
+def _log_dense_tuned(kind: str, key) -> None:
+    if key not in _dense_tuned_logged:
+        _dense_tuned_logged.add(key)
+        logger.info("Muse dense tuned: %s %s", kind, key)
+
 
 def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
     global _tgemm
+    tiled = getattr(linear, "small_m_tiled_weight", None)
+    if tiled is not None and linear.bias is None and tiled_gemm_applies(x, tiled):
+        return tiled_gemm(x, tiled, *linear.weight.shape)
+    if _DENSE_TUNED and linear.bias is None:
+        solution = hipblaslt_tuned_solution(x, linear.weight)
+        if solution is not None:
+            _log_dense_tuned("gemm", (*linear.weight.shape, x.shape[0], solution))
+            return bf16_gemm_hipblaslt(x, linear.weight, solution)
     if (
         _USE_AITER_DENSE
         and linear.bias is None
@@ -431,21 +494,9 @@ class MuseSpark1xAttention(nn.Module):
             .to(dtype)
         )
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        qkv, _ = self.qkv_proj(hidden_states)
-        split_sizes = [self.q_size, self.kv_size, self.kv_size]
-        if self.use_o_gate:
-            q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
-        else:
-            q, k, v = qkv.split(split_sizes, dim=-1)
-            o_gate = None
+    def qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_qk_norm:
             if _USE_FUSED_QK_NORM and qk_norm_supported(q, k, self.head_dim):
                 q, k = fused_qk_norm(
@@ -463,9 +514,45 @@ class MuseSpark1xAttention(nn.Module):
             q = (q * temperature.unsqueeze(-1)).to(q.dtype)
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
-        output = self.attn(q, k, v, forward_batch)
+        return q, k
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        reduce: bool = True,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        # Decode / verify: the fused QK-norm / RoPE kernels also store K/V into
+        # the FP8 cache, so the attention layer must not store them again.
+        projected = (
+            qkv_proj_norm_rope_kv_write(self, positions, hidden_states, forward_batch)
+            if FUSED_QKV_CACHE and QK_ROPE_CACHE and _USE_FUSED_QK_NORM
+            else None
+        )
+        if projected is not None:
+            q, k, v, o_gate = projected
+            kv_written = True
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            split_sizes = [self.q_size, self.kv_size, self.kv_size]
+            if self.use_o_gate:
+                q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
+            else:
+                q, k, v = qkv.split(split_sizes, dim=-1)
+                o_gate = None
+            fused_qk = (
+                qk_norm_rope_kv_write(self, positions, q, k, v, forward_batch)
+                if QK_ROPE_CACHE and _USE_FUSED_QK_NORM
+                else None
+            )
+            kv_written = fused_qk is not None
+            q, k = fused_qk if kv_written else self.qk_norm_rope(positions, q, k)
+        output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
         output = self._fused_o_norm_gate.forward(output, o_gate)
-        output, _ = self.o_proj(output)
+        output, _ = self.o_proj(output, skip_all_reduce=not reduce)
         return output
 
 
@@ -701,6 +788,7 @@ class MuseSpark1xMoE(nn.Module):
         if config.num_local_experts % parallel.moe_ep_size:
             raise ValueError("num_experts must be divisible by expert parallel size")
         self.layer_idx = layer_idx
+        self._compact_a4_reported = False
         self.tp_size = parallel.tp_size
         self.ep_size = parallel.moe_ep_size
         self.ep_rank = parallel.moe_ep_rank
@@ -795,7 +883,53 @@ class MuseSpark1xMoE(nn.Module):
             object.__setattr__(self, "_fused_routing_op", op)
         return op
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        skip_post_expert_proj: bool = False,
+        target_verify: bool = False,
+        sp: SPShape | None = None,
+    ) -> torch.Tensor:
+        """MoE on ``hidden_states``; under sequence parallelism (``sp``) they are this
+        rank's token shard and so is the result. ``skip_post_expert_proj`` returns the
+        reduced expert output before the unpooler (fused into the next boundary)."""
+        topk_scores, topk_ids, expert_input = self.route(hidden_states)
+        rows = topk_ids.shape[0] if sp is None else sp.padded
+        use_a4w4 = self.uses_a4w4(rows, target_verify)
+        quantized = None
+        if sp is not None:
+            if use_a4w4:
+                # Row-local MXFP4: gather the shards' FP4 data and scales, not BF16 rows.
+                a1, a1s = mxfp4_moe.quantize_rows(expert_input)
+                quantized = (
+                    sp_gather(a1.view(torch.uint8), rows).view(a1.dtype),
+                    sp_gather(a1s.view(torch.uint8), rows).view(a1s.dtype),
+                )
+                expert_input = None
+            else:
+                expert_input = sp_gather(expert_input, rows)
+            topk_ids = sp_gather(topk_ids, rows)
+            topk_scores = sp_gather(topk_scores, rows)
+        output = self.run_experts(
+            expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+        )
+        if sp is not None:
+            output = sp_reduce_scatter(output, sp.padded)
+        elif self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        if skip_post_expert_proj:
+            return output
+        return self.unpool(output)
+
+    def route(self, hidden_states: torch.Tensor):
+        """Router top-k and the expert input (pooler + pre-expert norm) of these rows."""
+        if (
+            router_pooler.SHARED_ROUTER_POOLER
+            and _USE_ROUTER_GEMV
+            and router_pooler.can_share_router_pooler(self, hidden_states)
+        ):
+            return router_pooler.route_with_shared_pooler(self, hidden_states)
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
@@ -804,14 +938,19 @@ class MuseSpark1xMoE(nn.Module):
             # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
             router_logits = router_gemv_fp32(hidden_states, self.router.weight)
         else:
-            router_input = (
-                hidden_states.float() if self.router_in_fp32 else hidden_states
-            )
-            router_logits = self.router(router_input)
+            router_logits = None
+            if _DENSE_TUNED and self.router_in_fp32:
+                router_logits = router_gemm_tuned(hidden_states, self.router.weight)
+                if router_logits is not None:
+                    _log_dense_tuned("router", hidden_states.shape[0])
+            if router_logits is None:
+                router_input = (
+                    hidden_states.float() if self.router_in_fp32 else hidden_states
+                )
+                router_logits = self.router(router_input)
         topk_scores, topk_ids = self._routing_op().forward(
             None, router_logits, self.top_k, True
         )
-
         expert_input = (
             _dense_linear(hidden_states, self.pre_expert_proj, max_m=128)
             if self.pre_expert_proj is not None
@@ -819,20 +958,84 @@ class MuseSpark1xMoE(nn.Module):
         )
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
-        if self.nvfp4_checkpoint:
-            output = self.experts(
-                expert_input, topk_scores, topk_ids, self.post_expert_norm
-            )
-        else:
-            output = self.experts(
+        return topk_scores, topk_ids, expert_input
+
+    def uses_a4w4(self, rows: int, target_verify: bool) -> bool:
+        return (
+            mxfp4_moe.A4W4_ENABLED
+            and not target_verify
+            and self.mxfp4_checkpoint
+            and rows >= mxfp4_moe.A4W4_MIN_ROWS
+            and getattr(self.experts, "a4w4_weights", None) is not None
+        )
+
+    def run_experts(
+        self,
+        expert_input,
+        topk_scores,
+        topk_ids,
+        target_verify: bool,
+        use_a4w4: bool,
+        quantized=None,
+    ):
+        """This rank's experts over all given rows; per-token partial sums before the TP reduction."""
+        if use_a4w4:
+            norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
+            assert has_norm and norm_weight is not None
+            return mxfp4_moe.run_a4w4(
                 expert_input,
                 topk_scores,
                 topk_ids,
+                self.experts,
                 self.local_expert_start,
-                self.post_expert_norm,
+                norm_weight,
+                self.post_expert_norm.eps,
+                gain,
+                quantized=quantized,
             )
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        if (
+            mxfp4_moe.COMPACT_A4_ENABLED
+            and target_verify
+            and self.mxfp4_checkpoint
+            and self.tp_size == self.ep_size == 8
+            and self.num_local_experts == 32
+            and self.top_k == 8
+            and expert_input.shape[0] % 8 == 0
+            and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
+        ):
+            norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
+            assert has_norm and norm_weight is not None
+            if not self._compact_a4_reported:
+                logger.info(
+                    "Muse compact A4 target-verify: layer=%d rows=%d local_start=%d",
+                    self.layer_idx,
+                    expert_input.shape[0],
+                    self.local_expert_start,
+                )
+                self._compact_a4_reported = True
+            return mxfp4_moe.run_compact_a4(
+                expert_input,
+                topk_scores,
+                topk_ids,
+                self.experts,
+                self.local_expert_start,
+                norm_weight,
+                self.post_expert_norm.eps,
+                gain,
+            )
+        if self.nvfp4_checkpoint:
+            return self.experts(
+                expert_input, topk_scores, topk_ids, self.post_expert_norm
+            )
+        return self.experts(
+            expert_input,
+            topk_scores,
+            topk_ids,
+            self.local_expert_start,
+            self.post_expert_norm,
+        )
+
+    def unpool(self, output: torch.Tensor) -> torch.Tensor:
         if self.post_expert_proj is not None:
             output = _dense_linear(output, self.post_expert_proj, max_m=64)
         return output
@@ -918,15 +1121,64 @@ class MuseSpark1xDecoderLayer(nn.Module):
         attn_input: torch.Tensor | None = None,
         ffn_boundary: FusedPostNormResidualPreNorm | None = None,
         pre_norm_dtype: torch.dtype | None = None,
+        sp: SPShape | None = None,
     ):
+        """Under sequence parallelism (``sp``) ``stream`` / ``attn_input`` are this rank's
+        token shard; attention and the experts still see every token."""
         attn_input = (
             self.self_attn_input_norm(stream) if attn_input is None else attn_input
         )
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        if sp is not None and hasattr(self.self_attn, "ulysses_qkv_weight"):
+            attn_output = ulysses_attention(
+                self.self_attn, attn_input, positions, forward_batch, sp
+            )
+        elif sp is not None:
+            partial = self.self_attn(
+                positions,
+                sp_gather(attn_input, sp.num_tokens),
+                forward_batch,
+                reduce=False,
+            )
+            attn_output = sp_reduce_scatter(partial, sp.padded)
+        else:
+            attn_output = self.self_attn(positions, attn_input, forward_batch)
         ffn_input, stream, _ = self._fused_attn_boundary.forward(
             stream, attn_output, branch_dtype=torch.bfloat16
         )
-        ffn_output = self.mlp(ffn_input)
+        target_verify = forward_batch.forward_mode.is_target_verify()
+        if (
+            sp is None
+            and _FUSED_UNPOOL_BOUNDARY
+            and self._can_fuse_unpool_boundary(ffn_input, ffn_boundary)
+        ):
+            # The MoE keeps its per-expert norm / combine and TP reduction; only the
+            # unpooler moves into the next boundary's norm-residual kernel.
+            expert_output = self.mlp(
+                ffn_input, skip_post_expert_proj=True, target_verify=target_verify
+            )
+            ffn_boundary._ensure_cached_weights(torch.bfloat16)
+            next_attn_input, stream = unpool_gemm_norm_residual(
+                expert_output,
+                self.mlp.post_expert_proj.weight,
+                stream,
+                ffn_boundary._cc_post_weight,
+                ffn_boundary._cc_pre_weight,
+                ffn_boundary._cc_alpha,
+                ffn_boundary._cc_beta,
+                ffn_boundary._post_norm.eps,
+                ffn_boundary._pre_norm.eps,
+                block_n=64,
+                block_k=128,
+                split_k=4,
+                pre_bf16=pre_norm_dtype is torch.bfloat16,
+                num_warps=16,
+            )
+            return stream, next_attn_input
+        ffn_output = (
+            self.mlp(ffn_input, target_verify=target_verify, sp=sp)
+            if self.is_moe_layer
+            else self.mlp(ffn_input)
+        )
         if ffn_boundary is None:
             return self.post_feedforward_residual_gate(
                 stream, self.post_feedforward_layernorm(ffn_output)
@@ -943,6 +1195,33 @@ class MuseSpark1xDecoderLayer(nn.Module):
 
     def self_attn_input_norm(self, stream: torch.Tensor) -> torch.Tensor:
         return self.self_attn.pre_attn_norm(stream).to(torch.bfloat16)
+
+    def _can_fuse_unpool_boundary(
+        self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
+    ) -> bool:
+        """Unpooler + FFN boundary fusion: TP8/EP8 MoE layers at up to 16 rows."""
+        if not self.is_moe_layer or boundary is None:
+            return False
+        moe = self.mlp
+        proj = moe.post_expert_proj
+        return (
+            proj is not None
+            and proj.bias is None
+            and moe.tp_size == 8
+            and moe.ep_size == 8
+            and 0 < x.shape[0] <= 16
+            and x.dtype == torch.bfloat16
+            and x.shape[1] == 8192
+            and x.is_contiguous()
+            and proj.weight.shape == (8192, 4096)
+            and proj.weight.dtype == torch.bfloat16
+            and proj.weight.is_contiguous()
+            and boundary._post_norm_is_input_scale
+            and boundary._use_residual_gate
+            and boundary._post_norm.has_weight
+            and boundary._pre_norm.has_weight
+            and boundary._residual_add.gate.numel() == 8192
+        )
 
 
 # Keep the pre-attention norm under self_attn to match Muse checkpoint names.
@@ -1037,6 +1316,10 @@ class MuseSpark1xModel(nn.Module):
         # in operator dtype (bf16) like the CUDA model does.
         aux_hidden_states: list[torch.Tensor] = []
         if self._ffn_boundaries is not None and stream.shape[0] > 0:
+            # Long plain prefills: every rank keeps a 1/TP token shard of the stream.
+            sp = sp_shape(forward_batch, stream.shape[0])
+            if sp is not None:
+                stream = sp_shard(stream, sp)
             final_pre_norm_dtype = torch.bfloat16
             attn_input = self.layers[0].self_attn_input_norm(stream)
             last = len(self.layers) - 1
@@ -1048,11 +1331,17 @@ class MuseSpark1xModel(nn.Module):
                     attn_input=attn_input,
                     ffn_boundary=self._ffn_boundaries[i],
                     pre_norm_dtype=final_pre_norm_dtype if i == last else None,
+                    sp=sp,
                 )
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
             # == self.norm(norm_input).to(bf16) from the last boundary
             hidden_states = attn_input
+            if sp is not None:
+                hidden_states = sp_gather(hidden_states, sp.num_tokens)
+                aux_hidden_states = [
+                    sp_gather(a, sp.num_tokens) for a in aux_hidden_states
+                ]
         else:
             for i, layer in enumerate(self.layers):
                 stream = layer(positions, stream, forward_batch)
@@ -1109,6 +1398,14 @@ class MuseSparkTextForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        # Unquantized linear shapes tuned on MI355X at TP8, registered before any
+        # weights load: tiled small-M GEMMs for the attention O projection and the
+        # DFlash draft's MLP (the draft loads after the target, in this process),
+        # and the draft MLP's M = 24 GEMMs on the aiter Triton a16w16 kernel.
+        register_gfx950_unquantized_gemm_shapes(
+            tiled_weights=tuple(TILED_GEMM_LAYOUT),
+            triton_a16w16=_DRAFT_TRITON_A16W16_GEMMS,
+        )
         if getattr(config, "inference_moe_w13_interleaved", False):
             raise ValueError("Interleaved expert checkpoints are not supported")
         quant_name = _quantization_name(quant_config)
@@ -1492,6 +1789,28 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        moe_layers = [
+            layer.mlp
+            for layer in self.model.layers
+            if isinstance(layer.mlp, MuseSpark1xMoE)
+        ]
+        if router_pooler.JOINT_ROUTER_POOLER:
+            for moe in moe_layers:
+                router_pooler.prepare_joint_router_pooler(moe)
+        if mxfp4_moe.A4W4_ENABLED:
+            for module in self.model.modules():
+                if isinstance(module, MuseSpark1xMxfp4Experts):
+                    mxfp4_moe.prepare_a4w4_weights(module)
+        if _DENSE_TILED:
+            for moe in moe_layers:
+                for proj in (moe.pre_expert_proj, moe.post_expert_proj):
+                    if proj is not None:
+                        proj.small_m_tiled_weight = prepare_tiled_weight(
+                            proj.weight.data
+                        )
+        if ulysses_enabled():
+            for layer in self.model.layers:
+                prepare_ulysses(layer.self_attn)
         for layer in self.model.layers:
             for residual in (
                 layer.post_attention_residual_gate,

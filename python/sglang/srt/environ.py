@@ -1898,6 +1898,21 @@ class Envs:
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
+    # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
+    # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-
+    # parallel prefill, Ulysses attention, tuned verify-width dense GEMMs, shared
+    # and joint router/pooler projections.
+    SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
+    SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
+    SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
+    SGLANG_MUSE_A4W4_MOE = EnvBool(True)
+    SGLANG_MUSE_PREFILL_SP = EnvBool(True)
+    SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
+    SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
+    SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
+    SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
