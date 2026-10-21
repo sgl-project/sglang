@@ -57,7 +57,6 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     use_mla_backend,
 )
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
-from sglang.srt.layers.attention.dsa.kv_layout import is_q8_raw_fp8_nope_layout
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -554,11 +553,13 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
-    kv_lora_rank: Optional[int] = None,
-    qk_rope_head_dim: Optional[int] = None,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
+
     chosen = {prefill_backend, decode_backend}
 
     rocm_only = {"triton"} & chosen
@@ -603,11 +604,19 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
 ) -> None:
-    """Backward-compatible entry point for the TileLang DSA validation."""
+    """Entry point for TileLang DSA validation with explicit KV geometry."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
+        kv_cache_dtype,
+        prefill_backend,
+        decode_backend,
+        hip=hip,
+        dcp_size=dcp_size,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
 
 
@@ -713,6 +722,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            kv_lora_rank=model_config_of(view).kv_lora_rank,
+            qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -747,8 +758,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
-        kv_lora_rank=getattr(model_config_of(view), "kv_lora_rank", None),
-        qk_rope_head_dim=getattr(model_config_of(view), "qk_rope_head_dim", None),
+        kv_lora_rank=model_config_of(view).kv_lora_rank,
+        qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

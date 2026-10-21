@@ -29,10 +29,10 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_q8_raw_fp8_nope_layout,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.kv_layout import is_q8_raw_fp8_nope_layout
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,

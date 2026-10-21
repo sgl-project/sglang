@@ -4,11 +4,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.attention.dsa.kv_layout import is_q8_raw_fp8_nope_layout
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _validate_flashmla_sparse_q8_backend,
@@ -57,6 +57,7 @@ def test_q8_validator_accepts_bf16_and_fp8_kv_on_sm90(kv_cache_dtype):
         kv_cache_store_fp8=kv_cache_dtype == torch.float8_e4m3fn,
         qk_rope_head_dim=64,
         device_sm_major=9,
+        kv_lora_rank=512,
     )
 
 
@@ -81,6 +82,7 @@ def test_q8_validator_rejects_unsupported_configs(
             kv_cache_store_fp8=store_fp8,
             qk_rope_head_dim=rope,
             device_sm_major=device_sm_major,
+            kv_lora_rank=512,
         )
 
 
@@ -102,6 +104,7 @@ def test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward(extra):
         kv_cache_store_fp8=False,
         qk_rope_head_dim=0,
         device_sm_major=9,
+        kv_lora_rank=512,
     )
     kwargs.update(extra)
     with pytest.raises(ValueError):
@@ -120,6 +123,7 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool_with_rope():
             kv_cache_store_fp8=False,
             qk_rope_head_dim=64,
             device_sm_major=9,
+            kv_lora_rank=512,
         )
 
 
@@ -131,7 +135,6 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool_with_rope():
         (512, 64, "tilelang", False),
         (512, 0, "trtllm", False),
         (512, 0, "flashmla_kv", False),
-        (None, 0, "tilelang", False),
     ],
 )
 def test_q8_raw_fp8_layout_and_validator_agree(rank, rope, decode, expected):

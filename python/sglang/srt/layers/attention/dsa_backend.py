@@ -14,9 +14,12 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+    is_q8_raw_fp8_nope_layout,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.layers.attention.dsa.kv_layout import is_q8_raw_fp8_nope_layout
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -420,7 +423,7 @@ def _validate_flashmla_sparse_q8_backend(
     kv_cache_store_fp8: bool,
     qk_rope_head_dim: int,
     device_sm_major: int,
-    kv_lora_rank: Optional[int] = None,
+    kv_lora_rank: int,
     hisparse_enabled: bool = False,
     mixed_chunk_enabled: bool = False,
 ) -> None:
