@@ -16,6 +16,7 @@ import triton.language as tl
 def _weighted_topk_rank_sum_kernel(
     routed_rank_ptr,  # [M, topk, R]
     topk_weights_ptr,  # [M, topk]
+    topk_ids_ptr,
     output_ptr,  # [M, R]
     M,
     R,
@@ -25,9 +26,12 @@ def _weighted_topk_rank_sum_kernel(
     stride_rr,
     stride_wm,
     stride_wk,
+    stride_im,
+    stride_ik,
     stride_om,
     stride_or,
     TOPK: tl.constexpr,
+    HAS_TOPK_IDS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
@@ -40,17 +44,25 @@ def _weighted_topk_rank_sum_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
     for k in tl.static_range(TOPK):
+        route_mask = token_mask
+        if HAS_TOPK_IDS:
+            route = tl.load(
+                topk_ids_ptr + token * stride_im + k * stride_ik,
+                mask=token_mask,
+                other=-1,
+            )
+            route_mask = route_mask & (route >= 0)
         routed_rank = tl.load(
             routed_rank_ptr
             + token[:, None] * stride_rm
             + k * stride_rk
             + rank[None, :] * stride_rr,
-            mask=mask,
+            mask=mask & route_mask[:, None],
             other=0.0,
         ).to(tl.float32)
         weight = tl.load(
             topk_weights_ptr + token * stride_wm + k * stride_wk,
-            mask=token_mask,
+            mask=route_mask,
             other=0.0,
         ).to(tl.float32)
         accumulator += routed_rank * weight[:, None]
@@ -69,6 +81,7 @@ def weighted_topk_rank_sum(
     output: torch.Tensor,
     routed_scaling_factor: float,
     *,
+    topk_ids: torch.Tensor | None = None,
     block_m: int,
 ) -> None:
     """Compute ``output[m] = scale * sum_k(gamma[m,k] * rank[m,k])``."""
@@ -81,6 +94,11 @@ def weighted_topk_rank_sum(
     if routed_rank.shape[0] == 0:
         return
 
+    if topk_ids is not None:
+        assert topk_ids.shape == topk_weights.shape
+        assert topk_ids.device == routed_rank.device
+        assert topk_ids.dtype in (torch.int32, torch.int64)
+
     rank = routed_rank.shape[2]
     assert block_m in (1, 2)
     block_rank = max(16, triton.next_power_of_2(rank))
@@ -89,6 +107,7 @@ def weighted_topk_rank_sum(
     ](
         routed_rank,
         topk_weights,
+        topk_ids,
         output,
         routed_rank.shape[0],
         rank,
@@ -98,9 +117,12 @@ def weighted_topk_rank_sum(
         routed_rank.stride(2),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        topk_ids.stride(0) if topk_ids is not None else 0,
+        topk_ids.stride(1) if topk_ids is not None else 0,
         output.stride(0),
         output.stride(1),
         TOPK=routed_rank.shape[1],
+        HAS_TOPK_IDS=topk_ids is not None,
         BLOCK_M=block_m,
         BLOCK_R=block_rank,
         num_warps=1,
@@ -112,6 +134,7 @@ def _fused_base_shared_lora_reduce_kernel(
     routed_base_ptr,  # [M, topk, K], already weighted by the base MoE
     routed_rank_ptr,  # [M, topk, R]
     topk_weights_ptr,  # [M, topk]
+    topk_ids_ptr,
     shared_b_ptr,  # [K, R]
     output_ptr,  # [M, K]
     M,
@@ -126,11 +149,14 @@ def _fused_base_shared_lora_reduce_kernel(
     stride_rr,
     stride_wm,
     stride_wk,
+    stride_im,
+    stride_ik,
     stride_sk,
     stride_sr,
     stride_om,
     stride_ok,
     TOPK: tl.constexpr,
+    HAS_TOPK_IDS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -147,12 +173,20 @@ def _fused_base_shared_lora_reduce_kernel(
     base_acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     rank_acc = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
     for topk_idx in tl.static_range(TOPK):
+        route_mask = token_mask
+        if HAS_TOPK_IDS:
+            route = tl.load(
+                topk_ids_ptr + token * stride_im + topk_idx * stride_ik,
+                mask=token_mask,
+                other=-1,
+            )
+            route_mask = route_mask & (route >= 0)
         base = tl.load(
             routed_base_ptr
             + token[:, None] * stride_bm
             + topk_idx * stride_bk
             + out_col[None, :] * stride_bn,
-            mask=token_mask[:, None] & out_mask[None, :],
+            mask=route_mask[:, None] & out_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         routed_rank = tl.load(
@@ -160,12 +194,12 @@ def _fused_base_shared_lora_reduce_kernel(
             + token[:, None] * stride_rm
             + topk_idx * stride_rk
             + rank[None, :] * stride_rr,
-            mask=token_mask[:, None] & rank_mask[None, :],
+            mask=route_mask[:, None] & rank_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         weight = tl.load(
             topk_weights_ptr + token * stride_wm + topk_idx * stride_wk,
-            mask=token_mask,
+            mask=route_mask,
             other=0.0,
         ).to(tl.float32)
         base_acc += base
@@ -200,6 +234,7 @@ def fused_base_shared_lora_reduce(
     output: torch.Tensor,
     routed_scaling_factor: float,
     *,
+    topk_ids: torch.Tensor | None = None,
     block_m: int,
     block_k: int,
 ) -> None:
@@ -237,6 +272,11 @@ def fused_base_shared_lora_reduce(
     if routed_base.shape[0] == 0:
         return
 
+    if topk_ids is not None:
+        assert topk_ids.shape == topk_weights.shape
+        assert topk_ids.device == routed_rank.device
+        assert topk_ids.dtype in (torch.int32, torch.int64)
+
     rank = routed_rank.shape[2]
     assert block_m in (1, 2, 4, 8)
     assert block_k in (32, 64, 128)
@@ -250,6 +290,7 @@ def fused_base_shared_lora_reduce(
         routed_base,
         routed_rank,
         topk_weights,
+        topk_ids,
         shared_b,
         output,
         routed_base.shape[0],
@@ -264,11 +305,14 @@ def fused_base_shared_lora_reduce(
         routed_rank.stride(2),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        topk_ids.stride(0) if topk_ids is not None else 0,
+        topk_ids.stride(1) if topk_ids is not None else 0,
         shared_b.stride(0),
         shared_b.stride(1),
         output.stride(0),
         output.stride(1),
         TOPK=routed_base.shape[1],
+        HAS_TOPK_IDS=topk_ids is not None,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         BLOCK_R=block_rank,
@@ -284,6 +328,7 @@ def _fused_base_mapped_shared_lora_reduce_kernel(
     routed_base_ptr,
     routed_rank_ptr,
     topk_weights_ptr,
+    topk_ids_ptr,
     shared_b_ptr,  # [S, K, R]
     token_lora_mapping_ptr,
     output_ptr,
@@ -298,12 +343,15 @@ def _fused_base_mapped_shared_lora_reduce_kernel(
     stride_rr,
     stride_wm,
     stride_wk,
+    stride_im,
+    stride_ik,
     stride_ss,
     stride_sk,
     stride_sr,
     stride_om,
     stride_ok,
     TOPK: tl.constexpr,
+    HAS_TOPK_IDS: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -317,12 +365,16 @@ def _fused_base_mapped_shared_lora_reduce_kernel(
     base_acc = tl.zeros((1, BLOCK_K), dtype=tl.float32)
     rank_acc = tl.zeros((1, BLOCK_R), dtype=tl.float32)
     for topk_idx in tl.static_range(TOPK):
+        route_active = tl.full((), True, tl.int1)
+        if HAS_TOPK_IDS:
+            route = tl.load(topk_ids_ptr + token * stride_im + topk_idx * stride_ik)
+            route_active = route >= 0
         base = tl.load(
             routed_base_ptr
             + token * stride_bm
             + topk_idx * stride_bk
             + out_col[None, :] * stride_bn,
-            mask=out_mask[None, :],
+            mask=route_active & out_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         routed_rank = tl.load(
@@ -330,10 +382,14 @@ def _fused_base_mapped_shared_lora_reduce_kernel(
             + token * stride_rm
             + topk_idx * stride_rk
             + rank[None, :] * stride_rr,
-            mask=rank_mask[None, :],
+            mask=route_active & rank_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        weight = tl.load(topk_weights_ptr + token * stride_wm + topk_idx * stride_wk)
+        weight = tl.load(
+            topk_weights_ptr + token * stride_wm + topk_idx * stride_wk,
+            mask=route_active,
+            other=0.0,
+        )
         base_acc += base
         rank_acc += routed_rank * weight
 
@@ -366,6 +422,7 @@ def fused_base_mapped_shared_lora_reduce(
     output: torch.Tensor,
     routed_scaling_factor: float,
     *,
+    topk_ids: torch.Tensor | None = None,
     block_k: int,
 ) -> None:
     """Fused decode tail with a per-token shared-B adapter slot."""
@@ -417,6 +474,11 @@ def fused_base_mapped_shared_lora_reduce(
     if routed_base.shape[0] == 0:
         return
 
+    if topk_ids is not None:
+        assert topk_ids.shape == topk_weights.shape
+        assert topk_ids.device == routed_rank.device
+        assert topk_ids.dtype in (torch.int32, torch.int64)
+
     assert block_k in (32, 64, 128)
     block_rank = max(16, triton.next_power_of_2(routed_rank.shape[2]))
     _fused_base_mapped_shared_lora_reduce_kernel[
@@ -425,6 +487,7 @@ def fused_base_mapped_shared_lora_reduce(
         routed_base,
         routed_rank,
         topk_weights,
+        topk_ids,
         shared_b_view,
         token_lora_mapping,
         output,
@@ -439,12 +502,15 @@ def fused_base_mapped_shared_lora_reduce(
         routed_rank.stride(2),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        topk_ids.stride(0) if topk_ids is not None else 0,
+        topk_ids.stride(1) if topk_ids is not None else 0,
         shared_b_view.stride(0),
         shared_b_view.stride(1),
         shared_b_view.stride(2),
         output.stride(0),
         output.stride(1),
         TOPK=routed_base.shape[1],
+        HAS_TOPK_IDS=topk_ids is not None,
         NUM_SLOTS=shared_b.shape[0],
         BLOCK_K=block_k,
         BLOCK_R=block_rank,

@@ -72,7 +72,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
+        topk_weights = topk_output.topk_weights
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
         assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
@@ -119,7 +119,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         )
 
         # Stage 1: Gate/Up (Marlin)
-        projection_cache = torch.zeros(
+        projection_cache = torch.empty(
             (M * topk * (2 * N + K),),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
@@ -188,6 +188,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             moe_block_size=block_size_m,
             top_k=1,
             mul_topk_weights=True,
+            zero_inactive_output=True,
             is_ep=quant_info.expert_map is not None,
             b_q_type=scalar_type2,
             size_m=M * topk,

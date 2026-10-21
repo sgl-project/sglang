@@ -233,7 +233,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     topk_ids = topk_output.topk_ids
-    topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
+    topk_weights = topk_output.topk_weights
     if (
         topk_ids.ndim != 2
         or topk_weights.shape != topk_ids.shape
@@ -572,7 +572,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     )
 
     # Stage 1: gate_up (marlin) — concurrent with the side-stream delta above.
-    projection_cache = torch.zeros(
+    projection_cache = torch.empty(
         (M * topk * (2 * N + K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -673,6 +673,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                         down_rank_sum,
                         routed_scaling_factor,
                         block_m=_weighted_rank_sum_block_m(M),
+                        topk_ids=topk_ids,
                     )
                 down_shrink_done.record()
             if torch.cuda.is_current_stream_capturing():
@@ -701,6 +702,7 @@ def fused_experts_experimental_sgl_marlin_lora(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=ep_active,
         b_q_type=scalar_type2,
         size_m=M * topk,
@@ -782,6 +784,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 output,
                 routed_scaling_factor,
                 block_k=64,
+                topk_ids=topk_ids,
             )
         else:
             tail_block_m, tail_block_k = fused_base_shared_lora_reduce_config(M)
@@ -794,6 +797,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 routed_scaling_factor,
                 block_m=tail_block_m,
                 block_k=tail_block_k,
+                topk_ids=topk_ids,
             )
     elif routed_scaling_factor == 1.0 and M <= 512:
         torch.sum(intermediate_cache3, dim=1, out=output)
@@ -810,6 +814,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 down_rank_sum,
                 routed_scaling_factor,
                 block_m=_weighted_rank_sum_block_m(M),
+                topk_ids=topk_ids,
             )
         else:
             # Wait only at the shared-B consumer.

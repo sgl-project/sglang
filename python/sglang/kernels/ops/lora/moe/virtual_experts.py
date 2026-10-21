@@ -21,6 +21,7 @@ def _fused_virtual_topk_ids_kernel(
     virtual_topk_ids_ptr,
     token_lora_mask_ptr,
     num_experts_for_weight: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -32,7 +33,7 @@ def _fused_virtual_topk_ids_kernel(
         lora_id = token_lora_mapping[m]
         mask[m] = (lora_id >= 0)
         safe_lora = max(lora_id, 0)
-        if shared_outer:  (handled by num_experts_for_weight == 0 sentinel)
+        if shared_outer:
             virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
         else:
             virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
@@ -54,7 +55,8 @@ def _fused_virtual_topk_ids_kernel(
     # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
     # a real virtual-expert slot belonging to another adapter and trigger OOB
     # loads in downstream LoRA kernels.
-    shifted = base + safe_lora * num_experts_for_weight
+    expert = 0 if SHARED_OUTER else base
+    shifted = expert + safe_lora * num_experts_for_weight
     result = tl.where(base < 0, base, shifted)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
@@ -77,14 +79,7 @@ def _fused_virtual_topk_ids(
     M, top_k = topk_ids.shape
     device = topk_ids.device
 
-    if shared_outer:
-        num_experts_for_weight = 1
-        # For shared_outer, we need topk_ids to be zeros
-        zero_topk = torch.zeros_like(topk_ids)
-        input_topk = zero_topk
-    else:
-        num_experts_for_weight = num_experts
-        input_topk = topk_ids
+    num_experts_for_weight = 1 if shared_outer else num_experts
 
     virtual_topk_ids = torch.empty_like(topk_ids)
     token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
@@ -93,11 +88,12 @@ def _fused_virtual_topk_ids(
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
     _fused_virtual_topk_ids_kernel[grid](
-        input_topk,
+        topk_ids,
         token_lora_mapping,
         virtual_topk_ids,
         token_lora_mask,
         num_experts_for_weight,
+        shared_outer,
         M,
         top_k,
         BLOCK_SIZE,
