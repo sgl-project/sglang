@@ -9,6 +9,8 @@ def apply_gguf_moe_weights(
     outputs: torch.Tensor, weights: torch.Tensor, expert_ids: torch.Tensor
 ) -> None:
     """Weight rows in place, rounding each product before native MoE reduction."""
+    import sgl_kernel  # noqa: F401
+
     torch.ops.sgl_kernel.apply_gguf_moe_weights.default(outputs, weights, expert_ids)
 
 
@@ -20,6 +22,8 @@ def resolve_gguf_moe_weights(device_type: str) -> Optional[Callable]:
     device registration, rather than the Python wrapper's presence, establishes
     that the rebuilt provider can consume raw routes without Python clearing.
     """
+    import sgl_kernel  # noqa: F401
+
     try:
         torch.ops.sgl_kernel.apply_gguf_moe_weights.default
     except AttributeError:
