@@ -130,7 +130,9 @@ def _metadata(pool_pages: int, active_pages: int, world: int, rank: int, args):
     device = f"cuda:{rank}"
     generator = torch.Generator().manual_seed(args.seed + pool_pages + active_pages)
     pages_cpu = torch.randperm(pool_pages, generator=generator)[:active_pages] + 1
-    pages = pages_cpu.to(device=device)
+    # Production DSA metadata uses int32 physical page tables. Keep that dtype
+    # here so the benchmark exercises the same gather address arithmetic.
+    pages = pages_cpu.to(device=device, dtype=torch.int32)
     slots = (
         pages[:, None] * PAGE_SIZE + torch.arange(PAGE_SIZE, device=device)
     ).flatten()
@@ -147,7 +149,9 @@ def _metadata(pool_pages: int, active_pages: int, world: int, rank: int, args):
     table.flatten()[: slots.numel()] = slots.to(torch.int32)
     ends = lengths_cpu.to(torch.int64).cumsum(0).to(device=device) - 1
     reference_slots = torch.arange(PAGE_SIZE, PAGE_SIZE + slots.numel(), device=device)
-    reference_pages = torch.arange(1, active_pages + 1, device=device)
+    reference_pages = torch.arange(
+        1, active_pages + 1, device=device, dtype=torch.int32
+    )
     query_count = max(16, math.ceil(requests / world))
     request_ids = (rank + torch.arange(query_count, device=device) * world) % requests
     lengths = lengths_cpu.to(device=device)
@@ -296,7 +300,7 @@ def _check(pool, reference, meta, layers: int, mode: str) -> None:
     if mode == "partial_prefetch":
         torch.testing.assert_close(
             pool.prefill_page_ids[: pool.prefill_num_pages],
-            meta.pages.sort().values,
+            meta.pages.sort().values.to(torch.int64),
             rtol=0,
             atol=0,
         )

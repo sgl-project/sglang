@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 # CPU CI exercises the bit-exact codec/reference contract. The CUDA
@@ -208,6 +207,40 @@ def test_cuda_paged_dequant_matches_stored_byte_reference(output_dtype):
         rows, indices, 1.375, dtype=output_dtype
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_paged_dequant_output_address_crosses_int32_boundary():
+    """Every row must survive a flattened BF16 output larger than four GiB.
+
+    Two alternating source rows keep the reference small. Validate the entire
+    output in bounded chunks, including both sides of the 2**31-element
+    boundary. Peak GPU allocation is about 4.06 GiB, with no giant reference.
+    """
+    num_tokens = (2**31) // (NVFP4_LATENT_DIM + NVFP4_ROPE_DIM) + 2
+    latent, rope = _make_inputs(2, torch.bfloat16, "cpu")
+    stored = torch.zeros(2, 1, NVFP4_BYTES_PER_TOKEN, dtype=torch.uint8)
+    quantize_nvfp4_k_cache_into_reference(latent, rope, stored, torch.arange(2), 1.375)
+    expected_rows = dequantize_nvfp4_k_cache_paged_reference(
+        stored, torch.arange(2), 1.375, dtype=torch.bfloat16
+    ).cuda()
+    assert torch.isfinite(expected_rows).all()
+    indices = torch.arange(num_tokens, device="cuda", dtype=torch.int32).remainder_(2)
+    actual = dequantize_nvfp4_k_cache_paged(stored.cuda(), indices, 1.375)
+    assert actual.numel() > 2**31
+    expected_bits = expected_rows.view(torch.int16)
+    exact = torch.ones((), dtype=torch.bool, device="cuda")
+    finite = torch.ones_like(exact)
+    for start in range(0, num_tokens, 65536):
+        chunk = actual[start : start + 65536]
+        # The chunk starts and chunk size are even. Broadcasting two reference
+        # rows avoids materializing a second multi-GiB expected output.
+        bits = chunk.view(torch.int16)
+        exact &= (bits[0::2] == expected_bits[0]).all()
+        exact &= (bits[1::2] == expected_bits[1]).all()
+        finite &= torch.isfinite(chunk).all()
+    assert bool(exact), "dequantized bytes differ across the int32 address boundary"
+    assert bool(finite), "dequantization produced non-finite values"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

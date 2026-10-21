@@ -496,7 +496,9 @@ def _dequantize_nvfp4_k_cache_paged_kernel(
     output_stride: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # A flattened long-context prefill can exceed 2**31 output elements even
+    # though its token count fits int32. Widen before the row-stride multiply.
+    token = tl.program_id(0).to(tl.int64)
     dimension = tl.arange(0, BLOCK)
     physical = tl.load(indices_ptr + token).to(tl.int64)
     valid_row = (physical >= 0) & (physical < num_rows)
