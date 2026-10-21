@@ -823,23 +823,29 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    # The targets lead each request's verify window. Read them from that window,
+    # not req_to_token: after verify's read-done the scheduler may hand a finished
+    # request's row to a new request.
+    window = batch.out_cache_loc.view(bs, -1)
+    window_rows = torch.arange(bs, device=device)
+    window_starts = torch.zeros_like(num_correct_drafts)
     if _is_cpu:
         assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
+            window_rows,
+            window.int(),
+            window_starts,
+            num_correct_drafts + 1,
             tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            window.shape[1],
         )
     else:
         assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
+            window_rows,
+            window,
+            window_starts,
+            num_correct_drafts + 1,
             tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            window.shape[1],
             next_power_of_2(bs),
         )
     fill_accept_out_cache_loc_func(

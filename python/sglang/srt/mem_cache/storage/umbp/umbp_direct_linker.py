@@ -65,20 +65,20 @@ def _ordered_layers(entry) -> list[int]:
             f"UMBP pool {entry.name} components have different layer counts."
         )
     pool_layer_count = component_lengths.pop()
-    if pool_layer_count != len(entry.layer_mapping):
-        raise ValueError(
-            f"UMBP pool {entry.name} has {pool_layer_count} buffers per component "
-            f"but {len(entry.layer_mapping)} mapped layers."
-        )
-    by_buffer = {
-        buffer_index: logical_layer
-        for logical_layer, buffer_index in entry.layer_mapping.items()
-    }
+    by_buffer = {}
+    for logical_layer, mapped in entry.layer_mapping.items():
+        indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        for index in indices:
+            if index in by_buffer:
+                raise ValueError(
+                    f"UMBP pool {entry.name} maps buffer {index} more than once."
+                )
+            by_buffer[index] = logical_layer
     if sorted(by_buffer) != list(range(pool_layer_count)):
         raise ValueError(
             f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
         )
-    return [by_buffer[index] for index in range(pool_layer_count)]
+    return list(dict.fromkeys(by_buffer[index] for index in range(pool_layer_count)))
 
 
 @dataclass
@@ -712,15 +712,17 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         entry = self.pools[plan.name]
         items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
-            buffer_index = entry.layer_mapping.get(logical_layer)
-            if buffer_index is None:
+            mapped = entry.layer_mapping.get(logical_layer)
+            if mapped is None:
                 continue
+            indices = [mapped] if isinstance(mapped, int) else list(mapped)
             items.append(
                 [
-                    (*component[buffer_index], offsets[buffer_index])
+                    (*component[index], offsets[index])
                     for component, offsets in zip(
                         entry.buffer_meta, entry._component_offsets
                     )
+                    for index in indices
                 ]
             )
         return items

@@ -446,8 +446,13 @@ class TestLayerRunnerDispatch(CustomTestCase):
         self.assertTrue(layer.use_flashinfer_trtllm_moe)
         self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
 
-    def test_gfx1250_internal_router_supports_expert_parallelism(self):
-        """The direct kernel maps global routes to its local expert shard."""
+    def test_gfx1250_internal_router_maps_global_routes_to_the_local_shard(self):
+        """gfx1250 W4A8 routes from raw logits inside the kernel; with expert
+        parallelism the kernel maps those global routes onto this rank's shard
+        through its expert map, so the layer builds as a direct kernel."""
+        from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+            build_ep_expert_map,
+        )
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a8_mxfp4_moe import (
             QuarkW4A8MXFp4MoE,
         )
@@ -457,22 +462,27 @@ class TestLayerRunnerDispatch(CustomTestCase):
             "_use_gfx1250_w4a8",
             True,
         ):
-            for ep_size in (1, 2):
-                with (
-                    self.subTest(ep_size=ep_size),
-                    get_parallel().override(
-                        tp_size=ep_size,
-                        tp_rank=ep_size - 1,
-                        attn_tp_size=ep_size,
-                        attn_tp_rank=ep_size - 1,
-                        moe_ep_size=ep_size,
-                        moe_ep_rank=ep_size - 1,
-                    ),
-                ):
-                    layer = self._build_layer(object.__new__(QuarkW4A8MXFp4MoE))
-                    self.assertEqual(layer.num_local_experts, 4 // ep_size)
-                    self.assertIsNone(layer.runner_backend)
-                    self.assertFalse(layer.dispatcher.skip_local_expert_mapping)
+            expert_parallel = self._build_layer(object.__new__(QuarkW4A8MXFp4MoE))
+            with get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+            ):
+                single_rank = self._build_layer(object.__new__(QuarkW4A8MXFp4MoE))
+        for layer in (expert_parallel, single_rank):
+            self.assertIsNone(layer.runner_backend)
+            self.assertFalse(layer.dispatcher.skip_local_expert_mapping)
+        # Rank 1 of 2 owns global experts 2 and 3; the extra trailing slot keeps
+        # the -1 padding route at -1.
+        self.assertEqual(
+            build_ep_expert_map(
+                num_experts=4, num_local_experts=2, ep_rank=1, device="cpu"
+            ).tolist(),
+            [-1, -1, 0, 1, -1],
+        )
 
     def test_borrowed_inkling_dense_loader_keeps_canonical_weights(self):
         from sglang.srt.environ import envs
