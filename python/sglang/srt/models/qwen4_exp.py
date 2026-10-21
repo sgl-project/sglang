@@ -211,17 +211,22 @@ def _breakable_ple_prefetch(ple, batch):
 
 
 @eager_on_graph(True)
-def _breakable_ple_forward(ple, hidden_states, batch):
+def _breakable_ple_forward(ple, hidden_states, batch, output):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     if batch.batch is None:
         # Idle batch replayed as a dummy extend: join the collective, add nothing.
         ple.forward_idle(forward_batch)
-        return torch.zeros_like(hidden_states)
+        output.copy_(hidden_states)
+        return
     # PLE pads its output to the token bucket after applying the live layout.
-    return ple(
-        hidden_states=hidden_states,
-        forward_batch=forward_batch,
-        batch=batch.batch,
+    torch.add(
+        hidden_states,
+        ple(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            batch=batch.batch,
+        ),
+        out=output,
     )
 
 
@@ -1670,9 +1675,11 @@ class Qwen4ExpLayerExtensionMixin:
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return residual + _breakable_ple_forward(
-                ple=self.ple, hidden_states=residual, batch=ple_batch
+            output = torch.empty_like(residual)
+            _breakable_ple_forward(
+                ple=self.ple, hidden_states=residual, batch=ple_batch, output=output
             )
+            return output
         if ple_batch is None:
             if not _get_ple_forward_mode(forward_batch).is_idle():
                 raise RuntimeError("non-idle Qwen4 PLE forward is missing its batch")
