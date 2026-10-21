@@ -1325,6 +1325,7 @@
                   {
                     "group": "DeepReinforce",
                     "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.5",
                       "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
                     ]
                   },

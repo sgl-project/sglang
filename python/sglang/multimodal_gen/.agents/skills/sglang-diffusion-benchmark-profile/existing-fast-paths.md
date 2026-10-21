@@ -322,7 +322,7 @@ framework-specific optimization workflow.
   layouts (B > 1, SP > 1, LoRA-wrapped or quantized projections,
   head_dim != 128) and first-sight mismatches keep the Triton
   `qknorm_complex_rope` / `qknorm_complex_rope_kv` chain.
-- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_complex_rope.py`,
+- Validation: `test/registered/kernels/ops/diffusion/test_complex_rope.py`,
   the `test_qwen21_cuda_qk_rope_*` cases in `test_model_fast_paths.py`, and
   `python/sglang/multimodal_gen/test/unit/test_qwen_image21_cuda.py`.
 - Workflow rule: if a Qwen-Image 2.1 trace still shows

@@ -198,7 +198,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             e_score_correction_bias=torch.zeros(16) if correction_bias else None
         )
         experts = SimpleNamespace(
-            should_fuse_routed_scaling_factor_in_topk=folded_in_topk
+            should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
+            runner_backend=None,
+            routing_method_type=None,
         )
         exec_config = SimpleNamespace(
             moe=SimpleNamespace(enable_waterfill=False, ep_num_redundant_experts=0)
@@ -529,13 +531,13 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     def test_glm53_idle_rank_preserves_routed_topk_contract(self):
         """An idle rank must return the pre-append top-8 shape; returning top-9
         here would make the AITER postprocessor append shared ID 288 twice."""
-        topk = TopK.__new__(TopK)
-        torch.nn.Module.__init__(topk)
-        topk.topk_config = TopKConfig(
-            top_k=9, shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
-        )
-        topk.enable_waterfill = False
-        topk.waterfill_balancer = None
+        with (
+            get_context().override_server_args(enable_waterfill=False),
+            get_model().override(
+                shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+            ),
+        ):
+            topk = TopK(top_k=8, layer_id=0)
 
         with (
             patch.object(
