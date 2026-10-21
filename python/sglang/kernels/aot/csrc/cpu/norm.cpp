@@ -873,36 +873,6 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
   });
 }
 
-// input : {batch_size, hidden_size}
-// weight: {hidden_size}
-at::Tensor fused_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
-  // Out-of-place fused RMSNorm. The numerics are exactly `rmsnorm_cpu`'s, so this
-  // delegates to it rather than duplicating the kernel; the only thing added is the
-  // 2-D guard, which mirrors the reference implementation's assertion.
-  TORCH_CHECK(input.dim() == 2, "fused_rmsnorm_cpu expects a 2D tensor, got ", input.dim(), "D.");
-  return rmsnorm_cpu(input, weight, eps);
-}
-
-// input : {batch_size, hidden_size}, written and returned in place
-// weight: {hidden_size}
-at::Tensor fused_rmsnorm_cpu_inplace(at::Tensor& input, at::Tensor& weight, double eps) {
-  const auto st = input.scalar_type();
-  // In-place requires a contiguous input: the kernel writes contiguous output offsets
-  // while reading rows at the input stride, which is only the same location when the
-  // rows are not padded. Use fused_rmsnorm_cpu for a non-contiguous input.
-  CHECK_INPUT(input);
-  CHECK_INPUT_ND<2>(input);
-  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, st);
-
-  NormParams p{input, static_cast<float>(eps)};
-  p.weight = weight.data_ptr();
-
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_rmsnorm_inplace_kernel", [&] {
-    norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(input.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
-  });
-  return input;
-}
-
 // x       : {batch_size, hidden_size}
 // residual: {batch_size, hidden_size}, read-only - `mid` is returned separately
 // weight1 : {hidden_size}

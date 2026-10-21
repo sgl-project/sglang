@@ -44,7 +44,7 @@ def _make_case(tokens, hidden_dim, num_experts, dtype, correction_bias):
         (16, 63, 32, 4, 0.0, True),
     ],
 )
-def test_fused_moe_router_cpu_matches_reference(
+def test_fused_moe_router_shim_cpu_matches_reference(
     dtype, tokens, hidden_dim, num_experts, topk, softcap, correction_bias
 ):
     torch.manual_seed(tokens * 1000 + hidden_dim + num_experts + topk)
@@ -55,7 +55,7 @@ def test_fused_moe_router_cpu_matches_reference(
     ref_weights, ref_ids = _reference_router(
         hidden_states, gating_output, topk, softcap, bias
     )
-    out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_cpu(
+    out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_shim_cpu(
         hidden_states, gating_output, topk, softcap, bias
     )
 

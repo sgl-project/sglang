@@ -198,7 +198,6 @@ def register_fake_ops(tp_size: int):
         "l2norm_cpu",
         "fused_experts_cpu",
         "fused_rmsnorm_gated_cpu",
-        "fused_rmsnorm_cpu",
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
         "causal_conv1d_fwd_cpu",
@@ -210,11 +209,6 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
-
-    @register_cpu_compile_fake("fused_rmsnorm_cpu_inplace")
-    def _(input, *args, **kwargs):
-        # writes into and returns ``input``; a fresh allocation would misdescribe it
-        return input
 
     @register_cpu_compile_fake("fused_dual_residual_rmsnorm_cpu")
     def _(x, residual, w1, w2, eps):
@@ -423,7 +417,7 @@ def register_fake_ops(tp_size: int):
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
-    @register_cpu_compile_fake("fused_moe_router_cpu")
+    @register_cpu_compile_fake("fused_moe_router_shim_cpu")
     def _(
         hidden_states,
         gating_output,

@@ -698,7 +698,7 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
   return std::make_tuple(topk_weights, topk_ids);
 }
 
-std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+std::tuple<at::Tensor, at::Tensor> fused_moe_router_shim_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
@@ -709,14 +709,14 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
 
   CHECK_DIM(2, hidden_states);
   CHECK_DIM(2, gating_output);
-  TORCH_CHECK(gating_output.scalar_type() == at::kFloat, "fused_moe_router_cpu: gating_output must be float32");
+  TORCH_CHECK(gating_output.scalar_type() == at::kFloat, "fused_moe_router_shim_cpu: gating_output must be float32");
 
   const auto st = hidden_states.scalar_type();
   const int64_t num_tokens = hidden_states.size(0);
   const int64_t hidden_dim = hidden_states.size(1);
   const int64_t num_experts = gating_output.size(0);
-  TORCH_CHECK(gating_output.size(1) == hidden_dim, "fused_moe_router_cpu: hidden dimension mismatch");
-  TORCH_CHECK(topk > 0 && topk <= num_experts, "fused_moe_router_cpu: topk must satisfy 0 < topk <= num_experts");
+  TORCH_CHECK(gating_output.size(1) == hidden_dim, "fused_moe_router_shim_cpu: hidden dimension mismatch");
+  TORCH_CHECK(topk > 0 && topk <= num_experts, "fused_moe_router_shim_cpu: topk must satisfy 0 < topk <= num_experts");
 
   const float* correction_bias_ptr = nullptr;
   if (correction_bias.has_value()) {
@@ -728,7 +728,7 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_moe_router_cpu", [&] { LAUNCH_FUSED_MOE_ROUTER_KERNEL(); });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_moe_router_shim_cpu", [&] { LAUNCH_FUSED_MOE_ROUTER_KERNEL(); });
   return std::make_tuple(topk_weights, topk_ids);
 }
 
