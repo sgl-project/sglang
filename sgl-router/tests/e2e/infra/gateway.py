@@ -1,7 +1,7 @@
 """Minimal sgl-router Gateway class for e2e tests.
 
 sgl-router is a Rust binary
-(`experimental/sgl-router/target/release/sgl-router`) configured entirely
+(`sgl-router/target/release/sgl-router`) configured entirely
 through CLI flags. This Gateway execs the binary with `--worker-urls <...>`
 (static discovery) plus the model + policy flags.
 
@@ -38,21 +38,17 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Repo-relative path to the release binary. Set ``SGL_ROUTER_BINARY`` to
-# override (e.g. a debug build, or a non-default ``CARGO_TARGET_DIR``).
-# This file is at `experimental/sgl-router/tests/e2e/infra/gateway.py`,
-# so four `.parent` hops to reach the sgl-router workspace root
-# (infra → e2e → tests → sgl-router). Cargo lands the binary at
-# `experimental/sgl-router/target/release/sgl-router`. A previous
-# version used three hops and pointed at `tests/target/`, which
-# would have broken any test that actually launches the router via
-# this helper.
-DEFAULT_BINARY = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "target"
-    / "release"
-    / "sgl-router"
-)
+# The cargo workspace root: infra -> e2e -> tests -> sgl-router.
+_SGL_ROUTER_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def router_binary_path() -> Path:
+    """``SGL_ROUTER_BINARY`` if set, else the release build under ``CARGO_TARGET_DIR``."""
+    env_binary = os.environ.get("SGL_ROUTER_BINARY")
+    if env_binary:
+        return Path(env_binary)
+    target_dir = os.environ.get("CARGO_TARGET_DIR", str(_SGL_ROUTER_ROOT / "target"))
+    return Path(target_dir) / "release" / "sgl-router"
 
 
 def _get_open_port() -> int:
@@ -133,14 +129,7 @@ class Gateway:
         self.host = host
         self.port = port or _get_open_port()
         self.base_url = f"http://{self.host}:{self.port}"
-        # Resolve binary from env override, explicit arg, or repo default.
-        env_binary = os.environ.get("SGL_ROUTER_BINARY")
-        if binary is not None:
-            self.binary = Path(binary)
-        elif env_binary:
-            self.binary = Path(env_binary)
-        else:
-            self.binary = DEFAULT_BINARY
+        self.binary = Path(binary) if binary is not None else router_binary_path()
 
         # Test-side overrides for the router's tunables. Both default to
         # `None`, in which case the router uses its production defaults
@@ -332,7 +321,7 @@ class Gateway:
         if not self.binary.exists():
             raise RuntimeError(
                 f"sgl-router binary not found at {self.binary}. "
-                "Build it first: `cd experimental/sgl-router && cargo build --release` "
+                "Build it first: `cd sgl-router && cargo build --release` "
                 "or set SGL_ROUTER_BINARY to the binary path."
             )
         logger.info("sgl-router args: %s", args)
