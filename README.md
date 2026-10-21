@@ -12,3 +12,15 @@ python3 /tmp/pr43182-move-proof/a3d9fac64feae6e8cde40a99b4835ccebe0a0d44.py
 ```
 
 The verifier runs the repository formatters and compares the reproduced tree byte-for-byte against the target commit. See `output.log` for the successful run. It leaves a temporary worktree and prints cleanup commands.
+
+## Package-level support predicate
+
+Commit `b709e9b5ef7d38913653048f27960e65617da04b` moves `supports_prefill_cp_bcg` into the package initializer and restores its original import path. Its function body is unchanged in this move commit; removing the now-redundant self-import and the review's test changes are separate.
+
+After downloading this branch as above, run from a SGLang checkout:
+
+```bash
+python3 /tmp/pr43182-move-proof/b709e9b5ef7d38913653048f27960e65617da04b.py
+```
+
+The recipe uses the relocation primitives, the package import path (rather than importing `.__init__`), and an explicit blank-line normalization. See `support-api-output.log` for its byte-for-byte PASS result.

@@ -1,0 +1,12 @@
+  $ git rev-parse --show-toplevel
+  $ git worktree add -b repro-zk7u78eg /var/folders/8s/l6jxm5w16z1206c4btcd8ky00000gp/T/repro-zk7u78eg b709e9b5ef7d38913653048f27960e65617da04b~1
+  $ git add -A
+  $ git diff --cached --name-only --diff-filter=ACMR b709e9b5ef7d38913653048f27960e65617da04b~1
+  $ pre-commit run --files python/sglang/srt/arg_groups/cuda_graph_hook.py python/sglang/srt/arg_groups/model_hook.py python/sglang/srt/layers/cp/bcg/__init__.py python/sglang/srt/layers/cp/bcg/bcg.py python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+  $ git status --porcelain
+  $ git add -A && git commit -m repro
+  $ git diff b709e9b5ef7d38913653048f27960e65617da04b -- .
+
+PASS: reproduces the commit byte-for-byte.
+  $ git worktree remove --force /var/folders/8s/l6jxm5w16z1206c4btcd8ky00000gp/T/repro-zk7u78eg
+  $ git branch -D repro-zk7u78eg
