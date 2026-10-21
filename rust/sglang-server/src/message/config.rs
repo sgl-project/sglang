@@ -156,6 +156,11 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// What a `/generate` request that sends no `max_new_tokens` (and gets
+    /// none from `preferred_sampling_params`) asks for: Python's
+    /// `SamplingParams` default unless the launcher overrides it. `None` is
+    /// no limit, which the scheduler clamps to the context window.
+    pub default_max_new_tokens: Option<i64>,
     /// Native-generation launch policy normally applied by Python ingress.
     pub lora_ids: BTreeMap<String, String>,
     pub enable_strict_thinking: bool,
@@ -231,6 +236,7 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        default_max_new_tokens,
         lora_ids,
         enable_strict_thinking,
         limit_mm_data_per_request,
@@ -278,6 +284,7 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        default_max_new_tokens: Option<i64>,
         lora_ids: BTreeMap<String, String>,
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
@@ -323,6 +330,7 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            default_max_new_tokens,
             lora_ids,
             enable_strict_thinking,
             limit_mm_data_per_request,
@@ -376,6 +384,7 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),
