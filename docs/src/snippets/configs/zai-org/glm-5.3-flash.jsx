@@ -5,8 +5,8 @@ export const config = {
 
   // One TPU7x (Ironwood) host: 4 chips, 8 TensorCores, served by sglang-torchtpu.
   hardware: [{ id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" },
-    { id: "a3", label: "A3", vram: "64GB/die", vendor: "npu", npuDevices: 16 },
-    { id: "a5", label: "A5", vram: "128GB", vendor: "npu", npuDevices: 8 },
+    { id: "a3", label: "A3 Series", vram: "64GB/die", vendor: "npu", npuDevices: 16 },
+    { id: "a5", label: "950PR/DT Series", vram: "128GB", vendor: "npu", npuDevices: 8 },
   ],
 
   matchDims: [
