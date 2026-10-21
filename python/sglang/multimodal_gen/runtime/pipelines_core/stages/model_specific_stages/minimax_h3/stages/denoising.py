@@ -1054,15 +1054,26 @@ def _maybe_prepare_vsa_h3_step_metadata(
     latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
+    native_layout: bool = True,
 ) -> Callable[[int], Any] | None:
     """Per-step VSA-H3 metadata builder over the request-static packed layout,
-    or None off the VSA path."""
+    or None off the VSA path.
+
+    Ref2VA regions are read from the native packed layout's stream_layout;
+    ``native_layout=False`` marks a layout serialized by ComfyUI, whose
+    stream_layout does not tell reference images from reference videos."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
+    if is_ref2va and not native_layout:
+        raise NotImplementedError(
+            "VSA-H3 tiles Ref2VA references on SGLang's native packed layout; "
+            "a ComfyUI-serialized Ref2VA layout is not tiled. Use "
+            "--attention-backend fa for it."
+        )
     config = server_args.attention_backend_config or {}
     pipeline_config = server_args.pipeline_config
     tile_size = int(config.get("vsa_tile_size", pipeline_config.vsa_tile_size))
