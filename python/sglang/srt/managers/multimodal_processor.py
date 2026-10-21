@@ -9,7 +9,7 @@ from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProces
 from sglang.srt.multimodal.processors.token_space_processor import (
     TokenSpaceMultimodalProcessor,
 )
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_mm, get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,18 @@ def get_mm_processor_cls(hf_config, model_config=None):
         uses_transformers_backend = (
             get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
         )
+
+    if get_mm().enable_token_space_processor:
+        for model_cls, processor_cls in TOKEN_SPACE_PROCESSOR_MAPPING.items():
+            if (
+                model_cls.__name__ in hf_config.architectures
+                and processor_cls.supports_token_space_processing(hf_config)
+                and (
+                    not uses_transformers_backend
+                    or processor_cls.supports_transformers_backend
+                )
+            ):
+                return processor_cls
 
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ not in hf_config.architectures:
