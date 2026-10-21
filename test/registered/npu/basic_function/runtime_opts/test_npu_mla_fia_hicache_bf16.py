@@ -24,8 +24,8 @@ register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
 class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # PR runs the mixin smoke request; nightly runs the full GSM8K set.
     gsm8k_num_examples = 1319
-    # TODO: re-calibrate for sgl_eval (Moonlight bf16 baseline ~0.837).
-    gsm8k_accuracy_thres = 0.83
+    # sgl_eval measures 0.8143 on the full 1319-question set.
+    gsm8k_accuracy_thres = 0.8
     gsm8k_backend = "sgl_eval"
     gsm8k_max_tokens = 4096
 
