@@ -3,6 +3,7 @@ the torch implementations are the fallback and the reference."""
 
 import functools
 import math
+import warnings
 from typing import Optional
 
 import torch
@@ -638,6 +639,31 @@ def qsa_mqa_prefill(
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+    if q.is_xpu and (q.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e4m3fn):
+        _scoring_dtype(q, k)
+    if (
+        q.is_xpu
+        and q.dtype == k.dtype
+        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q.shape[1:] == (4, 128)
+        and k.ndim == 3
+        and k.shape[1:] == (1, 128)
+    ):
+        import sgl_kernel  # noqa: F401
+
+        if hasattr(torch.ops.sgl_kernel, "qsa_mqa_prefill"):
+            return torch.ops.sgl_kernel.qsa_mqa_prefill(
+                q.contiguous(),
+                k.contiguous(),
+                row_starts.to(device=q.device, dtype=torch.int32).contiguous(),
+                row_ends.to(device=q.device, dtype=torch.int32).contiguous(),
+                score_scale,
+            )
+        warnings.warn(
+            "sgl-kernel-xpu was built without QSA MQA; using the slow prefill reference",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
@@ -678,6 +704,34 @@ def qsa_mqa_decode(
             max_model_len,
             score_scale,
             min_scored_len=min_scored_len,
+        )
+    if q.is_xpu and (
+        q.dtype == torch.float8_e4m3fn or k_cache.dtype == torch.float8_e4m3fn
+    ):
+        _scoring_dtype(q, k_cache)
+    if (
+        q.is_xpu
+        and q.dtype == k_cache.dtype
+        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q.shape[1:] == (4, 128)
+        and k_cache.ndim == 4
+        and k_cache.shape[2:] == (1, 128)
+    ):
+        import sgl_kernel  # noqa: F401
+
+        if hasattr(torch.ops.sgl_kernel, "qsa_mqa_decode"):
+            return torch.ops.sgl_kernel.qsa_mqa_decode(
+                q.contiguous(),
+                k_cache.contiguous(),
+                page_table.to(device=q.device, dtype=torch.int32).contiguous(),
+                context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+                max_model_len,
+                score_scale,
+            )
+        warnings.warn(
+            "sgl-kernel-xpu was built without QSA MQA; using the slow decode reference",
+            RuntimeWarning,
+            stacklevel=2,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
