@@ -488,6 +488,12 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+        self.use_fp32_logits_buffer = (
+            envs.SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER.get()
+            and not self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.final_logit_softcapping
+        )
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
@@ -1069,29 +1075,21 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor],
         use_logits_buffer: bool,
     ) -> Optional[torch.Tensor]:
-        if not envs.SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER.get():
+        if not self.use_fp32_logits_buffer or not use_logits_buffer:
             return None
-        buffer = logits_metadata.next_token_logits_buffer if use_logits_buffer else None
+        buffer = logits_metadata.next_token_logits_buffer
         weight = getattr(lm_head, "weight", None)
+        # Logits buffers are row slices of contiguous fp32 allocations.
+        # LoRA and quantized heads are dispatched separately in _compute_lm_head.
         if (
             buffer is None
             or weight is None
             or embedding_bias is not None
             or self.logit_scale is not None
-            or self.final_logit_softcapping
-            or self.do_tensor_parallel_all_gather
-            or self.do_tensor_parallel_all_gather_dp_attn
-            or hasattr(lm_head, "set_lora")
-            or should_apply_lm_head_quant_method(
-                lm_head, getattr(lm_head, "quant_method", None)
-            )
             or not hidden_states.is_cuda
             or hidden_states.dtype != torch.bfloat16
             or weight.dtype != torch.bfloat16
-            or buffer.dtype != torch.float32
-            or not buffer.is_contiguous()
-            or tuple(buffer.shape) != (hidden_states.shape[0], weight.shape[0])
-            or weight.shape[0] != self.vocab_size
+            or buffer.shape != (hidden_states.shape[0], weight.shape[0])
         ):
             return None
         return buffer

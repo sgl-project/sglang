@@ -114,7 +114,7 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
     def _compute_lm_head(
         self, hidden_states, lm_head, embedding_bias=None, *, out=None
     ):
-        if out is not None or not hasattr(lm_head, "weight"):
+        if not hasattr(lm_head, "weight"):
             return super()._compute_lm_head(
                 hidden_states, lm_head, embedding_bias, out=out
             )
@@ -134,6 +134,7 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 hidden_states.to(lm_head.weight.dtype),
                 lm_head.weight.T,
                 out_dtype=output_dtype,
+                out=out,
             )
         if embedding_bias is not None:
             logits = logits + embedding_bias
