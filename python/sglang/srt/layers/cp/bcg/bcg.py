@@ -29,16 +29,14 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
-    get_cp_strategy,
+    get_cp_strategy_kind,
 )
-from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_split_before_forward,
     prepare_cp_forward,
 )
-from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -49,16 +47,13 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
-PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
-    tuple[ContextParallelStrategyKind, CPAttentionBackendKind]
-] = {
-    (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
-    (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSA),
-}
-
-
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
+
+    from sglang.srt.layers.cp.bcg import (
+        PREFILL_CP_BCG_SUPPORTED_COMBINATIONS,
+        get_cp_bcg_input_type,
+    )
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
@@ -79,28 +74,21 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         return False
     if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
         return False
-    if combination == (
-        ContextParallelStrategyKind.INTERLEAVE,
-        CPAttentionBackendKind.DSA,
-    ):
-        from sglang.srt.layers.cp.bcg.interleave_bcg import supports_interleave_bcg
-
-        return supports_interleave_bcg(server_args)
-    return True
-
-
-def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
-    """Return whether CP breakable prefill capture is enabled."""
-    return supports_prefill_cp_bcg(server_args)
+    return get_cp_bcg_input_type(combination[0]).supports(server_args)
 
 
 def filter_prefill_cp_bcg_capture_num_tokens(
     capture_num_tokens: list[int], server_args: ServerArgs
 ) -> list[int]:
     """Keep only token buckets where the selected CP strategy can run."""
-    min_num_tokens = resolved_view(server_args).attn_cp_size
-    if resolving_view(server_args).cp_strategy == "zigzag":
-        min_num_tokens *= 2
+    from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type
+
+    input_type = get_cp_bcg_input_type(
+        ContextParallelStrategyKind.from_string(resolving_view(server_args).cp_strategy)
+    )
+    min_num_tokens = input_type.min_capture_tokens(
+        resolved_view(server_args).attn_cp_size
+    )
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(
@@ -133,10 +121,10 @@ class PrefillCPBCGInput:
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
-        if cls is PrefillCPBCGInput and get_cp_strategy().name == "interleave":
-            from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
+        if cls is PrefillCPBCGInput:
+            from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type
 
-            return InterleaveCPBCGInput.create(runner)
+            return get_cp_bcg_input_type(get_cp_strategy_kind()).create(runner)
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -159,29 +147,22 @@ class PrefillCPBCGInput:
         # No override: retain the runner's existing model/mRoPE selection.
         return None
 
+    @staticmethod
+    def supports(server_args: ServerArgs) -> bool:
+        return True
+
+    @staticmethod
+    def min_capture_tokens(cp_size: int) -> int:
+        return cp_size
+
+    def _max_local_tokens(self, extend_seq_lens: Any) -> int:
+        raise NotImplementedError
+
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
         """Return the largest aligned local shard, uniformly across CP ranks."""
-        strategy = get_cp_strategy()
-        if extend_seq_lens is None:
+        if extend_seq_lens is None or len(extend_seq_lens) == 0:
             return None
-        if isinstance(strategy, InterleaveCPStrategy):
-            num_tokens = sum(int(length) for length in extend_seq_lens)
-            max_local_tokens = (num_tokens + strategy.cp_size - 1) // strategy.cp_size
-        elif isinstance(strategy, ZigzagCPStrategy):
-            cp_segment_num = strategy.cp_size * 2
-            per_rank_logical_tokens = [0] * strategy.cp_size
-            for raw_length in extend_seq_lens:
-                base, remainder = divmod(int(raw_length), cp_segment_num)
-                for rank in range(strategy.cp_size):
-                    opposite_rank = cp_segment_num - 1 - rank
-                    per_rank_logical_tokens[rank] += (
-                        base * 2
-                        + int(rank < remainder)
-                        + int(opposite_rank < remainder)
-                    )
-            max_local_tokens = max(per_rank_logical_tokens)
-        else:
-            return None
+        max_local_tokens = self._max_local_tokens(extend_seq_lens)
         align_size = get_cp_padding_align_size()
         return (max_local_tokens + align_size - 1) // align_size * align_size
 
@@ -238,7 +219,6 @@ class PrefillCPBCGInput:
         # Replay batches may reuse a ForwardBatch object whose metadata was
         # built for a different request layout. Always rebuild before sharding.
         forward_batch.attn_cp_metadata = None
-        out_cache_loc = forward_batch.out_cache_loc
         prepare_cp_forward(forward_batch)
 
         captured_local_tokens = None
@@ -306,16 +286,6 @@ class PrefillCPBCGInput:
         forward_batch.input_embeds = input_embeds
         forward_batch.positions = positions
         self.live_local_tokens = live_local_tokens
-
-        if isinstance(get_cp_strategy(), InterleaveCPStrategy):
-            metadata = forward_batch.attn_cp_metadata
-            cp_size = len(metadata.per_rank_actual_token)
-            base, remainder = divmod(static_num_tokens, cp_size)
-            metadata.total_seq_lens = static_num_tokens
-            metadata.per_rank_logical_token = [
-                base + int(rank < remainder) for rank in range(cp_size)
-            ]
-            forward_batch.out_cache_loc = out_cache_loc
 
 
 def execute_prefill_cp_bcg(

@@ -15,8 +15,8 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
+from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
@@ -190,7 +190,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner = self._make_runner()
         runner.capture_num_tokens.append(2560)
         runner.max_num_tokens = 2560
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576, 2560: 640},
@@ -200,7 +200,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -222,7 +222,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_preserves_two_x_padding_limit(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -239,7 +239,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_falls_back_when_no_capture_has_capacity(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 516},
@@ -250,7 +250,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -268,7 +268,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 raise StopAfterRecordingFill
 
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -280,7 +280,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
             self.assertRaises(StopAfterRecordingFill),

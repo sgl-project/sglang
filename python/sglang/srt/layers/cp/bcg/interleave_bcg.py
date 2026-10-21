@@ -17,21 +17,6 @@ from sglang.srt.layers.cp.utils import cp_interleave_input_ids
 from sglang.srt.runtime_context import get_parallel
 
 
-def supports_interleave_bcg(server_args):
-    cfg = resolving_view(server_args)
-    resolved = resolved_view(server_args)
-    return (
-        cfg.enable_prefill_cp
-        and cfg.pp_size == 1
-        and cfg.dp_size == 1
-        and cfg.ep_size == 1
-        and resolved.attn_cp_size > 1
-        and resolved.attn_cp_size == cfg.tp_size
-        and "Glm5NextForConditionalGeneration"
-        in model_config_of(server_args).hf_config.architectures
-    )
-
-
 class InterleaveCPBCGInput(PrefillCPBCGInput):
     @classmethod
     def create(cls, runner):
@@ -53,21 +38,38 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
             and not any(prefix_lens)
         )
 
-    def required_local_tokens(self, extend_seq_lens):
-        if extend_seq_lens is None or len(extend_seq_lens) == 0:
-            return None
+    @staticmethod
+    def supports(server_args):
+        cfg = resolving_view(server_args)
+        return (
+            cfg.dp_size == 1
+            and cfg.ep_size == 1
+            and resolved_view(server_args).attn_cp_size > 1
+            and "Glm5NextForConditionalGeneration"
+            in model_config_of(server_args).hf_config.architectures
+        )
+
+    def _max_local_tokens(self, extend_seq_lens):
         size = get_parallel().attn_cp_size
-        rows = (sum(int(length) for length in extend_seq_lens) + size - 1) // size
-        return (rows + size - 1) // size * size
+        return (sum(int(length) for length in extend_seq_lens) + size - 1) // size
 
     def model_positions(self, forward_batch):
         return self.positions[: self.live_local_tokens]
 
     def prepare(self, runner, forward_batch, *, static_num_tokens, capture):
         global_positions = forward_batch.positions
+        out_cache_loc = forward_batch.out_cache_loc
         super().prepare(
             runner, forward_batch, static_num_tokens=static_num_tokens, capture=capture
         )
+        metadata = forward_batch.attn_cp_metadata
+        cp_size = len(metadata.per_rank_actual_token)
+        base, remainder = divmod(static_num_tokens, cp_size)
+        metadata.total_seq_lens = static_num_tokens
+        metadata.per_rank_logical_token = [
+            base + int(rank < remainder) for rank in range(cp_size)
+        ]
+        forward_batch.out_cache_loc = out_cache_loc
         # KPool compresses consecutive global tokens; only the model argument
         # (DSA RoPE) is local. Do not replace ForwardBatch's global positions.
         forward_batch.positions = global_positions

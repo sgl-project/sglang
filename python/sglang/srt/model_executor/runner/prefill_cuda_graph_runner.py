@@ -58,13 +58,9 @@ from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg.bcg import (
     PrefillCPBCGInput,
-)
-from sglang.srt.layers.cp.bcg.bcg import (
-    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
-)
-from sglang.srt.layers.cp.bcg.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
+    supports_prefill_cp_bcg,
 )
 from sglang.srt.layers.cp.utils import (
     is_cp_active,
@@ -612,7 +608,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         server_args = model_runner.server_args
         self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_bcg_capture(server_args)
+        ) and supports_prefill_cp_bcg(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
                 # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
