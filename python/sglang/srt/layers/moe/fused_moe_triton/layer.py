@@ -74,6 +74,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -101,25 +102,23 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _deferred_finalize_info_logged = False
 
 
-def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
+def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
     return (
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and not getattr(
-                quant_method, "_moe_runner_backend", get_moe_runner_backend()
-            ).is_marlin()
+            and (runner_backend is None or not runner_backend.is_marlin())
         )
         or (
-            isinstance(quant_method, Fp8MoEMethod)
+            runner_backend is not None
             and (
-                get_moe_runner_backend().is_cutlass()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                # Materialized TRT-LLM routes carry the final weights, including
+                # when a quantization wrapper delegates to a layer-owned scheme.
+                runner_backend.is_flashinfer_trtllm()
+                or runner_backend.is_flashinfer_trtllm_routed()
+                or isinstance(quant_method, Fp8MoEMethod)
+                and runner_backend.is_cutlass()
             )
-        )
-        or (
-            isinstance(quant_method, UnquantizedFusedMoEMethod)
-            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
     )
 
@@ -192,6 +191,7 @@ def create_moe_dispatcher(
         or a2a_backend.is_pplx()
     ):
         return MaybeTboDeepEPDispatcher(
+            runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -359,6 +359,7 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
+        uses_expert_location: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -367,6 +368,8 @@ class FusedMoE(torch.nn.Module):
         self.params_dtype = params_dtype
         self.layer_name = prefix
         self.layer_id = layer_id
+        self.is_draft = get_flags().moe.in_speculative_scope
+        self.uses_expert_location = uses_expert_location and not self.is_draft
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -533,19 +536,7 @@ class FusedMoE(torch.nn.Module):
             and num_experts == 512
             and top_k == 10
         )
-        self.supports_deferred_finalize = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        )
-        global _deferred_finalize_info_logged
-        if not _deferred_finalize_info_logged:
-            _deferred_finalize_info_logged = True
-            logging.getLogger(__name__).debug(
-                "FlashInfer TRTLLM MoE deferred finalize is "
-                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-                f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
-                f"quant_method={type(self.quant_method).__name__})."
-            )
+        self.supports_deferred_finalize = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -563,6 +554,24 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
+        self.runner_backend = self.quant_method.get_moe_runner_backend(self)
+        self.moe_runner_config.runner_backend = self.runner_backend
+        self._set_runner_flags()
+        self.supports_deferred_finalize = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_trtllm()
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
+        )
+        global _deferred_finalize_info_logged
+        if not _deferred_finalize_info_logged:
+            _deferred_finalize_info_logged = True
+            logging.getLogger(__name__).debug(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={self.runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
+
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
         )
@@ -580,14 +589,11 @@ class FusedMoE(torch.nn.Module):
         self.swiglu_alpha = gemm1_alpha
         self.swiglu_clamp_limit = gemm1_clamp_limit
 
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        if self.use_flashinfer_trtllm_moe:
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            _fuses_routed_scaling_factor_in_topk(self.quant_method)
+            _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
 
         self.routing_method_type = routing_method_type
@@ -599,6 +605,20 @@ class FusedMoE(torch.nn.Module):
         self._dwdp_bound = False
 
         self.runner = self.quant_method.runner
+
+    def _set_runner_flags(self) -> None:
+        backend = self.runner_backend
+        self.enable_flashinfer_cutlass_moe = (
+            backend is not None and backend.is_flashinfer_cutlass()
+        )
+        self.use_flashinfer_mxfp4_moe = (
+            backend is not None and backend.is_flashinfer_mxfp4()
+        )
+        self.use_triton_kernels = backend is not None and backend.is_triton_kernels()
+        self.use_deep_gemm = backend is not None and backend.is_deep_gemm()
+        self.use_flashinfer_trtllm_moe = backend is not None and (
+            backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+        )
 
     @property
     def num_global_routed_experts(self) -> int:
@@ -815,17 +835,19 @@ class FusedMoE(torch.nn.Module):
 
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice and leave the
-        # trailing padding as zeros.  Rank-mismatched tensors (bias / scalar
+        # the buffer is padded. Initialize padding even if a runner fallback
+        # disabled use_padded_loading. Rank-mismatched tensors (bias / scalar
         # scales) don't carry shard_dim; they keep the plain broadcast copy.
         if (
             loaded_weight.dim() == expert_data.dim()
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
-            )
+            loaded_size = loaded_weight.shape[shard_dim]
+            expert_data.narrow(
+                shard_dim, loaded_size, expert_data.shape[shard_dim] - loaded_size
+            ).zero_()
+            expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
         else:
             expert_data.copy_(loaded_weight)
 
@@ -900,16 +922,18 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice only.  See the
-        # rank-mismatch note in _load_w13.
+        # the buffer is padded. Zero the untouched tail before copying the
+        # leading slice. See the rank-mismatch note in _load_w13.
         if (
             loaded_weight.dim() == expert_data.dim()
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
-            )
+            loaded_size = loaded_weight.shape[shard_dim]
+            expert_data.narrow(
+                shard_dim, loaded_size, expert_data.shape[shard_dim] - loaded_size
+            ).zero_()
+            expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
         else:
             expert_data.copy_(loaded_weight)
 
@@ -1058,7 +1082,9 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        global_expert_location_metadata = get_global_expert_location_metadata()
+        global_expert_location_metadata = (
+            get_global_expert_location_metadata() if self.uses_expert_location else None
+        )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
@@ -1215,10 +1241,7 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
-        elif isinstance(method, Fp8MoEMethod) and (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        elif isinstance(method, Fp8MoEMethod) and (self.use_flashinfer_trtllm_moe):
             # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 clear_mxfp8_shuffle_index_cache,
@@ -1243,16 +1266,11 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
-        use_flashinfer_trtllm_weight_layout = (
-            method.use_flashinfer_trtllm_weight_layout
-            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
-            else self.use_flashinfer_trtllm_moe
-        )
-
-        # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if use_flashinfer_trtllm_weight_layout and (
-            isinstance(method, ModelOptNvFp4FusedMoEMethod)
-            or isinstance(method, Fp8MoEMethod)
+        # ModelOpt NVFP4 reorders weights and block scales in _load_w13;
+        # its per-tensor global scales retain the logical [gate, up] order.
+        # These other methods also reorder their per-tensor scales.
+        if self.use_flashinfer_trtllm_moe and (
+            isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
             or isinstance(method, CompressedTensorsMxInt4MoE)
         ):
@@ -1467,10 +1485,7 @@ class FusedMoE(torch.nn.Module):
         method = _weight_layout_method(self)
         if self.scheme is not None:
             method = self.scheme
-        if isinstance(method, Fp8MoEMethod) and (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        if isinstance(method, Fp8MoEMethod) and (self.use_flashinfer_trtllm_moe):
             # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 clear_mxfp8_shuffle_index_cache,
@@ -1541,6 +1556,14 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
+            if (
+                TopKOutputChecker.format_is_bypassed(topk_output)
+                and topk_output.expert_location_dispatch_info is not None
+            ):
+                # The opaque logits-only op cannot carry placement metadata.
+                return self.forward_impl(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1854,7 +1877,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
-        router_logits=router_logits,
+        raw_router_logits=router_logits,
         topk_config=TopKConfig(
             top_k=top_k,
             topk_group=topk_group,
@@ -1862,6 +1885,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             correction_bias=correction_bias,
             renormalize=renormalize,
             allow_routed_experts_capture=allow_routed_experts_capture,
+            layer_id=layer_id,
         ),
     )
     forward_context = get_tc_piecewise_forward_context()

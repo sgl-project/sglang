@@ -94,6 +94,7 @@ class _Fixture:
             reqs=reqs,
             encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
+            req_pool_indices_cpu=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
             extend_num_tokens=self.extend_num_tokens,

@@ -8,8 +8,9 @@ from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
     commit_packed_rows,
     copy_packed_rows,
 )
+from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
 
 # A window row the replay expects but no longer holds; that request's attention
 # would read the wrong rows.
@@ -278,7 +279,8 @@ class RequestWindow:
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
-            if not in_capture:
+            # Signal-only: skip building the predicate when detection is off.
+            if not in_capture and resolve_level() >= InvariantCheckLevel.WARN:
                 expect(
                     _SWA_HISTORY_PRESENT,
                     (self.tags[layer, src] == layout.history_pos)

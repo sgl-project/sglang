@@ -46,10 +46,9 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
-_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -167,7 +166,7 @@ class TargetVerifyExecutor:
         simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate and _is_hip else sampling_info
+        accept_sampling_info = None if simulate else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
