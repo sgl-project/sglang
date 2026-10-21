@@ -702,11 +702,13 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             },
         }
 
-    def _respond(self, stream, *, output, **request_fields):
+    def _respond(
+        self, stream, *, output, tool_call_parser="response_template", **request_fields
+    ):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
         serving.reasoning_parser = "response_template"
-        serving.tool_call_parser = "response_template"
+        serving.tool_call_parser = tool_call_parser
         serving._reasoning_detector = ResponseTemplateReasoningDetector(
             response_template=self.TEMPLATE
         )
@@ -799,6 +801,28 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     stream,
                     output=output,
                     tool_choice="auto",
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
+    def test_json_text_format_with_natively_required_tools_stays_message(self):
+        """A required or named choice that a tool parser owns natively accepts a
+        JSON text format; the JSON answer stays a message, never a tool call."""
+        payload = '{"name": "get_weather", "parameters": {"city": "Paris"}}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for tool_choice in ("required", {"type": "function", "name": "get_weather"}):
+            with self.subTest(tool_choice=tool_choice):
+                response = self._respond(
+                    False,
+                    output=output,
+                    tool_call_parser="glm47",
+                    tool_choice=tool_choice,
                     text={"format": {"type": "json_object"}},
                 )
 

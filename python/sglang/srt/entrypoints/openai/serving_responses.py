@@ -1187,7 +1187,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if (
             content
-            and chat_tools
+            and self._tool_parsing_active(request, chat_tools)
             and is_required
             and not parsed_via_native
             and not detector_owns_format
