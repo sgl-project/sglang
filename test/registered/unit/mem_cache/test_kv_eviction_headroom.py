@@ -81,8 +81,12 @@ class TestKVEvictionHeadroom(CustomTestCase):
 
     def test_unified_swa_adds_headroom_after_preferred_planning(self):
         allocator = SimpleNamespace(
-            reclaim_plan=MagicMock(return_value=(0, 100)),
+            reclaim_plan=MagicMock(side_effect=[(0, 100), (0, 0)]),
             ensure_capacity=MagicMock(return_value=True),
+            free_group=None,
+            free_page_reps_group=None,
+            full_free_group=[],
+            full_page_reps_group=[],
         )
         tree_cache = MagicMock()
         tree_cache.supports_prefix_sharing.return_value = True
@@ -107,9 +111,14 @@ class TestKVEvictionHeadroom(CustomTestCase):
             swa_evictable_tokens=180,
             prefer_swa=True,
         )
-        tree_cache.evict.assert_called_once_with(
-            EvictParams(num_tokens=0, swa_num_tokens=180)
-        )
+        tree_cache.evict_for_alloc.assert_called_once()
+        params = tree_cache.evict_for_alloc.call_args.args[0]
+        reclaim_satisfied = tree_cache.evict_for_alloc.call_args.kwargs[
+            "allocation_reclaim_satisfied"
+        ]
+        self.assertEqual(params, EvictParams(num_tokens=0, swa_num_tokens=180))
+        self.assertTrue(reclaim_satisfied())
+        allocator.reclaim_plan.assert_called_with(200, 280)
         allocator.ensure_capacity.assert_called_once_with(200, 200)
 
 

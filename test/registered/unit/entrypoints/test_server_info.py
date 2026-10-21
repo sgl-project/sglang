@@ -32,9 +32,11 @@ import msgspec.structs
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -171,6 +173,23 @@ class TestServerInfoTransportParity(CustomTestCase):
                     json.loads(leader_json), json.loads(json.dumps(http_info))
                 )
 
+                # The embedded Rust server's launch-time fields, which stamp
+                # the init info the scheduler handshake carries for Python.
+                scheduler = SimpleNamespace(
+                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertEqual(rust_launch.pop("status"), "ready")
+                self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
+                self.assertEqual(rust_launch, json.loads(leader_json))
+
+                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                scheduler.server_args = ServerArgs(
+                    model_path="dummy", page_size=64, enable_http2=True
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertIs(rust_launch["enable_http2"], False)
+
                 with (
                     patch.object(
                         common,
@@ -188,6 +207,28 @@ class TestServerInfoTransportParity(CustomTestCase):
                 load.return_value.start_metadata_server.assert_called_once_with(
                     host="127.0.0.1", port=50051, server_info_json=leader_json
                 )
+
+    def test_rust_server_followers_skip_runtime_metadata_server(self):
+        """A follower node hosting a Rust listener must not bind grpc_port a
+        second time; that node's KV publishers are served by the listener."""
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            patch.object(
+                common,
+                "get_serving",
+                return_value=SimpleNamespace(
+                    host="127.0.0.1",
+                    grpc_port=50051,
+                    smg_grpc_mode=False,
+                    grpc_mode=False,
+                ),
+            ),
+            patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+        ):
+            self.assertIsNone(
+                common.start_follower_grpc_server(ServerArgs(model_path="dummy"), {})
+            )
+        load.return_value.start_metadata_server.assert_not_called()
 
 
 class TestServerInfoKvEventsField(CustomTestCase):

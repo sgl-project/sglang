@@ -196,7 +196,7 @@ class _MockDispatchOutput:
         self.hidden_states = hidden_states
         self.topk_output = BypassedTopKOutput(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            raw_router_logits=router_logits,
             topk_config=TopKConfig(top_k=top_k, renormalize=True),
         )
 

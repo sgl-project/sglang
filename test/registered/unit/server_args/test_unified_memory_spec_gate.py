@@ -31,8 +31,9 @@ from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class _PlainHFConfig:
@@ -92,24 +93,25 @@ _VERIFY_BACKENDS = (
     "triton",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
     "flashmla",
     "flashinfer",
     "fa3",
 )
-_MHA_RAILS = ("triton", "flashinfer", "fa3")
+_MHA_RAILS = ("triton", "flashinfer", "fa3", "trtllm_mha")
 
 
-class TestUnifiedMemorySpecGate(unittest.TestCase):
+class TestUnifiedMemorySpecGate(CustomTestCase):
     VERIFY_BACKENDS = _VERIFY_BACKENDS
     MHA_RAILS = _MHA_RAILS
     MLA_ONLY = tuple(b for b in _VERIFY_BACKENDS if b not in _MHA_RAILS)
-    UNAUDITED = ("fa4", "trtllm_mha")
+    UNAUDITED = ("fa4",)
 
     def test_dspark_verify_backends(self):
-        for backend in self.VERIFY_BACKENDS:
+        for backend in self.VERIFY_BACKENDS + ("fa4",):
             self.assertTrue(_accepts("DSPARK", backend=backend), backend)
-        for backend in self.UNAUDITED:
+        self.assertTrue(_accepts("DSPARK", backend="fa4", draft_backend="fa4"))
+        # trtllm_mha is audited for the EAGLE and DFLASH arms only.
+        for backend in ("trtllm_mha",):
             self.assertFalse(_accepts("DSPARK", backend=backend), backend)
 
     def test_dcp_keeps_flashinfer_off_the_verify_list(self):
