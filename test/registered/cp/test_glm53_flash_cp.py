@@ -49,8 +49,6 @@ class TestGLM53FlashB200ContextParallel(
         "incoai/GLM-5.3-Flash-DFlash2",
         "--speculative-draft-attention-backend",
         "fa4",
-        "--cuda-graph-max-bs-prefill",
-        "16384",
         # Leave room for the larger prefill graph capture.
         "--mem-fraction-static",
         "0.75",
