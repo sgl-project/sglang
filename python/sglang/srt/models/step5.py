@@ -118,7 +118,7 @@ from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 class Step5MLP(nn.Module):
-    """BF16 SwiGLU with post-SiLU clamp and native TP reduction."""
+    """BF16 SwiGLU with post-SiLU clamp and boundary-owned TP reduction."""
 
     def __init__(
         self,
@@ -154,6 +154,8 @@ class Step5MLP(nn.Module):
             input_is_parallel=True,
             params_dtype=torch.bfloat16,
             quant_config=None,
+            # Stage boundaries sum dense and shared-expert TP partials.
+            # The attention-DP path has no stage boundaries and sums here.
             reduce_results=use_dp_attention_reduce,
             use_dp_attention_reduce=use_dp_attention_reduce,
             prefix=add_prefix("down_proj", prefix),
@@ -161,7 +163,7 @@ class Step5MLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return BF16 partials for stage boundaries, or summed DP-local output."""
+        """Return BF16 TP partials, except on the boundary-free attention-DP path."""
         gate_up, _ = self.gate_up_proj(hidden_states)
         activation = self.act_fn(gate_up)
         output, _ = self.down_proj(activation)
