@@ -3902,6 +3902,48 @@ class TestDeclarationValidation(CustomTestCase):
             validate_declarations(args, [("src", {"nope": 1})])
 
 
+class TestBeamOverrides(CustomTestCase):
+    def test_only_nvfp4_defaults_to_trtllm_moe_on_blackwell(self):
+        """The cookbook NVFP4 recipe sets neither backend; other formats and
+        explicit runners must keep their MoE runner."""
+        attention = {"attention_backend": "trtllm_mha"}
+        trtllm_moe = {**attention, "moe_runner_backend": "flashinfer_trtllm"}
+        defaults = dict(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            quantization=None,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+        )
+        cases = (
+            ("NVFP4", {}, trtllm_moe),
+            ("FP8", {}, attention),
+            (None, {}, attention),
+            ("NVFP4", {"moe_runner_backend": "flashinfer_cutlass"}, attention),
+        )
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+            override_platform(is_sm120=False),
+        ):
+            for quant_algo, overrides, expected in cases:
+                with self.subTest(quant_algo=quant_algo, **overrides):
+                    hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])
+                    if quant_algo is not None:
+                        hf_config.quantization_config = {
+                            "quant_method": "modelopt",
+                            "quant_algo": quant_algo,
+                        }
+                    args = SimpleNamespace(**{**defaults, **overrides})
+                    self.assertEqual(
+                        collect_model_override_declarations(
+                            "BeamForCausalLM", args, hf_config
+                        ),
+                        [("_beam_overrides", expected)],
+                    )
+
+
 class TestQwen3VLHopperServingOverrides(CustomTestCase):
     def setUp(self):
         super().setUp()

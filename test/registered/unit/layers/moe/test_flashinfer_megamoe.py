@@ -48,6 +48,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
