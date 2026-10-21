@@ -25,18 +25,26 @@ class TestCublasWorkspace(unittest.TestCase):
     def test_sync_precedes_clear(self):
         events = []
         device = SimpleNamespace(synchronize=lambda: events.append("sync"))
-        with mock.patch("torch.version.cuda", "13.0"), mock.patch(
-            "torch._C._cuda_clearCublasWorkspaces", create=True,
-            side_effect=lambda: events.append("clear"),
+        with (
+            mock.patch("torch.version.cuda", "13.0"),
+            mock.patch(
+                "torch._C._cuda_clearCublasWorkspaces",
+                create=True,
+                side_effect=lambda: events.append("clear"),
+            ),
         ):
             prepare_cublas_for_graph_capture(device)
         self.assertEqual(events, ["sync", "clear"])
 
     def test_non_cuda_noop(self):
         device = SimpleNamespace(synchronize=mock.Mock())
-        with mock.patch("torch.version.cuda", None), mock.patch(
-            "torch._C._cuda_clearCublasWorkspaces", create=True,
-        ) as clear:
+        with (
+            mock.patch("torch.version.cuda", None),
+            mock.patch(
+                "torch._C._cuda_clearCublasWorkspaces",
+                create=True,
+            ) as clear,
+        ):
             prepare_cublas_for_graph_capture(device)
         device.synchronize.assert_not_called()
         clear.assert_not_called()
@@ -51,14 +59,18 @@ class TestCublasWorkspace(unittest.TestCase):
             mock.patch(BCG + ".get_device_module", return_value=device),
             mock.patch("torch.version.cuda", "13.0"),
             mock.patch("torch.cuda.CUDAGraph", return_value=graph),
-            mock.patch("torch._C._cuda_clearCublasWorkspaces", create=True,
-                       side_effect=lambda: events.append("clear")),
+            mock.patch(
+                "torch._C._cuda_clearCublasWorkspaces",
+                create=True,
+                side_effect=lambda: events.append("clear"),
+            ),
         ):
             capture._begin_new_segment()
             events.append("eager-break")
             capture._begin_new_segment()
-        self.assertEqual(events, ["sync", "clear", "begin", "eager-break",
-                                  "sync", "clear", "begin"])
+        self.assertEqual(
+            events, ["sync", "clear", "begin", "eager-break", "sync", "clear", "begin"]
+        )
 
     def test_xpu_segment_does_not_prepare_cuda_workspace(self):
         graph = mock.Mock()
