@@ -10,6 +10,8 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
+    apply_routing_simulation,
+    routing_simulation_enabled,
 )
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -138,6 +140,16 @@ def _finish_vision_topk(
 ):
     config = moe.topk.topk_config
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
+    if routing_simulation_enabled():
+        apply_routing_simulation(
+            indices,
+            weights,
+            logits.shape[1],
+            num_routed_topk=config.top_k - config.num_shared_topk_slots,
+            top_k=config.top_k,
+            layer_id=moe.layer_id,
+        )
+        padded_rows_masked = False
     indices, weights, recorder_ids = _post_process_topk_ids(
         indices,
         weights,
