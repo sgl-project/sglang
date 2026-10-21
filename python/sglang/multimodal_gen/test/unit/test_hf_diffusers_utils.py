@@ -486,8 +486,7 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
 
 
 def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path):
-    """LocalEntryNotFoundError subclasses EntryNotFoundError, so an offline Hub was
-    treated as "no model_index.json" and the cache fallback never ran."""
+    """An unreachable Hub must fall back to the cached model_index.json."""
     cached = tmp_path / "model_index.json"
     cached.write_text("{}")
 
@@ -507,60 +506,35 @@ def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path)
     )
 
 
-def test_unreachable_hub_is_not_reported_as_single_model_repo(monkeypatch):
-    """With the Hub unreachable and nothing cached, the repo must not be assumed to
-    be a single model (which ends in a misleading "-Diffusers" hint)."""
+@pytest.mark.parametrize("cached_single_model", [True, False])
+def test_unreachable_hub_model_index(
+    monkeypatch, tmp_path, recording_snapshot_download, cached_single_model
+):
+    """Offline, a cached single model loads; a cache miss is reported, not a -Diffusers hint."""
 
     def offline(*args, **kwargs):
         raise LocalEntryNotFoundError("offline")
-
-    downloads = []
-    monkeypatch.setattr(
-        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        hf_diffusers_utils, "_resolve_remote_repo_model_index_path", offline
-    )
-    monkeypatch.setattr(
-        hf_diffusers_utils, "maybe_download_model", lambda *a, **k: downloads.append(a)
-    )
-
-    with pytest.raises(ValueError, match="Failed to download or parse"):
-        hf_diffusers_utils.maybe_download_model_index("org/model")
-    assert downloads == []
-
-
-def test_unreachable_hub_uses_cached_single_model_snapshot(monkeypatch, tmp_path):
-    """Offline, a fully cached repo with config.json and no model_index.json is
-    still a single model, as it was before the unreachable-Hub check."""
-    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
-
-    def offline(*args, **kwargs):
-        raise LocalEntryNotFoundError("offline")
-
-    def cached_snapshot(repo_id, local_files_only=False, **kwargs):
-        assert local_files_only
-        return str(tmp_path)
 
     monkeypatch.setattr(
         hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
     )
     monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda **k: None)
-    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", cached_snapshot)
-    monkeypatch.setattr(
-        hf_diffusers_utils,
-        "maybe_download_model",
-        lambda *a, **k: pytest.fail("must not hit the Hub"),
-    )
 
-    config = hf_diffusers_utils.maybe_download_model_index("org/model")
-    assert config == {"architectures": ["M"]}
+    if cached_single_model:
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
+        calls = recording_snapshot_download(tmp_path)
+        config = hf_diffusers_utils.maybe_download_model_index("org/model")
+        assert config == {"architectures": ["M"]}
+        assert calls == ["probe"]
+    else:
+        monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", offline)
+        with pytest.raises(ValueError, match="not found in local cache"):
+            hf_diffusers_utils.maybe_download_model_index("org/model")
 
 
 def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
-    """Only the component's own directory name selects scheduler_config.json; a
-    parent such as `scheduler_ablation/` must not redirect every component."""
+    """Only the component dir name, not a parent dir, selects scheduler_config.json."""
     component = tmp_path / "scheduler_ablation" / "unet"
     component.mkdir(parents=True)
     (component / "config.json").write_text(json.dumps({"_class_name": "UNet"}))
@@ -571,8 +545,7 @@ def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
 
 
 def test_modelopt_config_patch_does_not_write_through_cache_symlink(tmp_path):
-    """In an HF snapshot config.json is a symlink to a blob shared by every
-    revision; the ModelOpt normalization must replace the link, not edit the blob."""
+    """Normalizing config.json must not modify the shared HF cache blob."""
     blob = tmp_path / "blob"
     original = json.dumps(
         {"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}}

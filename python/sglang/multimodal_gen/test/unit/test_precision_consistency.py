@@ -178,12 +178,10 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         )
 
     def test_autocast_and_dtype_alignment(self):
-        amp_platform = _FakePlatform("cpu", is_mps=False, amp_supported=True)
-        with mock.patch.object(precision, "current_platform", amp_platform):
-            self.assertTrue(autocast_enabled(torch.float16, disable_autocast=False))
-            self.assertTrue(autocast_enabled(torch.bfloat16, disable_autocast=False))
-            self.assertFalse(autocast_enabled(torch.float32, disable_autocast=False))
-            self.assertFalse(autocast_enabled(torch.float16, disable_autocast=True))
+        self.assertTrue(autocast_enabled(torch.float16, disable_autocast=False))
+        self.assertTrue(autocast_enabled(torch.bfloat16, disable_autocast=False))
+        self.assertFalse(autocast_enabled(torch.float32, disable_autocast=False))
+        self.assertFalse(autocast_enabled(torch.float16, disable_autocast=True))
 
         module = _ParameterDtypeWinsModule()
         self.assertEqual(get_module_dtype(module), torch.float16)
@@ -232,35 +230,23 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             self.assertEqual(module.weight.dtype, torch.float32)
 
     def test_temporary_module_dtype_restores_each_tensor_dtype(self):
-        """A bf16 module with fp32 norm weights and an fp32 buffer must come back
-        with every tensor in its own dtype, not uniformly in the first parameter's."""
+        """Every parameter and buffer registration must come back in its own original dtype."""
         module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.LayerNorm(2))
         module.to(torch.bfloat16)
         module[1].float()
-        module.register_buffer("scale", torch.ones(2, dtype=torch.float32))
+        shared = torch.ones(2, dtype=torch.float32)
+        module[0].register_buffer("first", shared)
+        module[0].register_buffer("second", shared)
+        module[1].register_buffer("first", shared)
 
         with temporary_module_dtype(module, torch.float16):
-            self.assertEqual(module[0].weight.dtype, torch.float16)
             self.assertEqual(module[1].weight.dtype, torch.float16)
+            self.assertEqual(module[0].second.dtype, torch.float16)
 
         self.assertEqual(module[0].weight.dtype, torch.bfloat16)
         self.assertEqual(module[1].weight.dtype, torch.float32)
-        self.assertEqual(module.scale.dtype, torch.float32)
-
-    def test_temporary_module_dtype_restores_shared_buffer_in_each_owner(self):
-        """One buffer registered in two submodules diverges into two copies
-        after module.to(); both owners must come back in the original dtype."""
-        module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
-        module.to(torch.bfloat16)
-        shared = torch.ones(2, dtype=torch.float32)
-        module[0].register_buffer("shared", shared)
-        module[1].register_buffer("shared", shared)
-
-        with temporary_module_dtype(module, torch.float16):
-            self.assertEqual(module[1].shared.dtype, torch.float16)
-
-        self.assertEqual(module[0].shared.dtype, torch.float32)
-        self.assertEqual(module[1].shared.dtype, torch.float32)
+        for buffer in (module[0].first, module[0].second, module[1].first):
+            self.assertEqual(buffer.dtype, torch.float32)
 
     def test_temp_fp32_module_handles_mixed_parameter_dtypes(self):
         class MixedDtypeModule(torch.nn.Module):

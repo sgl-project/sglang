@@ -288,52 +288,41 @@ def temporary_module_dtype(
     original_dtypes = (
         _snapshot_tensor_dtypes(module)
         if restore_dtype is None and isinstance(module, torch.nn.Module)
-        else {}
+        else []
     )
-    original_buffer_dtypes = _snapshot_buffer_dtypes(module) if original_dtypes else []
     original_dtype = restore_dtype or get_module_dtype(module)
     module = module.to(dtype=dtype)
     try:
         yield module
     finally:
         if original_dtypes:
-            _restore_tensor_dtypes(module, original_dtypes, original_buffer_dtypes)
+            _restore_tensor_dtypes(original_dtypes)
         else:
             module.to(dtype=original_dtype)
 
 
-def _snapshot_tensor_dtypes(module: torch.nn.Module) -> dict[str, torch.dtype]:
-    return {
-        name: tensor.dtype
-        for name, tensor in (*module.named_parameters(), *module.named_buffers())
-    }
-
-
-def _snapshot_buffer_dtypes(
+def _snapshot_tensor_dtypes(
     module: torch.nn.Module,
-) -> list[tuple[torch.nn.Module, str, torch.dtype]]:
-    # Record per (owner, name) pair: a buffer shared by two submodules is
-    # deduplicated by named_buffers(), but module.to() gives each owner its
-    # own converted copy, so each owner must be restored separately.
+) -> list[tuple[dict, str, torch.dtype]]:
+    # named_parameters()/named_buffers() skip duplicates; module.to() converts each.
     return [
-        (submodule, buffer_name, buffer.dtype)
+        (tensors, name, tensor.dtype)
         for _, submodule in module.named_modules(remove_duplicate=False)
-        for buffer_name, buffer in submodule.named_buffers(recurse=False)
+        for tensors in (submodule._parameters, submodule._buffers)
+        for name, tensor in tensors.items()
+        if tensor is not None
     ]
 
 
-def _restore_tensor_dtypes(
-    module: torch.nn.Module,
-    dtypes: dict[str, torch.dtype],
-    buffer_dtypes: list[tuple[torch.nn.Module, str, torch.dtype]],
-) -> None:
-    for name, param in module.named_parameters():
-        if name in dtypes and param.dtype != dtypes[name]:
-            param.data = param.data.to(dtypes[name])
-    for submodule, buffer_name, dtype in buffer_dtypes:
-        buffer = submodule._buffers.get(buffer_name)
-        if buffer is not None and buffer.dtype != dtype:
-            submodule._buffers[buffer_name] = buffer.to(dtype)
+def _restore_tensor_dtypes(dtypes: list[tuple[dict, str, torch.dtype]]) -> None:
+    for tensors, name, dtype in dtypes:
+        tensor = tensors.get(name)
+        if tensor is None or tensor.dtype == dtype:
+            continue
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = tensor.data.to(dtype)
+        else:
+            tensors[name] = tensor.to(dtype)
 
 
 @dataclass

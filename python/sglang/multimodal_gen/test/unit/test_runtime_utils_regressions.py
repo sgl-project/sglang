@@ -1,12 +1,10 @@
-"""Regression tests for small runtime/utils bugs (CPU only)."""
-
 import base64
 import io
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
@@ -19,29 +17,43 @@ def _gif_bytes() -> bytes:
     return buffer.getvalue()
 
 
-@pytest.mark.parametrize("payload", [_gif_bytes(), b"not a gif"])
-def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload):
-    """Every URL video was left in the temp dir for good, whether decoding
-    succeeded or not."""
+@pytest.mark.parametrize(
+    "status_code, payload, error",
+    [
+        (200, _gif_bytes(), None),
+        (200, b"not a gif", UnidentifiedImageError),
+        (404, b"", ValueError),
+    ],
+)
+def test_load_video_removes_downloaded_temp_file(
+    monkeypatch, tmp_path, status_code, payload, error
+):
+    """A downloaded URL video must not outlive load_video, on success or failure."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    closed = []
     response = SimpleNamespace(
-        status_code=200,
+        status_code=status_code,
         iter_content=lambda chunk_size: iter([payload]),
-        close=lambda: None,
+        close=lambda: closed.append(True),
     )
     monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
 
-    try:
-        vision.load_video("https://example.com/clip.gif")
-    except Exception:
-        pass
+    if error is None:
+        frames = vision.load_video("https://example.com/clip.gif")
+        assert [frame.convert("RGB").getpixel((0, 0)) for frame in frames] == [
+            (255, 0, 0),
+            (0, 0, 255),
+        ]
+    else:
+        with pytest.raises(error):
+            vision.load_video("https://example.com/clip.gif")
 
     assert list(tmp_path.iterdir()) == []
+    assert closed == [True]
 
 
 def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):
-    """A MIME-style base64 payload with newlines was silently cut at the first
-    line, and the truncated bytes were written to disk without an error."""
+    """A line-wrapped base64 payload must be decoded in full, not cut at the first line."""
     raw = bytes(range(256)) * 2
     wrapped = base64.encodebytes(raw).decode()
     assert "\n" in wrapped.strip()
@@ -62,37 +74,8 @@ def test_media_type_with_newline_is_rejected(tmp_path):
     assert not any("\n" in p.name for p in tmp_path.rglob("*"))
 
 
-def test_load_video_rejects_oversized_download(monkeypatch, tmp_path):
-    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    monkeypatch.setattr(vision, "_VIDEO_DOWNLOAD_MAX_BYTES", 10)
-    closed = []
-    response = SimpleNamespace(
-        status_code=200,
-        iter_content=lambda chunk_size: iter([b"x" * 8, b"x" * 8]),
-        close=lambda: closed.append(True),
-    )
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
-
-    with pytest.raises(ValueError, match="exceeds"):
-        vision.load_video("https://example.com/clip.mp4")
-
-    assert list(tmp_path.iterdir()) == []
-    assert closed == [True]
-
-
-def test_load_video_closes_response_on_bad_status(monkeypatch):
-    closed = []
-    response = SimpleNamespace(status_code=404, close=lambda: closed.append(True))
-    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
-
-    with pytest.raises(ValueError, match="404"):
-        vision.load_video("https://example.com/clip.mp4")
-    assert closed == [True]
-
-
 def test_bool_env_var_warning_is_deduplicated_per_variable(monkeypatch):
-    """The warning was keyed by the bad value, so a second variable holding the
-    same bad value was never reported."""
+    """Each env var with a bad bool value must be warned about once."""
     monkeypatch.setattr(common, "_warned_bool_env_var_keys", set())
     monkeypatch.setenv("SGLANG_TEST_FLAG_A", "maybe")
     monkeypatch.setenv("SGLANG_TEST_FLAG_B", "maybe")

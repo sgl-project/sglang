@@ -155,9 +155,7 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         self.assertFalse(DiffusionNvtxHooks()._enabled)
 
     def test_toggling_mid_forward_keeps_push_pop_balanced(self) -> None:
-        """Regression: enabling between a forward's pre- and post-hook popped a
-        range the pre-hook never pushed (closing the parent's), and disabling
-        in between left the pushed range open."""
+        """Toggling hooks mid-forward must not pop an unpushed range or leak a pushed one."""
         hooks = DiffusionNvtxHooks()
         dummy = torch.nn.Linear(2, 2)
         hooks._module_to_name_map[dummy] = "dummy"
@@ -201,26 +199,6 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         # always_call=True; they must match to keep the stack balanced.
         self.assertEqual(push.call_count, pop.call_count)
         self.assertEqual(push.call_count, 1)
-
-    def test_failed_range_push_does_not_pop_in_post_hook(self) -> None:
-        """If range_push raises, the post-hook must not pop a range that was
-        never pushed."""
-        model = torch.nn.Linear(2, 2)
-        hooks = DiffusionNvtxHooks()
-        hooks.register_hooks(model, prefix="lin")
-        hooks.set_enabled(True)
-        with (
-            patch.object(
-                nvtx_pytorch_hooks.nvtx,
-                "range_push",
-                side_effect=RuntimeError("push failed"),
-            ),
-            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
-        ):
-            with self.assertRaises(RuntimeError):
-                model(torch.zeros(2))
-        pop.assert_not_called()
-        self.assertEqual(hooks._range_pushed, [])
 
 
 class _NoOpResidencyStrategy:

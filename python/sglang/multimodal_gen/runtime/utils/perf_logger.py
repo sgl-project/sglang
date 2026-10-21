@@ -133,8 +133,10 @@ def get_git_commit_hash() -> str:
                 .strip()
                 .decode("utf-8")
             )
+        _CACHED_COMMIT_HASH = commit_hash
         return commit_hash
     except (subprocess.CalledProcessError, FileNotFoundError):
+        _CACHED_COMMIT_HASH = "N/A"
         return "N/A"
 
 

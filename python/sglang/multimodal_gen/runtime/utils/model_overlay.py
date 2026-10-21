@@ -393,15 +393,12 @@ def resolve_direct_overlay_repo(
         return None
 
     if snapshot_download_fn is not None:
-        # The manifest download alone leaves the rest of the overlay repo
-        # (model_index.json, configs) out of the snapshot.
+        # The manifest alone leaves model_index.json and configs out of the snapshot.
         try:
-            overlay_dir = str(
-                snapshot_download_fn(
-                    repo_id=model_name_or_path,
-                    allow_patterns=MODEL_OVERLAY_METADATA_PATTERNS,
-                    max_workers=4,
-                )
+            overlay_dir = download_overlay_metadata(
+                model_name_or_path,
+                {"overlay_repo_id": model_name_or_path},
+                snapshot_download_fn=snapshot_download_fn,
             )
         except Exception:
             logger.debug(

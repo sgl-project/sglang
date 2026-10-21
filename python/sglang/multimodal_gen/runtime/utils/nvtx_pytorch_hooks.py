@@ -88,7 +88,7 @@ class DiffusionNvtxHooks:
         # so a forward that bypasses the component-use gate (e.g. an early
         # warmup pass) cannot accidentally pollute the captured timeline.
         self._enabled: bool = False
-        # One entry per in-flight forward: whether its pre-hook pushed a range.
+        # Per in-flight forward: whether its pre-hook pushed a range.
         self._range_pushed: list[bool] = []
 
     def register_hooks(
@@ -171,19 +171,14 @@ class DiffusionNvtxHooks:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
+        self._range_pushed.append(False)
         if not self._enabled:
-            self._range_pushed.append(False)
             return
-        try:
-            name = self._module_to_name_map.get(module, "unknown")
-            shapes = _collect_input_shapes(args, kwargs)
-            marker = f"{name} in={shapes}" if shapes else name
-            nvtx.range_push(marker)
-        except BaseException:
-            # Keep the stack aligned with the post-hook, which still fires.
-            self._range_pushed.append(False)
-            raise
-        self._range_pushed.append(True)
+        name = self._module_to_name_map.get(module, "unknown")
+        shapes = _collect_input_shapes(args, kwargs)
+        marker = f"{name} in={shapes}" if shapes else name
+        nvtx.range_push(marker)
+        self._range_pushed[-1] = True
 
     def _forward_hook(
         self,

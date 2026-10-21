@@ -102,8 +102,7 @@ class TestLogOnceTakesFormatArgs(unittest.TestCase):
 
 class TestLateConfiguredLogLevel(unittest.TestCase):
     def test_debug_root_level_set_after_logger_creation_logs_on_all_ranks(self):
-        """The "log on every rank at DEBUG" rule read the level when the logger was
-        created, i.e. before configure_logger ran, so it never took effect."""
+        """A DEBUG level set after logger creation must still log on every rank."""
         import os
         from unittest.mock import patch
 

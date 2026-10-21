@@ -200,8 +200,7 @@ def test_registry_source_revision_survives_upstream_removing_required_file(
 
 
 def test_sibling_hf_cache_repo_does_not_match_overlay(monkeypatch, tmp_path):
-    """A cache dir of `ltx-2.3-distilled` must not resolve to the `ltx-2.3`
-    overlay just because the shorter repo name is a substring of the path."""
+    """A cache dir whose name only contains an overlay's repo name must not match it."""
     spec = {"overlay_repo_id": "overlay/ltx-2.3"}
     monkeypatch.setattr(
         model_overlay,
@@ -221,8 +220,7 @@ def test_sibling_hf_cache_repo_does_not_match_overlay(monkeypatch, tmp_path):
 
 
 def test_direct_overlay_repo_downloads_full_metadata_not_just_manifest(tmp_path):
-    """Resolving an overlay repo by Hub id fetched only `_overlay/overlay_manifest.json`,
-    so the returned snapshot lacked model_index.json and the configs."""
+    """An overlay repo given by Hub id must resolve with model_index.json present."""
     snapshot = tmp_path / "snapshot"
 
     def hf_hub_download_fn(repo_id, filename):

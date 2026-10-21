@@ -680,15 +680,14 @@ def test_timing_tolerance_override_leaves_memory_guards_alone():
 
 
 def test_request_metrics_compare_by_identity():
-    """RequestMetrics declares no dataclass fields, so the generated __eq__ made
-    every pair of instances equal."""
+    """Distinct RequestMetrics instances must not compare equal."""
     assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
         "b"
     )
 
 
 def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
-    """The `tag` argument was ignored and every record was written with a fixed tag."""
+    """log_request_summary must record the tag it is given."""
     monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
     monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
     monkeypatch.setattr(

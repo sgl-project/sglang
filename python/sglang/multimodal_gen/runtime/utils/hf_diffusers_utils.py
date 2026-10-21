@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import shutil
+import tempfile
 import time
 from functools import reduce
 from pathlib import Path
@@ -482,13 +483,15 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
         config["quantization_config"] = normalized_quant_config
         try:
-            # Replace the path instead of writing through it: in an HF snapshot
-            # it is a symlink to a blob shared by every revision.
-            tmp_path = f"{config_path}.{os.getpid()}.tmp"
+            # HF snapshot files are symlinks to shared blobs: replace, don't write through.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(config_path), suffix=".tmp"
+            )
             try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=2, sort_keys=True)
                     f.write("\n")
+                shutil.copymode(config_path, tmp_path)
                 os.replace(tmp_path, config_path)
             finally:
                 if os.path.exists(tmp_path):
@@ -758,8 +761,7 @@ def _resolve_remote_repo_model_index_path(
         # revalidates the remote file when online.
         return hf_hub_download(repo_id=model_name_or_path, filename=filename)
     except Exception as online_err:
-        # LocalEntryNotFoundError subclasses EntryNotFoundError but means the
-        # Hub was unreachable and nothing was cached, not that the file is absent.
+        # LocalEntryNotFoundError (Hub unreachable) subclasses EntryNotFoundError.
         if isinstance(online_err, EntryNotFoundError) and not isinstance(
             online_err, LocalEntryNotFoundError
         ):
@@ -821,21 +823,6 @@ def _download_overlay_manifest(repo_id: str, filename: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
-def _cached_single_model_snapshot(repo_id: str) -> str | None:
-    """Cached snapshot of ``repo_id`` if it holds config.json and no model_index.json."""
-    if envs.SGLANG_USE_MODELSCOPE.get():
-        return None
-    try:
-        local_path = snapshot_download(repo_id=repo_id, local_files_only=True)
-    except Exception:
-        return None
-    if os.path.exists(os.path.join(local_path, "config.json")) and not os.path.exists(
-        os.path.join(local_path, "model_index.json")
-    ):
-        return local_path
-    return None
-
-
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     Download and extract just the model_index.json for a Hugging Face model.
@@ -895,20 +882,15 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         )
         return config
     except EntryNotFoundError as e:
-        local_path = None
-        if isinstance(e, LocalEntryNotFoundError):
-            # Hub unreachable: only a cached single-model snapshot proves it is one
-            local_path = _cached_single_model_snapshot(model_name_or_path)
-            if local_path is None:
-                raise ValueError(
-                    f"Failed to download or parse model_index.json for {model_name_or_path}: {e}"
-                ) from e
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
-        if local_path is None:
-            local_path = maybe_download_model(model_name_or_path)
+        # Hub unreachable: use only the cache.
+        offline = isinstance(e, LocalEntryNotFoundError)
+        local_path = maybe_download_model(
+            model_name_or_path, download=not offline, skip_overlay_resolution=offline
+        )
         config_path = os.path.join(local_path, "config.json")
         if not os.path.exists(config_path):
             raise ValueError(
@@ -1158,8 +1140,7 @@ def maybe_download_model(
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    # Not retried: the generic handler below re-raises it as a ValueError.
-                    # Cleanup, if performed, makes the next call download afresh.
+                    # Not retried: the handler below re-raises it as a ValueError.
                     raise ValueError(
                         f"CI validation failed for downloaded model at {local_path}. "
                         f"Some safetensors shards are missing. Cleanup performed: {cleanup_performed}."
