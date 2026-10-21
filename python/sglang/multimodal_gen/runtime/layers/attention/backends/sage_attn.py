@@ -80,6 +80,19 @@ class SageAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if query.device.type == "xpu":
+            # the sageattention package is CUDA-only; XPU runs SGLang's Triton kernel
+            from sglang.kernels.ops.diffusion import sage_attn_qk_int8_pv_fp16
+
+            return sage_attn_qk_int8_pv_fp16(
+                query,
+                key,
+                value,
+                causal=self.causal,
+                sm_scale=self.softmax_scale,
+                return_lse=return_softmax_lse,
+            )
+
         if envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
             "trtllm_gen",
             "trtllm-gen",
@@ -170,7 +183,7 @@ class SageAttentionImpl(AttentionImpl):
                 key,
                 value,
                 tensor_layout="NHD",
-                is_causal=self.causal,
+                causal=self.causal,
                 sm_scale=self.softmax_scale,
                 return_lse=return_softmax_lse,
                 pv_accum_dtype="fp32+fp16",
@@ -184,7 +197,7 @@ class SageAttentionImpl(AttentionImpl):
                 value,
                 # since input is (batch_size, seq_len, head_num, head_dim)
                 tensor_layout="NHD",
-                is_causal=self.causal,
+                causal=self.causal,
                 sm_scale=self.softmax_scale,
                 return_lse=return_softmax_lse,
             )
