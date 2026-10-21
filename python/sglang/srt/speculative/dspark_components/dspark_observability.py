@@ -194,6 +194,7 @@ class DsparkInfoDumper:
         self._records: deque[DecodeStepRecord] = deque(maxlen=max_records)
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
+        self._cost_history: deque[tuple[int, int, int, int]] = deque(maxlen=3)
 
         self._device_module = torch.get_device_module(device)
         self._d2h_stream = None
@@ -237,18 +238,33 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
-        prev = self._pending
-        if (
-            self._on_step is not None
-            and step_cpu_ms is not None
-            and prev is not None
-            and obs.forward_ct == prev.forward_ct + 1
-            and (obs.bs, obs.num_verify_tokens, obs.verify_tokens_dp_synced)
-            == (prev.bs, prev.num_verify_tokens, prev.verify_tokens_dp_synced)
-        ):
-            # Match the SPS profiler's whole-step CPU boundary. Requiring
-            # stable geometry avoids assigning transition time to a new shape.
-            self._on_step(obs, step_cpu_ms * 1e-3)
+        if self._on_step is not None:
+            self._cost_history.append(
+                (
+                    obs.forward_ct,
+                    obs.bs,
+                    obs.num_verify_tokens,
+                    obs.verify_tokens_dp_synced,
+                )
+            )
+            # Overlap launches i before waiting for result i-1. The host
+            # interval can therefore measure GPU work from i-2. Only learn
+            # once the entire pipeline has the same physical geometry.
+            if (
+                step_cpu_ms is not None
+                and len(self._cost_history) == 3
+                and all(
+                    step
+                    == (
+                        obs.forward_ct - 2 + i,
+                        obs.bs,
+                        obs.num_verify_tokens,
+                        obs.verify_tokens_dp_synced,
+                    )
+                    for i, step in enumerate(self._cost_history)
+                )
+            ):
+                self._on_step(obs, step_cpu_ms * 1e-3)
         self._drain_pending()
 
         future = (
@@ -279,6 +295,7 @@ class DsparkInfoDumper:
             return
         self._drain_pending()
         self._prev_stamp = None
+        self._cost_history.clear()
         self._current_segments = {}
         self._open_segments = {}
 
@@ -291,6 +308,7 @@ class DsparkInfoDumper:
         self._records.clear()
         self._pending = None
         self._prev_stamp = None
+        self._cost_history.clear()
         self._current_segments = {}
         self._open_segments = {}
         self._sps_window = []
