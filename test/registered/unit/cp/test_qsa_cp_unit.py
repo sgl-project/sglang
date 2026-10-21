@@ -50,6 +50,118 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
     gather.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "cp_enabled,hybrid_backend,breakable,capture_mode",
+    [
+        (True, False, False, False),
+        (True, True, False, False),
+        (False, True, False, False),
+        (True, True, True, False),
+        (False, True, True, False),
+        (True, True, False, True),
+        (False, True, False, True),
+    ],
+)
+def test_qsa_model_forward_prefetches_exact_kv_after_index_key_gather(
+    monkeypatch, cp_enabled, hybrid_backend, breakable, capture_mode
+):
+    from sglang.srt.models import qwen4_exp
+
+    decoder = qwen4_exp.Qwen4ExpAttentionDecoderLayer
+    hidden = torch.randn(4, 8)
+    positions = torch.arange(4)
+    q, k, v = (torch.randn(4, 8) for _ in range(3))
+    topk = torch.arange(8, dtype=torch.int32).reshape(4, 2)
+    expected = torch.randn(4, 8)
+    metadata = object()
+    batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, positions=positions)
+    events = []
+    prefetch_expected = cp_enabled and not (breakable or capture_mode)
+
+    def prefetch(attn, actual_k, actual_v, actual_batch):
+        assert attn is layer.attn
+        assert actual_k is k and actual_v is v
+        assert actual_batch is batch
+        events.append("prefetch")
+
+    sparse_backend = SimpleNamespace(
+        set_mtp_shared_sparse_indices=Mock(),
+        get_indexer_metadata=Mock(return_value=metadata),
+        prefetch_cp_kv=Mock(side_effect=prefetch),
+    )
+    backend = (
+        SimpleNamespace(full_attn_backend=sparse_backend)
+        if hybrid_backend
+        else sparse_backend
+    )
+    monkeypatch.setattr(qwen4_exp, "get_attn_backend", lambda: backend)
+    monkeypatch.setattr(qwen4_exp, "_shards_rows_over_cp", lambda _: cp_enabled)
+    monkeypatch.setattr(qwen4_exp, "is_in_breakable_cuda_graph", lambda: breakable)
+    monkeypatch.setattr(
+        qwen4_exp, "get_is_capture_mode", lambda: breakable or capture_mode
+    )
+    monkeypatch.setattr(
+        qwen4_exp,
+        "get_tc_piecewise_forward_context",
+        lambda: SimpleNamespace(forward_batch=batch),
+    )
+
+    def prepare(**kwargs):
+        events.append("prepare")
+        return q, k, v, None
+
+    def indexer(actual_hidden, actual_positions, actual_batch, actual_meta, **kwargs):
+        assert actual_hidden is hidden and actual_positions is positions
+        assert actual_batch is batch and actual_meta is metadata
+        assert ("cp_global_rope_positions" in kwargs) == cp_enabled
+        if cp_enabled:
+            assert kwargs["cp_global_rope_positions"] is batch.positions
+        hook = kwargs.get("cp_on_key_gather_issued")
+        assert (hook is not None) == prefetch_expected
+        events.append("index_key_gather")
+        if hook is not None:
+            hook()
+        events.append("index_compression_and_selection")
+        return topk
+
+    def attention(actual_q, actual_k, actual_v, actual_batch, **kwargs):
+        assert actual_q is q and actual_k is k and actual_v is v
+        assert actual_batch is batch
+        torch.testing.assert_close(kwargs["topk_indices"], topk)
+        events.append("attention")
+        return expected
+
+    layer = SimpleNamespace(
+        is_qsa=True,
+        layer_id=7,
+        alt_stream=None,
+        _qsa_prefill_topk_bridge=None,
+        _prepare_attn_stage=lambda value, *args: value,
+        _prepare_qkv_gate=prepare,
+        indexer=indexer,
+        attn=attention,
+        o_proj=lambda value: (value, None),
+        attn_boundary=SimpleNamespace(finish=lambda value, _: value),
+        _run_ffn_stage=lambda value, _: value,
+    )
+    for name in (
+        "self_attention",
+        "_compute_qsa_topk_indices",
+        "_compute_qsa_topk_indices_eager",
+    ):
+        setattr(layer, name, getattr(decoder, name).__get__(layer))
+
+    assert decoder.forward(layer, positions, hidden, batch) is expected
+    assert events == [
+        "prepare",
+        "index_key_gather",
+        *(["prefetch"] if prefetch_expected else []),
+        "index_compression_and_selection",
+        "attention",
+    ]
+    assert sparse_backend.prefetch_cp_kv.call_count == int(prefetch_expected)
+
+
 def test_cuda_indexer_forwards_global_rope_to_cp_path():
     hidden, local_rope, metadata, global_rope, hook = (object() for _ in range(5))
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)

@@ -4,7 +4,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -1819,6 +1819,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        cp_on_key_gather_issued: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             return _breakable_qsa_indexer(
@@ -1828,6 +1830,7 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            cp_on_key_gather_issued=cp_on_key_gather_issued,
         )
 
     def _compute_qsa_topk_indices_eager(
@@ -1835,6 +1838,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        cp_on_key_gather_issued: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1863,6 +1868,8 @@ class Qwen4ExpAttentionDecoderLayer(
                 if positions.ndim == 2
                 else forward_batch.positions
             )
+            if cp_on_key_gather_issued is not None:
+                indexer_kwargs["cp_on_key_gather_issued"] = cp_on_key_gather_issued
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -1906,10 +1913,26 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
+        indexer_kwargs = {}
+        if (
+            self.is_qsa
+            and _shards_rows_over_cp(forward_batch)
+            and not get_is_capture_mode()
+        ):
+            from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+            # Launch only after the index-key gather so every rank issues CP
+            # collectives in the same order. Keep graph captures on the inline
+            # path: the prefetch owns temporary K/V across the eager indexer.
+            sparse_backend = resolve_qsa_sparse_backend(get_attn_backend())
+            indexer_kwargs["cp_on_key_gather_issued"] = partial(
+                sparse_backend.prefetch_cp_kv, self.attn, k, v, forward_batch
+            )
+
         if overlap_indexer:
             with torch.cuda.stream(self.alt_stream):
                 topk_indices = self._compute_qsa_topk_indices(
-                    hidden_states, positions, forward_batch
+                    hidden_states, positions, forward_batch, **indexer_kwargs
                 )
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
@@ -1918,7 +1941,7 @@ class Qwen4ExpAttentionDecoderLayer(
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
-                hidden_states, positions, forward_batch
+                hidden_states, positions, forward_batch, **indexer_kwargs
             )
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
