@@ -4590,6 +4590,7 @@ class DeepseekV4AttnBackend(
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
                 raw_positions[:live],
+                zero_row=self.token_to_kv_pool.request_window.zero_row,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
