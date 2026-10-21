@@ -77,10 +77,9 @@ class TestDPAttentionMixedChunk(
 ):
     # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    # sgl_eval and evalscope probe the same model with different harnesses:
-    # evalscope asks 5-shot and samples with the server default temperature,
-    # sgl_eval asks 0-shot and decodes greedily. Greedy 0-shot scores lower, so
-    # the 0.83 evalscope baseline becomes 0.800-0.814 here (1319 questions).
+    # sgl_eval vs evalscope on the same model: evalscope runs gsm8k 4-shot and
+    # samples at temperature 1.0, sgl_eval runs it 0-shot with greedy decoding.
+    # The 0.83 evalscope baseline therefore reads 0.800-0.814 here (1319 questions).
     gsm8k_accuracy_thres = 0.79
     gsm8k_backend = "sgl_eval"
     gsm8k_max_tokens = 4096
