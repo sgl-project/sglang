@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
+from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
@@ -125,6 +126,61 @@ _mock_device = patch(
     "sglang.srt.arg_groups.serving_hook.get_device", return_value="cuda"
 )
 _mock_device.start()
+
+
+class TestServerArgsPositionalOrder(CustomTestCase):
+    def test_new_parallel_flag_preserves_existing_positional_slots(self):
+        """New options must not reinterpret existing positional constructor calls."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (95, "disable_attn_tp_gather"),
+            (96, "enable_p2p_check"),
+            (97, "device"),
+            (535, "grpc_response_timeout_secs"),
+            (536, "enable_paged_experts"),
+            (537, "paged_experts_num_resident"),
+            (538, "enable_nvidia_megakernel"),
+            (539, "enable_megamoe_for_layernorm_sp"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        # Surviving legacy inputs retain their slots after an intentional removal.
+        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional[95] = True
+        positional[96] = False
+        positional[97] = "cpu"
+        positional[535] = 123.0
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.disable_attn_tp_gather)
+        self.assertFalse(args.enable_p2p_check)
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.grpc_response_timeout_secs, 123.0)
+        self.assertFalse(args.enable_megamoe_for_layernorm_sp)
+
+    def test_builtin_fields_have_explicit_positional_slots(self):
+        """New namespace fields cannot shift previously appended built-in options."""
+        self.assertEqual(
+            tuple(field.name for field in msgspec.structs.fields(ServerArgs)),
+            POSITIONAL_FIELD_ORDER,
+        )
+
+    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                keyword_args = ServerArgs(
+                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
+                )
+                argv = ["--model-path", "dummy"]
+                if enabled:
+                    argv.append("--enable-megamoe-for-layernorm-sp")
+                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
+                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
+                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -438,6 +494,14 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-min-bs must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval_min_bs=-1
+            ).resolve_once()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(
@@ -652,6 +716,43 @@ class TestImageProcessorBackend(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "conflicts.*torchvision"):
             handle_deprecated_args(server_args)
+
+
+class TestTokenspeedMlaAlias(CustomTestCase):
+    def test_maps_to_cutedsl_with_fp8_kv(self):
+        server_args = ServerArgs(model_path="dummy", attention_backend="tokenspeed_mla")
+
+        with self.assertLogs(serving_hook.logger, level="WARNING"):
+            handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(resolution_result(server_args, "kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "prefill"
+        )
+
+    def test_speculative_verify_moves_to_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            decode_attention_backend="tokenspeed_mla",
+            prefill_attention_backend="tokenspeed_mla",
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="EAGLE3",
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "decode_attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "prefill_attention_backend"), "trtllm_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "decode"
+        )
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -2135,6 +2236,13 @@ class TestSSLArgs(unittest.TestCase):
             self._validate_ssl(enable_ssl_refresh=True)
         self.assertIn("--enable-ssl-refresh", str(context.exception))
         self.assertIn("--ssl-certfile", str(context.exception))
+
+    def test_http_worker_reuseport_requires_multiple_uvicorn_workers(self):
+        for kwargs in ({}, {"tokenizer_worker_num": 2, "enable_http2": True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError) as context:
+                self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
+            self.assertIn("--enable-http-worker-reuseport", str(context.exception))
+        self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
 
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):

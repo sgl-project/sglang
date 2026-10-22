@@ -45,7 +45,7 @@ def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
 def kv_mamba_slots(kv: ReqKvInfo) -> int:
     total = kv.mamba_pool_idx.numel() if kv.holds_mamba else 0
     if kv.mamba_ping_pong_track_buffer is not None:
-        total += int((kv.mamba_ping_pong_track_buffer != -1).sum().item())
+        total += kv.mamba_ping_pong_empty.count(False)
     return total
 
 

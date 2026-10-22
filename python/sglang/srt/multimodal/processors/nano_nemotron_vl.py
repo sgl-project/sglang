@@ -13,6 +13,7 @@
 
 import logging
 import math
+from collections import deque
 from math import sqrt
 
 import numpy as np
@@ -258,11 +259,80 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             f"{self.AUDIO_END_TOKEN}"
         )
 
+    def _media_token_ids(self) -> dict[int, str]:
+        """Only placeholders represented by a single token can be spliced."""
+        candidates = {
+            self.mm_tokens.image_token_id: self.IMG_CONTEXT_TOKEN,
+            self.mm_tokens.video_token_id: self.VIDEO_CONTEXT_TOKEN,
+            self.mm_tokens.audio_token_id: self.AUDIO_CONTEXT_TOKEN,
+        }
+        return {
+            tid: text
+            for tid, text in candidates.items()
+            if tid is not None and self.tokenizer.convert_ids_to_tokens(tid) == text
+        }
+
+    def _splice_media(
+        self, token_ids: list[int], renders: dict[int, list[str]]
+    ) -> list[int]:
+        """Replace placeholder IDs without re-tokenizing surrounding text."""
+        pending = {
+            tid: deque(rendered) for tid, rendered in renders.items() if rendered
+        }
+        expanded = []
+        for tid in token_ids:
+            queue = pending.get(tid)
+            if queue:
+                expanded.extend(
+                    self.tokenizer.encode(queue.popleft(), add_special_tokens=False)
+                )
+            else:
+                expanded.append(tid)
+        audio_id = self.mm_tokens.audio_token_id
+        if audio_id is not None:
+            # Audio extracted from video may not have an explicit placeholder.
+            for rendered in pending.pop(audio_id, ()):
+                expanded.extend(
+                    self.tokenizer.encode(rendered, add_special_tokens=False)
+                )
+        if any(pending.values()):
+            raise ValueError("More media items than media placeholders in prompt")
+        return expanded
+
     async def process_mm_data_async(
         self, image_data, audio_data, input_text, request_obj, **kwargs
     ):
+        token_ids = input_text if isinstance(input_text, list) else None
+        if token_ids is not None:
+            # Keep text for the string/video fallback, not final tokenization.
+            input_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+        media_tokens = self._media_token_ids()
+        if request_obj.video_data and self.mm_tokens.video_token_id not in media_tokens:
+            # Preserve the text path for tokenizers without a single video token.
+            token_ids = None
+        if token_ids is not None:
+            for token_id, data, modality in (
+                (self.mm_tokens.image_token_id, image_data, "image"),
+                (self.mm_tokens.video_token_id, request_obj.video_data, "video"),
+            ):
+                if token_id not in media_tokens or self._all_mm_data_is_preprocessed(
+                    data
+                ):
+                    continue
+                data_count = (
+                    len(data) if isinstance(data, list) else int(data is not None)
+                )
+                if token_ids.count(token_id) != data_count:
+                    raise ValueError(
+                        f"{modality} placeholder count does not match data count"
+                    )
+        renders: dict[int, list[str]] = {}
         base_output = await self.load_mm_data(
-            prompt=input_text,
+            prompt=(
+                input_text
+                if token_ids is None
+                else "".join(media_tokens.get(tid, "") for tid in token_ids)
+            ),
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=audio_data if self.audio_extractor else None,
@@ -319,10 +389,15 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         if base_output.images and self.dynamic_resolution:
             image_is_dynamic = True
             image_sizes = [(img.width, img.height) for img in base_output.images]
-            text_only = input_text.replace(self.IMG_CONTEXT_TOKEN, "")
-            text_tokens = len(
-                self.tokenizer(text_only, add_special_tokens=False)["input_ids"]
-            )
+            if token_ids is not None:
+                text_tokens = sum(
+                    tid != self.mm_tokens.image_token_id for tid in token_ids
+                )
+            else:
+                text_only = input_text.replace(self.IMG_CONTEXT_TOKEN, "")
+                text_tokens = len(
+                    self.tokenizer(text_only, add_special_tokens=False)["input_ids"]
+                )
             total_token_budget = self.max_model_len - text_tokens
             budgeted_sizes = compute_budgeted_image_sizes(
                 image_sizes,
@@ -348,6 +423,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             rendered_images = [
                 self.render_image_dynamic(num_tokens=nt) for nt in num_tokens_per_image
             ]
+            renders[self.mm_tokens.image_token_id] = rendered_images
             prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
             image_feature = preprocessed_images
         elif base_output.images:
@@ -358,6 +434,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 self.render_image(num_tiles=image.shape[0])
                 for image in preprocessed_images
             ]
+            renders[self.mm_tokens.image_token_id] = rendered_images
             prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
             image_feature = torch.cat(preprocessed_images, dim=0)
 
@@ -406,6 +483,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                                 ti, fi_list, ts_list, num_tokens=tpf[ti]
                             )
                         )
+                    renders.setdefault(self.mm_tokens.video_token_id, []).append(
+                        "\n".join(rendered_parts)
+                    )
                     prompt = prompt.replace(
                         self.VIDEO_CONTEXT_TOKEN, "\n".join(rendered_parts), 1
                     )
@@ -420,6 +500,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                             zip(timestamps, tpf, strict=True)
                         )
                     ]
+                    renders.setdefault(self.mm_tokens.video_token_id, []).append(
+                        "".join(rendered_frames)
+                    )
                     prompt = prompt.replace(
                         self.VIDEO_CONTEXT_TOKEN, "".join(rendered_frames), 1
                     )
@@ -456,6 +539,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             for audio in all_audios:
                 num_tokens = extractor.audio_token_count(len(audio))
                 rendered = self.render_audio(num_tokens=num_tokens)
+                renders.setdefault(self.mm_tokens.audio_token_id, []).append(rendered)
                 if self.AUDIO_CONTEXT_TOKEN in prompt:
                     prompt = prompt.replace(self.AUDIO_CONTEXT_TOKEN, rendered, 1)
                 else:
@@ -486,9 +570,14 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                     )
                 )
 
-        prompt_ids = self.tokenizer(
-            prompt, add_special_tokens=False, return_tensors="pt"
-        )["input_ids"].flatten()
+        if token_ids is None:
+            prompt_ids = self.tokenizer(
+                prompt, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"].flatten()
+        else:
+            prompt_ids = torch.tensor(
+                self._splice_media(token_ids, renders), dtype=torch.long
+            )
         offsets = self.get_mm_items_offset(prompt_ids, self.mm_tokens.image_token_id)
         img_offsets = [
             (start, end)
@@ -500,8 +589,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             for start, end in offsets
             if prompt_ids[start - 1] == self.PLACEHOLDER_ID
         ]
-        # Cleanup:
-        prompt_ids[prompt_ids == self.PLACEHOLDER_ID] = self.img_start_token_id
+        # Normalize generated video markers, not unknown tokens in client text.
+        for start, _ in video_offsets:
+            prompt_ids[start - 1] = self.img_start_token_id
 
         # Compute audio offsets
         if audio_items:
