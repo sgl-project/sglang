@@ -14,6 +14,7 @@
 namespace sglang {
 namespace cutlass_moe {
 
+template <bool kTransposeProblemSizes>
 __global__ void count_expert_routes(
     const int32_t* __restrict__ topk_ids,
     int32_t* __restrict__ problem_sizes1,
@@ -34,28 +35,30 @@ __global__ void count_expert_routes(
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    problem_sizes1[expert * 3] = count;
-    problem_sizes1[expert * 3 + 1] = 2 * n;
+    constexpr int kCountColumn = kTransposeProblemSizes ? 1 : 0;
+    constexpr int kOutputColumn = 1 - kCountColumn;
+    problem_sizes1[expert * 3 + kCountColumn] = count;
+    problem_sizes1[expert * 3 + kOutputColumn] = 2 * n;
     problem_sizes1[expert * 3 + 2] = k;
-    problem_sizes2[expert * 3] = count;
-    problem_sizes2[expert * 3 + 1] = k;
+    problem_sizes2[expert * 3 + kCountColumn] = count;
+    problem_sizes2[expert * 3 + kOutputColumn] = k;
     problem_sizes2[expert * 3 + 2] = n;
   }
 }
 
+template <bool kTransposeProblemSizes>
 __global__ void compute_expert_offsets(
     const int32_t* __restrict__ problem_sizes1,
     int32_t* __restrict__ expert_offsets,
     int32_t* __restrict__ blockscale_offsets,
-    int32_t* __restrict__ cursors,
     int32_t num_experts) {
   int32_t offset = 0;
   int32_t blockscale_offset = 0;
   expert_offsets[0] = 0;
   if (blockscale_offsets != nullptr) blockscale_offsets[0] = 0;
   for (int32_t expert = 0; expert < num_experts; ++expert) {
-    const int32_t count = problem_sizes1[expert * 3];
-    cursors[expert] = offset;
+    constexpr int kCountColumn = kTransposeProblemSizes ? 1 : 0;
+    const int32_t count = problem_sizes1[expert * 3 + kCountColumn];
     offset += count;
     expert_offsets[expert + 1] = offset;
     if (blockscale_offsets != nullptr) {
@@ -70,15 +73,18 @@ __global__ void complete_route_maps(
     const int32_t* __restrict__ expert_offsets,
     int32_t* __restrict__ input_permutation,
     int32_t* __restrict__ output_permutation,
-    int32_t* __restrict__ cursors,
     int32_t num_routes,
     int32_t topk,
     int32_t num_experts) {
   const int32_t expert = blockIdx.x;
+  // Exactly one CTA owns each expert's interval, so its cursor is block-local.
+  __shared__ int32_t cursor;
+  if (threadIdx.x == 0) cursor = expert_offsets[expert];
+  __syncthreads();
   for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(num_routes); i += blockDim.x) {
     const int32_t route = topk_ids[i];
     if (route == expert) {
-      const int32_t destination = atomicAdd(cursors + expert, 1);
+      const int32_t destination = atomicAdd(&cursor, 1);
       input_permutation[destination] = i / topk;
       output_permutation[i] = destination;
     } else if (expert == 0 && (route < 0 || route >= num_experts)) {
@@ -101,6 +107,7 @@ __global__ void complete_route_maps(
 /// \param input_permutation Destination-to-token map, with zero-filled unused capacity.
 /// \param output_permutation Route-to-destination map, with -1 for ids outside [0, num_experts).
 /// \param blockscale_offsets Optional MXFP8 row offsets, rounded up to 128 per expert.
+template <bool kTransposeProblemSizes = false>
 inline void cutlass_prepare_moe_input(
     tvm::ffi::TensorView topk_ids,
     tvm::ffi::TensorView expert_offsets,
@@ -108,7 +115,6 @@ inline void cutlass_prepare_moe_input(
     tvm::ffi::TensorView problem_sizes2,
     tvm::ffi::TensorView input_permutation,
     tvm::ffi::TensorView output_permutation,
-    tvm::ffi::TensorView cursors,
     int64_t num_experts,
     int64_t n,
     int64_t k,
@@ -141,7 +147,6 @@ inline void cutlass_prepare_moe_input(
       .with_device(device)
       .verify(input_permutation)
       .verify(output_permutation);
-  TensorMatcher({num_experts}).with_dtype<int32_t>().with_device(device).verify(cursors);
 
   int32_t* blockscale_ptr = nullptr;
   if (blockscale_offsets.has_value()) {
@@ -157,17 +162,21 @@ inline void cutlass_prepare_moe_input(
   auto* sizes1 = static_cast<int32_t*>(problem_sizes1.data_ptr());
   auto* sizes2 = static_cast<int32_t*>(problem_sizes2.data_ptr());
   auto* offsets = static_cast<int32_t*>(expert_offsets.data_ptr());
-  auto* cursor_ptr = static_cast<int32_t*>(cursors.data_ptr());
   const auto stream = LaunchKernel::resolve_device(device.unwrap());
 
   LaunchKernel(dim3(experts), dim3(threads), stream)(
-      cutlass_moe::count_expert_routes, ids, sizes1, sizes2, routes, static_cast<int32_t>(n), static_cast<int32_t>(k));
+      cutlass_moe::count_expert_routes<kTransposeProblemSizes>,
+      ids,
+      sizes1,
+      sizes2,
+      routes,
+      static_cast<int32_t>(n),
+      static_cast<int32_t>(k));
   LaunchKernel(dim3(1), dim3(1), stream)(
-      cutlass_moe::compute_expert_offsets,
+      cutlass_moe::compute_expert_offsets<kTransposeProblemSizes>,
       sizes1,
       offsets,
       blockscale_ptr,
-      cursor_ptr,
       static_cast<int32_t>(num_experts));
   if (num_routes != 0) {
     LaunchKernel(dim3(experts), dim3(threads), stream)(
@@ -176,7 +185,6 @@ inline void cutlass_prepare_moe_input(
         offsets,
         static_cast<int32_t*>(input_permutation.data_ptr()),
         static_cast<int32_t*>(output_permutation.data_ptr()),
-        cursor_ptr,
         routes,
         static_cast<int32_t>(topk.unwrap()),
         static_cast<int32_t>(num_experts));

@@ -179,9 +179,11 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         Only the external CUTLASS GEMMs are replaced with dense expert GEMMs;
         this checks routing, not native INT4 GEMM numerics.
         """
-        experts, hidden, intermediate = 2, 128, 128
+        experts, hidden, intermediate = 17, 128, 128
         ids = torch.tensor(
-            [[1, 0], [0, -1], [2, 5], [1, -3]], device="cuda", dtype=torch.int32
+            [[1, 0], [0, -1], [experts, experts + 3], [1, -3]],
+            device="cuda",
+            dtype=torch.int32,
         )
         weights = torch.tensor(
             [[0.25, 0.75], [0.6, 0.4], [0.3, 0.7], [0.8, 0.2]], device="cuda"
@@ -316,7 +318,9 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                             torch.testing.assert_close(
                                 offsets,
                                 torch.tensor(
-                                    [0, 2, 4], device="cuda", dtype=torch.int32
+                                    [0, 2] + [4] * (experts - 1),
+                                    device="cuda",
+                                    dtype=torch.int32,
                                 ),
                             )
                             self.assertTrue(torch.isfinite(actual).all().item())
@@ -324,6 +328,15 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                                 actual, reference.to(actual.dtype), rtol=1e-2, atol=1e-3
                             )
                             self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
+                            torch.testing.assert_close(
+                                value,
+                                inputs.masked_fill(
+                                    ~local_routes.any(-1, keepdim=True), poison
+                                ),
+                                rtol=0,
+                                atol=0,
+                                equal_nan=True,
+                            )
                 if ep_size == 2:
                     backing = torch.tensor(
                         [[0, 0, 1, 0], [1, 0, 0, 0]],
@@ -348,7 +361,9 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                             torch.testing.assert_close(
                                 offsets,
                                 torch.tensor(
-                                    [0, 2, 4], device="cuda", dtype=torch.int32
+                                    [0, 2] + [4] * (experts - 1),
+                                    device="cuda",
+                                    dtype=torch.int32,
                                 ),
                             )
                             reference = dense_reference(
@@ -381,7 +396,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                 torch.testing.assert_close(
                     ids,
                     torch.tensor(
-                        [[1, 0], [0, -1], [2, 5], [1, -3]],
+                        [[1, 0], [0, -1], [experts, experts + 3], [1, -3]],
                         device="cuda",
                         dtype=torch.int32,
                     ),

@@ -18,6 +18,9 @@ if _is_cuda_alike:
 
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.cutlass_prepare_moe_input import (
+        cutlass_prepare_moe_input,
+    )
 else:
     from sgl_kernel import silu_and_mul
 
@@ -143,9 +146,24 @@ def cutlass_w4a8_moe(
             num_local_experts=num_local_experts,
         )
 
-    src2dst = cutlass_w4_run_moe_ep_preproess(
-        topk_ids,
-    )
+    if _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        cutlass_prepare_moe_input(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+            transpose_problem_sizes=True,
+        )
+        src2dst = c_map
+    else:
+        src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
 
     gateup_input = torch.empty(
         (m * topk, k),
@@ -165,22 +183,20 @@ def cutlass_w4a8_moe(
         k,
     )
 
-    # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
-    # they are kept to allow for a quick switch of the permutation logic
-    # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)

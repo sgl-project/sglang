@@ -152,6 +152,160 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 self.assertEqual(int(sizes1[:, 0].count_nonzero()), 0)
                 self.assertEqual(int(sizes2[:, 0].count_nonzero()), 0)
 
+    def test_prepare_has_no_expert_sized_global_scratch(self):
+        """A warmed producer needs no extra storage even when experts exceed routes."""
+        experts, tokens, topk = 513, 2, 2
+        ids = torch.tensor(
+            [[0, experts - 1], [-1, experts]], device="cuda", dtype=torch.int32
+        )
+        offsets = torch.empty(experts + 1, device="cuda", dtype=torch.int32)
+        sizes1 = torch.empty((experts, 3), device="cuda", dtype=torch.int32)
+        sizes2 = torch.empty_like(sizes1)
+        a_map = torch.empty(tokens * topk, device="cuda", dtype=torch.int32)
+        c_map = torch.empty_like(a_map)
+
+        def prepare():
+            cutlass_prepare_moe_input(
+                ids, offsets, sizes1, sizes2, a_map, c_map, experts, 96, 160
+            )
+
+        for _ in range(3):
+            prepare()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated()
+        prepare()
+        torch.cuda.synchronize()
+        self.assertEqual(torch.cuda.max_memory_allocated(), allocated)
+
+    def test_prepare_transposed_shapes_match_native_w4a8(self):
+        """W4A8 metadata and complete maps survive live/inactive graph transitions."""
+        from sgl_kernel import get_cutlass_w4a8_moe_mm_data
+
+        experts, n, k = 17, 96, 160
+        patterns = (
+            [[0, 16], [1, 0], [16, 1], [0, 16]],
+            [[0, 16], [1, -1], [experts, -7], [16, experts + 3]],
+            [[-1, experts], [-7, experts + 1], [-1, -9], [experts, experts]],
+        )
+        states = [
+            torch.tensor(pattern, device="cuda", dtype=torch.int32)
+            for pattern in patterns
+        ]
+        ids = states[0].clone()
+        offsets = torch.full((experts + 1,), -999, device="cuda", dtype=torch.int32)
+        sizes1 = torch.full((experts, 3), -999, device="cuda", dtype=torch.int32)
+        sizes2 = torch.full_like(sizes1, -999)
+        a_map = torch.full((ids.numel(),), -999, device="cuda", dtype=torch.int32)
+        c_map = torch.full_like(a_map, -999)
+        native_offsets = offsets.clone()
+        native_sizes1 = sizes1.clone()
+        native_sizes2 = sizes2.clone()
+
+        def prepare():
+            cutlass_prepare_moe_input(
+                ids,
+                offsets,
+                sizes1,
+                sizes2,
+                a_map,
+                c_map,
+                experts,
+                n,
+                k,
+                transpose_problem_sizes=True,
+            )
+
+        prepare()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare()
+        for state in (*states, states[0]):
+            with self.subTest(ids=state.tolist()):
+                ids.copy_(state)
+                for value in (offsets, sizes1, sizes2, a_map, c_map):
+                    value.fill_(-999)
+                graph.replay()
+                # The installed native producer supplies the integer W4A8 ABI oracle.
+                # It does not read or write a_map/c_map, and does not define their order.
+                get_cutlass_w4a8_moe_mm_data(
+                    ids,
+                    native_offsets,
+                    native_sizes1,
+                    native_sizes2,
+                    a_map,
+                    c_map,
+                    experts,
+                    n,
+                    k,
+                )
+                for actual, reference in (
+                    (offsets, native_offsets),
+                    (sizes1, native_sizes1),
+                    (sizes2, native_sizes2),
+                ):
+                    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                flat = ids.flatten()
+                local = (flat >= 0) & (flat < experts)
+                live = int(offsets[-1])
+                torch.testing.assert_close(
+                    c_map[local].sort().values,
+                    torch.arange(live, device="cuda", dtype=torch.int32),
+                    rtol=0,
+                    atol=0,
+                )
+                self.assertTrue(bool((c_map[~local] == -1).all()))
+                for expert in range(experts):
+                    rows = c_map[flat == expert]
+                    self.assertTrue(bool((rows >= offsets[expert]).all()))
+                    self.assertTrue(bool((rows < offsets[expert + 1]).all()))
+                routes = torch.arange(ids.numel(), device="cuda")[local]
+                torch.testing.assert_close(
+                    a_map[c_map[local].long()],
+                    (routes // ids.shape[1]).int(),
+                    rtol=0,
+                    atol=0,
+                )
+                self.assertTrue(bool((a_map[live:] == 0).all()))
+                torch.testing.assert_close(ids, state, rtol=0, atol=0)
+
+        def prepare_and_consume():
+            prepare()
+            return offsets + 1
+
+        compiled = torch.compile(prepare_and_consume, fullgraph=True)
+        offsets.fill_(-999)
+        sizes1.fill_(-999)
+        sizes2.fill_(-999)
+        result = compiled()
+        torch.testing.assert_close(result, native_offsets + 1, rtol=0, atol=0)
+        torch.testing.assert_close(sizes1, native_sizes1, rtol=0, atol=0)
+        torch.testing.assert_close(sizes2, native_sizes2, rtol=0, atol=0)
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            fake_ids = torch.empty(ids.shape, device="cuda", dtype=torch.int32)
+            fake_offsets = torch.empty(experts + 1, device="cuda", dtype=torch.int32)
+            fake_sizes1 = torch.empty((experts, 3), device="cuda", dtype=torch.int32)
+            fake_sizes2 = torch.empty_like(fake_sizes1)
+            fake_a_map = torch.empty(ids.numel(), device="cuda", dtype=torch.int32)
+            fake_c_map = torch.empty_like(fake_a_map)
+            self.assertIsNone(
+                cutlass_prepare_moe_input(
+                    fake_ids,
+                    fake_offsets,
+                    fake_sizes1,
+                    fake_sizes2,
+                    fake_a_map,
+                    fake_c_map,
+                    experts,
+                    n,
+                    k,
+                    transpose_problem_sizes=True,
+                )
+            )
+
     def test_prepare_rejects_noncontiguous_metadata(self):
         """Reject layouts whose physical order differs from the route-map contract."""
         ids = torch.tensor([[0, 1], [1, -1], [2, 0]], device="cuda", dtype=torch.int32)
