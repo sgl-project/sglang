@@ -241,6 +241,16 @@ framework-specific optimization workflow.
   reduction order of the eager RMSNorm that follows under fp32 autocast
   (Wan pipelines decode with fp32 VAE weights under bf16 autocast, where this
   was measured non-bit-exact even though the add itself is commutative).
+- `conv_bias_epilogue` (`modulate/conv_bias_epilogue_triton.py`): PyTorch's
+  cuDNN conv adds its bias as a separate unvectorised `add_` on channels_last
+  outputs (~10% of a Wan 2.1 decode). `WanCausalConv3d._conv_with_epilogue`
+  runs the conv without bias and applies it in one bit-exact pass, fused with
+  the residual add for `conv2` (`residual=`) and deferred into `norm2` for
+  `conv1` (`skip_bias=` + `WanRMS_norm.forward(x, conv_bias=...)`; the gated
+  `wan_rmsnorm_silu` absorbs it via `conv_bias=`). `wan_rmsnorm_silu` itself
+  now tiles `[ROWS, C]` pixels per program (0.63 -> ~3 TB/s at C = 96); its
+  reduction tree changed, which moves ~2e-6 of the elements by one bf16 ulp
+  relative to the previous kernel, within the same quality-gated contract.
 - The Qwen-Image VAE (`autoencoder_kl_qwenimage.py`) uses the same
   `cat_pad_channels_last_3d` + compact-cache helper for every causal conv
   slot; single-frame image decodes keep the compact cache at the reference
@@ -312,7 +322,7 @@ framework-specific optimization workflow.
   layouts (B > 1, SP > 1, LoRA-wrapped or quantized projections,
   head_dim != 128) and first-sight mismatches keep the Triton
   `qknorm_complex_rope` / `qknorm_complex_rope_kv` chain.
-- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_complex_rope.py`,
+- Validation: `test/registered/kernels/ops/diffusion/test_complex_rope.py`,
   the `test_qwen21_cuda_qk_rope_*` cases in `test_model_fast_paths.py`, and
   `python/sglang/multimodal_gen/test/unit/test_qwen_image21_cuda.py`.
 - Workflow rule: if a Qwen-Image 2.1 trace still shows
@@ -393,7 +403,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py` and `test/registered/kernels/ops/layernorm/test_qknorm_across_heads.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -510,7 +520,7 @@ framework-specific optimization workflow.
   `group_limited_topk` through the diffusion facade when the CUDA layout guard
   passes, otherwise it retains the eager reference chain.
 - LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="lossless"` and `quality="high"`:
-  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `LTX2_RMS_NORM_MODULATE.mark` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),

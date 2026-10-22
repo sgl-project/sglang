@@ -36,7 +36,6 @@ request.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import msgspec
@@ -48,15 +47,13 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
-    can_use_fused_layernorm_modulate,
     fp8_rowwise,
     fused_inplace_qknorm_rope,
-    fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
-    is_plain_layer_norm,
     residual_gate_add,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -88,6 +85,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -139,71 +139,46 @@ def _fast_path_allowed(x: torch.Tensor) -> bool:
     return x.is_cuda and x.dtype is torch.bfloat16 and not torch.compiler.is_compiling()
 
 
-def _can_verify() -> bool:
-    # First-sight verification runs the eager chain and a host sync.
-    return not torch.cuda.is_current_stream_capturing()
-
-
 def _norm_modulate(
     norm: nn.LayerNorm, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     """``(1 + scale) * LN(x) + shift`` with ``(B, 1, D)`` modulation."""
-    scale_row, shift_row = scale[:, 0], shift[:, 0]
-    if (
-        _LN_MODULATE.disabled
-        or not _fast_path_allowed(x)
-        or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-    ):
+
+    def reference():
         return (1 + scale) * norm(x) + shift
-    sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
-    if not _LN_MODULATE.is_verified(sig) and not _can_verify():
-        return (1 + scale) * norm(x) + shift
-    try:
-        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
-    except Exception as exc:
-        _LN_MODULATE.on_exception(exc, logger=logger)
-        return (1 + scale) * norm(x) + shift
-    if _LN_MODULATE.is_verified(sig):
-        return out
-    return _LN_MODULATE.accept_or_fallback(
-        out,
-        (1 + scale) * norm(x) + shift,
-        sig=sig,
-        logger=logger,
-        mismatch_msg="FLUX 3 fused LN+modulate is not bit-exact here; using eager",
+
+    if not _fast_path_allowed(x):
+        return reference()
+    return layernorm_modulate_bitexact(
+        _LN_MODULATE,
+        norm,
+        x,
+        scale[:, 0],
+        shift[:, 0],
+        reference,
+        sig=(x.device, x.shape[0], x.shape[-1], norm.eps),
     )
 
 
 def _swiglu(packed: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * value`` of a packed ``[gate | value]`` projection."""
     gate, value = packed.chunk(2, dim=-1)
-    if _SWIGLU.disabled or not _fast_path_allowed(packed):
+    if not _fast_path_allowed(packed):
         return F.silu(gate) * value
-    sig = (packed.device, packed.shape[-1], packed.stride(-2))
-    if not _SWIGLU.is_verified(sig) and not _can_verify():
-        return F.silu(gate) * value
-    try:
-        out = fused_packed_silu_mul_bitexact(packed)
-    except Exception as exc:
-        _SWIGLU.on_exception(exc, logger=logger)
-        return F.silu(gate) * value
-    if _SWIGLU.is_verified(sig):
-        return out
-    return _SWIGLU.accept_or_fallback(
-        out,
-        F.silu(gate) * value,
-        sig=sig,
+    return _SWIGLU.run(
+        lambda: fused_packed_silu_mul_bitexact(packed),
+        lambda: F.silu(gate) * value,
+        sig=(packed.device, packed.shape[-1], packed.stride(-2)),
         logger=logger,
-        mismatch_msg="FLUX 3 fused SwiGLU is not bit-exact here; using eager",
     )
 
 
+# Not apply_qk_norm_rope: Flux3RMSNorm has neither RMSNorm's weight nor its eps,
+# and the eager fallback is Flux3's own fp32 pair rotation.
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
         _fast_path_allowed(q)
-        and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        not in ("0", "false", "off", "no")
+        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and can_use_fused_inplace_qknorm_rope(
             head_dim=head_dim,
             rope_dim=head_dim,
@@ -658,40 +633,43 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             if arch.vec_in_dim is not None
             else None
         )
+        self.quant_config = quant_config
         streams = sorted(self.in_channels)
         self.early_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"early_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
         self.single_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"single_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
-
-        def block(prefix: str) -> Flux3Block:
-            return Flux3Block(
-                hidden,
-                arch.num_attention_heads,
-                arch.mlp_ratio,
-                quant_config=quant_config,
-                supported_attention_backends=self._supported_attention_backends,
-                prefix=prefix,
-            )
-
         self.content_mode_blocks = nn.ModuleDict(
             {
                 m: nn.ModuleList(
-                    block(f"content_mode_blocks.{m}.{i}") for i in range(arch.depth)
+                    self._make_block(f"content_mode_blocks.{m}.{i}")
+                    for i in range(arch.depth)
                 )
                 for m in streams
             }
         )
         self.txt_mode_blocks = nn.ModuleList(
-            block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
+            self._make_block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
         )
         self.single_blocks = nn.ModuleList(
-            block(f"single_blocks.{i}") for i in range(arch.depth_single_blocks)
+            self._make_block(f"single_blocks.{i}")
+            for i in range(arch.depth_single_blocks)
         )
+        out_modes = self.in_channels if arch.out_modes is None else arch.out_modes
         self.final_layer = nn.ModuleDict(
-            {m: Flux3LastLayer(hidden, c) for m, c in self.in_channels.items()}
+            {
+                m: Flux3LastLayer(hidden, c)
+                for m, c in self.in_channels.items()
+                if m in out_modes
+            }
         )
         self.layer_names = [
             "txt_mode_blocks",
@@ -699,6 +677,23 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             "single_blocks",
         ]
         self.__post_init__()
+
+    # ------------------------------------------------------------------ factories
+    # Subclasses swap the block / modulation implementation; the module tree
+    # (and therefore the checkpoint layout) stays the same.
+    def _make_modulation(self, prefix: str) -> nn.Module:
+        del prefix
+        return Flux3Modulation(self.hidden_size)
+
+    def _make_block(self, prefix: str) -> nn.Module:
+        return Flux3Block(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.arch.mlp_ratio,
+            quant_config=self.quant_config,
+            supported_attention_backends=self._supported_attention_backends,
+            prefix=prefix,
+        )
 
     # ------------------------------------------------------------------ pieces
     @property
@@ -856,10 +851,11 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
             )
             names.append(key)
-        outputs = self.denoise(
-            context=context, streams=streams, targets=[s.name for s in streams]
-        )
-        return {key: outputs[s.name] for key, s in zip(names, streams)}
+        targets = [s.name for s in streams if s.name in self.final_layer]
+        outputs = self.denoise(context=context, streams=streams, targets=targets)
+        return {
+            key: outputs[s.name] for key, s in zip(names, streams) if s.name in outputs
+        }
 
 
 def _compute_dtype(linear: nn.Module) -> torch.dtype:

@@ -307,7 +307,12 @@ class _FakeKVCache:
     def __init__(self, max_slots: int):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
 
-    def move_kv_cache(self, dst_loc: torch.Tensor, src_loc: torch.Tensor):
+    def move_physical_pages(
+        self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
