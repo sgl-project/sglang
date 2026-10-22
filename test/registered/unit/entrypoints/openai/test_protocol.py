@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
+from sglang.srt.sampling.sampling_params import MAX_N
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -63,6 +64,16 @@ class TestCompletionRequest(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
+
+    def test_completion_n_bounds(self):
+        """n outside [1, MAX_N] must be rejected before reaching the response path."""
+        for n in (-1, 0, MAX_N + 1):
+            with self.subTest(n=n), self.assertRaises(ValidationError):
+                CompletionRequest(model="test-model", prompt="Hello", n=n)
+        for n in (1, MAX_N):
+            self.assertEqual(
+                CompletionRequest(model="test-model", prompt="Hello", n=n).n, n
+            )
 
 
 class TestChatCompletionRequest(unittest.TestCase):

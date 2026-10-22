@@ -16,6 +16,7 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_N,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
@@ -109,6 +110,16 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_n_bounds(self):
+        """n outside [1, MAX_N] must be rejected at admission, not fail later."""
+        for value in (-1, 0, MAX_N + 1, "2"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "n must be"):
+                    self._make(n=value).verify(self.VOCAB_SIZE)
+
+        self._make(n=1).verify(self.VOCAB_SIZE)
+        self._make(n=MAX_N).verify(self.VOCAB_SIZE)
 
     def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
         self._make(
@@ -315,7 +326,6 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
-    # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""
         self._make(sampling_seed=None).verify(self.VOCAB_SIZE)
