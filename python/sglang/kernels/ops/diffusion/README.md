@@ -186,6 +186,7 @@ tensor copy at each residual site.
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
 | `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
@@ -203,6 +204,22 @@ tensor copy at each residual site.
 | `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
+
+### Rowwise E4M3 producers (SM89+)
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `fp8_rowwise` | Triton | Dynamic per-row FP32 scales, E4M3 payload and zero-row padding; matches the eager quantizer |
+| `fused_packed_swiglu_fp8_rowwise` | Triton | Packed/row-strided BF16 `[B,T,2*K]` to padded 2D E4M3 + FP32 row scales; preserves both BF16 rounds of `F.silu(gate) * up`; mounted in FLUX3 FP8r MLP output projections |
+
+The SwiGLU producer avoids materializing a BF16 activation. Its measured SM89
+`K=9216` path uses nine 1024-element tiles, native BF16 rounding, and paired
+FP32-to-E4M3 conversions, retaining one row reduction and zero-row padding.
+Other widths/devices retain the full-row implementation. Finite inputs,
+`K <= 16384`, and flattenable B/T row strides are required. Padding rows have
+zero payload and scale `1e-12`. The local CUDA-graph benchmark is
+`test/manual/kernels/diffusion/bench_swiglu_fp8_rowwise.py`; it compares the
+existing two kernels and the fusion, both alone and with the same FP8 GEMM.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
