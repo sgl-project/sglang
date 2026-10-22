@@ -14,7 +14,7 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
-use crate::proxy::grpc::{EngineRpc, GrpcResponse, TypedRpc};
+use crate::proxy::grpc::{EngineRpc, GrpcResponse};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::{PolicySelectionFailureReason, RequestLogContext};
@@ -26,8 +26,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
-    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
+    let (request, routing) = prepare(&ctx, endpoint, &headers, body).await?;
     routing.dispatch(&ctx, request, headers, start).await
 }
 
@@ -130,49 +130,12 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    match prepare(ctx, endpoint, &headers, body).await {
         Ok((mut request, routing)) => {
             forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
         }
         Err(error) => (Err(error), None),
     }
-}
-
-/// [`route_grpc`] for a typed request, prepared from its fields as `endpoint` prepares a body.
-pub async fn route_typed<R: TypedRpc>(
-    ctx: &AppContext,
-    endpoint: Endpoint,
-    request: R,
-    headers: HeaderMap,
-) -> (
-    Result<GrpcResponse<R::Reply>, ApiError>,
-    Option<RequestLogContext>,
-) {
-    let start = Instant::now();
-    let prepared = async {
-        let model = ModelId(ctx.config.model.id.clone());
-        let routing = ModelRouting::lookup(ctx, &model)?;
-        let path = endpoint.path();
-        if path != GENERATE_PATH {
-            require_plain_workers(ctx, &model, path)?;
-        }
-        let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
-        Ok::<_, ApiError>((prepared, routing))
-    };
-    match prepared.await {
-        Ok((mut prepared, routing)) => {
-            forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await
-        }
-        Err(error) => (Err(error), None),
-    }
-}
-
-/// `text` as the ids `endpoint` would forward in its place over HTTP; `None`
-/// when it keeps the text, as under `--disable-input-ids-forwarding`.
-pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Vec<i32>> {
-    let model = ModelId(ctx.config.model.id.clone());
-    let ids = forwarded_prompt_ids(ctx, &model, endpoint.path(), text)?;
-    ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
 }
 
 impl Endpoint {
@@ -194,7 +157,6 @@ async fn prepare<'a>(
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
-    grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
     let served_model = || ModelId(ctx.config.model.id.clone());
     let (routing, request) = match endpoint {
@@ -210,13 +172,8 @@ async fn prepare<'a>(
             } else {
                 COMPLETIONS_PATH
             };
-            let request = if grpc && matches!(endpoint, Endpoint::Completions) {
-                PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
-            } else if grpc {
-                PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
-            } else {
-                PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
-            };
+            let request =
+                PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?;
             (routing, request)
         }
         Endpoint::Generate => {
