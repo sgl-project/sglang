@@ -32,6 +32,21 @@ def test_single_backend_resolves_without_backend():
     )
 
 
+def test_shuffle_weighted_sum_has_one_native_primary_backend():
+    specs = K.registry.get("moe.shuffle_weighted_sum")
+    assert len(specs) == 1
+    spec = K.select_kernel("moe.shuffle_weighted_sum")
+    assert spec is specs[0] and spec.backend is KernelBackend.JIT
+    assert (
+        spec.target
+        == "sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum"
+    )
+    assert K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+    with pytest.raises(KeyError):
+        K.select_kernel("moe.shuffle_weighted_sum", backend=KernelBackend.TRITON)
+
+
 def test_fp8_scaled_mm_requires_explicit_registry_backend(monkeypatch):
     monkeypatch.setattr(sel, "_platform", lambda: _SM90)
     with pytest.raises(ValueError, match="multiple backends"):

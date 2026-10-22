@@ -9,6 +9,7 @@ import torch
 from sglang.kernels.ops.moe.cutlass_prepare_moe_input import cutlass_prepare_moe_input
 from sglang.kernels.ops.moe.shuffle_weighted_sum import (
     _shuffle_weighted_sum_kernel,
+    _shuffle_weighted_sum_triton,
     shuffle_weighted_sum,
 )
 from sglang.srt.layers.moe import cutlass_moe
@@ -244,7 +245,9 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                             output = torch.empty(
                                 (tokens, 257), device="cuda", dtype=dtype
                             )
-                            shuffle_weighted_sum(inputs, output, mapping, weights)
+                            _shuffle_weighted_sum_triton(
+                                inputs, output, mapping, weights
+                            )
                             expected = (
                                 torch.tensor([3.5, 2, 0], device="cuda", dtype=dtype)
                                 .repeat(copies)[:tokens, None]
@@ -253,16 +256,305 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                             torch.testing.assert_close(output, expected, rtol=0, atol=0)
                             if specialization_count is None:
                                 specialization_count = len(cache)
+                                self.assertGreater(specialization_count, 0)
                             self.assertEqual(len(cache), specialization_count)
 
                             mapping.fill_(-1)
                             inputs.fill_(float("nan"))
                             weights.fill_(float("nan"))
                             output.fill_(float("nan"))
-                            shuffle_weighted_sum(inputs, output, mapping, weights)
+                            _shuffle_weighted_sum_triton(
+                                inputs, output, mapping, weights
+                            )
                             self.assertTrue(bool(torch.isfinite(output).all()))
                             self.assertEqual(int(torch.count_nonzero(output)), 0)
                             self.assertEqual(len(cache), specialization_count)
+
+    def test_cuda_reduction_matches_triton_for_ragged_strided_views(self):
+        """Guard masked gathers and exact slot arithmetic across dtype/layout keys."""
+        for dtype in (torch.float16, torch.bfloat16):
+            for weight_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                for index_dtype in (torch.int32, torch.int64):
+                    with self.subTest(
+                        dtype=dtype, weights=weight_dtype, mapping=index_dtype
+                    ):
+                        tokens, rows, width, topk = 5, 6, 257, 3
+                        inputs_storage = torch.full(
+                            (rows + 2, width + 7),
+                            float("nan"),
+                            device="cuda",
+                            dtype=dtype,
+                        )
+                        inputs = inputs_storage[1 : rows + 1, 3 : width + 3]
+                        inputs[:4].copy_(
+                            (
+                                torch.arange(4 * width, device="cuda").view(4, width)
+                                % 29
+                                - 14
+                            ).to(dtype)
+                            / 16
+                        )
+                        invalid = -(2**40) if index_dtype == torch.int64 else -999
+                        invalid_positive = (
+                            2**40 if index_dtype == torch.int64 else 2**31 - 1
+                        )
+                        mapping_storage = torch.full(
+                            (tokens * topk + 4,),
+                            invalid,
+                            device="cuda",
+                            dtype=index_dtype,
+                        )
+                        mapping = mapping_storage[2:-2].view(tokens, topk)
+                        mapping.copy_(
+                            torch.tensor(
+                                [
+                                    [0, 1, 2],
+                                    [-1, 3, rows],
+                                    [invalid, invalid_positive, -1],
+                                    [3, 0, -1],
+                                    [1, 2, 0],
+                                ],
+                                device="cuda",
+                                dtype=index_dtype,
+                            )
+                        )
+                        score_storage = torch.full(
+                            (tokens * 2 + 1, topk * 3 + 2),
+                            float("nan"),
+                            device="cuda",
+                            dtype=weight_dtype,
+                        )
+                        weights = score_storage[
+                            1 : tokens * 2 + 1 : 2, 1 : topk * 3 + 1 : 3
+                        ]
+                        weights.copy_(
+                            torch.tensor(
+                                [
+                                    [0.25, 0.5, -0.125],
+                                    [float("nan"), 0.75, float("nan")],
+                                    [float("nan")] * 3,
+                                    [0.5, -0.25, float("nan")],
+                                    [0.125, -0.5, 0.25],
+                                ],
+                                device="cuda",
+                                dtype=weight_dtype,
+                            )
+                        )
+                        out_storage = torch.full(
+                            (tokens + 2, width + 9), -17, device="cuda", dtype=dtype
+                        )
+                        ref_storage = out_storage.clone()
+                        output = out_storage[1 : tokens + 1, 4 : width + 4]
+                        reference = ref_storage[1 : tokens + 1, 4 : width + 4]
+                        saved = [
+                            value.clone()
+                            for value in (
+                                inputs_storage,
+                                mapping_storage,
+                                score_storage,
+                            )
+                        ]
+                        _shuffle_weighted_sum_triton(
+                            inputs, reference, mapping, weights
+                        )
+                        shuffle_weighted_sum(inputs, output, mapping, weights)
+                        torch.testing.assert_close(
+                            out_storage.view(torch.int16),
+                            ref_storage.view(torch.int16),
+                            rtol=0,
+                            atol=0,
+                        )
+                        for value, before in zip(
+                            (inputs_storage, mapping_storage, score_storage), saved
+                        ):
+                            torch.testing.assert_close(
+                                value, before, rtol=0, atol=0, equal_nan=True
+                            )
+                        self.assertEqual(int(torch.count_nonzero(output[2])), 0)
+
+    def test_cuda_reduction_preserves_fma_denormals_and_slot_order(self):
+        """FMA residuals and BF16 subnormal operands must survive the CUDA port."""
+        for dtype, value in ((torch.float16, 1025.0), (torch.bfloat16, 129.0)):
+            with self.subTest(dtype=dtype):
+                inputs = torch.tensor(
+                    [[-value], [value], [65504.0], [-65504.0], [2**-14]],
+                    device="cuda",
+                    dtype=dtype,
+                )
+                mapping = torch.tensor(
+                    [[0, 1, -1], [2, 3, 4]], device="cuda", dtype=torch.int64
+                )
+                weights = torch.tensor(
+                    [[1.0, 1.0 - 2**-23, float("nan")], [1.0, 1.0, 1.0]],
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                output = torch.empty((2, 1), device="cuda", dtype=dtype)
+                reference = torch.empty_like(output)
+                _shuffle_weighted_sum_triton(inputs, reference, mapping, weights)
+                shuffle_weighted_sum(inputs, output, mapping, weights)
+                expected = torch.tensor(
+                    [[-value * 2**-23], [2**-14]], device="cuda", dtype=dtype
+                )
+                torch.testing.assert_close(
+                    output.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    output.view(torch.int16),
+                    reference.view(torch.int16),
+                    rtol=0,
+                    atol=0,
+                )
+        inputs = torch.tensor(
+            [[2**-133, -(2**-133), -(2**-133)]], device="cuda", dtype=torch.bfloat16
+        )
+        mapping = torch.tensor([[0, -1]], device="cuda", dtype=torch.int32)
+        weights = torch.tensor(
+            [[2**120, float("nan")]], device="cuda", dtype=torch.float32
+        )
+        output = torch.empty((1, 3), device="cuda", dtype=torch.bfloat16)
+        shuffle_weighted_sum(inputs, output, mapping, weights)
+        expected = torch.tensor(
+            [[2**-13, -(2**-13), -(2**-13)]], device="cuda", dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(
+            output.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
+        weights[0, 0] = 1.0
+        shuffle_weighted_sum(inputs, output, mapping, weights)
+        torch.testing.assert_close(
+            output.view(torch.int16), inputs.view(torch.int16), rtol=0, atol=0
+        )
+        weights[0, 0] = 2**-40
+        shuffle_weighted_sum(inputs, output, mapping, weights)
+        # FP32 underflow creates -0 in slot0; the inactive +0 FMA restores +0.
+        self.assertTrue(bool((output.view(torch.int16) == 0).all()))
+
+    def test_cuda_reduction_graph_changes_and_empty_routes(self):
+        """A current-stream graph must rewrite poisoned output on every map change."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                inputs = (
+                    torch.arange(4 * 513, device="cuda").view(4, 513).to(dtype) / 128
+                )
+                mapping = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int64)
+                weights = torch.tensor(
+                    [[0.25, 0.75], [0.5, -0.25]], device="cuda", dtype=torch.float32
+                )
+                output = torch.empty((2, 513), device="cuda", dtype=dtype)
+                reference = torch.empty_like(output)
+                shuffle_weighted_sum(inputs, output, mapping, weights)
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=side):
+                    shuffle_weighted_sum(inputs, output, mapping, weights)
+                torch.cuda.current_stream().wait_stream(side)
+                for state in ("partial", "zero", "recovery"):
+                    inputs.copy_(
+                        torch.arange(4 * 513, device="cuda").view(4, 513).to(dtype)
+                        / 128
+                    )
+                    mapping.copy_(
+                        torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int64)
+                    )
+                    weights.copy_(
+                        torch.tensor([[0.25, 0.75], [0.5, -0.25]], device="cuda")
+                    )
+                    if state == "partial":
+                        mapping[0] = -1
+                        weights[0, 0] = float("nan")
+                        inputs[0].fill_(float("nan"))
+                    elif state == "zero":
+                        mapping.fill_(-1)
+                        weights.fill_(float("nan"))
+                        inputs.fill_(float("nan"))
+                    output.fill_(float("nan"))
+                    _shuffle_weighted_sum_triton(inputs, reference, mapping, weights)
+                    graph.replay()
+                    torch.testing.assert_close(
+                        output.view(torch.int16),
+                        reference.view(torch.int16),
+                        rtol=0,
+                        atol=0,
+                    )
+                    self.assertTrue(bool(torch.isfinite(output).all()))
+                for input_rows, topk in ((0, 2), (4, 0)):
+                    empty_inputs = torch.empty(
+                        (input_rows, 513), device="cuda", dtype=dtype
+                    )
+                    empty_maps = torch.zeros(
+                        (2 * topk,), device="cuda", dtype=torch.int32
+                    )
+                    empty_weights = torch.full(
+                        (2, topk), float("nan"), device="cuda", dtype=torch.float32
+                    )
+                    output.fill_(float("nan"))
+                    shuffle_weighted_sum(
+                        empty_inputs, output, empty_maps, empty_weights
+                    )
+                    self.assertTrue(bool((output.view(torch.int16) == 0).all()))
+                empty_output = output[:0]
+                shuffle_weighted_sum(inputs, empty_output, mapping[:0], weights[:0])
+                shuffle_weighted_sum(inputs[:, :0], output[:, :0], mapping, weights)
+        # FP32 input/output retains the original Triton path and contract.
+        inputs = torch.tensor([[1.0, 2.0]], device="cuda")
+        output = torch.empty_like(inputs)
+        shuffle_weighted_sum(
+            inputs,
+            output,
+            torch.tensor([0], device="cuda"),
+            torch.tensor([[0.5]], device="cuda"),
+        )
+        torch.testing.assert_close(output, inputs / 2, rtol=0, atol=0)
+
+    def test_cuda_reduction_preserves_identity_alias_and_compiled_mutation(self):
+        """Preserve safe in-place topk1 and expose the mutation to compile/fake."""
+        dtype = torch.bfloat16
+        inputs = torch.arange(3 * 257, device="cuda").view(3, 257).to(dtype) / 128
+        saved = inputs.clone()
+        mapping = torch.arange(3, device="cuda", dtype=torch.int32)
+        weights = torch.full((3, 1), 0.5, device="cuda")
+        with torch.no_grad():
+            shuffle_weighted_sum(inputs, inputs, mapping, weights)
+        torch.testing.assert_close(inputs, saved / 2, rtol=0, atol=0)
+        storage = torch.cat((saved, torch.full_like(saved, float("nan"))))
+        with torch.no_grad():
+            shuffle_weighted_sum(storage[:3], storage[3:], mapping, weights)
+        torch.testing.assert_close(storage[:3], saved, rtol=0, atol=0)
+        torch.testing.assert_close(storage[3:], saved / 2, rtol=0, atol=0)
+
+        def reduce_and_consume(values, output, route_map, scores):
+            shuffle_weighted_sum(values, output, route_map, scores)
+            return output + 1
+
+        compiled = torch.compile(reduce_and_consume, fullgraph=True)
+        output = torch.empty_like(inputs)
+        reference = torch.empty_like(inputs)
+        for active in (True, False, True):
+            mapping.copy_(torch.arange(3, device="cuda", dtype=torch.int32))
+            weights.fill_(0.5)
+            if not active:
+                mapping.fill_(-1)
+                weights.fill_(float("nan"))
+            _shuffle_weighted_sum_triton(inputs, reference, mapping, weights)
+            output.fill_(float("nan"))
+            with torch.no_grad():
+                result = compiled(inputs, output, mapping, weights)
+            torch.testing.assert_close(
+                output.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0
+            )
+            torch.testing.assert_close(result, reference + 1, rtol=0, atol=0)
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            fake_values = torch.empty((6, 257), dtype=dtype, device="cuda")
+            fake_output = torch.empty((3, 257), dtype=dtype, device="cuda")
+            fake_map = torch.empty(6, dtype=torch.int32, device="cuda")
+            fake_scores = torch.empty((3, 2), dtype=torch.float32, device="cuda")
+            self.assertIsNone(
+                shuffle_weighted_sum(fake_values, fake_output, fake_map, fake_scores)
+            )
 
     def test_native_fp8_padding_survives_graph_replay(self):
         if torch.cuda.get_device_capability()[0] not in (9, 10, 12):

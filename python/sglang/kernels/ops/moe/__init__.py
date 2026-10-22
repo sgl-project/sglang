@@ -72,7 +72,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="moe.shuffle_weighted_sum",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
         capabilities=CUDA_ONLY,
     )

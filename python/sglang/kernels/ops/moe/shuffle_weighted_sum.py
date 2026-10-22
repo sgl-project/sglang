@@ -1,8 +1,38 @@
 """Reduce routed rows while skipping inactive permutation entries."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_hip_runtime,
+    is_musa_runtime,
+    load_jit,
+    make_cpp_args,
+)
+from sglang.kernels.jit.utils.common import is_sail_runtime
+from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+
+@cache_once
+def _jit_shuffle_weighted_sum_module(
+    dtype: torch.dtype, weight_dtype: torch.dtype, index_dtype: torch.dtype, topk: int
+) -> Module:
+    args = make_cpp_args(dtype, weight_dtype, index_dtype, topk, 128)
+    return load_jit(
+        "shuffle_weighted_sum",
+        *args,
+        cuda_files=["moe/shuffle_weighted_sum.cuh"],
+        cuda_wrappers=[("reduce", f"shuffle_weighted_sum_cuda<{args}>")],
+    )
 
 
 @triton.jit(do_not_specialize=["rows", "weight_stride0", "weight_stride1"])
@@ -44,7 +74,7 @@ def _shuffle_weighted_sum_kernel(
     )
 
 
-def shuffle_weighted_sum(
+def _shuffle_weighted_sum_triton(
     inputs: torch.Tensor,
     output: torch.Tensor,
     permutation: torch.Tensor,
@@ -72,3 +102,30 @@ def shuffle_weighted_sum(
         weights.stride(1),
         BLOCK=256,
     )
+
+
+@register_custom_op(op_name="shuffle_weighted_sum", mutates_args=["output"])
+def shuffle_weighted_sum(
+    inputs: torch.Tensor,
+    output: torch.Tensor,
+    permutation: torch.Tensor,
+    weights: torch.Tensor,
+) -> None:
+    """Sum mapped expert outputs; inactive maps read neither data nor weights."""
+    if (
+        inputs.is_cuda
+        and inputs.dtype in (torch.float16, torch.bfloat16)
+        and output.dtype == inputs.dtype
+        and weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and permutation.dtype in (torch.int32, torch.int64)
+        and inputs.ndim == output.ndim == weights.ndim == 2
+        and output.numel() != 0
+        and not is_hip_runtime()
+        and not is_musa_runtime()
+        and not is_sail_runtime()
+    ):
+        _jit_shuffle_weighted_sum_module(
+            inputs.dtype, weights.dtype, permutation.dtype, weights.shape[1]
+        ).reduce(inputs, output, permutation, weights)
+    else:
+        _shuffle_weighted_sum_triton(inputs, output, permutation, weights)
