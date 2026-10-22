@@ -21,6 +21,8 @@ NUM_ROWS = 4
 
 
 class _Req:
+    bidir_prefix_len = -1
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
