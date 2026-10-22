@@ -348,7 +348,9 @@ class _DeepEPv2Impl:
             )
         _ensure_deepep_v2_available()
         topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        # DeepEP 2.5 keeps topk_idx in the handle without copying (and rejects
+        # do_handle_copy), so hand it a tensor no caller can reuse before combine.
+        topk_ids = topk_output.topk_ids.to(torch.int64, copy=True)
         self._validate_common(hidden_states, topk_ids)
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
@@ -403,9 +405,6 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
-            # DeepEP 2.5 stopped copying topk_idx into the handle by default; the
-            # handle must not alias a tensor the caller may reuse before combine.
-            do_handle_copy=True,
         )
         local_tokens = hidden_states.shape[0]
         if event.event is not None:

@@ -869,6 +869,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_size=down_input.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
         )
+        if trace_deepep_v2_masked:
+            logger.warning(
+                "DeepEP v2 masked runner down input: x=%s scale=%s scale_stride=%s "
+                "scale_dtype=%s recipe_a=%s recipe_b=%s",
+                tuple(down_input.shape),
+                tuple(down_input_scale.shape),
+                down_input_scale.stride(),
+                down_input_scale.dtype,
+                recipe_a_down,
+                recipe_b,
+            )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
