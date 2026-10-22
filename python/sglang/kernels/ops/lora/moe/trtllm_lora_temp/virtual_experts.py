@@ -250,8 +250,8 @@ def _moe_lora_shrink_splitk_kernel(
     pid_mn = pid // SPLIT_K
 
     # GDC wait: the routing buffers (sorted_token_ids/expert_ids/
-    # num_tokens_post_padded) come from the immediately preceding align and
-    # sanitize kernels; wait before consuming them.
+    # num_tokens_post_padded) come from routing preparation; wait before
+    # consuming them.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
