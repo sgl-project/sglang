@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import deepep_v2
 from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,11 +20,13 @@ class _FakeGroup:
 
 class _FakeBuffer:
     instances = []
+    num_rdma_ranks = 1
 
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
         self.num_bytes = 1 << 20
+        self.num_rdma_ranks = type(self).num_rdma_ranks
         type(self).instances.append(self)
 
 
@@ -31,6 +34,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
     def setUp(self):
         reset_context()
         _FakeBuffer.instances = []
+        _FakeBuffer.num_rdma_ranks = 1
         self._patches = [
             patch.object(deepep_v2, "use_deepep_v2", True),
             patch.object(deepep_v2, "ElasticBuffer", _FakeBuffer, create=True),
@@ -96,6 +100,46 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         grown = self._get(group, router_topk=6)
         self.assertIs(self._get(group, router_topk=3), grown)
         self.assertEqual([b.kwargs["num_topk"] for b in _FakeBuffer.instances], [3, 6])
+
+    def test_multi_node_without_ibstat_uses_explicit_sms(self):
+        """DeepEP's own SM sizing divides by zero without `ibstat` once RDMA is used."""
+        _FakeBuffer.num_rdma_ranks = 2
+        with patch.object(deepep_v2.shutil, "which", return_value=None):
+            self._get()
+            self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 32)
+            deepep_v2.DeepEPv2Buffer.destroy()
+            with envs.SGLANG_DEEPEP_V2_NUM_SMS.override(24):
+                self._get()
+                self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 24)
+        deepep_v2.DeepEPv2Buffer.destroy()
+        _FakeBuffer.num_rdma_ranks = 1
+        with patch.object(deepep_v2.shutil, "which", return_value=None):
+            self._get()
+            self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 0)
+
+    def test_deepep_2_5_epbuffer_is_preferred(self):
+        """DeepEP 2.5 renamed ElasticBuffer to EPBuffer; 2.1 only has ElasticBuffer."""
+        import importlib
+        import sys
+        import types
+
+        def _reload_with(**names):
+            fake = types.ModuleType("deep_ep")
+            fake.__dict__.update(names)
+            with patch.dict(sys.modules, {"deep_ep": fake}):
+                return importlib.reload(deepep_v2).ElasticBuffer
+
+        class _EP25:
+            pass
+
+        class _Elastic21:
+            pass
+
+        try:
+            self.assertIs(_reload_with(EPBuffer=_EP25, ElasticBuffer=_Elastic21), _EP25)
+            self.assertIs(_reload_with(ElasticBuffer=_Elastic21), _Elastic21)
+        finally:
+            importlib.reload(deepep_v2)
 
     def test_key_keeps_process_group_object(self):
         group = _FakeGroup()

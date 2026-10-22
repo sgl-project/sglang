@@ -46,6 +46,7 @@ class _FakeBuffer:
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
         self.num_bytes = 1 << 20
+        self.num_rdma_ranks = 1
         type(self).last = self
 
     def dispatch(self, x, **kwargs):

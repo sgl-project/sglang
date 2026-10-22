@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from typing import NamedTuple, Optional
 
 import torch
@@ -30,6 +31,9 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+# Used when DeepEP cannot size SMs itself (no `ibstat` for the RDMA bandwidth).
+# Measured working in a B300 2x8 EP16 smoke; not tuned.
+_NO_IBSTAT_NUM_SMS = 32
 # Must match DeepGEMM's contiguous expert alignment.
 _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
@@ -38,7 +42,11 @@ sglang_per_token_group_quant_fp8 = None
 
 
 try:
-    from deep_ep import ElasticBuffer
+    try:
+        # DeepEP >= 2.5 renamed ElasticBuffer to EPBuffer; dispatch/combine are unchanged.
+        from deep_ep import EPBuffer as ElasticBuffer
+    except ImportError:
+        from deep_ep import ElasticBuffer
 
     use_deepep_v2 = True
 except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
@@ -139,6 +147,20 @@ def _quantize_for_deepep_v2_dispatch(
     )
 
 
+def _resolve_num_sms(*, num_rdma_ranks: int) -> int:
+    num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+    # DeepEP's automatic choice reads RDMA bandwidth from `ibstat` once a buffer
+    # spans RDMA ranks; without it that estimate divides by zero on dispatch.
+    if num_sms == 0 and num_rdma_ranks > 1 and shutil.which("ibstat") is None:
+        logger.warning(
+            "DeepEP v2: `ibstat` not found; using %d SMs. Install infiniband-diags "
+            "or set SGLANG_DEEPEP_V2_NUM_SMS.",
+            _NO_IBSTAT_NUM_SMS,
+        )
+        num_sms = _NO_IBSTAT_NUM_SMS
+    return num_sms
+
+
 class DeepEPv2Buffer:
     """Facade for the process-wide ElasticBuffer stored in runtime resources."""
 
@@ -151,7 +173,7 @@ class DeepEPv2Buffer:
         buffers = get_resources().buffers
         state = buffers.get(cls._STATE_KEY)
         if state is None:
-            state = SimpleNamespace(buffer=None, key=None, num_topk=0)
+            state = SimpleNamespace(buffer=None, key=None, num_topk=0, num_sms=0)
             buffers[cls._STATE_KEY] = state
         return state
 
@@ -209,6 +231,7 @@ class DeepEPv2Buffer:
         state.buffer = buffer
         state.key = key
         state.num_topk = router_topk
+        state.num_sms = _resolve_num_sms(num_rdma_ranks=buffer.num_rdma_ranks)
         logger.info(
             "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
@@ -229,6 +252,12 @@ class DeepEPv2Buffer:
         state.buffer = None
         state.key = None
         state.num_topk = 0
+        state.num_sms = 0
+
+    @classmethod
+    def num_sms(cls) -> int:
+        """SM count for dispatch/combine of the current buffer (0 lets DeepEP choose)."""
+        return cls._state().num_sms
 
 
 class _DeepEPv2Impl:
@@ -370,10 +399,13 @@ class _DeepEPv2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=_EXPERT_ALIGNMENT,
-            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
+            num_sms=DeepEPv2Buffer.num_sms(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
+            # DeepEP 2.5 stopped copying topk_idx into the handle by default; the
+            # handle must not alias a tensor the caller may reuse before combine.
+            do_handle_copy=True,
         )
         local_tokens = hidden_states.shape[0]
         if event.event is not None:
