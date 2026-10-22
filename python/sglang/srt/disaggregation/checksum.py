@@ -103,8 +103,7 @@ class KvChecksumComputer:
     ) -> int:
         expected_device = kv_page_indices_gpu.device.type
         assert (
-            expected_device in ("cuda", "npu")
-            and kv_page_indices_gpu.is_contiguous()
+            expected_device in ("cuda", "npu") and kv_page_indices_gpu.is_contiguous()
         )
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
@@ -121,9 +120,7 @@ class KvChecksumComputer:
             all_lens += self._state_item_lens
             all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
         if expected_device == "npu":
-            from sglang.srt.hardware_backend.npu.checksum import (
-                adler32_strided_checksum,
-            )
+            from sgl_kernel_npu.mem_cache.checksum import adler32_strided_checksum
         else:
             from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 

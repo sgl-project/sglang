@@ -5,7 +5,8 @@ metadata buffer; decode recomputes it and compares. Decode skips the comparison
 when the checksum it received is 0, so requests returning 200 would also pass if
 prefill never wrote one. test_corrupted_checksum_is_rejected rules that out:
 prefill adds 1 to one request's checksum and decode must reject that request.
-The kernel's own arithmetic is covered by test/manual/ascend/test_npu_kv_checksum.py.
+The kernel's arithmetic is tested in sgl-kernel-npu/tests/manual/test_kv_checksum.py.
+The SGLang page/state integration is covered by test_npu_kv_checksum.py.
 """
 
 import json
