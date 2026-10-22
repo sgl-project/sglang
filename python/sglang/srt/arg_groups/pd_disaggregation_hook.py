@@ -12,7 +12,11 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    num_dp_ranks_of,
+    uses_mooncake_host_receive,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -61,6 +65,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if uses_mooncake_host_receive(cfg) and (
+        cfg.pp_size != 1
+        or cfg.dp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.speculative_algorithm is not None
+    ):
+        raise ValueError(
+            "Mooncake host receive requires PP=DP=DCP=1 and no speculative decoding"
+        )
     if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
         raise ValueError(
             "--disaggregation-decode-host-receive-threshold must be between 0 and 1"

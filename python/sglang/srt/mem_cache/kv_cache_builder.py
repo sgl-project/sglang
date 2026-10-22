@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, uses_mooncake_host_receive
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +231,11 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # Only a decode server reaches resolution with the ratio unset. A
         # backup-only pool fits at least one runnable request. Sharing the pool
         # with prefix caching keeps the standard HiCache default.
-        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+        if (
+            backend == "host_pool"
+            and not memory.enable_hierarchical_cache
+            and not uses_mooncake_host_receive(get_disagg())
+        ):
             ratio = BACKUP_ONLY_HICACHE_RATIO
             if memory.hicache_size == 0:
                 req_pool, allocator = tp_worker.get_memory_pool()

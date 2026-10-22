@@ -111,7 +111,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_observability,
+    uses_mooncake_host_receive,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.poll_timer import PollTimer
@@ -413,6 +418,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        assert not getattr(self, "_host_receive_restores", {}), (
+            "Host receive restores must drain before cache reset"
+        )
+        self._host_receive_restores = {}
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -1438,6 +1447,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
+        from sglang.srt.runtime_context import get_disagg
+
+        if uses_mooncake_host_receive(get_disagg()):
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+            return (
+                isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool))
+                and not getattr(kv_cache, "kpool_use_compress", False)
+                and PoolName.KV in self.host_pool_group.entry_map
+                and all(
+                    spec.indices_from_pool == PoolName.KV
+                    for spec in self.sidecar_pool_specs
+                )
+            )
         return isinstance(kv_cache, MHATokenToKVPool) and (
             PoolName.KV in self.host_pool_group.entry_map
         )
@@ -1569,7 +1592,9 @@ class UnifiedRadixCache(BasePrefixCache):
             raise
         return backup
 
-    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+    def _prepare_retraction_restore(
+        self, req: Req, backup: RetractionBackup
+    ) -> CacheOperation:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1598,12 +1623,15 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         assert resolved is not None or not restored_transfers
 
-        operation = CacheOperation(
+        return CacheOperation(
             backup.host_indices,
             device_indices,
             node_id=-1,
             pool_transfers=resolved,
         )
+
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+        operation = self._prepare_retraction_restore(req, backup)
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
@@ -1616,7 +1644,57 @@ class UnifiedRadixCache(BasePrefixCache):
         completion.finish_event.synchronize()
         self.discard_kv_cache_backup(backup)
 
+    def queue_host_receive_restores(self, reqs: list[Req]) -> None:
+        """Use native load batches for request-owned, already-received backups.
+
+        Requests remain in the scheduler waiting queue until the native ack is
+        retired on every rank. Thus admission reservations and cancellation
+        continue to see them while existing decode work can progress.
+        """
+        pending = self._host_receive_restores
+        items = [
+            (req, req.kv.retraction_backup)
+            for req in reqs
+            if req.kv.retraction_backup is not None
+            and id(req.kv.retraction_backup) not in pending
+        ]
+        if not items or not self.has_free_load_back_slot():
+            return
+        # Prepare all descriptors before mutating the native submission queue.
+        ops = [self._prepare_retraction_restore(req, backup) for req, backup in items]
+        for op in ops:
+            # These slots belong to requests, not radix nodes. Native ack
+            # retirement must not interpret the placeholder -1 as a tree ID.
+            op.node_ids = []
+        cc = self.cache_controller
+        cc.load_queue.extend(ops)
+        cc.start_loading()
+        ack = cc.ack_load_queue[-1]
+        for req, backup in items:
+            pending[id(backup)] = (req, backup, ack)
+
+    def advance_host_receive_restores(self) -> None:
+        """Native completion consensus precedes Host release and readiness."""
+        # Enter on every rank, including ranks whose local event is unfinished.
+        self.loading_check()
+        pending = self._host_receive_restores
+        live_acks = {id(ack) for ack in self.cache_controller.ack_load_queue}
+        for key, (req, backup, ack) in list(pending.items()):
+            if id(ack) in live_acks:
+                continue
+            assert req.kv.retraction_backup is backup
+            del pending[key]
+            self.discard_kv_cache_backup(backup)
+            req.kv.retraction_backup = None
+
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
+        pending = self._host_receive_restores
+        entry = pending.get(id(backup))
+        if entry is not None:
+            # Leave the shared ack in the native queue until rank consensus;
+            # cancellation owns only this request's Host and device slots.
+            entry[2].finish_event.synchronize()
+            del pending[id(backup)]
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 

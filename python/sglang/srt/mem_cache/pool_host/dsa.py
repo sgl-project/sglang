@@ -258,6 +258,36 @@ class DSAIndexerPoolHost(HostKVCache):
         self.index_k_data_refs = []
         super().destroy()
 
+    def get_transfer_buf_infos(self, pools):
+        if (
+            len(pools) != 1
+            or pools[0] is not self.device_pool
+            or self.layout != "layer_first"
+        ):
+            raise ValueError(
+                "DSA Host receive requires layer_first without draft pools"
+            )
+        device = self.device_pool.get_state_buf_infos()
+        refs = iter(self.index_k_data_refs)
+        host = ([], [], [])
+        # Native wire keeps skipped-layer placeholders; Host storage is compact.
+        for extent, stride in zip(device[1], device[2], strict=True):
+            if extent == stride == 0:
+                values = (0, 0, 0)
+            else:
+                tensor = next(refs)
+                if (
+                    not tensor.is_contiguous()
+                    or stride != self.indexer_page_stride_size
+                ):
+                    raise ValueError("DSA Host wire stride mismatch")
+                values = (tensor.data_ptr(), tensor.nbytes, stride)
+            for combined, value in zip(host, values, strict=True):
+                combined.append(value)
+        if next(refs, None) is not None:
+            raise ValueError("Unmapped DSA Host buffer")
+        return device, host
+
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
 

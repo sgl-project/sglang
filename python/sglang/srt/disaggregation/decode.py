@@ -123,6 +123,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    uses_mooncake_host_receive,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.common import async_h2d
@@ -461,7 +462,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if get_disagg().disaggregation_enable_kv_checksum:
-            kv_args = self.kv_manager.kv_args
+            kv_args = (
+                self.kv_manager.device_kv_args
+                if uses_mooncake_host_receive(get_disagg())
+                else self.kv_manager.kv_args
+            )
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -661,15 +666,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            mooncake_host = uses_mooncake_host_receive(get_disagg())
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
-            if (kv_args.state_types and kv_args.state_types != [StateType.SWA]) or any(
-                spec.indices_from_pool not in (PoolName.KV, PoolName.SWA)
+            state_type = StateType.DSA if mooncake_host else StateType.SWA
+            index_sources = (
+                (PoolName.KV,) if mooncake_host else (PoolName.KV, PoolName.SWA)
+            )
+            if (kv_args.state_types and kv_args.state_types != [state_type]) or any(
+                spec.indices_from_pool not in index_sources
                 for spec in self.tree_cache.sidecar_pool_specs
             ):
-                raise ValueError(
-                    "Host receive supports full KV and separate paged SWA pools"
-                )
+                raise ValueError("Unsupported Host receive state or index source")
             self.host_pool = group.get_pool(PoolName.KV)
             self.host_reserved_tokens = decode_retraction_max_tokens(
                 self.req_to_token_pool, pool
@@ -688,7 +696,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 }
 
             device_buffers, host_buffers = group.get_contiguous_buf_infos(
-                pool_names(PoolName.KV)
+                {PoolName.KV} if mooncake_host else pool_names(PoolName.KV)
             )
             if device_buffers != (
                 kv_args.kv_data_ptrs,
@@ -705,7 +713,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ) = host_buffers
             self.host_swa_pool = None
             self.host_swa_reserved_tokens = 0
-            if kv_args.state_types:
+            if kv_args.state_types == [StateType.SWA]:
                 self.host_swa_pool = group.get_pool(PoolName.SWA)
                 self.host_swa_reserved_tokens = min(
                     decode_retraction_max_tokens(
@@ -723,8 +731,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "SWA host pool must hold a retraction and a receive page; "
                         "increase --hicache-size or --hicache-ratio"
                     )
+            if kv_args.state_types:
                 device_state, host_state = group.get_contiguous_buf_infos(
-                    pool_names(PoolName.SWA)
+                    {PoolName.INDEXER} if mooncake_host else pool_names(PoolName.SWA)
                 )
                 if device_state != (
                     kv_args.state_data_ptrs[0],
@@ -732,7 +741,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_args.state_item_lens[0],
                 ):
                     raise ValueError(
-                        "Host receive buffers must match the SWA transfer layout"
+                        "Host receive buffers must match the state transfer layout"
                     )
                 (
                     kv_args.host_state_data_ptrs,
@@ -1444,7 +1453,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if (
                 get_disagg().disaggregation_decode_host_receive_threshold < 1
-                and not decode_req.is_rebootstrap
+                and (
+                    not decode_req.is_rebootstrap
+                    or uses_mooncake_host_receive(get_disagg())
+                )
                 and not _is_fake_transfer(decode_req.req)
                 and decode_req.kv_receiver.supports_host_destination
                 and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
@@ -1843,7 +1855,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
-        seq_len = len(decode_req.req.origin_input_ids)
+        seq_len = self._rebootstrap_prefill_len(decode_req.req)
         page_size = self.host_pool.page_size
         num_tokens = ceil_align(seq_len, page_size)
         required_tokens = num_tokens + self.host_reserved_tokens
@@ -1925,7 +1937,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required_tokens = self._required_admission_tokens(
             req,
             self._required_alloc_tokens(
-                fill_len=len(req.origin_input_ids), prefix_len=0
+                fill_len=self._pre_alloc_fill_len(req), prefix_len=0
             ),
             0,
             retractable_tokens,
@@ -3301,6 +3313,12 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
+        host_receive = uses_mooncake_host_receive(get_disagg())
+        if host_receive:
+            self.tree_cache.queue_host_receive_restores(
+                self.waiting_queue[:num_not_used_batch]
+            )
+
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
@@ -3308,7 +3326,9 @@ class SchedulerDisaggregationDecodeMixin:
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if i < num_not_used_batch and not (
+                host_receive and req.kv.retraction_backup is not None
+            ):
                 can_run_list.append(req)
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.
@@ -3350,7 +3370,10 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+        if (
+            not host_receive
+            and get_disagg().disaggregation_decode_host_receive_threshold < 1
+        ):
             for req in new_batch.reqs:
                 if req.kv.retraction_backup is not None:
                     restore_kv_cache(
@@ -3364,6 +3387,10 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
+        if uses_mooncake_host_receive(get_disagg()):
+            # Reap before admitting more work; waiting requests retain the
+            # native output reservation until their restore is globally ready.
+            self.tree_cache.advance_host_receive_restores()
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

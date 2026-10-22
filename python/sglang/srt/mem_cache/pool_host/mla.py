@@ -281,6 +281,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self._init_device_row_stride(self.device_kv_buffers)
         self._init_write_back_staging_buffers()
 
+    def get_transfer_buf_infos(self, pools):
+        if len(pools) != 1 or self.layout != "layer_first":
+            raise ValueError(
+                "MLA Host receive requires layer_first without draft pools"
+            )
+        pool = pools[0]
+        if (
+            getattr(pool, "kpool_use_compress", False)
+            or pool.page_size != self.page_size
+        ):
+            raise ValueError("MLA Host receive requires uncompressed matching pages")
+        device, host = pool.get_contiguous_buf_infos(), self.get_contiguous_buf_infos()
+        if (
+            len(device[0]) != len(host[0])
+            or device[2] != host[2]
+            or any(not tensor.is_contiguous() for tensor in self.data_refs)
+        ):
+            raise ValueError("Host main KV wire geometry differs")
+        return device, host
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""

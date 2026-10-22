@@ -110,6 +110,15 @@ class HostPoolGroup:
                 continue
             host = entry.host_pool
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
+            export = getattr(host, "get_transfer_buf_infos", None)
+            if export is not None:
+                if any(pool.page_size != self.page_size for pool in pools):
+                    raise ValueError("Host receive requires matching pool page sizes")
+                device, host_infos = export(pools)
+                for combined, values in zip(device_infos, device, strict=True):
+                    combined.extend(values)
+                host_by_device_ptr.update(zip(device[0], zip(*host_infos), strict=True))
+                continue
             for pool in pools:
                 dense_mha = (
                     isinstance(pool, MHATokenToKVPool)

@@ -157,6 +157,15 @@ def derive_parallel_widths(
     }
 
 
+def uses_mooncake_host_receive(cfg):
+    """Opt in through the native always-host threshold, without another flag."""
+    return (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and cfg.disaggregation_decode_host_receive_threshold == 0
+    )
+
+
 def parallel_widths_of(cfg: Any) -> dict:
     """Return derived parallel settings from resolved configuration."""
     return derive_parallel_widths(

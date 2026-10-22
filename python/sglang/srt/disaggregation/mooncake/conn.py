@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import dataclasses
 import logging
 import os
@@ -15,7 +16,12 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -73,9 +79,11 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_memory,
     get_observability,
     get_schedule,
+    uses_mooncake_host_receive,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -262,6 +270,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self.supports_host_destination = bool(
+            disaggregation_mode == DisaggregationMode.DECODE
+            and uses_mooncake_host_receive(get_disagg())
+        )
+        if self.supports_host_destination:
+            assert args.host_kv_data_ptrs, "Missing verified Host destinations"
+            # Checksums run on the restored Device pages, not the Host wire slots.
+            self.device_kv_args = copy.copy(args)
+            args.kv_data_ptrs = args.host_kv_data_ptrs
+            args.kv_data_lens = args.host_kv_data_lens
+            args.kv_item_lens = args.host_kv_item_lens
+            args.state_data_ptrs = args.host_state_data_ptrs or []
+            args.state_data_lens = args.host_state_data_lens or []
+            args.state_item_lens = args.host_state_item_lens or []
         enable_custom_mem_pool, custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
@@ -269,6 +291,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        if (
+            self.supports_host_destination
+            and not self.enable_deferred_decode_kv_release
+        ):
+            raise ValueError("Mooncake Host receive requires deferred KV release")
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -3196,9 +3223,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeFailureExceptionMixin:
     """Shared `failure_exception` for the Mooncake sender and receiver.
 
-    Both sides conclude a failed room identically: latch Failed, clear local
-    state, then raise with the recorded reason -- or, when no reason was
-    recorded locally, report it as propagated from another rank. Expects the
+    Latch Failed and raise with the recorded reason, or report a propagated
+    failure when no reason was recorded locally. Host receivers keep their
+    state until the queue owner releases the room after the drain. Expects the
     concrete class to provide ``conclude_state``, ``clear()``,
     ``bootstrap_room`` and ``kv_mgr``.
     """
@@ -3208,7 +3235,8 @@ class MooncakeFailureExceptionMixin:
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        if not getattr(self, "supports_host_destination", False):
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
@@ -3330,6 +3358,29 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
+    @property
+    def supports_host_destination(self):
+        return self.kv_mgr.supports_host_destination
+
+    def is_abort_release_safe(self) -> bool:
+        return self.kv_mgr.is_abort_release_safe(
+            self.bootstrap_room, len(self.bootstrap_infos or ())
+        )
+
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        # Partial metadata publication can leave init_time unset while a peer
+        # already has Host addresses. Arm the native generation before ABORT.
+        super()._send_abort_notification(
+            force_arm=force_arm or self.supports_host_destination
+        )
+
+    def _clear(self) -> None:
+        if not self._owns_bootstrap_room:
+            return
+        super()._clear()
+        if self.supports_host_destination:
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -3441,7 +3492,22 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
+        if self.supports_host_destination:
+            if destination != KVTransferDestination.HOST:
+                raise ValueError(
+                    "Host-only connection cannot publish a device destination"
+                )
+            if state_indices is not None or device_kv_indices is not None:
+                raise ValueError(
+                    "Unexpected alternate indices in shared-index Host receive"
+                )
+            state_indices = [
+                kv_indices.tolist() for _ in self.kv_mgr.kv_args.state_types
+            ]
+        elif destination != KVTransferDestination.DEVICE:
+            raise ValueError("This Mooncake connection has no Host registration")
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     publish,
     spawn_world_rank,
+    uses_mooncake_host_receive,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -608,7 +609,7 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or uses_mooncake_host_receive(get_disagg()):
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
@@ -3481,6 +3482,10 @@ class Scheduler(
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
+        if uses_mooncake_host_receive(get_disagg()):
+            if req.kv.retraction_backup is not None:
+                req.skip_radix_cache_insert = True
+            discard_kv_cache_backup(req, self.tree_cache, "host_pool")
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
@@ -5761,6 +5766,12 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
+        if uses_mooncake_host_receive(get_disagg()):
+            # Drain H2D before retract_all releases rows; stale Host backups
+            # must not survive the weight-update cache reset.
+            for req in retract_reqs:
+                discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+            self.tree_cache.advance_host_receive_restores()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
