@@ -1603,9 +1603,23 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             output += bias
         return output.view(*input.shape[:-1], weight.shape[0])
 
+    # DeepGEMM accepts a partial final K block when both operands carry ceil(K / 128)
+    # scales; its TMA descriptors need 16-byte-aligned base pointers and fp8 row strides.
+    prequant_k_tail = (
+        input_scale is not None
+        and list(block_size) == [128, 128]
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % block_size[1] != 0
+        and weight.shape[1] % 16 == 0
+        and input.is_contiguous()
+        and weight.is_contiguous()
+        and input.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(
-        weight.shape, block_size, output_dtype
+    if not (
+        prequant_k_tail
+        or _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype)
     ) or _ue8m0_deepgemm_skips_block32(block_size, weight_scale, input_scale):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
