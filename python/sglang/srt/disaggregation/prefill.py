@@ -1659,6 +1659,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.kv.req_pool_idx,
                         seq_len,
                         page_size,
+                        token_to_kv_pool=self.token_to_kv_pool,
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )

@@ -1746,6 +1746,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         decode_req.req.kv.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
+                        token_to_kv_pool=self.token_to_kv_pool,
                         prefix_len=total_prefix_len,
                     )
                 )
