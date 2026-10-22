@@ -44,6 +44,9 @@ from sglang.kernels.ops.mamba.kda_prefill_track import (
     kda_track_conv_window,
     kda_track_ssm_state,
 )
+from sglang.srt.layers.attention.linear.kda_flashinfer_prefill_graph import (
+    FlashInferKDAPrefillGraph,
+)
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
     build_prefill_track_plan,
 )
@@ -101,6 +104,7 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
     has_initial_state: torch.Tensor  # [max_seqs] bool
     track_dst: torch.Tensor  # [max_seqs] int64
     token_index: torch.Tensor  # [num_tokens] int32 arange
+    flashinfer: Optional[FlashInferKDAPrefillGraph] = None
 
     @classmethod
     def allocate(
@@ -111,6 +115,7 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        flashinfer_wrapper_cls=None,
     ) -> KDAPrefillGraphMetadata:
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, KDA_CHUNK_SIZE) + max_seqs
@@ -149,6 +154,17 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
             has_initial_state=torch.zeros(max_seqs, dtype=torch.bool, device=device),
             track_dst=torch.zeros(max_seqs, dtype=torch.int64, device=device),
             token_index=torch.arange(num_tokens, dtype=torch.int32, device=device),
+            flashinfer=(
+                FlashInferKDAPrefillGraph(
+                    wrapper_cls=flashinfer_wrapper_cls,
+                    num_tokens=num_tokens,
+                    max_seqs=max_seqs,
+                    track=track,
+                    device=device,
+                )
+                if flashinfer_wrapper_cls is not None
+                else None
+            ),
         )
 
     def can_fit(self, extend_seq_lens: list[int]) -> bool:
@@ -185,6 +201,8 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         self.has_initial_state[bs:].fill_(False)
         if track_rows is not None:
             self.track_dst[:bs].copy_(track_rows.dst[:bs])
+        if self.flashinfer is not None:
+            self.flashinfer.fill(self, extend_seq_lens, track_rows)
 
     def _write_host_tables(
         self, *, lens: np.ndarray, track_rows: Optional[KDAPrefillTrackRows]
@@ -350,27 +368,39 @@ def kda_extend_in_graph(
             dtype=torch.float32,
             device=ssm_states.device,
         )
-    core_attn_out = kernel_dispatcher.extend(
-        q=q,
-        k=k,
-        v=v,
-        g=a,
-        beta=b,
-        ssm_states=ssm_states,
-        cache_indices=meta.cache_indices,
-        query_start_loc=meta.cu_seqlens,
-        A_log=layer.A_log,
-        dt_bias=layer.dt_bias,
-        lower_bound=layer.lower_bound,
-        beta_is_raw=gate_was_flat,
-        extend_seq_lens_cpu=None,
-        is_spec_decode=False,
-        return_intermediate_states=False,
-        track_state=h_track,
-        track_chunk_idx=meta.track_chunk_idx if meta.track else None,
-        chunk_indices=meta.chunk_indices,
-        chunk_offsets=meta.chunk_offsets,
-    )
+    if meta.flashinfer is not None:
+        core_attn_out = meta.flashinfer.run(
+            layer=layer,
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
+            ssm_states=ssm_states,
+            h_track=h_track,
+        )
+    else:
+        core_attn_out = kernel_dispatcher.extend(
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
+            ssm_states=ssm_states,
+            cache_indices=meta.cache_indices,
+            query_start_loc=meta.cu_seqlens,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=layer.lower_bound,
+            beta_is_raw=gate_was_flat,
+            extend_seq_lens_cpu=None,
+            is_spec_decode=False,
+            return_intermediate_states=False,
+            track_state=h_track,
+            track_chunk_idx=meta.track_chunk_idx if meta.track else None,
+            chunk_indices=meta.chunk_indices,
+            chunk_offsets=meta.chunk_offsets,
+        )
 
     if meta.track:
         kda_track_ssm_state(

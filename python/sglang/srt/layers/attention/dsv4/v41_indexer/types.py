@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
@@ -47,6 +47,13 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # rank's rows are an interleaved subset of the batch's.
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
+    # [columns] int64 index-K pool slot of each flattened-K column, from
+    # scoring.prefill_k_slots; gathered with the metadata, never per layer.
+    k_slots: torch.Tensor
+    # ratio -> scoring.PrefillIndexPlan, filled by the first layer of each ratio and
+    # reused by the rest of the forward; None when the metadata outlives a forward
+    # (captured graphs), so every layer builds its own.
+    index_plans: Optional[Dict[int, object]]
     # [rows, pages] int32 at the KV page size; the index-K pool pages it with
     # expand_index_page_table.
     kv_page_table: torch.Tensor
