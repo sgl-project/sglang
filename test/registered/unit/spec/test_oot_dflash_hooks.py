@@ -107,7 +107,7 @@ class TestOOTDFlashHooks(CustomTestCase):
 
 
 class TestDFlashDraftBackendResolution(CustomTestCase):
-    """Backends that serve one attention layout follow the draft's layout."""
+    """MLA drafts fall back to the default MLA draft backend."""
 
     def _resolve(self, draft_backend, *, mla, target_backend="fa3"):
         args = _make_dflash_args(draft_backend)
@@ -122,7 +122,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
-                return_value=SimpleNamespace(is_xpu=False, is_hip=False),
+                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=True),
             ),
             patch(
                 f"{HOOK_MODULE}.attention_backends_of",
@@ -136,34 +136,14 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             _resolve_dflash_draft_attention_backend(args)
         return resolution_result(args, "speculative_draft_attention_backend")
 
-    def test_layout_specific_backends(self):
-        self.assertEqual(self._resolve("tokenspeed_mla", mla=True), "tokenspeed_mla")
-        self.assertEqual(self._resolve("tokenspeed_mla", mla=False), "flashinfer")
-        # A DeepSeek target's tokenspeed_mla must not reach a GQA draft.
+    def test_mla_drafts_take_the_default_mla_backend(self):
+        # On SM100 a non-MLA draft leaving trtllm_mha goes to fa4 instead.
+        self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
+        # The trtllm-gen MLA decode kernel has no bidirectional mask.
         self.assertEqual(
-            self._resolve(None, mla=False, target_backend="tokenspeed_mla"),
-            "flashinfer",
+            self._resolve(None, mla=True, target_backend="trtllm_mla"), "flashinfer"
         )
         self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
-        self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
-
-    def test_draft_worker_does_not_inherit_tokenspeed_mla(self):
-        """A GQA DSpark draft inherits its backend in the worker, so an MLA target's
-        tokenspeed_mla must fall back unless the draft names it."""
-        from sglang.srt.speculative import draft_worker_common as common
-
-        target = ("tokenspeed_mla", "tokenspeed_mla")
-        platform = SimpleNamespace(is_xpu=False)
-        for named, expected in ((None, "flashinfer"), ("tokenspeed_mla",) * 2):
-            spec = SimpleNamespace(speculative_draft_attention_backend=named)
-            with (
-                patch.object(common, "get_spec", return_value=spec),
-                patch.object(common, "attention_backends", return_value=target),
-                patch.object(common, "get_platform", return_value=platform),
-                patch.object(common.torch.version, "hip", None),
-            ):
-                result = common.resolve_draft_worker_attention_backend()
-            self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 """DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph."""
 
 import copy
-import importlib.util
 import math
 import unittest
 
@@ -30,7 +29,7 @@ register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
 
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
-BACKENDS = ("triton", "flashinfer", "tokenspeed_mla")
+BACKENDS = ("triton", "flashinfer")
 
 
 def _rope(x, positions):
@@ -88,7 +87,7 @@ class TestDFlashMLABackends(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
-    def _make_runner(self, backend_name, config, fp8):
+    def _make_runner(self, backend_name, config):
         model_config = TinyMLAModelConfig(
             num_heads=HEADS,
             kv_lora_rank=RANK,
@@ -120,7 +119,6 @@ class TestDFlashMLABackends(unittest.TestCase):
             kv_lora_rank=RANK,
             qk_rope_head_dim=ROPE,
             disable_cuda_graph=False,
-            fp8_kv_cache=fp8,
         )
         runner.is_draft_worker = True
         runner.spec_algorithm = SpeculativeAlgorithm.DFLASH
@@ -141,7 +139,6 @@ class TestDFlashMLABackends(unittest.TestCase):
 
     def _check(self, backend_name, *, causal):
         torch.manual_seed(20261016)
-        fp8 = backend_name == "tokenspeed_mla"
         config = Qwen3Config(
             hidden_size=HIDDEN,
             num_hidden_layers=1,
@@ -158,7 +155,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             layer_types=["full_attention"],
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
-        runner, backend = self._make_runner(backend_name, config, fp8)
+        runner, backend = self._make_runner(backend_name, config)
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
         # an FP32 table that Module.to would round to BF16.
@@ -226,11 +223,8 @@ class TestDFlashMLABackends(unittest.TestCase):
         def check(actual, expected):
             self.assertTrue(torch.isfinite(actual).all())
             relative_l2 = (actual.float() - expected).norm() / expected.norm()
-            self.assertLess(relative_l2.item(), 0.05 if fp8 else 0.012)
-            if not fp8:
-                torch.testing.assert_close(
-                    actual.float(), expected, atol=0.025, rtol=0.025
-                )
+            self.assertLess(relative_l2.item(), 0.012)
+            torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
 
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
             batch, hidden, expected = make_inputs((0, 31))
@@ -269,11 +263,6 @@ class TestDFlashMLABackends(unittest.TestCase):
     def _check_backends(self, *, causal):
         for backend_name in BACKENDS:
             with self.subTest(backend=backend_name):
-                if backend_name == "tokenspeed_mla" and (
-                    torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}
-                    or importlib.util.find_spec("tokenspeed_mla") is None
-                ):
-                    self.skipTest("TokenSpeed MLA requires SM100/SM103 and the package")
                 self._check(backend_name, causal=causal)
 
     def test_bidirectional(self):

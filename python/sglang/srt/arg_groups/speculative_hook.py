@@ -855,8 +855,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
-
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -911,7 +909,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            is_dflash_mla_draft_config,
+        )
 
         draft_hf_config = _load_draft_hf_config(cfg)
         draft_text_config = (
@@ -925,17 +926,23 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        # trtllm_mha serves only MHA/GQA layers.
-        if is_dflash_mla_draft_config(draft_hf_config) or not (
-            all_sliding or all_causal
-        ):
+        if is_dflash_mla_draft_config(draft_hf_config):
+            # trtllm_mha serves only MHA/GQA layers; the fallback is the default
+            # MLA draft backend.
+            fallback_backend = get_fallback_backend()
+            logger.warning(
+                "DFLASH MLA drafts cannot use 'trtllm_mha'. Falling back to '%s'.",
+                fallback_backend,
+            )
+            draft_backend = fallback_backend
+        elif not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:
                 fallback_backend = "fa4"
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' for non-MLA drafts whose "
-                "layers all use sliding attention or are explicitly causal; got "
+                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
+                "attention or the draft is explicitly causal; got "
                 "layer_types=%r, is_causal=%r. "
                 "Falling back to '%s'.",
                 layer_types,
@@ -943,16 +950,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    elif draft_backend == "tokenspeed_mla" and not is_dflash_mla_draft_config(
-        _load_draft_hf_config(cfg)
-    ):
-        fallback_backend = get_fallback_backend()
-        logger.warning(
-            "DFLASH only enables 'tokenspeed_mla' for MLA drafts. "
-            "Falling back to '%s'.",
-            fallback_backend,
-        )
-        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(

@@ -234,11 +234,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.is_dflash_mla_draft = model_runner.model_config.is_dflash_mla_draft
         # Planned per batch, so every layer must share it: False only for a
         # bidirectional DFlash MLA draft.
         self.causal = True
-        if self.is_dflash_mla_draft:
+        if model_runner.model_config.is_dflash_mla_draft:
             from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_causal
 
             self.causal = is_dflash_mla_draft_causal(

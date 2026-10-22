@@ -46,10 +46,6 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
-        # tokenspeed_mla serves only MLA layers, so a draft gets it only when
-        # it is named explicitly.
-        if draft_backend == "tokenspeed_mla":
-            draft_backend = None
     if draft_backend is None:
         return platform_fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
