@@ -340,6 +340,20 @@ def handle_linear_attn_backend(server_args: Any):
             "FlashKDA is prefill-only; using triton for KDA decode "
             "(FlashKDA stays on prefill)."
         )
+    if decode == "aiter":
+        if cfg.linear_attn_decode_backend == "aiter":
+            raise ValueError(
+                "--linear-attn-decode-backend aiter is not supported: "
+                "AITER chunk KDA is prefill-only. Use "
+                "--linear-attn-prefill-backend aiter (decode stays on triton)."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_decode_backend="triton",
+        )
+        decode = "triton"
+        logger.info("AITER chunk KDA is prefill-only; using triton for KDA decode.")
 
     if (
         decode == "flashinfer"

@@ -194,6 +194,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_conv_indices = None
         track_ssm_h_src = None
         track_chunk_idx = None
+        track_chunk_idx_cpu = None
         track_ssm_h_dst = None
         track_ssm_h_batch_src = None
         track_ssm_final_src = None
@@ -341,6 +342,15 @@ class MambaAttnBackendBase(AttentionBackend):
                 else:
                     logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
+                    if cpu_track_metadata:
+                        track_chunk_idx_cpu = build_prefill_track_plan(
+                            forward_batch.mamba_prefill_track_mask_cpu,
+                            forward_batch.mamba_track_seqlens_cpu,
+                            forward_batch.extend_seq_lens_cpu,
+                            forward_batch.extend_prefix_lens_cpu,
+                            self.mamba_chunk_size,
+                            mamba2=isinstance(self, Mamba2AttnBackend),
+                        ).chunk_indices
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch, track_mask_indices
                     )
@@ -377,6 +387,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             track_chunk_idx=track_chunk_idx,
+            track_chunk_idx_cpu=track_chunk_idx_cpu,
             track_ssm_seq_idx=track_ssm_seq_idx,
             track_ssm_end_locs=track_ssm_end_locs,
             track_ssm_recompute_dst=track_ssm_recompute_dst,

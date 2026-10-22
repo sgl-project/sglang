@@ -787,7 +787,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
     decode_allowed = {"triton", "flashinfer"}
-    prefill_allowed = {"triton", "flashkda", "flashinfer"}
+    prefill_allowed = {"triton", "flashkda", "flashinfer", "aiter"}
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})

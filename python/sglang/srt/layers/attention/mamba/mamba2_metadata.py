@@ -58,6 +58,9 @@ class ForwardMetadata:
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
     track_chunk_idx: Optional[torch.Tensor] = None
+    # Host mirror for eager kernels that split at a tracked chunk boundary.
+    # Graph paths leave this unset and use their static device tables.
+    track_chunk_idx_cpu: Optional[list[int]] = None
     # Batch rows of the chunk-unaligned tracked seqs; indexes the fp32
     # h_track_buf snapshot (KDA path) with plain integer indexing, so the
     # copy into the track slots does not nonzero()-sync the stream.

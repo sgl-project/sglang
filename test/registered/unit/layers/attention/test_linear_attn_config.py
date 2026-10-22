@@ -159,7 +159,7 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
         from sglang.srt.configs.kimi_k3 import KimiK3Config
         from sglang.srt.configs.kimi_linear import KimiLinearConfig
         from sglang.srt.layers.attention.linear.kda_backend import (
-            flashinfer_kda_prefill_default,
+            kda_prefill_default,
         )
         from sglang.srt.model_executor.cuda_graph_config import (
             CudaGraphConfig,
@@ -191,6 +191,7 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
             (k3, (10, 3), fields, expected)
             for fields, expected in [
                 ({"linear_attn_prefill_backend": "triton"}, "triton"),
+                ({"linear_attn_prefill_backend": "aiter"}, "aiter"),
                 ({"linear_attn_prefill_backend": "helion"}, "helion"),
                 ({"linear_attn_backend": "helion"}, "helion"),
                 ({"enable_deterministic_inference": True}, "triton"),
@@ -226,10 +227,18 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
                     return_value=capability is not None,
                 ),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.is_hip",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.is_gfx95_supported",
+                    return_value=False,
+                ),
                 patch("torch.cuda.get_device_capability", return_value=capability),
             ):
                 backends = resolve_linear_attn_backends(
-                    prefill_default=flashinfer_kda_prefill_default(runner)
+                    prefill_default=kda_prefill_default(runner)
                 )
                 self.assertEqual(backends.prefill.value, expected)
                 self.assertEqual(
@@ -240,6 +249,51 @@ class TestFlashInferKDAPrefillPolicy(CustomTestCase):
                     get_exec().mamba.linear_attn_prefill_backend,
                     fields.get("linear_attn_prefill_backend"),
                 )
+
+    def test_gfx950_defaults_to_aiter_when_bf16_state_is_supported(self):
+        from sglang.srt.configs.kimi_k3 import KimiK3Config
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            kda_prefill_default,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import (
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+        from sglang.srt.runtime_context import get_context
+
+        config = KimiK3Config(
+            text_config={
+                "linear_attn_config": {
+                    "kda_layers": [0],
+                    "full_attn_layers": [],
+                    "gate_lower_bound": -5,
+                }
+            }
+        )
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config, is_draft_model=False)
+        )
+        with (
+            get_context().override_server_args(
+                linear_attn_backend="triton",
+                cuda_graph_config=CudaGraphConfig(
+                    prefill=PhaseConfig(backend="disabled")
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.attention.linear.kda_backend.is_hip",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.linear.kda_backend.is_gfx95_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.linear.kernels.kda_aiter.aiter_kda_prefill_available",
+                return_value=True,
+            ),
+        ):
+            self.assertEqual(kda_prefill_default(runner), "aiter")
 
     def test_fixed_restrictions_are_rejected_before_forward(self):
         from sglang.srt.layers.attention.linear.kda_backend import (

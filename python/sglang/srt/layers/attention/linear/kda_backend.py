@@ -71,8 +71,8 @@ def _validate_flashinfer_kda_prefill(
         )
 
 
-def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
+def kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+    """Select the platform KDA prefill default when its full contract is available."""
     from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
     from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 
@@ -83,15 +83,23 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         else config.linear_attn_config.get("gate_lower_bound")
     )
     execution = get_exec()
-    if (
+    eligible = (
         lower_bound is not None
         and execution.mamba.linear_attn_backend == "triton"
         and not execution.deterministic.enable_deterministic_inference
         and not execution.overlap.enable_two_batch_overlap
         and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
-        and is_cuda()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-    ):
+    )
+    if not eligible:
+        return None
+    if is_hip() and is_gfx95_supported():
+        from sglang.srt.layers.attention.linear.kernels.kda_aiter import (
+            aiter_kda_prefill_available,
+        )
+
+        if aiter_kda_prefill_available():
+            return "aiter"
+    if is_cuda() and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
         return "flashinfer"
     return None
 
@@ -204,6 +212,12 @@ class KDAKernelDispatcher:
             )
 
             self.extend_kernel = FlashKDAKernel()
+        elif prefill_backend.is_aiter():
+            from sglang.srt.layers.attention.linear.kernels.kda_aiter import (
+                AiterKDAPrefillKernel,
+            )
+
+            self.extend_kernel = AiterKDAPrefillKernel(triton_fallback=triton_kernel)
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("KDA FlashInfer prefill backend requires CUDA")
@@ -262,8 +276,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
+                "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'aiter', "
+                "'cutedsl', 'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
                 "SM100, ptx_kda SM100 or SM103)."
             )
 
@@ -1189,6 +1203,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            track_chunk_idx_cpu=(
+                self.forward_metadata.track_chunk_idx_cpu
+                if h_track_buf is not None
+                else None
+            ),
             state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
             state_checkpoint_every_n_tokens=(

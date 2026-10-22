@@ -433,7 +433,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import (
             KDAAttnBackend,
-            flashinfer_kda_prefill_default,
+            kda_prefill_default,
         )
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
@@ -477,7 +477,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
         elif hybrid_kda_config(runner.model_config) is not None and not is_npu():
-            prefill_default = flashinfer_kda_prefill_default(runner)
+            prefill_default = kda_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )
