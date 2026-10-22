@@ -78,8 +78,11 @@ pub async fn serve(
     tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    // Legacy conversation templates add stop strings `lower_chat` never sees;
+    // they stay on the typed handler.
     let openai_chat = chat_formatter
         .as_ref()
+        .filter(|formatter| !matches!(formatter, openai::ChatFormatter::Legacy(_)))
         .zip(tokenizer)
         .map(|(formatter, tokenizer)| openai::OpenAiChat::new(&server_args, formatter, tokenizer));
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
