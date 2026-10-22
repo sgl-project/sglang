@@ -40,6 +40,7 @@ class TestImagePreprocessing(CustomTestCase):
         rng = np.random.default_rng(991)
         for shape, size, crop in (
             ((256, 256), None, None),
+            ((128, 128), (1024, 1024), None),
             ((1081, 1921), (832, 480), (0, 0, 480, 832)),
             ((731, 517), (640, 904), (200, 0, 480, 640)),
             ((31, 47), (96, 64), None),

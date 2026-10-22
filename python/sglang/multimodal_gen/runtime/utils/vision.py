@@ -104,12 +104,13 @@ def preprocess_image(
     Size is (width, height); crop is (top, left, height, width).
     Non-RGB inputs and small images retain the CPU recipe.
     """
+    width, height = size or image.size
     if (
         device.type != "cuda"
         or torch.version.hip is not None
         or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
         or image.mode != "RGB"
-        or image.width * image.height < 256 * 256
+        or max(image.width * image.height, width * height) < 256 * 256
     ):
         if size is not None:
             image = image.resize(size, PIL.Image.Resampling.LANCZOS)
@@ -121,7 +122,6 @@ def preprocess_image(
     # upload compact pixels; the lookup table preserves the CPU FP32 rounding
     pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
     resize_rgb = get_kernel("mm.lanczos_resize")
-    width, height = size or image.size
     if crop == (0, 0, height, width):
         crop = None
     pixels = resize_rgb(
