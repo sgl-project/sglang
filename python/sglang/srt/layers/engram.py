@@ -308,13 +308,14 @@ class EngramHasher(nn.Module):
         assert self.history is not None, "EngramHasher.init_history was not called"
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
-        if num_tokens == 0:
-            return torch.empty(
-                (0, self.primes.shape[0], self.offsets.shape[1]),
+        mode = forward_batch.forward_mode
+        if num_tokens == 0 or mode.is_idle():
+            # A DP-attention idle batch carries pad rows; nothing reads its hashes.
+            return torch.zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
                 dtype=torch.int64,
                 device=input_ids.device,
             )
-        mode = forward_batch.forward_mode
         if (
             mode.is_extend()
             and not mode.is_target_verify()
