@@ -11,20 +11,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    LTX2_QKNORM_SPLIT_ROPE,
+    LTX2_RMS_NORM_MODULATE,
     BitExactFusionGate,
     can_use_fused_rmsnorm_modulation,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
     can_use_modulate_scale_shift_cuda,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
     fused_ltx2_rms_norm_modulate,
-    ltx2_qknorm_split_rope_active,
     ltx2_qknorm_split_rope_cuda,
-    ltx2_rms_norm_modulate_active,
-    mark_fused_gelu_site,
-    mark_ltx2_qknorm_split_rope_site,
-    mark_ltx2_rms_norm_modulate_site,
     modulate_scale_shift_cuda,
     residual_gate_add,
 )
@@ -184,10 +181,6 @@ def _ltx2_modulate(
                     out,
                     x * (1 + scale) + shift,
                     logger=logger,
-                    mismatch_msg=(
-                        "LTX-2 fused modulate is not bit-exact on this "
-                        "platform; falling back to eager"
-                    ),
                 )
     return x * (1 + scale) + shift
 
@@ -208,7 +201,7 @@ def _ltx2_rms_norm_modulate(
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_use_fused_rmsnorm_modulation(
+    if LTX2_RMS_NORM_MODULATE.is_enabled(block) and can_use_fused_rmsnorm_modulation(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
@@ -302,9 +295,12 @@ def _ltx2_build_batched_perturbation_states(
             cache_key = tuple(keep_values)
             mask = mask_cache.get(cache_key)
             if mask is None:
-                mask = torch.tensor(
-                    keep_values, device=values.device, dtype=values.dtype
-                ).view(len(keep_values), *([1] * (values.ndim - 1)))
+                # Build constants on-device: torch.tensor(list, device="cuda")
+                # copies unpinned host memory and fails during BCG capture.
+                mask = values.new_ones((len(keep_values), *([1] * (values.ndim - 1))))
+                for index, keep in enumerate(keep_values):
+                    if not keep:
+                        mask[index].zero_()
                 mask_cache[cache_key] = mask
             states[block_idx] = (mask, False)
     return states
@@ -752,7 +748,7 @@ class LTX2Attention(nn.Module):
         self.apply_gated_attention = bool(apply_gated_attention)
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
         self.prefix = prefix
-        mark_ltx2_qknorm_split_rope_site(self)
+        LTX2_QKNORM_SPLIT_ROPE.mark(self)
 
         tp_size = get_tp_world_size()
         if tp_size <= 0:
@@ -848,6 +844,7 @@ class LTX2Attention(nn.Module):
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                capture_dense_attention=True,
             )
         else:
             self.attn = USPAttention(
@@ -863,6 +860,7 @@ class LTX2Attention(nn.Module):
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                capture_dense_attention=True,
             )
 
     def forward(
@@ -914,7 +912,7 @@ class LTX2Attention(nn.Module):
                         eps=self.norm_eps,
                         num_heads=self.local_heads,
                         head_dim=self.dim_head,
-                        allow_sm90=ltx2_qknorm_split_rope_active(self),
+                        allow_sm90=LTX2_QKNORM_SPLIT_ROPE.is_enabled(self),
                     )
 
             if fused_qk is not None:
@@ -1078,10 +1076,10 @@ class LTX2FeedForward(nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
         )
-        mark_fused_gelu_site(self, "proj_in")
+        FUSED_LINEAR_GELU.mark(self, "proj_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj_in, x):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.proj_in, x):
             x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
         else:
             x, _ = self.proj_in(x)
@@ -1219,7 +1217,7 @@ class LTX2TransformerBlock(nn.Module):
         self.ff = LTX2FeedForward(
             dim, dim_out=dim, bias=ff_bias, quant_config=quant_config
         )
-        mark_ltx2_rms_norm_modulate_site(self)
+        LTX2_RMS_NORM_MODULATE.mark(self)
         self.audio_ff = LTX2FeedForward(
             audio_dim, dim_out=audio_dim, bias=audio_ff_bias, quant_config=quant_config
         )

@@ -184,8 +184,18 @@ jobs:
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
         timeout-minutes: 180
+        env:
+          # Files that intermittently hang silently on XPU; fail fast so --enable-retry reruns them.
+          XPU_TIMEOUT_OVERRIDES: >-
+            --timeout-override xpu/test_xpu_basic.py=180
+            --timeout-override xpu/test_layernorm_xpu.py=120
+            --timeout-override xpu/test_intel_xpu_backend.py=360
+            --timeout-override e2e/xpu/test_xpu_fp8_linear.py=240
+            --timeout-override kv_canary/test_self_unit_req_to_expected_token_ids_manager.py=120
+            --timeout-override kv_canary/test_self_unit_plan_input.py=120
+            --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --enable-retry"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
 
       - name: Cleanup container
         if: always()

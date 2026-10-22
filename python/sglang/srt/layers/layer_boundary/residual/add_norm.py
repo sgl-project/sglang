@@ -136,15 +136,13 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+# Largest batch the non-CuTe-DSL FlashInfer all-reduce fusion runs on;
+# it also sizes that fusion's workspace, pre-allocated before graph capture.
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def flashinfer_ar_fusion_applies(batch_size: int):
     return (
-        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
-        # Ref: https://github.com/sgl-project/sglang/issues/17237
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
@@ -273,9 +271,14 @@ def _norm_quant_kernel(quant_format: str):
 class PlainAdd:
     """A plain residual: the output is added into it."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = True
     applied_at_exit = False
     outlives_layer = True
+    writes_stream = False
+    quantized_sum = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
@@ -294,9 +297,14 @@ class ReplaceAtExit:
     previous residual is dropped. The stream is complete: the producer has its
     boundary complete each part's sum first (StageBoundary.sum_part)."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = True
+    writes_stream = True
+    quantized_sum = False
 
     def update(self, hidden_states, residual):
         return hidden_states
@@ -320,10 +328,19 @@ class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
-    the norm."""
+    the norm.
+
+    ``post_residual_addition`` is added after a plain add and before the norm.
+    It is not applied by the aiter mxfp4 and fp8-group kernels, after an
+    update other than a plain add, or by ``read``, which has no add."""
+
+    bind = None
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
 
     def init_residual(self, hidden_states):
@@ -355,10 +372,17 @@ class NormQuantReadout:
 @dataclass(frozen=True)
 class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
-    runs in the same kernel. An empty batch skips the norm."""
+    runs in the same kernel. An empty batch skips the norm. It rejects a
+    ``quant_format`` and a ``post_residual_addition``, except that the latter
+    is not applied after an update other than a plain add."""
+
+    bind = None
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states
@@ -401,7 +425,11 @@ class UnfusedNormReadout(NormReadout):
     two steps: the update rounds to the activation dtype before the norm, as
     in models that add their residual themselves. No fused kernel takes it."""
 
+    bind = None
+
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
 
     def update_and_read(
         self,

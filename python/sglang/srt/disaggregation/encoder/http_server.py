@@ -163,6 +163,14 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_observability,
+    get_parallel,
+    get_serving,
+    publish,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
@@ -221,6 +229,7 @@ def set_global_state(global_state: _GlobalState):
 def get_global_state() -> _GlobalState:
     return _global_state
 
+app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
 
 async def init_multi_tokenizer() -> ServerArgs:
     """
