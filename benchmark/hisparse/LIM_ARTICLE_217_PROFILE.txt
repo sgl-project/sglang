@@ -1,5 +1,8 @@
 217 / GLM-5.2 W4A8 / LIM 文章对照与实测，2026-10-22
 
+最新三路径精度复测见 LIM_PRECISION_217_RESULTS.txt：32题自由生成、32×512完整词表与重复对照、32K边界组。
+该精度复测采用独立配置；本文件中的profile和性能数据仍对应下述原始配置。
+
 本轮按用户提供的《decode KVcache 低时延卸载技术实践》重新采集三组对照；
 输入为固定 token-ID retrieval 提示，输出512 token、ignore_eos，不是 SWE-bench。
 现有实现是原生 LIM 管理元数据 + 独立 copy + 独立 SFA。CopySFA、SharedCopy、
