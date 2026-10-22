@@ -8,6 +8,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_observability,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -640,6 +641,13 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        # Request-level prefix-cache samples, fed to the hit-rate window. See
+        # `_record_prefix_cache_sample`.
+        self.log_cache_num_reqs = 0
+        self.log_cache_query_tokens = 0
+        self.log_cache_hit_tokens = 0
+        # Off by default: sampling stays a no-op unless --enable-cache-hit-rate.
+        self.enable_cache_hit_rate = get_observability().enable_cache_hit_rate
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -918,6 +926,23 @@ class PrefillAdder:
         ):
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
+
+    def _record_prefix_cache_sample(self, req: Req) -> None:
+        """Record one request-level (queries, hits) sample for the hit-rate window.
+
+        Mirrors vLLM's `PrefixCacheStats`: recorded once per admission, with
+        queries = the full prompt length and hits = the radix-cache match, so a
+        prompt split into N chunks contributes exactly one sample instead of N.
+        Chunked continuations (`add_chunked_req`) and dllm staging re-adds are
+        deliberately excluded -- their tokens are already inside the admission
+        sample. Retracted requests are counted again on re-admission, matching
+        vLLM, which records every admission including preempted ones.
+        """
+        if not self.enable_cache_hit_rate:
+            return
+        self.log_cache_num_reqs += 1
+        self.log_cache_query_tokens += len(req.full_untruncated_fill_ids)
+        self.log_cache_hit_tokens += req.prefix_len
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
@@ -1626,6 +1651,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
+        self._record_prefix_cache_sample(req)
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
