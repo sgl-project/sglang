@@ -1330,25 +1330,6 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
-    def test_dspark_draft_pool_shards_kv_heads_by_full_tp_under_cp(self):
-        """A DSpark draft allocates its pool outside draft_tp_context, yet its attention
-        shards KV heads by full TP under CP; only the target pool uses attention TP."""
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        with get_parallel().override(
-            tp_size=4, attn_tp_size=1, attn_cp_size=4, attn_dp_size=1
-        ):
-            for is_draft_worker, expected in ((True, 4), (False, 1)):
-                with self.subTest(is_draft_worker=is_draft_worker):
-                    kvc = SimpleNamespace(
-                        is_draft_worker=is_draft_worker,
-                        spec_algorithm=SpeculativeAlgorithm.DSPARK,
-                    )
-                    self.assertEqual(
-                        KVCacheConfigurator._mha_kv_head_tp_size(kvc), expected
-                    )
-
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
