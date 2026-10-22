@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
@@ -17,7 +18,10 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 # MoE and linear attention keep their TP partition (the linear attention
 # gathers the sequence where its recurrence needs it). Model ports register
 # here; every other model keeps the ordinary prefill CP path.
-_SUPPORTED_MODELS: set[str] = {"Glm5NextForConditionalGeneration"}
+_SUPPORTED_MODELS: set[str] = {
+    "Glm5NextForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
+}
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
@@ -43,26 +47,51 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
     # This hook runs before speculative defaults and NEXTN alias resolution.
-    # Native MTP keeps the target's CP/TP placement; other draft architectures
-    # have their own topology and model-boundary contracts.
-    if cfg.speculative_algorithm is not None and (
-        model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration"
-        or cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
-        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
-        or cfg.speculative_eagle_topk not in (None, 1)
-    ):
-        raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
+    # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
+    # target's gathered hidden states and runs its draft with ordinary TP.
+    # Only GLM-5.3-Flash has these speculative paths ported.
+    if cfg.speculative_algorithm is not None:
+        if model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration":
+            raise ValueError(
+                "--speculative-algorithm is not supported with CP-TP group sharing."
+            )
+        if cfg.speculative_algorithm != "DFLASH" and (
+            cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
+            or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+            or cfg.speculative_eagle_topk not in (None, 1)
+        ):
+            raise ValueError(
+                "CP/TP group sharing only supports DFLASH or native MTP with top-k 1."
+            )
 
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
     }
+    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+        unsupported |= {
+            # The MoE runs TP experts on rows gathered over the TP group.
+            # Waterfill turns on DeepEP and EP after this hook.
+            "ep-size > 1": view.ep_size > 1,
+            "moe-a2a-backend": view.moe_a2a_backend != "none",
+            "enable-waterfill": cfg.enable_waterfill,
+            "pp-size > 1": cfg.pp_size > 1,
+            # Prefill only: a decode node serves plain TP.
+            "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+        }
+    else:
+        unsupported["disaggregation-mode"] = cfg.disaggregation_mode != "null"
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")
+    # Decode sees this prefill as TP cp_size, while its sender stages by
+    # attention TP 1, so the two would pick different staging layouts.
+    if cfg.disaggregation_mode == "prefill" and envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        raise ValueError(
+            "SGLANG_DISAGG_STAGING_BUFFER is not supported with CP-TP group sharing."
+        )
 
     linear_config = mambaish_config(model)
     if getattr(linear_config, "linear_num_key_heads", None) is not None:
@@ -79,12 +108,10 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
-    declare_resolution(
-        server_args,
-        "resolve_cp_tp_group_sharing",
-        enable_cp_tp_group_sharing=True,
-        # The sequence collectives have batch-dependent sizes.
-        cuda_graph_config=with_phase(
+    fields = {"enable_cp_tp_group_sharing": True}
+    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+        # Qwen's sequence collectives still have batch-dependent sizes.
+        fields["cuda_graph_config"] = with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        ),
-    )
+        )
+    declare_resolution(server_args, "resolve_cp_tp_group_sharing", **fields)

@@ -566,7 +566,11 @@ class SamplingParams:
             if self.true_cfg_scale is not None
             else self.guidance_scale
         )
-        return cfg_scale > 1.0 and self.negative_prompt is not None
+        return (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        )
 
     @classmethod
     def default_image_output_format(cls) -> str | None:
@@ -1407,7 +1411,7 @@ class SamplingParams:
             "--true-cfg-scale",
             type=float,
             dest="true_cfg_scale",
-            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image, FLUX.1)",
         )
         add_argument(
             "--guidance-rescale",
