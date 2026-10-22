@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import (
+    async_h2d,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_hip,
@@ -996,6 +997,8 @@ class ReqKvInfo:
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # Per entry of the ping-pong buffer: True where it holds no slot (-1).
+    mamba_ping_pong_empty: Optional[list[bool]] = None
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -1003,6 +1006,9 @@ class ReqKvInfo:
     # Seq len of the other ping-pong slot's state. None means what is in
     # that slot cannot be named (never written, donated, freed).
     mamba_prev_track_seqlen: Optional[int] = None
+    # Decode batch whose boundary step rode a mixed forward, which wrote no
+    # track state; the undo there leaves next == last without an in-place write.
+    mamba_untracked_decode_batch_idx: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -2088,10 +2094,12 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_ping_pong_empty = None
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.kv.mamba_prev_track_seqlen = None
+        self.kv.mamba_untracked_decode_batch_idx = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
@@ -2282,8 +2290,17 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    track_position: int
     track_seqlen: int
+
+
+def _gather_mamba_track_indices(
+    ping_pong_mapping: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    track_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Each request's ping-pong slot id at its track position, read on the device."""
+    return ping_pong_mapping[req_pool_indices, track_positions]
 
 
 def mamba_lazy_spec_in_window(
@@ -2307,10 +2324,7 @@ def set_mamba_track_indices_from_reqs(
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare).
     """
-    req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
@@ -2328,17 +2342,9 @@ def set_mamba_track_indices_from_reqs(
         i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
     ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    idx = (
-        torch.tensor(
-            track_positions,
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    positions = async_h2d(track_positions, dtype=torch.int64, device=mapping.device)
+    batch.mamba_track_indices = _gather_mamba_track_indices(
+        mapping, batch.req_pool_indices, positions
     )
     if freed_rows:
         # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
@@ -2494,9 +2500,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_start: Optional[Tuple[int, float]] = None
 
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
-
-    # Forward-pass metrics
-    fpm_start_time: float = 0.0
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
@@ -2917,7 +2920,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
         mamba_track_mask_cpu = []
-        mamba_track_indices_cpu = []
+        mamba_track_positions_cpu = []
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
@@ -2990,7 +2993,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if get_exec().mamba.enable_mamba_extra_buffer:
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
-                mamba_track_indices_cpu.append(track_entry.track_index)
+                mamba_track_positions_cpu.append(track_entry.track_position)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
 
             if self.return_logprob:
@@ -3097,21 +3100,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
+            # Ping-pong slot ids live on the device; gather them there.
+            track_positions = torch.tensor(
+                mamba_track_positions_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
+            self.mamba_track_indices = _gather_mamba_track_indices(
+                self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                self.req_pool_indices,
+                track_positions,
             )
             self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
+                mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
             self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+                mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+            ).to(self.device, non_blocking=True)
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -3173,9 +3176,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -3227,7 +3228,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
-            track_index=track_index,
+            track_position=track_position,
             track_seqlen=mamba_track_seqlen,
         )
 
@@ -3312,8 +3313,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             merged_seq_lens_cpu = None
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
+        # merge_batch drops the Mamba track fields, but checkpoint_kv_cache still
+        # donates each prefill row's track slot after this forward, so keep the
+        # prefill rows' tracking. Decode tails are not tracked in a mixed step.
+        prefill_track = None
+        if self.mamba_track_indices is not None:
+            if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                running_batch.mamba_lazy_undo_prealloc_at_boundary()
+            prefill_track = (
+                self.mamba_track_indices,
+                self.mamba_track_mask,
+                self.mamba_track_seqlens,
+                self.mamba_prefill_track_mask_cpu,
+                self.mamba_track_seqlens_cpu,
+            )
+
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if prefill_track is not None:
+            indices, mask, seqlens, mask_cpu, seqlens_cpu = prefill_track
+            untracked = torch.full(
+                (running_bs,), -1, dtype=torch.int64, device=indices.device
+            )
+            self.mamba_track_indices = torch.cat([indices, untracked])
+            self.mamba_track_mask = torch.cat([mask, untracked >= 0])
+            self.mamba_track_seqlens = torch.cat([seqlens, untracked])
+            self.mamba_prefill_track_mask_cpu = mask_cpu + [False] * running_bs
+            self.mamba_track_seqlens_cpu = seqlens_cpu + [-1] * running_bs
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
@@ -3601,7 +3627,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            if buf[other_idx].item() != -1:
+            if not req.kv.mamba_ping_pong_empty[other_idx]:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
@@ -3617,6 +3643,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # The in-flight write invalidates the keep slot's old checkpoint.
                 req.kv.mamba_last_track_seqlen = None
+
+    def mamba_lazy_undo_prealloc_at_boundary(self):
+        """Give back the slots mamba_lazy_prealloc_at_boundary handed this decode
+        batch before it rides a mixed forward, which writes no decode track state
+        and whose result path never frees them."""
+        if self.mamba_track_mask_cpu is None:
+            return
+        pool = self.req_to_token_pool
+        for req, at_boundary in zip(self.reqs, self.mamba_track_mask_cpu):
+            if not at_boundary:
+                continue
+            buf = req.kv.mamba_ping_pong_track_buffer
+            next_idx = req.kv.mamba_next_track_idx
+            req.kv.mamba_untracked_decode_batch_idx = req.decode_batch_idx
+            if buf[1 - next_idx].item() == -1:
+                # The prealloc failed, so tracking would have been in place.
+                continue
+            pool.mamba_allocator.free(buf[next_idx].unsqueeze(0))
+            pool.set_mamba_ping_pong_slot(req, next_idx, -1)
+            req.kv.mamba_next_track_idx = 1 - next_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3642,7 +3688,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
+            has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None
@@ -3986,7 +4032,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             dp_balance_stats=self.dp_balance_stats,
             prefill_stats=self.prefill_stats,
-            fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
