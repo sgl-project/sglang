@@ -75,15 +75,19 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
 class SparsePrefillWorkspace:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    The workspace contents are fully overwritten before every attention call,
-    so token buckets and compression ratios can safely share one buffer. Sparse
-    prefill executes eagerly and serially on the supported paths, which makes it
-    safe to replace the scratch allocation when a larger extent is needed.
+    Every attention call overwrites the rows it reads, except compressed rows
+    that ``SparsePrefillChunkCache.dequantized_source`` marks as already holding
+    their source's dequant, so token buckets and compression ratios can safely
+    share one buffer. Sparse prefill executes eagerly and serially on the
+    supported paths, which makes it safe to replace the scratch allocation when
+    a larger extent is needed.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        # Bumped on every reallocation, so a reused dequant never outlives its buffer.
+        self.generation = 0
 
     def get(
         self,
@@ -99,6 +103,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self.generation += 1
         return self._buffer[:num_tokens]
 
 
@@ -162,6 +167,9 @@ class SparsePrefillChunkCache:
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
     seq_lens_cpu: Optional[list[int]] = None
+    # The compressed rows the workspace head holds: layers that read one kv_source
+    # layer's cache reuse its dequant instead of repeating it.
+    dequantized_source: Optional[tuple] = None
 
     @classmethod
     def build(

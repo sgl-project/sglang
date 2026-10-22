@@ -4216,13 +4216,27 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged_dsv4(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+            # Ratio-1/2 layers read their kv_source layer's cache, which no later
+            # layer of this forward writes, so its rows are dequantized once. A
+            # captured graph replays the same layer order, so it may skip too.
+            source = (
+                extra_k_cache.data_ptr(),
+                flat_token_ids.data_ptr(),
+                self.sparse_prefill_workspace.generation,
+                n_compressed,
             )
+            if cache.dequantized_source != source:
+                dequantize_k_cache_paged_dsv4(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                )
+                cache.dequantized_source = source
+        else:
+            # The SWA rows below overwrite the workspace head.
+            cache.dequantized_source = None
         dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
