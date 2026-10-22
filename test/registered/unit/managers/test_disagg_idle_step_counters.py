@@ -15,10 +15,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
-from sglang.srt.managers.pp_prefetch_scheduler import AdmissionUpdate
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_pp_mixin import PrefillControl
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -70,39 +68,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def setUp(self):
         super().setUp()
         enter_scope(self, published_topology(role="scheduler"))
-
-    def test_shared_release_ring_preserves_native_and_admission_payloads(self):
-        control = PrefillControl(["r"], AdmissionUpdate())
-        for payload, wire in (
-            ([], []),
-            (["r"], ["r"]),
-            (PrefillControl(["r"]), ["r"]),
-            (control, [control]),
-        ):
-            for last, occupied, previous, expected in (
-                (True, True, None, wire),
-                (True, False, payload, None),
-                (False, True, payload, wire),
-                (False, True, None, None),
-            ):
-                with self.subTest(
-                    payload=payload, last=last, occupied=occupied, previous=previous
-                ):
-                    s = Scheduler.__new__(Scheduler)
-                    s.pp_group = SimpleNamespace(is_last_rank=last)
-                    s._pp_send_pyobj_to_next_stage = Mock(return_value=["work"])
-                    work, result = s._pp_pd_send_consensus_release(
-                        [payload if occupied else None], 0, previous, payload
-                    )
-                    self.assertIs(result, payload if last and occupied else previous)
-                    if expected is None:
-                        s._pp_send_pyobj_to_next_stage.assert_not_called()
-                        self.assertEqual(work, [])
-                    else:
-                        s._pp_send_pyobj_to_next_stage.assert_called_once_with(
-                            expected, async_send=True
-                        )
-                        self.assertEqual(work, ["work"])
 
     @parameterized.expand(
         [
@@ -511,6 +476,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = False
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
@@ -576,8 +542,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
-        scheduler.pp_prefetch_admission = None
-        scheduler.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
@@ -588,13 +553,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_recv_prefill_control = Mock(return_value=PrefillControl([]))
-        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
+        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
         scheduler._pp_pd_get_decode_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_send_consensus_bootstrapped_ids = Mock(return_value=([], None))
-        scheduler._pp_pd_send_consensus_release = Mock(return_value=([], None))
+        scheduler._pp_pd_send_consensus_release_ids = Mock(return_value=([], None))
         scheduler.process_prefill_chunk = Mock()
         scheduler._process_hicache_events = Mock()
         scheduler.dp_attn_adapter = SimpleNamespace(

@@ -12,6 +12,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -24,7 +25,6 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
@@ -42,7 +42,6 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.pp_prefetch_scheduler import AdmissionUpdate
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
@@ -81,18 +80,6 @@ def _pp_exchange_outputs_before_forward(
     if not spec_relay or is_last_rank or cur_batch is None:
         return False
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
-
-
-@dataclass(frozen=True)
-class PrefillControl:
-    """Transfer/release progress plus optional admission on the native PP stream.
-
-    Bootstrap stays entirely in the native PPConsensusStore. Admission rides
-    the existing transfer fold and release return; no new PP message is added.
-    """
-
-    transferred_rids: List[str]
-    admission: Optional[AdmissionUpdate] = None
 
 
 @dataclass
@@ -151,6 +138,7 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -229,25 +217,45 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
-        """Native PD prefill loop, with optional hop-by-hop cache admission.
+        """
+        This is the prefill server event loop for pipeline parallelism.
 
-        Bootstrap remains in PPConsensusStore. The transfer fold and release
-        return carry admission alongside their native RID lists. C posts those
-        same messages before model waits; A/B retain their original timing.
+        Notes:
+        1. Following the same rules as the event_loop_pp.
+        2. Adds extra steps for KV transfer process: bootstrap + release.
+
+        Prefill Server Schedule:
+        ====================================================================
+        Stage P
+        recv ith req from previous stage
+        pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
+        recv ith transferred req from previous stage
+        recv ith proxy from previous stage
+        run ith batch
+        recv prev (i+1) % mb_size th release req from previous stage
+        local consensus on release req
+        recv prev (i+1) % mb_size th outputs
+        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
+        send ith req to next stage
+        send ith transferred req to next stage
+        send ith proxy to next stage
+        send current stage's outputs to next stage (can be stashed and delayed to send later)
+
+        the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
+        ====================================================================
+
+        Release Requests still use the two-pass PP consensus. Bootstrap uses
+        PPConsensusStore instead of the legacy two-round RID sync.
+
         """
         self.init_pp_loop_state()
-        async_admission = pp_cache_admission_enabled()
-        if async_admission:
-            from sglang.srt.managers.pp_prefetch_scheduler import PPAdmissionGate
 
-            self.pp_prefetch_admission = PPAdmissionGate(self, parallel=get_parallel())
-            self.tree_cache.cache_controller.layer_done_counter.configure_overlap_capacity(
-                self.pp_loop_size
-            )
-        control_slots: List[Optional[PrefillControl]] = [None] * self.pp_loop_size
-        returned_control: Optional[PrefillControl] = None
-        send_forward_control_work = []
-        send_return_control_work = []
+        # PD additional state initialization
+        tmbs = [None] * self.pp_loop_size
+        transferred_rids: List[str] = []
+        release_rids: Optional[List[str]] = None
+        send_transfer_work = []
+        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -260,61 +268,32 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
-                next_returned_control = None
+                next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
+
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 self.process_bootstrapped_queue()
-                incoming_control = None
-                if not self.pp_group.is_first_rank:
-                    incoming_control = self._pp_recv_prefill_control()
-                    if self.pp_prefetch_admission is not None:
-                        self.pp_prefetch_admission.receive_forward(
-                            incoming_control.admission
-                        )
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids(
-                    incoming_control.transferred_rids
-                    if incoming_control is not None
-                    else None
-                )
-                self._pp_commit_comm_work(send_forward_control_work)
+
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
+                tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
                 self._process_hicache_events()
-                admission_update = None
-                if self.pp_prefetch_admission is None:
-                    prefill_plan = self.get_new_batch_prefill(self.running_batch)
-                else:
-                    prefill_plan, admission_update = (
-                        self.pp_prefetch_admission.select_batch(self.running_batch)
-                    )
-                forward_control = PrefillControl(transferred_rids, admission_update)
-                control_slots[mb_id] = forward_control
+                prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
-
-                if async_admission:
-                    (
-                        send_return_control_work,
-                        returned_control,
-                        self.send_req_work,
-                        send_forward_control_work,
-                    ) = self._pp_pd_post_prefill_control(
-                        control_slots,
-                        next_first_rank_mb_id,
-                        returned_control,
-                        forward_control,
-                        recv_reqs,
-                    )
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -347,23 +326,16 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if not async_admission:
-                    send_return_control_work, returned_control = (
-                        self._pp_pd_send_consensus_release(
-                            control_slots,
-                            next_first_rank_mb_id,
-                            returned_control,
-                            forward_control,
-                        )
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
+                )
 
-                if control_slots[next_mb_id] is not None:
-                    next_returned_control = self._pp_recv_prefill_control()
-                    if self.pp_prefetch_admission is not None:
-                        self.pp_prefetch_admission.consume_return(
-                            next_returned_control.admission
-                        )
-                self._pp_commit_comm_work(send_return_control_work)
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
+                # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
@@ -372,25 +344,24 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if control_slots[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(
-                        next_returned_control.transferred_rids
-                    )
+                if tmbs[next_mb_id] is not None:
+                    self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    if not async_admission:
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs, async_send=True
-                        )
-                        send_forward_control_work = self._pp_send_pd_control(
-                            forward_control
-                        )
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
-                returned_control = next_returned_control
+                release_rids = next_release_rids
+
                 self.running_batch.batch_is_full = False
 
+            # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
                 if len(self.disagg_prefill_inflight_queue) == 0:
@@ -432,6 +403,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self._pp_prefetch_step()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -513,8 +485,10 @@ class SchedulerPPMixin:
                     )
                 )
 
-                send_release_work, release_rids = self._pp_pd_send_consensus_release(
-                    tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                    )
                 )
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
@@ -641,33 +615,29 @@ class SchedulerPPMixin:
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
-    def _pp_recv_prefill_control(self: Scheduler) -> PrefillControl:
-        """Decode transfer/release framing without changing native A/B payloads."""
-        wire = self._pp_recv_pyobj_from_prev_stage()
-        if self.pp_prefetch_admission is None:
-            return PrefillControl(wire)
-        return wire[0]
-
-    def _pp_send_pd_control(self: Scheduler, control: PrefillControl | List[str]):
-        # Decode keeps its RID list. Prefill frames admission only on the async
-        # path; native A/B payloads and the P2P/TP helper's List contract stay intact.
-        if isinstance(control, PrefillControl):
-            control = (
-                [control] if control.admission is not None else control.transferred_rids
+    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+        # get the current stage transfer success
+        if self.pp_group.is_first_rank:
+            transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
             )
-        return self._pp_send_pyobj_to_next_stage(control, async_send=True)
-
-    def _pp_pd_get_prefill_transferred_ids(
-        self: Scheduler, previous_rids: Optional[List[str]] = None
-    ):
-        """Fold native transfer completion; framing belongs to the caller."""
-        transferred_rids = self.get_rids(
-            self.disagg_prefill_inflight_queue,
-            True,
-            [KVPoll.Success, KVPoll.Failed],
-        )
-        if previous_rids is not None:
-            transferred_rids = list(set(previous_rids) & set(transferred_rids))
+        # if other ranks, do intersection with the previous rank's transferred rids
+        else:
+            # 2 (Release): Receive the transferred rids from the previous rank
+            # 1. recv previous stage's transferred reqs info
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                True,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
         return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
@@ -693,52 +663,27 @@ class SchedulerPPMixin:
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
 
-    def _pp_pd_post_prefill_control(
-        self,
-        control_slots,
-        next_first_rank_mb_id,
-        returned_control,
-        forward_control,
-        recv_reqs,
-    ):
-        """Post control before model waits, preserving the native wire order.
-
-        No receive/work wait is moved. The shared ordered CPU stream remains:
-        return release/control, forward requests, forward transfer/control.
-        """
-        return_control_work, returned_control = self._pp_pd_send_consensus_release(
-            control_slots,
-            next_first_rank_mb_id,
-            returned_control,
-            forward_control,
-        )
-        request_work, forward_control_work = [], []
-        if not self.pp_group.is_last_rank:
-            request_work = self._pp_send_pyobj_to_next_stage(recv_reqs, async_send=True)
-            forward_control_work = self._pp_send_pd_control(forward_control)
-        return (
-            return_control_work,
-            returned_control,
-            request_work,
-            forward_control_work,
-        )
-
-    def _pp_pd_send_consensus_release(
+    def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        control_slots: List[Optional[List[str] | PrefillControl]],
+        tmbs: List[List[str]],
         next_first_rank_mb_id: int,
-        returned_control: Optional[List[str] | PrefillControl],
-        forward_control: List[str] | PrefillControl,
+        release_rids: List[str],
+        transferred_rids: List[str],
     ):
-        """Native release ring for both Decode RIDs and Prefill control."""
-        work = []
+        send_release_work = []
         if self.pp_group.is_last_rank:
-            if control_slots[next_first_rank_mb_id] is not None:
-                returned_control = forward_control
-                work = self._pp_send_pd_control(returned_control)
-        elif returned_control is not None:
-            work = self._pp_send_pd_control(returned_control)
-        return work, returned_control
+            if tmbs[next_first_rank_mb_id] is not None:
+                release_rids = transferred_rids
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        # 4 (Release): send the release rids from non last rank to the next rank
+        else:
+            if release_rids is not None:
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        return send_release_work, release_rids
 
     def _pp_record_comm_event(self: Scheduler) -> Optional[torch.Event]:
         """Mark the tail of the PP comm stream; None when not overlapping."""
@@ -804,7 +749,26 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_prefetch_step(self: Scheduler):
+        # All native PP loops (unified, P and D) use the same completion path.
+        # No traffic is added to L2-only deployments; runtime attach can enable
+        # it after the normal request relay has applied attach on every stage.
+        if not self.enable_hierarchical_cache or not self.tree_cache.enable_storage:
+            return
+        consensus = self.tree_cache.cache_controller.pp_prefetch_consensus
+        consensus.advance(
+            lambda: self._pp_recv_pyobj_from_prev_stage(
+                tag=P2PTag.HICACHE_PREFETCH_COMPLETION
+            )[0],
+            lambda update: self._pp_send_pyobj_to_next_stage(
+                [update], async_send=True, tag=P2PTag.HICACHE_PREFETCH_COMPLETION
+            ),
+            self.pp_loop_size,
+        )
+
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler, data, async_send: bool = False, *, tag: int = 0
+    ):
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -821,10 +785,11 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 async_send=async_send,
+                tag=tag,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, *, tag: int = 0):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
                 get_parallel().attn_dp_rank
@@ -839,6 +804,7 @@ class SchedulerPPMixin:
                 * get_parallel().tp_size
                 + dp_offset,
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                tag=tag,
             )
         else:
             data = None

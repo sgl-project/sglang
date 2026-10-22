@@ -64,7 +64,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_enabled
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -366,17 +365,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
-        Agree cache progress within a stage and, on the native path, across PP.
+        Synchronize data across all TP and PP ranks.
 
-        Native: PP0's attention groups reduce, then propagate to following stages.
-        Async admission: every stage reduces locally; the Gate coordinates the
-        usable request prefix instead of synchronizing cache-event progress.
+        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
+        and then the result is propagated to all following PP ranks.
 
         Must be called in the scheduler thread.
         """
-        if pp_cache_admission_enabled():
-            self._all_reduce_attn_groups(data, tp_reduce_op)
-            return
         if self.pp_rank == 0:
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
@@ -1782,8 +1777,6 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         mem_quota: Optional[int] = None,
         req=None,
-        *,
-        skip_load_back_threshold: bool = False,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
@@ -1810,7 +1803,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
-                skip_load_back_threshold=skip_load_back_threshold,
             )
             return success
         finally:
@@ -1826,7 +1818,6 @@ class UnifiedRadixCache(BasePrefixCache):
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
-        skip_load_back_threshold: bool = False,
     ) -> bool:
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
@@ -1840,8 +1831,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
-        threshold = 1 if skip_load_back_threshold else max(1, self.load_back_threshold)
-        if (kv_tokens < threshold and not comp_xfers) or (
+        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -2066,7 +2056,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
             self.cache_controller.register_cache_query(
-                req.cache_request_handle, key, transfers
+                req.cache_request_handle,
+                key,
+                transfers,
+                req.storage_prefetch_retry_attempts,
             )
 
     def _build_prefetch_component_transfers(self, node_id, key, last_hash):
@@ -2316,14 +2309,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
 
-    def get_admission_storage_span(
-        self, request: CacheRequestHandle
-    ) -> Optional[tuple[int, int]]:
-        """Peek native L3 attribution while a PP certificate is deferred."""
-        count = self.prefetch_loaded_tokens_by_reqid.get(request, 0)
-        start = self.prefetch_loaded_storage_start_by_reqid.get(request)
-        return (start, start + count) if count > 0 and start is not None else None
-
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
         with self.cache_controller.pp_prefetch_state_lock:
@@ -2417,52 +2402,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.prefetch_stop_policy == "timeout":
                 self._mark_prefetch_deadline_expired(operation)
 
-        return self.finalize_prefetch(request)
-
-    def prefetch_ready_to_finalize(
-        self, requests: list[CacheRequestHandle]
-    ) -> list[bool]:
-        """Stage-local stop permissions, without terminating or publishing.
-
-        Called once per scheduler beat for not-yet-ready queued requests. The
-        timeout clock is sampled even when no ACK arrives. A single batched
-        TP/CP reduction agrees the permissions; never a cross-PP collective.
-        Native request/ACK order already agrees the list within the stage.
-        """
-        if not requests:
-            return []
-        policy = self.prefetch_stop_policy
-        if policy == "best_effort":
-            return [True] * len(requests)
-        ready = []
-        for request in requests:
-            info = self.ongoing_prefetch.get(request)
-            done = info is None or info.operation.is_terminated()
-            if not done and policy == "timeout":
-                done = self._prefetch_deadline_expired(info.operation)
-                if not done:
-                    self._start_storage_prefetch_wait(info.operation)
-            ready.append(done)
-        flags = torch.tensor(ready, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(flags, torch.distributed.ReduceOp.MAX)
-        ready = flags.bool().tolist()
-        if policy == "timeout":
-            for request, done in zip(requests, ready):
-                info = self.ongoing_prefetch.get(request)
-                if done and info is not None and not info.operation.is_terminated():
-                    self._mark_prefetch_deadline_expired(info.operation)
-        return ready
-
-    def finalize_prefetch(self, request: CacheRequestHandle) -> bool:
-        """Publish the ACK-safe prefix after the scheduler grants stop permission.
-
-        Natural completion may already have published it. Marking termination
-        does not join a worker: the native ACK path still owns unfinished tails.
-        """
-        info = self.ongoing_prefetch.get(request)
-        if info is None:
-            return True
-        operation = info.operation
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             if operation.deadline_expired:
@@ -2495,9 +2434,8 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[request]
 
-        # ACKs already agree within the controller's selected sync groups.
-        # With async admission, stages may publish different lengths; the Gate
-        # later agrees a full prefix. Publishing needs no extra collective here.
+        # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
+        # and `pool_hits` in their operations are same.  No need to sync cross-rank here.
         if not self._check_hybrid_prefetch_result(
             request, operation, hash_value, host_indices
         ):
@@ -2824,8 +2762,6 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
-        if pp_cache_admission_enabled():
-            self.cache_controller.release_pp_prefetch(rid)
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(rid)
@@ -3080,8 +3016,10 @@ class UnifiedRadixCache(BasePrefixCache):
             """If n is None, consume all items from the queue.
             Otherwise, consume n items from the queue.  Blocking if there are no enough n items.
 
-            Counts are agreed within a stage. The native PP path relays PP0's
-            counts; async admission uses each stage's own counts (see _all_reduce).
+            In TP, each rank consumes the a minimal number of items of all ranks.
+            In PP, each rank consumes the exact number of items of PP0.  Refer to _pp_sync for more details.
+
+            This prevents TP/PP divergence.
             """
             if n is None:
                 while not q.empty():
@@ -3090,7 +3028,7 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 for _ in range(n):
                     # Block when there are not enough elements.
-                    # Peers in the selected sync scope consume the agreed count.
+                    # All TP/PP ranks must consume the same number of elements.
                     item = q.get()
                     yield item
 
@@ -3215,15 +3153,15 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                if not buffer_mode and cc.pp_prefetch_command_group is not None:
+                    operation = cc.resolve_cache_query(operation)
+                    if operation is None:
+                        continue
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
-                if (
-                    pp_cache_admission_enabled()
-                    and info is not None
-                    and info.operation is not operation
-                ):
+                if info is not None and info.operation is not operation:
                     # Reject late old queries once, before accounting/allocation.
                     # The cache-mode allocator below is called synchronously in
                     # this scheduler thread; only native buffer mode parks hits.
@@ -3480,11 +3418,7 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
-        if cc is None or (
-            self.pp_rank > 0
-            and self.host_memory_mode != "buffer_only"
-            and not pp_cache_admission_enabled()
-        ):
+        if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
             # Zero placeholders shaped like PP0's slots: _pp_sync hands the
@@ -3564,7 +3498,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Every rank must enter the all_reduce below; ongoing_write_through can
             # diverge across ranks (e.g. write_backup returning 0 on a subset).
             finish_count = 0
-            if self.pp_rank == 0 or pp_cache_admission_enabled():
+            if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_write_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
@@ -3605,7 +3539,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Every rank must enter the all_reduce below; ongoing_load_back can
             # diverge across ranks.
             finish_count = 0
-            if self.pp_rank == 0 or pp_cache_admission_enabled():
+            if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
             # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
             # equal iff reclaim victim order matched on every rank.
@@ -3676,12 +3610,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(
-                best_match_node_id,
-                mem_quota,
-                req=req,
-                skip_load_back_threshold=params.skip_load_back_threshold,
-            ):
+            if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )

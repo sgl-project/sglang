@@ -69,41 +69,38 @@ def _cache_query_ranks(rank, rendezvous):
         c._storage_hit_query.side_effect = lambda op: case.query_hits(
             op, 0 if op.request_id == "miss" and rank == 1 else (12, 32, 20)[rank]
         )
-        with patch(
-            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
-            return_value=True,
-        ):
-            if rank == 0:
-                for rid in ("hit", "miss"):
-                    case.register_cache_query(rid)
-                local = case.bind_cache_query("hit", start=local_start)
-                # PP0 submits "miss" even without a local prefetch operation.
-                c.pp_prefetch_command_queue.put(None)
-            c.pp_prefetch_command_thread_func()
-            if rank != 0:
-                # The shared query arrived before this stage's native request.
-                case.register_cache_query("hit")
-                local = case.bind_cache_query("hit", start=local_start)
-                if rank != 2:
-                    missed = case.bind_cache_query("miss")
-            assert c.prefetch_hit_queue.get_nowait() is local
-            assert c.pp_prefetch_states["hit"].operation.storage_hit_count == 12
-            expected_suffix = (0, 4, 0)[rank]
-            assert local.storage_hit_count == expected_suffix
-            assert (
-                local.all_hash_values
-                == c.pp_prefetch_states["hit"].operation.all_hash_values[
-                    local_start // 4 :
-                ]
-            )
-            assert local.hash_value == local.all_hash_values[: expected_suffix // 4]
-            if rank == 1:
-                assert c.prefetch_hit_queue.get_nowait() is missed
-                assert missed.storage_hit_count == 0
-            # PP0 and PP2 joined the second query without a local GET.
-            assert c.prefetch_hit_queue.empty()
-            assert c.pp_prefetch_states["miss"].ready_event.is_set()
-            c.mem_pool_host.alloc.assert_not_called()
+        if rank == 0:
+            case.register_cache_query("hit")
+            local = case.bind_cache_query("hit", start=local_start)
+            case.register_cache_query("miss")
+            # PP0 submits "miss" even without a local prefetch operation.
+            c.pp_prefetch_command_queue.put(None)
+        c.pp_prefetch_command_thread_func()
+        if rank != 0:
+            # The shared query arrived before this stage's native request.
+            case.register_cache_query("hit")
+            local = case.bind_cache_query("hit", start=local_start)
+            case.register_cache_query("miss")
+            if rank != 2:
+                missed = case.bind_cache_query("miss")
+        hit = c.prefetch_hit_queue.get_nowait()
+        assert hit.operation.storage_hit_count == 12
+        assert c.resolve_cache_query(hit) is local
+        expected_suffix = (0, 4, 0)[rank]
+        assert local.storage_hit_count == expected_suffix
+        assert (
+            local.all_hash_values == hit.operation.all_hash_values[local_start // 4 :]
+        )
+        assert local.hash_value == local.all_hash_values[: expected_suffix // 4]
+        if rank == 1:
+            assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is missed
+            assert missed.storage_hit_count == 0
+        else:
+            assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is None
+        # PP0 and PP2 joined the second query without a local GET.
+        assert c.prefetch_hit_queue.empty()
+        assert not c.pp_prefetch_states
+        c.mem_pool_host.alloc.assert_not_called()
     finally:
         torch.distributed.destroy_process_group()
 
@@ -135,6 +132,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.prefetch_hit_queue = Queue()
         c.prefetch_sync_queue = Queue()
         c.ack_prefetch_queue = Queue()
+        c.pp_prefetch_consensus = None  # Publisher-only tests; ring has a Gloo test.
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
@@ -162,6 +160,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.pp_rank = 1
+        cache.host_memory_mode = c.host_memory_mode
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
         cache._all_reduce = Mock()
@@ -233,11 +232,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
 
-    def register_cache_query(self, rid="hit"):
+    def register_cache_query(self, rid="hit", attempt=0):
         self.c.register_cache_query(
-            CacheRequestHandle(rid, 0), RadixKey(array("q", range(32))), []
+            CacheRequestHandle(rid, 0), RadixKey(array("q", range(32))), [], attempt
         )
-        return self.c.pp_prefetch_states[rid].ticket
+        return self.c.pp_cache_query.ticket
 
     def bind_cache_query(self, rid="hit", *, start=8):
         return self.c.submit_prefetch(
@@ -254,68 +253,85 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c = self.c
         c.host_memory_mode = "cache"
         c._storage_hit_query.side_effect = lambda op: self.query_hits(op, 20)
-        with patch(
-            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
-            return_value=True,
-        ):
-            for query_first in (False, True):
-                with self.subTest(query_first=query_first):
-                    rid = str(query_first)
-                    c.storage_config.pp_rank = 0
-                    ticket = self.register_cache_query(rid)
-                    self.register_cache_query(rid)
-                    self.assertIs(c.pp_prefetch_command_queue.get_nowait(), ticket)
-                    self.assertTrue(c.pp_prefetch_command_queue.empty())
-                    c.storage_config.pp_rank = 1
-                    if query_first:
-                        self.run_commands(ticket)
-                    self.register_cache_query(rid)
-                    local = self.bind_cache_query(rid)
-                    if not query_first:
-                        self.run_commands(ticket)
-                    self.assertIs(c.prefetch_hit_queue.get_nowait(), local)
-                    self.assertEqual(local.storage_hit_count, 12)
-                    self.assertEqual(
-                        local.all_hash_values,
-                        c.pp_prefetch_states[rid].operation.all_hash_values[2:],
-                    )
-                    self.assertEqual(local.hash_value, local.all_hash_values[:3])
-                    self.assertFalse(local.assume_stored)
-                    c._publish_cache_query(c.pp_prefetch_states[rid])
-                    self.assertTrue(c.prefetch_hit_queue.empty())
-                    self.assertTrue(c.pp_prefetch_command_queue.empty())
-            c.mem_pool_host.alloc.assert_not_called()
+        for query_first in (False, True):
+            with self.subTest(query_first=query_first):
+                rid = str(query_first)
+                c.storage_config.pp_rank = 0
+                ticket = self.register_cache_query(rid)
+                self.register_cache_query(rid)
+                self.assertIs(c.pp_prefetch_command_queue.get_nowait(), ticket)
+                self.assertTrue(c.pp_prefetch_command_queue.empty())
+                c.storage_config.pp_rank = 1
+                if query_first:
+                    self.run_commands(ticket)
+                self.register_cache_query(rid)
+                local = self.bind_cache_query(rid)
+                if not query_first:
+                    self.run_commands(ticket)
+                result = c.prefetch_hit_queue.get_nowait()
+                self.assertIs(c.resolve_cache_query(result), local)
+                self.assertEqual(local.storage_hit_count, 12)
+                self.assertEqual(
+                    local.all_hash_values,
+                    result.operation.all_hash_values[2:],
+                )
+                self.assertEqual(local.hash_value, local.all_hash_values[:3])
+                self.assertFalse(local.assume_stored)
+                self.assertTrue(c.prefetch_hit_queue.empty())
+                self.assertTrue(c.pp_prefetch_command_queue.empty())
+        c.mem_pool_host.alloc.assert_not_called()
 
     def test_cache_cancel_and_query_error_preserve_next_query(self):
         c = self.c
         c.host_memory_mode = "cache"
-        with patch(
-            f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
-            return_value=True,
-        ):
-            for rid in ("cancelled", "failed", "next"):
-                self.register_cache_query(rid)
-            self.bind_cache_query("cancelled")
-            self.assertFalse(c.release_pp_prefetch("cancelled"))
-            failed, following = (
-                self.bind_cache_query("failed"),
-                self.bind_cache_query("next"),
+        operations = []
+        for rid in ("cancelled", "failed", "next"):
+            self.register_cache_query(rid)
+            operations.append(self.bind_cache_query(rid))
+        cancelled, failed, following = operations
+        c.terminate_prefetch(cancelled)
+        self.assertFalse(c.release_pp_prefetch("cancelled"))
+
+        def query(op):
+            if op.request_id == "failed":
+                raise RuntimeError("query failed")
+            return self.query_hits(op, 20)
+
+        c._storage_hit_query.side_effect = query
+        self.run_commands()
+        self.assertIs(
+            c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), cancelled
+        )
+        self.assertEqual(cancelled.storage_hit_count, 0)
+        self.assertIs(c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), failed)
+        self.assertEqual(failed.storage_hit_count, 0)
+        self.assertIs(
+            c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), following
+        )
+        self.assertTrue(c.prefetch_hit_queue.empty())
+        self.assertFalse(c.pp_prefetch_states)
+        self.assertEqual(c._all_reduce.call_count, 3)
+        self.assertEqual(c._storage_hit_query.call_count, 2)
+
+    def test_cache_retry_does_not_overwrite_unconsumed_peer_query(self):
+        c = self.c
+        c.host_memory_mode = "cache"
+        c.storage_config.pp_rank = 1
+        first = self.register_cache_query(attempt=0)
+        old = self.bind_cache_query()
+        hits = iter((0, 20))
+        c._storage_hit_query.side_effect = lambda op: self.query_hits(op, next(hits))
+        # PP0 can retry before the peer's scheduler consumes the first result.
+        self.run_commands(first, replace(first, cache_attempt=1))
+        self.register_cache_query(attempt=1)
+        new = self.bind_cache_query()
+        for operation, expected in ((old, 0), (new, 12)):
+            self.assertIs(
+                c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), operation
             )
-
-            def query(op):
-                if op.request_id == "failed":
-                    raise RuntimeError("query failed")
-                return self.query_hits(op, 20)
-
-            c._storage_hit_query.side_effect = query
-            self.run_commands()
-            self.assertNotIn("cancelled", c.pp_prefetch_states)
-            self.assertIs(c.prefetch_hit_queue.get_nowait(), failed)
-            self.assertEqual(failed.storage_hit_count, 0)
-            self.assertIs(c.prefetch_hit_queue.get_nowait(), following)
-            self.assertTrue(c.prefetch_hit_queue.empty())
-            self.assertEqual(c._all_reduce.call_count, 3)
-            self.assertEqual(c._storage_hit_query.call_count, 2)
+            self.assertEqual(operation.storage_hit_count, expected)
+        self.assertFalse(c.pp_prefetch_states)
+        self.assertEqual(c._storage_hit_query.call_count, 2)
 
     def test_cache_query_real_broadcast_min_and_late_binding(self):
         with tempfile.TemporaryDirectory() as directory:

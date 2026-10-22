@@ -122,13 +122,13 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def test_pp_prefill_drains_before_admission(self):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
-        s.pp_prefetch_admission = None
         s.pp_loop_size = 1
         enter_scope(self, published_topology(pp_size=2))
-        s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
+        s._pp_prefetch_step = self.calls.completion
         s.waiting_queue = []
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
@@ -142,7 +142,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
 
         self.assertEqual(
             self.calls.mock_calls,
-            [call.drain(), call.retry(), call.admit(self.running_batch)],
+            [
+                call.completion(),
+                call.drain(),
+                call.retry(),
+                call.admit(self.running_batch),
+            ],
         )
 
 

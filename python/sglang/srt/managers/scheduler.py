@@ -299,7 +299,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
-from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_enabled
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -1297,7 +1296,6 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
-        self.pp_prefetch_admission = None
         self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
         self._event_loop_should_restart = False
@@ -3256,21 +3254,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            not pp_cache_admission_enabled()
-            and get_parallel().pp_rank == 0
-            and getattr(
-                self.tree_cache.cache_controller, "pp_prefetch_command_group", None
-            )
+        if get_parallel().pp_rank == 0 and getattr(
+            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
-        if (
-            self.pp_prefetch_admission is not None
-            and self.pp_prefetch_admission.reject_unsupported(req)
-        ):
-            return
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3290,9 +3279,13 @@ class Scheduler(
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            if pp_cache_admission_enabled():
-                tree_cache.register_pp_prefetch_query(req)
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
+            if (
+                self.enable_hicache_storage
+                and not buffer_mode
+                and tree_cache.cache_controller.pp_prefetch_command_group is not None
+            ):
+                tree_cache.register_pp_prefetch_query(req)
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -3341,10 +3334,6 @@ class Scheduler(
 
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
-        if pp_cache_admission_enabled():
-            # The gate uses the ingress attempt and native completed result.
-            # Do not replace an operation behind a readiness/prefix promise.
-            return
         retries = self.tree_cache.storage_prefetch_retries
         if retries is None:
             return
@@ -3498,8 +3487,6 @@ class Scheduler(
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
-        if self.pp_prefetch_admission is not None:
-            self.pp_prefetch_admission.release(req)
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
@@ -4004,9 +3991,7 @@ class Scheduler(
 
         return res
 
-    def get_new_batch_prefill(
-        self, running_batch: ScheduleBatch, *, admission=None
-    ) -> NextBatchPlan:
+    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -4020,7 +4005,6 @@ class Scheduler(
         ret, running_batch = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
-            admission=admission,
         )
 
         if self.prefill_delayer:
@@ -4038,7 +4022,6 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
-        admission=None,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -4054,9 +4037,8 @@ class Scheduler(
             # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
-        candidates = self.waiting_queue if admission is None else admission.candidates
         if (
-            running_batch.batch_is_full or len(candidates) == 0
+            running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
 
@@ -4086,12 +4068,11 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        if admission is None or admission.expected_layout is None:
-            self.policy.calc_priority(
-                candidates,
-                running_batch,
-                processed_tokens=self.processed_tokens_counter,
-            )
+        self.policy.calc_priority(
+            self.waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+        )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4130,35 +4111,18 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            waiting_queue_len=len(candidates),
+            waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            reserved_tokens=admission.reserved_tokens if admission is not None else 0,
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            if admission is None or admission.expected_layout is None:
-                adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                    self.chunked_req,
-                    candidates,
-                    adder.rem_chunk_tokens or 0,
-                    self.page_size,
-                )
-            else:
-                # Replay PP0's existing (rid, prefix_len, extend_end) layout;
-                # no extra end field or PP message is needed. This primarily
-                # handles shortest-prefill-first: it may shorten the active
-                # chunk for waiting requests that are absent from a peer's
-                # selected-RID view. Recomputing that policy locally could
-                # change extend_end, even with the same agreed prefix length.
-                adder.chunked_req_limit = next(
-                    (
-                        end - start
-                        for rid, start, end in admission.expected_layout
-                        if rid == self.chunked_req.rid
-                    ),
-                    None,
-                )
+            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                self.chunked_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -4170,16 +4134,16 @@ class Scheduler(
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
-                    candidates,
+                    self.waiting_queue,
                     running_batch.reqs,
                 )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(candidates))
+            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in candidates:
+        for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
@@ -4215,9 +4179,7 @@ class Scheduler(
                 ):
                     break
 
-            if admission is None and (
-                self.enable_hicache_storage or self.enable_lmcache
-            ):
+            if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4237,15 +4199,11 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            certified_prefix_len = None
-            if admission is not None:
-                certified_prefix_len = admission.prepare_request(req, self.tree_cache)
-            else:
-                req.init_next_round_input(self.tree_cache)
-                if self.enable_hicache_storage and self._prefetch_after_device_hit_loss(
-                    req
-                ):
-                    continue
+            req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage and (
+                self._prefetch_after_device_hit_loss(req)
+            ):
+                continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
@@ -4255,7 +4213,6 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
-                certified_prefix_len=certified_prefix_len,
             )
 
             if self.enable_lora:
@@ -5333,8 +5290,6 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
-            if self.pp_prefetch_admission is not None:
-                idle &= not self.pp_prefetch_admission.has_pending_work()
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5386,21 +5341,6 @@ class Scheduler(
         if not self.enable_hierarchical_cache:
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
-            )
-
-        # The event loop and DSA backend were selected at startup. Attaching
-        # L3 must not turn on cache-side admission without their counterparts.
-        # An already-active admission may still update the same backend's
-        # policy; the native attachment validates that operation below.
-        if self.pp_prefetch_admission is None and pp_cache_admission_enabled(
-            storage_backend=recv_req.hicache_storage_backend
-        ):
-            return AttachHiCacheStorageReqOutput(
-                success=False,
-                message=(
-                    "Reject attach: enabling PP cache admission requires a restart "
-                    "with the L3 storage backend configured at startup."
-                ),
             )
 
         if not self.is_fully_idle():
@@ -5457,18 +5397,6 @@ class Scheduler(
         if not self.enable_hierarchical_cache:
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
-            )
-
-        # Detach would disable the cache-side profile gate, but cannot replace
-        # the running PP event loop or its admission coordinator. Reject before
-        # touching the controller, queues or runtime configuration.
-        if self.pp_prefetch_admission is not None:
-            return DetachHiCacheStorageReqOutput(
-                success=False,
-                message=(
-                    "Reject detach: PP cache admission is a startup execution path. "
-                    "Restart without L3 to use native L2-only scheduling."
-                ),
             )
 
         if not self.is_fully_idle():

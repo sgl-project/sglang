@@ -323,9 +323,10 @@ class TestStoragePrefetchTimeout(unittest.TestCase):
         req._compute_max_prefix_len = lambda n: n - 1
         cache.cache_controller.register_cache_query = Mock()
         cache.register_pp_prefetch_query(req)
-        handle, key, transfers = (
+        handle, key, transfers, attempt = (
             cache.cache_controller.register_cache_query.call_args.args
         )
+        self.assertEqual(attempt, 0)
         self.assertEqual(handle, req.cache_request_handle)
         self.assertEqual(len(key), 8)
         self.assertEqual(
@@ -336,23 +337,6 @@ class TestStoragePrefetchTimeout(unittest.TestCase):
             ],
         )
         swa._swa_kv_pool_host.alloc.assert_not_called()
-
-    def test_async_readiness_uses_native_deadline_and_finalize(self):
-        cache, operation = _timeout_fixture("cache")
-        cache._all_reduce_attn_groups = Mock()
-        with patch("time.perf_counter", return_value=10.0) as clock:
-            self.assertEqual(cache.prefetch_ready_to_finalize([_REQ]), [False])
-            clock.return_value = 13.0
-            self.assertEqual(cache.prefetch_ready_to_finalize([_REQ]), [True])
-        self.assertTrue(operation.deadline_expired)
-        self.assertTrue(cache._storage_prefetch_wait[_REQ].expired)
-        self.assertIn(_REQ, cache.ongoing_prefetch)  # READY is not finalization.
-        cache.finalize_prefetch(_REQ)
-        self.assertNotIn(_REQ, cache.ongoing_prefetch)
-        cache.storage_prefetch_retries.refetch(_REQ.rid)
-        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
-        self.assertNotIn(_REQ, cache.ongoing_prefetch)
-        self.assertFalse(cache.storage_prefetch_retries._pending)
 
     def test_metric_episodes_do_not_restart_the_timeout(self):
         """Closing a wait-metric episode on readiness must not restart the

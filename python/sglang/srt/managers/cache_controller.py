@@ -42,7 +42,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_enabled
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -89,19 +88,6 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
-
-    def configure_overlap_capacity(self, max_inflight: int):
-        """Size the load-event ring before any load or consumer is scheduled."""
-        if max_inflight < 1:
-            raise ValueError("Load overlap capacity must be positive")
-        if self.producer_index != -1 or self.consumer_index != -1:
-            raise RuntimeError("Cannot resize load events after scheduling starts")
-        target = max(self.num_counters, max_inflight)
-        self.events.extend(
-            LayerLoadingEvent(self.num_layers)
-            for _ in range(target - self.num_counters)
-        )
-        self.num_counters = target
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -365,6 +351,17 @@ class HiCacheController:
         self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
         self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
         self.ack_prefetch_queue = Queue[PrefetchAck]()
+        # Stage-agreed ACKs wait here for the PP loop, never for another PP
+        # stage in the background completion worker.
+        self.pp_prefetch_ack_queue = Queue[PrefetchAck]()
+        self.pp_prefetch_consensus = None
+        if (
+            self.pp_group is not None
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            from sglang.srt.managers.pp_prefetch_scheduler import PPPrefetchConsensus
+
+            self.pp_prefetch_consensus = PPPrefetchConsensus(self)
         self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
@@ -621,7 +618,7 @@ class HiCacheController:
             # from other collectives and consistent across CPxTP participants.
             self.prefetch_hits_sync_groups = self._create_sync_groups()
             self.prefetch_completion_sync_groups = self._create_sync_groups(
-                include_pp=not pp_cache_admission_enabled()
+                include_pp=False
             )
 
             # Select the get and set functions
@@ -688,6 +685,8 @@ class HiCacheController:
         # previous partial detach. We attempt cleanup whenever possible.
         try:
             self._stop_storage_threads()
+            if self.pp_prefetch_consensus is not None:
+                self.pp_prefetch_consensus.reset(publish_finished=True)
         except Exception as e:
             # Do not proceed tearing down backend/process group if threads are not
             # fully stopped; otherwise still-alive threads may touch released state.
@@ -790,6 +789,8 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
+        if self.pp_prefetch_consensus is not None:
+            self.pp_prefetch_consensus.reset()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1213,11 +1214,6 @@ class HiCacheController:
             sidecar_hits = count_pool_hits(sidecar_results)
 
         # Clamp to minimal number of hits.
-        if pp_cache_admission_enabled():
-            # A missing required DSA sidecar result cannot certify KV bytes.
-            return min(
-                [kv_hits] + [sidecar_hits.get(t.name, 0) for t in kv_derived_transfers]
-            )
         return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
@@ -1436,16 +1432,22 @@ class HiCacheController:
                 continue
 
     def prefetch_sync_thread_func(self):
-        """Synchronize prefetch results across all PP and TP ranks."""
+        """Agree completion within the stage; PP publication belongs to its loop."""
         while not self.storage_stop_event.is_set():
             try:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
                 if ack is None:
                     continue
                 self._reduce_prefetch_ack(ack)
-                self.ack_prefetch_queue.put(ack)
+                if self.pp_prefetch_consensus is None:
+                    self._publish_prefetch_ack(ack)
+                else:
+                    self.pp_prefetch_ack_queue.put(ack)
             except Empty:
                 continue
+
+    def _publish_prefetch_ack(self, ack: PrefetchAck) -> None:
+        self.ack_prefetch_queue.put(ack)
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         """Synchronize all ranks to agree on a PrefetchAck."""
