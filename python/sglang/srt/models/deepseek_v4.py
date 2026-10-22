@@ -868,16 +868,7 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     )
 
 
-def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
-    # Same contract as _low_ratio_sources_capture_stub.
-    if not in_replay_tail_graph():
-        deepseek_v4_write_tail_source_kv(layer, x, positions)
-
-
-bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
-    deepseek_v4_write_tail_source_kv,
-    capture_stub=_write_tail_source_kv_capture_stub,
-)
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(deepseek_v4_write_tail_source_kv)
 
 
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
