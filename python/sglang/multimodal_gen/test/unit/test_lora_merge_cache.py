@@ -6,8 +6,11 @@ disk shortage returns None instead of raising, and the key separates
 combinations that must not share files.
 """
 
+import os
+
 import pytest
 import torch
+from safetensors.torch import load_file
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
     LoraMergeCache,
@@ -75,3 +78,48 @@ def test_the_key_separates_combinations(tmp_path):
         ["/models/h3", "transformer_2"], [(str(lora), 1.0, None)]
     )
     assert k == lora_merge_cache_key(base, [(str(lora), 1.0, None)])
+
+
+def test_failed_put_keeps_the_previous_entry(monkeypatch):
+    cache = LoraMergeCache("k5", expected_bytes=1)
+    merged = torch.randn(2, 2)
+    assert cache.put("a", merged) is not None
+
+    def partial_write(tensors, path):
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache."
+        "safetensors_save_file",
+        partial_write,
+    )
+    assert cache.put("a", torch.randn(2, 2)) is None
+    (entry,) = os.listdir(cache.root)
+    assert torch.equal(load_file(os.path.join(cache.root, entry))["weight"], merged)
+
+
+def test_low_space_evicts_least_recently_used_store(monkeypatch):
+    import shutil as _shutil
+    from types import SimpleNamespace
+
+    roots = []
+    for i, key in enumerate(("old", "recent")):
+        cache = LoraMergeCache(key, expected_bytes=1)
+        assert cache.put("a", torch.randn(2, 2)) is not None
+        cache.finalize()
+        os.utime(cache.root, (100 + i, 100 + i))
+        roots.append(cache.root)
+
+    real = _shutil.disk_usage
+    # Space only frees up once the oldest store is gone.
+    monkeypatch.setattr(
+        _shutil,
+        "disk_usage",
+        lambda p: SimpleNamespace(free=1 << 40 if not os.path.isdir(roots[0]) else 1),
+    )
+    new = LoraMergeCache("new", expected_bytes=1 << 20)
+    assert new.put("a", torch.randn(2, 2)) is not None
+    assert [os.path.isdir(r) for r in roots] == [False, True]
+    monkeypatch.setattr(_shutil, "disk_usage", real)

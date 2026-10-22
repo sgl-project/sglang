@@ -167,6 +167,7 @@ class LoRAPipeline(ComposedPipelineBase):
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
+    loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
@@ -198,6 +199,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
+        self.loaded_adapter_files = {}
         self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
@@ -791,7 +793,9 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count = 0
         missing_layers_by_adapter = [[] for _ in lora_nicknames]
         applied_count_by_adapter = [0 for _ in lora_nicknames]
+        use_cache = merge_cache is not None and merge_weights
         for name, layer in lora_layers.items():
+            adapted_before = adapted_count
             # Apply all LoRA adapters in order
             for idx, (nickname, path, lora_strength) in enumerate(
                 zip(lora_nicknames, lora_paths, strengths)
@@ -822,7 +826,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     layer.lora_rank = inferred_rank
                     layer.lora_alpha = inferred_alpha
 
-                    use_cache = merge_cache is not None and merge_weights
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
@@ -836,8 +839,6 @@ class LoRAPipeline(ComposedPipelineBase):
                             clear_existing and idx == 0
                         ),  # Only clear on first LoRA
                     )
-                    if use_cache and idx == len(lora_nicknames) - 1:
-                        self._merge_via_cache(name, layer, merge_cache)
                     adapted_count += 1
                     applied_count_by_adapter[idx] += 1
                 else:
@@ -856,6 +857,9 @@ class LoRAPipeline(ComposedPipelineBase):
                                     layer.unmerge_lora_weights()
                                 layer.clear_lora_weights()
                             layer.disable_lora = True
+            # Merge once every adapter is set, even if the last one skips this layer.
+            if use_cache and adapted_count > adapted_before:
+                self._merge_via_cache(name, layer, merge_cache)
 
         if rank == 0:
             total_layers = len(lora_layers)
@@ -1071,6 +1075,7 @@ class LoRAPipeline(ComposedPipelineBase):
             )
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
+        self.loaded_adapter_files[lora_nickname] = lora_local_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
@@ -1250,7 +1255,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         merge_cache = self._merge_cache_for(
                             module_name,
                             lora_layers_dict,
-                            tgt_paths,
+                            tgt_nicknames,
                             tgt_strengths,
                             enabled=cache_merged and effective_merge_weights,
                         )
@@ -1367,13 +1372,15 @@ class LoRAPipeline(ComposedPipelineBase):
         self,
         module_name: str,
         lora_layers: dict[str, BaseLayerWithLoRA],
-        lora_paths: list[str | None],
+        nicknames: list[str],
         strengths: list[float],
         enabled: bool,
     ) -> LoraMergeCache | None:
         if not enabled or envs.SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE:
             return None
-        if any(path is None for path in lora_paths):
+        # Key on the resolved local file: the user-facing path may be a repo id.
+        files = [self.loaded_adapter_files.get(nickname) for nickname in nicknames]
+        if any(file is None for file in files):
             return None
         if any(layer.weight.device.type != "cpu" for layer in lora_layers.values()):
             # Cache entries are CPU mappings. Rebinding a resident accelerator
@@ -1383,9 +1390,14 @@ class LoRAPipeline(ComposedPipelineBase):
             # Sharded weights would need per-rank stores; not worth it until a
             # multi-GPU consumer deployment exists.
             return None
+        # The effective alpha and PEFT config change the merged delta too.
         adapters = [
-            (path, strength, self.server_args.lora_alpha)
-            for path, strength in zip(lora_paths, strengths)
+            (
+                file,
+                strength,
+                (self.loaded_adapter_alphas.get(n), load_peft_config(file)),
+            )
+            for file, n, strength in zip(files, nicknames, strengths)
         ]
         key = lora_merge_cache_key([self.server_args.model_path, module_name], adapters)
         expected = sum(
