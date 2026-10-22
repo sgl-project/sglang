@@ -72,6 +72,7 @@ class TestMLAKVGather(CustomTestCase):
                     for _ in range(2)
                 ]
                 pool = SimpleNamespace(
+                    dtype=torch.float8_e4m3fn,
                     size=257 - page_size,
                     page_size=page_size,
                     get_key_buffer=lambda layer_id: layers[layer_id],
