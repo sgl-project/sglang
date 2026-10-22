@@ -140,8 +140,9 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
-        elif get_moe_a2a_backend().is_deepep():
-            # DeepEP path: use a unified kernel that decides quantisation
+        elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
+            # DeepEP / Ascend Ops path: the dispatcher hands over tokens grouped
+            # by expert, so use a unified kernel that decides quantisation.
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
@@ -329,7 +330,7 @@ def pre_permute_ascend_ops_to_ascend(
     return AscendRunnerInput(
         hidden_states=dispatch_output.hidden_states,
         hidden_states_scale=dispatch_output.hidden_states_scale,
-        expert_tokens=dispatch_output.expert_tokens,
+        expert_tokens=dispatch_output.expert_tokens.to(torch.int64),
         group_list_type=dispatch_output.group_list_type,
     )
 
@@ -409,8 +410,12 @@ def post_permute_ascend_to_ascend_ops(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendOpsCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+        AscendOpsCombineInput,
+    )
 
+    # The combine path (MC2 op or finalize routing) weights and sums the top-k
+    # routes itself, so only the expert output is passed on.
     return AscendOpsCombineInput(hidden_states=runner_output.hidden_states)
 
 

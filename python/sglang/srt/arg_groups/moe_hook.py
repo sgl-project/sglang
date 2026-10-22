@@ -335,11 +335,13 @@ def handle_a2a_moe(server_args: Any):
             ) from exc
         logger.info(
             "ascend_ops MoE backend enabled for main=%s, draft=%s with "
-            "prefill=%s, decode=%s.",
+            "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",
             a2a_backend == "ascend_ops",
             draft_a2a_backend == "ascend_ops",
             parsed_ascend_ops_config.prefill,
             parsed_ascend_ops_config.decode,
+            parsed_ascend_ops_config.ll_dispatch_alg,
+            parsed_ascend_ops_config.ll_combine_alg,
         )
     if cfg.enable_waterfill:
         declare_resolution(
