@@ -104,6 +104,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
     grammar_holds_calls,
 )
 from sglang.srt.runtime_context import get_disagg, get_serving
@@ -310,31 +311,24 @@ class OpenAIServingResponses(OpenAIServingChat):
             param="model",
         )
 
-    async def create_responses(self, request, raw_request=None):
+    async def create_responses(
+        self,
+        request: ResponsesRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
-        adapter = None
+        tool_adapter = None
         if self._translates_tools:
             try:
-                request, adapter = BeamToolAdapter.from_request(
+                request, tool_adapter = BeamToolAdapter.from_request(
                     request, tool_call_parser=self.tool_call_parser
                 )
             except ResponseToolChoiceError as exc:
                 return self.create_error_response(str(exc), param="tool_choice")
             except ValueError as exc:
                 return self.create_error_response(str(exc), param="tools")
-        return await self._create_responses(request, raw_request, tool_adapter=adapter)
-
-    async def _create_responses(
-        self,
-        request: ResponsesRequest,
-        raw_request: Optional[Request] = None,
-        *,
-        tool_adapter=None,
-    ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
-        # Validate model
-        if not self.tokenizer_manager:
-            return self.create_error_response("Model not loaded")
 
         if not self.enable_response_store and request.previous_response_id is not None:
             return self._response_store_disabled_error("previous_response_id")
@@ -894,14 +888,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if request.is_include_output_logprobs() and isinstance(meta_info, dict)
                 else None
             )
-            generated = final_res["text"]
-            finish = (
-                meta_info.get("finish_reason") if isinstance(meta_info, dict) else None
-            )
             output = self._make_response_output_items(
                 request,
                 self._settle_response_template_stop(
-                    generated, finish, request, generated
+                    final_res["text"],
+                    (
+                        meta_info.get("finish_reason")
+                        if isinstance(meta_info, dict)
+                        else None
+                    ),
+                    request,
+                    final_res["text"],
                 ),
                 tokenizer,
                 output_logprobs=output_logprobs,
@@ -2281,9 +2278,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 reasoning_parser_obj.detector, ResponseTemplateReasoningDetector
             )
         ) or (
-            tool_parser is not None
-            and not isinstance(tool_parser, JsonArrayParser)
-            and tool_parser.supports_abort_flush
+            isinstance(tool_parser, FunctionCallParser)
+            and isinstance(tool_parser.detector, ResponseTemplateToolDetector)
         )
         stream_offset = 0
         incremental = get_serving().incremental_streaming_output

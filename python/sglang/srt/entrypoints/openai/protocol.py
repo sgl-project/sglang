@@ -51,14 +51,8 @@ from openai.types.responses import (
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.response_custom_tool_call_param import (
-    ResponseCustomToolCallParam,
-)
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
-)
-from openai.types.responses.response_function_tool_call_param import (
-    ResponseFunctionToolCallParam,
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
@@ -1863,17 +1857,7 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
-class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
-    namespace: Optional[str]
-
-
-class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
-    namespace: Optional[str]
-
-
 ResponseInputOutputItem: TypeAlias = Union[
-    NamespacedFunctionCallParam,
-    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
@@ -2073,7 +2057,10 @@ class ResponsesRequest(PDRoutingFields):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """Normalize supported choices; unsupported built-ins fall back to auto."""
+        """``tool_choice`` reduced to what the server can actually honor: of the
+        object forms only a named ``function`` / ``custom`` tool survives, the
+        rest (web_search, mcp, ...) can't be forced through the tool-call
+        parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
@@ -2430,8 +2417,6 @@ class ResponseReasoningTextContent(BaseModel):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
-    NamespacedFunctionCallParam,
-    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,

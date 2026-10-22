@@ -637,7 +637,7 @@ class ResponseTemplateReasoningDetector:
     ) -> dict[str, Any] | None:
         """A structural tag for JSON framed as the answer, after the reasoning
         or, at the `message_start`, from the first token, or `None` to apply the
-        JSON schema directly. Calls to `tool_names` may come first."""
+        JSON schema directly. Calls to `tools` may come first."""
         return None
 
     def json_output_started(self, text: str) -> bool:
@@ -970,10 +970,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 def _typed_tool(tool: dict, held_by: ResponseTemplateField | None = None) -> dict:
     """`tool`, in either API's shape, as template grammars constrain it, strict
     where `held_by` holds its arguments."""
-    function = tool.get("function", tool)
-    if not isinstance(function, dict):
-        return tool
-    function = dict(function)
+    function = dict(tool.get("function", tool))
     parameters = function.get("parameters")
     if isinstance(parameters, dict):
         function["parameters"] = parameters = typed_parameters(parameters)

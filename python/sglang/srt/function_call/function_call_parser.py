@@ -257,11 +257,6 @@ class FunctionCallParser:
         sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
 
-    @property
-    def supports_abort_flush(self) -> bool:
-        """Whether finalization can safely retain calls after generation aborts."""
-        return isinstance(self.detector, ResponseTemplateToolDetector)
-
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:

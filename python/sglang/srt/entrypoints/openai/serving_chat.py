@@ -2939,9 +2939,8 @@ class OpenAIServingChat(OpenAIServingBase):
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
-            generated = text
             text = self._settle_response_template_stop(
-                text, finish_reason, request, generated
+                text, finish_reason, request, text
             )
 
             # Handle reasoning content
