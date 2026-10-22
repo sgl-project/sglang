@@ -1196,18 +1196,19 @@ class KVCacheConfigurator:
                 speculative_draft_attention_backend=draft_backend,
                 speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
             )
-            if allow_target_draft_different_cache_dtype(
-                is_dflash=self.spec_algorithm.is_dflash_family(),
-                speculative_draft_attention_backend=draft_backend,
-            ):
-                region_kv_dtype = draft_kv_dtype
-            elif draft_kv_dtype != self.kv_cache_dtype:
-                return FusedDraftDecision(
-                    declined=(
-                        f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
-                        f"from the host's ({self.kv_cache_dtype})"
+            if draft_kv_dtype != self.kv_cache_dtype:
+                if allow_target_draft_different_cache_dtype(
+                    is_dflash=self.spec_algorithm.is_dflash_family(),
+                    speculative_draft_attention_backend=draft_backend,
+                ):
+                    region_kv_dtype = draft_kv_dtype
+                else:
+                    return FusedDraftDecision(
+                        declined=(
+                            f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
+                            f"from the host's ({self.kv_cache_dtype})"
+                        )
                     )
-                )
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
