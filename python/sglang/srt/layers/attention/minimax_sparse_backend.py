@@ -288,6 +288,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "MiniMax-M3 speculative attention requires a linear EAGLE "
                 "draft chain (--speculative-eagle-topk 1)."
             )
+        # HiSparse swap-in keeps one device buffer and one LRU slot set per request,
+        # while linear verify scores bs * ndt rows.
+        if (
+            self._linear_verify
+            and self.hisparse_coordinator is not None
+            and spec.speculative_algorithm is not None
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 HiSparse does not support speculative decoding yet. "
+                "Disable --enable-hisparse or speculative decoding."
+            )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -295,8 +306,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
         )
 
-        # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
-        # route to forward_extend, dereferencing absent extend metadata. Fail at startup.
+        # Verify rows take the Triton decode kernels, but MSA decode with speculative
+        # decoding under CUDA graph has never been validated; fail at startup.
         if (
             self.use_msa
             and _decode_cuda_graph

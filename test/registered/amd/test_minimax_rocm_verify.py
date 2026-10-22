@@ -20,6 +20,7 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
 
         self.backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
         self.backend._linear_verify = True
+        self.backend.max_context_len = 8192
         self.backend.speculative_num_draft_tokens = 4
         self.backend._linear_verify_meta = None
         self.batch = SimpleNamespace(
