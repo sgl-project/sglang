@@ -156,7 +156,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ) = synthid_graph_config(
             processor=self.synthid_watermark,
             num_steps=self.speculative_num_steps,
-            rejection_sampling=model_runner.server_args.speculative_use_rejection_sampling,
+            rejection_sampling=get_spec().speculative_use_rejection_sampling,
         )
         if self.synthid_mixed:
             if not self.synthid_graph_supported:

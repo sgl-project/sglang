@@ -400,7 +400,7 @@ class TestSynthID(CustomTestCase):
                         )
                     outputs.append(tokens)
                     captured = output.sampling_mask_output
-                    masks.append(captured.token_ids[0, :captured.lengths[0]].tolist())
+                    masks.append(captured.token_ids[0, : captured.lengths[0]].tolist())
                     mask_scores.append(captured.selected_logprobs[0].item())
                 self.assertEqual(outputs[0][1].item(), outputs[1][1].item())
                 self.assertEqual(masks[0], masks[1])
@@ -601,7 +601,9 @@ class TestSynthID(CustomTestCase):
         sampler._sample_from_probs = Mock(wraps=sampler._sample_from_probs)
         tokens, output = _sample(sampler, info, torch.tensor([[0.5, 0.3, 0.2]]).log())
         captured = output.sampling_mask_output
-        self.assertEqual(set(captured.token_ids[0, :captured.lengths[0]].tolist()), {0, 1})
+        self.assertEqual(
+            set(captured.token_ids[0, : captured.lengths[0]].tolist()), {0, 1}
+        )
         probs = sampler._sample_from_probs.call_args.args[0]
         self.assertAlmostEqual(
             captured.selected_logprobs[0].item(),
@@ -650,7 +652,10 @@ class TestSynthID(CustomTestCase):
                 )
                 with envs.SGLANG_RETURN_ORIGINAL_LOGPROB.override(original):
                     compute_spec_logprobs(
-                        batch, output, torch.tensor([1]), accept_index=torch.tensor([[0]])
+                        batch,
+                        output,
+                        torch.tensor([1]),
+                        accept_index=torch.tensor([[0]]),
                     )
                 expected = (raw / (1 if original else 2)).log_softmax(-1)[0, 1]
                 torch.testing.assert_close(output.next_token_logprobs[0, 0], expected)
@@ -802,9 +807,8 @@ class TestSynthID(CustomTestCase):
                     )
                 },
             ),
-            patch.multiple(
-                eagle_utils, _is_cpu=False, _is_hip=False, _is_xpu=False
-            ),
+            patch.multiple(eagle_utils, _is_cpu=False, _is_hip=False, _is_xpu=False),
+            patch.object(eagle_utils, "tree_speculative_sampling_target_only", kernel),
             get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
             patch(
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
@@ -827,8 +831,8 @@ class TestSynthID(CustomTestCase):
         with patch(
             "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32"
         ) as hash_columns:
-            hash_columns.side_effect = (
-                lambda seeds, positions, columns: columns.unsqueeze(0).to(torch.uint32)
+            hash_columns.side_effect = lambda seeds, positions, columns: (
+                columns.unsqueeze(0).to(torch.uint32)
             )
             eagle_utils._seeded_verify_coins(
                 sampling_seed=torch.tensor([42]),
@@ -909,8 +913,9 @@ class TestSynthID(CustomTestCase):
         )
         relay.need_topk, relay.need_hidden_states = True, False
         relay.output_tokens_buf = torch.zeros(2, dtype=torch.int64)
-        relay.topk_p_buf, relay.topk_index_buf = torch.ones(2, 1), torch.zeros(
-            2, 1, dtype=torch.int64
+        relay.topk_p_buf, relay.topk_index_buf = (
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int64),
         )
         relay.draft_probs_buf = torch.tensor([[0.8, 0.2], [0.6, 0.4]])
         relay.draft_prob_token_ids_buf = relay.dsa_topk_indices_buf = None

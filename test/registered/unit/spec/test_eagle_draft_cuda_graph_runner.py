@@ -21,11 +21,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.runtime_context import publish, reset_context
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_worker_v2
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -80,6 +81,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.enterContext(envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.override(False))
 
     def _build_fused_proposal_worker(self):
         worker = EagleDraftWorker.__new__(EagleDraftWorker)
@@ -98,7 +100,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         worker.draft_attn_backend = SimpleNamespace(attn_backends=[object()])
         worker.draft_runner = SimpleNamespace(
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["DummyMTP"])
+                hf_config=SimpleNamespace(architectures=["DummyMTP"]),
+                model_is_mrope=False,
             ),
             canary_manager=None,
             forward=lambda batch: SimpleNamespace(
@@ -118,12 +121,37 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 (probs, None, torch.tensor([1.0]), torch.tensor([2])),
             )
         )
-        return worker
+        config = SynthIDConfig(keys=(1, 2), top_k=3, context_history_size=4)
+        processor = SynthIDWatermarkProcessor(config, "cpu", num_slots=1)
+        worker.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                sampler=SimpleNamespace(synthid_watermark=processor)
+            )
+        )
+        info = SamplingBatchInfo(
+            temperatures=torch.ones(1, 1),
+            top_ps=torch.ones(1),
+            top_ks=torch.tensor([TOP_K_ALL]),
+            min_ps=torch.zeros(1),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=8,
+            synthid_state=SynthIDState.for_initialized_slots(
+                torch.tensor([0]), config=config
+            ),
+            synthid_force_dense_draft_probs=True,
+        )
+        return worker, info
 
     def test_fused_proposal_survives_top1_draft_dispatch(self):
         """A supplied fused sample must win over the raw-logit argmax shortcut."""
-        worker = self._build_fused_proposal_worker()
+        worker, info = self._build_fused_proposal_worker()
         batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            moe_num_token_non_padded=None,
             batch_size=1,
             out_cache_loc=torch.arange(2),
             positions=torch.zeros(1, dtype=torch.int64),
@@ -131,13 +159,12 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 topk_p=torch.ones(1, 1),
                 topk_index=torch.tensor([[0]]),
                 hidden_states=torch.zeros(1, 2),
+                draft_probs=torch.tensor([[1.0, 0, 0, 0, 0, 0, 0, 0]]),
             ),
-            sampling_info=SimpleNamespace(synthid_state=None),
+            sampling_info=info,
         )
         with (
-            get_context().override_server_args(
-                speculative_use_rejection_sampling=False
-            ),
+            get_context().override_server_args(speculative_use_rejection_sampling=True),
             patch.object(eagle_worker_v2, "_is_cuda", False),
             patch.object(eagle_worker_v2, "_is_hip", False),
             torch.compiler.set_stance("force_eager"),
@@ -147,21 +174,20 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
 
     def test_fused_proposal_survives_top1_draft_extend_dispatch(self):
         """Draft-extend must not replace a fused sample with unmarked argmax."""
-        worker = self._build_fused_proposal_worker()
+        worker, info = self._build_fused_proposal_worker()
         batch = SimpleNamespace(
             seq_lens=torch.tensor([4]),
-            sampling_info=SimpleNamespace(synthid_state=None),
+            sampling_info=info,
         )
         result = SimpleNamespace(
             logits_output=SimpleNamespace(hidden_states=torch.zeros(3, 2)),
             accept_lens=torch.tensor([1]),
             next_token_ids=torch.tensor([3]),
             next_draft_input=SimpleNamespace(),
+            prepared_draft_extend_inputs=None,
         )
         with (
-            get_context().override_server_args(
-                speculative_use_rejection_sampling=False
-            ),
+            get_context().override_server_args(speculative_use_rejection_sampling=True),
             patch.object(eagle_worker_v2, "_is_hip", False),
             patch.object(
                 eagle_worker_v2,
@@ -186,6 +212,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 worker.speculative_num_steps = 2
                 worker.hot_token_id = None
                 worker.index_share_for_mtp_iteration = False
+                worker.seed_dsa_topk_from_draft_extend = False
                 worker._topk1_parents_prealloc = torch.tensor([[-1, 0]])
                 worker._topk1_score_indices_prealloc = torch.tensor([[0, 1]])
                 worker.target_worker = SimpleNamespace(
@@ -195,7 +222,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 )
                 worker.draft_runner = SimpleNamespace(
                     model_config=SimpleNamespace(
-                        hf_config=SimpleNamespace(architectures=["DummyMTP"])
+                        hf_config=SimpleNamespace(architectures=["DummyMTP"]),
+                        model_is_mrope=False,
                     ),
                     canary_manager=None,
                     forward=Mock(
@@ -214,6 +242,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 initial_dense[:, 7] = 1.0
                 initial_probs, initial_ids = initial_dense, None
                 batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    moe_num_token_non_padded=None,
                     batch_size=1,
                     out_cache_loc=torch.arange(2),
                     positions=torch.zeros(1, dtype=torch.int64),
@@ -227,11 +257,11 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                     sampling_info=SamplingBatchInfo(
                         temperatures=torch.ones(1, 1),
                         top_ps=torch.ones(1),
-                        top_ks=torch.tensor([-1 if force_dense else 1]),
+                        top_ks=torch.tensor([TOP_K_ALL]),
                         min_ps=torch.zeros(1),
-                        is_all_greedy=True,
-                        is_any_greedy=True,
-                        need_top_k_sampling=not force_dense,
+                        is_all_greedy=False,
+                        is_any_greedy=False,
+                        need_top_k_sampling=False,
                         need_top_p_sampling=False,
                         need_min_p_sampling=False,
                         vocab_size=8,
@@ -240,6 +270,17 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                         ),
                         synthid_force_dense_draft_probs=force_dense,
                     ),
+                )
+                worker._apply_synthid_to_draft_logits = Mock(
+                    return_value=(
+                        None,
+                        (
+                            initial_dense.clone(),
+                            None,
+                            torch.ones(1),
+                            torch.tensor([7]),
+                        ),
+                    )
                 )
                 if not force_dense:
                     (

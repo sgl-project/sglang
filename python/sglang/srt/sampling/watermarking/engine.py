@@ -4,17 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.watermarking.synthid.setup import init_synthid_watermark
 
 from .core import WatermarkState
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.sampler import Sampler
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def init_watermark_engine(
@@ -55,28 +51,3 @@ def init_watermark_engine(
     )
     sampler.watermark_state = state
     return state
-
-
-def prepare_watermark_sample(
-    *,
-    state: Optional[WatermarkState],
-    logits_output: LogitsProcessorOutput,
-    batch: ForwardBatch,
-) -> Optional[torch.Tensor]:
-    if state is None or not batch.sampling_info.has_watermark_candidates:
-        return None
-    logits = logits_output.next_token_logits
-    logprob_logits = logits.clone() if batch.return_logprob else None
-    indices = batch.req_pool_indices[: logits.shape[0]]
-    state.init_from_prompt(
-        indices, batch.watermark_prompt_tail_ids, batch.watermark_context_hash_history
-    )
-    state.force(logits, indices, batch.sampling_info)
-    return logprob_logits
-
-
-def commit_watermark_sample(
-    *, state: Optional[WatermarkState], tokens: torch.Tensor, batch: ForwardBatch
-) -> None:
-    if state is not None and batch.sampling_info.has_watermark_candidates:
-        state.append(batch.req_pool_indices[: tokens.shape[0]], tokens)

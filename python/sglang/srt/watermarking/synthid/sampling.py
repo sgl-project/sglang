@@ -170,12 +170,14 @@ def forward_synthid(
                 )
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
-                batch_next_token_ids, sampling_mask_capture = sampler._sample_from_probs(
-                    probs,
-                    sampling_info,
-                    positions,
-                    simple_sampling_case or ordinary_synthid,
-                    synthid_applied=True,
+                batch_next_token_ids, sampling_mask_capture = (
+                    sampler._sample_from_probs(
+                        probs,
+                        sampling_info,
+                        positions,
+                        simple_sampling_case or ordinary_synthid,
+                        synthid_applied=True,
+                    )
                 )
                 if return_sampler_logprobs:
                     logprobs = (
@@ -192,10 +194,12 @@ def forward_synthid(
     )
     if return_sampling_mask:
         if sampling_info.is_all_greedy:
-            logits_output.sampling_mask_output = sampler._build_greedy_sampling_mask_output(
-                sampling_info.sampling_mask_batch_indices,
-                batch_next_token_ids,
-                sampling_info.sampling_support_logprobs_capture_indices,
+            logits_output.sampling_mask_output = (
+                sampler._build_greedy_sampling_mask_output(
+                    sampling_info.sampling_mask_batch_indices,
+                    batch_next_token_ids,
+                    sampling_info.sampling_support_logprobs_capture_indices,
+                )
             )
         else:
             assert sampling_mask_capture is not None

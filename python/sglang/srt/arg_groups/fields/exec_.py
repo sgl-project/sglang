@@ -253,11 +253,17 @@ class ExecKernel(msgspec.Struct):
     ] = 5
     synthid_watermark_top_k: A[
         int,
-        Arg(help="SynthID candidate cap before request-level filtering.", resolvable=True),
+        Arg(
+            help="SynthID candidate cap before request-level filtering.",
+            resolvable=True,
+        ),
     ] = 1024
     synthid_watermark_context_history_size: A[
         int,
-        Arg(help="Number of prior SynthID context hashes retained per request.", resolvable=True),
+        Arg(
+            help="Number of prior SynthID context hashes retained per request.",
+            resolvable=True,
+        ),
     ] = 1024
     synthid_watermark_skip_first_ngram_calls: A[
         bool,

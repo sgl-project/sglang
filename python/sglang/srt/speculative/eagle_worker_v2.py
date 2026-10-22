@@ -855,11 +855,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
             draft_prob_token_ids_list = [spec_info.draft_prob_token_ids]
-        synthid_chain_tokens = (
-            [topk_index]
-            if synthid_enabled
-            else None
-        )
+        synthid_chain_tokens = [topk_index] if synthid_enabled else None
 
         topk1_chain_fits = (
             self.topk == 1

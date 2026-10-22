@@ -148,13 +148,15 @@ class TestSynthIDCacheFlush(CustomTestCase):
     def test_relay_keeps_beam_tail_slicing_and_request_policy(self):
         """Adding watermark metadata must not relay beam-tail rows as requests."""
         for enabled, beam in ((False, True), (True, False), (True, True)):
-            with self.subTest(
-                enabled=enabled, beam=beam
-            ), get_context().override_server_args(
-                enable_watermark=enabled,
-                watermark_algorithm="synthid" if enabled else None,
+            with (
+                self.subTest(enabled=enabled, beam=beam),
+                get_context().override_server_args(
+                    enable_watermark=enabled,
+                    watermark_algorithm="synthid" if enabled else None,
+                ),
             ):
                 scheduler = Scheduler.__new__(Scheduler)
+                scheduler._engine_paused = False
                 scheduler.spec_algorithm = SimpleNamespace(is_ngram=lambda: False)
                 scheduler.future_map = MagicMock()
                 scheduler.beam_coordinator = MagicMock()
@@ -214,6 +216,7 @@ class TestSynthIDCacheFlush(CustomTestCase):
             ):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.is_fully_idle = MagicMock(return_value=True)
+                scheduler._engine_paused = False
                 scheduler.tree_cache = MagicMock()
                 scheduler.req_to_token_pool = MagicMock()
                 scheduler.token_to_kv_pool_allocator = MagicMock()

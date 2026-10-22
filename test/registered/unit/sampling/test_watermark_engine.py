@@ -1,6 +1,5 @@
 """Algorithm dispatch, config admission and request-policy compatibility."""
 
-import dataclasses
 import json
 import tempfile
 import unittest
@@ -9,7 +8,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.arg_groups.overrides import materialize_declarations
+from sglang.srt.arg_groups.fields.exec_ import ExecFeatures, ExecKernel
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_watermark_config
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -51,8 +51,7 @@ class TestWatermarkEngine(CustomTestCase):
         with patch("sglang.srt.arg_groups.validation_hook.is_cuda", return_value=True):
             handle_watermark_config(args)
             check_watermark_server_args(args)
-        materialize_declarations(args)
-        return args
+        return resolving_view(args)
 
     def test_legacy_keys_and_generic_synthid_preserve_same_config(self):
         """Selecting the new API must not replace the existing key/tournament law."""
@@ -77,10 +76,13 @@ class TestWatermarkEngine(CustomTestCase):
             self.assertFalse(args.watermark_enforce_all)
             with get_context().override_server_args(
                 **{
-                    field.name: getattr(args, field.name)
-                    for field in dataclasses.fields(ServerArgs)
-                    if field.name.startswith(("synthid_", "watermark_"))
-                    or field.name == "enable_watermark"
+                    name: getattr(args, name)
+                    for name in (
+                        *ExecFeatures.__struct_fields__,
+                        *ExecKernel.__struct_fields__,
+                    )
+                    if name.startswith(("synthid_", "watermark_"))
+                    or name == "enable_watermark"
                 }
             ):
                 resolved = get_synthid_config()
@@ -127,7 +129,12 @@ class TestWatermarkEngine(CustomTestCase):
         for kwargs in (
             {"enable_watermark": True, "watermark_algorithm": "unknown"},
             {"enable_watermark": True, "device": "cpu"},
-            {"enable_watermark": True, "is_embedding": True},
+            {
+                "enable_watermark": True,
+                "watermark_algorithm": "synthid",
+                "watermark_config": str(self.key_file),
+                "is_embedding": True,
+            },
             {"watermark_algorithm": "synthid"},
             {"watermark_config": '{"key":"1234"}'},
             {"enable_watermark": True, "watermark_algorithm": "synthid"},
@@ -239,7 +246,9 @@ class TestWatermarkEngine(CustomTestCase):
         args = self.resolve(enable_watermark=True, watermark_config=source)
         self.assertNotIn("123456", repr(args))
         self.assertNotIn("654321", repr(args))
-        rendered = redact_watermark_secrets(dataclasses.asdict(args))
+        rendered = redact_watermark_secrets(
+            {name: getattr(args, name) for name in ExecFeatures.__struct_fields__}
+        )
         self.assertEqual(rendered["watermark_key"], "<redacted>")
         self.assertEqual(rendered["watermark_config"], "<redacted>")
         self.assertEqual(args.watermark_key, "123456")

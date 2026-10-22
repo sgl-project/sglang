@@ -46,7 +46,9 @@ def _stub_capture_hardware(*, patches, backend):
         kind = (
             "off"
             if runner.synthid_watermark is None
-            else "on" if runner.sparse_synthid_draft_probs else "mixed"
+            else "on"
+            if runner.sparse_synthid_draft_probs
+            else "mixed"
         )
         captured[kind] = backend.page_table
 
@@ -197,7 +199,9 @@ class TestEagleWatermarkGraphState(CustomTestCase):
                     (
                         {"on", "off", "mixed"}
                         if enabled and not enforce
-                        else {"on"} if enabled else {"off"}
+                        else {"on"}
+                        if enabled
+                        else {"off"}
                     ),
                 )
 

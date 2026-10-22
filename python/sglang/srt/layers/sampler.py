@@ -40,9 +40,9 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
 )
-from sglang.utils import LazyImport
 from sglang.srt.watermarking.synthid.sampling import forward_synthid
 from sglang.srt.watermarking.synthid.setup import init_synthid_watermark
+from sglang.utils import LazyImport
 
 if is_cuda():
     from sgl_kernel import (
@@ -153,7 +153,9 @@ class Sampler(nn.Module):
             get_exec().kernel.synthid_watermark_key_file is not None
             and self.synthid_watermark is None
         ):
-            raise RuntimeError("SynthID watermarking is configured but not initialized.")
+            raise RuntimeError(
+                "SynthID watermarking is configured but not initialized."
+            )
         if self.synthid_watermark is not None:
             self.synthid_watermark.invalidate_on_cache_flush()
         if self.watermark_state is not None:
@@ -218,8 +220,13 @@ class Sampler(nn.Module):
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
-        if self.synthid_watermark is not None and is_enabled(sampling_info.synthid_state):
-            if is_mixed(sampling_info.synthid_state) and not sampling_info.is_all_greedy:
+        if self.synthid_watermark is not None and is_enabled(
+            sampling_info.synthid_state
+        ):
+            if (
+                is_mixed(sampling_info.synthid_state)
+                and not sampling_info.is_all_greedy
+            ):
                 return forward_mixed(
                     sampler=self,
                     logits_output=logits_output,
@@ -230,8 +237,13 @@ class Sampler(nn.Module):
                     positions=positions,
                 )
             return forward_synthid(
-                self, logits_output, sampling_info, return_logprob,
-                top_logprobs_nums, token_ids_logprobs, positions,
+                self,
+                logits_output,
+                sampling_info,
+                return_logprob,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                positions,
             )
 
         # Preprocess logits (custom processors and NaN handling)
@@ -768,8 +780,11 @@ class Sampler(nn.Module):
         return batch_next_token_ids, logprobs
 
     def _sync_token_ids_across_tp(
-        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo,
-        *, force_sync: bool = False,
+        self,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        *,
+        force_sync: bool = False,
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars or force_sync:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
@@ -904,7 +919,11 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
             "With sampling seed, multinomial_with_seed will provide wrong results"
         )
     probs_sort, probs_idx = top_k_top_p_min_p_filter_probs_torch(
-        probs, top_ks, top_ps, min_ps, need_min_p_sampling,
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
         max_top_k=max_top_k if partial_sort else None,
     )
 
@@ -1006,8 +1025,11 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
 @torch.compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
-    logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor,
-    *, synthid_applied: bool = False,
+    logprobs: torch.Tensor,
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    synthid_applied: bool = False,
 ) -> torch.Tensor:
     """
     Samples n elements from an input tensor `inputs` of shape (n, m) using

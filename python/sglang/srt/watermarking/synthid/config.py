@@ -63,7 +63,9 @@ def validate_synthid_watermark(
     if view.device != "cuda" or not cuda_is_available():
         raise ValueError("SynthID watermarking requires NVIDIA CUDA.")
     if view.is_embedding or view.dllm_algorithm is not None:
-        raise ValueError("SynthID watermarking requires autoregressive text generation.")
+        raise ValueError(
+            "SynthID watermarking requires autoregressive text generation."
+        )
     if view.disaggregation_mode != "null":
         raise ValueError("SynthID watermarking does not support PD disaggregation.")
     if rl_on_policy_target is not None:

@@ -61,8 +61,12 @@ class TestSynthIDKernels(CustomTestCase):
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         for kind in ("joint", "min_p", "greedy"):
-            with self.subTest(kind=kind), get_context().override_server_args(
-                sampling_backend="flashinfer", speculative_use_rejection_sampling=True
+            with (
+                self.subTest(kind=kind),
+                get_context().override_server_args(
+                    sampling_backend="flashinfer",
+                    speculative_use_rejection_sampling=True,
+                ),
             ):
                 config = SynthIDConfig(keys=(1, 2), top_k=3)
                 processor = SynthIDWatermarkProcessor(config, "cuda", num_slots=2)

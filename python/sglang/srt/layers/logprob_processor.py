@@ -18,8 +18,8 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 from sglang.srt.sampling.watermarking.synthid_request import is_enabled
+from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -410,7 +410,9 @@ def compute_spec_logprobs(
         and original_logits is None
     ):
         raise RuntimeError("Speculative SynthID logprobs require unwatermarked logits.")
-    source_logits = original_logits if original_logits is not None else next_token_logits
+    source_logits = (
+        original_logits if original_logits is not None else next_token_logits
+    )
 
     if accept_index is not None:
         max_accept = accept_index.shape[1]
