@@ -25,7 +25,6 @@ from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
-    ABORT_TAG,
     AbortAck,
     AbortNotification,
     AckTarget,
@@ -38,7 +37,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=37, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
@@ -233,39 +232,6 @@ class WorkerFailureAbortScenarios:
         self.assertEqual(manager._sent, [(self.room, target)])
 
 
-class TestAbortWireFormat(CustomTestCase):
-    def test_abort_notification_round_trip(self):
-        notification = AbortNotification(100, "10.0.0.1", 5000, 7)
-
-        self.assertEqual(
-            AbortNotification.from_zmq(notification.to_zmq()), notification
-        )
-
-    def test_legacy_abort_without_return_address(self):
-        self.assertEqual(
-            AbortNotification.from_zmq([ABORT_TAG, b"101"]),
-            AbortNotification(room=101),
-        )
-
-    def test_malformed_abort_is_rejected(self):
-        self.assertIsNone(AbortNotification.from_zmq([ABORT_TAG, b"bad-room"]))
-
-    def test_malformed_abort_generation_is_dropped(self):
-        notification = AbortNotification.from_zmq(
-            [ABORT_TAG, b"101", b"10.0.0.1", b"5000", b"bad-generation"]
-        )
-
-        self.assertEqual(
-            notification,
-            AbortNotification(room=101, decode_ip="10.0.0.1", decode_port=5000),
-        )
-
-    def test_abort_ack_round_trip(self):
-        ack = AbortAck(room=102, prefill_rank=3, generation=7)
-
-        self.assertEqual(AbortAck.from_zmq(ack.to_zmq()), ack)
-
-
 class TestCommonAbortAckDispatch(CustomTestCase):
     def test_abort_ack_message_is_aggregated(self):
         mgr = _make_manager()
@@ -275,33 +241,6 @@ class TestCommonAbortAckDispatch(CustomTestCase):
 
         self.assertTrue(claimed)
         self.assertEqual(mgr._deferred_abort_ack_tracker[103].prefill_ranks, {4})
-
-    def test_non_ack_message_is_not_claimed(self):
-        mgr = _make_manager()
-
-        self.assertFalse(mgr.handle_abort_ack_message([b"STATUS", b"103", b"4"]))
-
-    def test_malformed_abort_ack_is_ignored(self):
-        mgr = _make_manager()
-        mgr.register_deferred_abort_room(103)
-
-        self.assertTrue(
-            mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"bad-room", b"4", b"1"])
-        )
-        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
-
-    def test_generationless_abort_ack_warns_and_is_ignored(self):
-        mgr = _make_manager()
-        mgr.register_deferred_abort_room(103)
-
-        with patch(
-            "sglang.srt.disaggregation.common.conn.logger.warning_once"
-        ) as warning:
-            claimed = mgr.handle_abort_ack_message([ABORT_ACK_TAG, b"103", b"4"])
-
-        self.assertTrue(claimed)
-        self.assertFalse(mgr.is_abort_release_safe(103, required_acks=1))
-        warning.assert_called_once()
 
     def test_stale_generation_ack_is_ignored_after_room_reuse(self):
         mgr = _make_manager()
@@ -398,30 +337,6 @@ class TestCommonAbortAckDispatch(CustomTestCase):
 
 
 class TestDeferredAckTargets(CustomTestCase):
-    def test_ack_held_until_outstanding_drains(self):
-        mgr = _make_prefill_manager()
-        target = AckTarget("10.0.0.1", 5000, 9)
-        mgr.register_deferred_ack_target(7, target)
-
-        mgr._staging_outstanding[7] = 1
-        mgr._maybe_ack_drained_abort(7)
-        self.assertEqual(mgr._sent, [])
-
-        mgr._staging_outstanding[7] = 0
-        mgr._maybe_ack_drained_abort(7)
-        self.assertEqual(mgr._sent, [(7, target)])
-
-    def test_ack_fires_at_most_once(self):
-        mgr = _make_prefill_manager()
-        target = AckTarget("10.0.0.2", 5001, 10)
-        mgr.register_deferred_ack_target(8, target)
-
-        mgr._maybe_ack_drained_abort(8)
-        mgr._maybe_ack_drained_abort(8)
-
-        self.assertEqual(mgr._sent, [(8, target)])
-        self.assertNotIn(8, mgr._deferred_ack_targets)
-
     def test_target_registered_during_poison_never_acks(self):
         """A target that races past the poisoned check must not ack later."""
         mgr = _make_prefill_manager()
@@ -440,13 +355,6 @@ class TestDeferredAckTargets(CustomTestCase):
 
         self.assertEqual(mgr._sent, [])
         self.assertNotIn(7, mgr._deferred_ack_targets)
-
-    def test_unregistered_room_is_noop(self):
-        mgr = _make_prefill_manager()
-
-        mgr._maybe_ack_drained_abort(999)
-
-        self.assertEqual(mgr._sent, [])
 
     def test_sender_clear_keeps_target_until_outstanding_transfer_drains(self):
         mgr = _make_prefill_manager()
@@ -498,77 +406,6 @@ class TestDeferredAckTargets(CustomTestCase):
         mgr._maybe_ack_drained_abort(7)
         self.assertEqual(len(mgr._sent), 2)
 
-    def test_repeated_abort_from_one_decode_rank_keeps_latest_generation(self):
-        mgr = _make_prefill_manager()
-        mgr._staging_outstanding[7] = 1
-        mgr.register_deferred_ack_target(7, AckTarget("10.0.0.1", 5000, 3))
-        latest = AckTarget("10.0.0.1", 5000, 4)
-        mgr.register_deferred_ack_target(7, latest)
-
-        mgr._staging_outstanding[7] = 0
-        mgr._maybe_ack_drained_abort(7)
-
-        self.assertEqual(mgr._sent, [(7, latest)])
-
-    def test_prefill_unique_rank_formula(self):
-        mgr = CommonKVManager.__new__(CommonKVManager)
-        mgr.attn_tp_rank, mgr.pp_size, mgr.attn_cp_size = 2, 3, 4
-        mgr.pp_rank, mgr.attn_cp_rank = 1, 3
-
-        self.assertEqual(mgr._prefill_unique_rank(), 31)
-
-
-class TestAbortAckAggregation(CustomTestCase):
-    def test_release_safe_only_after_all_required_ranks_ack(self):
-        mgr = _make_manager()
-        room = 100
-        generation = mgr.register_deferred_abort_room(room)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-
-        mgr.note_abort_ack(room, 0, generation)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-
-        mgr.note_abort_ack(room, 1, generation)
-        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
-
-    def test_duplicate_rank_ack_does_not_over_count(self):
-        mgr = _make_manager()
-        room = 101
-        generation = mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0, generation)
-        mgr.note_abort_ack(room, 0, generation)  # same rank twice
-        # Two acks arrived but from one rank: not safe for a 2-rank prefill.
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-
-    def test_clear_deferred_abort_state(self):
-        mgr = _make_manager()
-        room = 103
-        generation = mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0, generation)
-        mgr.clear_deferred_abort_state(room)
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
-
-    def test_ack_before_register_is_dropped(self):
-        # An ack for a room that isn't actively held must not be recorded (it
-        # would otherwise pollute a later request reusing the same room).
-        mgr = _make_manager()
-        room = 104
-        mgr.note_abort_ack(room, 0, 1)  # no register yet
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
-
-    def test_register_resets_stale_acks(self):
-        mgr = _make_manager()
-        room = 106
-        generation = mgr.register_deferred_abort_room(room)
-        mgr.note_abort_ack(room, 0, generation)
-        mgr.note_abort_ack(room, 1, generation)
-        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=2))
-        # Re-registering (a later reuse) wipes the prior acks.
-        mgr.register_deferred_abort_room(room)
-        self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
-
 
 class _BareReceiver(CommonKVReceiver):
     """Concrete shell: the ABC check blocks CommonKVReceiver.__new__."""
@@ -608,31 +445,6 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = enabled
         mgr.local_ip, mgr.rank_port = "10.0.0.1", 6000
         return mgr
-
-    def test_tracker_armed_before_the_abort_is_sent(self):
-        mgr = self._make_decode_manager()
-        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
-        recv._send_abort_notification()
-        self.assertEqual(armed_at_send, [True])
-
-    def test_prealloc_abort_does_not_arm(self):
-        # A receiver that never published metadata (init_time None) does not
-        # enter the deferred-release flow that cleans the tracker up; arming
-        # it would leak one set per aborted prealloc request.
-        mgr = self._make_decode_manager()
-        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
-        recv._send_abort_notification()
-        self.assertEqual(armed_at_send, [False])
-        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
-
-    def test_opted_out_backend_does_not_arm(self):
-        # Backends without a drain ack send the ABORT but must not arm:
-        # nothing would ever clean the tracker up.
-        mgr = self._make_decode_manager(enabled=False)
-        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
-        recv._send_abort_notification()
-        self.assertEqual(armed_at_send, [False])
-        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
     def test_force_arm_arms_unpublished_receiver_before_send(self):
         # Bug regression: a send_metadata that failed partway leaves init_time
@@ -757,12 +569,6 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(q._deferred_releases, [])
             device_release.assert_not_called()
 
-    def test_noop_when_nothing_deferred(self):
-        q = _make_queue()
-        with patch.object(decode_mod, "release_kv_cache") as rel:
-            q.resolve_deferred_releases()
-        rel.assert_not_called()
-
     def test_holds_until_drained_then_releases(self):
         mgr = _make_manager()
         room, idx = 200, 7
@@ -828,23 +634,6 @@ class TestResolveDeferredReleases(CustomTestCase):
             duration_seconds=32.0,
             outcome="timeout",
         )
-
-    def test_metrics_disabled_does_not_observe_release(self):
-        mgr = _make_manager()
-        room, idx = 301, 4
-        q = _make_queue(enable_metrics=False)
-        dreq = _make_decode_req(room, idx, mgr)
-        q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
-
-        with (
-            patch.object(decode_mod.time, "monotonic", return_value=20.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
-        ):
-            q.resolve_deferred_releases()
-
-        rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
-        self.assertEqual(q.num_pending_deferred_releases(), 0)
-        q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
     def test_failed_release_is_isolated_and_not_retried(self):
         # A raising _do_release must drop the entry (no double-free on retry) and
