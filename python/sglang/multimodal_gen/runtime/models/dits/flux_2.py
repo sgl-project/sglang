@@ -354,10 +354,6 @@ def _xpu_gated_resnorm(
         sig=sig,
         equal=tensors_equal,
         logger=logger,
-        mismatch_msg=(
-            "FLUX.2 fused XPU gated residual+LN+modulate fast path is not "
-            "bit-exact on this platform; falling back to eager"
-        ),
     )
 
 
