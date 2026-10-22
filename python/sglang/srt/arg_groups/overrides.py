@@ -1072,6 +1072,24 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
 
 
 @register_post_process
+def _deterministic_rocm_rccl_check(view: Any) -> dict:
+    # Deterministic TP on ROCm relies on the one-stage custom all-reduce; above two ranks
+    # RCCL's results change with the batch, even with its algorithm and protocol pinned.
+    if (
+        view.enable_deterministic_inference
+        and get_platform().is_hip
+        and view.tp_size > 2
+        and view.disable_custom_all_reduce
+    ):
+        raise ValueError(
+            "--disable-custom-all-reduce cannot be combined with "
+            "--enable-deterministic-inference on ROCm when --tp-size is above 2: "
+            "the all-reduce would run through RCCL, which is not batch-invariant."
+        )
+    return {}
+
+
+@register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}

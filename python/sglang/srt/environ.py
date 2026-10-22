@@ -368,6 +368,8 @@ class Envs:
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     # Comma-separated peer IPs admitted by TCP-bound IPC sockets; empty admits all.
     SGLANG_ZMQ_ALLOWED_PEERS = EnvTuple(tuple())
+    # Source IP for outgoing TCP IPC connects, so an allowlisting peer sees it.
+    SGLANG_ZMQ_SOURCE_IP = EnvStr(None)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
@@ -830,8 +832,10 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
-    SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
+    SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(True)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
+    SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S = EnvFloat(600.0)
 
     # ===================================================================
     # Mooncake store
@@ -903,6 +907,15 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Set by someone bisecting a numerical or performance regression to an
+    # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
+    # without rebuilding. The tile is on by default because hipBLASLt ships no
+    # tuned gfx1250 kernel, so the library GEMM this falls back to is slower
+    # than the BF16 path it replaces and, under torch.compile, fails to lower
+    # torch._scaled_mm at all. That is the part the code cannot tell you: this
+    # is a diagnostic switch, not a supported off-ramp -- to actually stop
+    # serving FP8, drop --quantization fp8.
+    SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -975,6 +988,9 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
+    # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
+    SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -1165,8 +1181,8 @@ class Envs:
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
-    SGLANG_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
-    SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
+    SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1471,8 +1487,8 @@ class Envs:
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
-    SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
-    SGLANG_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
+    SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
+    SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
