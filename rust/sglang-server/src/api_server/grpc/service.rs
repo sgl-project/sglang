@@ -13,7 +13,7 @@ use super::{info, native_api};
 use crate::api_server::core::{CoreHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
-use crate::message::wire::fill_preferred_sampling;
+use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -92,6 +92,9 @@ impl SglangService for GrpcService {
         request: Request<api::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let mut request = request.into_inner();
+        // Read before the fills below: only a `max_new_tokens` the client set
+        // is checked against the context window.
+        let client_max_new_tokens = ClientMaxNewTokens::of_proto(request.sampling_params.as_ref());
         if let Some(preferred) = &self.config.preferred_sampling_params {
             request.sampling_params =
                 fill_preferred_sampling(request.sampling_params.take(), &preferred.0)
@@ -101,8 +104,9 @@ impl SglangService for GrpcService {
         // schema default, as an absent JSON key does.
         request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
-        let (payloads, is_batch) = into_requests(request, &self.config.generation_policy)
+        let (mut payloads, is_batch) = into_requests(request, &self.config.generation_policy)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        client_max_new_tokens.mark(&mut payloads);
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
         // the same boundary here.
@@ -698,6 +702,7 @@ mod tests {
 
     /// Launch-time preferred sampling params fill the fields a protobuf request
     /// left unset, beneath the ones it set: the HTTP precedence at the gRPC entry.
+    /// A filled `max_new_tokens` is marked defaulted; a set one is the client's.
     #[tokio::test]
     async fn preferred_sampling_params_fill_unset_fields() {
         let preferred = PreferredSamplingParams(serde_json::json!({
@@ -705,25 +710,34 @@ mod tests {
             "max_new_tokens": 32,
         }));
         let harness = Harness::build(1, false, Duration::from_secs(1), true, Some(preferred));
-        let mut request = ids_request(&[1], None);
-        request.sampling_params = Some(api::SamplingParamsOrList {
-            value: Some(api::sampling_params_or_list::Value::One(
-                api::SamplingParams {
-                    temperature: Some(0.8),
-                    ..Default::default()
-                },
-            )),
-        });
-        let _stream = harness
-            .service
-            .generate(Request::new(request))
-            .await
-            .unwrap()
-            .into_inner();
+        for (max_new_tokens, expected) in [(None, (Some(32), true)), (Some(8), (Some(8), false))] {
+            let mut request = ids_request(&[1], None);
+            request.sampling_params = Some(api::SamplingParamsOrList {
+                value: Some(api::sampling_params_or_list::Value::One(
+                    api::SamplingParams {
+                        temperature: Some(0.8),
+                        max_new_tokens,
+                        ..Default::default()
+                    },
+                )),
+            });
+            let _stream = harness
+                .service
+                .generate(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
 
-        let intake = harness.next_generation().await;
-        assert_eq!(intake.request.sampling_params.temperature, 0.8);
-        assert_eq!(intake.request.sampling_params.max_new_tokens, Some(32));
+            let intake = harness.next_generation().await;
+            assert_eq!(intake.request.sampling_params.temperature, 0.8);
+            assert_eq!(
+                (
+                    intake.request.sampling_params.max_new_tokens,
+                    intake.request.max_new_tokens_defaulted,
+                ),
+                expected
+            );
+        }
     }
 
     /// Protobuf has no null: a sampling field the client left unset takes the
@@ -752,6 +766,7 @@ mod tests {
         let intake = harness.next_generation().await;
         assert_eq!(intake.request.sampling_params.temperature, 0.8);
         assert_eq!(intake.request.sampling_params.max_new_tokens, Some(128));
+        assert!(intake.request.max_new_tokens_defaulted);
         assert_eq!(intake.request.sampling_params.top_p, 1.0);
     }
 
