@@ -90,6 +90,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    batch.prefill_input_ids_host = None
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
@@ -112,6 +113,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
             batch.input_ids = prefill_gpu
+            batch.prefill_input_ids_host = batch.prefill_input_ids_cpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():

@@ -604,6 +604,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
     mm_token_modalities: Optional[torch.Tensor] = None
+    # Host copy of a pure-prefill batch's input ids, or None.
+    prefill_input_ids_host: Optional[torch.Tensor] = None
     multi_gate_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Encoder-decoder host fields
@@ -1087,6 +1089,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
+            prefill_input_ids_host=batch.prefill_input_ids_host,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],

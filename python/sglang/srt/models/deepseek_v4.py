@@ -3398,6 +3398,17 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         )
 
 
+def _batch_may_hold_image_rows(
+    forward_batch: ForwardBatch, image_token_id: int
+) -> bool:
+    """False only when the host copy of a prefill batch's ids proves no row is an
+    image token (a literal image token id or a multimodal pad id)."""
+    ids = forward_batch.prefill_input_ids_host
+    if ids is None or get_is_capture_mode():
+        return True
+    return bool(((ids == image_token_id) | (ids >= MM_PAD_SHIFT_VALUE)).any())
+
+
 def _gather_late_layer_ids(
     input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
 ) -> torch.Tensor:
@@ -3941,6 +3952,11 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
+        keep_image_rows = (
+            self.config.model_type == "deepseek_v41"
+            and self.config.vision_n_layers > 0
+            and _batch_may_hold_image_rows(forward_batch, self.config.image_token_id)
+        )
         for i in range(self.start_layer, self.end_layer):
             if _is_cuda:
                 layer = self.layers[i]
@@ -4069,10 +4085,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if keep_image_rows:
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         state.residual,

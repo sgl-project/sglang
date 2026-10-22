@@ -101,7 +101,9 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
         expected[1] = hidden[1]
         for contains_mm in (False, True):
             batch = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND, contains_mm_inputs=lambda: contains_mm
+                forward_mode=ForwardMode.EXTEND,
+                contains_mm_inputs=lambda: contains_mm,
+                prefill_input_ids_host=ids,
             )
             with (
                 patch.object(dsv4, "is_cp_active", return_value=False),
@@ -116,6 +118,23 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
+
+    def test_image_row_select_is_skipped_only_for_text_only_host_ids(self):
+        image_id = 42
+        cases = [
+            (None, False, True),  # no host ids: decode, verify, or a mixed batch
+            (torch.tensor([7, 9]), True, True),  # graph capture
+            (torch.tensor([7, image_id]), False, True),
+            (torch.tensor([7, dsv4.MM_PAD_SHIFT_VALUE + 1]), False, True),
+            (torch.tensor([7, 9]), False, False),
+        ]
+        for ids, capturing, expected in cases:
+            with self.subTest(ids=ids, capturing=capturing):
+                batch = SimpleNamespace(prefill_input_ids_host=ids)
+                with patch.object(dsv4, "get_is_capture_mode", return_value=capturing):
+                    self.assertEqual(
+                        dsv4._batch_may_hold_image_rows(batch, image_id), expected
+                    )
 
 
 if __name__ == "__main__":
