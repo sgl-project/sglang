@@ -177,14 +177,27 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             query_sequence_ids.to(sequence_lengths.device),
             self.compress_ratio,
         )
-        compressed_keys = gather_qsa_compressed_keys(
-            compressed_buffer,
-            self.token_slot_table,
-            compressed_cu_seqlens,
-            sum(complete_blocks),
-            max(complete_blocks, default=0),
-            ratio,
-        )
+        if compressed_buffer.device.type == "cuda":
+            compressed_keys = gather_qsa_compressed_keys(
+                compressed_buffer,
+                self.token_slot_table,
+                compressed_cu_seqlens,
+                sum(complete_blocks),
+                max(complete_blocks, default=0),
+                ratio,
+            )
+        else:
+            # Retain the tensor path on NPU/CPU; the fused gather targets CUDA.
+            parts = [
+                self.token_slot_table[sequence_id, : count * ratio : ratio]
+                for sequence_id, count in enumerate(complete_blocks)
+                if count
+            ]
+            compressed_keys = (
+                compressed_buffer.index_select(0, torch.cat(parts).long() // ratio)
+                if parts
+                else compressed_buffer.new_empty((0, *compressed_buffer.shape[1:]))
+            )
         return compressed_keys, row_starts, row_ends, sequence_lengths
 
     def get_decode_mqa_inputs(

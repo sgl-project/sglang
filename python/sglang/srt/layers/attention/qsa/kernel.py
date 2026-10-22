@@ -1,4 +1,4 @@
-"""CUDA kernels and tensor transforms for simple QSA."""
+"""Platform kernels and tensor transforms for compressed QSA."""
 
 from __future__ import annotations
 
@@ -33,6 +33,10 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if logits.device.type == "npu":
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import fast_topk
+
+        return fast_topk(logits, lengths, topk, starts)
     if logits.is_cuda:
         if is_batch_invariant_mode_enabled() and not is_hip():
             from flashinfer import TopKTieBreak, top_k_ragged_transform
@@ -325,7 +329,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with platform kernels or the Torch reference."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -336,6 +340,12 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
+    if block_indices.device.type == "npu":
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion import expand_blocks
+
+        return expand_blocks(
+            block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+        )
     if block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.

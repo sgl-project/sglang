@@ -44,6 +44,7 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.config import get_active_qsa_profile
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
@@ -235,6 +236,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
+    def _requires_attention_input_update(self) -> bool:
+        hf_config = self.model_runner.model_config.hf_config
+        # Active QSA consumes device metadata. Dense fallback still uses FIA's
+        # CPU-length input update and must retain the ordinary replay path.
+        return not (
+            is_deepseek_dsa(hf_config)
+            or is_deepseek_v4(hf_config)
+            or get_active_qsa_profile(hf_config) is not None
+        )
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -369,10 +380,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if not (
-            is_deepseek_dsa(self.model_runner.model_config.hf_config)
-            or is_deepseek_v4(self.model_runner.model_config.hf_config)
-        ):
+        if self._requires_attention_input_update():
             if forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
