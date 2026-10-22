@@ -5,7 +5,7 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 from __future__ import annotations
 
 import functools
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, Tuple
 
 import torch
 
@@ -57,18 +57,15 @@ def flat_index_logits_rows_per_tile(
     *,
     heads: int,
     budget_bytes: int,
-    item_size: Optional[int] = None,
 ) -> int:
-    """Rows per logits tile within ``budget_bytes`` (sized as fp32, which also
-    bounds bf16), at the kernel's row alignment."""
-    if item_size is None:
-        item_size = index_logits_dtype().itemsize
+    """Rows per logits tile within ``budget_bytes``, at the kernel's row alignment.
+    Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
+    half the budget, which leaves room for the per-row selection scratch that
+    grows with the tile."""
     row_alignment = 128 // heads
-    # NOTE: for bf16, the estimated row bytes is 2 times the actual bytes
-    effective_width = width * item_size // 4
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(effective_width),
+        row_bytes=mqa_logits_row_bytes(width),
         budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
