@@ -144,3 +144,13 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.kda_prefill_track:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

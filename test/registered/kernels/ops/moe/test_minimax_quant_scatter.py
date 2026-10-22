@@ -11,11 +11,11 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     fill_gateup_input_triton_kernel,
     moe_ep_deepgemm_preprocess,
 )
+from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
+    per_token_quant_fp8_ue8m0_scatter,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
-)
-from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
-    per_token_quant_fp8_ue8m0_scatter,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
