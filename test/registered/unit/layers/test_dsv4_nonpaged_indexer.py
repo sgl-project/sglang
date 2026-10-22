@@ -984,6 +984,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             compressed_page_size=64,
             topk_metadata_chunks=self.topk_plans,
             use_topk_v2=True,
+            rows_per_request=1,
             row_chunks=lambda: list(zip(self.chunks, self.plans)),
         )
         inputs = DecodeInputs(
@@ -1093,6 +1094,64 @@ class TestChunkedPagedDecode(CustomTestCase):
             indexer.topk_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
+
+
+class TestGroupedVerifyRows(CustomTestCase):
+    """Static verify rows reach the paged logits kernel as one request per block."""
+
+    def _args(self, rows_per_request, rows=slice(None)):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            DeepGEMMDecodeData,
+        )
+
+        requests, block, heads, pages = 3, 6, 2, 4
+        num_rows = requests * block
+        lens = torch.arange(num_rows, dtype=torch.int32) + 100
+        table = torch.arange(requests * pages, dtype=torch.int32).view(requests, pages)
+        metadata = SimpleNamespace(
+            compressed_seq_lens=lens,
+            page_table=table.repeat_interleave(block, dim=0),
+            rows_per_request=rows_per_request,
+        )
+        data = DeepGEMMDecodeData(
+            q_fp4=torch.arange(num_rows * heads * 64, dtype=torch.int8).view(
+                num_rows, 1, heads, 64
+            ),
+            q_sf=torch.arange(num_rows * heads, dtype=torch.int32).view(
+                num_rows, 1, heads
+            ),
+            weights=torch.zeros((num_rows, heads), dtype=torch.float32),
+            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
+        )
+        return data, metadata, table, data.paged_logits_args(metadata, rows)
+
+    def test_one_row_per_request_keeps_the_per_row_layout(self):
+        data, metadata, _table, ((q, sf), lens, table) = self._args(1)
+        self.assertTrue(torch.equal(q, data.q_fp4))
+        self.assertTrue(torch.equal(sf, data.q_sf))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens))
+        self.assertTrue(torch.equal(table, metadata.page_table))
+
+    def test_block_rows_become_one_request(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(6)
+        self.assertEqual(tuple(q.shape), (3, 6, 2, 64))
+        self.assertEqual(tuple(sf.shape), (3, 6, 2))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens.view(3, 6)))
+        self.assertEqual(tuple(table.shape), (3, 4))
+        self.assertTrue(torch.equal(table, per_request_table))
+        self.assertEqual(table.stride(1), 1)
+
+    def test_row_chunk_groups_its_own_rows(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(
+            6, slice(6, 18)
+        )
+        self.assertEqual(tuple(q.shape), (2, 6, 2, 64))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4[6:18]))
+        self.assertTrue(
+            torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6))
+        )
+        self.assertTrue(torch.equal(table, per_request_table[1:]))
 
 
 class TestCandidateIndexerGating(CustomTestCase):
