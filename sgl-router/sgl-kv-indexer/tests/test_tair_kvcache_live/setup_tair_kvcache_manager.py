@@ -559,6 +559,10 @@ def write_env_file(workdir: str, state: Dict[str, Any]) -> str:
         f"export TAIR_KVCACHE_LIVE_ENDPOINT=http://127.0.0.1:{state['rpc_port']}",
         f"export TAIR_KVCACHE_LIVE_INSTANCE_ID={state['instance_id']}",
         f"export TAIR_KVCACHE_LIVE_INSTANCE_GROUP={state['instance_group']}",
+        # The registered instance's block size. A caller that reports events
+        # for this instance has to key blocks the same way, so it is exported
+        # rather than left for the caller to guess.
+        f"export TAIR_KVCACHE_LIVE_BLOCK_SIZE={BLOCK_SIZE}",
         f"export TAIR_KVCACHE_LIVE_MODEL_NAME={MODEL_NAME}",
         f"export TAIR_KVCACHE_LIVE_MODEL_DTYPE={MODEL_DTYPE}",
         f"export TAIR_KVCACHE_LIVE_HTTP_ENDPOINT=http://127.0.0.1:{state['http_port']}",
