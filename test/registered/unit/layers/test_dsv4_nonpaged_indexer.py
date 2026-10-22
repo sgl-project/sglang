@@ -567,7 +567,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         expected = torch.zeros((query_rows, 128), dtype=torch.float32)
         deep_gemm = SimpleNamespace(fp8_fp4_mqa_logits=MagicMock(return_value=expected))
 
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_INDEXER}.dsv4_fp8_index_cache_is_ue8m0", return_value=False),
+        ):
             kv = C4IndexerBackendMixin._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
