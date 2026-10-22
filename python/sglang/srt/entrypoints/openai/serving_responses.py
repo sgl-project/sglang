@@ -2278,7 +2278,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 reasoning_parser_obj.detector, ResponseTemplateReasoningDetector
             )
         ) or (
-            isinstance(tool_parser, FunctionCallParser)
+            tool_parser is not None
+            and not isinstance(tool_parser, JsonArrayParser)
             and isinstance(tool_parser.detector, ResponseTemplateToolDetector)
         )
         stream_offset = 0
