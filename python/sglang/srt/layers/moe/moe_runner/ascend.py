@@ -64,6 +64,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
         AscendTPCombineInput,
         AscendTPDispatchOutput,
@@ -315,6 +319,21 @@ def pre_permute_ascend_tp_to_ascend(
     )
 
 
+@register_pre_permute("ascend_ops", "ascend")
+def pre_permute_ascend_ops_to_ascend(
+    dispatch_output: AscendOpsDispatchOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    return AscendRunnerInput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        expert_tokens=dispatch_output.expert_tokens,
+        group_list_type=dispatch_output.group_list_type,
+    )
+
+
 @register_pre_permute("deepep_normal", "ascend")
 def pre_permute_deepep_normal_to_ascend(
     dispatch_output: DeepEPNormalDispatchOutput,
@@ -381,6 +400,18 @@ def post_permute_ascend_to_ascend_tp(
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
 
     return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
+
+
+@register_post_permute("ascend", "ascend_ops")
+def post_permute_ascend_to_ascend_ops(
+    runner_output: AscendRunnerOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendOpsCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsCombineInput
+
+    return AscendOpsCombineInput(hidden_states=runner_output.hidden_states)
 
 
 @register_post_permute("ascend", "deepep_normal")
