@@ -43,7 +43,10 @@ import logging
 
 import msgspec
 
-from sglang.srt.mem_cache.pool_host.page_unified import PAGE_UNIFIED_OBJECT_LAYOUT
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PAGE_UNIFIED_OBJECT_LAYOUT,
+    PageUnifiedLayout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +202,23 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     @property
     def head_group_num(self) -> int:
         return len(self.head_ranges)
+
+    def chunk_spans(self, layout: PageUnifiedLayout) -> list[tuple[int, int]]:
+        """Byte ``(offset, length)`` of each suffix's chunk in one page block.
+
+        Plan head group ``j`` is pool head group ``j``: both cut the rank's
+        heads into equal groups in head order.
+        """
+        if layout.head_group_num != self.head_group_num:
+            raise ValueError(
+                f"the unified plan cuts {self.head_group_num} head groups but "
+                f"the page block holds {layout.head_group_num}."
+            )
+        return [
+            layout.chunk_span(layer_range=layer_range, head_group=head_group)
+            for layer_range in self.layer_ranges
+            for head_group in range(self.head_group_num)
+        ]
 
 
 def plan_unified_kv(

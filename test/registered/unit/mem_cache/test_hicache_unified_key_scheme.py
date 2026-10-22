@@ -96,9 +96,18 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
     def test_unified_needs_a_supported_storage_backend(self):
         with self.assertRaisesRegex(ValueError, "needs"):
             _resolve(hicache_storage_backend=None)
-        for backend in ("hf3fs", "mooncake"):
+        for backend in ("hf3fs", "nixl"):
             with self.subTest(backend=backend), self.assertRaises(NotImplementedError):
                 _resolve(hicache_storage_backend=backend)
+
+    def test_unified_accepts_the_mooncake_backend(self):
+        args = _resolve(
+            hicache_storage_backend="mooncake",
+            hicache_storage_head_partition=2,
+            hicache_storage_layer_partition=8,
+        )
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+        self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
 
     def test_unified_refuses_speculative_decoding(self):
         # Draft layers sit on the host pool's layer axis but outside the grid.
@@ -342,13 +351,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=True,
             ),
             patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
-            patch.object(
-                controller,
-                "_build_unified_plan",
-                return_value=SimpleNamespace(
-                    suffixes=["shared"], layer_ranges=[(0, 4)], head_group_num=1
-                ),
-            ),
+            patch.object(controller, "_build_unified_plan", return_value=None),
         ):
             config = controller._generate_storage_config("org/model")
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
@@ -437,6 +440,35 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     ],
                 )
                 self.assertEqual(config.unified_chunk_spans, expected_spans)
+
+    def test_rank_suffix_config_has_no_chunk_spans(self):
+        controller = self._controller()
+        controller.mem_pool_host.layout = "page_first"
+        controller.storage_host_pool.storage_format_tag = None
+        controller.enable_storage_metrics = False
+        parallel = SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
+            patch.object(controller, "_build_unified_plan", return_value=None),
+        ):
+            config = controller._generate_storage_config("org/model")
+        self.assertIsNone(config.unified_suffixes)
+        self.assertIsNone(config.unified_chunk_spans)
 
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
