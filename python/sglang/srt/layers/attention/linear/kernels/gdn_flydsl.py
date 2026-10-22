@@ -18,10 +18,10 @@ def _load_aiter_flydsl_gdn():
         from aiter.ops.prefill_batch_metadata import (
             build_gated_delta_rule_prefill_metadata,
         )
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+        from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_o import (
             chunk_fwd_o_opt_vk,
         )
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
             l2norm_fwd,
         )
     except ImportError as exc:
