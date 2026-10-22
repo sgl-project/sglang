@@ -3556,6 +3556,7 @@ class DeepseekV4HipRadixBackend(
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
+                zero_row=window.zero_row,
                 capacity=window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
