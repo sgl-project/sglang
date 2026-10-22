@@ -75,7 +75,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    get_next_token_logits_dtype,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -712,7 +715,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if graph_shared_output is None or rows > graph_shared_output.max_rows:
             return None
         return graph_shared_output.get_logits_buffer(
-            self.model_runner.model_config.vocab_size, rows=rows
+            self.model_runner.model_config.vocab_size,
+            rows=rows,
+            dtype=get_next_token_logits_dtype(
+                self.model_runner.model_config.hf_text_config
+            ),
         )
 
     def _uses_eager_prefill_tail(self) -> bool:
