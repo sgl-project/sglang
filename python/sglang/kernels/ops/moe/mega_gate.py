@@ -5,14 +5,6 @@ from typing import Optional
 import torch
 
 
-def is_mega_gate_available() -> bool:
-    try:
-        from deep_gemm import bf16_mega_gate as impl
-    except ImportError:
-        return False
-    return callable(impl)
-
-
 def bf16_mega_gate(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,

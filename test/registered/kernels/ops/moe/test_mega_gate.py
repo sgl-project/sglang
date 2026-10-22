@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate, is_mega_gate_available
+from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,8 +16,6 @@ class TestMegaGate(CustomTestCase):
         super().setUpClass()
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
             raise unittest.SkipTest("MegaGate requires SM10x")
-        if not is_mega_gate_available():
-            raise unittest.SkipTest("DeepGEMM does not expose bf16_mega_gate")
 
     @staticmethod
     def _reference(

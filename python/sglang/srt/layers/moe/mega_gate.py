@@ -4,7 +4,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate, is_mega_gate_available
+from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.topk import (
@@ -31,7 +31,6 @@ class MegaGateRouting(NamedTuple):
 def mega_gate_supported(moe) -> bool:
     if (
         _device_sm // 10 != 10
-        or not is_mega_gate_available()
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
