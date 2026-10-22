@@ -55,7 +55,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import is_xpu, run_with_deadline
 
 try:
     from nixl._bindings import (
@@ -71,6 +71,8 @@ try:
     )
 except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -998,6 +1000,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
 
     def _init_staging_allocator(self):
@@ -1008,6 +1011,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
 
     def _register_staging_memory(self, ptr: int, size: int):
@@ -1781,6 +1785,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
+                            # NIXL reads the staging buffer asynchronously, and the next
+                            # decode rank's gather overwrites it from offset 0. Gated to
+                            # XPU, where this corrupted KV under concurrent requests.
+                            if _is_xpu and kv_xfer_handle is not None:
+                                self._await_handles(
+                                    [kv_xfer_handle], failure_seen=False
+                                )
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
@@ -2651,16 +2662,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
             [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
+            dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
