@@ -1554,7 +1554,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             # Set by the model only for a DCP extend that gathered the KV.
-            gathered = getattr(forward_batch, "npu_dcp_extend_kv", None)
+            gathered = forward_batch.npu_dcp_extend_kv
             if gathered is not None:
                 return self._forward_sparse_dcp_gathered(
                     q_nope,

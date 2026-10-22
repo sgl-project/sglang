@@ -3489,7 +3489,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             # read rank-local metadata off the attention backend. A DSA extend
             # whose prefix is cheaper to move than its queries gathers the KV
             # instead, which needs this; its presence is what selects that path.
-            if not self.use_dsa:
+            # The gathered-KV operator path is bf16/fp16 only; any other KV
+            # dtype keeps the query gather rather than raising there.
+            if not self.use_dsa or kv_cache_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
                 return None
             prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
             parallel = get_parallel()

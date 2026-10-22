@@ -20,6 +20,7 @@ from typing import Dict, List, NamedTuple, Sequence, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -251,11 +252,33 @@ def dcp_owned_prefix_positions(
     return torch.cat(parts)
 
 
+def dcp_local_prefix_rows(
+    prefix_slots: torch.Tensor,
+    prefix_lens: Sequence[int],
+    dcp_size: int,
+    dcp_rank: int,
+    interleave: int,
+) -> torch.Tensor:
+    """This rank's pool rows for its share of the concatenated prefix slots.
+
+    Selected by position, mapped by slot: the two agree only because allocator
+    pages are widened to ``dcp_size * interleave`` slots, and the row must be
+    the one ``localize_dcp_indices`` wrote. Ordered for ``plan_dcp_extend_gather``.
+    """
+    owned = dcp_owned_prefix_positions(prefix_lens, dcp_size, dcp_rank, interleave)
+    return dcp_local_row(
+        prefix_slots[owned.to(prefix_slots.device)], dcp_size, interleave
+    )
+
+
 # Above this many new tokens a DSA extend gathers the KV whatever the bytes say.
 # The query gather's fp32 ``[out, lse]`` exchange grows with the new tokens and
 # is held several times over: a 16k-token batch of three 1M-prefix requests ran
-# out of memory there on A3, while 4,096-token chunks run on main.
-DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = 4096
+# out of memory there on A3, while 4,096-token chunks run on main. Memory-driven,
+# so a deployment can move it.
+DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = (
+    envs.SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS.get()
+)
 
 
 def dcp_extend_gathers_kv(

@@ -557,7 +557,8 @@ def forward_dsa_prepare_npu(
 
 def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     """Lay this rank's per-request shards out at their padded send offsets."""
-    send = shards.new_empty((plan.send_rows, *shards.shape[1:]))
+    # Zeroed: no rank reads the pad rows, but they still cross the collective.
+    send = shards.new_zeros((plan.send_rows, *shards.shape[1:]))
     src = dst = 0
     for local_len, padded_len in zip(plan.local_lens, plan.padded_lens):
         send[dst : dst + local_len] = shards[src : src + local_len]
@@ -584,7 +585,7 @@ def _dcp_gather_extend_kv_npu(
     minutes. The keys travel separately because the operator takes them apart.
     """
     parallel = runtime_context.get_parallel()
-    plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
+    plan = forward_batch.npu_dcp_extend_gather
     if plan is None:
         plan = dcp_layout.plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
