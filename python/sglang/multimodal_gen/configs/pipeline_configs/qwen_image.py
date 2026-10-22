@@ -679,7 +679,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             width, height = self.calculate_vae_image_size(img, img.width, img.height)
             new_images.append(
                 preprocess_image(
-                    img, device=get_local_torch_device(), sizes=((width, height),)
+                    img, device=get_local_torch_device(), size=(width, height)
                 )
             )
             vae_image_sizes.append((width, height))

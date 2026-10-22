@@ -96,13 +96,12 @@ def preprocess_image(
     image: PIL.Image.Image,
     *,
     device: torch.device,
-    sizes: tuple[tuple[int, int], ...] = (),
+    size: tuple[int, int] | None = None,
     crop: tuple[int, int, int, int] | None = None,
 ) -> torch.Tensor:
-    """Pillow Lanczos steps, crop, and [-1, 1] normalization to [1, C, H, W].
+    """Pillow Lanczos resize, crop, and [-1, 1] normalization to [1, C, H, W].
 
-    Sizes are (width, height); crop is (top, left, height, width). Intermediate
-    resizes retain uint8 rounding, including models with two consecutive resizes.
+    Size is (width, height); crop is (top, left, height, width).
     Non-RGB inputs and small images retain the CPU recipe.
     """
     if (
@@ -112,7 +111,7 @@ def preprocess_image(
         or image.mode != "RGB"
         or image.width * image.height < 256 * 256
     ):
-        for size in sizes:
+        if size is not None:
             image = image.resize(size, PIL.Image.Resampling.LANCZOS)
         if crop is not None:
             top, left, height, width = crop
@@ -122,19 +121,17 @@ def preprocess_image(
     # upload compact pixels; the lookup table preserves the CPU FP32 rounding
     pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
     resize_rgb = get_kernel("mm.lanczos_resize")
-    sizes = sizes or (image.size,)
-    for index, (width, height) in enumerate(sizes):
-        last = index == len(sizes) - 1
-        if last and crop == (0, 0, height, width):
-            crop = None
-        pixels = resize_rgb(
-            pixels,
-            height,
-            width,
-            crop=crop if last else None,
-            mean=(0.5, 0.5, 0.5) if last else None,
-            std=(0.5, 0.5, 0.5) if last else None,
-        )
+    width, height = size or image.size
+    if crop == (0, 0, height, width):
+        crop = None
+    pixels = resize_rgb(
+        pixels,
+        height,
+        width,
+        crop=crop,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+    )
     return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 

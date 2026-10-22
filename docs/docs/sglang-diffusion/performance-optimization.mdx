@@ -21,8 +21,8 @@ The docs use "output-preserving" instead of promising bit-exact "lossless" becau
 ## Image and Video Input Processing
 
 Eligible RGB inputs use GPU Lanczos resize, crop, and normalization before
-encoding. This path retains Pillow's uint8 rounding, including intermediate
-rounding when a model resizes twice, and preserves the encoder input layout.
+encoding. This path retains Pillow's uint8 rounding, model-specific crop
+geometry, and the encoder input layout.
 It covers Cosmos3 image/video conditioning, Wan TI2V, FLUX.2/Klein reference
 images, Qwen-Image-Edit 2509/2511 VAE inputs, and RGB conversion in the shared
 image-VAE stage. Small images and unsupported image modes keep the CPU path.

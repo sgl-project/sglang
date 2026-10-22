@@ -603,18 +603,18 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         target_area = 1024 * 1024
         if image.mode == "RGB":
             width, height = image.size
-            sizes = []
+            size = None
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
                 width, height = int(width * scale), int(height * scale)
-                sizes.append((width, height))
+                size = (width, height)
             multiple = self.vae_config.arch_config.vae_scale_factor * 2
             out_w, out_h = width // multiple * multiple, height // multiple * multiple
             # Flux2 crops to the aligned canvas without a second resample
             pixels = preprocess_image(
                 image,
                 device=get_local_torch_device(),
-                sizes=tuple(sizes),
+                size=size,
                 crop=(
                     (height - out_h) // 2,
                     (width - out_w) // 2,

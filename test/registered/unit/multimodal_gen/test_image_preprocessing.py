@@ -26,11 +26,11 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 class TestImagePreprocessing(CustomTestCase):
     def test_cpu_cuda_values_and_strides(self):
         rng = np.random.default_rng(991)
-        for shape, sizes, crop in (
-            ((256, 256), (), None),
-            ((1081, 1921), ((1345, 757), (832, 480)), (0, 0, 480, 832)),
-            ((731, 517), ((640, 904),), (200, 0, 480, 640)),
-            ((31, 47), ((96, 64),), None),
+        for shape, size, crop in (
+            ((256, 256), None, None),
+            ((1081, 1921), (832, 480), (0, 0, 480, 832)),
+            ((731, 517), (640, 904), (200, 0, 480, 640)),
+            ((31, 47), (96, 64), None),
         ):
             image = Image.fromarray(rng.integers(0, 256, (*shape, 3), dtype=np.uint8))
             for mode in ("RGB", "RGBA", "L"):
@@ -38,11 +38,11 @@ class TestImagePreprocessing(CustomTestCase):
                     source = image.convert(mode)
                     with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(True):
                         expected = preprocess_image(
-                            source, device=torch.device("cuda"), sizes=sizes, crop=crop
+                            source, device=torch.device("cuda"), size=size, crop=crop
                         )
                     with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(False):
                         actual = preprocess_image(
-                            source, device=torch.device("cuda"), sizes=sizes, crop=crop
+                            source, device=torch.device("cuda"), size=size, crop=crop
                         )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     self.assertEqual(actual.stride(), expected.stride())

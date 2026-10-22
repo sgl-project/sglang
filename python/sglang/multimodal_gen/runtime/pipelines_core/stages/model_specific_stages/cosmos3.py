@@ -478,7 +478,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                     preprocess_image(
                         image,
                         device=get_local_torch_device(),
-                        sizes=((width, height),),
+                        size=(width, height),
                         crop=(
                             (height - target_h) // 2,
                             (width - target_w) // 2,
