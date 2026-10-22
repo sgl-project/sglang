@@ -66,7 +66,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_model, get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -305,6 +305,16 @@ def _use_nvfp4_dispatch() -> bool:
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 
 
+def _online_fp8_dense_enabled() -> bool:
+    """`--enable-nvfp4-ckpt-fp8-dense` (CUDA only)."""
+    if not is_cuda():
+        return False
+    try:
+        return bool(get_model().enable_nvfp4_ckpt_fp8_dense)
+    except (AttributeError, ValueError):  # config bag not published (offline tools)
+        return False
+
+
 @lru_cache(maxsize=8192)
 def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
     # Large checkpoints exceed regex's 500-entry cache. Keep compiled patterns
@@ -325,6 +335,43 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
+        self.online_fp8_exclude_modules: frozenset = frozenset()
+        self._online_fp8_config: Optional[Fp8Config] = None
+
+    # Linear layers the checkpoint leaves unquantized are served in the checkpoint
+    # dtype or, with --enable-nvfp4-ckpt-fp8-dense, quantized to block-FP8 while
+    # loading. Only NVFP4 configs opt in; a model keeps precision-sensitive modules
+    # out with `online_fp8_exclude_modules` (module names, or "*" for all).
+    supports_online_fp8_dense = False
+
+    def update_online_fp8_exclude_modules(self, names) -> None:
+        self.online_fp8_exclude_modules = frozenset(names)
+
+    def is_online_fp8_excluded(self, prefix: str) -> bool:
+        excluded = self.online_fp8_exclude_modules
+        return "*" in excluded or prefix.rsplit(".", 1)[-1] in excluded
+
+    def _unquantized_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> LinearMethodBase:
+        """Linear method for a layer the checkpoint leaves unquantized."""
+        from sglang.srt.layers.quantization.fp8 import Fp8OnlineBlockLinearMethod
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if (
+            not self.supports_online_fp8_dense
+            or isinstance(layer, ParallelLMHead)
+            or self.is_online_fp8_excluded(prefix)
+            or not _online_fp8_dense_enabled()
+        ):
+            return UnquantizedLinearMethod()
+        if self._online_fp8_config is None:
+            self._online_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,  # block-FP8 runtime contract
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+        return Fp8OnlineBlockLinearMethod(self._online_fp8_config)
 
     def _get_quant_method(
         self,
@@ -342,7 +389,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return self._unquantized_linear_method(layer, prefix)
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -806,6 +853,8 @@ _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
+    supports_online_fp8_dense = True
+
     def __init__(
         self,
         kv_cache_quant_algo: Optional[str],
@@ -1049,7 +1098,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return self._unquantized_linear_method(layer, prefix)
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
@@ -1060,7 +1109,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
-            return UnquantizedLinearMethod()
+            return self._unquantized_linear_method(layer, prefix)
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.
@@ -1487,6 +1536,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
       1.0 when the checkpoint has no NVFP4 activation scale.
     - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
     """
+
+    supports_online_fp8_dense = True
 
     def __init__(
         self,
