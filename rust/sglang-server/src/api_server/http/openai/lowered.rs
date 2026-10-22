@@ -421,7 +421,8 @@ mod tests {
     use axum::Router;
 
     use super::super::test_utils::{
-        answering_app_state_with_item, body_json, checkpoint_formatter, chunk, oneshot, post_json,
+        answering_app_state_with, answering_app_state_with_item, body_json, checkpoint_formatter,
+        chunk, oneshot, post_json,
     };
     use super::*;
     use crate::message::response::{ChunkExtras, ResponseItem};
@@ -469,6 +470,34 @@ mod tests {
         let state =
             answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), answer);
         super::super::routes().with_state(state)
+    }
+
+    /// A Jinja template's own thinking default (here Qwen3's `enable_thinking`,
+    /// on unless the request turns it off) decides whether the reply starts in
+    /// reasoning, as `template_detection` does.
+    #[tokio::test]
+    async fn jinja_template_thinking_default_separates_reasoning() {
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+            {% endfor %}<|im_start|>assistant\n\
+            {% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}";
+        let formatter = checkpoint_formatter(&json!({}), template);
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("qwen3".into()),
+            ..Default::default()
+        };
+        let state = answering_app_state_with(
+            Arc::new(args),
+            formatter,
+            Some(tokenizer()),
+            "17*23</think>391",
+        );
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "17*23?"}]});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "17*23", "{value}");
+        assert_eq!(message["content"], "391");
     }
 
     /// An `n` past the batch cap is a 400 before the prompt is copied, not a
