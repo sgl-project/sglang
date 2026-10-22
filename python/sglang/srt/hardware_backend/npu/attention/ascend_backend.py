@@ -440,10 +440,8 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        if (
-            not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
-            and not (dense_mla and parallel.dcp_enabled)
-            and not self.dsa_dcp_target
+        if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get() and not (
+            dense_mla and parallel.dcp_enabled
         ):
             assert not self.is_hybrid_swa, (
                 "Hybrid swa is not supply with `needs_cpu_seq_lens=False`."
