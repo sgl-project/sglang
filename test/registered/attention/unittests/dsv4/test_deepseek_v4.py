@@ -533,7 +533,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, mixed_num_prefill_tokens=None
+        )
         for num_qo_tokens, builds in (
             (_LARGE_INDEXER_QUERY_THRESHOLD, False),
             (_LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
@@ -572,7 +574,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, mixed_num_prefill_tokens=None
+        )
         backend = self._make_prefill_backend(hisparse_coordinator=object())
 
         shared_read_ends = backend.resolve_prefill_shared_read_ends(
