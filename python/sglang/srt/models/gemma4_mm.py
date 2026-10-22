@@ -39,8 +39,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -301,8 +301,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         mm_inputs: MultimodalInputs,
     ) -> array:
         """Pad input IDs with image and audio tokens."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -1099,12 +1098,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.layers.")
 
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
