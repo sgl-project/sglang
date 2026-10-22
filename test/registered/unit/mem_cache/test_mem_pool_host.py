@@ -748,16 +748,21 @@ class TestHostMemoryBudget(CustomTestCase):
                 )
                 self.assertEqual(budget, expected)
 
-    def test_no_hugetlb_credit_for_pin_memory_devices(self):
-        # npu/musa allocate with torch.empty(pin_memory=True) and never see the
-        # allocator, so what it could map from hugetlb does not apply.
+    def test_hugetlb_credit_is_gated_off(self):
+        # No credit where a mapping cannot take MAP_HUGETLB: npu/musa allocate
+        # with torch.empty(pin_memory=True) and never see the allocator, and
+        # mode=off opts out entirely.
         gib = 1024**3
         reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         allocator = self._hugetlb_allocator(96 * gib)
-        for device in ("npu", torch.device("xpu")):
-            with self.subTest(device=repr(device)):
+        for device, mode in (
+            ("npu", "prefer"),
+            (torch.device("xpu"), "prefer"),
+            ("cuda", "off"),
+        ):
+            with self.subTest(device=repr(device), mode=mode):
                 budget = self._budget_for(
-                    allocator, device, available=reserve + 64 * gib
+                    allocator, device, available=reserve + 64 * gib, mode=mode
                 )
                 self.assertEqual(budget, 64 * gib // 8)
                 allocator.free_hugetlb_bytes.assert_not_called()
@@ -821,16 +826,6 @@ class TestHostMemoryBudget(CustomTestCase):
             budget, (4 * gib - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
         )
 
-    def test_off_mode_does_not_query_or_credit_hugetlb(self):
-        gib = 1024**3
-        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
-        allocator = self._hugetlb_allocator(96 * gib)
-        budget = self._budget_for(
-            allocator, "cuda", available=reserve + 64 * gib, mode="off"
-        )
-        self.assertEqual(budget, 64 * gib // 8)
-        allocator.free_hugetlb_bytes.assert_not_called()
-
     def test_required_mode_uses_only_hugetlb(self):
         gib = 1024**3
         budget = self._budget_for(
@@ -851,6 +846,17 @@ class TestHostMemoryBudget(CustomTestCase):
             mode="required",
         )
         self.assertEqual(budget, 2 * mib)
+        # ... and without a page size it is a configuration error.
+        with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+            self._budget_for(
+                unittest.mock.Mock(
+                    supports_hugetlb=unittest.mock.Mock(return_value=True)
+                ),
+                "cuda",
+                available=1 << 50,
+                mode="required",
+                size="",
+            )
 
     def test_required_mode_is_ignored_by_unsupported_allocation_paths(self):
         gib = 1024**3
@@ -866,19 +872,6 @@ class TestHostMemoryBudget(CustomTestCase):
             self.assertEqual(budget, 64 * gib // 8)
             parser.assert_not_called()
         allocator.free_hugetlb_bytes.assert_not_called()
-
-    def test_required_mode_requires_a_hugepage_size(self):
-        allocator = unittest.mock.Mock(
-            supports_hugetlb=unittest.mock.Mock(return_value=True)
-        )
-        with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
-            self._budget_for(
-                allocator,
-                "cuda",
-                available=1 << 50,
-                mode="required",
-                size="",
-            )
 
     def test_guard_passes_its_allocator_and_device(self):
         device_pool = MHATokenToKVPool(

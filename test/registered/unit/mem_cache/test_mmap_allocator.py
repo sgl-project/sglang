@@ -241,44 +241,32 @@ class TestHugetlbPool(unittest.TestCase):
             ):
                 self.assertEqual(mmap_allocator.hugepage_mode(size), expected)
 
-    def test_hugetlb_pool_free_bytes_reads_the_requested_pool(self):
-        # sysfs keeps one pool per page size; MemAvailable excludes all of them.
+    def test_hugetlb_pool_free_bytes(self):
+        # sysfs keeps one pool per page size, and MemAvailable excludes all of
+        # them. A mapping reserves its pages at mmap time and faults them in
+        # afterwards; until then sysfs still counts them as free, and
+        # co-located ranks populate their pools concurrently, so only
+        # free - resv can back a new mapping.
+        pool_2mb = (6144 - 1000) * 2 * 1024**2
         with tempfile.TemporaryDirectory() as root:
-            self._sysfs(root, free_2mb=6144, free_1gb=3)
+            self._sysfs(root, free_2mb=6144, free_1gb=3, resv_2mb=1000)
             with unittest.mock.patch.object(
                 mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root
             ):
-                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                    self.assertEqual(
-                        mmap_allocator.hugetlb_pool_free_bytes(), 6144 * 2 * 1024**2
-                    )
-                with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
+                # The requested page size selects its pool, net of reservations.
+                with (
+                    self.subTest(why="2MB pool"),
+                    envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+                ):
+                    self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), pool_2mb)
+                with (
+                    self.subTest(why="1GB pool"),
+                    envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+                ):
                     self.assertEqual(
                         mmap_allocator.hugetlb_pool_free_bytes(), 3 * 1024**3
                     )
-
-    def test_hugetlb_pool_free_bytes_excludes_pages_reserved_by_other_mappings(self):
-        # A mapping reserves its pages at mmap time and faults them in
-        # afterwards; until then sysfs still counts them as free. Co-located
-        # ranks populate their pools concurrently, so only free - resv can back
-        # a new mapping.
-        with tempfile.TemporaryDirectory() as root:
-            self._sysfs(root, free_2mb=6144, resv_2mb=1000)
-            with (
-                unittest.mock.patch.object(mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root),
-                envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            ):
-                self.assertEqual(
-                    mmap_allocator.hugetlb_pool_free_bytes(),
-                    (6144 - 1000) * 2 * 1024**2,
-                )
-
-    def test_hugetlb_pool_free_bytes_is_zero_when_mmap_would_not_use_hugetlb(self):
-        with tempfile.TemporaryDirectory() as root:
-            self._sysfs(root, free_2mb=6144)
-            with unittest.mock.patch.object(
-                mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root
-            ):
+                # No credit where a new mapping would not take MAP_HUGETLB.
                 with (
                     self.subTest(why="not requested"),
                     envs.SGLANG_HUGEPAGE_SIZE.override(""),
@@ -296,28 +284,15 @@ class TestHugetlbPool(unittest.TestCase):
                     unittest.mock.patch.object(mmap_allocator, "_libc", None),
                 ):
                     self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
-                with (
-                    self.subTest(why="no pool of that size"),
-                    envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
-                    self.assertLogs(mmap_allocator.logger, "WARNING"),
-                ):
-                    self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
-
-    def test_hugetlb_pool_free_bytes_is_bounded_by_the_cgroup_limit(self):
-        with tempfile.TemporaryDirectory() as root:
-            self._sysfs(root, free_2mb=6144)
-            with (
-                unittest.mock.patch.object(mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root),
-                envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            ):
-                pool = 6144 * 2 * 1024**2
+                # A cgroup limit below the pool bounds the credit.
                 for cgroup, expected in [
-                    (None, pool),  # no container limit: the sysfs pool as-is
-                    (pool + 1, pool),  # cgroup room above the pool: the pool bounds
+                    (None, pool_2mb),  # no container limit: the sysfs pool as-is
+                    (pool_2mb + 1, pool_2mb),  # room above the pool: the pool bounds
                     (1024**3, 1024**3),  # in-container: the cgroup bounds
                 ]:
                     with (
-                        self.subTest(cgroup=cgroup),
+                        self.subTest(why="cgroup bound", cgroup=cgroup),
+                        envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
                         unittest.mock.patch.object(
                             mmap_allocator,
                             "cgroup_hugetlb_headroom_bytes",
@@ -327,6 +302,18 @@ class TestHugetlbPool(unittest.TestCase):
                         self.assertEqual(
                             mmap_allocator.hugetlb_pool_free_bytes(), expected
                         )
+
+        # No pool of the requested size: warn and report zero.
+        with tempfile.TemporaryDirectory() as empty_root:
+            with (
+                self.subTest(why="no pool of that size"),
+                unittest.mock.patch.object(
+                    mmap_allocator, "_HUGEPAGE_SYSFS_DIR", empty_root
+                ),
+                envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+                self.assertLogs(mmap_allocator.logger, "WARNING"),
+            ):
+                self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
 
 
 if __name__ == "__main__":
