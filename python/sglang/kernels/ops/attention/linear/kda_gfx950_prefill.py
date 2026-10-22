@@ -5,9 +5,8 @@
 anything the kernel does not cover, and the caller keeps the Triton ``chunk_kda``
 path. On by default on gfx950; ``SGLANG_ROCM_KDA_HIP_PREFILL=0`` turns it off.
 
-The kernel source ``kda_prefill_gfx950.hip`` next to this file is JIT-compiled
-with ``torch.utils.cpp_extension`` on first use and cached under
-``TORCH_EXTENSIONS_DIR``.
+The kernel is ``attention.kda_prefill_gfx950`` (``KernelBackend.KDA``), implemented
+in ``sglang.kernels.kda_kernels.kda_prefill_gfx950``.
 """
 
 from __future__ import annotations
@@ -17,10 +16,8 @@ from functools import lru_cache
 
 import torch
 
-_SRC = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "kda_prefill_gfx950.hip"
-)
-_ext = None
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import KernelBackend
 
 
 @lru_cache(maxsize=1)
@@ -31,31 +28,6 @@ def available() -> bool:
     if not torch.version.hip or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx950"
-
-
-def _load():
-    global _ext
-    if _ext is None:
-        from sglang.srt.utils.cpp_extension_loader import (
-            load_extension_with_recovery,
-        )
-
-        # torch's JIT builds for every arch in PYTORCH_ROCM_ARCH
-        previous_arch = os.environ.get("PYTORCH_ROCM_ARCH")
-        os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
-        try:
-            _ext = load_extension_with_recovery(
-                name="kda_prefill_gfx950",
-                sources=[_SRC],
-                extra_cuda_cflags=["-O3", "-mllvm", "-amdgpu-mfma-vgpr-form"],
-                extra_cflags=["-O3"],
-            )
-        finally:
-            if previous_arch is None:
-                os.environ.pop("PYTORCH_ROCM_ARCH", None)
-            else:
-                os.environ["PYTORCH_ROCM_ARCH"] = previous_arch
-    return _ext
 
 
 def extend(
@@ -114,8 +86,7 @@ def extend(
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync
     seq_lens = kwargs.get("extend_seq_lens_cpu")
-    empty = q.new_empty(0, dtype=torch.float32)
-    output = _load().kda_prefill_gfx950(
+    output = get_kernel("attention.kda_prefill_gfx950", KernelBackend.KDA)(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -127,12 +98,12 @@ def extend(
         cache_indices.to(torch.int32).contiguous(),
         query_start_loc.to(torch.int32).contiguous(),
         max(seq_lens) if seq_lens else q.shape[1],
-        empty if track_state is None else track_state,
-        (
-            empty.long()
+        q.shape[-1] ** -0.5,
+        track_state=track_state,
+        track_chunk_idx=(
+            None
             if track_chunk_idx is None
             else track_chunk_idx.to(torch.int64).contiguous()
         ),
-        q.shape[-1] ** -0.5,
     )
     return (output, None) if return_intermediate_states else output

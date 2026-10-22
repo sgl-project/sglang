@@ -522,6 +522,15 @@ register_kernel(
         ),
     )
 )
+# Called through ops.attention.linear.kda_gfx950_prefill, which checks for gfx950.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_prefill_gfx950",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.kda_prefill_gfx950:kda_prefill_gfx950",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="attention.fp8_attention",
