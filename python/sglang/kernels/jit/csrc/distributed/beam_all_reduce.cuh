@@ -29,6 +29,13 @@ struct Params {
   device::distributed::PushWorkSpace<World> workspace;
 };
 
+SGL_DEVICE void cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+SGL_DEVICE void cluster_wait() {
+  asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+}
+
 /// Every thread holds eight adjacent BF16 values of one row.
 template <uint32_t Hidden, uint32_t Cluster>
 SGL_DEVICE float inv_rms(const Vec& v, float eps) {
@@ -77,6 +84,8 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     device::PDLTriggerSecondary<true>();
     return;
   }
+  // inv_rms writes peers' shared memory, which is valid only once every CTA in the cluster has started.
+  if constexpr (Cluster > 1) cluster_arrive_relaxed();
   const auto idx = row * (Hidden / 8) + tx;
   Vec value;
   if constexpr (TopK == 1) {
@@ -131,6 +140,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     }
     value[j] = cast<bf16x2_t>(sum);
   }
+  if constexpr (Cluster > 1) cluster_wait();
   const float post_rstd = inv_rms<Hidden, Cluster>(value, p.eps);
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {
