@@ -66,6 +66,7 @@ def construct_variable_block_sizes(
     dit_seq_shape: tuple[int, int, int],
     num_tiles: tuple[int, int, int],
     device: torch.device,
+    tile_size: tuple[int, int, int] = VSA_TILE_SIZE,
 ) -> torch.LongTensor:
     """
     Compute the number of valid (non‑padded) tokens inside every
@@ -78,7 +79,7 @@ def construct_variable_block_sizes(
     """
     # unpack
     t, h, w = dit_seq_shape
-    ts_t, ts_h, ts_w = VSA_TILE_SIZE
+    ts_t, ts_h, ts_w = tile_size
     n_t, n_h, n_w = num_tiles
 
     def _sizes(dim_len: int, tile: int, n_tiles: int) -> torch.LongTensor:
@@ -174,12 +175,6 @@ def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore
         self,
         current_timestep: int,
@@ -189,7 +184,6 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
         **kwargs: dict[str, Any],
     ) -> VideoSparseAttentionMetadata:
-        patch_size = patch_size
         dit_seq_shape = (
             raw_latent_shape[0] // patch_size[0],
             raw_latent_shape[1] // patch_size[1],

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -78,3 +80,58 @@ def default_global_server_args():
         yield
     finally:
         set_global_server_args(previous)
+
+
+@contextmanager
+def mock_cuda_platform(
+    *,
+    memory_gb: int = 80,
+    available_memory_gb: int | dict[int, int] | None = None,
+):
+    """current_platform as an idle CUDA device of memory_gb GB, so ServerArgs resolution
+    and parallelism auto-tuning run without a GPU."""
+
+    def get_available_gpu_memory(device_id=0, **_kwargs):
+        if isinstance(available_memory_gb, dict):
+            return available_memory_gb[device_id]
+        if available_memory_gb is not None:
+            return available_memory_gb
+        return memory_gb
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
+            return_value=memory_gb * 1024**3,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
+            side_effect=get_available_gpu_memory,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
+            return_value=True,
+        ),
+    ):
+        yield
+
+
+@pytest.fixture
+def cuda_platform():
+    with mock_cuda_platform():
+        yield

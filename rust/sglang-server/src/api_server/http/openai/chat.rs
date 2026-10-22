@@ -14,7 +14,7 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
+use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -25,16 +25,17 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use sglang_processor::{
+    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
+    tool_call_stream,
+};
 
 use super::completions::completion_usage;
-use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
-use super::tools::{
-    apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
-    parse_chat_tool_calls,
-};
+use super::pd_routing::PDRoutingFields;
+use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -49,10 +50,12 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    pub(super) request: CreateChatCompletionRequest,
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    routing: PDRoutingFields,
 }
 
 async fn chat_completions(
@@ -62,18 +65,15 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        routing,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if request.model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
-            false,
-        );
+    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
@@ -120,11 +120,14 @@ async fn chat_completions(
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools_enabled = request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && tool_choice != DynamoToolChoice::None;
+    let tools = match sglang_processor::chat_tool_definitions(
+        request.tools.as_deref(),
+        &request.messages,
+    ) {
+        Ok(tools) => tools,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
     let parser = tools_enabled
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
@@ -139,16 +142,7 @@ async fn chat_completions(
     // the Dynamo request type has no such field, so it is always on when the
     // server was launched with `--reasoning-parser`.
     let reasoning_parser = state.server_args.reasoning_parser.clone();
-    let tools = request.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(|tool| ToolDefinition {
-                name: tool.function.name.clone(),
-                parameters: tool.function.parameters.clone(),
-                strict: tool.function.strict,
-            })
-            .collect::<Vec<_>>()
-    });
+    let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, prompt) =
@@ -173,7 +167,16 @@ async fn chat_completions(
     };
 
     let stream = request.stream.unwrap_or(false);
-    let n = request.n.unwrap_or(1) as usize;
+    let prompt_count = 1;
+    let choices_per_prompt = request.n.unwrap_or(1) as usize;
+    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+        Ok(routing) => routing,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    // Chat normalizes one prompt, so each bootstrap column has one entry.
+    let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
+    let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
+    let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -186,17 +189,13 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut submitted = Vec::with_capacity(n);
+    let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // V4 prefills <think>, so the generated stream has no opening marker.
-    let starts_in_reasoning = matches!(
-        reasoning_parser.as_deref(),
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
-    ) && prompt.ends_with("<think>");
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
     let mut prompt = Some(prompt);
-    for index in 0..n {
+    for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == n {
+        let choice_prompt = if index + 1 == choices_per_prompt {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
             prompt
@@ -216,6 +215,11 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: bootstrap_host.clone(),
+            bootstrap_port,
+            bootstrap_room,
+            routed_dp_rank: routing.routed_dp_rank,
+            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -253,6 +257,7 @@ async fn chat_completions(
             want_logprobs,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -445,10 +450,15 @@ pub(super) async fn unary_chat(
     want_logprobs: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
+    let reasoning_options = ReasoningOptions {
+        force_reasoning: starts_in_reasoning.then_some(true),
+        ..Default::default()
+    };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
@@ -470,8 +480,12 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning(
+            reasoning_parser.as_deref(),
+            &reasoning_options,
+            &output.text,
+            output.stop_trimmed_token_ids(),
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -547,7 +561,10 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), ReasoningOptions {
+                        force_reasoning: starts_in_reasoning.then_some(true),
+                        ..Default::default()
+                    }))
                     .collect()
             } else {
                 vec![]
@@ -605,7 +622,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {
@@ -719,19 +736,21 @@ pub(super) fn chat_event_stream(
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
-        Box::pin(apply_tool_calling_jail(
-            Some(dynamo_parser_name(&parser).to_owned()),
+        tool_call_stream(
+            &parser,
             tool_choice,
             tools,
             uses_tool_call_structural_tag,
             raw,
-        ))
+        )
     } else {
         Box::pin(raw)
     };
 
     async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
+        // Each choice's first tool call, whose deltas (a name and argument
+        // fragments, for some parsers) alone pass without parallel tool calls.
+        let mut first_tool_call: Vec<Option<u32>> = vec![None; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
@@ -739,15 +758,13 @@ pub(super) fn chat_event_stream(
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
                         if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
-                                }
+                            let seen = first_tool_call.get(index).copied().flatten();
+                            let first = seen.or(calls.first().map(|call| call.index));
+                            calls.retain(|call| Some(call.index) == first);
+                            if let (Some(first), Some(slot)) = (first, first_tool_call.get_mut(index))
+                                && !calls.is_empty()
+                            {
+                                *slot = Some(first);
                             }
                             if calls.is_empty() {
                                 choice.delta.tool_calls = None;
@@ -829,12 +846,21 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        merge_template_stops, starts_in_reasoning, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
@@ -848,6 +874,30 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prefilled_think_starts_in_reasoning() {
+        let glm = Some("glm45");
+        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
+        assert!(!starts_in_reasoning(
+            glm,
+            "<|user|>hi<|assistant|><think></think>"
+        ));
+        let qwen = Some("qwen3");
+        assert!(starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v4"),
+            "<｜Assistant｜><think>"
+        ));
+        assert!(!starts_in_reasoning(None, "<think>\n"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -1023,6 +1073,7 @@ mod tests {
             false,
             None,
             None,
+            false,
             None,
             true,
             None,
@@ -1059,6 +1110,7 @@ mod tests {
             false,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             true,
             None,
@@ -1166,5 +1218,110 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+
+    // A named dynamic tool must pass request validation and reach both wire formats.
+    #[tokio::test]
+    async fn system_message_tools_reach_http_responses() {
+        use super::super::test_utils::{body_json, post_json};
+        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::message::config::ServerArgs;
+        use crate::message::request::RequestKind;
+        use crate::tokenizer_manager::wiring::TmEvent;
+        use std::sync::Arc;
+
+        for stream in [false, true] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "model".into(),
+                tool_call_parser: Some("kimi_k3".into()),
+                ..Default::default()
+            });
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: CoreMetadata::from(args.as_ref()),
+                },
+            );
+            let formatter =
+                dynamo_renderer::kimi_k3_formatter_for(&Some("kimi_k3".into()), "kimi_k3", false)
+                    .unwrap();
+            let state = Arc::new(super::super::AppState {
+                core,
+                generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
+                server_args: args,
+                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+            });
+            let responder = tokio::spawn(async move {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected generation intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("expected generation");
+                };
+                assert!(generate.text.as_ref().unwrap().contains("lookup"));
+                assert!(
+                    generate
+                        .sampling_params
+                        .structural_tag
+                        .as_ref()
+                        .unwrap()
+                        .contains("lookup")
+                );
+                request.sink.try_send(chunk(request.rid.as_str(),
+                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>", true)).unwrap();
+            });
+            let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
+                "model":"model", "stream":stream,
+                "messages":[{"role":"system","tools":[{"name":"lookup","parameters":{"type":"object","properties":{}}}]},
+                            {"role":"user","content":"Call lookup"}],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "chat_template_kwargs":{"thinking":false}
+            })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let frames: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix("data: ")
+                            .filter(|data| *data != "[DONE]")
+                            .map(|data| serde_json::from_str(data).unwrap())
+                    })
+                    .collect();
+                assert!(
+                    frames.iter().any(
+                        |frame| frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+                            == "lookup"
+                    ),
+                    "{text}"
+                );
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| frame["choices"][0]["finish_reason"] == "tool_calls"),
+                    "{text}"
+                );
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup",
+                    "{body}"
+                );
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+            }
+            responder.await.unwrap();
+        }
     }
 }

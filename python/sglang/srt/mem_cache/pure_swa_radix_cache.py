@@ -16,12 +16,14 @@ class PureSWARadixCache(RadixCache):
 
     Extends RadixCache with SWA semantics. Only caches the prefill portion
     [0, evict_floor) on request completion. Window-range KV is freed.
-    No tombstone mechanism needed.
+    No tombstone mechanism needed. With ``params.disable`` it serves
+    ``--disable-radix-cache`` and caches nothing.
     """
 
     def __init__(self, params: CacheInitParams):
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
+        self.draft_swa_window = params.draft_swa_window
 
     def supports_swa(self) -> bool:
         assert self.sliding_window_size is not None, (

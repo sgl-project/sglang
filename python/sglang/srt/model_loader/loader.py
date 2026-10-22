@@ -47,6 +47,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,
@@ -85,7 +86,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
+    resolve_shared_experts_config,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -119,6 +120,7 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -135,7 +137,6 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -284,11 +285,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    # Decide the shared-experts-fusion question here, once per runner, before any
-    # layer exists: this is the only place a model class is instantiated, and it
-    # is the last point that still knows both the checkpoint's quantization and
-    # (through the build scope) whether this runner is a draft.
-    install_shared_experts_fusion_decision(
+    shared_experts = resolve_shared_experts_config(
         model_class, model_config.hf_config, quant_config
     )
     kwargs = {
@@ -304,8 +301,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    model = model_class(**kwargs)
-    check_stage_producers(model)
+    with get_model().override(shared_experts=shared_experts):
+        model = model_class(**kwargs)
+        check_stage_producers(model)
+    model.shared_experts_config = shared_experts
     return model
 
 
@@ -359,6 +358,11 @@ class BaseModelLoader(ABC):
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
+    if load_format == LoadFormat.INSTANTTENSOR:
+        # Pass extra config directly to InstantTensor and let it report invalid
+        # options, so newer versions can add parameters without a SGLang update.
+        return
+
     allowed_keys = {"enable_multithread_load", "num_threads"}
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
@@ -490,9 +494,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif (
-            load_format == LoadFormat.SAFETENSORS
-            or load_format == LoadFormat.FASTSAFETENSORS
+        elif load_format in (
+            LoadFormat.SAFETENSORS,
+            LoadFormat.FASTSAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -630,6 +635,12 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.download_dir,
                 hf_folder,
                 hf_weights_files,
+            )
+        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            weights_iterator = instanttensor_weights_iterator(
+                hf_weights_files,
+                extra_config=extra_config,
+                load_group=self.load_config.load_group,
             )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
@@ -1044,22 +1055,11 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
-                model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
+        weights = monokernel_weights_iterator(model=model, weights=weights)
+        model.load_weights(weights)
+        if (is_nvfp4_online or is_modelopt_fp4_online) and target_device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1493,7 +1493,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.get():
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )

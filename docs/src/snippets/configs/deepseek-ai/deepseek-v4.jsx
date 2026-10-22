@@ -1,5 +1,9 @@
 // Single `export const config` literal — no spreads/calls/IIFE (Mintlify re-evals at hydration).
 // Cells are denormalized: no `--nnodes`/`--node-rank`/`--dist-init-addr`/`--host`/`--port` literals — engine injects them.
+//
+// ASCEND (A3/A5): single-node recipes transcribed from local runs, kept
+// `in-progress` until they are re-run on a release build. TODO(NPU) marks what
+// is still missing (images, Playground gating).
 
 export const config = {
   modelName: "DeepSeek-V4",
@@ -15,6 +19,9 @@ export const config = {
     "dgx-spark",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
+    // Huawei Ascend (catalog entry + NPU docker block come from the engine).
+    // TODO(NPU): cite the recipe provenance for the cells at the bottom.
+    "a3", "a5"
   ],
 
   // Model-specific GPUs the shared HARDWARE_CATALOG doesn't carry — the engine
@@ -26,6 +33,12 @@ export const config = {
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
+  // Mintlify strips module-level statements, so shared predicates live as
+  // properties on the exported object (same pattern as kimi-k3).
+  isNpuHw(s) {
+    return !!s && (s.hw === "a3" || s.hw === "a5");
+  },
+
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
@@ -33,10 +46,21 @@ export const config = {
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
     { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
+  // Quantization switches by platform, the way kimi-k3's does: CUDA/ROCm see
+  // FP8 / FP4 / NVFP4. Ascend is resolved per chip — the A3 Series serves the
+  // ModelSlim W8A8 checkpoint, the 950PR/DT Series (a5) serves the FP8 one.
+  // `showWhen` on a legacy match dim is enough — the engine filters the row
+  // before rendering, and a hidden pick is re-seated on the next visible option,
+  // so switching hardware never leaves a value the other platform cannot run.
   quantizations: [
-    { id: "fp8", label: "FP8" },
-    { id: "fp4", label: "FP4" },
-    { id: "nvfp4", label: "NVFP4" },
+    { id: "fp8", label: "FP8",
+      showWhen: (s) => !config.isNpuHw(s) || s.hw === "a5" },
+    { id: "fp4", label: "FP4", showWhen: (s) => !config.isNpuHw(s) },
+    // A3 Series only: the ModelScope W8A8 build is the only Ascend checkpoint
+    // wired for this model; the 950PR/DT runs the FP8 checkpoint above.
+    { id: "modelslim", label: "Modelslim (W8A8)", subtitle: "ModelScope NPU checkpoint",
+      showWhen: (s) => s.hw === "a3" },
+    { id: "nvfp4", label: "NVFP4", showWhen: (s) => !config.isNpuHw(s) },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -49,9 +73,9 @@ export const config = {
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
-  // AgentX 1P1D recipe: InferenceX PR #3664, commit df5e433239d7.
-  // The strategy presets use c16 / c48 / c256. Pro uses its MTP head;
-  // Pro Official is the InferenceX checkpoint. Acceptance simulation is omitted.
+  // MI355X 1P1D strategy presets use c16 / c48 / c256.
+  // Pro uses its MTP head; Pro Official uses DSpark.
+  // See section 3.7 for the Pro Official c1 / c512 overrides.
   overlayDims: [
     { id: "pdMode", title: "PD role", default: "prefill",
       showWhen: (s) => s.hw === "mi355x" && s.quant === "fp4"
@@ -71,15 +95,17 @@ export const config = {
     const official = sel.variant === "pro-official";
     const gamma = sel.strategy === "low-latency" ? 6 : 3;
     const tp = dp || !prefill ? 8 : 4;
-    const image = "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001";
+    const image = "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019";
     const router = [
+      ...(official && dp ? ["env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests"] : []),
       "python3 -m sglang_router.launch_router",
       "  --pd-disaggregation",
       "  --prefill http://<prefill-host>:30000",
       "  --decode http://<decode-host>:30100",
       "  --host 0.0.0.0 --port 8000",
       "  --policy consistent_hashing --dp-aware",
-      "  --decode-policy round_robin",
+      `  --decode-policy ${official && dp ? "power_of_two" : "round_robin"}`,
+      ...(official && dp ? ["  --worker-startup-check-interval 1"] : []),
       "  --cache-threshold 0.3",
       "  --balance-abs-threshold 2 --balance-rel-threshold 1.1",
       "  --disable-circuit-breaker --health-failure-threshold 100",
@@ -89,7 +115,7 @@ export const config = {
       router: { port: 8000, command: router } };
     if (role === "router") return { ...common,
       commands: { python: router, docker: `docker run --network host --rm ${image} ${router}` } };
-    // Emit overrides only. Defaults checked against the pinned image:
+    // Emit overrides only. Baseline defaults originally checked against
     // SGLang 3b2ad1c6ae, MORI 879983bdbd8c. ROCm model setup enables the
     // Aiter indexer; MegaMoE MTPR defaults to 8192 and static heap is implicit.
     // This Aiter MegaMoEV2 uses mori_shmem_create_tensor, not the CCO allocator.
@@ -111,8 +137,12 @@ export const config = {
       // SGE follows NIC capabilities; MORI already selects 2 on AMD AINIC.
       `GPU_MAX_HW_QUEUES=${dp ? 5 : 2}`,
       ...(prefill ? ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock"] : []),
+      // Both PD peers must use the same KV layout. TP prefill and all
+      // decode points use mxscale; MegaMoE prefill keeps its existing GEMMs.
+      ...(official || dp ? ["SGLANG_DSV4_UNIFIED_KV_FP8=1"] : []),
+      ...(official && (!dp || !prefill) ? ["SGLANG_DSV4_DENSE_MXSCALE=1"] : []),
+      ...(official && !prefill ? [`MORI_MAX_DISPATCH_TOKENS_DECODE=${64 * (gamma + 1)}`] : []),
       ...(dp ? [
-        "SGLANG_DSV4_UNIFIED_KV_FP8=1",
         // Shared-expert/gatherv default off; reduce-scatter defaults on in ROCm.
         ...(prefill ? ["SGLANG_DP_USE_REDUCE_SCATTER=0"] : [
           "SGLANG_SHARED_EXPERT_TP1=1",
@@ -161,6 +191,10 @@ export const config = {
   },
 
   modelNames: {
+    // A3 Series serves the ModelScope W8A8 build; the 950PR/DT (a5) serves the
+    // official FP8 checkpoint.
+    "flash-official|modelslim": "Eco-Tech/DeepSeek-V4-Flash-0731-w8a8",
+    "flash-official|fp8": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
@@ -332,8 +366,10 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi30x-20261007",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261007",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261016",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261016",
+    // TODO(NPU): `a3:` / `a5:` images (kimi-k3: quay.io/ascend/sglang:
+    // main-cann9.1.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -466,10 +502,17 @@ sgl-eval run mmmu_pro \\
             envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
             flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            hide: { hw: ["mi300x", "mi355x"] } },
+            hide: { hw: ["mi300x", "mi355x"] },
+            // FlashInfer is a CUDA kernel. On NPU the option stays visible but
+            // greyed, so the reason reaches the reader instead of the chip just
+            // vanishing (kimi-k3 carries the same rule).
+            disable: [{ when: { hw: ["a3", "a5"] },
+              reason: "FlashInfer is a CUDA kernel and is not supported on NPU." }] },
           { id: "marlin",            label: "Marlin (W4A16)",
             flags: ["--moe-runner-backend marlin"],
-            hide: { hw: ["mi300x", "mi355x"] } },
+            hide: { hw: ["mi300x", "mi355x"] },
+            disable: [{ when: { hw: ["a3", "a5"] },
+              reason: "Marlin is a CUDA kernel and is not supported on NPU." }] },
         ],
       },
       // DeepGEMM MegaMoE only: the ROCm build is quantized through the backend
@@ -679,6 +722,7 @@ sgl-eval run mmmu_pro \\
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--load-balance-method round_robin",
@@ -697,6 +741,8 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=448"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -716,6 +762,7 @@ sgl-eval run mmmu_pro \\
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--tp 4",
@@ -734,6 +781,8 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=256"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -835,7 +884,8 @@ sgl-eval run mmmu_pro \\
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           // Same value as prefill — the handshake compares KV layouts.
-          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1"],
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=256"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -876,9 +926,9 @@ sgl-eval run mmmu_pro \\
       // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
       // than the default round-robin: consistent_hashing keeps a conversation on
       // the prefill worker that already holds its prefix (decode holds no
-      // reusable prefix, so it stays round-robin), and the tight balance
-      // thresholds stop that affinity from starving the peer at the small
-      // running-request ceiling the roles above use. Health checking stays
+      // reusable prefix, so Pro Official DP uses power-of-two; other presets
+      // keep round-robin). The tight balance thresholds stop that affinity
+      // from starving the peer at the small running-request ceiling above. Health checking stays
       // enabled here (unlike the default's 999999s interval) because a long
       // agentic run should notice a wedged worker, but it is slack enough that
       // a multi-minute prefill is not mistaken for a failure.
@@ -896,13 +946,14 @@ sgl-eval run mmmu_pro \\
         { when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           command:
-`python3 -m sglang_router.launch_router \\
+`env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
   --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
   --decode http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy consistent_hashing --dp-aware \\
-  --decode-policy round_robin \\
+  --decode-policy power_of_two \\
+  --worker-startup-check-interval 1 \\
   --cache-threshold 0.3 \\
   --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
   --disable-circuit-breaker --health-failure-threshold 100 \\
@@ -2370,7 +2421,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2393,7 +2444,7 @@ sgl-eval run mmmu_pro \\
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2420,7 +2471,7 @@ sgl-eval run mmmu_pro \\
       // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -3019,6 +3070,7 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3048,6 +3100,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3080,6 +3133,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3115,6 +3169,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3141,6 +3196,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3175,6 +3231,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3211,6 +3268,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3251,6 +3309,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3287,6 +3346,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3325,6 +3385,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3359,6 +3420,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3399,6 +3461,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3437,6 +3500,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3472,6 +3536,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3512,6 +3577,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3550,6 +3616,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3584,6 +3651,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3624,6 +3692,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -4050,5 +4119,105 @@ sgl-eval run mmmu_pro \\
       pd: true, nnodes: 1, verified: false, env: [], flags: [] },
     { match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
       pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+
+    // Ascend, transcribed from the recipes that were actually run (single node).
+    // TODO(NPU): images; keep `in-progress` until re-run on a release build.
+    {
+      match: { hw: "a3", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FAST_KERNEL=0",
+        "SGLANG_DSV4_FP4_EXPERTS=False",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--page-size 128",
+        "--device npu",
+        "--attention-backend dsv4",
+        "--watchdog-timeout 9000",
+        "--mem-fraction-static 0.7",
+        "--prefill-max-requests 160",
+        "--max-prefill-tokens 65536",
+        "--chunked-prefill-size 131072",
+        "--max-running-requests 160",
+        "--dp-size 16",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--quantization modelslim",
+        "--enable-dp-lm-head",
+        "--kv-cache-dtype bfloat16",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-attention-backend ascend",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-bs-decode 1 2 4 8 10",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "a5", variant: "flash-official", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "HCCL_BUFFSIZE=2048",
+        "HCCL_SOCKET_IFNAME=lo",
+        "GLOO_SOCKET_IFNAME=lo",
+        "HCCL_INTRA_DMA_ENABLE=1",
+        "SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False",
+        "FORCE_DRAFT_MODEL_NON_QUANT=1",
+        "SGLANG_DSV4_FP4_EXPERTS=True",
+        "SGLANG_OPT_FUSE_WQA_WKV=0",
+        "SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch",
+        "SGLANG_OPT_USE_FUSED_HASH_TOPK=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_PRE=False",
+        "SGLANG_OPT_DEEPGEMM_HC_PRENORM=False",
+        "SGLANG_OPT_USE_TILELANG_MHC_POST=False",
+        "SGLANG_OPT_FP8_WO_A_GEMM=False",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
+        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100",
+        "SGLANG_ENABLE_WAR_BARRIER=1",
+        "SGLANG_FORCE_COARSE_WAR_BARRIER=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--page-size 128",
+        "--tp-size 4",
+        "--device npu",
+        "--attention-backend dsv4",
+        "--watchdog-timeout 9000",
+        "--mem-fraction-static 0.72",
+        "--max-running-requests 64",
+        "--chunked-prefill-size 65536",
+        "--max-prefill-tokens 65536",
+        "--cuda-graph-bs-decode 1 2 4 8 10 16",
+        "--kv-cache-dtype auto",
+        "--enable-dp-lm-head",
+        "--disable-radix-cache",
+        "--enable-dp-attention",
+        "--dp-size 4",
+        "--reasoning-parser deepseek-v4",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-draft-model-quantization fp8",
+        "--speculative-draft-attention-backend ascend",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-dspark-block-size 5",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
   ],
 };
