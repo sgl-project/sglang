@@ -704,6 +704,11 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
+    # --enable-mixed-chunk + speculative decoding: running requests draft and verify
+    # inside the prefill step's target forward (verify-merged mixed step) instead of
+    # a 1-token decode. DSPARK only, without DP attention or PP; unsupported setups
+    # warn and fall back (see verify_merged_mixed_enabled).
+    SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
