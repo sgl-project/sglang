@@ -1555,8 +1555,6 @@ def setup_state_kv_args(
                 isinstance(full_kv_pool, NPUMLATokenToKVPool)
                 and full_kv_pool.index_head_dim is None
             ):
-                if full_attention_layer_ids is None:
-                    raise ValueError("NPU hybrid MLA requires full-attention layer IDs")
                 npu_kv_pool = full_kv_pool
                 kv_layer_count = len(full_attention_layer_ids)
                 draft_layer_count = kv_args.num_draft_entries // 2
