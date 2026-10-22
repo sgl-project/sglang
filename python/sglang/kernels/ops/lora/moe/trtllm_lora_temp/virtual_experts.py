@@ -22,6 +22,8 @@ def _fused_virtual_topk_ids_kernel(
     token_lora_mapping_ptr,
     virtual_topk_ids_ptr,
     token_lora_mask_ptr,
+    adapter_enabled_ptr,
+    stride_enabled,
     num_experts_for_weight: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
     M,
@@ -30,6 +32,8 @@ def _fused_virtual_topk_ids_kernel(
     local_expert_offset: tl.constexpr,
     local_num_experts: tl.constexpr,
     EP_LOCAL: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    HAS_ADAPTER_ENABLED: tl.constexpr,
     ENABLE_PDL: tl.constexpr = False,
 ):
     """
@@ -59,6 +63,16 @@ def _fused_virtual_topk_ids_kernel(
 
     lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
     mask_val = lora_id >= 0
+    if HAS_ADAPTER_ENABLED:
+        mask_val = mask_val & (lora_id < NUM_SLOTS)
+        mask_val = mask_val & (
+            tl.load(
+                adapter_enabled_ptr + lora_id * stride_enabled,
+                mask=valid & mask_val,
+                other=0,
+            )
+            != 0
+        )
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
@@ -78,7 +92,12 @@ def _fused_virtual_topk_ids_kernel(
     expert = 0 if SHARED_OUTER else base
     shifted = expert + safe_lora * num_experts_for_weight
     result = tl.where(base < 0, base, shifted)
-    result = tl.where(mask_val, result, -1)
+    if HAS_ADAPTER_ENABLED:
+        # The +1 histogram has one negative bucket, even when a caller uses
+        # another negative sentinel. Leave the borrowed original IDs untouched.
+        result = tl.where(mask_val & (base >= 0), shifted, -1)
+    else:
+        result = tl.where(mask_val, result, -1)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -99,6 +118,7 @@ def _fused_virtual_topk_ids(
     max_loras: int,
     local_expert_offset: int = 0,
     local_num_experts: int | None = None,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
     Returns virtual topk_ids, token_lora_mask, and virtual_num_experts.
@@ -120,6 +140,8 @@ def _fused_virtual_topk_ids(
 
     virtual_topk_ids = torch.empty_like(topk_ids)
     token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
+    if M * top_k == 0:
+        return virtual_topk_ids, token_lora_mask, num_experts_for_weight * max_loras
 
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
@@ -130,6 +152,8 @@ def _fused_virtual_topk_ids(
         token_lora_mapping,
         virtual_topk_ids,
         token_lora_mask,
+        adapter_enabled,
+        adapter_enabled.stride(0) if adapter_enabled is not None else 0,
         num_experts_for_weight,
         shared_outer,
         M,
@@ -138,6 +162,8 @@ def _fused_virtual_topk_ids(
         local_expert_offset,
         local_num_experts if local_num_experts is not None else 0,
         ep_local,
+        NUM_SLOTS=max_loras,
+        HAS_ADAPTER_ENABLED=adapter_enabled is not None,
         ENABLE_PDL=enable_pdl,
         **pdl_kwargs,
     )
@@ -440,6 +466,8 @@ def _merged_experts_fused_moe_lora_add_impl(
     prewarm_a_routing: bool = True,
     prewarm_b_routing: bool = True,
     zero_intermediate: bool = False,
+    include_inactive_routes: bool = False,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> "torch.Tensor | None":
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -461,6 +489,10 @@ def _merged_experts_fused_moe_lora_add_impl(
     ``broadcast_intermediate`` is an expand-only mode where one rank vector per
     token is reused for every routed expert.
 
+    ``include_inactive_routes`` retains negative routing blocks. The existing
+    expand then writes literal zero to private overwrite outputs, while ADD
+    projections preserve their inactive rows. Default routing is unchanged.
+
     EP accepts either global weights/IDs with a local range or already-localized
     weights/IDs from the standard dispatcher.
     """
@@ -470,6 +502,10 @@ def _merged_experts_fused_moe_lora_add_impl(
     per_expert_dim = max(lora_a.shape[1], lora_b.shape[1])
     ep_local = local_num_experts is not None and local_num_experts < per_expert_dim
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    if adapter_enabled is not None:
+        assert adapter_enabled.shape == (max_loras,)
+        assert adapter_enabled.dtype == torch.int32
+        assert adapter_enabled.device == topk_ids.device
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
         # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]
@@ -553,7 +589,13 @@ def _merged_experts_fused_moe_lora_add_impl(
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check routing_cache for cross-call reuse (gate_up and down share routing)
-        cache_key = (num_experts, shared_outer, block_size)
+        cache_key = (
+            num_experts,
+            shared_outer,
+            block_size,
+            include_inactive_routes,
+            id(adapter_enabled),
+        )
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
@@ -592,8 +634,9 @@ def _merged_experts_fused_moe_lora_add_impl(
                 block_size,
                 local_expert_offset,
                 local_num_experts,
-                do_skip=True,
+                do_skip=not include_inactive_routes,
                 compact=compact_merged,
+                adapter_enabled=adapter_enabled,
             )
             result = (
                 sorted_token_ids,
@@ -614,6 +657,7 @@ def _merged_experts_fused_moe_lora_add_impl(
                 max_loras,
                 local_expert_offset,
                 local_num_experts,
+                adapter_enabled=adapter_enabled,
             )
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
@@ -945,6 +989,8 @@ def merged_experts_fused_moe_lora_add(
     prewarm_a_routing: bool = True,
     prewarm_b_routing: bool = True,
     zero_intermediate: bool = False,
+    include_inactive_routes: bool = False,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> "torch.Tensor | None":
     """Public API: wraps the registered op with routing_cache support."""
     return _merged_experts_fused_moe_lora_add_impl(
@@ -971,4 +1017,6 @@ def merged_experts_fused_moe_lora_add(
         prewarm_a_routing=prewarm_a_routing,
         prewarm_b_routing=prewarm_b_routing,
         zero_intermediate=zero_intermediate,
+        include_inactive_routes=include_inactive_routes,
+        adapter_enabled=adapter_enabled,
     )

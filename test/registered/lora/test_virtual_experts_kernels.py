@@ -117,6 +117,32 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                             self.assertEqual(virtual_ids[m, k].item(), expected)
                     torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
 
+                    enabled = torch.ones(
+                        max_loras * 2, device=self.device, dtype=torch.int32
+                    )[::2]
+                    enabled[1] = 0
+                    filtered, adapter_mask, _ = remap(
+                        topk_ids,
+                        token_lora_mapping,
+                        num_experts,
+                        shared_outer=shared_outer,
+                        max_loras=max_loras,
+                        adapter_enabled=enabled,
+                    )
+                    for m in range(topk_ids.shape[0]):
+                        slot = int(token_lora_mapping[m])
+                        active = slot >= 0 and bool(enabled[slot])
+                        self.assertEqual(bool(adapter_mask[m]), active)
+                        for k in range(topk_ids.shape[1]):
+                            base = int(topk_ids[m, k])
+                            expected = -1
+                            if active and base >= 0:
+                                expected = (
+                                    slot if shared_outer else base + slot * num_experts
+                                )
+                            self.assertEqual(int(filtered[m, k]), expected)
+                    torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
+
     @unittest.skipUnless(is_cuda(), "Merged LoRA alignment requires CUDA")
     def test_shared_outer_merged_alignment_skips_original_negative_routes(self):
         """Shared-outer blocks contain exactly live original slots after remapping."""
@@ -156,8 +182,12 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                         block_size=block_size,
                         do_skip=True,
                         fuse_scatter=fuse_scatter,
+                        return_inactive_prefix_count=True,
                     )
-                    used = int(count.item())
+                    self.assertEqual(count.shape, (2,))
+                    self.assertEqual(count.data_ptr() % 8, 0)
+                    self.assertEqual(int(count[1]), 0)
+                    used = int(count[0])
                     self.assertGreaterEqual(used, 0)
                     self.assertEqual(used % block_size, 0)
                     self.assertLessEqual(used, sorted_ids.numel())
@@ -181,6 +211,46 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                     torch.testing.assert_close(
                         mapping, original_mapping, rtol=0, atol=0
                     )
+            topk_ids.copy_(live_ids)
+            _, experts, count, _, _ = moe_lora_merged_align(
+                topk_ids,
+                mapping,
+                num_experts=4,
+                shared_outer=True,
+                max_loras=3,
+                block_size=block_size,
+                do_skip=False,
+                fuse_scatter=fuse_scatter,
+                return_inactive_prefix_count=True,
+            )
+            expected_prefix = (int((topk_ids < 0).sum()) + block_size - 1) // block_size
+            self.assertEqual(int(count[1]), expected_prefix)
+            self.assertTrue(bool((experts[:expected_prefix] == -1).all()))
+            ep_ids = torch.tensor(
+                [[-1, 4, 5], [-3, -1, 4]], device=self.device, dtype=torch.int32
+            )
+            ep_mapping = torch.zeros(2, device=self.device, dtype=torch.int32)
+            sorted_ep, ep_experts, ep_count, _, _ = moe_lora_merged_align(
+                ep_ids,
+                ep_mapping,
+                num_experts=8,
+                shared_outer=False,
+                max_loras=1,
+                block_size=block_size,
+                local_expert_offset=4,
+                local_num_experts=2,
+                do_skip=False,
+                compact=True,
+                fuse_scatter=fuse_scatter,
+                return_inactive_prefix_count=True,
+            )
+            self.assertEqual(int(ep_count[1]), 1)
+            used_blocks = sorted_ep[: int(ep_count[0])].view(-1, block_size)
+            for index, block in enumerate(used_blocks):
+                live = block[block < ep_ids.numel()].long()
+                actual = ep_ids.flatten()[live]
+                expected = torch.where(actual < 0, -1, actual)
+                self.assertTrue(bool((expected == ep_experts[index]).all()))
 
     def test_positive_topk_remapped_correctly(self):
         """Sanity: valid (non-negative) IDs follow the
