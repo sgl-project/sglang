@@ -126,5 +126,70 @@ def test_cuda_graph_replay_updates_outputs():
         torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rows", [1, 6, 24, 96, 384])
+def test_block32_wo_b_consumer(rows, monkeypatch):
+    """V4.1 block32 WO-B consumes the same packed activation as its BF16 path."""
+    import functools
+    from types import SimpleNamespace
+
+    import deep_gemm
+
+    from sglang.srt.layers.quantization import fp8_utils
+    from sglang.srt.layers.quantization.mxfp8_input import (
+        accepts_mxfp8_deepgemm_input,
+    )
+
+    torch.manual_seed(20261022)
+    x = torch.randn(rows, 2, 4096, device="cuda", dtype=torch.bfloat16)
+    x[0].zero_()
+    if rows > 1:
+        x[1].mul_(1e-8)
+    w = torch.randn(1024, 2, 4096, device="cuda", dtype=torch.bfloat16)
+    xq, xs = _quantize_woa(x, 32)
+    wq, ws = _quantize_woa(w, 32)
+    wq, ws = wq.transpose(0, 1).contiguous(), ws.transpose(0, 1)
+    reference = torch.empty(rows, 2, 1024, device="cuda", dtype=torch.bfloat16)
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd", (xq, xs), (wq, ws), reference, recipe=(1, 1, 32)
+    )
+    actual_q, actual_s = fp8_wo_a_mxfp8(xq, xs, wq, ws, (1, 1, 32))
+
+    # Block32 weights retain one scale per 32x32 block, unlike native MXFP8.
+    wb = torch.randn(5120, 2048, device="cuda", dtype=torch.bfloat16)
+    blocks = wb.float().view(160, 32, 64, 32)
+    sf = torch.exp2(
+        torch.ceil(torch.log2(blocks.abs().amax((1, 3)).clamp_min(1e-10) / 448))
+    )
+    qb = (blocks / sf[:, None, :, None]).reshape_as(wb).to(torch.float8_e4m3fn)
+    sf.power_of_two = True
+    consumer = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+    layer = SimpleNamespace(
+        weight=qb,
+        weight_scale_inv=sf,
+        quant_method=SimpleNamespace(
+            use_mxfp8=False,
+            use_marlin=False,
+            weight_block_size=[32, 32],
+            w8a8_block_fp8_linear=functools.partial(consumer, act_scale_ue8m0=True),
+        ),
+    )
+    assert accepts_mxfp8_deepgemm_input(layer)
+
+    def unexpected_fallback(*args, **kwargs):
+        raise AssertionError("Packed UE8M0 block32 input must reach DeepGEMM")
+
+    monkeypatch.setattr(fp8_utils, "triton_w8a8_block_fp8_linear", unexpected_fallback)
+    expected = consumer(reference.flatten(1), qb, [32, 32], sf, act_scale_ue8m0=True)
+    actual = consumer(
+        actual_q, qb, [32, 32], sf, input_scale=actual_s, act_scale_ue8m0=True
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not fp8_utils._ue8m0_deepgemm_skips_block32([32, 32], sf, actual_s)
+    assert fp8_utils._ue8m0_deepgemm_skips_block32([32, 32], sf, sf)
+    sf.power_of_two = False
+    assert not accepts_mxfp8_deepgemm_input(layer)
+    assert fp8_utils._ue8m0_deepgemm_skips_block32([32, 32], sf, actual_s)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

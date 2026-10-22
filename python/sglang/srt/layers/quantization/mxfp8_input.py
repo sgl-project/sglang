@@ -41,10 +41,24 @@ def accepts_mxfp8_deepgemm_input(linear) -> bool:
     qm = getattr(linear, "quant_method", None)
     backend = getattr(qm, "mxfp8_dense_backend", None)
     weight = getattr(linear, "weight", None)
-    return bool(
+    from sglang.srt.layers.quantization.fp8_utils import (
+        deepgemm_w8a8_block_fp8_linear_with_fallback,
+    )
+
+    native_mxfp8 = (
         backend is not None
         and backend.is_deep_gemm()
         and getattr(qm, "use_mxfp8", False)
+    )
+    block_linear = getattr(qm, "w8a8_block_fp8_linear", None)
+    block32_deepgemm = (
+        getattr(block_linear, "func", block_linear)
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and getattr(qm, "weight_block_size", None) == [32, 32]
+        and getattr(getattr(linear, "weight_scale_inv", None), "power_of_two", False)
+    )
+    return bool(
+        (native_mxfp8 or block32_deepgemm)
         and not getattr(qm, "use_marlin", False)
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight is not None

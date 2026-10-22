@@ -1417,11 +1417,14 @@ def _ue8m0_deepgemm_skips_block32(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor],
 ) -> bool:
-    # UE8M0 DeepGEMM casts block32 fp32 scales itself: it takes only weights the
-    # load found power-of-two scaled, and no pre-quantized input, which nothing checks.
+    # UE8M0 DeepGEMM takes only weights checked as power-of-two at load.
+    # Packed int32 activation scales already encode UE8M0 exponents; arbitrary
+    # pre-quantized fp32 scales retain the existing Triton fallback.
     if list(block_size) != [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         return False
-    return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
+    return (
+        input_scale is not None and input_scale.dtype != torch.int32
+    ) or not getattr(weight_scale, "power_of_two", False)
 
 
 def _deepgemm_block_fp8_supported(
@@ -1448,7 +1451,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        # Block32 pre-quantized input reaches Triton below on UE8M0 DeepGEMM.
+        # Block32 accepts packed UE8M0 scales; fp32 scales still use Triton.
         assert (
             list(block_size) == [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         )
@@ -1480,7 +1483,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if input_scale is not None:
         # Pre-quantized activations retain their per-token group size and
-        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
+        # fp32 or packed UE8M0 scales. DeepGEMM checks the storage layout.
         input_2d = input.view(-1, input.shape[-1])
         output = w8a8_block_fp8_matmul_deepgemm(
             input_2d,
