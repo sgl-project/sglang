@@ -3,9 +3,9 @@
 
 Same fail-closed interface as ``kda_fused_decode_aiter_hip``: it serves
 ``SGLANG_ROCM_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs it
-does not cover keep the unfused KDA decode. The kernel source
-``kda_decode_gfx950.hip`` next to this file is JIT-compiled with
-``torch.utils.cpp_extension`` on first use.
+does not cover keep the unfused KDA decode. The kernel is
+``attention.kda_decode_gfx950`` (``KernelBackend.KDA``), implemented in
+``sglang.kernels.kda_kernels.kda_decode_gfx950``.
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ import os
 
 import torch
 
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.utils import is_hip
 
-_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_decode_gfx950.hip")
 _HEADS = 12
 _DIM = 128
 _CHANNELS = 3 * _HEADS * _DIM
-_ext = None
 
 
 def enabled() -> bool:
@@ -35,33 +35,10 @@ def available(device: torch.device | None = None) -> bool:
     return arch.split(":", 1)[0] == "gfx950"
 
 
-def _load():
-    global _ext
-    if _ext is None:
-        from sglang.srt.utils.cpp_extension_loader import (
-            load_extension_with_recovery,
-        )
-
-        # torch's JIT builds for every arch in PYTORCH_ROCM_ARCH
-        previous_arch = os.environ.get("PYTORCH_ROCM_ARCH")
-        os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
-        try:
-            _ext = load_extension_with_recovery(
-                name="kda_decode_gfx950",
-                sources=[_SRC],
-                extra_cuda_cflags=["-O3"],
-                extra_cflags=["-O3"],
-            )
-        finally:
-            if previous_arch is None:
-                os.environ.pop("PYTORCH_ROCM_ARCH", None)
-            else:
-                os.environ["PYTORCH_ROCM_ARCH"] = previous_arch
-    return _ext
-
-
 def warmup(**_: object) -> None:
-    _load()
+    from sglang.kernels.kda_kernels.kda_decode_gfx950 import load_ext
+
+    load_ext()
 
 
 def covered(
@@ -131,7 +108,7 @@ def run(
 ) -> torch.Tensor:
     if out is None:
         out = f_a.new_empty((1, f_a.shape[0], _HEADS, _DIM))
-    _load().kda_decode_gfx950(
+    get_kernel("attention.kda_decode_gfx950", KernelBackend.KDA)(
         f_a,
         f_b_weight,
         mixed_qkv,
