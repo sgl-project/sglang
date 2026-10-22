@@ -704,7 +704,9 @@ def load_cache_to_device_buffer_v41(
     if page_size != 1 << page_bits:
         raise ValueError(f"page_size must be a power of two, got {page_size}")
     if block_size % 64 or not 64 <= block_size <= 1024:
-        raise ValueError(f"block_size must be a wave multiple in [64, 1024], got {block_size}")
+        raise ValueError(
+            f"block_size must be a wave multiple in [64, 1024], got {block_size}"
+        )
     hot_buffer_size = hot_slots.shape[1]
     for name, tensor, dtype in (
         ("top_k_tokens", top_k_tokens, torch.int32),

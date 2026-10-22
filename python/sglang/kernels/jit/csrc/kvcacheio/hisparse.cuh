@@ -1051,7 +1051,8 @@ template <int DATA_BYTES, int SCALE_BYTES, int PAGE_BITS>
 struct V41PagedRows {
   static_assert(DATA_BYTES % 8 == 0 && SCALE_BYTES % 8 == 0, "rows must be whole 64-bit words");
   static constexpr int64_t kSlots = int64_t{1} << PAGE_BITS;
-  static constexpr int64_t kPageBytes = (kSlots * (DATA_BYTES + SCALE_BYTES) + DATA_BYTES - 1) / DATA_BYTES * DATA_BYTES;
+  static constexpr int64_t kPageBytes =
+      (kSlots * (DATA_BYTES + SCALE_BYTES) + DATA_BYTES - 1) / DATA_BYTES * DATA_BYTES;
   static constexpr int64_t kScaleBase = int64_t{DATA_BYTES} << PAGE_BITS;
   static constexpr int32_t kDataWords = DATA_BYTES / 8;
   static constexpr int32_t kTotalWords = (DATA_BYTES + SCALE_BYTES) / 8;
@@ -1383,8 +1384,7 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
     const int32_t miss_token = s_top_k_tokens[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
     const int64_t src_row = req_host[static_cast<int64_t>(miss_token) * COMPRESS_RATIO] / COMPRESS_RATIO;
-    const int64_t dst_row =
-        (evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE) ? req_hot_slots[evict_slot] : int64_t{-1};
+    const int64_t dst_row = (evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE) ? req_hot_slots[evict_slot] : int64_t{-1};
     // A hot slot outside the request's pages would write rows every request reads.
     if (dst_row < Rows::kSlots || (dst_row >> PAGE_BITS) >= num_device_pages || src_row < 0) {
       if (lane_id == 0) {

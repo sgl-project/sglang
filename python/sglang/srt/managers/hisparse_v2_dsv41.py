@@ -83,7 +83,9 @@ class HiSparseV2DSV41Cache:
                 continue
             ratio = pool.compression_ratios[layer_id]
             if ratio not in (1, 2):
-                raise ValueError(f"HiSparse V2 index layer {layer_id} has ratio {ratio}")
+                raise ValueError(
+                    f"HiSparse V2 index layer {layer_id} has ratio {ratio}"
+                )
             kv_pool = pool.kv_pools[ratio]
             layout = kv_pool.kv_layout
             if layout.page_align != layout.data_bytes:
@@ -112,7 +114,9 @@ class HiSparseV2DSV41Cache:
 
         rows, context = self.req_to_token.shape
         num_layers = len(layers)
-        self.host_locs = torch.full((rows, context), -1, dtype=torch.int32, device=device)
+        self.host_locs = torch.full(
+            (rows, context), -1, dtype=torch.int32, device=device
+        )
         self.protected_lens = torch.zeros(rows, dtype=torch.int64, device=device)
         self.hot_slots = torch.full(
             (num_layers, rows, buffer_tokens), -1, dtype=torch.int32, device=device
@@ -123,7 +127,9 @@ class HiSparseV2DSV41Cache:
         self._lru_init = torch.arange(buffer_tokens, dtype=torch.int16, device=device)
         self.lru = self._lru_init.expand(num_layers, rows, -1).clone()
         self.page_cols = (
-            torch.arange(-(-context // self.page_size), dtype=torch.int64, device=device)
+            torch.arange(
+                -(-context // self.page_size), dtype=torch.int64, device=device
+            )
             * self.page_size
         )
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -131,7 +137,9 @@ class HiSparseV2DSV41Cache:
         # hot slot outside the pool]
         self.stats = torch.zeros(3, dtype=torch.int64, device=device)
         # HiCache attaches after decode graphs are captured.
-        self.host_bindings = torch.zeros((num_layers, 2), dtype=torch.int64, device=device)
+        self.host_bindings = torch.zeros(
+            (num_layers, 2), dtype=torch.int64, device=device
+        )
         self.host_pool = None
 
     def attach_host_pools(self, host_pool_group) -> None:
@@ -150,7 +158,9 @@ class HiSparseV2DSV41Cache:
         bindings = []
         for spec in self.swap_layers:
             host = host_pool_group.get_pool(_HOST_POOL_NAMES[spec.ratio])
-            page_bytes = spec.device_buffer.stride(0) * spec.device_buffer.element_size()
+            page_bytes = (
+                spec.device_buffer.stride(0) * spec.device_buffer.element_size()
+            )
             if host.layout != "page_first" or host.kv_buffer.dim() != 3:
                 raise ValueError("HiSparse V2 needs the page_first HiCache layout")
             if host.item_bytes != page_bytes or host.num_host_pages != host_pages:
@@ -195,7 +205,9 @@ class HiSparseV2DSV41Cache:
 
     def preserve_index(self, device_tokens: torch.Tensor, host_tokens: torch.Tensor):
         source = device_tokens[:: self.page_size] // self.page_size
-        destination = self.base_full_pages + host_tokens[:: self.page_size] // self.page_size
+        destination = (
+            self.base_full_pages + host_tokens[:: self.page_size] // self.page_size
+        )
         # Host locks keep these rows alive for every request sharing the prefix.
         for ratio, index_pool in self.pool.index_pools.items():
             if ratio not in (1, 2):
@@ -360,8 +372,8 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
         )
         if prefixes + temps + growths > self.cache.host_pool.size + device:
             return False
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
         from sglang.srt.managers.hisparse_v2_coordinator import _PrefillReservation
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
 
         evict_from_tree_cache(self.tree_cache, needed)
         temp = self.allocator.alloc(needed)
