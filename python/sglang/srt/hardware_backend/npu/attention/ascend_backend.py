@@ -608,8 +608,10 @@ class AscendAttnBackend(AttentionBackend):
             metadata = self.forward_metadata
             # Derive FIA's Host lengths from the CPU mirror without a device readback.
             effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
+            effective_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
                 query_len = forward_batch.spec_info.draft_token_num
+                effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
                 spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is not None and spec_algorithm.is_dflash_family():
                     # Active Host lengths already include verify tokens; Ascend's
@@ -619,13 +621,10 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 else:
                     effective_seq_lens_cpu = effective_seq_lens_cpu + query_len
-            elif (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.spec_info is not None
-            ):
-                effective_seq_lens_cpu = effective_seq_lens_cpu + (
-                    self.speculative_step_id + 1
-                )
+            elif forward_batch.spec_info is not None:
+                step_offset = self.speculative_step_id + 1
+                effective_seq_lens_cpu = effective_seq_lens_cpu + step_offset
+                effective_seq_lens = effective_seq_lens + step_offset
             # Size the table from FIA's Host bound, which can lead device lengths.
             metadata.seq_lens_cpu_int, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
@@ -692,11 +691,6 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         if dense_mla_dcp_partial:
-            effective_seq_lens = forward_batch.seq_lens
-            if forward_batch.forward_mode.is_target_verify():
-                effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
-            elif forward_batch.spec_info is not None:
-                effective_seq_lens = effective_seq_lens + (self.speculative_step_id + 1)
             metadata.seq_lens = get_dcp_lens(
                 effective_seq_lens,
                 self.dcp_size,
