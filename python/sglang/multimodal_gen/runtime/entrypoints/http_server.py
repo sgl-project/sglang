@@ -46,10 +46,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.srt.utils.common import (
-    add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
+from sglang.srt.observability.http_request_metrics import (
+    add_http_request_metrics_middleware,
+    init_http_request_metrics,
 )
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.common import add_prometheus_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -112,6 +114,15 @@ async def _run_server_warmup_after_http_live(
         os.kill(os.getpid(), signal.SIGTERM)
 
 
+def build_route_request_models(app: FastAPI) -> None:
+    """Build the routes' pydantic models now; FastAPI otherwise builds them on the
+    first matching request (~17 ms). The OpenAPI schema resolves the same models."""
+    try:
+        app.openapi()
+    except Exception:
+        logger.debug("Route model prebuild failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
@@ -124,6 +135,7 @@ async def lifespan(app: FastAPI):
 
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
+    build_route_request_models(app)
     async_scheduler_client.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
@@ -420,11 +432,12 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled_kwargs())
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
-        add_prometheus_track_response_middleware(app)
+        add_http_request_metrics_middleware(app)
+        init_http_request_metrics()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

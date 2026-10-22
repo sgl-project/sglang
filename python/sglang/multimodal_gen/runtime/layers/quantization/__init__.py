@@ -6,9 +6,6 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
-    canonical_quantization_method,
-)
 
 # Importing linear loads this package before LinearBase has been defined.
 # Resolve implementations only when requested, after that import can finish.
@@ -49,8 +46,6 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "convrot_int8",
-    # deprecated alias of convrot_int8
-    "kitchen_int8",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -68,44 +63,12 @@ _BUILTIN_CONFIG_NAMES = {
     "mxfp4_npu": "NPUMXFP4Config",
     "convrot_int8": "ConvRotInt8Config",
 }
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG: dict[str, type[QuantizationConfig]] = {}
-
-
-def register_quantization_config(quantization: str):
-    """Register a customized vllm quantization config.
-
-    When a quantization method is not supported by vllm, you can register a customized
-    quantization config to support it.
-
-    Args:
-        quantization (str): The quantization method name.
-
-
-    """  # noqa: E501
-
-    def _wrapper(quant_config_cls):
-        if quantization in QUANTIZATION_METHODS:
-            raise ValueError(
-                f"The quantization method `{quantization}` is already exists."
-            )
-        if not issubclass(quant_config_cls, QuantizationConfig):
-            raise ValueError(
-                "The quantization config must be a subclass of `QuantizationConfig`."
-            )
-        _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization] = quant_config_cls
-        QUANTIZATION_METHODS.append(quantization)
-        return quant_config_cls
-
-    return _wrapper
 
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
-    quantization = canonical_quantization_method(quantization)
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
-        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
     name = _BUILTIN_CONFIG_NAMES[quantization]
     if name in globals():
         return globals()[name]
@@ -113,8 +76,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
 
 __all__ = [
-    "QuantizationMethods",
-    "QuantizationConfig",
-    "get_quantization_config",
     "QUANTIZATION_METHODS",
+    "QuantizationConfig",
+    "QuantizationMethods",
+    "get_quantization_config",
 ]

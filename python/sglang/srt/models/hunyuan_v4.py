@@ -357,14 +357,12 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             alt_stream=alt_stream,
             is_nextn=is_nextn,
         )
-        parallel = get_parallel()
         self.linear_gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * config.v_head_dim,
             bias=False,
             quant_config=quant_config,
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.linear_gate",
         )
         self.local_gate_width = self.num_local_heads * config.v_head_dim
@@ -395,8 +393,8 @@ class HYV4Attention(DeepseekV2AttentionMLA):
     @staticmethod
     def _resolve_gate_fallback_backend() -> str:
         try:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (  # noqa: F401
-                sigmoid_gate_mul,
+            from sglang.kernels.ops.elementwise.elementwise import (  # noqa: F401
+                fused_sigmoid_mul,
             )
         except ImportError:
             return "eager"
@@ -500,11 +498,11 @@ class HYV4Attention(DeepseekV2AttentionMLA):
                 f"output shape: {tuple(gate.shape)} != {tuple(attn_out.shape)}"
             )
         if backend == "triton" and attn_out.is_cuda:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                sigmoid_gate_mul,
+            from sglang.kernels.ops.elementwise.elementwise import (
+                fused_sigmoid_mul,
             )
 
-            return sigmoid_gate_mul(attn_out, gate)
+            return fused_sigmoid_mul(attn_out, gate)
         return attn_out * torch.sigmoid(gate)
 
     def prepare_attention_output_gate(self, hidden_states):

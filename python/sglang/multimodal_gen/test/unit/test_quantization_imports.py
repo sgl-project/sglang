@@ -26,6 +26,7 @@ def test_cold_import(module):
             "-c",
             f"import importlib; importlib.import_module('sglang.multimodal_gen.{module}')",
         ],
+        check=False,
         capture_output=True,
         text=True,
         timeout=60,
@@ -48,7 +49,6 @@ def test_cold_import(module):
         ("mxfp8", "MXFP8Config"),
         ("mxfp4_npu", "NPUMXFP4Config"),
         ("convrot_int8", "ConvRotInt8Config"),
-        ("kitchen_int8", "ConvRotInt8Config"),
     ],
 )
 def test_builtin_config_and_package_export(method, name):
@@ -58,26 +58,32 @@ def test_builtin_config_and_package_export(method, name):
     assert quantization.get_quantization_config(method) is config
 
 
-def test_custom_registration(monkeypatch):
-    monkeypatch.setattr(quantization, "_CUSTOMIZED_METHOD_TO_QUANT_CONFIG", {})
-    monkeypatch.setattr(
-        quantization, "QUANTIZATION_METHODS", list(quantization.QUANTIZATION_METHODS)
-    )
-
-    class CustomConfig(quantization.QuantizationConfig):
-        pass
-
-    assert (
-        quantization.register_quantization_config("test-custom")(CustomConfig)
-        is CustomConfig
-    )
-    assert quantization.get_quantization_config("test-custom") is CustomConfig
-    for name in ("test-custom", "fp8", "kitchen_int8"):
-        with pytest.raises(ValueError, match="already exists"):
-            quantization.register_quantization_config(name)(CustomConfig)
-    with pytest.raises(ValueError, match="subclass"):
-        quantization.register_quantization_config("invalid-config")(object)
-    with pytest.raises(ValueError, match="Invalid quantization method"):
-        quantization.get_quantization_config("unknown")
+def test_invalid_method_and_package_attribute():
+    for name in ("unknown", "kitchen_int8"):
+        with pytest.raises(ValueError, match="Invalid quantization method"):
+            quantization.get_quantization_config(name)
     with pytest.raises(AttributeError, match="no attribute"):
-        getattr(quantization, "UnknownConfig")
+        _ = quantization.UnknownConfig
+
+
+def test_lookup_loads_only_requested_backend():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from sglang.multimodal_gen.runtime.layers import quantization as q; "
+                "seen = []; sentinel = type('Module', (), {'Fp8Config': object()})(); "
+                "q.import_module = lambda name: (seen.append(name) or sentinel); "
+                "assert q.get_quantization_config('fp8') is sentinel.Fp8Config; "
+                "assert q.Fp8Config is sentinel.Fp8Config; "
+                "assert seen == [q.__name__ + '.fp8']"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "HF_HUB_OFFLINE": "1"},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

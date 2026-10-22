@@ -16,6 +16,7 @@ import logging
 import math
 import re
 from array import array
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -24,9 +25,10 @@ from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -35,18 +37,26 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+    CuteDSLFusion,
+    MoeDeferredFinalize,
+    install_cutedsl_fusion,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -54,18 +64,33 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKOutputChecker,
+    TopKOutputFormat,
+    is_expert_remapping_enabled,
+)
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    is_deepep_class_backend,
+    sum_post_experts_output,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp4FlashinferTrtllmMoEMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -79,7 +104,12 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -99,9 +129,11 @@ def load_mimo_v2_qkv_proj_weight(
     loaded_weight,
     expected_fused_tp_size: Optional[int] = None,
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    *,
+    qkv_proj: QKVParallelLinear,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
+    qkv_proj = unwrap_lora_layer(qkv_proj)
+    tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
     ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
 
     if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
@@ -192,11 +224,10 @@ def _resolve_deferred_qkv_scale_inv(
     expected_fused_tp_size: int,
     block_size: int = 128,
     config=None,
+    *,
+    model: nn.Module,
 ):
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
     ckpt_tp = expected_fused_tp_size
-    shards_per_rank = ckpt_tp // tp_size
 
     for scale_name, ckpt_scale in deferred_scale_inv.items():
         weight_name = scale_name.replace(".weight_scale_inv", ".weight")
@@ -206,6 +237,9 @@ def _resolve_deferred_qkv_scale_inv(
                 f"weight {weight_name} not found"
             )
 
+        qkv_proj = unwrap_lora_layer(model.get_submodule(weight_name.rsplit(".", 1)[0]))
+        tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
+        shards_per_rank = ckpt_tp // tp_size
         weight_param = params_dict[weight_name]
         scale_param = params_dict[scale_name]
         weight_data = weight_param.data
@@ -292,11 +326,11 @@ class MiMoV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -304,8 +338,7 @@ class MiMoV2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -314,8 +347,7 @@ class MiMoV2MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -328,7 +360,7 @@ class MiMoV2MLP(nn.Module):
         x,
         forward_batch: ForwardBatch = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
@@ -411,6 +443,11 @@ class MiMoV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        routing_method_type = (
+            RoutingMethodType.DeepSeekV3
+            if self.gate.e_score_correction_bias is not None and config.norm_topk_prob
+            else None
+        )
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
@@ -421,6 +458,7 @@ class MiMoV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -441,13 +479,44 @@ class MiMoV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
+
+        uses_mxfp4_runner = isinstance(
+            self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod
+        )
+        self._uses_expert_remap = (
+            not get_flags().moe.in_speculative_scope and is_expert_remapping_enabled()
+        )
+        use_bypassed_topk = (
+            uses_cutedsl_ar_fusion()
+            and not get_flags().moe.in_speculative_scope
+            and not self._uses_expert_remap
+            and not get_exec().features.enable_return_routed_experts
+            and get_exec().moe.expert_distribution_recorder_mode is None
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and uses_mxfp4_runner
+            and get_moe_a2a_backend().is_none()
+            and self.experts.quant_method.configure_bypassed_topk(self.topk.topk_config)
+        )
+        if uses_mxfp4_runner:
+            self.topk.topk_config.output_format = (
+                TopKOutputFormat.BYPASSED
+                if use_bypassed_topk
+                else TopKOutputFormat.STANDARD
+            )
+        self.supports_deferred_finalize = (
+            use_bypassed_topk and envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+        )
 
         # todo : implement tbo forward needed
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        self._enable_a2a_moe = (
+            is_deepep_class_backend() or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -462,12 +531,6 @@ class MiMoV2MoE(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        )
-
     def get_moe_weights(self):
         return [
             x.data
@@ -479,7 +542,7 @@ class MiMoV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MoeDeferredFinalize:
         if not self._enable_a2a_moe:
             return self.forward_normal(hidden_states)
         else:
@@ -488,13 +551,30 @@ class MiMoV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MoeDeferredFinalize:
 
         if hidden_states.shape[0] > 0:
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+            )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # Precomputed routing keeps FP32 weights and finalizes before the reduction.
+        if get_forward().defer_moe_finalize and TopKOutputChecker.format_is_bypassed(
+            topk_output
+        ):
+            deferred = self.experts.forward_deferred_finalize(
+                hidden_states, topk_output
+            )
+            return MoeDeferredFinalize.from_flashinfer(
+                deferred,
+                gated_shared_output=None,
+                m=hidden_states.shape[0],
+                reduce=sum_post_experts_output,
+            )
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -509,10 +589,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -542,10 +618,6 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -613,7 +685,6 @@ class MiMoV2Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -648,8 +719,7 @@ class MiMoV2Attention(nn.Module):
             v_head_size=self.v_head_dim,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
             skip_block_quant_check=True,
         )
@@ -659,8 +729,7 @@ class MiMoV2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -733,6 +802,26 @@ class MiMoV2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_rope_store(self, qkv, positions, forward_batch):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        query = self.rotary_emb.try_bf16_rope_store(
+            qkv,
+            positions,
+            get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
+            value_scale=1.0 if self.v_scale is None else self.v_scale,
+        )
+        if query is None:
+            return None
+        return self.attn(
+            query,
+            None,
+            None,
+            forward_batch,
+            save_kv_cache=False,
+            sinks=self.attention_sink_bias,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -740,6 +829,15 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and qkv.shape[0] > 0
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not torch.compiler.is_compiling()
+        ):
+            fused = self._forward_rope_store(qkv, positions, forward_batch)
+            if fused is not None:
+                return self.o_proj(fused)[0]
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
@@ -825,8 +923,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        self.is_layer_sparse = self.is_moe_layer(layer_id)
-        is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
+        self.is_layer_sparse = self.is_moe_layer(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = MiMoV2MoE(
@@ -836,18 +933,14 @@ class MiMoV2DecoderLayer(nn.Module):
                 layer_id=layer_id,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = MiMoV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 
@@ -856,14 +949,27 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
+        fusions = (
+            CuteDSLFusion()
+            if uses_cutedsl_ar_fusion() and not get_flags().moe.in_speculative_scope
+            else None
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm, {"fusions": fusions}),
+            (ffn, self.post_attention_layernorm, {"fusions": fusions}),
+        )
+
+    @classmethod
+    def stage_facts(cls, config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls.is_moe_layer(config, layer_id),
+                next_layer_sparse=cls.is_moe_layer(config, layer_id + 1),
             ),
         )
 
@@ -891,17 +997,19 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = ffn_exit.finish(hidden_states)
 
         return hidden_states
 
-    def is_moe_layer(self, layer_idx: int) -> bool:
+    @staticmethod
+    def is_moe_layer(config, layer_idx: int) -> bool:
         return (
-            hasattr(self.config, "moe_layer_freq")
-            and 0 <= layer_idx < len(self.config.moe_layer_freq)
-            and not isinstance(self.config.moe_layer_freq, int)
-            and self.config.moe_layer_freq[layer_idx]
+            hasattr(config, "moe_layer_freq")
+            and 0 <= layer_idx < len(config.moe_layer_freq)
+            and not isinstance(config.moe_layer_freq, int)
+            and config.moe_layer_freq[layer_idx]
         )
 
     def is_swa_layer(self) -> bool:
@@ -969,6 +1077,7 @@ class MiMoV2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("attn_tp")
         self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
@@ -993,11 +1102,25 @@ class MiMoV2Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(decoder_layer_type.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        if uses_cutedsl_ar_fusion():
+            install_cutedsl_fusion(
+                self.layers[self.start_layer : self.end_layer],
+                hidden_size=config.hidden_size,
+                top_k=config.num_experts_per_tok,
+                rms_epsilon=config.layernorm_epsilon,
+                can_defer_finalize=lambda layer: (
+                    isinstance(layer.mlp, MiMoV2MoE)
+                    and layer.mlp.supports_deferred_finalize
+                ),
+                label="MiMo",
+                include_shared_expert=False,
+            )
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -1092,8 +1215,7 @@ class MiMoV2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
+        attn_tp_rank, attn_tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
@@ -1217,8 +1339,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def preprocess_mm_for_encoder(self, mm_data, modality, config):
         if self._encoder_processor is None:
@@ -1332,16 +1453,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+        # Multimodal embedding must run even when aux hidden states are captured
+        # (DFLASH/MTP). Taking the capture branch first skipped image/audio
+        # feature placement and left placeholder tokens as plain text embeddings.
+        if self._is_multimodal:
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1350,13 +1466,17 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1561,6 +1681,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         loaded_weight,
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -1613,7 +1734,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            start = get_parallel().attn_tp_rank * param.numel()
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            start = (
+                                get_group_rank_size(projection.tp_group)[0]
+                                * param.numel()
+                            )
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1632,6 +1759,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 deferred_qkv_scale_inv,
                 expected_fused_tp_size,
                 config=self.config,
+                model=self,
             )
 
     def get_embed_and_head(self):
