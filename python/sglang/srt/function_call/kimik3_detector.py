@@ -116,7 +116,10 @@ class KimiK3Detector(BaseFormatDetector):
         for delta in result.deltas:
             if delta.name is not None:
                 self.current_tool_id += 1
-                self.prev_tool_call_arr.append({"name": delta.name, "arguments": {}})
+                # The serving terminal flush treats an object here as complete
+                # expected arguments. Keep a sentinel until native call close
+                # is validated; a length-cut header must remain just "{".
+                self.prev_tool_call_arr.append({"name": delta.name, "arguments": ""})
                 self.streamed_args_for_tool.append("")
             self.streamed_args_for_tool[self.current_tool_id] += delta.parameters
             calls.append(

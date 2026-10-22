@@ -223,6 +223,63 @@ def test_length_is_preserved_instead_of_promoted_to_tool_success(
     assert "KimiK3NativeOutputError" not in output
 
 
+@pytest.mark.parametrize("complete_first", [False, True])
+@pytest.mark.parametrize("choice", ["auto", "required", "named"])
+@pytest.mark.parametrize("reasoning", [False, True])
+@pytest.mark.parametrize("incremental", [False, True])
+def test_chat_length_at_call_header_never_completes_arguments(
+    monkeypatch, complete_first, choice, reasoning, incremental
+):
+    from sglang.srt.entrypoints.openai import serving_chat
+
+    header = f'{O}call tool="bash" index="{2 if complete_first else 1}"{S}'
+    raw = f"{O}tools{S}" + (CALL if complete_first else "") + header
+    tool_choice = (
+        {"type": "function", "function": {"name": "bash"}}
+        if choice == "named"
+        else choice
+    )
+    req = ChatCompletionRequest.model_validate(
+        dict(request().model_dump(), tool_choice=tool_choice)
+    )
+    for split in (0, len(raw) // 2, len(raw)):
+        chunks = [
+            (raw[:split], None),
+            (raw[split:] if incremental else raw, "length"),
+        ]
+        obj = chat(monkeypatch, chunks, reasoning=reasoning)
+        monkeypatch.setattr(
+            serving_chat,
+            "get_serving",
+            lambda: SimpleNamespace(
+                stream_response_default_include_usage=False,
+                incremental_streaming_output=incremental,
+                enable_cache_report=False,
+            ),
+        )
+        output = wire(obj, req)
+        arguments = {}
+        finishes = []
+        for line in output.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            frame = json.loads(line[6:])
+            assert "error" not in frame
+            for item in frame.get("choices", []):
+                if item.get("finish_reason"):
+                    finishes.append(item["finish_reason"])
+                for delta in item.get("delta", {}).get("tool_calls", []):
+                    index = delta["index"]
+                    arguments[index] = arguments.get(index, "") + delta.get(
+                        "function", {}
+                    ).get("arguments", "")
+        assert finishes == ["length"]
+        assert arguments[int(complete_first)] == "{"
+        if complete_first:
+            assert json.loads(arguments[0]) == {"command": "echo synthetic"}
+        assert "[DONE]" in output
+
+
 def test_nonstream_does_not_swallow_native_failure(monkeypatch):
     obj = chat(monkeypatch, [])
     with pytest.raises(KimiK3ParseError, match="invalid_header"):
