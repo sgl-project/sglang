@@ -73,8 +73,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.cutlass_prepare_moe_input",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.cutlass_prepare_moe_input:cutlass_prepare_moe_input",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shuffle_weighted_sum",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
         capabilities=CUDA_ONLY,
     )
@@ -109,6 +118,15 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.CUDA, CapabilityRequirement.MUSA}
         ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.compute_cutlass_w4a8_moe_input_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
+        capabilities=CUDA_ONLY,
     )
 )
 
