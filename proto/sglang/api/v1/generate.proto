@@ -2,7 +2,7 @@
 // rust/sglang-server/src/message/request.rs's GenerateBody (request) and
 // api_core/frame.rs's frame shape (response). Unknown JSON keys on the
 // request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (priority, extra_key, session_id,
+// Python-only `GenerateReqInput` fields (session_id,
 // ...), pinned by request.rs's unported-fields test.
 
 syntax = "proto3";
@@ -53,6 +53,64 @@ message GenerateRequest {
   optional StringListOrList mm_hashes = 20;
   optional MediaInput video_data = 21;
   optional MediaInput audio_data = 22;
+  // Prefix-cache namespace: requests share cached prefixes only under the same
+  // key. One key for every batch item, or one per item; an empty key means
+  // none.
+  StringOrList extra_key = 23;
+  // Scheduling priority, one value for every batch item; the scheduler
+  // validates it against its priority-scheduling mode.
+  optional int64 priority = 24;
+  // Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+  // same way.
+  StringOrList cache_salt = 25;
+  // Apply grammar constraints only after the reasoning section, for every
+  // batch item.
+  optional bool require_reasoning = 26;
+  // A field this server cannot honour. Unknown keys are ignored, but dropping
+  // this one would silently return a stateless answer for a session request,
+  // so a non-null value is rejected instead.
+  optional string session_params = 28 [(sglang.json.v1.field_json).raw_json = true];
+
+  // Orchestrator controls used by native gRPC clients such as Dynamo.
+  // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
+  // applies to every prompt, a list carries one (nullable) value per prompt.
+  OptionalStringOrList lora_path = 27;
+  optional string routing_key = 31;
+  optional uint64 max_thinking_tokens = 32;
+  KvHintsEnvelopeOrList kv_hints = 29;
+}
+
+message KvHintsEnvelopeOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    KvHintsEnvelope one = 1;
+    KvHintsEnvelopeList many = 2;
+  }
+}
+
+message KvHintsEnvelopeList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OptionalKvHintsEnvelope items = 1;
+}
+
+message OptionalKvHintsEnvelope {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional KvHintsEnvelope envelope = 1;
+}
+
+// Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
+// payloads are JSON because each action type owns its own schema.
+message KvHintsEnvelope {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
+}
+
+message KvHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  optional string payload = 4 [(sglang.json.v1.field_json).raw_json = true];
 }
 
 message SamplingParamsOrList {
@@ -122,6 +180,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Prompt tokens served from the prefix cache, and output tokens spent
+  // reasoning so far; reported on every frame.
+  uint32 cached_tokens = 13;
+  uint64 reasoning_tokens = 14;
 }
 
 message GenerateResponse {

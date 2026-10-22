@@ -139,6 +139,8 @@ class _AttnReadout:
     layer's output: an MHC layer takes its input written back. A
     ``post_residual_addition`` is not applied."""
 
+    bind = None
+
     is_plain_norm = False
     completing_fusions = ()
     gathering_reads = ()
@@ -164,6 +166,9 @@ class _AttnUpdate:
     """hc_post with the coefficients the attention's read produced. It is not a
     plain add, so it runs only once the sum it writes in is complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
@@ -186,6 +191,8 @@ class _AttnUpdate:
 class _FfnReadout:
     """The attention output's hc_post and the FFN input's hc_pre and norm, fused
     in hc_ffn_post_pre when it takes the batch."""
+
+    bind = None
 
     is_plain_norm = False
     completing_fusions = ()
@@ -214,6 +221,9 @@ class _FfnUpdate:
     """hc_post with the coefficients the FFN input's read produced, which this
     layer runs itself; the last layer also contracts the streams into the
     hidden states the layer stack hands on."""
+
+    bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

@@ -184,6 +184,9 @@ class _WrittenIn:
     """An update that is not a plain add: the output is written into the
     residual only once its sum is complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
 
@@ -291,20 +294,9 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "lifetime"):
             bind_exit(edge)
 
-    def test_pipeline_cannot_reconstruct_a_non_add_update(self):
-        local = Layout(frozenset())
-        update = SimpleNamespace(
-            is_plain_add=False, applied_at_exit=False, outlives_layer=True
-        )
-        edge = EdgeContract(
-            OutputContract(local, update=update), InputContract(local), local, local
-        )
-        with get_parallel().override(pp_size=2):
-            with self.assertRaisesRegex(NotImplementedError, "pipeline boundaries"):
-                bind_exit(edge)
-
 
 class ProbeRead:
+    bind = None
     reads_before_dp_gather = False
     completing_fusions = ()
     gathering_reads = ()

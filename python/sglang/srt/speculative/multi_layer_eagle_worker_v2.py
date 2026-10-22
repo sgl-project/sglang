@@ -34,6 +34,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftSWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -587,14 +588,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         seen = set()
         for runner in self.draft_runner_list:
-            pool = runner.req_to_token_pool.mamba_pool
+            req_pool = runner.req_to_token_pool
+            pool = req_pool.mamba_pool
             if id(pool) in seen:
                 continue
             seen.add(id(pool))
+            # The pool is a PHYSICAL store; a unified req pool hands out
+            # virtual slot ids (identity on a static pool).
             if clear is not None and len(clear) > 0:
-                pool.clear_slots(clear)
+                pool.clear_slots(req_pool.translate_mamba_indices(clear))
             if cow_src is not None and len(cow_src) > 0:
-                pool.copy_from(cow_src, cow_dst)
+                pool.copy_from(
+                    req_pool.translate_mamba_indices(cow_src),
+                    req_pool.translate_mamba_indices(cow_dst),
+                )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -1091,6 +1098,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 )
             ),
         )
+
+    @property
+    def draft_swa_window(self) -> int:
+        # The widened extend starts front rows below the committed length, and
+        # each depth reads its own window back from there.
+        draft = self._draft_worker
+        windows = [
+            runner.sliding_window_size
+            for runner in draft.draft_runner_list
+            if isinstance(runner.token_to_kv_pool, UnifiedDraftSWAKVPool)
+        ]
+        if not windows:
+            return 0
+        return max(windows) + draft.draft_extend_num_front_tokens
 
     def forward_batch_generation(
         self,

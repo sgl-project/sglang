@@ -112,6 +112,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
+    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
+    # whose heuristic reads the post-capture KV sizing switch.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
+
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
@@ -167,6 +173,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.cuda_graph_hook import (
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+        apply_prefill_cp_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -266,6 +273,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+    if cfg.enable_prefill_cp:
+        run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 
     # Validate logical-page KV cache sharding after its page size, attention
     # backend, memory budget, and shard topology have all resolved.
@@ -338,6 +347,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
+
+    # needs the resolved CUDA-graph, attention-backend and speculative settings
+    from sglang.srt.megakernels.guards import handle_nvidia_megakernel
+    from sglang.srt.monokernels.guards import handle_monokernel
+
+    # first, so a server with both kernel flags gets every reason in one error
+    run_hook(handle_nvidia_megakernel, server_args)
+    run_hook(handle_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 
