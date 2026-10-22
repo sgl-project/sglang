@@ -509,8 +509,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         observed_idle_flags = []
         observed_iters = []
         copy_events = []
+        run_batch_launches = []
 
         def run_batch(batch, pp_proxy_tensors=None):
+            run_batch_launches.append(batch)
             # Exercise the real timestamp, iteration, and flag handoff.
             self.launch_batch(
                 scheduler, batch, batch.launch_ts, pp_proxy_tensors=pp_proxy_tensors
@@ -547,6 +549,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
+        # Every run_batch launch may end an idle stretch, before the model forward.
+        self.assertEqual(
+            scheduler.metrics_reporter.maybe_report_idle_end.call_count,
+            len(run_batch_launches),
+        )
         if mode == ForwardMode.EXTEND:
             # A prefill is charged from the previous prefill's result, or from
             # its own launch when none applies -- the first one, or after a gap.
@@ -617,7 +624,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(
-            record_scheduler_active=Mock(), maybe_report_idle_stats=Mock()
+            record_scheduler_active=Mock(),
+            maybe_report_idle_stats=Mock(),
+            maybe_report_idle_end=Mock(),
         )
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)

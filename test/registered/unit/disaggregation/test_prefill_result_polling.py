@@ -191,6 +191,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
+                "maybe_report_idle_end",
                 "stats",
             ]
         )
