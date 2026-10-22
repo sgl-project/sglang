@@ -136,7 +136,6 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     captured["engine"].sampling_params["skip_special_tokens"]
                 )
                 self.assertTrue(captured["engine"].require_reasoning)
-                self.assertEqual(request._response_parser_prefix, "<|start|>assistant")
                 messages = captured["chat"].messages
                 self.assertEqual(messages[0].content, "Be concise.")
                 self.assertEqual(messages[-1].tool_call_id, "call_weather")

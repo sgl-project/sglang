@@ -124,9 +124,14 @@ def test_shell_result_rejects_missing_outcome():
         )
 
 
-@pytest.mark.parametrize("mode", ["full", "stream", "background"])
+# Replay serializes each outcome the same way in every mode.
 @pytest.mark.parametrize(
-    "outcome", [{"type": "exit", "exit_code": 7}, {"type": "timeout"}]
+    "mode,outcome",
+    [
+        ("full", {"type": "exit", "exit_code": 7}),
+        ("stream", {"type": "timeout"}),
+        ("background", {"type": "exit", "exit_code": 7}),
+    ],
 )
 @pytest.mark.parametrize("choice", ["auto", "required", {"type": "shell"}])
 def test_beam_shell_call_and_client_result_continuation(

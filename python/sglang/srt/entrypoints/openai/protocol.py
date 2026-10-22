@@ -36,6 +36,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -79,7 +80,6 @@ try:
 except:
     StructuralTag = Any
 
-from sglang.srt.entrypoints.openai.responses_adapters import ResponseToolState
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -1847,6 +1847,15 @@ class ResponseTool(BaseModel):
         return self
 
 
+class ResponseToolState(msgspec.Struct, frozen=True):
+    """Public tool metadata and name mappings for one translated request."""
+
+    public_tools: list[ResponseTool] | None = None
+    public_choice: str | dict[str, Any] | None = None
+    names: dict[str, dict[str, str]] = {}
+    custom_names: set[str] = set()
+
+
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
     phase: Optional[Literal["commentary", "final_answer"]]
 
@@ -2419,14 +2428,6 @@ class ToolCallProcessingResult(NamedTuple):
 class ResponseReasoningTextContent(BaseModel):
     text: str
     type: Literal["reasoning_text"] = "reasoning_text"
-
-
-class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
-    namespace: Optional[str]
-
-
-class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
-    namespace: Optional[str]
 
 
 ResponseInputOutputItem: TypeAlias = Union[

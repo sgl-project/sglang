@@ -2,7 +2,6 @@
 """Request-local tool translation; ordinary function tools pass through."""
 
 from sglang.srt.entrypoints.openai.responses_adapters import (
-    ResponseToolState,
     flatten_response_tools,
     harmony_custom_tool,
     response_tool_choice,
@@ -20,7 +19,10 @@ class ResponseToolAdapter:
     @classmethod
     def from_request(cls, request, *, use_harmony, tool_call_parser):
         """Translate tool definitions while retaining their public representation."""
-        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+        from sglang.srt.entrypoints.openai.protocol import (
+            ResponseTool,
+            ResponseToolState,
+        )
 
         flat_tools, names = flatten_response_tools(request.tools)
         adapter = cls(flat_tools, request.tool_choice)

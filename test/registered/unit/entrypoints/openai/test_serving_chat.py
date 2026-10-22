@@ -2067,7 +2067,7 @@ class ServingChatTestCase(CustomTestCase):
             "<|start|>assistant", tools=[_WEATHER_TOOL], regex=".*"
         )
         self.assertNotIn("structural_tag", adapted.sampling_params)
-        with envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.override(False):
+        with envs.SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR.override(False):
             adapted, _ = self._convert_rendered_as("<|start|>assistant")
         self.assertNotIn("structural_tag", adapted.sampling_params)
         self.tm._config_overrides["grammar_backend"] = "llguidance"

@@ -88,6 +88,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     flatten_response_input,
     harmony_custom_input,
+    harmony_output_item,
     label_developer_content,
     response_tool_name,
 )
@@ -317,7 +318,6 @@ class OpenAIServingResponses(OpenAIServingChat):
     async def create_responses(self, request, raw_request=None):
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
-        original_request = request
         try:
             request, adapter = self._tool_adapter_cls.from_request(
                 request,
@@ -328,11 +328,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(str(exc), param="tool_choice")
         except ValueError as exc:
             return self.create_error_response(str(exc), param="tools")
-        result = await self._create_responses(
-            request, raw_request, tool_adapter=adapter
-        )
-        original_request._response_parser_prefix = request._response_parser_prefix
-        return result
+        return await self._create_responses(request, raw_request, tool_adapter=adapter)
 
     async def _create_responses(
         self,
@@ -876,7 +872,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 output_items
                 if output_items is not None
                 else [
-                    request._tool_state.harmony_output_item(item)
+                    harmony_output_item(request._tool_state, item)
                     for item in self._make_response_output_items_with_harmony(context)
                 ]
             )
@@ -1915,7 +1911,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     item_id=item.id,
                     status=item.status,
                 )
-            item = request._tool_state.harmony_output_item(item, partial=not done)
+            item = harmony_output_item(request._tool_state, item, partial=not done)
             snapshot = item.model_dump()
             output_index = len(emitted_items)
             if active_item is None:
@@ -2313,6 +2309,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
         flushed = False
+        # Template parsers can finalize what an aborted generation produced.
+        flushes_on_abort = (
+            reasoning_parser_obj is not None
+            and isinstance(
+                reasoning_parser_obj.detector, ResponseTemplateReasoningDetector
+            )
+        ) or (
+            tool_parser is not None
+            and not isinstance(tool_parser, JsonArrayParser)
+            and tool_parser.supports_abort_flush
+        )
         stream_offset = 0
         incremental = get_serving().incremental_streaming_output
         generated_parts: list[str] = []
@@ -2573,14 +2580,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     flush = (
                         not flushed
                         and finish_reason is not None
-                        and (
-                            finish_reason.get("type") != "abort"
-                            or isinstance(
-                                getattr(reasoning_parser_obj, "detector", None),
-                                ResponseTemplateReasoningDetector,
-                            )
-                            or getattr(tool_parser, "supports_abort_flush", False)
-                        )
+                        and (finish_reason.get("type") != "abort" or flushes_on_abort)
                     )
                     flushed = flushed or flush
 

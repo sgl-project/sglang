@@ -1843,7 +1843,7 @@ _OBJECT_TOOLS = [{"type": "function", "function": {"name": "f", "strict": True, 
     "obj": {"type": "object"}, "v": {"type": "object"}, "w": {"type": "object"}}}}}]
 
 
-class ConstrainedToolBodyTest(unittest.TestCase):
+class ConstrainedToolBodyTest(CustomTestCase):
     """Under a grammar that keeps tool-call bodies well-formed, a closer inside a JSON string, a strict tool's JSON
     value or a parameter name is part of the call; without it the first closer still ends the call."""
 

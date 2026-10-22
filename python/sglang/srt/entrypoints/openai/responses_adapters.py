@@ -17,44 +17,32 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
-
-if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.protocol import ResponseTool
+from pydantic import BaseModel
 
 
-@dataclass
-class ResponseToolState:
-    """Public tool metadata and mappings for one translated request."""
-
-    public_tools: list[ResponseTool] | None = None
-    public_choice: str | dict[str, Any] | None = None
-    names: dict[str, dict[str, str]] = field(default_factory=dict)
-    custom_names: set[str] = field(default_factory=set)
-
-    def harmony_output_item(self, item, *, partial=False):
-        if item.type != "function_call" or getattr(item, "namespace", None) is not None:
-            return item
-        public_name = response_tool_name(item.name, self.names)
-        if item.name in self.custom_names:
-            # Harmony leaves a call cut off by the end of generation in_progress.
-            unfinished = partial or item.status == "in_progress"
-            decode = (
-                decode_custom_tool_input_prefix
-                if unfinished
-                else decode_custom_tool_input
-            )
-            return ResponseCustomToolCall(
-                type="custom_tool_call",
-                id=item.id,
-                call_id=item.call_id,
-                input=decode(item.arguments),
-                **public_name,
-            )
-        return item.model_copy(update=public_name)
+def harmony_output_item(state, item, *, partial=False):
+    """A Harmony output item under its public name, and a custom tool's call
+    as a `custom_tool_call`."""
+    if item.type != "function_call":
+        return item
+    public_name = response_tool_name(item.name, state.names)
+    if item.name in state.custom_names:
+        # Harmony leaves a call cut off by the end of generation in_progress.
+        unfinished = partial or item.status == "in_progress"
+        decode = (
+            decode_custom_tool_input_prefix if unfinished else decode_custom_tool_input
+        )
+        return ResponseCustomToolCall(
+            type="custom_tool_call",
+            id=item.id,
+            call_id=item.call_id,
+            input=decode(item.arguments),
+            **public_name,
+        )
+    return item.model_copy(update=public_name)
 
 
 class ResponseToolChoiceError(ValueError):
@@ -137,7 +125,7 @@ def response_tool_name(name, names):
 
 
 def flatten_response_input(item):
-    if hasattr(item, "model_dump"):
+    if isinstance(item, BaseModel):
         item = item.model_dump(exclude_none=True)
     if isinstance(item, dict) and item.get("type") in (
         "function_call",

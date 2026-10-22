@@ -1647,7 +1647,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _template_turn_grammar(self) -> bool:
         tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
         return (
-            envs.SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR.get()
+            envs.SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR.get()
             and tool_detector is not None
             and issubclass(tool_detector, ResponseTemplateToolDetector)
             and tool_detector.constrains_every_turn
@@ -1673,6 +1673,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
+        *,
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
