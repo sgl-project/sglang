@@ -2409,7 +2409,7 @@ def apply_fp8_linear_deterministic(
         block_size_k=128,
         use_heuristic=False,
         num_warps=4,
-        num_stages=2,
+        num_stages=3,
     )
     return output.view(*output_shape)
 
