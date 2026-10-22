@@ -985,6 +985,52 @@ class ServingChatTestCase(CustomTestCase):
             ([], "Plan", payload, ["stop"]),
         )
 
+    def test_markup_inside_reasoning_is_reasoning(self):
+        """Answer or call markup quoted inside the reasoning must neither end call
+        parsing nor become a call, whether or not the reasoning is separated;
+        unseparated output keeps the reasoning as it was written."""
+        self._use_delimited_response_template("beam")
+        call = '<call:get_weather>{"city": "Paris"}'
+        quoted_answer = "<think>The marker is <answer>. Use the tool.</think>"
+        quoted_call = "<think>Calls look like " + call + "</think><answer>Sunny."
+        cases = (
+            (
+                self._stopped_on_token(quoted_answer + call + "</call>", 7),
+                (
+                    "The marker is <answer>. Use the tool.",
+                    "",
+                    [("get_weather", {"city": "Paris"})],
+                ),
+                ("", quoted_answer, [("get_weather", {"city": "Paris"})]),
+            ),
+            (
+                self._stopped_on_token(quoted_call, 2),
+                ("Calls look like " + call, "Sunny.", []),
+                ("", quoted_call, []),
+            ),
+        )
+        for output, separated, unseparated in cases:
+            for separate, expected in ((True, separated), (False, unseparated)):
+                for stream, incremental in (
+                    (False, False),
+                    (True, False),
+                    (True, True),
+                ):
+                    with self.subTest(
+                        text=output["text"],
+                        separate=separate,
+                        stream=stream,
+                        incremental=incremental,
+                    ):
+                        served = self._served(
+                            output,
+                            stream,
+                            incremental=incremental,
+                            tools=[_WEATHER_TOOL],
+                            separate_reasoning=separate,
+                        )
+                        self.assertEqual(served, expected)
+
     def _served(
         self, output, stream, *, incremental=True, prompt="<assistant>", **fields
     ):

@@ -259,6 +259,65 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertTrue(reasoning.answer_started)
         self.assertEqual(tool_parser.parse_non_stream(generation), (generation, []))
 
+    def test_answer_opener_quoted_in_reasoning_keeps_the_later_call(self):
+        """Only an answer opener outside the reasoning ends call parsing, and the
+        reasoning stays in the unseparated text as written."""
+        reasoning = (
+            "<|channel|>analysis<|message|>The marker is "
+            "<|channel|>final<|message|>. Use the tool.<|end|><|start|>assistant"
+        )
+        generation = reasoning + _continuation_call(
+            "get_weather", _parameter("city", "Paris")
+        )
+        for constrained in (False, True):
+            for stream in (False, True):
+                with self.subTest(constrained=constrained, stream=stream):
+                    parser = FunctionCallParser(
+                        tools=[_tool()],
+                        tool_call_parser="beam",
+                        prefix=PREFIX,
+                        constrained=constrained,
+                    )
+                    if stream:
+                        content, calls = "", []
+                        for char in generation:
+                            text, new_calls = parser.parse_stream_chunk(char)
+                            content, calls = content + text, calls + new_calls
+                        text, new_calls = parser.parse_stream_end()
+                        content, calls = content + text, calls + new_calls
+                    else:
+                        content, calls = parser.parse_non_stream(generation)
+
+                    self.assertEqual(content, reasoning)
+                    self.assertEqual(
+                        [call.name for call in calls if call.name], ["get_weather"]
+                    )
+                    self.assertEqual(
+                        json.loads("".join(call.parameters for call in calls)),
+                        {"city": "Paris"},
+                    )
+
+    def test_reasoning_cut_off_in_its_closer_is_kept_as_written(self):
+        """The rest of a closer that ends the parse is no output."""
+        generation = "<|channel|>analysis<|message|>Thinking.<|end|>"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                parser = FunctionCallParser(
+                    tools=[_tool()],
+                    tool_call_parser="beam",
+                    prefix=PREFIX,
+                    constrained=True,
+                )
+                if stream:
+                    content = "".join(
+                        parser.parse_stream_chunk(char)[0] for char in generation
+                    )
+                    content += parser.parse_stream_end()[0]
+                else:
+                    content = parser.parse_non_stream(generation)[0]
+
+                self.assertEqual(content, generation)
+
     def test_answer_opened_by_the_prompt_continues_as_text(self):
         """Under a grammar that admits calls or an answer, generation that
         continues an answer the prompt opened is text, streamed or not."""

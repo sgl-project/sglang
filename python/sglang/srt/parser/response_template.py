@@ -241,10 +241,13 @@ def _tool_extraction_template(
         tool_field["transform"] = "{content}"
     fields = {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field}
     if ends_at_answer:
-        fields[_CONTENT_FIELD] = {
-            **copy.deepcopy(template["fields"][_CONTENT_FIELD]),
-            "optional": True,
-        }
+        # The answer opens only outside the reasoning, which stays text.
+        for name in (_THINKING_FIELD, _CONTENT_FIELD):
+            if name in template["fields"]:
+                fields[name] = {
+                    **copy.deepcopy(template["fields"][name]),
+                    "optional": True,
+                }
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
@@ -293,6 +296,8 @@ class ResponseTemplateStreamAdapter:
         self._pending_tool_streamed = False
         self._open_tool_captures: dict = {}
         self._open_region: dict | None = None
+        # Where the output ends, before finalize completes a cut-off closer.
+        self._output_end: int | None = None
         self._grammar_start = grammar_start
         # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
@@ -348,6 +353,7 @@ class ResponseTemplateStreamAdapter:
         self._finalized = True
         if self._verbatim:
             return events
+        self._output_end = len(self._parser.input_text)
         events += self._parser.feed(self._closer_rest())
         return self._end_reasoning(events + self._parser.finalize()[1])
 
@@ -401,6 +407,13 @@ class ResponseTemplateStreamAdapter:
     def _generated_text(self, event: dict) -> str:
         start = max(event["start"], self._prefix_end)
         return self._parser.input_text[start : event["end"]]
+
+    def _output_text(self, event: dict) -> str:
+        """The generated text of `event`, without closer bytes finalize added."""
+        end = event["end"] if self._output_end is None else self._output_end
+        return self._parser.input_text[
+            max(event["start"], self._prefix_end) : min(event["end"], end)
+        ]
 
     def _open_tool_name(self, captures: dict | None) -> str | None:
         """Name already fixed by the opener, before the region body exists."""
@@ -476,6 +489,13 @@ class ResponseTemplateStreamAdapter:
             elif field == _CONTENT_FIELD and etype == "region_open":
                 # The answer's opener stays text, like the answer after it.
                 normal_parts.append(self._generated_text(event))
+            elif field == _THINKING_FIELD:
+                # Unseparated output keeps its reasoning as it was written.
+                normal_parts.append(
+                    event["text"]
+                    if etype == "region_chunk"
+                    else self._output_text(event)
+                )
             elif field != _TOOL_FIELD or etype == "region_chunk":
                 continue
             elif etype == "region_open":
