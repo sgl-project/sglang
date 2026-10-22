@@ -97,6 +97,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
 from sglang.srt.runtime_context import (
     attention_backends,
+    draft_attn_tp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -1058,7 +1059,6 @@ class KVCacheConfigurator:
         The pool factories decide whether a decline refuses the boot.
         Asymmetric K/V rows fuse only on backends that carry v_head_dim through
         to the kernel."""
-        from sglang.srt.layers.cp.base import is_cp_enabled
         from sglang.srt.mem_cache.layout.fused_draft import (
             LAYER_FULL,
             FusedDraftDecision,
@@ -1155,10 +1155,8 @@ class KVCacheConfigurator:
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=(
-                get_parallel().tp_size
-                if is_cp_enabled()
-                and get_parallel().attn_dp_size == 1
-                and self.spec_algorithm.is_dflash()
+                draft_attn_tp_size()
+                if self.spec_algorithm.is_dflash()
                 else get_parallel().attn_tp_size
             ),
             # A DFLASH-family draft config inherits the target's NEXTN depth
@@ -1179,11 +1177,15 @@ class KVCacheConfigurator:
         # price those rows in that dtype even when the target uses FP8.
         # Other drafts retain the host dtype; an unresolved `auto` is checked
         # when the draft binds, after its quant config is available.
-        fa4_draft = self.spec_algorithm.is_dflash_family() and draft_backend == "fa4"
         region_kv_dtype = self.kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype not in (None, "auto") or fa4_draft:
-            from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+        if draft_kv_cache_dtype not in (None, "auto") or (
+            self.spec_algorithm.is_dflash_family() and draft_backend == "fa4"
+        ):
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                allow_target_draft_different_cache_dtype,
+                configure_kv_cache_dtype,
+            )
 
             _, draft_kv_dtype = configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
@@ -1194,7 +1196,10 @@ class KVCacheConfigurator:
                 speculative_draft_attention_backend=draft_backend,
                 speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
             )
-            if fa4_draft:
+            if allow_target_draft_different_cache_dtype(
+                is_dflash=self.spec_algorithm.is_dflash_family(),
+                speculative_draft_attention_backend=draft_backend,
+            ):
                 region_kv_dtype = draft_kv_dtype
             elif draft_kv_dtype != self.kv_cache_dtype:
                 return FusedDraftDecision(
@@ -2652,6 +2657,8 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         # DCP allocation is in the global virtual loc space.
                         # The target attention path localizes these locs when
