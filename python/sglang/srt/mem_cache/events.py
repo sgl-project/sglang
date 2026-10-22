@@ -20,6 +20,7 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
@@ -39,6 +40,8 @@ from sglang.srt.mem_cache.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
+
+logger = logging.getLogger(__name__)
 
 # Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
 # end of extra_key, so the last 32 characters of extra_key are the id.
@@ -164,6 +167,29 @@ def enable_mm_routing_labels() -> None:
     MM_ROUTING_LABELS.enabled = True
 
 
+def attach_mm_routing_labels(mm_items, labels) -> None:
+    """Attach caller routing labels to processed items, one per item in order.
+
+    On a count mismatch the request keeps no labels, so its multimodal
+    tokens are reported without spans.
+    """
+    if not labels or not mm_items:
+        return
+    if len(labels) != len(mm_items):
+        logger.warning(
+            "mm_routing_labels length (%d) != mm_items length (%d); "
+            "ignoring routing labels for this request.",
+            len(labels),
+            len(mm_items),
+        )
+        return
+    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+
+    for item, label in zip(mm_items, labels):
+        if isinstance(item, MultimodalDataItem) and isinstance(label, str):
+            item.routing_label = label or None
+
+
 def register_mm_routing_labels(mm_items) -> None:
     if not MM_ROUTING_LABELS.enabled:
         return
@@ -250,9 +276,13 @@ class KVCacheEventRecorder:
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
                     if tail.mm_routing_spans or event.mm_routing_spans:
-                        tail.mm_routing_spans = (
-                            tail.mm_routing_spans or [[] for _ in tail.block_hashes]
-                        ) + (event.mm_routing_spans or [[] for _ in event.block_hashes])
+                        # Extend in place: a chain coalesces one page at a time,
+                        # so rebuilding the list would be quadratic in its length.
+                        if not tail.mm_routing_spans:
+                            tail.mm_routing_spans = [[] for _ in tail.block_hashes]
+                        tail.mm_routing_spans.extend(
+                            event.mm_routing_spans or [[] for _ in event.block_hashes]
+                        )
                     tail.block_hashes.extend(event.block_hashes)
                     tail.token_ids.extend(event.token_ids)
                     return
