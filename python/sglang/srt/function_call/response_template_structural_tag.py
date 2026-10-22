@@ -19,6 +19,7 @@ import json
 from functools import lru_cache
 from typing import Any, Callable
 
+import msgspec
 import regex as re
 
 try:
@@ -621,14 +622,116 @@ def _json_compiles(schema: str) -> bool:
     return True
 
 
-def _xml_arguments_format(
-    content_args: dict[str, Any],
-    parameters: dict[str, Any],
-    *,
-    strict: bool,
-    closers: list[str],
-    sorted_arguments: bool,
-) -> dict[str, Any] | None:
+class _XmlFraming(msgspec.Struct, frozen=True):
+    """The literal pieces of an `xml-inline` parameter tag, and the raw text a
+    value may hold between them."""
+
+    content_args: dict[str, Any]
+    json_values: bool
+    key_pattern: str
+    begins: list[str]
+    middles: list[str]
+    ends: list[str]
+    # Ends that are the next parameter's opener, looked ahead for.
+    follows: list[str]
+    closers: list[str]
+    text: dict[str, Any]
+
+    @property
+    def starts(self) -> list[str]:
+        # Each value but the last then ends by opening the next parameter,
+        # whose tag starts after the opener.
+        return [""] if self.follows else self.begins
+
+    def tag(
+        self, begin: str, value: dict[str, Any], fits: list[str], last: bool
+    ) -> dict[str, Any]:
+        if self.follows and not last:
+            fits = [
+                e + sep + self.begins[0] for e in fits for sep in ("", "\n")
+            ] + self.follows
+        return _tag(begin, value, fits)
+
+    def separated(self, tags: list[dict[str, Any]]) -> dict[str, Any]:
+        return _one_of(tags) if self.follows else _sequence(_SEPARATOR, _one_of(tags))
+
+    def arguments(self, body: dict[str, Any], optional: bool) -> dict[str, Any]:
+        """`body` after the opener of its first parameter."""
+        if not self.follows:
+            return body
+        body = _sequence(_SEPARATOR, _const_strings(self.begins), body)
+        return _optional(body) if optional else body
+
+    def any_parameter(self, last: bool) -> dict[str, Any]:
+        name = {"type": "regex", "pattern": self.key_pattern}
+        content = _sequence(name, _const_strings(self.middles), self.text)
+        return self.separated(
+            [self.tag(start, content, self.ends, last) for start in self.starts]
+        )
+
+    def any_parameters(self) -> dict[str, Any]:
+        more = {"type": "star", "content": self.any_parameter(False)}
+        if not self.follows:
+            return more
+        return self.arguments(_sequence(more, self.any_parameter(True)), True)
+
+    def read_back(self, written: str) -> dict[str, Any] | None:
+        """The arguments the parser reads from `written`, unless a closer ends
+        the call in it."""
+        if any(closer in written for closer in self.closers):
+            return None
+        try:
+            return parse_content(written, "xml-inline", self.content_args)
+        except ValueError:
+            return None
+
+    def parameter(
+        self, key: str, value: dict[str, Any], choices: list[str] | None, last: bool
+    ) -> dict[str, Any] | None:
+        begins, middles, ends = self.begins, self.middles, self.ends
+        if not re.fullmatch(self.key_pattern, key) or any(
+            list(self.read_back(b + key + m + "0" + e) or ()) != [key]
+            for b in begins
+            for m in middles
+            for e in ends
+        ):
+            raise ValueError(f"parameter name {key!r} cannot be encoded in tool calls")
+        if choices is None:
+            return self.separated(
+                [
+                    self.tag(s + key + m, value, ends, last)
+                    for s in self.starts
+                    for m in middles
+                ]
+            )
+        # Optional framing whitespace must not change a text choice.
+        tags, framed = [], set()
+        for b, s in zip(begins, self.starts):
+            for m in middles:
+                by_ends: dict[tuple[str, ...], list[str]] = {}
+                for choice in choices:
+                    fits = tuple(
+                        e
+                        for e in ends
+                        if self.read_back(b + key + m + choice + e) == {key: choice}
+                    )
+                    by_ends.setdefault(fits, []).append(choice)
+                for fits, group in by_ends.items():
+                    if fits:
+                        tags.append(
+                            self.tag(
+                                s + key + m, _const_strings(group), list(fits), last
+                            )
+                        )
+                        framed.update(group)
+        if framed != set(choices):
+            return None
+        return self.separated(tags)
+
+
+def _xml_framing(
+    content_args: dict[str, Any], closers: list[str]
+) -> _XmlFraming | None:
     if set(content_args) - {"tag_pattern", "value_parser", "merge_duplicates"}:
         return None
     value_parser = content_args.get("value_parser") or {"name": "text"}
@@ -640,7 +743,6 @@ def _xml_arguments_format(
     value_split = key_split and _split_group(key_split[2], "value")
     if not key_split or not value_split:
         return None
-    key_pattern = key_split[1]
     begins, middles = _literals(key_split[0]), _literals(value_split[0])
     ends = _literals(value_split[2], lookahead=True)
     if not begins or not middles or not ends:
@@ -654,11 +756,37 @@ def _xml_arguments_format(
     ):
         return None
     follows = [before + ahead for before, ahead in aheads]
+    # Raw text has no escaping for a call closer, nor, where a value may end
+    # before the next opener, for any value end.
+    excludes = closers + follows + ends if follows else closers
+    return _XmlFraming(
+        content_args=content_args,
+        json_values=value_parser.get("name") == "json",
+        key_pattern=key_split[1],
+        begins=begins,
+        middles=middles,
+        ends=ends,
+        follows=follows,
+        closers=closers,
+        text={"type": "any_text", "excludes": excludes} if excludes else _ANY_TEXT,
+    )
+
+
+def _xml_arguments_format(
+    content_args: dict[str, Any],
+    parameters: dict[str, Any],
+    *,
+    strict: bool,
+    closers: list[str],
+    sorted_arguments: bool,
+) -> dict[str, Any] | None:
+    framing = _xml_framing(content_args, closers)
+    if framing is None:
+        return None
     properties = parameters.get("properties")
-    json_values = value_parser.get("name") == "json"
     typed = properties is None or (
         isinstance(properties, dict)
-        and (json_values or all(map(_typed_by_parser, properties.values())))
+        and (framing.json_values or all(map(_typed_by_parser, properties.values())))
     )
     # Other schema shapes cannot be typed by the XML parser.
     if strict and (set(parameters) - _ANNOTATIONS - _OBJECT_KEYWORDS or not typed):
@@ -673,131 +801,64 @@ def _xml_arguments_format(
             return None
         names = (*properties, *(key for key in required if key not in properties))
     pieces = (
-        _literal_piece(begins, before=_SEPARATOR["pattern"]),
-        (f"(?:{key_pattern})", _endings(names), False),
-        _literal_piece(middles),
+        _literal_piece(framing.begins, before=_SEPARATOR["pattern"]),
+        (f"(?:{framing.key_pattern})", _endings(names), False),
+        _literal_piece(framing.middles),
         # Values of every format are some text.
         _TEXT_PIECE,
-        _literal_piece(ends),
+        _literal_piece(framing.ends),
     )
     if _spells_closer(tuple(closers), pieces, repeats=True):
         return None
-
-    # Raw text has no escaping for a call closer, nor, where a value may end
-    # before the next opener, for any value end.
-    excludes = closers + follows + ends if follows else closers
-    text = {"type": "any_text", "excludes": excludes} if excludes else _ANY_TEXT
-    # Each value but the last then ends by opening the next parameter, whose
-    # tag starts after the opener.
-    starts = [""] if follows else begins
-
-    def tag(
-        begin: str, value: dict[str, Any], fits: list[str], last: bool
-    ) -> dict[str, Any]:
-        if follows and not last:
-            fits = [e + sep + begins[0] for e in fits for sep in ("", "\n")] + follows
-        return _tag(begin, value, fits)
-
-    def separated(tags: list[dict[str, Any]]) -> dict[str, Any]:
-        return _one_of(tags) if follows else _sequence(_SEPARATOR, _one_of(tags))
-
-    def arguments(body: dict[str, Any], optional: bool) -> dict[str, Any]:
-        """`body` after the opener of its first parameter."""
-        if not follows:
-            return body
-        body = _sequence(_SEPARATOR, _const_strings(begins), body)
-        return _optional(body) if optional else body
-
-    def any_parameter(last: bool) -> dict[str, Any]:
-        name = {"type": "regex", "pattern": key_pattern}
-        content = _sequence(name, _const_strings(middles), text)
-        return separated([tag(start, content, ends, last) for start in starts])
-
-    def any_parameters() -> dict[str, Any]:
-        more = {"type": "star", "content": any_parameter(False)}
-        return (
-            arguments(_sequence(more, any_parameter(True)), True) if follows else more
-        )
-
     if not strict:
-        return any_parameters()
+        return framing.any_parameters()
     if properties is None:
         extra = parameters.get("additionalProperties", True)
         if extra is False:
             return {"type": "const_string", "value": ""}
-        return any_parameters() if extra is True or extra == {} else None
+        return framing.any_parameters() if extra is True or extra == {} else None
     # A declared key repeated as an extra one would bypass its schema.
     if parameters.get("additionalProperties", False) is not False:
         return None
+    return _strict_xml_arguments(
+        framing, parameters, required, sorted_arguments=sorted_arguments
+    )
 
-    def read_back(written: str) -> dict[str, Any] | None:
-        """The arguments the parser reads from `written`, unless a closer ends
-        the call in it."""
-        if any(closer in written for closer in closers):
-            return None
-        try:
-            return parse_content(written, "xml-inline", content_args)
-        except ValueError:
-            return None
 
-    def parameter(
-        key: str, value: dict[str, Any], choices: list[str] | None, last: bool
-    ) -> dict[str, Any] | None:
-        if not re.fullmatch(key_pattern, key) or any(
-            list(read_back(b + key + m + "0" + e) or ()) != [key]
-            for b in begins
-            for m in middles
-            for e in ends
-        ):
-            raise ValueError(f"parameter name {key!r} cannot be encoded in tool calls")
-        if choices is None:
-            return separated(
-                [tag(s + key + m, value, ends, last) for s in starts for m in middles]
-            )
-        # Optional framing whitespace must not change a text choice.
-        tags, framed = [], set()
-        for b, s in zip(begins, starts):
-            for m in middles:
-                by_ends: dict[tuple[str, ...], list[str]] = {}
-                for choice in choices:
-                    fits = tuple(
-                        e
-                        for e in ends
-                        if read_back(b + key + m + choice + e) == {key: choice}
-                    )
-                    by_ends.setdefault(fits, []).append(choice)
-                for fits, group in by_ends.items():
-                    if fits:
-                        tags.append(
-                            tag(s + key + m, _const_strings(group), list(fits), last)
-                        )
-                        framed.update(group)
-        if framed != set(choices):
-            return None
-        return separated(tags)
-
+def _strict_xml_arguments(
+    framing: _XmlFraming,
+    parameters: dict[str, Any],
+    required: list[str],
+    *,
+    sorted_arguments: bool,
+) -> dict[str, Any] | None:
+    """Declared parameters, each held to its schema, required ones present."""
+    properties = parameters["properties"]
+    excludes = framing.closers + framing.follows + framing.ends
     values = {}
     for key, schema in properties.items():
-        value = _value_format(schema, parameters, json_values, closers + follows + ends)
+        value = _value_format(schema, parameters, framing.json_values, excludes)
         if value is None:
             return None
         choices = None
         if value["type"] in ("const_string", "or"):
             choices = _string_choices(schema)
-        values[key] = (text if value == _ANY_TEXT else value, choices)
-    values.update((key, (text, None)) for key in required if key not in properties)
+        values[key] = (framing.text if value == _ANY_TEXT else value, choices)
+    values.update(
+        (key, (framing.text, None)) for key in required if key not in properties
+    )
     if not values:
         return {"type": "const_string", "value": ""}
     more, final = {}, {}
     for key, (value, choices) in values.items():
-        more[key] = parameter(key, value, choices, last=False)
-        final[key] = parameter(key, value, choices, last=True)
+        more[key] = framing.parameter(key, value, choices, last=False)
+        final[key] = framing.parameter(key, value, choices, last=True)
         if more[key] is None or final[key] is None:
             return None
 
     def ordered(keys: tuple[str, ...]) -> dict[str, Any]:
         before = [more[k] if k in required else _optional(more[k]) for k in keys]
-        if not follows:
+        if not framing.follows:
             return _sequence(*before)
 
         def last(start: int, stop: int) -> dict[str, Any]:
@@ -820,7 +881,7 @@ def _xml_arguments_format(
     orders = [tuple(values)]
     if sorted_arguments and sorted(values) != list(values):
         orders.append(tuple(sorted(values)))
-    return arguments(_one_of([ordered(keys) for keys in orders]), not required)
+    return framing.arguments(_one_of([ordered(keys) for keys in orders]), not required)
 
 
 def _arguments_format(

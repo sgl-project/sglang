@@ -1463,17 +1463,50 @@ class OpenAIServingChat(OpenAIServingBase):
         request._response_parser_prefix = prefix
         request._response_parser_tool_grammar = template_tool_call_grammar
         sampling_params = adapted_request.sampling_params or {}
-        # Output that starts the assistant message may skip the reasoning, so a
-        # template grammar then covers the reasoning from the first token.
+        if template_tool_call_grammar:
+            self._fit_tool_call_grammar_to_prefix(
+                request,
+                adapted_request,
+                sampling_params,
+                prefix,
+                message_start_tool_call_constraint,
+            )
+        # Structural tags, regex and EBNF can describe the template's own
+        # framing, so only JSON-schema output bypasses the template.
+        if sampling_params.get("json_schema"):
+            self._set_json_grammar_start(
+                request,
+                adapted_request,
+                sampling_params,
+                prefix,
+                tool_call_constraint,
+                tools,
+            )
+
+    def _fit_tool_call_grammar_to_prefix(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        adapted_request: GenerateReqInput,
+        sampling_params: dict[str, Any],
+        prefix: str,
+        message_start_tool_call_constraint: (
+            Callable[[], ToolCallConstraint | None] | None
+        ),
+    ) -> None:
+        """Fit the template's tool-call grammar to where `prefix` leaves the
+        output: at the message start, inside an answer, or after reasoning."""
         detector = self._reasoning_detector
+        if not isinstance(detector, ResponseTemplateReasoningDetector):
+            return
+        starts_message = detector.starts_message(prefix)
         message_start_constraint = (
             message_start_tool_call_constraint()
-            if message_start_tool_call_constraint is not None
-            and isinstance(detector, ResponseTemplateReasoningDetector)
-            and detector.starts_message(prefix)
+            if starts_message and message_start_tool_call_constraint is not None
             else None
         )
         if message_start_constraint is not None:
+            # Output that starts the assistant message may skip the reasoning,
+            # so the grammar then covers the reasoning from the first token.
             tag = message_start_constraint[1]
             sampling_params["structural_tag"] = json.dumps(
                 tag.model_dump(by_alias=True)
@@ -1482,9 +1515,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 sampling_params, adapted_request.require_reasoning
             )
         elif (
-            template_tool_call_grammar
-            and request.tool_choice in ("auto", "none")
-            and isinstance(detector, ResponseTemplateReasoningDetector)
+            request.tool_choice in ("auto", "none")
             and (rest := detector.answer_rest_structural_tag(prefix)) is not None
         ):
             # A continued answer never reaches the reasoning end the grammar
@@ -1492,11 +1523,9 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_params["structural_tag"] = json.dumps(rest)
             adapted_request.require_reasoning = False
         elif (
-            template_tool_call_grammar
-            and request.tool_choice == "auto"
+            request.tool_choice == "auto"
             and adapted_request.require_reasoning
-            and isinstance(detector, ResponseTemplateReasoningDetector)
-            and detector.starts_message(prefix)
+            and starts_message
         ):
             # The grammar would wait for the reasoning end, which output that
             # skips the reasoning never reaches.
@@ -1504,83 +1533,164 @@ class OpenAIServingChat(OpenAIServingBase):
                 "cannot enforce automatic tool choice on output that may skip "
                 "the reasoning for this response template"
             )
-        # Structural tags, regex and EBNF can describe the template's own
-        # framing, so only JSON-schema output bypasses the template.
-        if sampling_params.get("json_schema"):
-            # The scheduler defers the grammar to the reasoning's end only when
-            # the reasoning parser's think_end_token encodes to token ids.
-            reasoning_gated = (
-                adapted_request.require_reasoning
-                and self._reasoning_detector is not None
-                and bool(
-                    self._reasoning_detector.get_think_end_token_ids(
-                        self.tokenizer_manager.tokenizer
-                    )
+
+    def _set_json_grammar_start(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        adapted_request: GenerateReqInput,
+        sampling_params: dict[str, Any],
+        prefix: str,
+        tool_call_constraint: ToolCallConstraint | None,
+        tools: List[Tool],
+    ) -> None:
+        """Record where JSON-schema output starts, framing a JSON answer with
+        the template's own grammar where it can."""
+        detector = self._reasoning_detector
+        # The scheduler defers the grammar to the reasoning's end only when
+        # the reasoning parser's think_end_token encodes to token ids.
+        reasoning_gated = (
+            adapted_request.require_reasoning
+            and detector is not None
+            and bool(detector.get_think_end_token_ids(self.tokenizer_manager.tokenizer))
+        )
+        request._response_parser_grammar_start = (
+            GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
+        )
+        # Unless the schema is the required/named tool call itself, the JSON
+        # is response data, and template syntax inside its strings is literal.
+        json_answer = (
+            tool_call_constraint is None or tool_call_constraint[0] != "json_schema"
+        )
+        # A JSON answer released at the reasoning end still opens the answer;
+        # the forced tool-call array stays bare JSON.
+        if (
+            reasoning_gated
+            and json_answer
+            and isinstance(detector, ResponseTemplateReasoningDetector)
+        ):
+            tag, from_start = self._json_answer_structural_tag(
+                request,
+                detector,
+                json.loads(sampling_params["json_schema"]),
+                prefix,
+                tools,
+            )
+            if tag is not None:
+                sampling_params["structural_tag"] = json.dumps(tag)
+                del sampling_params["json_schema"]
+                set_request_reasoning_in_grammar(sampling_params, from_start)
+                request._response_parser_grammar_start = GRAMMAR_AT_ANSWER
+        # The template's JSON-answer grammar admits native calls instead of
+        # the answer, which tool extraction still reads.
+        request._response_parser_json_response_format = (
+            json_answer and request._response_parser_grammar_start != GRAMMAR_AT_ANSWER
+        )
+
+    def _json_answer_structural_tag(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        detector: ResponseTemplateReasoningDetector,
+        json_schema: Any,
+        prefix: str,
+        tools: List[Tool],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """The template's tag for a JSON answer, and whether it covers the
+        output from the first token."""
+        # Calls instead of the answer take the template's framing, which only
+        # a response-template tool parser reads.
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        tool_dicts, undeclared_names = [], False
+        if (
+            tools
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        ):
+            parser = FunctionCallParser(
+                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+            )
+            tool_dicts = [tool.model_dump() for tool in parser.structural_tag_tools()]
+            undeclared_names = parser.detector.admits_undeclared_tools()
+        parallel_tool_calls = request.parallel_tool_calls is not False
+        from_start = detector.starts_message(prefix)
+        tag = detector.json_answer_structural_tag(
+            json_schema,
+            tools=tool_dicts,
+            parallel_tool_calls=parallel_tool_calls,
+            message_start=from_start,
+            undeclared_names=undeclared_names,
+        )
+        if tag is None and from_start:
+            from_start = False
+            tag = detector.json_answer_structural_tag(
+                json_schema,
+                tools=tool_dicts,
+                parallel_tool_calls=parallel_tool_calls,
+                undeclared_names=undeclared_names,
+            )
+        return tag, from_start
+
+    def _takes_turn_grammar(
+        self, request: ChatCompletionRequest, *, output_constrained: bool
+    ) -> bool:
+        """Whether a turn nothing else constrains takes the template's grammar."""
+        return (
+            request.tool_choice in ("auto", "none")
+            and not (
+                output_constrained
+                or request.regex
+                or request.ebnf
+                or (
+                    request.response_format is not None
+                    and request.response_format.type != "text"
                 )
             )
-            request._response_parser_grammar_start = (
-                GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
+            and self._template_turn_grammar()
+        )
+
+    def _record_template_tool_call_grammar(
+        self,
+        request: ChatCompletionRequest,
+        result: MessageProcessingResult,
+        parser: FunctionCallParser,
+    ) -> None:
+        """Record whether the tool-call constraint is the template's own
+        grammar, which parsing then relies on."""
+        tool_call_constraint = result.tool_call_constraint
+        client_grammar = (
+            request.regex
+            or request.ebnf
+            or (
+                request.response_format is not None
+                and request.response_format.type == "structural_tag"
             )
-            # Unless the schema is the required/named tool call itself, the JSON
-            # is response data, and template syntax inside its strings is literal.
-            json_answer = (
-                tool_call_constraint is None or tool_call_constraint[0] != "json_schema"
+        )
+        # A client grammar replaces the tag that holds automatic calls to strictness
+        # or count; a JSON answer is checked where its tag is derived.
+        if (
+            request.tool_choice == "auto"
+            and tool_call_constraint is not None
+            and client_grammar
+        ):
+            raise ValueError(
+                "cannot enforce strict tools or parallel_tool_calls=False with "
+                "automatic tool choice under another output constraint for "
+                "this response template"
             )
-            # A JSON answer released at the reasoning end still opens the
-            # answer; the forced tool-call array stays bare JSON.
-            if (
-                reasoning_gated
-                and json_answer
-                and isinstance(detector, ResponseTemplateReasoningDetector)
-            ):
-                json_schema = json.loads(sampling_params["json_schema"])
-                # Calls instead of the answer take the template's framing, which
-                # only a response-template tool parser reads.
-                tool_detector = FunctionCallParser.ToolCallParserEnum.get(
-                    self.tool_call_parser
+        result.template_tool_call_grammar = (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] == "structural_tag"
+            # Another output constraint replaces the tool-call tag.
+            and not (
+                client_grammar
+                or (
+                    request.response_format is not None
+                    and request.response_format.type != "text"
                 )
-                tool_dicts, undeclared_names = [], False
-                if (
-                    tools
-                    and tool_detector is not None
-                    and issubclass(tool_detector, ResponseTemplateToolDetector)
-                ):
-                    parser = FunctionCallParser(
-                        tools,
-                        self.tool_call_parser,
-                        tokenizer=self.tokenizer_manager.tokenizer,
-                    )
-                    tool_dicts = [
-                        tool.model_dump() for tool in parser.structural_tag_tools()
-                    ]
-                    undeclared_names = parser.detector.admits_undeclared_tools()
-                parallel_tool_calls = request.parallel_tool_calls is not False
-                from_start = detector.starts_message(prefix)
-                tag = detector.json_answer_structural_tag(
-                    json_schema,
-                    tools=tool_dicts,
-                    parallel_tool_calls=parallel_tool_calls,
-                    message_start=from_start,
-                    undeclared_names=undeclared_names,
-                )
-                if tag is None and from_start:
-                    from_start = False
-                    tag = detector.json_answer_structural_tag(
-                        json_schema,
-                        tools=tool_dicts,
-                        parallel_tool_calls=parallel_tool_calls,
-                        undeclared_names=undeclared_names,
-                    )
-                if tag is not None:
-                    sampling_params["structural_tag"] = json.dumps(tag)
-                    del sampling_params["json_schema"]
-                    set_request_reasoning_in_grammar(sampling_params, from_start)
-                    request._response_parser_grammar_start = GRAMMAR_AT_ANSWER
-            # The template's JSON-answer grammar admits native calls instead of
-            # the answer, which tool extraction still reads.
-            request._response_parser_json_response_format = (
-                json_answer
-                and request._response_parser_grammar_start != GRAMMAR_AT_ANSWER
+            )
+        )
+        if result.template_tool_call_grammar:
+            result.message_start_tool_call_constraint = lambda: (
+                self._message_start_tool_call_constraint(request, result, parser)
             )
 
     def _message_start_tool_call_constraint(
@@ -1806,19 +1916,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-        if (
-            tool_call_constraint is None
-            and request.tool_choice in ("auto", "none")
-            and not (
-                output_constrained
-                or request.regex
-                or request.ebnf
-                or (
-                    request.response_format is not None
-                    and request.response_format.type != "text"
-                )
-            )
-            and self._template_turn_grammar()
+        if tool_call_constraint is None and self._takes_turn_grammar(
+            request, output_constrained=output_constrained
         ):
             # Unconstrained turns still take the template's framing: reasoning,
             # then calls with any arguments or the answer.
@@ -1872,44 +1971,9 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         if template_tool_parser is not None and result.uses_response_template:
-            client_grammar = (
-                request.regex
-                or request.ebnf
-                or (
-                    request.response_format is not None
-                    and request.response_format.type == "structural_tag"
-                )
+            self._record_template_tool_call_grammar(
+                request, result, template_tool_parser
             )
-            # A client grammar replaces the tag that holds automatic calls to strictness
-            # or count; a JSON answer is checked where its tag is derived.
-            if (
-                request.tool_choice == "auto"
-                and tool_call_constraint is not None
-                and client_grammar
-            ):
-                raise ValueError(
-                    "cannot enforce strict tools or parallel_tool_calls=False with "
-                    "automatic tool choice under another output constraint for "
-                    "this response template"
-                )
-            result.template_tool_call_grammar = (
-                tool_call_constraint is not None
-                and tool_call_constraint[0] == "structural_tag"
-                # Another output constraint replaces the tool-call tag.
-                and not (
-                    client_grammar
-                    or (
-                        request.response_format is not None
-                        and request.response_format.type != "text"
-                    )
-                )
-            )
-            if result.template_tool_call_grammar:
-                result.message_start_tool_call_constraint = lambda: (
-                    self._message_start_tool_call_constraint(
-                        request, result, template_tool_parser
-                    )
-                )
         result.skip_special_tokens = request.skip_special_tokens
         if self.reasoning_parser == "k2_horizon" and thinking_mode:
             parser = ReasoningParser(
