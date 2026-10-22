@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -515,3 +516,21 @@ def test_status_text_reads_executor_that_ran_after_rebuild() -> None:
     runtime._owns_live = lambda executor: True
     runtime.ensure_executor(running)
     assert "123.4 ms" in runtime.status_text()
+
+
+def test_worker_status_is_pushed_to_the_page(monkeypatch) -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        _push_worker_status,
+    )
+
+    sent = []
+    server = SimpleNamespace(
+        PromptServer=SimpleNamespace(
+            instance=SimpleNamespace(send_sync=lambda *a: sent.append(a))
+        )
+    )
+    monkeypatch.setitem(sys.modules, "server", server)
+    monkeypatch.setattr(SGLDiffusionGenerator, "shared", lambda: _status_runtime())
+    _push_worker_status()
+    assert sent[0][0] == "sgld.worker_status"
+    assert "123.4 ms" in sent[0][1]["text"]

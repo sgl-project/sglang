@@ -141,11 +141,13 @@ DiT only. Text encoding and VAE stay in ComfyUI.
 ## Worker Status Node
 
 `SGLDiffusion Worker Status` (category `SGLDiffusion`) takes the SGLD `MODEL`
-and the sampler's `LATENT` output (`after_sampling`), so it always runs after
-sampling and is never served from ComfyUI's cache. It prints the model, worker
-liveness, and the worker's own `RequestMetrics` for the last DiT call of that
-run: forward time and peak VRAM for one sampler step (with CFG, one of the
-step's two calls), not the whole run.
+and prints the model, worker liveness, and the worker's own `RequestMetrics` for
+the last DiT call: forward time and peak VRAM for one sampler step (with CFG,
+one of the step's two calls), not the whole run. It is never served from
+ComfyUI's cache. Run it on its own to check loader settings and worker
+readiness before generating, or wire the sampler's `LATENT` into the optional
+`after_sampling` input so it runs after that sampler and reports its metrics.
+The node's text box also refreshes after every DiT call while a sampler runs.
 
 Settings use the `SGLDOptions` widget names and values and come in two groups.
 Loader settings (model type, parallel layout, attention, quantization, execution
