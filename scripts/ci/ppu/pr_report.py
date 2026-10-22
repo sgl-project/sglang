@@ -272,7 +272,16 @@ def summarize(directory, lane):
     return result
 
 
-def aggregate(needs, cpu_only=False):
+def aggregate(needs, cpu_only=False, e2e_requested=False):
+    e2e = needs.get("e2e", {})
+    if e2e_requested and not cpu_only:
+        if (
+            e2e.get("result") != "success"
+            or e2e.get("outputs", {}).get("evidence_ok") != "true"
+        ):
+            return False
+    elif e2e and e2e.get("result") != "skipped":
+        return False
     check = needs.get("check-changes", {})
     if check.get("result") != "success":
         return False
@@ -318,10 +327,15 @@ if __name__ == "__main__":
     parser.add_argument("--lane", choices=SUITES)
     parser.add_argument("--kernel", action="store_true")
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--e2e-requested", action="store_true")
     args = parser.parse_args()
     if args.mode == "aggregate":
         raise SystemExit(
-            0 if aggregate(json.loads(os.environ["NEEDS_JSON"]), args.cpu_only) else 1
+            0
+            if aggregate(
+                json.loads(os.environ["NEEDS_JSON"]), args.cpu_only, args.e2e_requested
+            )
+            else 1
         )
     elif args.mode == "verify":
         verify(args.directory, args.lane, args.kernel)

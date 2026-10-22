@@ -1,0 +1,135 @@
+name: PPU PR E2E
+
+on:
+  workflow_call:
+    inputs:
+      plan_hash:
+        required: true
+        type: string
+      cpu_identity:
+        required: true
+        type: string
+      cpu_evidence_ok:
+        required: true
+        type: string
+    outputs:
+      evidence_ok:
+        description: All selected entries have verified evidence for this plan.
+        value: ${{ jobs.finish.outputs.evidence_ok }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      default: ${{ steps.matrix.outputs.default }}
+      default_selected: ${{ steps.matrix.outputs.default_selected }}
+      extended: ${{ steps.matrix.outputs.extended }}
+      extended_selected: ${{ steps.matrix.outputs.extended_selected }}
+      distributed: ${{ steps.matrix.outputs.distributed }}
+      distributed_selected: ${{ steps.matrix.outputs.distributed_selected }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Require current-attempt CPU evidence and authorized plan
+        env:
+          CPU_IDENTITY: ${{ inputs.cpu_identity }}
+          CPU_EVIDENCE_OK: ${{ inputs.cpu_evidence_ok }}
+          PLAN_HASH: ${{ inputs.plan_hash }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/ppu/select_pr_e2e.py cpu --plan selection.json
+          python3 scripts/ci/ppu/select_pr_e2e.py check --plan selection.json
+      - name: Expand immutable execution matrices
+        id: matrix
+        run: python3 scripts/ci/ppu/select_pr_e2e.py matrix --plan selection.json
+
+  default:
+    needs: prepare
+    if: needs.prepare.outputs.default_selected == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.default) }}
+    uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
+    with:
+      entry: ${{ matrix.id }}
+      nodes: ${{ matrix.nodes }}
+      job_minutes: ${{ matrix.job_minutes }}
+      worker_minutes: ${{ matrix.worker_minutes }}
+      phase: default
+      plan_hash: ${{ inputs.plan_hash }}
+    secrets: inherit
+
+  extended:
+    needs: [prepare, default]
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.extended_selected == 'true' &&
+      (needs.default.result == 'success' || needs.prepare.outputs.default_selected == 'false')
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.extended) }}
+    uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
+    with:
+      entry: ${{ matrix.id }}
+      nodes: ${{ matrix.nodes }}
+      job_minutes: ${{ matrix.job_minutes }}
+      worker_minutes: ${{ matrix.worker_minutes }}
+      phase: extended
+      plan_hash: ${{ inputs.plan_hash }}
+    secrets: inherit
+
+  distributed:
+    needs: [prepare, default, extended]
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.distributed_selected == 'true' &&
+      (needs.default.result == 'success' || needs.prepare.outputs.default_selected == 'false') &&
+      (needs.extended.result == 'success' || needs.prepare.outputs.extended_selected == 'false')
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.distributed) }}
+    uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
+    with:
+      entry: ${{ matrix.id }}
+      nodes: ${{ matrix.nodes }}
+      job_minutes: ${{ matrix.job_minutes }}
+      worker_minutes: ${{ matrix.worker_minutes }}
+      phase: distributed
+      plan_hash: ${{ inputs.plan_hash }}
+    secrets: inherit
+
+  finish:
+    needs: [prepare, default, extended, distributed]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      evidence_ok: ${{ steps.verify.outputs.evidence_ok }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-e2e-result-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: e2e-results
+      - name: Require exact selected-ID completion and current PR state
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/ppu/pr_e2e_report.py aggregate --plan selection.json --directory e2e-results

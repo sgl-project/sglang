@@ -102,7 +102,9 @@ export SGLANG_SAIL_PLA_CUDA=0
 export GLOO_SOCKET_IFNAME=lo
 
 cd /workspace/source
-git config --global --add safe.directory /workspace/source
+if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
+  git config --global --add safe.directory /workspace/source
+fi
 SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
 export SGLANG_PPU_SOURCE_REVISION
 
@@ -186,6 +188,9 @@ bash scripts/ci/warm_page_cache.sh "$ACCURACY_MODEL_PATH"
 # register_ppu_ci declares. No --continue-on-error: one registered file runs
 # here, and a suite that cannot evaluate has to turn the run red. Whether a score
 # it did measure is a pass is the evaluator's judgement, not this script's.
+if [[ -n "${PPU_E2E_PLAN:-}" ]]; then
+  exec python3 scripts/ci/ppu/pr_e2e_worker.py suite
+fi
 cd test
 python3 run_suite.py \
   --hw ppu \

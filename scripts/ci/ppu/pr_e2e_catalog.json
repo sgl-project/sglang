@@ -1,0 +1,1968 @@
+{
+  "schema_version": 1,
+  "functional_blocker": "No registered nightly-1/2/4/8-ppu tests at the inspected target revision.",
+  "entries": [
+    {
+      "id": "dsv3.2-fp8-accuracy-gsm8k-144g",
+      "family": "deepseek",
+      "format": "fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-dsv32-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv3.2/fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv32_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "dsv3.2-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv32-fp8-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv3.2/fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "dsv3.2-fp8-accuracy-gsm8k-smoke-144g",
+      "family": "deepseek",
+      "format": "fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-dsv32-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv3.2/fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv32_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv32-fp8-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv3.2/fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "dsv3.2-fp8-answer-144g",
+      "family": "deepseek",
+      "format": "fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-dsv32-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/dsv3.2/fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_dsv32_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-dsv32-fp8",
+        "config": "test/registered/ppu/answer_eval/configs/dsv3.2/fp8-144g.json"
+      }
+    },
+    {
+      "id": "dsv4-flash-mxfp4-accuracy-gsm8k-144g",
+      "family": "deepseek",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-dsv4flash-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_flash_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [
+        "dsv4-flash-mxfp4-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4flash-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "dsv4-flash-mxfp4-accuracy-gsm8k-smoke-144g",
+      "family": "deepseek",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-dsv4flash-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_flash_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4flash-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "dsv4-flash-w8a8-accuracy-gsm8k-144g",
+      "family": "deepseek",
+      "format": "w8a8-int8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-dsv4flash-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_flash_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {
+        "SGLANG_DSV4_FP4_EXPERTS": "0",
+        "SGLANG_OPT_USE_TOPK_V2": "0",
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [
+        "dsv4-flash-w8a8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4flash-w8a8-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "dsv4-flash-w8a8-accuracy-gsm8k-smoke-144g",
+      "family": "deepseek",
+      "format": "w8a8-int8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-dsv4flash-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_flash_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {
+        "SGLANG_DSV4_FP4_EXPERTS": "0",
+        "SGLANG_OPT_USE_TOPK_V2": "0",
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4flash-w8a8-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "dsv4-flash-w8a8-int8-answer-144g",
+      "family": "deepseek",
+      "format": "w8a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-dsv4flash-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/dsv4-flash/w8a8-int8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_dsv4_flash_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-dsv4flash-w8a8",
+        "config": "test/registered/ppu/answer_eval/configs/dsv4-flash/w8a8-int8-144g.json"
+      }
+    },
+    {
+      "id": "dsv4-pro-0813-mxfp4-answer-144g",
+      "family": "deepseek",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-dsv4pro-ppu",
+      "config": "scripts/ci/ppu/blocked_configs/dsv4-pro-answer.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_dsv4_pro_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "PR #70 Pro-0813 Answer model.path is not absolute; maintainer must supply the staged checkpoint path.",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-dsv4pro-0813-mxfp4",
+        "config": "test/registered/ppu/answer_eval/configs/dsv4-pro/mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "dsv4-pro-mxfp4-accuracy-gsm8k-144g",
+      "family": "deepseek",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-dsv4pro-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-pro/mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_pro_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [
+        "dsv4-pro-mxfp4-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4pro-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-pro/mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "dsv4-pro-mxfp4-accuracy-gsm8k-smoke-144g",
+      "family": "deepseek",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-dsv4pro-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/dsv4-pro/mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_dsv4_pro_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {
+        "SGLANG_DEFAULT_THINKING": "1",
+        "SGLANG_DSV4_REASONING_EFFORT": "high"
+      },
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "107913533169e97ff4139664110bed4e523c68b2",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "dsv4pro-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/dsv4-pro/mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-accuracy-ceval-144g",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-fp8chan-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ceval.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-accuracy-gsm8k-144g",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-fp8chan-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-fp8chan-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-accuracy-ifeval-144g",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-fp8chan-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-answer-144g",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-glm52-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/glm5.2/fp8-channelwise-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_glm52_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "glm52-fp8-chan",
+        "config": "test/registered/ppu/answer_eval/configs/glm5.2/fp8-channelwise-144g.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-pd-perf-144g-1p1d-4k-1500",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "pd",
+      "mode": "pd",
+      "suite": "nightly-pd-perf-16-glm52-ppu",
+      "config": "test/registered/ppu/pd_perf_eval/configs/glm5.2/fp8-channelwise-144g-pd-1p1d-4k-1500.json",
+      "files": [
+        "test/registered/ppu/pd_perf_eval/test_ppu_glm52_pd_perf.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 13800,
+      "worker_minutes": 240,
+      "job_minutes": 270,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-pd-perf-glm52.yml",
+        "job": "pd-perf-16-glm52-fp8chan",
+        "config": "test/registered/ppu/pd_perf_eval/configs/glm5.2/fp8-channelwise-144g-pd-1p1d-4k-1500.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-perf-144g-prefill-4k",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-8-glm52-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_glm52_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 9000,
+      "worker_minutes": 165,
+      "job_minutes": 190,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "glm52-fp8chan-4k",
+        "config": "test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-fp8-channelwise-perf-144g-prefill-64k",
+      "family": "glm",
+      "format": "fp8-channelwise",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-8-glm52-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_glm52_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 9000,
+      "worker_minutes": 240,
+      "job_minutes": 265,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "glm52-fp8chan-64k",
+        "config": "test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-accuracy-ceval-144g",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-mxfp4-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ceval.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-accuracy-gsm8k-144g",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-accuracy-ifeval-144g",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-glm52-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_glm52_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "glm-5.2-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "glm52-mxfp4-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-answer-144g",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-glm52-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/glm5.2/mxfp4-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_glm52_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 10800,
+      "worker_minutes": 210,
+      "job_minutes": 240,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "glm52-mxfp4",
+        "config": "test/registered/ppu/answer_eval/configs/glm5.2/mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-pd-perf-144g-1p1d-4k-1500",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "pd",
+      "mode": "pd",
+      "suite": "nightly-pd-perf-16-glm52-ppu",
+      "config": "test/registered/ppu/pd_perf_eval/configs/glm5.2/mxfp4-fp8-144g-pd-1p1d-4k-1500.json",
+      "files": [
+        "test/registered/ppu/pd_perf_eval/test_ppu_glm52_pd_perf.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 13800,
+      "worker_minutes": 240,
+      "job_minutes": 270,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-pd-perf-glm52.yml",
+        "job": "pd-perf-16-glm52-mxfp4",
+        "config": "test/registered/ppu/pd_perf_eval/configs/glm5.2/mxfp4-fp8-144g-pd-1p1d-4k-1500.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-perf-144g-prefill-4k",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-4-glm52-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_glm52_mxfp4_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7800,
+      "worker_minutes": 145,
+      "job_minutes": 170,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "glm52-mxfp4-4k",
+        "config": "test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-mxfp4-fp8-perf-144g-prefill-64k",
+      "family": "glm",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-4-glm52-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_glm52_mxfp4_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7800,
+      "worker_minutes": 145,
+      "job_minutes": 170,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "glm52-mxfp4-64k",
+        "config": "test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json"
+      }
+    },
+    {
+      "id": "glm-5.2-w8a8-int8-answer-144g",
+      "family": "glm",
+      "format": "w8a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-glm52-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/glm5.2/w8a8-int8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_glm52_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "glm52-w8a8",
+        "config": "test/registered/ppu/answer_eval/configs/glm5.2/w8a8-int8-144g.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-accuracy-ceval-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-kimi26-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_kimi_k26_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "kimi26-mxfp4-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ceval.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-kimi26-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_kimi_k26_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "kimi26-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-kimi26-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_kimi_k26_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "kimi26-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-accuracy-ifeval-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-kimi26-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_kimi_k26_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "kimi-k2.6-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "kimi26-mxfp4-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-answer-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-kimi26-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/kimi2.6/mxfp4-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_kimi_k26_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 10800,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-kimi26-mxfp4",
+        "config": "test/registered/ppu/answer_eval/configs/kimi2.6/mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-mxfp4-fp8-perf-144g",
+      "family": "kimi",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-8-kimi26-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_kimi_k26_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7800,
+      "worker_minutes": 145,
+      "job_minutes": 170,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "kimi26-mxfp4",
+        "config": "test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-w4a8-int8-answer-144g",
+      "family": "kimi",
+      "format": "w4a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-kimi26-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_kimi_k26_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 10800,
+      "worker_minutes": 210,
+      "job_minutes": 240,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-kimi26-w4a8",
+        "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-w4a8-int8-perf-144g",
+      "family": "kimi",
+      "format": "w4a8-int8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-8-kimi26-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_kimi_k26_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7800,
+      "worker_minutes": 145,
+      "job_minutes": 170,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "kimi26-w4a8",
+        "config": "test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json"
+      }
+    },
+    {
+      "id": "kimi-k2.6-w8a8-int8-answer-144g-2nodes",
+      "family": "kimi",
+      "format": "w8a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-16-kimi26-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_kimi_k26_w8a8_answer.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 300,
+      "job_minutes": 330,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer-16.yml",
+        "job": "answer-16-k8s",
+        "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-accuracy-ceval-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-fp8chan-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ceval.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-fp8chan-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-fp8chan-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-accuracy-ifeval-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-fp8chan-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-answer-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-minimax27-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/minimax2.7/fp8-channelwise-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_minimax_m27_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "minimax27-fp8-chan",
+        "config": "test/registered/ppu/answer_eval/configs/minimax2.7/fp8-channelwise-144g.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-fp8-channelwise-perf-144g",
+      "family": "minimax",
+      "format": "fp8-channelwise",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-2-minimax27-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_minimax_m27_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 135,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "minimax27-fp8chan",
+        "config": "test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-accuracy-ceval-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-mxfp4-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ceval.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-accuracy-ifeval-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-minimax27-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_minimax_m27_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "minimax-m2.7-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "minimax27-mxfp4-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-answer-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-minimax27-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/minimax2.7/mxfp4-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_minimax_m27_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "ans-minimax27-mxfp4",
+        "config": "test/registered/ppu/answer_eval/configs/minimax2.7/mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-mxfp4-fp8-perf-144g",
+      "family": "minimax",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-2-minimax27-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_minimax_m27_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 135,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "minimax27-mxfp4",
+        "config": "test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json"
+      }
+    },
+    {
+      "id": "minimax-m2.7-w8a8-int8-answer-144g",
+      "family": "minimax",
+      "format": "w8a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-minimax27-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/minimax2.7/w8a8-int8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_minimax_m27_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "minimax27-w8a8",
+        "config": "test/registered/ppu/answer_eval/configs/minimax2.7/w8a8-int8-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-accuracy-ceval-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-fp8chan-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ceval.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-fp8chan-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-fp8chan-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-accuracy-ifeval-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-fp8-channelwise-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-fp8chan-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-answer-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen35_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 10800,
+      "worker_minutes": 270,
+      "job_minutes": 300,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "qwen35-397b-fp8-chan",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-pd-perf-144g-1p1d-4k-1500",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "pd",
+      "mode": "pd",
+      "suite": "nightly-pd-perf-16-qwen35-ppu",
+      "config": "test/registered/ppu/pd_perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-pd-1p1d-4k-1500.json",
+      "files": [
+        "test/registered/ppu/pd_perf_eval/test_ppu_qwen35_pd_perf.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 13800,
+      "worker_minutes": 240,
+      "job_minutes": 270,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-pd-perf-qwen35.yml",
+        "job": "pd-perf-16-qwen35-fp8chan",
+        "config": "test/registered/ppu/pd_perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-pd-1p1d-4k-1500.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-fp8-channelwise-perf-144g",
+      "family": "qwen",
+      "format": "fp8-channelwise",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-4-qwen35-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_qwen35_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 135,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "qwen35-fp8chan",
+        "config": "test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-ceval-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ceval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-mxfp4-ceval",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ceval.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-mxfp4-gsm8k",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "smoke",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k-smoke.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 140,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-mxfp4-gsm8k-smoke",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k-smoke.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-ifeval-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "accuracy",
+      "mode": "full",
+      "suite": "nightly-accuracy-8-qwen35-ppu",
+      "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ifeval.json",
+      "files": [
+        "test/registered/ppu/accuracy_eval/test_ppu_qwen35_accuracy.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 30600,
+      "worker_minutes": 570,
+      "job_minutes": 600,
+      "environment": {},
+      "dependencies": [
+        "qwen3.5-397b-a17b-mxfp4-fp8-accuracy-gsm8k-smoke-144g"
+      ],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-accuracy.yml",
+        "job": "qwen35-mxfp4-ifeval",
+        "config": "test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ifeval.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-answer-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen35_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 10800,
+      "worker_minutes": 210,
+      "job_minutes": 240,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "qwen35-397b-mxfp4",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-pd-perf-144g-1p1d-4k-1500",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "pd",
+      "mode": "pd",
+      "suite": "nightly-pd-perf-16-qwen35-ppu",
+      "config": "test/registered/ppu/pd_perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-pd-1p1d-4k-1500.json",
+      "files": [
+        "test/registered/ppu/pd_perf_eval/test_ppu_qwen35_pd_perf.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 13800,
+      "worker_minutes": 240,
+      "job_minutes": 270,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-pd-perf-qwen35.yml",
+        "job": "pd-perf-16-qwen35-mxfp4",
+        "config": "test/registered/ppu/pd_perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-pd-1p1d-4k-1500.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-mxfp4-fp8-perf-144g",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-4-qwen35-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_qwen35_prefill_perf.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 7200,
+      "worker_minutes": 135,
+      "job_minutes": 160,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf.yml",
+        "job": "qwen35-mxfp4",
+        "config": "test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-w8a8-int8-answer-144g",
+      "family": "qwen",
+      "format": "w8a8-int8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-8-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen35_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 330,
+      "job_minutes": 360,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "qwen35-397b-w8a8",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-fp8-answer-144g-4nodes",
+      "family": "qwen",
+      "format": "fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-32-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen38_a95b_answer.py"
+      ],
+      "nodes": 4,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 300,
+      "job_minutes": 330,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer-32.yml",
+        "job": "answer-32-k8s",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-fp8-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-fp8-perf-144g-4nodes",
+      "family": "qwen",
+      "format": "fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-32-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_qwen38_a95b_prefill_perf.py"
+      ],
+      "nodes": 4,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 12000,
+      "worker_minutes": 300,
+      "job_minutes": 330,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf-32.yml",
+        "job": "perf-32-k8s",
+        "config": "test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-mxfp4-fp8-answer-144g-2nodes",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-16-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen38_a95b_mxfp4_answer.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 14400,
+      "worker_minutes": 300,
+      "job_minutes": 330,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer-16.yml",
+        "job": "answer-16-k8s",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g.json"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-mxfp4-fp8-perf-144g-2nodes",
+      "family": "qwen",
+      "format": "mxfp4-fp8",
+      "category": "perf",
+      "mode": "perf",
+      "suite": "nightly-perf-16-ppu",
+      "config": "test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json",
+      "files": [
+        "test/registered/ppu/perf_eval/test_ppu_qwen38_a95b_mxfp4_prefill_perf.py"
+      ],
+      "nodes": 2,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 12000,
+      "worker_minutes": 300,
+      "job_minutes": 330,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-perf-16.yml",
+        "job": "perf-16-k8s",
+        "config": "test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json"
+      }
+    },
+    {
+      "id": "qwen3.8-27b-bf16-answer-144g",
+      "family": "qwen",
+      "format": "bf16",
+      "category": "answer",
+      "mode": "answer",
+      "suite": "nightly-answer-1-ppu",
+      "config": "test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json",
+      "files": [
+        "test/registered/ppu/answer_eval/test_ppu_qwen38_answer.py"
+      ],
+      "nodes": 1,
+      "cards_per_node": 8,
+      "board": "ZW-M890P",
+      "timeout_seconds": 2400,
+      "worker_minutes": 120,
+      "job_minutes": 150,
+      "environment": {},
+      "dependencies": [],
+      "blocked": "",
+      "source": {
+        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
+        "workflow": ".github/workflows/test-ppu-answer.yml",
+        "job": "qwen38-27b-bf16",
+        "config": "test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json"
+      }
+    }
+  ]
+}

@@ -66,6 +66,9 @@ runner_args=()
 python3 test/run_suite.py --hw "$hw" --suite "$suite" --pytest --require-nonempty \
     --junit-dir "$PPU_EVIDENCE_DIR/$suite" --timeout-per-file "$cap" --suite-timeout "$cap" \
     "${runner_args[@]}"
+if [[ "$lane" == cpu ]]; then
+    python3 scripts/ci/ppu/validate_pr_e2e_configs.py
+fi
 if [[ "$lane" == body && "${PPU_RUN_KERNEL:-false}" == true ]]; then
     remaining=$((1080 - (SECONDS-tests_start)))
     ((remaining > 0))

@@ -201,6 +201,9 @@ NIGHTLY_SUITES = {
         "nightly-answer-8-glm52-ppu",
         "nightly-answer-8-kimi26-ppu",
         "nightly-answer-8-minimax27-ppu",
+        "nightly-answer-8-dsv32-ppu",
+        "nightly-answer-8-dsv4flash-ppu",
+        "nightly-answer-8-dsv4pro-ppu",
         # Whole boards, one suite each: every node runs the same registered file
         # and the launcher tells each which rank it is.
         "nightly-answer-16-ppu",
@@ -259,6 +262,9 @@ NIGHTLY_SUITES = {
         "nightly-accuracy-8-kimi26-ppu",
         "nightly-accuracy-8-minimax27-ppu",
         "nightly-accuracy-8-qwen35-ppu",
+        "nightly-accuracy-8-dsv32-ppu",
+        "nightly-accuracy-8-dsv4flash-ppu",
+        "nightly-accuracy-8-dsv4pro-ppu",
     ],
 }
 

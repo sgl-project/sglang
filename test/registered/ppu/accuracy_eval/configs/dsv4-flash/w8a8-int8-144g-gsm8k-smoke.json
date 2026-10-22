@@ -1,0 +1,61 @@
+{
+  "schema_version": "ppu-accuracy-test-config/v1",
+  "test_id": "dsv4-flash-w8a8-accuracy-gsm8k-smoke-144g",
+  "name": "DeepSeek-V4-Flash-W8A8 accuracy on GSM8K, 20 samples (ZW-M890P, 8x144G)",
+  "category": "LLM_Infer",
+  "framework": "sglang",
+  "test_category": "accuracy",
+  "hardware": {
+    "platform": "PPU",
+    "generation": "zw-m890p",
+    "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "memory_gib_per_device": 144
+  },
+  "model": {
+    "path": "/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Flash-W8A8-INT8",
+    "checkpoint_name": "DeepSeek-V4-Flash-W8A8-INT8",
+    "served_model_name": "DeepSeek-V4",
+    "accepted_model_types": ["deepseek_v4"]
+  },
+  "server": {
+    "startup_timeout_seconds": 5400,
+    "parameters": {
+      "trust_remote_code": true,
+      "tp_size": 8,
+      "attention_backend": "dsv4",
+      "cuda_graph_max_bs": 64,
+      "mem_fraction_static": 0.8,
+      "quantization": "w8a8_int8",
+      "reasoning_parser": "deepseek-v4",
+      "tool_call_parser": "deepseekv4",
+      "disable_piecewise_cuda_graph": true,
+      "disable_shared_experts_fusion": true,
+      "disable_custom_all_reduce": true,
+      "dist_timeout": 60000,
+      "watchdog_timeout": 60000
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
+    }
+  },
+  "evaluation": {
+    "dataset": "gsm8k",
+    "dataset_dir": "/nas_aisw/datasets/evalscope/AI-ModelScope/gsm8k",
+    "eval_batch_size": 64,
+    "few_shot_num": 0,
+    "filters": {
+      "remove_until": "</think>"
+    },
+    "limit": 20,
+    "primary_metric": "accuracy",
+    "baseline": null,
+    "generation": {
+      "max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "seed": 42
+    },
+    "source_case": "btv1.1/llm_infer_sglang_evalscope/P0_daily/deepseek-v4-flash-a8w8_3003.json",
+    "tc_name": "deepseek-v4-flash_0009"
+  }
+}

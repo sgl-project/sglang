@@ -102,7 +102,9 @@ export SGLANG_SAIL_PLA_CUDA=0
 export GLOO_SOCKET_IFNAME=lo
 
 cd /workspace/source
-git config --global --add safe.directory /workspace/source
+if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
+  git config --global --add safe.directory /workspace/source
+fi
 SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
 export SGLANG_PPU_SOURCE_REVISION
 
@@ -348,6 +350,9 @@ bash scripts/ci/warm_page_cache.sh "$PD_MODEL_PATH"
 # things to preserve: its own log, which the action streams for worker-0 only, and
 # its exact exit status through the tee. It reads NODE_RANK for the file names and
 # nothing else, so it needs no PD-specific variant.
+if [[ -n "${PPU_E2E_PLAN:-}" ]]; then
+  exec python3 scripts/ci/ppu/pr_e2e_worker.py suite
+fi
 cd test
 bash ../scripts/ci/ppu/run_perf_suite_node.sh \
   "$PERF_SUITE" "$PERF_TIMEOUT_PER_FILE" "$SGLANG_PPU_PD_PERF_RESULTS_DIR/ranks"

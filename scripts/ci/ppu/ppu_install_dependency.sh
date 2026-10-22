@@ -18,7 +18,9 @@ if [[ -n "${PPU_ARTIFACTORY_USER:-}" && -n "${PPU_ARTIFACTORY_PASSWORD:-}" ]]; t
     chmod 600 ~/.netrc
 fi
 
-git config --global --add safe.directory "${REPO_ROOT}"
+if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
+    git config --global --add safe.directory "${REPO_ROOT}"
+fi
 
 # Only pip/wheel. Deliberately NOT setuptools or dill: the v2.1.1 image pins them
 # to satisfy constraints that an --upgrade breaks (observed in run 31663500015):
@@ -142,13 +144,15 @@ cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[runtime_common,tracing]" --no-
 _kernel_start=$SECONDS
 bash "${REPO_ROOT}/scripts/ci/ppu/ppu_build_kernel.sh"
 if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
-    printf '{"aot_seconds":%s}\n' "$((SECONDS-_kernel_start))" > "${PPU_EVIDENCE_DIR:?}/aot.json"
+    printf '{"aot_seconds":%s}\n' "$((SECONDS-_kernel_start))" > "${PPU_INSTALL_EVIDENCE_DIR:-${PPU_EVIDENCE_DIR:?}}/aot.json"
 fi
 
 # PR suites need pytest but never PD/EIC installation; nightly keeps its defaults.
 if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
     ${PIP_INSTALL} pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate
-    exit 0
+    if [[ "${PPU_E2E_REQUIRE_PD:-false}" != true ]]; then
+        exit 0
+    fi
 fi
 
 # ==================== EIC SDK + mooncake-barex (for disaggregation tests) ==================== #

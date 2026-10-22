@@ -1,0 +1,141 @@
+name: PPU PR E2E Entry
+
+on:
+  workflow_call:
+    inputs:
+      entry:
+        required: true
+        type: string
+      nodes:
+        required: true
+        type: number
+      job_minutes:
+        required: true
+        type: number
+      worker_minutes:
+        required: true
+        type: number
+      phase:
+        required: true
+        type: string
+      plan_hash:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
+
+jobs:
+  execute:
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: ${{ inputs.job_minutes }}
+    env:
+      ENTRY: ${{ inputs.entry }}
+      PLAN_HASH: ${{ inputs.plan_hash }}
+      EVIDENCE_SOURCE: /wl_nas/pr-ci/e2e/${{ github.run_id }}/${{ github.run_attempt }}/${{ inputs.entry }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ppu-e2e
+      - name: Download prior smoke evidence
+        if: inputs.phase == 'extended'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-e2e-result-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: e2e-dependencies
+      - name: Validate plan, matrix entry, and checkpoint smoke prerequisites
+        env:
+          ENTRY_NODES: ${{ inputs.nodes }}
+          ENTRY_JOB_MINUTES: ${{ inputs.job_minutes }}
+          ENTRY_WORKER_MINUTES: ${{ inputs.worker_minutes }}
+          ENTRY_PHASE: ${{ inputs.phase }}
+        run: |
+          python3 scripts/ci/ppu/select_pr_e2e.py entry --plan .ppu-e2e/selection.json
+          python3 scripts/ci/ppu/pr_e2e_report.py dependencies --plan .ppu-e2e/selection.json --entry "$ENTRY" --directory e2e-dependencies
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Fresh authorization before resource allocation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/ppu/select_pr_e2e.py check --plan .ppu-e2e/selection.json
+          [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$PPU_BASE_IMAGE_REF" == *@"$PPU_BASE_IMAGE_DIGEST" ]]
+          test ! -e "$EVIDENCE_SOURCE"
+          mkdir -p "$EVIDENCE_SOURCE"
+      - name: Execute selected E2E worker gang
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: ${{ inputs.nodes > 1 && inputs.nodes || 0 }}
+          nproc_per_node: 8
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: e2e-${{ inputs.entry }}
+          command: python3 /workspace/source/scripts/ci/ppu/pr_e2e_worker.py
+          artifact_paths: .ppu-e2e/selection.json
+          host_volumes: /wl_nas/pr-ci/e2e/${{ github.run_id }}/${{ github.run_attempt }}/${{ inputs.entry }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number }}/e2e/${{ inputs.entry }}/${{ github.run_id }}/${{ github.run_attempt }}:/ppu-pr-cache
+          extra_env: "PPU_E2E_PLAN=/workspace/source/.ppu-e2e/selection.json,PPU_E2E_ENTRY=${{ inputs.entry }},PPU_EVIDENCE_DIR=/ppu-evidence,GITHUB_SHA=${{ github.sha }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_SERVER_URL=${{ github.server_url }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: ${{ inputs.worker_minutes }}
+          cleanup_policy: always
+      - name: Export sanitized runner-owned evidence
+        id: export
+        if: always()
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$(mktemp -d "$RUNNER_TEMP/ppu-e2e.XXXXXX")/sanitized"
+          python3 scripts/ci/ppu/pr_report.py export --directory "$EVIDENCE_SOURCE" --destination "$directory"
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+      - name: Verify every rank and evaluation result
+        if: always()
+        env:
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          ACTION_OUTPUTS: ${{ toJSON(steps.worker.outputs) }}
+          ARTIFACT_DIRECTORY: ${{ steps.export.outputs.directory }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-result"
+          python3 scripts/ci/ppu/pr_e2e_report.py verify --plan .ppu-e2e/selection.json --entry "$ENTRY" --directory "$ARTIFACT_DIRECTORY" --destination "$RUNNER_TEMP/e2e-result/entry.json"
+      - name: Upload sanitized E2E evidence
+        if: always() && steps.export.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-e2e-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.entry }}
+          path: ${{ steps.export.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload terminal entry result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-e2e-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.entry }}
+          path: ${{ runner.temp }}/e2e-result/entry.json
+          if-no-files-found: error
+          retention-days: 14

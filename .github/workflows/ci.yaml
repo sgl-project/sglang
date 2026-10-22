@@ -2,7 +2,7 @@ name: CI Pipeline
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
   pull_request_review:
     types: [submitted]
 
@@ -22,8 +22,9 @@ concurrency:
     ci-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{
     ((github.event_name == 'pull_request_review' &&
     (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
-    (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-    github.event.label.name != 'run-ci')) && github.run_id || 'active' }}
+    (github.event_name == 'pull_request' &&
+    (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+    !contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))) && github.run_id || 'active' }}
   cancel-in-progress: true
 
 jobs:
@@ -60,15 +61,43 @@ jobs:
 
   # CPU validation runs without run-ci or private worker credentials. Reuse the
   # same path selector as hardware CI so documentation-only PRs skip the suite.
-  cpu-precheck:
-    name: CPU Shortlist
+  e2e-selection:
+    name: PPU E2E Selection
     needs: precheck
     if: >-
       github.event_name == 'pull_request' &&
-      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    outputs:
+      requested: ${{ steps.select.outputs.requested }}
+      plan_hash: ${{ steps.select.outputs.plan_hash }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Generate authorized immutable E2E plan
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/ppu/select_pr_e2e.py plan --plan selection.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: selection.json
+          if-no-files-found: error
+          retention-days: 14
+
+  cpu-precheck:
+    name: CPU Shortlist
+    needs: [precheck, e2e-selection]
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     uses: ./.github/workflows/pr-test-ppu.yml
     with:
       cpu_only: true
+      e2e_requested: ${{ needs.e2e-selection.outputs.requested == 'true' }}
+      e2e_plan_hash: ${{ needs.e2e-selection.outputs.plan_hash }}
 
   ai-code-review:
     name: AI Code Review (Copilot Gate)
@@ -92,13 +121,41 @@ jobs:
   # reuse its result from this workflow run; do not trust a previous PR revision.
   ci:
     name: Full CI
-    needs: [registration-validation, cpu-precheck]
+    needs: [registration-validation, cpu-precheck, e2e-selection]
     if: >-
-      github.event_name == 'pull_request' &&
-      contains(github.event.pull_request.labels.*.name, 'run-ci') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+      github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     uses: ./.github/workflows/pr-test-ppu.yml
     with:
       cpu_precheck_result: ${{ needs.cpu-precheck.result }}
       cpu_precheck_evidence_ok: ${{ needs.cpu-precheck.outputs.cpu_evidence_ok }}
+      cpu_precheck_identity: ${{ needs.cpu-precheck.outputs.cpu_identity }}
+      e2e_requested: ${{ needs.e2e-selection.outputs.requested == 'true' }}
+      e2e_plan_hash: ${{ needs.e2e-selection.outputs.plan_hash }}
     secrets: inherit
+
+  e2e-gate:
+    # An irrelevant event must not create a competing successful required check.
+    name: >-
+      ${{ github.event_name == 'pull_request' &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name)) &&
+      'PPU E2E Gate' || 'PPU E2E Ignored Event' }}
+    needs: [precheck, e2e-selection, cpu-precheck, ci]
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Require requested E2E completion even if Full CI was skipped
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/ppu/pr_e2e_report.py outer --plan selection.json

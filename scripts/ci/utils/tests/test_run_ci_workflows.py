@@ -26,25 +26,27 @@ class RunCiWorkflowContractTest(unittest.TestCase):
         workflow = self.read_workflow("ci.yaml")
 
         self.assertIn(
-            "types: [opened, synchronize, reopened, ready_for_review, labeled]",
+            "types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]",
             workflow,
         )
         jobs = yaml.safe_load(workflow)["jobs"]
         self.assertEqual(
-            jobs["ci"]["needs"], ["registration-validation", "cpu-precheck"]
+            jobs["ci"]["needs"],
+            ["registration-validation", "cpu-precheck", "e2e-selection"],
         )
         self.assertIn(
             "contains(github.event.pull_request.labels.*.name, 'run-ci')",
             workflow,
         )
-        self.assertIn(
-            "github.event.action != 'labeled' || "
-            "github.event.label.name == 'run-ci'",
-            workflow,
-        )
+        self.assertIn("github.event.action != 'unlabeled'", jobs["e2e-selection"]["if"])
+        self.assertIn("contains(fromJSON(", jobs["e2e-selection"]["if"])
         self.assertNotIn("require_run_ci_label: false", workflow)
         self.assertIn("github.event.action == 'labeled'", workflow)
-        self.assertIn("github.event.label.name != 'run-ci'", workflow)
+        self.assertIn("!github.event.pull_request.draft", jobs["ci"]["if"])
+        self.assertEqual(
+            jobs["e2e-gate"]["needs"],
+            ["precheck", "e2e-selection", "cpu-precheck", "ci"],
+        )
 
     def test_review_events_cannot_cancel_pr_execution(self):
         concurrency = yaml.safe_load(self.read_workflow("ci.yaml"))["concurrency"]
@@ -52,7 +54,8 @@ class RunCiWorkflowContractTest(unittest.TestCase):
         script = r"""
             const {template, github} = JSON.parse(process.argv[1]);
             const group = template.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expr) =>
-                Function('github', `return (${expr});`)(github));
+                Function('github', 'contains', 'fromJSON', `return (${expr});`)(
+                    github, (items, value) => items.includes(value), JSON.parse));
             process.stdout.write(group.trim());
         """
 
@@ -111,20 +114,29 @@ class RunCiWorkflowContractTest(unittest.TestCase):
     def test_cpu_precheck_runs_before_label_authorization(self):
         jobs = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]
         cpu = jobs["cpu-precheck"]
-        self.assertEqual(cpu["needs"], "precheck")
+        self.assertEqual(cpu["needs"], ["precheck", "e2e-selection"])
         self.assertEqual(cpu["uses"], "./.github/workflows/pr-test-ppu.yml")
-        self.assertEqual(cpu["with"], {"cpu_only": True})
+        self.assertEqual(
+            cpu["with"],
+            {
+                "cpu_only": True,
+                "e2e_requested": "${{ needs.e2e-selection.outputs.requested == 'true' }}",
+                "e2e_plan_hash": "${{ needs.e2e-selection.outputs.plan_hash }}",
+            },
+        )
         self.assertNotIn("secrets", cpu)
         self.assertEqual(
             cpu["if"].strip(),
-            "github.event_name == 'pull_request' && "
-            "(github.event.action != 'labeled' || github.event.label.name == 'run-ci')",
+            "github.event_name == 'pull_request' && !github.event.pull_request.draft",
         )
         self.assertEqual(
             jobs["ci"]["with"],
             {
                 "cpu_precheck_result": "${{ needs.cpu-precheck.result }}",
                 "cpu_precheck_evidence_ok": "${{ needs.cpu-precheck.outputs.cpu_evidence_ok }}",
+                "cpu_precheck_identity": "${{ needs.cpu-precheck.outputs.cpu_identity }}",
+                "e2e_requested": cpu["with"]["e2e_requested"],
+                "e2e_plan_hash": cpu["with"]["e2e_plan_hash"],
             },
         )
 
@@ -153,6 +165,7 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             {
                 "CPU_RESULT": "${{ inputs.cpu_precheck_result }}",
                 "CPU_EVIDENCE_OK": "${{ inputs.cpu_precheck_evidence_ok }}",
+                "CPU_IDENTITY": "${{ inputs.cpu_precheck_identity }}",
             },
         )
         for result, evidence in (
@@ -175,6 +188,11 @@ class RunCiWorkflowContractTest(unittest.TestCase):
                         "GITHUB_OUTPUT": str(output),
                         "CPU_RESULT": result,
                         "CPU_EVIDENCE_OK": evidence,
+                        "CPU_IDENTITY": "42:1:sha:plan",
+                        "GITHUB_RUN_ID": "42",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_SHA": "sha",
+                        "PLAN_HASH": "plan",
                     },
                     capture_output=True,
                     text=True,
@@ -300,7 +318,7 @@ class PpuPathSelectionTest(unittest.TestCase):
         )
         return json.loads(result.stdout)
 
-    def lanes(self, paths, force=False):
+    def lanes(self, paths, force=False, e2e=False):
         matches = [] if force else self.match_paths(paths)["filters"]
         selected = set()
         for lane in ("cpu", "ppu_single", "ppu_kernel", "ppu_multi"):
@@ -310,6 +328,8 @@ class PpuPathSelectionTest(unittest.TestCase):
             for term in terms:
                 if term == "steps.run-mode.outputs.run_all_tests == 'true'":
                     value = force
+                elif term == "inputs.e2e_requested == true":
+                    value = e2e
                 else:
                     prefix, suffix = "steps.filter.outputs.", " == 'true'"
                     self.assertTrue(term.startswith(prefix) and term.endswith(suffix))
@@ -347,6 +367,10 @@ class PpuPathSelectionTest(unittest.TestCase):
         self.assertEqual(
             self.match_paths(paths), {"filters": [], "labels": ["documentation"]}
         )
+
+    def test_explicit_e2e_on_docs_forces_cpu_only(self):
+        self.assertEqual(self.lanes(["docs/guide.md"]), set())
+        self.assertEqual(self.lanes(["docs/guide.md"], e2e=True), {"cpu"})
 
     def test_relevant_runtime_tests_and_build_inputs_are_selected(self):
         single = {"cpu", "ppu_single"}
@@ -394,6 +418,8 @@ class PpuPathSelectionTest(unittest.TestCase):
                 (
                     ".github/workflows/ci.yaml",
                     ".github/workflows/pr-test-ppu.yml",
+                    ".github/workflows/pr-test-ppu-e2e.yml",
+                    ".github/workflows/pr-test-ppu-e2e-entry.yml",
                     ".github/workflows/pr-gate.yml",
                     ".github/workflows/labeler.yml",
                     ".github/labeler.yml",
@@ -465,6 +491,7 @@ class PpuPathSelectionTest(unittest.TestCase):
         terms = [
             "steps.filter.outputs.cpu == 'true'",
             "steps.run-mode.outputs.run_all_tests == 'true'",
+            "inputs.e2e_requested == true",
         ]
         self.assertEqual(selector, "${{ " + " || ".join(terms) + " }}")
         self.assertEqual(

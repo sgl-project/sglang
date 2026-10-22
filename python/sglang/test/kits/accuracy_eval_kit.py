@@ -261,6 +261,7 @@ SERVER_PARAMETER_CLI_ORDER = (
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
+    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL",
 }
 
 # The generation keys a config may pin, matching what the internal cases state
