@@ -24,15 +24,28 @@ concurrency:
 jobs:
   test-miles-mi35x:
     if: github.repository == 'sgl-project/sglang'
+    name: test-miles-mi35x (${{ matrix.suite }}, ${{ matrix.runner }}${{ matrix.partition_size && format(', part {0}', matrix.part) || '' }})
     strategy:
       fail-fast: false
       matrix:
+        # All suites use the 8-GPU MI35X pool. The 2-GPU suite includes the
+        # GLM-5.2 5-layer test, which takes the linux-mi35x-gpu-2 runner down
+        # ("runner lost communication") but passes on an 8-GPU runner.
         include:
           - suite: nightly-stage-c-2-gpu-mi350
-            runner: linux-mi35x-gpu-2
-          # Use 8-GPU MI35X pool for 4-GPU suite.
+            runner: linux-mi35x-gpu-8
+          # The 4-GPU suite is ~6 h of estimated test time; split it so each
+          # half fits in the step timeout.
           - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi35x-gpu-8
+            partition_id: 0
+            partition_size: 2
+            part: 1/2
+          - suite: nightly-stage-c-4-gpu-mi350
+            runner: linux-mi35x-gpu-8
+            partition_id: 1
+            partition_size: 2
+            part: 2/2
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
@@ -88,6 +101,7 @@ jobs:
             -e PYTHONPATH=/root/miles:/opt/tilelang \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --cadence nightly \
+            ${{ matrix.partition_size && format('--auto-partition-id {0} --auto-partition-size {1}', matrix.partition_id, matrix.partition_size) || '' }} \
             ${{ (github.event_name != 'workflow_dispatch' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           cat "${GITHUB_WORKSPACE}/github_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE}

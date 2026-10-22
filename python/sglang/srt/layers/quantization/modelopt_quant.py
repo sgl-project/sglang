@@ -2847,14 +2847,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
-                # The kernel clamps both raw halves with one limit, which is
-                # exact for both only when their dequantization scales match.
-                if not torch.equal(layer.g1_alphas, layer.g1_alphas_up):
-                    logger.warning_once(
-                        "NVFP4 MoE gate/up global scales differ; the TRT-LLM SwiGLU "
-                        "clamp limit is exact for the gate half only. "
-                        "Accuracy may be affected."
+                # The kernel clamps both raw halves with one limit, so move both onto
+                # the larger alpha by rescaling the smaller half's E4M3 block scales.
+                untied = layer.g1_alphas != layer.g1_alphas_up
+                if untied.any():
+                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
+                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
+                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
+                    ratios = torch.where(
+                        untied[:, None], ratios / shared_alphas[:, None], 1.0
                     )
+                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
+                    block_scales.copy_(
+                        block_scales.float().mul_(ratios[:, :, None, None])
+                    )
+                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
+                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
                     layer,
                     "gemm1_clamp_limit",
