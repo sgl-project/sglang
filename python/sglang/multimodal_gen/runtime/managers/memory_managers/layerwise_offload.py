@@ -29,6 +29,7 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
+from sglang.multimodal_gen.runtime.managers.memory_managers import shared_pinned_store
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
@@ -485,6 +486,25 @@ def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
     if stride is None:
         return torch.empty(*size, dtype=dtype, pin_memory=True)
     return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
+
+
+def _store_holds(buf, dtype, offsets, contiguous_weights) -> bool:
+    """Whether a shared store holds the weights this process loaded.
+
+    The key naming a store is structural -- the manager cannot see which
+    checkpoint the weights came from -- so the bytes are compared rather than
+    trusted. A store holding different weights is refused, and the caller falls
+    back to a private allocation.
+    """
+    store = torch.frombuffer(buf, dtype=dtype)
+    for name, _weight, local_weight in contiguous_weights:
+        off = offsets[name]
+        source = local_weight.flatten()
+        if source.device.type != "cpu":
+            source = source.to("cpu")
+        if not torch.equal(store[off : off + source.numel()], source):
+            return False
+    return True
 
 
 class _DirectReader:
@@ -1014,8 +1034,17 @@ class LayerwiseOffloadManager:
         residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD,
         pin_budget: HostPinBudget | None = None,
         pin_component_name: str = "layerwise offload",
+        store_shard: int = 0,
     ) -> None:
         self.model = model
+        # Which slice of a folded component this rank holds. Only folded
+        # components have more than one; see _shared_store_key.
+        self._store_shard = store_shard
+        # One pool per slice: only the pool's owner may create its segments, so
+        # two slices sharing a pool would leave one of them unpublished.
+        self._store_pool = (
+            f"{pin_component_name}#s{store_shard}" if store_shard else pin_component_name
+        )
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self._synchronous_mps = current_platform.is_mps()
@@ -1487,6 +1516,20 @@ class LayerwiseOffloadManager:
             placed_bytes / (1 << 30),
         )
 
+    def _shared_store_key(self, layer_idx: int, dtype, total_numel: int) -> str:
+        """Structural name of one layer store, shared across co-resident runs.
+
+        It names the store's shape, not the checkpoint that filled it: a store
+        holding other weights is refused by the byte comparison instead. A
+        folded component holds a different slice of every layer per rank, so
+        the slice has to be part of the name -- otherwise two ranks collide on
+        one name and both fall back private. The same slice in another engine
+        still produces the same name, which is what makes a folded component
+        shareable at all.
+        """
+        name = f"{self._pin_component_name}:{layer_idx}:{dtype}:{total_numel}"
+        return f"{name}:s{self._store_shard}" if self._store_shard else name
+
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
@@ -1584,13 +1627,29 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                cpu_buffer, populated = self._prepare_host_buffer(
-                    contiguous_weights,
-                    aligned_offsets,
-                    total_numel,
-                    dtype,
-                    pin_this_layer,
-                )
+                shared = None
+                if pin_this_layer and envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+                    shared = shared_pinned_store.begin(
+                        self._shared_store_key(layer_idx, dtype, total_numel),
+                        total_numel * dtype.itemsize,
+                        lambda buf: _store_holds(
+                            buf, dtype, aligned_offsets, contiguous_weights
+                        ),
+                        pool=self._store_pool,
+                    )
+                if shared is not None:
+                    cpu_buffer = torch.frombuffer(
+                        shared.buffer, dtype=dtype, count=total_numel
+                    )
+                    populated = not shared.created
+                else:
+                    cpu_buffer, populated = self._prepare_host_buffer(
+                        contiguous_weights,
+                        aligned_offsets,
+                        total_numel,
+                        dtype,
+                        pin_this_layer,
+                    )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
@@ -1616,7 +1675,19 @@ class LayerwiseOffloadManager:
 
                     current_offset += numel
 
+                if shared is not None and shared_pinned_store.commit(shared) is None:
+                    # Registration failed after the bytes were already placed in
+                    # the segment: rebuild them in a private allocation.
+                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
+                    for name, _weight, local_weight in contiguous_weights:
+                        off = aligned_offsets[name]
+                        count = local_weight.numel()
+                        cpu_buffer[off : off + count].copy_(local_weight.flatten())
+
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+        if envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+            shared_pinned_store.summary(self._store_pool)
 
     @staticmethod
     def _prepare_host_buffer(
@@ -2746,6 +2817,13 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
+    def _layerwise_store_shard(self) -> int:
+        """Which slice of this component this rank holds; 0 when it holds all.
+
+        Only a folded encoder shards its weights, and an encoder overrides this.
+        """
+        return 0
+
     # whether the current module is selected by the `dit` group
     layerwise_offload_dit_group_enabled: bool = True
     # H3 has a large packed-sequence working set on MPS, so its non-block
@@ -3102,6 +3180,7 @@ class LayerwiseOffloadableModuleMixin:
                 initialize=False,
                 residency_policy=residency_policy,
                 residency_lifetime=residency_lifetime,
+                store_shard=self._layerwise_store_shard(),
             )
             self.layerwise_offload_managers.append(manager)
 
