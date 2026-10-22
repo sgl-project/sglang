@@ -502,8 +502,11 @@ class AscendAttnBackend(AttentionBackend):
             or (
                 model_runner.spec_algorithm is not None
                 and model_runner.spec_algorithm.is_dflash_family()
-            )  # DFlash/DSpark publish the verify KV boundary on CPU
+                and not self.use_flash_mla
+            )  # FIA-based DFlash/DSpark paths consume host verify lengths
         )
+        # The scheduler ORs target and draft capabilities: a FIA draft still
+        # requires the mirror when its FlashMLA target opts out.
         self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
         if _env_opt_out and _host_bound:
             logger.warning(

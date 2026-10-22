@@ -196,43 +196,53 @@ def test_ragged_verify_is_rejected(backend):
 
 
 @pytest.mark.parametrize(
-    "enabled,arch35,dspark,needs_cpu",
+    "enabled,arch35,dspark,is_draft,force_cpu,needs_cpu",
     [
-        (False, False, False, True),
-        (False, True, False, True),
-        (True, False, False, True),
-        (True, False, True, True),
-        (True, True, False, False),
-        (True, True, True, True),
+        (False, False, False, False, False, True),
+        (False, True, False, False, False, True),
+        (True, False, False, False, False, True),
+        (True, False, True, False, False, True),
+        (True, True, False, False, False, False),
+        (True, True, True, False, False, False),
+        (True, True, True, True, False, True),
+        (False, True, True, True, False, True),
+        (True, True, False, False, True, True),
+        (True, True, True, False, True, True),
     ],
 )
-def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
-    enabled, arch35, dspark, needs_cpu
+def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
+    enabled, arch35, dspark, is_draft, force_cpu, needs_cpu
 ):
+    uses_flash_mla = enabled and arch35 and not is_draft
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
         is_none=lambda: not dspark,
         is_dflash_family=lambda: dspark,
+        get_num_tokens_per_req_for_target_verify=lambda count, **kwargs: count,
     )
     model_config = SimpleNamespace(
-        attention_arch=mod.AttentionArch.MLA,
+        attention_arch=mod.AttentionArch.MHA if is_draft else mod.AttentionArch.MLA,
         dtype=torch.bfloat16,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         qk_nope_head_dim=128,
         num_attention_heads=8,
         context_len=512,
-        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+        hf_config=SimpleNamespace(
+            architectures=[
+                "DSparkDraftModel" if is_draft else "KimiK3ForConditionalGeneration"
+            ]
+        ),
     )
     runner = SimpleNamespace(
         device="cpu",
-        is_draft_worker=False,
+        is_draft_worker=is_draft,
         page_size=128,
         model_config=model_config,
         kv_cache_dtype=torch.bfloat16,
         req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 512)),
         token_to_kv_pool=object(),
-        use_mla_backend=True,
+        use_mla_backend=not is_draft,
         spec_algorithm=spec,
         is_hybrid_swa=False,
         server_args=SimpleNamespace(enable_mixed_chunk=False),
@@ -253,7 +263,7 @@ def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
             sys.modules,
             {
                 "cann_ops_transformer.ops.attention.flash_mla": (
-                    cann_module if enabled and arch35 else None
+                    cann_module if uses_flash_mla else None
                 )
             },
         ),
@@ -287,13 +297,46 @@ def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
         patch.object(
             mod.envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS,
             "get",
-            return_value=False,
+            return_value=force_cpu,
         ),
     ):
         obj = mod.AscendAttnBackend(runner)
-    assert obj.use_flash_mla is (enabled and arch35)
+    assert obj.use_flash_mla is uses_flash_mla
     assert obj.needs_cpu_seq_lens is needs_cpu
-    assert obj.requires_host_seq_lens_update is not (enabled and arch35)
+    assert obj.requires_host_seq_lens_update is not uses_flash_mla
+
+
+@pytest.mark.parametrize("draft_needs_cpu", [True, False])
+def test_scheduler_keeps_cpu_mirror_until_draft_supports_device_lengths(
+    draft_needs_cpu,
+):
+    from sglang.srt.managers import overlap_utils
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    target = SimpleNamespace(needs_cpu_seq_lens=False)
+    draft = SimpleNamespace(needs_cpu_seq_lens=draft_needs_cpu)
+    with (
+        patch.object(
+            overlap_utils,
+            "get_exec",
+            return_value=SimpleNamespace(
+                overlap=SimpleNamespace(enable_two_batch_overlap=False)
+            ),
+        ),
+        patch.object(
+            overlap_utils,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+        ),
+        patch.object(
+            SpeculativeAlgorithm,
+            "from_string",
+            return_value=SimpleNamespace(is_ngram=lambda: False),
+        ),
+    ):
+        assert (
+            overlap_utils.decide_needs_cpu_seq_lens((target, draft)) is draft_needs_cpu
+        )
 
 
 @pytest.fixture
