@@ -283,6 +283,10 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
         self._finish_count = 0
         self._demote_events = 0
         self._demoted_tokens = 0
+        # Per reserved request: device tokens its own tail and decode output need.
+        self._growth: dict[str, int] = {}
+        # Per reservation still in prefill: tokens its locked tree path holds on device.
+        self._prefilling: dict[str, int] = {}
 
     def attach_tree(self, tree_cache, *, draft_caches=()) -> None:
         from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -330,20 +334,31 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
         needed = self.temp_tokens_required(req, max_new_tokens=max_new_tokens)
         if not needed:
             return True
-        prefix_len = (
-            len(req.full_untruncated_fill_ids)
-            // self.cache.page_size
-            * self.cache.page_size
+        page = self.cache.page_size
+        fill_len = len(req.full_untruncated_fill_ids)
+        prefix_len = fill_len // page * page
+        # The tail past the tree prefix and every output token stay on device.
+        growth = -(-(fill_len + max_new_tokens) // page) * page - (
+            max(0, fill_len - self.sliding_window) // page * page
         )
-        pending_tokens = sum(p.prefix_len for p in self.pending.values())
+        temps = self.reserved_temp_tokens() + needed
+        growths = sum(self._growth.values()) + growth
+        device = int(self.cache.device_tokens * 0.95)
+        # A request in chunked prefill locks its whole tree path on device until it
+        # is admitted, so only admitted prefixes can make room by demotion.
+        if temps + growths + sum(self._prefilling.values()) + fill_len > device:
+            return False
         claimed = {
             node.id: len(node.key)
             for state in self.requests.values()
             for node in state.nodes
         }
-        capacity = self.cache.host_pool.size + int(self.cache.device_tokens * 0.95)
-        used = sum(claimed.values()) + pending_tokens + self.reserved_temp_tokens()
-        if prefix_len + needed > capacity - used:
+        prefixes = (
+            sum(claimed.values())
+            + sum(p.prefix_len for p in self.pending.values())
+            + prefix_len
+        )
+        if prefixes + temps + growths > self.cache.host_pool.size + device:
             return False
         from sglang.srt.mem_cache.common import evict_from_tree_cache
         from sglang.srt.managers.hisparse_v2_coordinator import _PrefillReservation
@@ -353,7 +368,16 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
         if temp is None:
             return False
         self.pending[req.rid] = _PrefillReservation(temp, prefix_len)
+        self._growth[req.rid] = growth
+        self._prefilling[req.rid] = fill_len
         return True
+
+    def admit_request(self, req) -> bool:
+        self._prefilling.pop(req.rid, None)
+        admitted = super().admit_request(req)
+        if not admitted:
+            self._growth.pop(req.rid, None)
+        return admitted
 
     def on_node_evicted(self, node) -> None:
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -410,6 +434,8 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
             )
 
     def request_finished(self, req) -> None:
+        self._growth.pop(req.rid, None)
+        self._prefilling.pop(req.rid, None)
         was_active = req.kv.req_pool_idx in self.requests
         super().request_finished(req)
         if not was_active:
