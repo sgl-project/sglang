@@ -100,11 +100,16 @@ def _load_with_blocked_import(relpath, module_name, blocked):
     from unittest import mock
 
     import sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion as plugin
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
+        _ADAPTERS,
+    )
 
     path = Path(plugin.__file__).parent / relpath
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(sys.modules, {blocked: None}):  # None makes import raise
+    # Private adapter classes register themselves while the module executes.
+    # Keep the real registry intact for subsequent tests.
+    with mock.patch.dict(_ADAPTERS), mock.patch.dict(sys.modules, {blocked: None}):
         spec.loader.exec_module(module)
     return module
 
