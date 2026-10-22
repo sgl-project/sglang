@@ -44,10 +44,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     flatten_extra_params,
     get_declared_request_extra_fields,
-    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
@@ -95,31 +96,6 @@ async def shutdown_video_jobs() -> None:
     for task in tasks:
         with suppress(asyncio.CancelledError):
             await task
-
-
-def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
-    return request_extra_value(request, name)
-
-
-def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
-    value = getattr(request, name, None)
-    if value is not None:
-        return value
-    return _extra_value(request, name)
-
-
-def _video_request_model_kwargs(
-    request: VideoGenerationsRequest,
-    sampling_params_cls: type[SamplingParams],
-) -> dict[str, Any]:
-    """Extract fields owned and declared by the active model contract."""
-
-    kwargs = {}
-    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "video"):
-        value = _extra_value(request, field_name)
-        if value is not None:
-            kwargs[field_name] = value
-    return kwargs
 
 
 def _parse_form_extra_value(value: Any) -> Any:
@@ -229,15 +205,17 @@ def _is_probably_video_source(source: Any) -> bool:
 
 
 def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
-    video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
+    video_path = request_field_value(req, "video_path") or request_field_value(
+        req, "video_url"
+    )
     if video_path:
         return str(video_path)
 
-    input_reference = _request_value(req, "input_reference")
+    input_reference = request_field_value(req, "input_reference")
     if _is_probably_video_source(input_reference):
         return str(input_reference)
 
-    reference_url = _request_value(req, "reference_url")
+    reference_url = request_field_value(req, "reference_url")
     if _is_probably_video_source(reference_url):
         return str(reference_url)
 
@@ -247,7 +225,7 @@ def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
 def _resolve_image_path(
     req: VideoGenerationsRequest, video_path: str | None
 ) -> str | None:
-    image_path = _request_value(req, "input_reference")
+    image_path = request_field_value(req, "input_reference")
     if video_path and image_path == video_path:
         return None
     if _is_probably_video_source(image_path):
@@ -292,14 +270,14 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "max_sequence_length": request.max_sequence_length,
         "flow_shift": request.flow_shift,
         "enable_teacache": request.enable_teacache,
-        "use_diffusion_decoder": _extra_value(request, "use_diffusion_decoder"),
-        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
-        "cache_dit_params": _extra_value(request, "cache_dit_params"),
-        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
-        "attention_backend_override": _extra_value(
+        "use_diffusion_decoder": request_extra_value(request, "use_diffusion_decoder"),
+        "enable_cache_dit": request_extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": request_extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": request_extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": request_extra_value(
             request, "attention_backend_override"
         ),
-        "skip_softmax_params": _extra_value(request, "skip_softmax_params"),
+        "skip_softmax_params": request_extra_value(request, "skip_softmax_params"),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -308,7 +286,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "upscaling_model_path": request.upscaling_model_path,
         "upscaling_scale": request.upscaling_scale,
         "output_path": request.output_path,
-        "quality": _extra_value(request, "quality"),
+        "quality": request_extra_value(request, "quality"),
         "output_compression": request.output_compression,
         "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
@@ -317,7 +295,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "num_profiled_timesteps": request.num_profiled_timesteps,
         "profile_all_stages": request.profile_all_stages,
         "diffusers_kwargs": request.diffusers_kwargs,
-        **_video_request_model_kwargs(request, sampling_params_cls),
+        **request_model_kwargs(request, sampling_params_cls, "video"),
     }
 
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
@@ -382,6 +360,14 @@ async def _save_first_input_image(
     )
 
 
+async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
+    return list(
+        await asyncio.gather(
+            *(cloud_storage.upload_and_cleanup(path) for path in paths)
+        )
+    )
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
@@ -419,19 +405,31 @@ async def _dispatch_job_async(
                     )
             raise
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls = await _upload_and_cleanup_videos(save_file_path_list)
+        if not output_persistent and not all(cloud_urls):
+            # The temp output dir is removed in `finally`, so an output that was
+            # not uploaded would be unretrievable once the job reports completed.
+            raise RuntimeError(
+                "Video output could not be published: no output_path is configured "
+                "and cloud storage upload is disabled or failed."
+            )
 
-        persistent_path = (
-            save_file_path if not cloud_url and output_persistent else None
-        )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
-            "url": cloud_url,
-            "file_path": persistent_path,
+            "url": cloud_urls[0],
+            "urls": cloud_urls,
+            "file_path": (
+                os.path.abspath(save_file_path)
+                if not cloud_urls[0] and output_persistent
+                else None
+            ),
             "file_paths": (
-                [os.path.abspath(path) for path in save_file_path_list]
+                [
+                    None if url else os.path.abspath(path)
+                    for path, url in zip(save_file_path_list, cloud_urls)
+                ]
                 if output_persistent
                 else None
             ),
@@ -450,6 +448,7 @@ async def _dispatch_job_async(
                 "status": "failed",
                 "error": {"message": str(e)},
                 "url": None,
+                "urls": None,
                 "file_path": None,
                 "file_paths": None,
                 "num_outputs": None,
@@ -851,17 +850,48 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+def _parse_video_variant_index(variant: str | None) -> int | None:
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_video_variant_url(job: dict, variant: str | None) -> str | None:
+    urls = job.get("urls")
+    if urls:
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(urls):
+            return urls[variant_index]
+        return None
+    if _parse_video_variant_index(variant) != 0:
+        return None
+    return job.get("url")
+
+
+_ARTIFACT_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".safetensors": "application/octet-stream",
+}
+
+
+def _select_lidar_artifact_path(job: dict, variant: str | None) -> str | None:
+    """A joint camera/LiDAR job's extra artifact, addressed by its ``lidar.files`` key."""
+    lidar = job.get("lidar")
+    if not variant or not isinstance(lidar, dict):
+        return None
+    files = lidar.get("files")
+    return files.get(variant) if isinstance(files, dict) else None
+
+
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
     file_paths = job.get("file_paths")
     if file_paths:
-        try:
-            variant_index = 0 if variant is None else int(variant)
-        except (TypeError, ValueError):
-            return None
-        if 0 <= variant_index < len(file_paths):
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(file_paths):
             return file_paths[variant_index]
         return None
-    if variant not in (None, "0", 0):
+    if _parse_video_variant_index(variant) != 0:
         return None
     return job.get("file_path")
 
@@ -874,13 +904,16 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if job.get("url"):
+    cloud_url = _select_video_variant_url(job, variant)
+    if cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = _select_video_variant_path(job, variant)
+    file_path = _select_lidar_artifact_path(job, variant) or _select_video_variant_path(
+        job, variant
+    )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
@@ -888,7 +921,9 @@ async def download_video_content(
             status_code=404, detail=f"Video variant {variant} not found"
         )
 
-    media_type = "video/mp4"  # default variant
+    media_type = _ARTIFACT_MEDIA_TYPES.get(
+        os.path.splitext(file_path)[1].lower(), "video/mp4"
+    )
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )

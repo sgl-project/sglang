@@ -17,6 +17,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -24,6 +28,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -41,6 +46,16 @@ _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -141,7 +156,14 @@ class DSAIndexerPoolHost(HostKVCache):
         allocator_type: str = "default",
         is_dummy: bool = False,
     ):
+        if _is_xpu and not is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__,
+                layout=anchor_host.layout,
+                ops=self._kvcacheio_ops,
+            )
         self._is_dummy = is_dummy
+        self._destroyed = False
         self.decl = decl
         storage_info = decl.storage_info
         device_pool = decl.device_pool
@@ -226,6 +248,15 @@ class DSAIndexerPoolHost(HostKVCache):
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        if self._destroyed:
+            return
+        if not self._is_dummy and self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(self.index_k_with_scale_buffer)
+        self.index_k_with_scale_buffer = None
+        self.index_k_data_refs = []
+        super().destroy()
 
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
@@ -336,6 +367,11 @@ class DSAIndexerPoolHost(HostKVCache):
             device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
         return host_page_indices, device_page_indices
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def load_to_device_per_layer(
         self,

@@ -3,6 +3,7 @@ from typing import Any, Optional
 import numpy as np
 import pybase64
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
@@ -48,9 +49,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
             return None
-        # The model's own attribute is the baked decision (0 when its gate
-        # disabled fusion); the ACTIVE flag can be holding another runner's.
-        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
+        # The loader attaches this to every entry model, including wrappers.
+        # Size from the owner, independent of which runner is currently active.
+        num_fused_shared_experts = model.shared_experts_config.num_fused_shared_experts
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
@@ -106,6 +107,18 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        device_width = self.device_cache.buffer.shape[2]
+        if topk_indices.shape[1] != device_width:
+            # Routes whose shared columns are appended after capture pass routed ids only.
+            if topk_indices.shape[1] != device_width - self.num_fused_shared_experts:
+                raise ValueError(
+                    f"Captured top-k width {topk_indices.shape[1]} is neither the "
+                    f"device width {device_width} nor its routed part "
+                    f"{device_width - self.num_fused_shared_experts}"
+                )
+            topk_indices = F.pad(
+                topk_indices, (0, self.num_fused_shared_experts), value=-1
+            )
         if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[

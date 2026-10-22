@@ -188,6 +188,7 @@ class AutoRoundConfig(QuantizationConfig):
         raise NotImplementedError
 
     def get_layer_config(self, layer, layer_name: str):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         def get_config(name: str, quantized: bool = True):
@@ -243,7 +244,10 @@ class AutoRoundConfig(QuantizationConfig):
             )
 
         # 3. Handle fused MoE
-        if self.extra_config and "fusedmoe" in layer.__class__.__name__.lower():
+        if self.extra_config and (
+            "fusedmoe" in layer.__class__.__name__.lower()
+            or isinstance(layer, FusedMoE)
+        ):
             moe_configs = [
                 get_config(name, quantized)
                 for name in self.extra_config
