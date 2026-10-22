@@ -123,6 +123,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         target_layer_num: int,
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
+        write_back_staging: torch.Tensor | None = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
@@ -258,9 +259,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             return
 
-        self._initialize_transfer_views()
+        self._initialize_transfer_views(write_back_staging)
 
-    def _initialize_transfer_views(self) -> None:
+    def _initialize_transfer_views(self, write_back_staging=None) -> None:
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -292,7 +293,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         if self._native_buffers is None:
             self._init_device_row_stride(self.device_kv_buffers)
-        self._init_write_back_staging_buffers()
+        self._init_write_back_staging_buffers(write_back_staging)
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -463,7 +464,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         return buffer
 
-    def _init_write_back_staging_buffers(self):
+    def _init_write_back_staging_buffers(self, write_back_staging=None):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_buffer = None
@@ -472,7 +473,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return
         if self.layout == "page_unified":
             self._require_packed_device_rows("page_unified staged write-back")
-            self._init_page_unified_staging()
+            self._init_page_unified_staging(write_back_staging)
             return
         # The staged kernel reads whole device pages, so it needs packed rows.
         if (

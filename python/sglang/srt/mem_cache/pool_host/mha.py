@@ -154,7 +154,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         start_layer: int,
         end_layer: int,
         draft_buffer_infos: Sequence[MHABufferInfo] = (),
-        write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
+        write_back_staging: torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | None = None,
         pool_label: str = "kv",
         head_group_num: int = 1,
     ):
@@ -376,7 +378,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             return
         if self.layout == "page_unified":
             self._require_packed_device_rows("page_unified staged write-back")
-            self._init_page_unified_staging()
+            self._init_page_unified_staging(write_back_staging)
             return
         # The staged kernel reads whole device pages, so it needs packed rows.
         if self.layout != "page_first" or not self.device_rows_packed:

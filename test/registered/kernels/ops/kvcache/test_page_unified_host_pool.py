@@ -102,9 +102,30 @@ def _restore_storage_pages(host_pool, host_indices):
     return restored_indices
 
 
+def _prepare_staging(device_pool, *, is_mla=False, head_group_num=1):
+    from sglang.srt.mem_cache.pool_host.base import (
+        prepare_page_unified_write_back_staging,
+    )
+    from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+    geometry = PageUnifiedLayout(
+        page_size=PAGE_SIZE,
+        layer_num=LAYERS,
+        head_num=1 if is_mla else device_pool.head_num,
+        head_group_num=head_group_num,
+        head_dim=device_pool.kv_cache_dim if is_mla else HEAD_DIM,
+        itemsize=device_pool.store_dtype.itemsize,
+        is_mla=is_mla,
+    )
+    return prepare_page_unified_write_back_staging(
+        geometry, dtype=device_pool.store_dtype, device=torch.device(DEVICE)
+    )
+
+
 @pytest.mark.parametrize("head_num,head_group_num", [(8, 1), (8, 2), (8, 8), (4, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mha_page_unified(head_num, head_group_num, dtype):
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_mha_page_unified(head_num, head_group_num, dtype, preallocate):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -120,9 +141,22 @@ def test_mha_page_unified(head_num, head_group_num, dtype):
         start_layer=0,
         end_layer=LAYERS,
     )
-    host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool, head_group_num=head_group_num
+    staging = (
+        _prepare_staging(device_pool, head_group_num=head_group_num)
+        if preallocate
+        else None
     )
+    host_pool = _pinned_host_pool(
+        MHATokenToKVPoolHost,
+        device_pool,
+        head_group_num=head_group_num,
+        write_back_staging=staging,
+    )
+    if preallocate:
+        assert host_pool.staging_buffer.data_ptr() == staging.data_ptr()
+        assert (
+            host_pool.staging_buffer.shape[0] == host_pool.page_num < staging.shape[0]
+        )
 
     generator = torch.Generator(device=DEVICE).manual_seed(20260915)
     for layer in range(LAYERS):
@@ -180,7 +214,8 @@ def test_mha_page_unified(head_num, head_group_num, dtype):
 
 @pytest.mark.parametrize("kv_lora_rank,qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype):
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -196,7 +231,15 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype):
         start_layer=0,
         end_layer=LAYERS,
     )
-    host_pool = _pinned_host_pool(MLATokenToKVPoolHost, device_pool)
+    staging = _prepare_staging(device_pool, is_mla=True) if preallocate else None
+    host_pool = _pinned_host_pool(
+        MLATokenToKVPoolHost, device_pool, write_back_staging=staging
+    )
+    if preallocate:
+        assert host_pool.staging_buffer.data_ptr() == staging.data_ptr()
+        assert (
+            host_pool.staging_buffer.shape[0] == host_pool.page_num < staging.shape[0]
+        )
 
     generator = torch.Generator(device=DEVICE).manual_seed(20260916)
     for layer in range(LAYERS):

@@ -202,6 +202,7 @@ def build_kv_host_pool(
                 for pool in mtp_draft_device_pools
             ),
             layer_shard_enabled=kv_pool.layer_shard_enabled,
+            write_back_staging=kv_pool.hicache_write_back_staging,
             target_layer_num=(
                 (kv_pool.layer_num + kv_pool.layer_shard_size - 1)
                 // kv_pool.layer_shard_size
@@ -1605,6 +1606,7 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
 

@@ -43,9 +43,18 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool_host.base import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
+    prepare_page_unified_write_back_staging,
+)
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -71,12 +80,12 @@ if TYPE_CHECKING:
 def prepare_hicache_staging(
     *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
 ) -> None:
-    """Materialize MHA transfer buffers before the final KV budget is measured."""
+    """Materialize transfer buffers before the final KV budget is measured."""
     if is_npu():
         return
     memory = get_memory()
     page_size = get_schedule().page_size
-    if memory.hicache_mem_layout != "page_first" or not (
+    if memory.hicache_mem_layout not in ("page_first", "page_unified") or not (
         memory.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
@@ -88,25 +97,65 @@ def prepare_hicache_staging(
             prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
         elif isinstance(pool, HybridLinearKVPool):
             prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
-        elif isinstance(pool, MHATokenToKVPool):
+        elif isinstance(pool, (MHATokenToKVPool, MLATokenToKVPool)):
+            is_mla = isinstance(pool, MLATokenToKVPool)
+            if pool.layer_num == 0 or (
+                is_mla and memory.hicache_mem_layout != "page_unified"
+            ):
+                return
             # Ratio-based host pools can only shrink with post-capture KV sizing.
             # Sidecars instead inherit their target host pool's capacity.
             page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
             if memory.hicache_size <= 0 and not sidecar:
-                page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
-            staging = prepare_mha_write_back_staging(
-                pool.get_device_pool_infos()[0].buffer_info,
-                layer_num=pool.layer_num + len(packed_drafts),
-                page_size=page_size,
-                page_capacity=page_capacity,
-                staging=pool.hicache_write_back_staging,
-            )
+                capacity_tokens = (
+                    pool.size
+                    if pool.host_capacity_tokens is None
+                    else pool.host_capacity_tokens
+                )
+                page_capacity = (
+                    int(capacity_tokens * memory.hicache_ratio) // page_size + 1
+                )
+            info = pool.get_device_pool_infos()[0].buffer_info
+            layer_num = pool.layer_num + len(packed_drafts)
+            if memory.hicache_mem_layout == "page_unified":
+                if is_mla and pool.layer_shard_enabled:
+                    layer_num = (
+                        pool.layer_num + pool.layer_shard_size - 1
+                    ) // pool.layer_shard_size + len(packed_drafts)
+                geometry = PageUnifiedLayout(
+                    page_size=page_size,
+                    layer_num=layer_num,
+                    head_num=1 if is_mla else info.head_num,
+                    head_group_num=1
+                    if is_mla
+                    else resolve_head_group_num(info.head_num),
+                    head_dim=info.kv_cache_dim if is_mla else info.head_dim,
+                    itemsize=info.dtype.itemsize,
+                    is_mla=is_mla,
+                )
+                staging = prepare_page_unified_write_back_staging(
+                    geometry,
+                    dtype=info.dtype,
+                    device=info.device,
+                    page_capacity=page_capacity,
+                    staging=pool.hicache_write_back_staging,
+                )
+                buffers = (staging,)
+            else:
+                staging = prepare_mha_write_back_staging(
+                    info,
+                    layer_num=layer_num,
+                    page_size=page_size,
+                    page_capacity=page_capacity,
+                    staging=pool.hicache_write_back_staging,
+                )
+                buffers = staging
             pool.hicache_write_back_staging = staging
             if staging is not None:
                 logger.info(
                     "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
-                    sum(buffer.nbytes for buffer in staging) / (1 << 20),
-                    pool.layer_num + len(packed_drafts),
+                    sum(buffer.nbytes for buffer in buffers) / (1 << 20),
+                    layer_num,
                 )
 
     runner = tp_worker.model_runner
