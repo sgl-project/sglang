@@ -566,6 +566,14 @@ class TestHiCacheHostRegister(unittest.TestCase):
         total = 3076 * mib  # 1538 whole 2 MiB hugepages
         cudart = _FakeCudart()
 
+        def register(granularity_mib):
+            cudart.registrations.clear()
+            _cuda_host_register(
+                _FakeBuffer(base, total),
+                registration_granularity_bytes=granularity_mib * mib,
+            )
+            return cudart.registrations[:]
+
         with (
             mock.patch.object(host_common, "tensor_uses_hugepage", return_value=True),
             envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
@@ -576,31 +584,22 @@ class TestHiCacheHostRegister(unittest.TestCase):
             ),
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
         ):
-            # Raise a warning if the granularity-derived chunk is not hugepage-aligned.
-            with self.assertLogs(host_common.logger, level="WARNING") as logs:
-                _cuda_host_register(
-                    _FakeBuffer(base, total), registration_granularity_bytes=301 * mib
-                )
-            self.assertTrue(any("copy granularity" in line for line in logs.output))
-            # A page-multiple granularity keeps the grid and stays silent.
-            with self.assertNoLogs(host_common.logger, level="WARNING"):
-                _cuda_host_register(
-                    _FakeBuffer(base, total), registration_granularity_bytes=300 * mib
-                )
+            # lcm(2 MiB, 513 MiB) = 1026 MiB exceeds the 1 GiB chunk limit.
+            with self.assertRaises(ValueError):
+                register(513)
+            # lcm(2 MiB, 301 MiB) = 602 MiB fits: chunks keep both grids.
+            lcm_aligned = register(301)
+            # A page-multiple granularity keeps the same grid.
+            page_multiple = register(300)
 
-        # 902, 902, 902, 370 MiB.
+        self.assertEqual([s for _, s, _ in lcm_aligned], [602 * mib] * 5 + [66 * mib])
         self.assertEqual(
-            cudart.registrations[:4],
-            [
-                (base, 902 * mib, 0),
-                (base + 902 * mib, 902 * mib, 0),
-                (base + 1804 * mib, 902 * mib, 0),
-                (base + 2706 * mib, 370 * mib, 0),
-            ],
+            [s for _, s, _ in page_multiple], [900 * mib] * 3 + [376 * mib]
         )
-        for ptr, size, _ in cudart.registrations:
-            self.assertEqual((ptr - base) % two_mib, 0)
-            self.assertEqual(size % two_mib, 0)
+        for registrations in (lcm_aligned, page_multiple):
+            for ptr, size, _ in registrations:
+                self.assertEqual((ptr - base) % two_mib, 0)
+                self.assertEqual(size % two_mib, 0)
 
     def test_null_pinned_allocation_raises(self):
         """On XPU a null pinned buffer must fail at allocation, not at first transfer."""

@@ -186,32 +186,17 @@ def _cuda_host_register(
                 "registration_granularity_bytes must be positive, got "
                 f"{registration_granularity_bytes}"
             )
-        if registration_granularity_bytes > chunk_limit_bytes:
+        # Every internal boundary must align to both a complete copy unit and
+        # a hugepage. Rounding to either grid separately can break the other.
+        alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)
+        if alignment_bytes > chunk_limit_bytes:
             raise ValueError(
-                "Host registration granularity exceeds the configured chunk limit: "
+                "Host registration alignment exceeds the configured chunk limit: "
                 f"granularity={registration_granularity_bytes}, "
+                f"hugepage={hugepage_size}, alignment={alignment_bytes}, "
                 f"chunk_limit={chunk_limit_bytes}"
             )
-        chunk_bytes = (
-            chunk_limit_bytes // registration_granularity_bytes
-        ) * registration_granularity_bytes
-    if hugepage_size:
-        page_aligned_chunk = max(chunk_bytes // hugepage_size, 1) * hugepage_size
-        if (
-            registration_granularity_bytes is not None
-            and page_aligned_chunk % registration_granularity_bytes != 0
-        ):
-            logger.warning(
-                "Hugepage rounding moved host-registration chunk boundaries off "
-                "the copy granularity (chunk=%d, granularity=%d, hugepage=%d); "
-                "a batched copy may span two registrations. Make "
-                "registration_granularity_bytes a multiple of the hugepage size "
-                "to keep every copy inside one registration.",
-                page_aligned_chunk,
-                registration_granularity_bytes,
-                hugepage_size,
-            )
-        chunk_bytes = page_aligned_chunk
+        chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
     registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0
