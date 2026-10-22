@@ -53,6 +53,9 @@ def _get_param_type(tools: list[Tool], function_name: str, param_name: str) -> s
             continue
         definition = get_schema_properties(parameters).get(param_name)
         if isinstance(definition, dict):
+            types = definition.get("type")
+            if isinstance(types, list) and "string" in types:
+                return "string"
             return infer_type_from_json_schema(definition) or "string"
     return "string"
 

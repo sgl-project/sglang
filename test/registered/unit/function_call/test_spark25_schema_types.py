@@ -90,17 +90,25 @@ class TestSpark25SchemaTypes(CustomTestCase):
                         )
 
     def test_mixed_string_union_preserves_text(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "value": {"anyOf": [{"type": "integer"}, {"type": "string"}]}
-            },
-        }
-        for chunk_size in (None, 1):
-            with self.subTest(chunk_size=chunk_size):
-                self.assertEqual(
-                    self._parse(schema, {"value": "42"}, chunk_size), {"value": "42"}
-                )
+        definitions = [
+            {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+            {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+            {"type": ["integer", "string"]},
+            {"type": ["string", "integer"]},
+            {"type": ["null", "integer", "string"]},
+            {"type": ["integer", "null", "string"]},
+        ]
+        for definition in definitions:
+            schema = {"type": "object", "properties": {"value": definition}}
+            for value in ("42", "2.5", "true", "[1,2]", '{"nested":1}'):
+                for chunk_size in (None, 1, 7):
+                    with self.subTest(
+                        definition=definition, value=value, chunk_size=chunk_size
+                    ):
+                        self.assertEqual(
+                            self._parse(schema, {"value": value}, chunk_size),
+                            {"value": value},
+                        )
 
 
 if __name__ == "__main__":
