@@ -1465,20 +1465,19 @@ class MQALayer(MqaAttentionBase):
                 method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
-        if envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get():
-            self.fused_mxfp8_wqkv_a = (
-                self.fuse_wqa_wkv and self._prepare_deepgemm_mxfp8_input(self.wqkv_a)
+        self.fused_mxfp8_wqkv_a = (
+            self.fuse_wqa_wkv and self._prepare_deepgemm_mxfp8_input(self.wqkv_a)
+        )
+        self.fused_mxfp8_wo_b = (
+            self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            and self._prepare_deepgemm_mxfp8_input(self.wo_b)
+        )
+        if self.layer_id == 0:
+            logger.info(
+                "DSv4.1 fused MXFP8 producers: wqkv_a=%s wo_b=%s",
+                self.fused_mxfp8_wqkv_a,
+                self.fused_mxfp8_wo_b,
             )
-            self.fused_mxfp8_wo_b = (
-                self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
-                and self._prepare_deepgemm_mxfp8_input(self.wo_b)
-            )
-            if self.layer_id == 0:
-                logger.info(
-                    "DSv4.1 fused MXFP8 producers: wqkv_a=%s wo_b=%s",
-                    self.fused_mxfp8_wqkv_a,
-                    self.fused_mxfp8_wo_b,
-                )
 
     @staticmethod
     def _prepare_deepgemm_mxfp8_input(linear) -> bool:
