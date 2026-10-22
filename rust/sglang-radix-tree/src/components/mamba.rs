@@ -172,10 +172,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .arena
                 .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-            let tokens = tree_core
-                .arena
-                .node(node_id)
-                .device_reclaimable_value_len(MAMBA);
+            let tokens = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, tokens);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
@@ -203,6 +200,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tail_node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
     ) {
         let Some(cap) = self.mamba_max_states_per_path else {
             return;
@@ -242,6 +240,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 MAMBA,
                 device_frees,
                 host_frees,
+                cache_actions,
                 EvictLayer::Device,
                 Some(&mut tracker),
             );
@@ -251,6 +250,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 &mut tracker,
                 device_frees,
                 host_frees,
+                cache_actions,
                 EvictLayer::Device,
             );
             excess -= 1;
@@ -282,20 +282,21 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = MAMBA;
-        let node = tree_core.arena.node_mut(node_id);
+        let node = tree_core.arena.node(node_id);
         let mut freed = 0;
         let mut host_freed = 0;
 
         // Device layer
         if target.contains(EvictLayer::Device) && node.has_device_value(MAMBA) {
-            freed = node.device_reclaimable_value_len(MAMBA);
+            freed = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             device_frees
                 .entry(ct)
                 .or_default()
-                .push(node.take_device_value(MAMBA));
+                .push(tree_core.arena.node_mut(node_id).take_device_value(MAMBA));
             tree_core.dec_evictable_size(MAMBA, freed);
         }
 
@@ -347,6 +348,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
     ) -> Option<NodeIdx_> {
         let ct = MAMBA;
         assert!(
@@ -412,10 +414,19 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 ct,
                 device_frees,
                 host_frees,
+                cache_actions,
                 EvictLayer::Device,
                 Some(tracker),
             );
-            tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
+            tree_core.cascade_evict_(
+                x,
+                ct,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                EvictLayer::Device,
+            );
             None
         };
         tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
@@ -452,7 +463,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             tree_core.arena.inc_host_lock_ref(node_id, MAMBA);
         } else {
-            let value_len = node.device_reclaimable_value_len(MAMBA);
+            let value_len = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             if node.device_lock_ref(MAMBA) == 0 {
                 tree_core.dec_evictable_size(MAMBA, value_len);
                 tree_core.inc_protected_size(MAMBA, value_len);
@@ -498,7 +509,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             "Mamba release hit lock_ref=0 on node {node_id}"
         );
         if device_lock_ref == 1 {
-            let value_len = node.device_reclaimable_value_len(MAMBA);
+            let value_len = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, value_len);
             tree_core.dec_protected_size(MAMBA, value_len);
         }
@@ -722,6 +733,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
     ) {
         let ct = MAMBA;
         let mut x = tree_core
@@ -744,7 +756,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             // cover an ancestor whose Mamba state is not being transferred.
             if tree_core.evictable_host_leaves.contains(cur) {
                 // Host leaf: atomic eviction (all components host + delete)
-                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);
+                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
             } else {
                 // Internal: tombstone Mamba + cascade
                 assert!(
@@ -756,6 +768,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     ct,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                     Some(tracker),
                 );
@@ -765,6 +778,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     tracker,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                 );
             }
