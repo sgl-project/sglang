@@ -87,9 +87,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         for _ in range(3):
             self.assertIs(self._get(group, router_topk=3), target)
             self.assertIs(self._get(group, router_topk=6), target)
-        self.assertEqual(
-            [b.kwargs["num_topk"] for b in _FakeBuffer.instances], [6]
-        )
+        self.assertEqual([b.kwargs["num_topk"] for b in _FakeBuffer.instances], [6])
 
     def test_larger_topk_rebuilds_once_at_the_max(self):
         """A smaller top-k built first is outgrown once, then stays shared."""
@@ -97,9 +95,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         self._get(group, router_topk=3)
         grown = self._get(group, router_topk=6)
         self.assertIs(self._get(group, router_topk=3), grown)
-        self.assertEqual(
-            [b.kwargs["num_topk"] for b in _FakeBuffer.instances], [3, 6]
-        )
+        self.assertEqual([b.kwargs["num_topk"] for b in _FakeBuffer.instances], [3, 6])
 
     def test_key_keeps_process_group_object(self):
         group = _FakeGroup()
