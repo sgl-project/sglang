@@ -884,6 +884,7 @@ class EngramEmbedding(nn.Module):
             or self.tp_size != 4
             # Other loaders may bypass the model's collective finish_load hook.
             or get_model().load_format not in ("auto", "safetensors")
+            or get_model().weight_cache_mode != "off"
             or parallel.attn_dp_size != 1
             or parallel.attn_cp_size != 1
             or execution.features.enable_memory_saver

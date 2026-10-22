@@ -63,8 +63,9 @@ def test_lookup_reload_and_graph(group, empty_shards, id_dtype):
     with torch.device("cuda"):
         peer = EngramEmbedding(size, 256, 1, tuple(bounds))
     assert peer._peer_storage is not None
-    with torch.device("cuda"), get_model().override(load_format="dummy"):
-        assert EngramEmbedding(size, 256, 1, tuple(bounds))._peer_storage is None
+    for overrides in ({"load_format": "dummy"}, {"weight_cache_mode": "client"}):
+        with torch.device("cuda"), get_model().override(**overrides):
+            assert EngramEmbedding(size, 256, 1, tuple(bounds))._peer_storage is None
     peer._load_rows(peer.weight, weight)
     peer._load_rows(peer.scale, scale)
     peer.finish_load("test")
