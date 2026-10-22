@@ -37,7 +37,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -63,6 +66,7 @@ from sglang.srt.models.gemma4_causal import (
     Gemma4TextModel,
     load_tied_lm_head,
     pp_filter_load_weight,
+    shared_vocab_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.runtime_context import get_parallel
@@ -265,12 +269,20 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
 
         # Create logits processor for the multimodal model
-        self.logits_processor = LogitsProcessor(config.text_config)
+        self.logits_processor = LogitsProcessor(
+            config.text_config,
+            use_attn_tp_group=(
+                self.lm_head.use_attn_tp_group
+                if isinstance(self.lm_head, VocabParallelEmbedding)
+                else None
+            ),
+        )
         self.capture_aux_hidden_states = False
 
         self.post_init()
@@ -303,13 +315,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         """Pad input IDs with image and audio tokens."""
         return pad_mm_tokens(input_ids, mm_inputs)
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
-
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
@@ -1135,7 +1142,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_embed(self):
         return self.language_model.embed_tokens.weight
 
-    def get_embed_and_head(self):
+    def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
             # Under PP, embed_tokens lives on the first rank and lm_head on the
             # last; neither rank holds both tensors, so we can't return the
@@ -1148,9 +1155,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "on the first PP rank and lm_head on the last; use "
                 "--pp-size 1 if you need this API."
             )
-        embed = self.language_model.embed_tokens.weight
-        # a materialized lm_head is loaded from this very tensor, so it is exact
-        return embed, embed
+        embed = shared_vocab_weight(
+            self.language_model.embed_tokens, draft_embedding=draft_embedding
+        )
+        head = (
+            embed
+            if self.lm_head.weight is self.language_model.embed_tokens.weight
+            else shared_vocab_weight(self.lm_head, draft_embedding=draft_embedding)
+        )
+        return embed, head
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.get_embed_and_head(draft_embedding=draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         self.capture_aux_hidden_states = True

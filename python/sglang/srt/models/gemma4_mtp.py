@@ -98,6 +98,9 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
+            # The assistant's own head uses a replicated, potentially
+            # centroid-ordered vocabulary and skip_all_gather=True.
+            enable_vocab_parallel=False,
         )
         self.post_projection = ReplicatedLinear(
             self.hidden_size,

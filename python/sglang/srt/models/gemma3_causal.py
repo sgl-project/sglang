@@ -30,6 +30,7 @@ from transformers import (
 
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -113,11 +114,17 @@ class Gemma3MLP(nn.Module):
                 "`gelu_pytorch_tanh`."
             )
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="gelu_tanh"
+        )
         self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -363,6 +370,8 @@ class Gemma3DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
         self.is_sliding = self.self_attn.is_sliding
         self.layer_id = layer_id
 

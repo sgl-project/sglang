@@ -34,6 +34,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
     gemma_routing_post_topk,
 )
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -85,7 +86,88 @@ def get_attention_sliding_window_size(config):
 
 
 Gemma4MLP = Gemma3MLP
-Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+class Gemma4TextScaledWordEmbedding(VocabParallelEmbedding):
+    """Vocabulary-sharded lookup with Gemma's activation-dtype scaling.
+
+    The checkpoint weight stays unscaled so the LM head can share it. Scale
+    after lookup and reduction, preserving nn.Embedding's rounding order.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int],
+        embed_scale: float = 1.0,
+        *,
+        prefix: str = "",
+        use_attn_tp_group: bool = False,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            prefix=prefix,
+            use_attn_tp_group=use_attn_tp_group,
+        )
+        self.padding_idx = padding_idx
+        self.embed_scale = embed_scale
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().forward(input_ids) * self.embed_scale
+
+
+@torch.no_grad()
+def shared_vocab_weight(
+    embedding: nn.Module,
+    *,
+    draft_embedding: Optional[nn.Module] = None,
+    default_group=None,
+) -> torch.Tensor:
+    """Share a local bank, or repartition it for a draft at bind time.
+
+    A matching vocab-parallel draft reuses the parameter directly. A replicated
+    draft needs the original vocabulary; gather once here, never during decode.
+    """
+    weight = embedding.weight
+    sharded = isinstance(embedding, VocabParallelEmbedding)
+    if draft_embedding is None:
+        if sharded:
+            return weight
+        rank, size = get_group_rank_size(default_group)
+        shard_size = (weight.shape[0] + size - 1) // size
+        return (
+            weight[rank * shard_size : (rank + 1) * shard_size] if size > 1 else weight
+        )
+
+    draft_sharded = isinstance(draft_embedding, VocabParallelEmbedding)
+    if (
+        sharded
+        and draft_sharded
+        and embedding.shard_indices == draft_embedding.shard_indices
+    ):
+        return weight
+
+    if sharded:
+        if embedding.tp_size > 1:
+            full_weight = torch.empty(
+                (embedding.num_embeddings_padded, weight.shape[1]),
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+            embedding.tp_group.all_gather_into_tensor(full_weight, weight)
+            weight = full_weight
+        weight = weight[: embedding.num_embeddings]
+
+    if not draft_sharded:
+        return weight
+    indices = draft_embedding.shard_indices
+    weight = weight[indices.org_vocab_start_index : indices.org_vocab_end_index]
+    padding = draft_embedding.num_embeddings_per_partition - weight.shape[0]
+    if padding:
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, padding))
+    return weight
 
 
 def load_tied_lm_head(
@@ -609,6 +691,8 @@ class Gemma4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         # Per-Layer Embedding (PLE) components — present in each decoder layer
         if self.hidden_size_per_layer_input > 0:
@@ -841,6 +925,8 @@ class Gemma4TextModel(PreTrainedModel):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        enable_vocab_parallel: bool = True,
     ) -> None:
         super().__init__(config=config)
         self.config = config
@@ -884,11 +970,28 @@ class Gemma4TextModel(PreTrainedModel):
                 )
 
         if self.pp_group.is_first_rank:
-            self.embed_tokens = Gemma4TextScaledWordEmbedding(
+            embedding_cls = (
+                Gemma4TextScaledWordEmbedding
+                if enable_vocab_parallel and not envs.SGLANG_DISABLE_FUSIONS.get()
+                else Gemma3TextScaledWordEmbedding
+            )
+            embedding_kwargs = (
+                dict(
+                    prefix=add_prefix("embed_tokens", prefix),
+                    use_attn_tp_group=(
+                        get_parallel().attn_dp_size > 1
+                        or get_parallel().enable_dp_lm_head
+                    ),
+                )
+                if embedding_cls is Gemma4TextScaledWordEmbedding
+                else {}
+            )
+            self.embed_tokens = embedding_cls(
                 config.vocab_size,
                 config.hidden_size,
                 self.padding_idx,
                 embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
+                **embedding_kwargs,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -898,7 +1001,8 @@ class Gemma4TextModel(PreTrainedModel):
             and self.hidden_size_per_layer_input
             and self.hidden_size_per_layer_input > 0
         ):
-            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+            # PLE is a separate lookup bank, never used as the vocabulary head.
+            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 self.vocab_size_per_layer_input,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
                 self.padding_idx,
@@ -947,7 +1051,7 @@ class Gemma4TextModel(PreTrainedModel):
         self.layers_to_capture = []
         self.post_init()
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
     def dtype(self) -> torch.dtype:
@@ -1160,7 +1264,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.logits_processor = LogitsProcessor(config)
 
         # tie_word_embeddings ties lm_head to embed_tokens, but with PP those
         # tensors live on opposite ranks (first vs last).  In the PP > 1 case
@@ -1174,9 +1277,19 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(
+            config,
+            use_attn_tp_group=(
+                self.lm_head.use_attn_tp_group
+                if isinstance(self.lm_head, VocabParallelEmbedding)
+                else None
+            ),
+        )
 
         self.capture_aux_hidden_states = False
         self.post_init()
@@ -1193,7 +1306,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
             return
         super().tie_weights(*args, **kwargs)
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1450,24 +1563,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    def _shard_weight(
-        self, weight: torch.Tensor, *, draft_embedding=None
-    ) -> torch.Tensor:
-        group = self._shared_vocab_tp_group
-        if draft_embedding is not None:
-            group = (
-                draft_embedding.tp_group
-                if isinstance(draft_embedding, VocabParallelEmbedding)
-                else None
-            )
-        tp_rank, tp_size = get_group_rank_size(group)
-        if tp_size <= 1:
-            return weight
-        shard_size = (weight.shape[0] + tp_size - 1) // tp_size
-        return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
-
     def get_embed(self):
-        return self._shard_weight(self.model.embed_tokens.weight)
+        return shared_vocab_weight(
+            self.model.embed_tokens, default_group=self._shared_vocab_tp_group
+        )
 
     def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
@@ -1483,10 +1582,20 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 "PP rank and lm_head on the last; use --pp-size 1 if you "
                 "need this API."
             )
-        embed = self._shard_weight(
-            self.model.embed_tokens.weight, draft_embedding=draft_embedding
+        embed = shared_vocab_weight(
+            self.model.embed_tokens,
+            draft_embedding=draft_embedding,
+            default_group=self._shared_vocab_tp_group,
         )
-        head = self._shard_weight(self.lm_head.weight, draft_embedding=draft_embedding)
+        head = (
+            embed
+            if self.lm_head.weight is self.model.embed_tokens.weight
+            else shared_vocab_weight(
+                self.lm_head,
+                draft_embedding=draft_embedding,
+                default_group=self._shared_vocab_tp_group,
+            )
+        )
         return embed, head
 
     def get_embed_and_head_for_draft(self, draft_embedding):

@@ -84,7 +84,12 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    EvictResult,
+)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
@@ -484,10 +489,59 @@ class TreeCacheNamespace(SimpleNamespace):
         return False
 
     def supports_prefix_sharing(self) -> bool:
-        return True
+        return False
 
     def evict(self, params: EvictParams):
-        pass
+        return EvictResult()
+
+    def evict_for_alloc(self, params: EvictParams, **kwargs):
+        # No cached prefixes can be reclaimed in a static-batch benchmark.
+        return self.evict(params)
+
+    def swa_retain_floor(self, req):
+        return None
+
+    evict_sliding_windows = BasePrefixCache.evict_sliding_windows
+
+    def retire_sliding_windows(self, batch):
+        if self.swa_retain_window is None:
+            return
+        # Static batches advance every request by one token per decode. Avoid
+        # scanning requests between page retirement boundaries.
+        if self.next_swa_retirement is not None:
+            remaining = self.next_swa_retirement - 1
+            self.next_swa_retirement = remaining
+            if remaining > 0:
+                return
+        # The previous forward has completed. Use CPU sequence lengths because
+        # this benchmark bypasses the scheduler's Req output bookkeeping.
+        allocator = self.token_to_kv_pool_allocator
+        grouped = False
+        next_retirement = None
+        for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+            frontier = max(
+                req.kv.get_evicted_seqlen(ComponentType.SWA),
+                req.kv.swa_dead_lo(self.page_size),
+            )
+            if seq_len - self.swa_retain_window >= frontier + self.page_size:
+                if not grouped:
+                    allocator.free_group_begin()
+                    grouped = True
+                self.evict_sliding_windows(req, seq_len)
+            remaining = (
+                max(frontier, req.kv.get_evicted_seqlen(ComponentType.SWA))
+                + self.page_size
+                + self.swa_retain_window
+                - seq_len
+            )
+            next_retirement = (
+                remaining
+                if next_retirement is None
+                else min(next_retirement, remaining)
+            )
+        if grouped:
+            allocator.free_group_end()
+        self.next_swa_retirement = next_retirement
 
     def maybe_hand_to_session(self, req):
         pass
@@ -500,6 +554,14 @@ def extend(reqs, model_runner):
         page_size=get_schedule().page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        next_swa_retirement=None,
+        swa_retain_window=(
+            model_runner.sliding_window_size
+            if hasattr(model_runner.token_to_kv_pool_allocator, "free_swa_segment")
+            and not model_runner.token_to_kv_pool_allocator.swa_req_ring
+            else None
+        ),
     )
 
     batch = ScheduleBatch.init_new(
@@ -512,6 +574,9 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    if model_runner.prefill_aware_swa:
+        for req in reqs:
+            req.kv.swa_evict_floor = req.extend_end
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     if (
         batch.input_ids is None
@@ -535,6 +600,7 @@ def extend(reqs, model_runner):
 @torch.no_grad
 def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
+    batch.tree_cache.retire_sliding_windows(batch)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     forward_batch = ForwardBatch.init_new(
@@ -954,7 +1020,7 @@ def latency_test(
     custom_input_len = len(custom_inputs)
 
     # Run the sweep
-    result_list = []
+    warmed_shapes = {(bench_args.batch_size[0], bench_args.input_len[0])}
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
@@ -978,6 +1044,31 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
+        if (bs, il) not in warmed_shapes:
+            rank_print(f"Warmup for batch size {bs}, input length {il} ...")
+            warmup_reqs = prepare_synthetic_inputs_for_latency_test(
+                bs, il, bs_aligned_inputs
+            )
+            latency_test_run_once(
+                bench_args.run_name,
+                model_runner,
+                rank_print,
+                warmup_reqs,
+                bs,
+                il,
+                min(32, ol),
+                log_decode_step=0,
+                profile=False,
+                profile_record_shapes=False,
+                profile_activities=("CPU", "GPU"),
+                profile_prefix="",
+                profile_stage="all",
+                tp_rank=tp_rank,
+                profile_start_step=None,
+                profile_steps=None,
+            )
+            warmed_shapes.add((bs, il))
+
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
@@ -998,13 +1089,10 @@ def latency_test(
             bench_args.profile_steps,
         )
         if ret is not None:
-            result_list.append(ret)
-
-    # Write results in jsonlines format on rank 0.
-    if tp_rank == 0 and bench_args.result_filename:
-        with open(bench_args.result_filename, "a") as fout:
-            for result in result_list:
-                fout.write(json.dumps(result) + "\n")
+            # Preserve completed shapes if a later shape fails.
+            if tp_rank == 0 and bench_args.result_filename:
+                with open(bench_args.result_filename, "a") as fout:
+                    fout.write(json.dumps(ret) + "\n")
 
     if cfg.tp_size > 1:
         destroy_model_parallel()
@@ -1084,7 +1172,11 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        failed = [proc.exitcode for proc in workers if proc.exitcode != 0]
+        if failed:
+            raise RuntimeError(
+                f"one-batch worker processes failed: exit codes {failed}"
+            )
 
 
 def cli_main():
