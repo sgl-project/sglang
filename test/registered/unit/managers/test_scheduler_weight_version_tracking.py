@@ -80,6 +80,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.lora_manager = None
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",

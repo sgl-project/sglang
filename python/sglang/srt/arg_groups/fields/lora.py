@@ -35,6 +35,17 @@ class Lora(msgspec.Struct):
         Optional[bool],
         "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
     ] = None
+    enable_lora_merge: A[
+        bool,
+        "Enable merge/unmerge endpoints and capture decode graphs without LoRA kernels. By default, merging saves the affected base weights on CPU for exact restoration.",
+    ] = False
+    lora_unmerge_mode: A[
+        str,
+        Arg(
+            help="How to unmerge LoRA weights: 'restore' copies back original weights saved on CPU; 'subtract' keeps no backup and subtracts the adapter update, which can accumulate rounding error.",
+            choices=["restore", "subtract"],
+        ),
+    ] = "restore"
     enable_lora_overlap_loading: A[
         Optional[bool],
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",

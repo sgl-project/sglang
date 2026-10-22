@@ -787,6 +787,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
+        self.merged_lora_name: Optional[str] = None
         # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
@@ -1940,7 +1941,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Schedule at most one LoRA release per state, returning the new task if any."""
         if state.lora_released:
             return None
-        if not (self.enable_lora and state.obj.lora_path):
+        if not (
+            self.enable_lora and state.obj.lora_path and state.obj.lora_id is not None
+        ):
             return None
         state.lora_released = True
         task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
@@ -3738,6 +3741,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
+        if self.merged_lora_name is not None:
+            if obj.is_single and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                obj.lora_path = self.merged_lora_name
+            paths = (
+                obj.lora_path if isinstance(obj.lora_path, list) else [obj.lora_path]
+            )
+            if any(path != self.merged_lora_name for path in paths):
+                raise ValueError(
+                    f"This replica has merged adapter '{self.merged_lora_name}'; "
+                    "send that lora_path or unmerge before serving other adapters"
+                )
         if not obj.lora_path:
             return
 

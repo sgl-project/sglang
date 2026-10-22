@@ -80,6 +80,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MergeLoRAWeightsReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
@@ -90,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
+    UnmergeLoRAWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1776,6 +1778,24 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
+    def merge_lora_weights(self, lora_name: str):
+        """Drain requests and merge a loaded adapter. Keep using its lora_path."""
+        return self.loop.run_until_complete(self.async_merge_lora_weights(lora_name))
+
+    def unmerge_lora_weights(self):
+        """Drain requests and restore the original base weights."""
+        return self.loop.run_until_complete(self.async_unmerge_lora_weights())
+
+    async def async_merge_lora_weights(self, lora_name: str):
+        return await self.tokenizer_manager.merge_lora_weights(
+            MergeLoRAWeightsReqInput(lora_name=lora_name)
+        )
+
+    async def async_unmerge_lora_weights(self):
+        return await self.tokenizer_manager.merge_lora_weights(
+            UnmergeLoRAWeightsReqInput()
         )
 
     def unload_lora_adapter(self, lora_name: str):

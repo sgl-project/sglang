@@ -117,6 +117,9 @@ class LoRAManager:
                 f"size {get_parallel().attn_cp_size})"
             )
         self.pending_lora_load_events = {}
+        self.lora_unmerge_mode = get_lora().lora_unmerge_mode
+        self.merged_lora_id: Optional[str] = None
+        self.merged_lora_weights: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         self.eviction_policy = get_lora().lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
@@ -226,7 +229,7 @@ class LoRAManager:
         shared by prepare_lora_batch and can_run_graph so they stay consistent."""
         max_bs = self.lora_backend.prefill_cuda_graph_max_bs
         max_tokens = self.lora_backend.prefill_cuda_graph_max_tokens
-        if max_bs is None or max_tokens is None:
+        if self.merged_lora_id is not None or max_bs is None or max_tokens is None:
             return False
         # DP attention: per-rank eligibility could diverge across ranks and
         # desync collectives; keep LoRA prefill eager.
@@ -480,6 +483,9 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        if self.merged_lora_id is not None:
+            self.reset_lora_batch()
+            return
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
         # through the plain model path.  Clear any routing retained by the

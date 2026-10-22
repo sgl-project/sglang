@@ -105,7 +105,13 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -237,7 +243,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        self.record_nolora_graph = record_nolora_graph or get_lora().enable_lora_merge
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -617,6 +623,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
             return None
+        if (
+            self.model_runner.lora_manager is not None
+            and self.model_runner.lora_manager.merged_lora_id is not None
+        ):
+            return "nolora"
         if forward_batch.lora_ids is not None and any(
             uid is not None for uid in forward_batch.lora_ids
         ):
@@ -1228,6 +1239,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             attention_variant,
                         )
         _set_capture_attention_variant(None)
+        _set_capture_lora_variant(None)
 
     def capture_one_shape(
         self,

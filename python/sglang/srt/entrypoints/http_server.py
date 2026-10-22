@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MergeLoRAWeightsReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -155,6 +156,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UnmergeLoRAWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -812,6 +814,7 @@ async def model_info():
     model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
+        "merged_lora_name": _global_state.tokenizer_manager.merged_lora_name,
         # Manager-owned, and moved by a weight update alongside `model_path`:
         # this is where a client reads the identity the server answers under.
         "served_model_name": _global_state.tokenizer_manager.served_model_name,
@@ -1621,6 +1624,32 @@ async def pd_role_switch(
         result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
     except Exception as e:
         return _create_error_response(e)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/merge_lora_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def merge_lora_weights(
+    obj: Annotated[MergeLoRAWeightsReqInput, Body()], request: Request
+):
+    """Drain this replica, then merge one loaded adapter into its base weights."""
+    result = await _global_state.tokenizer_manager.merge_lora_weights(obj, request)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/unmerge_lora_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unmerge_lora_weights(request: Request):
+    """Drain this replica and restore its original base weights."""
+    result = await _global_state.tokenizer_manager.merge_lora_weights(
+        UnmergeLoRAWeightsReqInput(), request
+    )
     return ORJSONResponse(
         msgspec_to_builtins(result),
         status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
