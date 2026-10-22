@@ -421,6 +421,97 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
         return encode_MediaRef(self)
 
 
+class GetHiCacheStorageRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetHiCacheStorageRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetHiCacheStorageRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetHiCacheStorageRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetHiCacheStorageRequest(self)
+
+
+class AttachHiCacheStorageRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AttachHiCacheStorageRequest: JSON object (unknown keys ignored)."""
+
+    hicache_storage_backend: Optional[str] = None
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AttachHiCacheStorageRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AttachHiCacheStorageRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AttachHiCacheStorageRequest(self)
+
+
+class DetachHiCacheStorageRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DetachHiCacheStorageRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DetachHiCacheStorageRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DetachHiCacheStorageRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DetachHiCacheStorageRequest(self)
+
+
+class ClearHiCacheStorageRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ClearHiCacheStorageRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ClearHiCacheStorageRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ClearHiCacheStorageRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ClearHiCacheStorageRequest(self)
+
+
+class HiCacheStatus(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.HiCacheStatus: JSON object (unknown keys ignored)."""
+
+    hicache_storage_backend: Optional[str] = None
+    hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "HiCacheStatus":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_HiCacheStatus(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_HiCacheStatus(self)
+
+
+class HiCacheStorageResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.HiCacheStorageResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "HiCacheStorageResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_HiCacheStorageResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_HiCacheStorageResponse(self)
+
+
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
 
@@ -1814,6 +1905,106 @@ def encode_MediaInput(v: MediaInput) -> Any:
     if isinstance(v, list) and (v and isinstance(v[0], list)):
         return encode_MediaItemsList(v)
     return v
+
+
+def decode_GetHiCacheStorageRequest(value: Any) -> GetHiCacheStorageRequest:
+    m = _expect_map(value, expected="struct GetHiCacheStorageRequest")
+    return GetHiCacheStorageRequest()
+
+
+def encode_GetHiCacheStorageRequest(v: GetHiCacheStorageRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_AttachHiCacheStorageRequest(value: Any) -> AttachHiCacheStorageRequest:
+    m = _expect_map(value, expected="struct AttachHiCacheStorageRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "hicache_storage_backend":
+            kw["hicache_storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_storage_backend_extra_config_json":
+            kw["hicache_storage_backend_extra_config_json"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_storage_prefetch_policy":
+            kw["hicache_storage_prefetch_policy"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_write_policy":
+            kw["hicache_write_policy"] = None if x is None else _expect_str(x, expected="a string")
+    return AttachHiCacheStorageRequest(**kw)
+
+
+def encode_AttachHiCacheStorageRequest(v: AttachHiCacheStorageRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.hicache_storage_backend is not None:
+        d["hicache_storage_backend"] = v.hicache_storage_backend
+    if v.hicache_storage_backend_extra_config_json is not None:
+        d["hicache_storage_backend_extra_config_json"] = v.hicache_storage_backend_extra_config_json
+    if v.hicache_storage_prefetch_policy is not None:
+        d["hicache_storage_prefetch_policy"] = v.hicache_storage_prefetch_policy
+    if v.hicache_write_policy is not None:
+        d["hicache_write_policy"] = v.hicache_write_policy
+    return d
+
+
+def decode_DetachHiCacheStorageRequest(value: Any) -> DetachHiCacheStorageRequest:
+    m = _expect_map(value, expected="struct DetachHiCacheStorageRequest")
+    return DetachHiCacheStorageRequest()
+
+
+def encode_DetachHiCacheStorageRequest(v: DetachHiCacheStorageRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ClearHiCacheStorageRequest(value: Any) -> ClearHiCacheStorageRequest:
+    m = _expect_map(value, expected="struct ClearHiCacheStorageRequest")
+    return ClearHiCacheStorageRequest()
+
+
+def encode_ClearHiCacheStorageRequest(v: ClearHiCacheStorageRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_HiCacheStatus(value: Any) -> HiCacheStatus:
+    m = _expect_map(value, expected="struct HiCacheStatus")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "hicache_storage_backend":
+            kw["hicache_storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_storage_backend_extra_config":
+            kw["hicache_storage_backend_extra_config"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_storage_prefetch_policy":
+            kw["hicache_storage_prefetch_policy"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_write_policy":
+            kw["hicache_write_policy"] = None if x is None else _expect_str(x, expected="a string")
+    return HiCacheStatus(**kw)
+
+
+def encode_HiCacheStatus(v: HiCacheStatus) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["hicache_storage_backend"] = v.hicache_storage_backend
+    d["hicache_storage_backend_extra_config"] = v.hicache_storage_backend_extra_config
+    d["hicache_storage_prefetch_policy"] = v.hicache_storage_prefetch_policy
+    d["hicache_write_policy"] = v.hicache_write_policy
+    return d
+
+
+def decode_HiCacheStorageResponse(value: Any) -> HiCacheStorageResponse:
+    m = _expect_map(value, expected="struct HiCacheStorageResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return HiCacheStorageResponse(**kw)
+
+
+def encode_HiCacheStorageResponse(v: HiCacheStorageResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
 
 
 def decode_ListModelsRequest(value: Any) -> ListModelsRequest:
