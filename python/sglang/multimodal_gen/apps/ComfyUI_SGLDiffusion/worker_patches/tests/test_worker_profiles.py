@@ -2,13 +2,14 @@
 
 import multiprocessing as mp
 import os
+import subprocess
 import sys
 import types
 from dataclasses import dataclass
 
 import pytest
 
-from sglang.multimodal_gen.apps import comfyui_worker_patches as patches
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import worker_patches as patches
 
 
 def test_registered_names_only():
@@ -137,7 +138,9 @@ def test_real_spawn_installs_after_load_or_aborts(fail):
 
 
 def test_bound_helper_does_not_change_class_or_other_instances():
-    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import bind_with_globals
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
+        bind_with_globals,
+    )
 
     class Example:
         def run(self):
@@ -154,7 +157,9 @@ def test_bound_helper_does_not_change_class_or_other_instances():
 
 
 def test_h3_dynamic_lora_rejected():
-    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import _reject_lora
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
+        _reject_lora,
+    )
 
     with pytest.raises(ValueError, match="LoRA"):
         _reject_lora("adapter")
@@ -166,7 +171,7 @@ def options_module():
     import importlib.util
     from pathlib import Path
 
-    path = Path(patches.__file__).parent.parent / "ComfyUI_SGLDiffusion/options.py"
+    path = Path(patches.__file__).parent.parent / "options.py"
     spec = importlib.util.spec_from_file_location("sgld_options_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -211,3 +216,48 @@ def test_legacy_widget_positions_preserved(options_module):
         "memory_mode resident_layers prefetch_layers"
     ).split()
     assert list(options_module._FIELDS) == legacy + ["alignment_mode"]
+
+
+def test_worker_import_does_not_load_comfyui():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+class NoComfyUI:
+    def find_spec(self, fullname, *args):
+        if fullname.endswith("ComfyUI_SGLDiffusion.nodes") or fullname in ("folder_paths", "comfy"):
+            raise AssertionError(f"Worker imported {fullname}")
+sys.meta_path.insert(0, NoComfyUI())
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import h3
+""",
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("first", ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"])
+def test_lazy_node_registration(monkeypatch, first):
+    import importlib.util
+    from pathlib import Path
+
+    # ComfyUI loads plugins by file path under its own module name.
+    name = "sgld_custom_node_test"
+    path = Path(patches.__file__).parent.parent / "__init__.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    assert "NODE_CLASS_MAPPINGS" not in vars(module)
+    assert module.WEB_DIRECTORY == "./web"
+    nodes = types.ModuleType(name + ".nodes")
+    nodes.NODE_CLASS_MAPPINGS = {"SGLDOptions": object()}
+    nodes.NODE_DISPLAY_NAME_MAPPINGS = {"SGLDOptions": "SGLDiffusion Options"}
+    monkeypatch.setitem(sys.modules, nodes.__name__, nodes)
+    assert getattr(module, first) is getattr(nodes, first)
+    assert module.NODE_CLASS_MAPPINGS is nodes.NODE_CLASS_MAPPINGS
+    assert module.NODE_DISPLAY_NAME_MAPPINGS is nodes.NODE_DISPLAY_NAME_MAPPINGS
+    with pytest.raises(AttributeError):
+        module.unknown_attribute
