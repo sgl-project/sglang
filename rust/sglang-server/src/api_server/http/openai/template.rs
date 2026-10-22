@@ -62,23 +62,29 @@ pub(super) fn render_body(
     )
 }
 
-/// Python's template kwargs: the server defaults, under the request's effort
-/// and the thinking toggle it implies (`ChatCompletionRequest`'s validator),
-/// under the request's own `chat_template_kwargs`.
+/// Python's template kwargs: the server defaults, under the thinking toggle
+/// the request's effort implies (`ChatCompletionRequest`'s validator), under
+/// the request's own `chat_template_kwargs`. Its `reasoning_effort` moves onto
+/// the request's (`_convert_to_internal_request`), which the template sees
+/// unless a default names one.
 fn template_kwargs(
     body: &Value,
     kwargs: Option<&ChatTemplateKwargs>,
     defaults: &ChatTemplateKwargs,
 ) -> ChatTemplateKwargs {
     let mut merged = defaults.clone();
-    if let Some(effort) = sglang_processor::requested_effort(body) {
-        merged.insert("reasoning_effort".into(), effort.clone());
-    }
     if let Some(thinking) = sglang_processor::requested_thinking(body) {
         merged.insert("thinking".into(), thinking.into());
         merged.insert("enable_thinking".into(), thinking.into());
     }
-    merged.extend(kwargs.cloned().unwrap_or_default());
+    let mut own = kwargs.cloned().unwrap_or_default();
+    let effort = own
+        .remove("reasoning_effort")
+        .or_else(|| sglang_processor::requested_effort(body).cloned());
+    merged.extend(own);
+    if let Some(effort) = effort {
+        merged.entry("reasoning_effort".into()).or_insert(effort);
+    }
     merged
 }
 
@@ -125,7 +131,11 @@ fn last_assistant_message(
     }
     let mut messages = serde_json::to_value(&request.messages).ok()?;
     let list = messages.as_array_mut()?;
-    let content = list.last()?["content"].as_str()?.to_owned();
+    // `_process_messages` first sets a null content to "".
+    let content = match &list.last()?["content"] {
+        Value::Null => String::new(),
+        content => content.as_str()?.to_owned(),
+    };
     let prefix = if continuing {
         list.pop();
         content
@@ -239,6 +249,16 @@ mod tests {
         let rendered = render(&formatter, json!({"model": "m", "messages": messages}));
         assert_eq!(rendered.prompt.as_str(), "<user>Hi<user>Hel<assistant>");
         assert_eq!(rendered.continuation, "");
+
+        // A null content is "" first, so the turn is still asked as a user's.
+        let call =
+            json!({"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let messages = json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call]}
+        ]);
+        let rendered = render(&formatter, json!({"model": "m", "messages": messages}));
+        assert_eq!(rendered.prompt.as_str(), "<user>Hi<user><assistant>");
     }
 
     /// The request's effort reaches a Jinja template with the thinking toggle
@@ -259,6 +279,13 @@ mod tests {
             "chat_template_kwargs": {"enable_thinking": false}
         });
         assert_eq!(render(&formatter, body).prompt.as_str(), "high|True|False");
+
+        // A default effort wins over the request's, as on Python.
+        let body = json!({"model": "m", "messages": messages, "reasoning_effort": "high"});
+        let request = serde_json::from_value(body.clone()).unwrap();
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("low"))]);
+        let rendered = render_chat(&formatter, body, &request, None, &defaults).unwrap();
+        assert_eq!(rendered.prompt.as_str(), "low|True|True");
     }
 
     /// A DeepSeek-V4.1 developer turn, which SGLang's encoder declines, renders
