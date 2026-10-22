@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1564,16 +1564,19 @@ class TestFusedDraftPageEnvelopeHiCache(CustomTestCase):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        target = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.DFLASH)
+        target = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            kv_cache_configurator=SimpleNamespace(
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                is_hybrid_swa=True,
+                mambaish_config=None,
+            ),
+        )
         worker = SimpleNamespace(
             target_worker=SimpleNamespace(model_runner=target),
             _draft_model_runners=lambda: (SimpleNamespace(token_to_kv_pool=draft),),
         )
-        with patch.object(
-            spec,
-            "get_memory",
-            return_value=SimpleNamespace(enable_hierarchical_cache=True),
-        ):
+        with published_topology(enable_hierarchical_cache=True):
             plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
         self.assertIs(plan.mode, spec.HiCacheDraftMode.FUSED)
         self.assertEqual(target.mtp_draft_device_pools, ())

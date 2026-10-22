@@ -281,20 +281,18 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         from sglang.srt.mem_cache.unified_draft_pool import (
-            UnifiedDraftKVPool,
             fused_draft_host_allocator,
         )
 
         if any(fused_draft_host_allocator(pool) is not None for pool in draft_pools):
-            if not (
-                spec_algorithm.is_dflash()
-                and len(draft_pools) == 1
-                and isinstance(draft_pools[0], UnifiedDraftKVPool)
-                and draft_pools[0]._host_sub_pool_name == "full"
-            ):
-                raise NotImplementedError(
-                    "HiCache fused draft KV requires a full-attention DFLASH draft."
-                )
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                validate_fused_hicache_draft,
+            )
+
+            validate_fused_hicache_draft(
+                target_config=target_model_runner.kv_cache_configurator,
+                draft_device_pools=draft_pools,
+            )
             # The target's page envelopes already carry every draft layer.
             # Packing or adding a sidecar would back up the same bytes twice.
             return HiCacheDraftPlan(

@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     place_fused_draft,
     register_host_kind,
 )
-from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.runtime_context import get_memory, get_parallel, override_platform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -690,11 +690,6 @@ class TestFusedDraftDecision(CustomTestCase):
                 attention_arch=AttentionArch.MHA,
             ),
         )
-        memory = SimpleNamespace(
-            enable_unified_memory=True,
-            enable_hierarchical_cache=hicache,
-            hicache_storage_backend=storage_backend,
-        )
         spec = SimpleNamespace(
             speculative_num_steps=1,
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
@@ -706,7 +701,11 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_cp_size=attn_cp_size,
                 attn_dp_size=attn_dp_size,
             ),
-            patch.object(kvc, "get_memory", return_value=memory),
+            get_memory().override(
+                enable_unified_memory=True,
+                enable_hierarchical_cache=hicache,
+                hicache_storage_backend=storage_backend,
+            ),
             patch.object(
                 kvc,
                 "get_disagg",

@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -1757,11 +1758,42 @@ def build_swa_draft_pools(
 
 def validate_fused_hicache_draft(
     *,
-    draft_device_pools: tuple[Any, ...],
-    tree_cache: Any,
+    target_config: Optional[KVCacheConfigurator] = None,
+    draft_device_pools: Optional[tuple[Any, ...]] = None,
+    tree_cache: Any = None,
 ) -> None:
-    """Fused draft KV is restored by its target's complete page envelope."""
-    from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+    """Validate fusion at sizing, draft binding, and host registration.
+
+    Sizing supplies only the target config. Draft binding also supplies the
+    device pools; registration supplies the pools and the completed cache so
+    its page envelopes and shared buffer can be checked.
+    """
+    if target_config is not None and not (
+        target_config.spec_algorithm.is_dflash()
+        and target_config.is_hybrid_swa
+        and target_config.mambaish_config is None
+        and get_memory().hicache_storage_backend is None
+    ):
+        raise NotImplementedError(
+            "--enable-hierarchical-cache fused draft KV requires DFLASH, a "
+            "hybrid-SWA target without Mamba, and L2-only storage."
+        )
+
+    if draft_device_pools is not None:
+        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+
+        if not (
+            len(draft_device_pools) == 1
+            and isinstance(draft_device_pools[0], UnifiedDraftKVPool)
+            and draft_device_pools[0]._host_sub_pool_name == "full"
+        ):
+            raise NotImplementedError(
+                "HiCache fused draft KV requires a full-attention DFLASH draft."
+            )
+
+    if tree_cache is None:
+        return
+    assert draft_device_pools is not None
 
     entries = tree_cache.cache_controller.mem_pool_host.entry_map
     if any(
@@ -1775,12 +1807,7 @@ def validate_fused_hicache_draft(
             "the fused draft bytes."
         )
     target = entries[PoolName.KV].device_pool
-    if len(draft_device_pools) != 1 or not all(
-        isinstance(pool, UnifiedDraftKVPool)
-        and pool._host_sub_pool_name == "full"
-        and pool._unified_buffer is target._unified_buffer
-        for pool in draft_device_pools
-    ):
+    if draft_device_pools[0]._unified_buffer is not target._unified_buffer:
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 
