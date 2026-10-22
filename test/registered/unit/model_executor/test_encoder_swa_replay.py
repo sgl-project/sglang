@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
@@ -52,7 +52,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+# The fake request window's zero row: past every slot the fixtures use.
+_ZERO_ROW = 64 * 2 * SWA_WINDOW
+
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 MAX_CTX = 1024
 
 
@@ -94,6 +97,7 @@ class _Fixture:
             reqs=reqs,
             encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
+            req_pool_indices_cpu=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
             extend_num_tokens=self.extend_num_tokens,
@@ -144,7 +148,7 @@ def _backend(fx):
     backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
     backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
     backend.token_to_kv_pool = SimpleNamespace(
-        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
+        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW, zero_row=_ZERO_ROW)
     )
     backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
     backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
@@ -304,6 +308,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         expected = window_layout(
             req,
             tail.positions,
+            zero_row=_ZERO_ROW,
             capacity=2 * SWA_WINDOW,
             floor=floor,
             num_groups=3,

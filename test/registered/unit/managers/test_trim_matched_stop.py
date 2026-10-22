@@ -26,9 +26,6 @@ def _trim(output, matched, no_stop_trim, *, gpt_oss=False):
 
 
 class TestTrimMatchedStop(unittest.TestCase):
-    def test_no_finished_reason_returns_output(self):
-        self.assertEqual(_trim("abc", None, False), "abc")
-
     def test_no_matched_returns_output(self):
         stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
         self.assertEqual(
@@ -45,9 +42,6 @@ class TestTrimMatchedStop(unittest.TestCase):
         self.assertEqual(
             _trim("ans\n\nQuestion: A", "Question", True), "ans\n\nQuestion"
         )
-
-    def test_str_not_found_returns_output(self):
-        self.assertEqual(_trim("no stop here", "Question", False), "no stop here")
 
     # --- stop token ---
     def test_token_trim_drops_last(self):

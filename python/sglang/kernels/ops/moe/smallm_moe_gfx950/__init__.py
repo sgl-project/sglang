@@ -23,8 +23,12 @@ import tempfile
 
 import torch
 
-from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-    find_loaded_library,
+from sglang.kernels.jit.utils.hipcc import (
+    HipKernel,
+    check_hip,
+    hip_lib,
+    hip_version,
+    hipcc_path,
 )
 from sglang.srt.environ import envs
 
@@ -38,7 +42,6 @@ MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 MAX_TOK_DISPATCH = {256: 40}
 MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
 
-_hip = None
 _kernels: dict = {}
 _available = None
 _disabled_reason = None
@@ -81,83 +84,6 @@ assert ctypes.sizeof(Args) == 104, ctypes.sizeof(
 )  # must match static_assert(sizeof(Args) == 104) in smallm_moe.hip
 
 
-def _hip_lib():
-    global _hip
-    if _hip is None:
-        # Bind to the HIP runtime torch already mapped. ROCm 10 ships a second
-        # libamdhip64 in _rocm_sdk_devel; an unversioned CDLL("libamdhip64.so")
-        # picks that one, and every launch on a torch stream then fails with
-        # hipErrorContextIsDestroyed (709).
-        torch.cuda.current_device()
-        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
-        _hip.hipModuleLoad.restype = ctypes.c_int
-        _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        _hip.hipModuleGetFunction.restype = ctypes.c_int
-        _hip.hipModuleGetFunction.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-        ]
-        _hip.hipModuleLaunchKernel.restype = ctypes.c_int
-        _hip.hipModuleLaunchKernel.argtypes = (
-            [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-        )
-        _hip.hipGetErrorString.restype = ctypes.c_char_p
-    return _hip
-
-
-def _check(rc, what):
-    if rc != 0:
-        raise RuntimeError(
-            f"smallm_moe: {what} failed: {rc} ({_hip_lib().hipGetErrorString(rc).decode()})"
-        )
-
-
-class _Kernel:
-    def __init__(self, mod, name):
-        self.fn = ctypes.c_void_p()
-        _check(
-            _hip_lib().hipModuleGetFunction(ctypes.byref(self.fn), mod, name.encode()),
-            f"hipModuleGetFunction {name}",
-        )
-
-    def launch(self, grid, args, stream, block=256, shared=0):
-        size = ctypes.c_size_t(ctypes.sizeof(args))
-        extra = (ctypes.c_void_p * 5)(
-            1,
-            ctypes.cast(ctypes.byref(args), ctypes.c_void_p).value,
-            2,
-            ctypes.cast(ctypes.byref(size), ctypes.c_void_p).value,
-            3,
-        )
-        _check(
-            _hip_lib().hipModuleLaunchKernel(
-                self.fn,
-                grid,
-                1,
-                1,
-                block,
-                1,
-                1,
-                shared,
-                ctypes.c_void_p(stream),
-                None,
-                ctypes.cast(extra, ctypes.c_void_p),
-            ),
-            "hipModuleLaunchKernel",
-        )
-
-
-def _hipcc():
-    return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
-
-
-def _hip_version():
-    if torch.version.hip:
-        return tuple(int(x) for x in torch.version.hip.split("-")[0].split(".")[:3])
-    return (0, 0, 0)
-
-
 def smallm_moe_enabled() -> bool:
     """True unless SGLANG_ROCM_SMALLM_MOE=0, when the device is exactly gfx950 on ROCm >= 7.2 (the kernel uses
     v_cvt_scalef32_pk_bf16_fp4 / v_dot2_f32_bf16 and needs that toolchain), hipcc is present, and no build/load
@@ -176,15 +102,15 @@ def smallm_moe_enabled() -> bool:
             arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         _available = (
             arch == "gfx950"
-            and _hip_version() >= (7, 2, 0)
-            and os.path.exists(_hipcc())
+            and hip_version() >= (7, 2, 0)
+            and os.path.exists(hipcc_path())
         )
         if not _available:
             logger.info(
                 "smallm_moe not enabled (arch=%r, hip=%s, hipcc=%s); aiter fused_moe stays in use",
                 arch,
-                _hip_version(),
-                os.path.exists(_hipcc()),
+                hip_version(),
+                os.path.exists(hipcc_path()),
             )
     return _available and _disabled_reason is None
 
@@ -209,7 +135,7 @@ def _get_kernels(inter: int, pre: str):
             try:
                 subprocess.run(
                     [
-                        _hipcc(),
+                        hipcc_path(),
                         "--genco",
                         "--offload-arch=gfx950",
                         "-O3",
@@ -226,8 +152,8 @@ def _get_kernels(inter: int, pre: str):
                 _disable(f"hipcc failed: {detail.strip()[-400:]}")
             mod = ctypes.c_void_p()
             try:
-                _check(
-                    _hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
+                check_hip(
+                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
                     "hipModuleLoad",
                 )
             except RuntimeError as e:
@@ -237,9 +163,9 @@ def _get_kernels(inter: int, pre: str):
         mod = _kernels["_mod"]
         try:
             kk = {
-                "p1": _Kernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
+                "p1": HipKernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
                 "p2": {
-                    sl: _Kernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
+                    sl: HipKernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
                     for sl in (10, 11)
                 },
             }
