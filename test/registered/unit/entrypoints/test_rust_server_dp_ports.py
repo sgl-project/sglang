@@ -44,6 +44,18 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
+        (
+            {"hicache_storage_backend_extra_config": "{}"},
+            "hicache_storage_backend_extra_config",
+            "{}",
+        ),
+        (
+            {"hicache_storage_prefetch_policy": "timeout"},
+            "hicache_storage_prefetch_policy",
+            "timeout",
+        ),
+        ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -61,6 +73,10 @@ def _scheduler_for_typed_config():
     ],
     ids=[
         "native-grpc",
+        "hicache_storage_backend",
+        "hicache_storage_backend_extra_config",
+        "hicache_storage_prefetch_policy",
+        "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",

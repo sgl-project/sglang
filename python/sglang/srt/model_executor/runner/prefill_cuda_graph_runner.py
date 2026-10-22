@@ -56,13 +56,9 @@ from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.bcg import (
+from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+from sglang.srt.layers.cp.bcg.bcg import (
     PrefillCPBCGInput,
-)
-from sglang.srt.layers.cp.bcg import (
-    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
-)
-from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
@@ -612,7 +608,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         server_args = model_runner.server_args
         self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_bcg_capture(server_args)
+        ) and supports_prefill_cp_bcg(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
                 # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
@@ -784,6 +780,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if self.enable_cp_bcg_capture:
+            cp_positions = self.prefill_cp_bcg_input.model_positions(forward_batch)
+            if cp_positions is not None:
+                return cp_positions
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -1336,6 +1336,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        if getattr(
+            self, "enable_cp_bcg_capture", False
+        ) and not self.prefill_cp_bcg_input.allows_replay(
+            batch_size, num_tokens, prefix_lens, contains_mm_inputs
+        ):
+            return False
         if contains_mm_inputs and (
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
