@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -391,7 +392,13 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
-        self.use_flash_mla = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
+        flash_mla_requested = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
+        self.use_flash_mla = flash_mla_requested and is_npu_arch35()
+        if flash_mla_requested and not self.use_flash_mla:
+            logger.warning(
+                "NPU FlashMLA requires Ascend A5 (arch35); using the original "
+                "MLA attention and KV cache on this device."
+            )
         if self.use_flash_mla:
             spec_algorithm = model_runner.spec_algorithm
             if (

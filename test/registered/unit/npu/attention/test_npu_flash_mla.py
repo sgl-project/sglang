@@ -186,11 +186,18 @@ def test_ragged_verify_is_rejected(backend):
 
 
 @pytest.mark.parametrize(
-    "enabled,dspark,needs_cpu",
-    [(False, False, True), (True, False, False), (True, True, True)],
+    "enabled,arch35,dspark,needs_cpu",
+    [
+        (False, False, False, True),
+        (False, True, False, True),
+        (True, False, False, True),
+        (True, False, True, True),
+        (True, True, False, False),
+        (True, True, True, True),
+    ],
 )
 def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
-    enabled, dspark, needs_cpu
+    enabled, arch35, dspark, needs_cpu
 ):
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
@@ -234,8 +241,13 @@ def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
     with (
         patch.dict(
             sys.modules,
-            {"cann_ops_transformer.ops.attention.flash_mla": cann_module},
+            {
+                "cann_ops_transformer.ops.attention.flash_mla": (
+                    cann_module if enabled and arch35 else None
+                )
+            },
         ),
+        patch.object(mod, "is_npu_arch35", return_value=arch35),
         patch.object(mod.torch, "tensor", side_effect=tensor_on_cpu),
         patch.object(mod, "is_deepseek_dsa", return_value=False),
         patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
@@ -269,8 +281,9 @@ def test_cpu_length_gate_only_opens_for_supported_non_speculative_mla(
         ),
     ):
         obj = mod.AscendAttnBackend(runner)
+    assert obj.use_flash_mla is (enabled and arch35)
     assert obj.needs_cpu_seq_lens is needs_cpu
-    assert obj.requires_host_seq_lens_update is (not enabled)
+    assert obj.requires_host_seq_lens_update is not (enabled and arch35)
 
 
 @pytest.fixture
@@ -282,7 +295,7 @@ def pool_factory():
         self.layer_transfer_counter = None
         self.memory_saver_adapter = SimpleNamespace(region=lambda _: nullcontext())
 
-    def make_pool(enabled=True, fia_nz=False, dcp_size=1, **overrides):
+    def make_pool(enabled=True, arch35=True, fia_nz=False, dcp_size=1, **overrides):
         arguments = dict(
             size=256,
             page_size=128,
@@ -297,6 +310,7 @@ def pool_factory():
         with (
             patch.object(KVCache, "__init__", init_cache),
             patch.object(pool_mod.NPUMLATokenToKVPool, "_finalize_allocation_log"),
+            patch.object(pool_mod, "is_npu_arch35", return_value=arch35),
             patch.object(
                 pool_mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled
             ),
@@ -360,8 +374,15 @@ def test_merged_cache_preserves_split_views_and_page_boundary_writes(pool_factor
     assert not hasattr(pool, "v_buffer")
 
 
-def test_disabled_switch_keeps_separate_cache_allocations(pool_factory):
-    pool = pool_factory(enabled=False)
+@pytest.mark.parametrize(
+    "enabled,arch35", [(False, False), (False, True), (True, False)]
+)
+@pytest.mark.parametrize("fia_nz", [False, True])
+def test_fallback_keeps_separate_cache_allocations(
+    pool_factory, enabled, arch35, fia_nz
+):
+    pool = pool_factory(enabled=enabled, arch35=arch35, fia_nz=fia_nz)
+    assert pool.use_flash_mla is False
     key, rope = pool.get_kv_buffer(0)
     assert key.is_contiguous() and rope.is_contiguous()
     assert key.untyped_storage().data_ptr() != rope.untyped_storage().data_ptr()
