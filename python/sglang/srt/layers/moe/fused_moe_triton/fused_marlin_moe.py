@@ -305,15 +305,14 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
-    intermediate_cache13 = torch.zeros(
-        (M * topk_ids.shape[1] * max(gemm1_n, K),),
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
-    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
+    intermediate_cache3 = intermediate_cache13[: M * topk * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
@@ -381,9 +380,9 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
-        intermediate_cache3.zero_()
-
+    # Gate-up is dead after activation, so its storage can hold the down output.
+    # Skipped down routes must start at zero before the top-k reduction.
+    intermediate_cache3.zero_()
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
