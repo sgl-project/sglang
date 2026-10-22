@@ -12,25 +12,13 @@ from huggingface_hub import snapshot_download
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+    fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
 )
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
@@ -49,12 +37,10 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    draft_attn_parallel_group,
     get_exec,
     get_parallel,
     get_spec,
@@ -62,13 +48,11 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
     is_xpu,
-    next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
@@ -79,7 +63,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -87,10 +70,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 logger = logging.getLogger(__name__)
@@ -349,20 +328,6 @@ def spec_need_hidden_states() -> bool:
     if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not spec.enable_multi_layer_eagle
-
-
-@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
-def create_num_accept_tokens_filter(
-    num_correct_drafts: torch.Tensor,
-    unfinished_index_device: torch.Tensor,
-    seq_lens: torch.Tensor,
-):
-    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
-    num_accept_tokens_filter[unfinished_index_device] = (
-        num_correct_drafts[unfinished_index_device] + 1
-    )
-    seq_lens.add_(num_correct_drafts + 1)
-    return num_accept_tokens_filter
 
 
 def _select_top_k_tokens_first(
@@ -770,15 +735,13 @@ def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
     Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
-    ``attn_tp_group`` is still the target's.
+    sync) uses ``draft_attn_parallel_group()``. Other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope.
     """
     if not owns_attention:
         return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
-    )
+    group = getattr(get_parallel(), f"{draft_attn_parallel_group()}_group")
+    return patch_tensor_parallel_group(group, owns_attention=True)
 
 
 def spec_stage_span(name: str):
@@ -826,28 +789,11 @@ def move_accept_tokens_to_target_kvcache(
     # The targets lead each request's verify window. Read them from that window,
     # not req_to_token: after verify's read-done the scheduler may hand a finished
     # request's row to a new request.
-    window = batch.out_cache_loc.view(bs, -1)
-    window_rows = torch.arange(bs, device=device)
-    window_starts = torch.zeros_like(num_correct_drafts)
-    if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            window_rows,
-            window.int(),
-            window_starts,
-            num_correct_drafts + 1,
-            tgt_cache_loc,
-            window.shape[1],
-        )
-    else:
-        assign_extend_cache_locs[(bs,)](
-            window_rows,
-            window,
-            window_starts,
-            num_correct_drafts + 1,
-            tgt_cache_loc,
-            window.shape[1],
-            next_power_of_2(bs),
-        )
+    fill_front_out_cache_loc_func(
+        num_correct_drafts + 1,
+        batch.out_cache_loc,
+        tgt_cache_loc,
+    )
     fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,

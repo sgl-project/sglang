@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 import torch
 
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
-from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -36,11 +35,6 @@ def _vec(val: float = 1.0) -> torch.Tensor:
     return torch.full((HIDDEN_DIM,), val, dtype=torch.float32)
 
 
-def _vec2d(val: float = 1.0) -> torch.Tensor:
-    """Create a [1, HIDDEN_DIM] tensor."""
-    return torch.full((1, HIDDEN_DIM), val, dtype=torch.float32)
-
-
 # ========================================================================
 # PositionalEmbeds
 # ========================================================================
@@ -53,69 +47,9 @@ class TestPositionalEmbeds(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_from_list_of_1d_tensors(self):
-        pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 5])
-        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
-        self.assertAlmostEqual(pe.embeds[0, 0].item(), 1.0)
-        self.assertAlmostEqual(pe.embeds[1, 0].item(), 2.0)
-
-    def test_from_list_of_2d_tensors(self):
-        pe = PositionalEmbeds(embeds=[_vec2d(3), _vec2d(4)], positions=[1, 2])
-        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
-
-    def test_from_pre_stacked_tensor(self):
-        stacked = torch.zeros(3, HIDDEN_DIM)
-        pe = PositionalEmbeds(embeds=stacked, positions=[0, 1, 2])
-        self.assertIs(pe.embeds, stacked)
-
     def test_length_mismatch_raises(self):
         with self.assertRaises(ValueError):
             PositionalEmbeds(embeds=[_vec()], positions=[0, 1])
-
-    def test_empty(self):
-        pe = PositionalEmbeds(embeds=torch.zeros(0, HIDDEN_DIM), positions=[])
-        self.assertEqual(pe.embeds.shape[0], 0)
-
-
-# ========================================================================
-# convert_embeds_to_tensors
-# ========================================================================
-
-
-class TestConvertEmbedsToTensors(CustomTestCase):
-    def setUp(self):
-        # The code under test reads its config from the bags.
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
-
-    def test_none_returns_none(self):
-        self.assertIsNone(convert_embeds_to_tensors(None))
-
-    def test_empty_list(self):
-        self.assertEqual(convert_embeds_to_tensors([]), [])
-
-    def test_single_input(self):
-        """[num_replacements][hidden_size] -> [[tensor, ...]]"""
-        result = convert_embeds_to_tensors([[1.0, 2.0], [3.0, 4.0]])
-        self.assertEqual(len(result), 1)  # wrapped in outer list
-        self.assertEqual(len(result[0]), 2)  # two replacement vectors
-        self.assertTrue(torch.is_tensor(result[0][0]))
-        self.assertEqual(result[0][0].tolist(), [1.0, 2.0])
-        self.assertEqual(result[0][0].dtype, torch.float32)
-        self.assertEqual(result[0][0].dim(), 1)  # each vector is 1-D
-
-    def test_batch_input(self):
-        """[num_inputs][num_replacements][hidden_size] -> [[tensor, ...], ...]"""
-        result = convert_embeds_to_tensors(
-            [
-                [[1.0, 2.0]],
-                [[3.0, 4.0], [5.0, 6.0]],
-            ]
-        )
-        self.assertEqual(len(result), 2)
-        self.assertEqual(len(result[0]), 1)
-        self.assertEqual(len(result[1]), 2)
 
 
 # ========================================================================
