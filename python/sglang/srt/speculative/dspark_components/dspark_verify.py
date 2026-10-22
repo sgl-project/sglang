@@ -161,7 +161,7 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            return self.verify_epilogue.read_accept(bs)
+            return self.verify_epilogue.snapshot_accept(bs)
 
         simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
@@ -671,6 +671,8 @@ class DsparkVerifyEpilogue:
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        """Views of the accept buffers: the in-graph accept writes through them
+        (`_accept` passes them as `out`), so they must stay aliases."""
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
@@ -678,6 +680,20 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
+        )
+
+    def snapshot_accept(self, bs: int) -> AcceptOuts:
+        """Clones of the accept buffers for readers outside the graph: the overlap
+        readback on copy_stream may run after the next replay rewrites the buffers.
+        Made on the forward stream; `async_d2h`'s `record_stream` keeps them alive."""
+        views = self.read_accept(bs)
+        return AcceptOuts(
+            correct_len=views.correct_len.clone(),
+            bonus=views.bonus.clone(),
+            cap_trim_lens=views.cap_trim_lens.clone(),
+            commit_lens=views.commit_lens.clone(),
+            new_seq_lens=views.new_seq_lens.clone(),
+            out_tokens=views.out_tokens.clone(),
         )
 
     @property

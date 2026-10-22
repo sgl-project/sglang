@@ -132,5 +132,74 @@ class TestAcceptTailParity(CustomTestCase):
                     self._run(simulated_correct_len, verify_lens)
 
 
+def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+
+
+class TestFoldedAcceptSnapshot(CustomTestCase):
+    """The folded accept's outputs must neither alias the epilogue buffers nor
+    change when the next replay rewrites them: a late overlap readback that saw
+    the next step's accept lengths made TP ranks commit different token counts."""
+
+    def test_folded_accept_outputs_survive_the_next_replay(self):
+        candidates, logits, prefix_lens = _greedy_inputs()
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS + 1,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=_RecordingTpSync(),
+        )
+        epilogue._accept(
+            candidates=candidates,
+            logits=logits,
+            draft_tokens=candidates[:, 1:].contiguous(),
+            seq_lens=prefix_lens,
+        )
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type="test")
+                )
+            )
+        )
+        executor = TargetVerifyExecutor(
+            target_worker=target_worker,
+            gamma=STRIDE - 1,
+            verify_num_draft_tokens=STRIDE,
+            model_runner=None,
+            kv_injector=None,
+            tp_sync=_RecordingTpSync(),
+            verify_epilogue=epilogue,
+        )
+        accept = executor.accept_and_finalize(
+            folded_accept=True,
+            bs=BS,
+            verify_ids_2d=None,
+            target_logits=None,
+            draft_block=None,
+            sampling_info=None,
+            draft_input=None,
+            layout=None,
+            prefix_lens=None,
+            draft_tokens=None,
+        )
+        # Rows match 0, 2 and 4 drafts: commit = correct + bonus = 1, 3, 5.
+        self.assertEqual(accept.commit_lens.tolist(), [1, 3, 5])
+        expected = {
+            field: getattr(accept, field).clone() for field in accept.__struct_fields__
+        }
+        for field in accept.__struct_fields__:
+            self.assertFalse(
+                _shares_storage(
+                    getattr(accept, field), getattr(epilogue, f"{field}_buf")
+                ),
+                field,
+            )
+        for field in accept.__struct_fields__:  # the next verify replay
+            getattr(epilogue, f"{field}_buf").fill_(-1)
+        for field in accept.__struct_fields__:
+            self.assertTrue(torch.equal(getattr(accept, field), expected[field]), field)
+
+
 if __name__ == "__main__":
     unittest.main()
