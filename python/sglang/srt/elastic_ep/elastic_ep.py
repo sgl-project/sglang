@@ -992,20 +992,42 @@ def observe_recovery_membership(
         membership_epoch=membership_epoch,
     )
     state = ElasticEPStateManager.instance()
-    if state is not None and state.recovery_phase == "awaiting_recovery":
-        is_replay = (
+    if state is None:
+        raise RuntimeError("Elastic EP membership state is not initialized.")
+    if state.recovery_phase == "awaiting_recovery":
+        same_fence = (
             state.runtime_instance_id == observation.runtime_instance_id
             and state.recovery_topology_generation == observation.topology_generation
             and state.recovery_rank_offset == observation.rank
             and state.recovery_failed_allocation_incarnation
             == observation.failed_allocation_incarnation
+        )
+        if (
+            same_fence
+            and state.recovery_membership_epoch is not None
+            and observation.membership_epoch < state.recovery_membership_epoch
+        ):
+            raise ValueError("Membership observation is stale or an ABA replay.")
+        is_replay = (
+            same_fence
             and state.recovery_membership_epoch == observation.membership_epoch
         )
         if not is_replay:
             raise ValueError("Recovery membership observation is awaiting recovery.")
-    return publish_membership_observation(
+    elif state.recovery_phase != "idle":
+        raise ValueError(
+            "Recovery membership observation requires an idle recovery state."
+        )
+    key = publish_membership_observation(
         observation, deadline_unix_seconds=deadline_unix_seconds
     )
+    # Admit the failed slot synchronously before acknowledging the observation.
+    # Otherwise a recovery request can reach a survivor before its runner poll
+    # consumes the durable observation and still see the slot as active.
+    if state.recovery_phase == "idle":
+        if not consume_recovery_membership_observation():
+            raise RuntimeError("Elastic EP membership observation was not applied.")
+    return key
 
 
 def consume_recovery_membership_observation(

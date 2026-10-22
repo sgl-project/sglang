@@ -15,6 +15,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     RecoveryOperation,
     ScaleCohort,
+    get_membership_observation,
     get_recovery_operation_for_slot,
     observe_recovery_membership,
     poll_recovery_control_plane,
@@ -217,13 +218,24 @@ def test_membership_observation_accepts_replay_and_rejects_stale_aba_epochs():
         assert publish_membership_observation(observation) == observation_key
         with pytest.raises(ValueError, match="stale|ABA"):
             publish_membership_observation(replace(observation, membership_epoch=8))
-        publish_membership_observation(
-            replace(
-                observation,
-                failed_allocation_incarnation="allocation/8",
-                membership_epoch=10,
-            )
+        replacement = replace(
+            observation,
+            failed_allocation_incarnation="allocation/8",
+            membership_epoch=10,
         )
+        replacement_key = publish_membership_observation(replacement)
+        assert get_membership_observation() == replacement
+        assert replacement_key != observation_key
+        with pytest.raises(ValueError, match="stale|ABA"):
+            publish_membership_observation(replace(replacement, membership_epoch=9))
+        with pytest.raises(ValueError, match="stale|ABA"):
+            publish_membership_observation(
+                replace(
+                    observation,
+                    membership_epoch=10,
+                )
+            )
+        assert get_membership_observation() == replacement
         with pytest.raises(ValueError, match="stale|ABA"):
             publish_membership_observation(observation)
         with pytest.raises(ValueError, match="stale|ABA"):
@@ -400,7 +412,7 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
             failed_allocation_incarnation="inc-1",
             membership_epoch=1,
         )
-        assert state.recovery_phase == "idle"
+        assert state.recovery_phase == "awaiting_recovery"
         assert state.active_ranks_cpu[1].item() == 0
         observe_recovery_membership(
             runtime_instance_id="runtime-1",
@@ -417,7 +429,7 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
                 failed_allocation_incarnation="inc-1",
                 membership_epoch=0,
             )
-        assert poll_recovery_control_plane()
+        assert not poll_recovery_control_plane()
         assert state.recovery_phase == "awaiting_recovery"
         assert state.active_ranks_cpu[1].item() == 0
         observe_recovery_membership(
