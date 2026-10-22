@@ -4295,6 +4295,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return responses[0]
 
         # The scheduler quorum has durably applied this exact observation.
+        # Commit the matching tokenizer-visible recovery state before the HTTP
+        # handler acknowledges membership. Synchronous scheduler admission has
+        # already consumed the observation, so a later scheduler poll cannot be
+        # relied on to publish this transition back to the tokenizer.
+        self.elastic_recovery_topology_generation = obj.topology_generation
+        self.elastic_recovery_rank_offset = obj.rank
+        self.elastic_recovery_failed_allocation_incarnation = (
+            obj.failed_allocation_incarnation
+        )
+        self.elastic_recovery_phase = "awaiting_recovery"
+        self.elastic_recovery_succeeded = None
+        self.elastic_recovery_error = None
+
         # Fence the local routing view and publish it to the DPC on the same
         # ordered control channel used by the subsequent recovery request.
         self._elastic_membership_fences[obj.rank] = (*fence, obj.membership_epoch)

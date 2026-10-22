@@ -632,6 +632,21 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                 observation_result = await observation_task
                 self.assertTrue(observation_result.accepted)
                 self.assertEqual(observation_result.observation_key, "observation-key")
+                status_before_recovery = manager.get_elastic_ep_state()
+                self.assertEqual(
+                    status_before_recovery["recovery_phase"], "awaiting_recovery"
+                )
+                self.assertIsNone(status_before_recovery["recovery_operation_id"])
+                self.assertEqual(
+                    status_before_recovery["recovery_topology_generation"], 3
+                )
+                self.assertEqual(status_before_recovery["recovery_rank_offset"], 1)
+                self.assertEqual(
+                    status_before_recovery["recovery_failed_allocation_incarnation"],
+                    "failed-pod-uid",
+                )
+                self.assertIsNone(status_before_recovery["recovery_succeeded"])
+                self.assertIsNone(status_before_recovery["recovery_error"])
 
             ranks = sock_recv(dpc_receiver)
             self.assertIsInstance(ranks, ActiveRanksOutput)
