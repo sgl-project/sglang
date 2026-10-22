@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
+    LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -732,6 +733,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if self.selector is not None and self._draft_sampler is None:
+                # No captured graph runs the selector, so its kernels (flashinfer's
+                # top-k may JIT for minutes) would first build in a served decode,
+                # under the scheduler watchdog.
+                self._warm_eager_selector()
+
+    def _warm_eager_selector(self) -> None:
+        hidden = torch.zeros(
+            (int(self.block_size), int(self.draft_model.config.hidden_size)),
+            dtype=self.draft_model_runner.dtype,
+            device=self.device,
+        )
+        self._propose_selector_block(
+            draft_logits_output=LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=hidden
+            ),
+            bs=1,
+            lm_head=unwrap_lora_layer(self._target_worker.model_runner.model.lm_head),
+            anchor_token_ids=torch.zeros((1,), dtype=torch.int64, device=self.device),
+            sampling_info=None,
+        )
 
     def _prewarm_batch_size(self, block_size: int) -> int:
         """Largest batch the non-greedy verify path can see in one step."""
