@@ -667,6 +667,7 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
         pool.lora_added_tokens_size = 0
         pool.pin_memory_available = False
         pool.enable_lora_overlap_loading = False
+        pool.max_rank_spaced_layout = False
         pool.base_model = object()
         pool.A_buffer = {
             "down_proj": [torch.full((1, 2, 3), -1.0)],
@@ -733,6 +734,7 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
         pool.lora_added_tokens_size = 0
         pool.pin_memory_available = False
         pool.enable_lora_overlap_loading = False
+        pool.max_rank_spaced_layout = False
         pool.base_model = object()
         pool.A_buffer = {
             "gate_up_proj": [torch.full((1, 4, 5), -7.0)],
@@ -839,6 +841,7 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                 pool.lora_added_tokens_size = 0
                 pool.pin_memory_available = False
                 pool.enable_lora_overlap_loading = False
+                pool.max_rank_spaced_layout = False
                 pool.base_model = object()
                 pool.A_buffer = {
                     f"gate_up_proj{suffix}": [torch.full((1, 1, 4, 5), -1.0)],
@@ -893,6 +896,74 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                 self.assertEqual(
                     torch.count_nonzero(pool.B_buffer[f"gate_up_proj{suffix}"][0]), 0
                 )
+
+
+class TestMaxRankSpacedDenseLoad(unittest.TestCase):
+    def test_stacked_a_spaced_at_max_rank_and_stale_tails_zeroed(self):
+        """A low-rank adapter reusing a higher-rank slot must land with stacked A
+        slice p at row p * max_lora_rank and zeroed rank tails."""
+        max_r, r, hidden, out = 4, 2, 5, 6
+        pool = _make_pool(
+            num_experts_global=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.num_layer = 1
+        pool.tp_rank = 0
+        pool.max_lora_rank = max_r
+        pool.target_modules = {"qkv_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = True
+        pool.lora_added_tokens_size = 0
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.max_rank_spaced_layout = True
+        pool.base_model = object()
+        # Stale contents left by an evicted rank-max_r adapter.
+        pool.A_buffer = {"qkv_proj": [torch.full((1, 3 * max_r, hidden), -7.0)]}
+        pool.B_buffer = {"qkv_proj": [torch.full((1, out, max_r), -7.0)]}
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        qkv_a = torch.arange(3 * r * hidden, dtype=torch.float32).reshape(3 * r, hidden)
+        qkv_b = torch.arange(out * r, dtype=torch.float32).reshape(out, r)
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=r),
+            scaling=1.0,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        "model.layers.0.self_attn.qkv_proj.lora_A.weight": qkv_a,
+                        "model.layers.0.self_attn.qkv_proj.lora_B.weight": qkv_b,
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={},
+            added_tokens_embeddings={},
+        )
+
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="rank2",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{"model.layers.0.self_attn.qkv_proj": _FakeDenseLayer()}],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        expected_a = torch.zeros(3 * max_r, hidden)
+        for p in range(3):
+            expected_a[p * max_r : p * max_r + r] = qkv_a[p * r : (p + 1) * r]
+        expected_b = torch.zeros(out, max_r)
+        expected_b[:, :r] = qkv_b
+        torch.testing.assert_close(pool.A_buffer["qkv_proj"][0][0], expected_a)
+        torch.testing.assert_close(pool.B_buffer["qkv_proj"][0][0], expected_b)
 
 
 class TestModuleLevelHelpers(unittest.TestCase):
@@ -1366,6 +1437,7 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         pool.experts_shared_outer_loras = False
         pool.strict_loading = False
         pool.lora_added_tokens_size = 0
+        pool.max_rank_spaced_layout = False
         # Tiny placeholder buffers — the mocked slicer raises before any of
         # this is read in the buffer-copy phase.
         pool.A_buffer = {
