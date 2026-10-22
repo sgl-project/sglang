@@ -1,4 +1,5 @@
 import enum
+import functools
 import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -63,8 +64,10 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     make_layers,
@@ -77,7 +80,30 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# The fused attention prologue is a gfx950-only aiter op; gate the arch here so
+# other HIP devices never take the fused path (and never pay a double qkv_proj).
+_use_fused_prologue = _use_aiter and is_gfx95_supported()
 _is_amx_available = cpu_has_amx_support()
+
+
+@functools.lru_cache(maxsize=1)
+def _fused_attention_prologue():
+    """Return the aiter fused-prologue ops, or None if this build lacks them.
+
+    Fails closed: a build whose aiter does not ship the op falls back to the
+    native prologue instead of raising ImportError.
+    """
+    if not _use_fused_prologue:
+        return None
+    try:
+        from aiter.ops.triton.attention.fused_attention_qk_norm_rope import (
+            fused_attention_qk_norm_rope,
+            fused_attention_qk_norm_rope_supported,
+        )
+    except ImportError:
+        return None
+    return fused_attention_qk_norm_rope, fused_attention_qk_norm_rope_supported
 
 
 if _is_npu:
@@ -740,6 +766,31 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def forward_prepare_fused(self, positions, hidden_states):
+        # gfx950 single-launch prologue: [Q||gate] split + Q/K GemmaRMSNorm +
+        # partial RoPE. Returns None when unavailable or unsupported so the
+        # caller falls back to the native prologue.
+        ops = _fused_attention_prologue()
+        if ops is None:
+            return None
+        fused_prologue, prologue_supported = ops
+        qkv, _ = self.qkv_proj(hidden_states)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        ok, _ = prologue_supported(
+            qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
+        )
+        if not ok:
+            return None
+        query, gate, key, value = fused_prologue(
+            qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
+        )
+        return (
+            query.reshape(-1, self.q_size),
+            key.reshape(-1, self.kv_size),
+            value.reshape(-1, self.kv_size),
+            gate.reshape(-1, self.q_size),
+        )
+
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -786,7 +837,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if (
+        fused = None
+        if _use_fused_prologue and self.attn_output_gate:
+            fused = self.forward_prepare_fused(positions, hidden_states)
+        if fused is not None:
+            q, k, v, gate = fused
+        elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
