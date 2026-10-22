@@ -350,6 +350,7 @@ class BeamMoE(nn.Module):
             and _is_cuda
             and self.tp_size == 4
             and self.ep_size == 1
+            and self.experts.w13_weight.dtype == torch.bfloat16
             and tuple(self.experts.w13_weight.shape) == (256, 1280, 5120)
             and torch.cuda.get_device_capability() == (10, 3)
         )
