@@ -189,10 +189,12 @@ def _run_marlin_flow(
         fused_tails=0,
         marlin_is_ep=[],
         marlin_sorted=[],
+        marlin_inactive_prefix=[],
         marlin_output_ids=[],
         marlin_output_initialized=[],
         marlin_zero_inactive_output=[],
         align_num_experts=[],
+        align_inactive_prefix=[],
         schedule=[],
         zeroed=[],
         event_records=[],
@@ -274,8 +276,11 @@ def _run_marlin_flow(
                 "intermediate_id": buffer_id,
                 "shared_b": kwargs["experts_shared_outer_loras_b"],
                 "zero_intermediate": kwargs.get("zero_intermediate", False),
+                "include_inactive_routes": kwargs["include_inactive_routes"],
             }
         )
+        assert kwargs["adapter_enabled"] is lora_info.adapter_enabled
+        assert kwargs["include_inactive_routes"] is True
 
     _stub_module(
         monkeypatch,
@@ -301,6 +306,9 @@ def _run_marlin_flow(
 
     def fake_align(_topk_ids, _block_size, num_experts, **_kwargs):
         calls.align_num_experts.append(num_experts)
+        calls.align_inactive_prefix.append(
+            _kwargs.get("return_inactive_prefix_count", False)
+        )
         return (
             torch.zeros(1, dtype=torch.int32),
             torch.zeros(1, dtype=torch.int32),
@@ -310,6 +318,9 @@ def _run_marlin_flow(
     def fake_marlin_gemm(_x, output, *_args, **kwargs):
         calls.marlin_is_ep.append(kwargs["is_ep"])
         calls.marlin_sorted.append(kwargs.get("expert_ids_are_sorted", False))
+        calls.marlin_inactive_prefix.append(
+            kwargs.get("has_inactive_prefix_count", False)
+        )
         calls.marlin_zero_inactive_output.append(
             kwargs.get("zero_inactive_output", False)
         )
@@ -324,12 +335,8 @@ def _run_marlin_flow(
         output.fill_(0)
         return output
 
-    def fake_silu_and_mul_add_delta(
-        _x, _delta, output, *, topk_ids, token_lora_mapping, adapter_enabled
-    ):
-        assert topk_ids is dispatch_output.topk_output.topk_ids
-        assert token_lora_mapping is lora_info.token_lora_mapping
-        assert adapter_enabled is lora_info.adapter_enabled
+    def fake_silu_and_mul_add_delta(_x, _delta, output, **kwargs):
+        assert not kwargs, "Completed private projections use the original activation"
         calls.schedule.append(("activation", stream_state["current"].name))
         output.fill_(0)
 
@@ -443,8 +450,10 @@ def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
     assert calls.align_num_experts == [1]
     assert calls.marlin_is_ep == [True, True]
     assert calls.marlin_sorted == [False, False]
+    assert calls.align_inactive_prefix == [False]
+    assert calls.marlin_inactive_prefix == [False, False]
 
-    assert calls.marlin_zero_inactive_output == [False, True]
+    assert calls.marlin_zero_inactive_output == [True, True]
     assert not any(calls.marlin_output_initialized)
 
     down_stage = [
@@ -471,6 +480,8 @@ def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifeti
     )
 
     assert calls.marlin_sorted == [True, True]
+    assert calls.align_inactive_prefix == [True]
+    assert calls.marlin_inactive_prefix == [True, True]
 
     # Capture records the LoRA stages even with no live adapter.
     shrinks = [call for call in calls.merged if call["stage"] == "shrink"]

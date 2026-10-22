@@ -416,7 +416,9 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
 
             sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_align_single_token(local_topk_ids, block_size_m)
+                moe_align_single_token(
+                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
+                )
             )
         else:
             align_num_experts = (
@@ -425,7 +427,10 @@ class MuseSpark1xFp4Experts(nn.Module):
                 else self.num_local_experts
             )
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                local_topk_ids, block_size_m, align_num_experts
+                local_topk_ids,
+                block_size_m,
+                align_num_experts,
+                return_inactive_prefix_count=expert_map is None,
             )
 
         # Both aligners emit ascending block IDs with inactive blocks first;
@@ -472,6 +477,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_fp32_reduce=True,
             is_zp_float=False,
             expert_ids_are_sorted=True,
+            has_inactive_prefix_count=expert_map is None,
         )
         silu_and_mul(
             cache1.view(-1, gemm1_n),
@@ -507,6 +513,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_fp32_reduce=True,
             is_zp_float=False,
             expert_ids_are_sorted=True,
+            has_inactive_prefix_count=expert_map is None,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
     def _forward_marlin(

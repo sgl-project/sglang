@@ -1166,7 +1166,8 @@ def _check_marlin_inactive_routes(
             assert projections == [False, True] * 4
 
 
-def test_moe_wna16_marlin_inactive_output_ownership():
+@pytest.mark.parametrize("has_inactive_prefix_count", [False, True])
+def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
     """Inactive-output policy honors sorted/EP routing and ignores unused tails."""
     torch.manual_seed(57)
     m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
@@ -1201,8 +1202,15 @@ def test_moe_wna16_marlin_inactive_output_ownership():
         ("valid-sorted", (0, 1, 2), True, False, False),
     )
     for case, route_ids, sorted_proof, scatter, is_ep in cases:
+        if has_inactive_prefix_count and not sorted_proof:
+            continue
         ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
-        sorted_ids, expert_ids, num_post = moe_align_block_size(ids, block_m, e)
+        sorted_ids, expert_ids, num_post = moe_align_block_size(
+            ids,
+            block_m,
+            e,
+            return_inactive_prefix_count=has_inactive_prefix_count,
+        )
         if scatter:
             # Keep the matching token blocks, but move the inactive block to
             # the middle so a first-ID shortcut without proof would be unsafe.
@@ -1222,7 +1230,9 @@ def test_moe_wna16_marlin_inactive_output_ownership():
                     (empty_block, sorted_ids[: used_blocks * block_m])
                 )
                 expert_ids = torch.cat((expert_ids[:1], expert_ids[:used_blocks]))
-                num_post.add_(block_m)
+                num_post[0].add_(block_m)
+                if has_inactive_prefix_count:
+                    num_post[1].add_(1)
                 used_blocks += 1
             # Only the published prefix is ordered. A binary search or scan
             # over allocated capacity would miscount these extra negative IDs.
@@ -1237,8 +1247,15 @@ def test_moe_wna16_marlin_inactive_output_ownership():
                 )
             )
 
+        if not has_inactive_prefix_count and case == "valid-sorted":
+            # An allocated second word is not a producer certificate. The
+            # legacy path must ignore it and discover its own prefix.
+            num_post = torch.cat((num_post, torch.full_like(num_post, 0x3FFFFFFF)))
+
         def gemm(*args, **kwargs):
             kwargs["is_ep"] = is_ep
+            if has_inactive_prefix_count:
+                kwargs["has_inactive_prefix_count"] = True
             if sorted_proof:
                 kwargs["expert_ids_are_sorted"] = True
             return moe_wna16_marlin_gemm(*args, **kwargs)
@@ -1360,6 +1377,117 @@ def test_marlin_lora_direct_inactive_routes():
     assert torch.count_nonzero(gate_output[ids < 0]) == 0
     assert torch.count_nonzero(down_output[ids < 0]) == 0
 
+    # A dense oracle for both real adapter slots keeps the selected projection
+    # independent of the kernels' inactive-address and payload masks.
+    finite_shared = torch.stack((shared, shared * 2))
+    finite_gate_b = torch.cat((gate_b, gate_b * 1.5))
+    finite_down_a = torch.cat((down_a, down_a * -0.75))
+    finite_activation = torch.randn_like(activation)
+    dense_gate = (
+        torch.einsum(
+            "smhr,sehir->smehi",
+            finite_shared.view(2, rows, 2, rank).float(),
+            finite_gate_b.view(2, experts, 2, intermediate, rank).float(),
+        )
+        .flatten(-2)
+        .to(gate_output.dtype)
+    )
+    dense_down = torch.einsum(
+        "mti,seri->smter",
+        finite_activation.view(rows, topk, intermediate).float(),
+        finite_down_a.float(),
+    ).to(down_output.dtype)
+    slot_shared = finite_shared.clone()
+    slot_gate_b = finite_gate_b.clone()
+    slot_down_a = finite_down_a.clone()
+    route_ids = torch.arange(topk, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    route_index = torch.arange(topk, device="cuda")
+    states = (
+        ("valid", (0, 1, 0), (1, 1)),
+        ("disabled", (0, 1, 0), (1, 0)),
+        ("missing-or-out-of-range", (0, -1, 2), (1, 1)),
+        ("zero", (0, 1, 0), (1, 1)),
+        ("recovery", (0, 1, 0), (1, 1)),
+    )
+    for enabled_dtype in (torch.bool, torch.int32, torch.int64):
+        # The optional metadata accepts a strided one-dimensional view.
+        enabled = torch.ones(4, device="cuda", dtype=enabled_dtype)[::2]
+
+        def project_enabled():
+            direct_decode_gate_expand(
+                slot_shared,
+                slot_gate_b,
+                ids,
+                slots,
+                gate_output,
+                adapter_enabled=enabled,
+            )
+            direct_decode_down_shrink(
+                activation,
+                slot_down_a,
+                ids,
+                slots,
+                down_output,
+                adapter_enabled=enabled,
+            )
+
+        ids.copy_(route_ids)
+        slots.copy_(torch.tensor(states[0][1], device="cuda", dtype=slots.dtype))
+        activation.copy_(finite_activation)
+        project_enabled()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            project_enabled()
+        for state, mapping, flags in states:
+            ids.copy_(route_ids)
+            slots.copy_(torch.tensor(mapping, device="cuda", dtype=slots.dtype))
+            enabled.copy_(torch.tensor(flags, device="cuda", dtype=enabled_dtype))
+            slot_shared.copy_(finite_shared)
+            slot_gate_b.copy_(finite_gate_b)
+            slot_down_a.copy_(finite_down_a)
+            activation.copy_(finite_activation)
+            if state == "disabled":
+                slot_shared[1].fill_(float("nan"))
+                slot_gate_b[1].fill_(float("nan"))
+                slot_down_a[1].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1].fill_(float("nan"))
+            elif state == "missing-or-out-of-range":
+                slot_shared[:, 1:].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1:].fill_(float("nan"))
+            elif state == "zero":
+                ids.fill_(-1)
+                slot_shared.fill_(float("nan"))
+                slot_gate_b.fill_(float("nan"))
+                slot_down_a.fill_(float("nan"))
+                activation.fill_(float("nan"))
+            gate_output.fill_(float("nan"))
+            down_output.fill_(float("nan"))
+            graph.replay()
+            expected_gate.zero_()
+            expected_down.zero_()
+            active_rows = []
+            if state != "zero":
+                for token, slot in enumerate(mapping):
+                    if 0 <= slot < len(flags) and flags[slot]:
+                        active_rows.append(token)
+                        expected_gate[token] = dense_gate[slot, token, route_index]
+                        expected_down[token] = dense_down[
+                            slot, token, route_index, route_index
+                        ]
+            torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
+            torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
+            assert torch.isfinite(gate_output).all()
+            assert torch.isfinite(down_output).all()
+            inactive_rows = [token for token in range(rows) if token not in active_rows]
+            assert torch.count_nonzero(gate_output[inactive_rows]) == 0
+            assert torch.count_nonzero(down_output[inactive_rows]) == 0
+            if active_rows:
+                # Slot zero is a loaded adapter and must remain a real projection.
+                assert 0 in active_rows
+                assert torch.count_nonzero(expected_gate[0]) > 0
+                assert torch.count_nonzero(expected_down[0]) > 0
+
 
 @pytest.mark.parametrize("use_expert_map", [False, True])
 @pytest.mark.parametrize("weight_first", [False, True])
@@ -1439,6 +1567,13 @@ def test_muse_marlin_inactive_routes(
     projection_buffers = []
 
     def record_projection_buffer(a, c, *args, **kwargs):
+        assert kwargs["is_ep"] is use_expert_map
+        assert kwargs["has_inactive_prefix_count"] is (not use_expert_map)
+        count = args[10]
+        assert count.shape == ((1,) if use_expert_map else (2,))
+        assert count.dtype == torch.int32 and count.is_contiguous()
+        if not use_expert_map:
+            assert count.data_ptr() % 8 == 0
         projection_buffers.append(c)
         c.fill_(float("nan"))
         c[local_ids.reshape(-1) < 0, 0] = float("inf")

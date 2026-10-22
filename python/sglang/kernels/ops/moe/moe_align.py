@@ -11,8 +11,11 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_moe_align_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_moe_align_module(
+    dtype: torch.dtype,
+    write_inactive_prefix_count: bool = False,
+) -> Module:
+    args = make_cpp_args(dtype, write_inactive_prefix_count)
     return load_jit(
         "moe_align_block_size",
         *args,
@@ -32,8 +35,14 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     cumsum_buffer: torch.Tensor,
     pad_sorted_token_ids: bool = False,
+    *,
+    write_inactive_prefix_count: bool = False,
 ) -> None:
-    module = _jit_moe_align_module(topk_ids.dtype)
+    """Align +1-offset buckets, optionally publishing a padded-token/block pair.
+
+    ``write_inactive_prefix_count`` requires an aligned int32[2] count output.
+    """
+    module = _jit_moe_align_module(topk_ids.dtype, write_inactive_prefix_count)
     module.moe_align_block_size(
         topk_ids,
         num_experts,
