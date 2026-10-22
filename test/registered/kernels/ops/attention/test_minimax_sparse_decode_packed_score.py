@@ -137,8 +137,10 @@ def _traced(case, packed, **kwargs):
     seen = {}
     counter = _Count(fwti._decode_score_packed_kernel)
     with pytest.MonkeyPatch.context() as mp:
-        for name in ("minimax_decode_topk", "minimax_decode_topk_page_table"):
-            orig = getattr(topk_ops, name)
+        for name, orig in (
+            ("minimax_decode_topk", topk_ops.minimax_decode_topk),
+            ("minimax_decode_topk_page_table", topk_ops.minimax_decode_topk_page_table),
+        ):
 
             def spy(score, *args, _orig=orig, **kw):
                 seen["score"] = score.clone()
@@ -158,15 +160,34 @@ def _assert_rows_equal(got, want, case, skip_trivial):
         assert torch.equal(got[:, r, :nb], want[:, r, :nb]), f"row {r} ({nb} blocks)"
 
 
-def _assert_selection_equal(got, want, case, dense):
+def _selected_blocks(idx, case, dense):
+    # The radix top-k places final-round ties by atomic order, so tied blocks may swap.
     if not dense:  # block ids: front-packed, -1 padded
-        assert torch.equal(got, want)
-        return
-    # page table: a row's entries past its selected pages are left unwritten
+        return [row[row >= 0] for row in idx]
+    # page table: each block's first page, mapped back to its block of the request
     blocks = ((case.seq_lens + case.blk - 1) // case.blk).clamp(max=TOPK)
+    ppb = case.blk // PAGE
+    out = []
     for r, nb in enumerate(blocks.tolist()):
-        n = nb * (case.blk // PAGE)
-        assert torch.equal(got[r, :n], want[r, :n]), f"row {r} ({n} pages)"
+        req = case.req_to_token[int(case.slot_ids[r])]
+        page_to_block = {
+            int(p) // PAGE: b for b, p in enumerate(req[:: case.blk].tolist())
+        }
+        out.append(
+            torch.tensor([page_to_block[int(p)] for p in idx[r, : nb * ppb : ppb]])
+        )
+    return out
+
+
+def _assert_selection_equal(got, want, score, case, dense):
+    # Tie-invariant: the scores are already equal, so equal selections hold equal scores.
+    for r, (g, w) in enumerate(
+        zip(_selected_blocks(got, case, dense), _selected_blocks(want, case, dense))
+    ):
+        assert g.numel() == w.numel(), f"row {r}"
+        sg = score[0, r, g.to(score.device).long()].sort().values
+        sw = score[0, r, w.to(score.device).long()].sort().values
+        assert torch.equal(sg, sw), f"row {r}"
 
 
 def _check_pair(case, dense):
@@ -179,7 +200,7 @@ def _check_pair(case, dense):
         )
     assert per_row_launches == 0 and packed_launches == 1
     _assert_rows_equal(got_score, want_score, case, skip_trivial=True)
-    _assert_selection_equal(got_idx, want_idx, case, dense)
+    _assert_selection_equal(got_idx, want_idx, want_score, case, dense)
     assert (got_len is None) == (want_len is None)
     if got_len is not None:
         assert torch.equal(got_len, want_len)
@@ -248,10 +269,10 @@ def test_unpackable_batch_falls_back():
     case.q, case.seq_lens, case.slot_ids = (
         t[:-1] for t in (case.q, case.seq_lens, case.slot_ids)
     )
-    (_, want, _), _, _ = _traced(case, False, dense=False)
+    (_, want, _), want_score, _ = _traced(case, False, dense=False)
     (_, got, _), _, launches = _traced(case, True, dense=False)
     assert launches == 0
-    assert torch.equal(got, want)
+    _assert_selection_equal(got, want, want_score, case, dense=False)
 
 
 @pytest.mark.parametrize("dense", [False, True], ids=["block_ids", "page_table"])
@@ -276,8 +297,8 @@ def test_graph_replay_at_longer_context(dense):
         want, want_score, _ = _traced(case, False, dense=dense, max_seqlen=MAX_CONTEXT)
     assert launches == 1
     _assert_rows_equal(got_score, want_score, case, skip_trivial=True)
-    _assert_selection_equal(out[1], want[1], case, dense)
-    if dense:
+    _assert_selection_equal(out[1], want[1], want_score, case, dense)
+    if dense:  # the forced local block holds the partial tail, so lengths never tie
         assert torch.equal(out[2], want[2])
 
 
