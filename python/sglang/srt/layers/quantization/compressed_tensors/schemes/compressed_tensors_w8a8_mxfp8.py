@@ -92,7 +92,21 @@ class CompressedTensorsW8A8MXFp8(CompressedTensorsLinearScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Checkpoint layout is kept as-is: weight [N, K] e4m3, weight_scale
         # [N, K // 32] ue8m0 bytes, which xpu_mxfp8_scaled_mm_linear reads directly.
-        pass
+        # Ensure contiguous once at load time to avoid per-forward allocation.
+        if (
+            hasattr(layer, "weight")
+            and layer.weight is not None
+            and not layer.weight.data.is_contiguous()
+        ):
+            with torch.no_grad():
+                layer.weight.set_(layer.weight.data.contiguous())
+        if (
+            hasattr(layer, "weight_scale")
+            and layer.weight_scale is not None
+            and not layer.weight_scale.data.is_contiguous()
+        ):
+            with torch.no_grad():
+                layer.weight_scale.set_(layer.weight_scale.data.contiguous())
 
     def apply_weights(
         self,

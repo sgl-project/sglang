@@ -22,8 +22,12 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
+    dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
+    mxfp8_group_quantize,
+    prepare_xpu_block_scale_for_scaled_mm,
     torch_w8a8_block_fp8_linear,
+    xpu_mxfp8_scaled_mm_linear,
 )
 from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
 from sglang.srt.server_args import prepare_server_args
@@ -126,6 +130,300 @@ class TestXPUFP8Linear(CustomTestCase):
             q_input, input_scale, weight, block_size, weight_scale
         ).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
+
+    def test_w8a8_mxfp8_dispatch_on_xpu(self):
+        dispatched_fn = dispatch_w8a8_mxfp8_linear()
+        self.assertIs(dispatched_fn, xpu_mxfp8_scaled_mm_linear)
+
+        dispatched_block_fn = dispatch_w8a8_block_fp8_linear(weight_block_size=[1, 32])
+        self.assertIs(dispatched_block_fn, torch_w8a8_block_fp8_linear)
+
+    def test_torch_w8a8_mxfp8_linear_prequantized(self):
+        M, K, N = 8, 256, 384
+        block_k = 32
+        q_input = torch.randn(M, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        input_scale = torch.full(
+            (M, K // block_k), 120, dtype=torch.uint8, device=self.device
+        )
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // block_k), 121, dtype=torch.uint8, device=self.device
+        )
+
+        output = torch_w8a8_block_fp8_linear(
+            q_input,
+            weight,
+            [1, 32],
+            weight_scale,
+            input_scale=input_scale,
+        )
+        input_scale_f = input_scale.view(torch.float8_e8m0fnu).float()
+        weight_scale_f = weight_scale.view(torch.float8_e8m0fnu).float()
+        input_scale_f = input_scale_f.unsqueeze(-1).expand(M, K // block_k, block_k)
+        weight_scale_f = weight_scale_f.unsqueeze(-1).expand(N, K // block_k, block_k)
+        reference = (
+            (q_input.float() * input_scale_f.reshape(M, K))
+            @ (weight.float() * weight_scale_f.reshape(N, K)).t()
+        ).to(torch.bfloat16)
+        self.assertEqual(output.shape, (M, N))
+        torch.testing.assert_close(output, reference, rtol=0.05, atol=0.1)
+
+    def test_torch_w8a8_mxfp8_linear_dynamic(self):
+        M, K, N = 8, 256, 384
+        input_tensor = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // 32), 121, dtype=torch.uint8, device=self.device
+        )
+
+        output = torch_w8a8_block_fp8_linear(
+            input_tensor, weight, [1, 32], weight_scale
+        )
+        self.assertEqual(output.shape, (M, N))
+        self.assertEqual(output.dtype, torch.bfloat16)
+
+    def test_fp8_linear_method_mxfp8_e2e(self):
+        """Verify end-to-end forward through Fp8LinearMethod with use_mxfp8=True."""
+        M, K, N = 8, 256, 384
+        config = Fp8Config(is_checkpoint_fp8_serialized=True, use_mxfp8=True)
+        method = Fp8LinearMethod(config)
+        self.assertTrue(method.use_mxfp8)
+
+        layer = torch.nn.Module()
+        layer.logical_widths = [N]
+        layer.input_size_per_partition = K
+        layer.output_size_per_partition = N
+        layer.orig_dtype = torch.bfloat16
+        layer.weight = torch.nn.Parameter(
+            torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+                torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.full((N, K // 32), 127, dtype=torch.uint8, device=self.device),
+            requires_grad=False,
+        )
+        layer.weight_scale_inv.format_ue8m0 = True
+        layer.input_scale = None
+        layer.deepgemm_mxfp8_input = False
+
+        method.process_weights_after_loading(layer)
+
+        # Dynamic activation quant
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        out_dyn = method.apply(layer, x)
+        self.assertEqual(out_dyn.shape, (M, N))
+        self.assertEqual(out_dyn.dtype, torch.bfloat16)
+
+        # Pre-quantized activation
+        qx = torch.randn(M, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        sx = torch.full((M, K // 32), 127, dtype=torch.uint8, device=self.device)
+        out_pre = method.apply(layer, (qx, sx))
+        self.assertEqual(out_pre.shape, (M, N))
+        self.assertEqual(out_pre.dtype, torch.bfloat16)
+
+    def test_xpu_mxfp8_scaled_mm_linear_3d_prequantized(self):
+        """Verify xpu_mxfp8_scaled_mm_linear correctly handles 3D pre-quantized activation scale."""
+        B, S, K, N = 2, 4, 256, 384
+        block_k = 32
+        qx = torch.randn(B, S, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        sx = torch.full(
+            (B, S, K // block_k), 120, dtype=torch.uint8, device=self.device
+        )
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // block_k), 121, dtype=torch.uint8, device=self.device
+        )
+        output = xpu_mxfp8_scaled_mm_linear(qx, weight, weight_scale, input_scale=sx)
+        self.assertEqual(output.shape, (B, S, N))
+        self.assertEqual(output.dtype, torch.bfloat16)
+
+    def test_mxfp8_group_quantize_non_contiguous_assert(self):
+        """Test that mxfp8_group_quantize asserts on non-contiguous input."""
+        x = torch.randn(8, 64, dtype=torch.bfloat16, device=self.device)[::2, :]
+        self.assertFalse(x.is_contiguous())
+        with self.assertRaises(AssertionError):
+            mxfp8_group_quantize(x)
+
+    def test_mxfp8_group_quantize_accuracy(self):
+        """Test mxfp8_group_quantize matches reference UE8M0 quantization on XPU."""
+        x = torch.randn(8, 64, dtype=torch.bfloat16, device=self.device)
+        q, s = mxfp8_group_quantize(x)
+        self.assertEqual(q.shape, (8, 64))
+        self.assertEqual(s.shape, (8, 2))
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s.dtype, torch.uint8)
+
+        # Compare with mathematical formula
+        blocks = x.float().reshape(8, -1, 32)
+        amax = blocks.abs().amax(-1).clamp(min=1e-10)
+        exp = torch.ceil(torch.log2(amax / torch.finfo(torch.float8_e4m3fn).max))
+        ref_scale = (exp + 127).to(torch.uint8)
+        self.assertTrue(torch.equal(s, ref_scale))
+
+    def test_torch_w8a8_mxfp8_linear_rejects_float32_weight_scale(self):
+        """Verify TypeError when float32 weight_scale is passed to [1, 32] linear."""
+        M, K, N = 8, 256, 384
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        float_weight_scale = torch.ones(
+            (N, K // 32), dtype=torch.float32, device=self.device
+        )
+        with self.assertRaises(TypeError):
+            torch_w8a8_block_fp8_linear(x, weight, [1, 32], float_weight_scale)
+
+    def test_xpu_mxfp8_scaled_mm_linear_validations(self):
+        """Verify input validation errors in xpu_mxfp8_scaled_mm_linear."""
+        M, K, N = 8, 256, 384
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // 32), 127, dtype=torch.uint8, device=self.device
+        )
+
+        # 1. Reject float32 weight_scale
+        with self.assertRaises(TypeError):
+            xpu_mxfp8_scaled_mm_linear(
+                torch.randn(M, K, dtype=torch.bfloat16, device=self.device),
+                weight,
+                torch.ones(N, K // 32, dtype=torch.float32, device=self.device),
+            )
+
+        # 2. Reject non-e4m3fn weight
+        with self.assertRaises(TypeError):
+            xpu_mxfp8_scaled_mm_linear(
+                torch.randn(M, K, dtype=torch.bfloat16, device=self.device),
+                weight.to(torch.bfloat16),
+                weight_scale,
+            )
+
+        # 3. Reject wrong weight_scale shape
+        with self.assertRaises(ValueError):
+            xpu_mxfp8_scaled_mm_linear(
+                torch.randn(M, K, dtype=torch.bfloat16, device=self.device),
+                weight,
+                torch.full((N, 4), 127, dtype=torch.uint8, device=self.device),
+            )
+
+        # 4. Reject non-e4m3fn pre-quantized input
+        with self.assertRaises(TypeError):
+            xpu_mxfp8_scaled_mm_linear(
+                torch.randn(M, K, dtype=torch.bfloat16, device=self.device),
+                weight,
+                weight_scale,
+                input_scale=torch.full(
+                    (M, K // 32), 127, dtype=torch.uint8, device=self.device
+                ),
+            )
+
+        # 5. Reject wrong input_scale shape in pre-quantized mode
+        qx = torch.randn(M, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        with self.assertRaises(ValueError):
+            xpu_mxfp8_scaled_mm_linear(
+                qx,
+                weight,
+                weight_scale,
+                input_scale=torch.full(
+                    (M, 4), 127, dtype=torch.uint8, device=self.device
+                ),
+            )
+
+    def test_xpu_mxfp8_scaled_mm_linear_output_dtype(self):
+        """Verify custom output_dtype support and bias alignment in xpu_mxfp8_scaled_mm_linear."""
+        M, K, N = 8, 256, 384
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // 32), 127, dtype=torch.uint8, device=self.device
+        )
+        bias_fp32 = torch.randn(N, dtype=torch.float32, device=self.device)
+        out_fp16 = xpu_mxfp8_scaled_mm_linear(
+            x, weight, weight_scale, bias=bias_fp32, output_dtype=torch.float16
+        )
+        self.assertEqual(out_fp16.dtype, torch.float16)
+
+    def test_xpu_mxfp8_scaled_mm_linear_non_contiguous_weight(self):
+        """Verify non-contiguous sliced weight is handled properly."""
+        M, K, N = 8, 256, 384
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        # Sliced along dim 1: non-contiguous
+        weight_large = torch.randn(
+            N, K * 2, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        weight_sliced = weight_large[:, :K]
+        self.assertFalse(weight_sliced.is_contiguous())
+        weight_scale = torch.full(
+            (N, K // 32), 127, dtype=torch.uint8, device=self.device
+        )
+        out = xpu_mxfp8_scaled_mm_linear(x, weight_sliced, weight_scale)
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_prepare_xpu_block_scale_for_mxfp8(self):
+        """Verify prepare_xpu_block_scale_for_scaled_mm handles [1, 32] contiguous layout."""
+        N, K_blocks = 64, 8
+        scale_2d = torch.full(
+            (N * 2, K_blocks), 127, dtype=torch.uint8, device=self.device
+        )
+        # Sliced along dim 0 with step 2 is non-contiguous
+        non_contiguous_scale = scale_2d[::2, :]
+        self.assertFalse(non_contiguous_scale.is_contiguous())
+
+        reordered = prepare_xpu_block_scale_for_scaled_mm(
+            non_contiguous_scale,
+            [1, 32],
+            torch_w8a8_block_fp8_linear,
+        )
+        self.assertTrue(reordered.is_contiguous())
+        self.assertEqual(reordered.shape, (N, K_blocks))
+
+    def test_mxfp8_group_quantize_all_zeros(self):
+        """Verify mxfp8_group_quantize works on all-zero inputs."""
+        zero_x = torch.zeros(8, 64, dtype=torch.bfloat16, device=self.device)
+        qz, sz = mxfp8_group_quantize(zero_x)
+        self.assertEqual(qz.shape, (8, 64))
+        self.assertEqual(sz.shape, (8, 2))
+        self.assertTrue(torch.all(qz.view(torch.uint8) == 0))
+
+    def test_mxfp8_float32_input_support(self):
+        """Verify mxfp8_group_quantize and xpu_mxfp8_scaled_mm_linear support float32 directly."""
+        M, K, N = 8, 256, 384
+        x_fp32 = torch.randn(M, K, dtype=torch.float32, device=self.device)
+        q, s = mxfp8_group_quantize(x_fp32)
+        self.assertEqual(q.shape, (M, K))
+        self.assertEqual(s.shape, (M, K // 32))
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s.dtype, torch.uint8)
+
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full(
+            (N, K // 32), 127, dtype=torch.uint8, device=self.device
+        )
+        out = xpu_mxfp8_scaled_mm_linear(x_fp32, weight, weight_scale)
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.float32)
 
     def test_torch_w8a8_block_fp8_linear_shapes_and_dims(self):
         """Test small sizes with varied M, 2D/3D shapes, and bias to keep memory minimal."""
@@ -298,7 +596,7 @@ class TestXPUFP8Linear(CustomTestCase):
             torch.float8_e4m3fn
         )
         weight_scale = torch.ones(2, 2, dtype=torch.float32, device=self.device)
-        for block_size in ([], [128], [128, 128, 128], [1, 32], [64, 64]):
+        for block_size in ([], [128], [128, 128, 128], [64, 64]):
             with self.subTest(block_size=block_size), self.assertRaises(ValueError):
                 torch_w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
 

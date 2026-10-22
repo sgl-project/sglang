@@ -140,6 +140,8 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _is_hip:
     from sglang.srt.layers.quantization import fp8_hip
+if _is_xpu:
+    from sgl_kernel import fused_experts
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -1126,7 +1128,26 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         elif backend.is_xpu_scaled_mm():
             # torch scaled_mm reads the canonical [N, K // 32] ue8m0 bytes in
-            # weight_scale_inv directly; no backend-specific layout to prepare.
+            # weight_scale_inv directly; ensure contiguous once at load time.
+            if (
+                hasattr(layer, "weight")
+                and layer.weight is not None
+                and not layer.weight.data.is_contiguous()
+            ):
+                with torch.no_grad():
+                    layer.weight.set_(layer.weight.data.contiguous())
+            if scale_u8 is not None:
+                copy_or_rebind_param(layer, "weight_scale_inv", scale_u8.contiguous())
+                layer.weight_scale_inv.format_ue8m0 = True
+            elif (
+                hasattr(layer, "weight_scale_inv")
+                and layer.weight_scale_inv is not None
+                and not layer.weight_scale_inv.data.is_contiguous()
+            ):
+                with torch.no_grad():
+                    layer.weight_scale_inv.set_(
+                        layer.weight_scale_inv.data.contiguous()
+                    )
             return
         elif backend.is_gfx95():
             fp8_hip.process_dense_weights(self, layer, scale_u8)
@@ -3295,8 +3316,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _is_xpu and not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
-            from sgl_kernel import fused_experts
-
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
