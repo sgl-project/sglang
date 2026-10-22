@@ -42,8 +42,10 @@ _MXFP4_QUANT_BLOCK_SIZE_TL = tl.constexpr(_MXFP4_QUANT_BLOCK_SIZE)
             args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0
             and args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0
         ),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: (
+            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        ),
     }
 )
 @triton.jit
