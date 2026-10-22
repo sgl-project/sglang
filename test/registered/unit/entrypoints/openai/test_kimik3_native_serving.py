@@ -443,3 +443,72 @@ def test_responses_token_adapter_still_receives_ids_and_finish_metadata():
     assert items[0].content[0].text == "token result"
     assert output.parse_responses_output.call_args.kwargs["output_ids"] == [7, 8]
     assert output.parse_responses_output.call_args.kwargs["finish_reason"] == finish
+
+
+UNCLOSED_RESPONSE = {
+    "before_tool_call": f"{O}response{S}hello" + VALID,
+    "at_stop": f"{O}response{S}hello",
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNCLOSED_RESPONSE))
+def test_reasoning_cleanup_cannot_hide_unclosed_response(case):
+    text = UNCLOSED_RESPONSE[case]
+    reason = "invalid_boundary" if case == "before_tool_call" else "unclosed_channel"
+    for split in range(len(text) + 1):
+        parser = ReasoningParser("kimi_k3", tool_call_parser_active=True)
+        with pytest.raises(KimiK3ParseError, match=reason):
+            parser.parse_stream_chunk(text[:split])
+            parser.parse_stream_chunk(text[split:])
+            parser.parse_stream_end(finish_reason="stop")
+    parser = ReasoningParser("kimi_k3", tool_call_parser_active=True)
+    with pytest.raises(KimiK3ParseError, match=reason):
+        parser.parse_non_stream(text, finish_reason="stop")
+
+
+@pytest.mark.parametrize("case", sorted(UNCLOSED_RESPONSE))
+@pytest.mark.parametrize("per_char", [False, True])
+def test_chat_reasoning_unclosed_response_is_native_error(monkeypatch, case, per_char):
+    text = UNCLOSED_RESPONSE[case]
+    chunks = (
+        [(char, None) for char in text] + [("", "stop")]
+        if per_char
+        else [(text, "stop")]
+    )
+    output = wire(chat(monkeypatch, chunks, reasoning=True))
+    assert "KimiK3NativeOutputError" in output
+    assert '"code": 502' in output or '"code":502' in output
+    assert "[DONE]" not in output
+    frames = [
+        json.loads(line[6:])
+        for line in output.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert not any(
+        choice.get("finish_reason")
+        for frame in frames
+        for choice in frame.get("choices", [])
+    )
+
+
+def test_chat_reasoning_closed_response_before_tool_call_succeeds(monkeypatch):
+    text = f"{O}response{S}hello{C}response{S}" + VALID
+    output = wire(chat(monkeypatch, [(text, "stop")], reasoning=True))
+    assert "echo synthetic" in output
+    assert "[DONE]" in output
+    assert "KimiK3NativeOutputError" not in output
+
+
+@pytest.mark.parametrize("case", sorted(UNCLOSED_RESPONSE))
+def test_responses_reasoning_unclosed_response_never_completes(case):
+    serving = make_serving()
+    serving.tool_call_parser = "kimi_k3"
+    serving.reasoning_parser = "kimi_k3"
+    frames = event_payloads(
+        StreamFixture(serving, responses_request(), require_reasoning=True).run(
+            [engine_chunk(UNCLOSED_RESPONSE[case], finish=True)]
+        )
+    )
+    assert frames[-1]["type"] == "response.failed"
+    assert "Invalid Kimi K3 native output" in frames[-1]["response"]["error"]["message"]
+    assert not any(frame["type"] == "response.completed" for frame in frames)

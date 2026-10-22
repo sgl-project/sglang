@@ -278,3 +278,54 @@ def test_only_proven_stop_suffix_can_be_restored(kind, matched):
         restore_kimik3_stop(section(), {"type": kind, "matched": matched}, tokenizer)
         == section()
     )
+
+
+def guard(chunks, *, allow_incomplete=False):
+    validator = KimiK3HeaderValidator()
+    for chunk in chunks:
+        validator.feed(chunk)
+    validator.finish(allow_incomplete=allow_incomplete)
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        (f"{O}response{S}hello" + section(), "invalid_boundary"),
+        (f"thought{C}think{S}{O}response{S}hello" + section(), "invalid_boundary"),
+        (f"{O}response{S}hello", "unclosed_channel"),
+        (f"{O}response{S}a{O}response{S}b{C}response{S}", "invalid_boundary"),
+        (f"{O}response{S}a{C}message{S}", "invalid_boundary"),
+        (f"{O}response{S}a{C}response{S}{C}message{S}" + section(), "invalid_boundary"),
+    ],
+)
+def test_raw_header_guard_keeps_response_boundaries_cleanup_removes(text, reason):
+    # The raw parser rejects these inputs itself; reasoning cleanup would strip
+    # the response/message markers before the tool parser could see them.
+    with pytest.raises(KimiK3ParseError, match=reason):
+        parse([text])
+    for chunks in schedules(text):
+        with pytest.raises(KimiK3ParseError, match=reason):
+            guard(chunks)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"{O}response{S}hello{C}response{S}" + section(),
+        f"thought{O}response{S}hi{C}response{S}{C}message{S}",
+        f"thought{C}think{S}{O}response{S}hi{C}response{S}{C}message{S}",
+        f"skipped think answer{C}response{S}{C}message{S}",
+        f"{O}response{S}a{C}response{S}{O}response{S}b{C}response{S}",
+        section() + f"{O}response{S}after tools{C}response{S}",
+    ],
+)
+def test_raw_header_guard_accepts_supported_response_transitions(text):
+    parse([text])
+    for chunks in schedules(text):
+        guard(chunks)
+
+
+def test_raw_header_guard_allows_length_inside_response():
+    guard([f"{O}response{S}partial"], allow_incomplete=True)
+    with pytest.raises(KimiK3ParseError, match="unclosed_channel"):
+        guard([f"{O}response{S}partial"])

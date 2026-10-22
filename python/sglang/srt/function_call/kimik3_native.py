@@ -122,9 +122,12 @@ class _JsonQuotes:
 class KimiK3HeaderValidator:
     """Validate raw headers before reasoning parsing can consume the evidence.
 
-    Channel ordering is checked by the tool parser on its own input. This guard
-    only checks header syntax: raw generation may start inside a prefilled think
-    channel, or transition straight to tools without an explicit think close.
+    Tool-section ordering is checked by the tool parser on its own input. This
+    guard checks header syntax plus the response/message boundaries that
+    reasoning cleanup erases before that parser runs. Raw generation may still
+    start inside a prefilled think channel, transition straight to tools or a
+    response without an explicit think close, or end a skipped think channel
+    with a bare response close.
     """
 
     def __init__(self):
@@ -133,6 +136,8 @@ class KimiK3HeaderValidator:
         self.json_argument = False
         self.string_argument = False
         self.quotes = _JsonQuotes()
+        self.response_open = False
+        self.message_closed = False
 
     def feed(self, text: str) -> None:
         if self.failure:
@@ -168,6 +173,7 @@ class KimiK3HeaderValidator:
                 if header is None:
                     break
                 token, name, attrs, _ = header
+                self._channel(token, name)
                 if token == _OPEN and name == "argument":
                     self.json_argument = (
                         _attributes(attrs, {"key", "type"})["type"] != "string"
@@ -182,10 +188,27 @@ class KimiK3HeaderValidator:
             self.failure = error
             raise
 
+    def _channel(self, token: str, name: str) -> None:
+        # Reasoning cleanup strips response wrappers and message closes before
+        # the tool parser sees its input, so these boundaries are enforced here.
+        if self.message_closed:
+            raise KimiK3ParseError("invalid_boundary")
+        if name == "response":
+            if token == _OPEN and self.response_open:
+                raise KimiK3ParseError("invalid_boundary")
+            # A bare close is valid: the prefilled think channel can be skipped.
+            self.response_open = token == _OPEN
+        elif self.response_open:
+            raise KimiK3ParseError("invalid_boundary")
+        elif token == _CLOSE and name == "message":
+            self.message_closed = True
+
     def finish(self, *, allow_incomplete: bool = False) -> None:
         if self.failure:
             raise self.failure
-        if not allow_incomplete and self.pending.startswith((_OPEN, _CLOSE)):
+        if not allow_incomplete and (
+            self.response_open or self.pending.startswith((_OPEN, _CLOSE))
+        ):
             self.failure = KimiK3ParseError("unclosed_channel")
             raise self.failure
 
