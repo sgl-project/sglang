@@ -625,28 +625,49 @@ is re-registered; its circuit breaker will open in the meantime.
 
 ## Native gRPC
 
-`--grpc-port` serves `sglang.api.v1.SglangService/Generate`
-(`proto/sglang/api/v1/service.proto`). The router and engine use the same generated
-`GenerateRequest` and `GenerateStreamItem` types. Workers must expose this service
-on their native Rust server's `--grpc-port`; the router discovers the port from
-`/server_info`. The legacy `sglang.runtime.v1` bridge is not compatible and is no
-longer served by the router.
+`--grpc-port` also serves `sglang.api.v1.SglangService/Generate`
+(`proto/sglang/api/v1/service.proto`) for native Rust engines. It uses the same
+`GenerateRequest` and `GenerateStreamItem` types as the engine. Requests use HTTP
+`/generate` preparation and routing, including text tokenization, sampling
+overrides, PD bootstrap, and DP-rank selection. Replies preserve native token IDs,
+batches, and per-item errors. Non-streaming requests are buffered until completion.
+Metadata supplies routing and trace headers; HTTP credentials are not forwarded.
+Cancellation uses `api.v1.Abort`. Other `api.v1` methods answer `UNIMPLEMENTED`.
+The selected worker must expose the matching service on its discovered gRPC port.
+The existing `runtime.v1` RPCs below remain available for workers that serve them.
 
-Generate uses the HTTP `/generate` preparation and routing pipeline: tokenized
-or text prompts, batches, sampling overrides, PD bootstrap, and DP-rank selection.
-The response stream forwards typed frames and per-item errors without converting
-them into JSON. A non-streaming request still receives a gRPC stream, buffered
-until completion. Other native RPCs currently answer `UNIMPLEMENTED`. The removed
-legacy OpenAI, embedding, classify and rerank RPCs remain available through their
-HTTP endpoints; HTTP requests continue to reach workers over HTTP.
+`--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
+(`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
+router or at an engine. A call is routed exactly like its HTTP route and sent to
+the same RPC on the selected engine's native gRPC server, which engines run
+beside HTTP with their own `--grpc-port`; the router reads that port from each
+worker's `/server_info`. HTTP requests are unaffected and still reach engines
+over HTTP.
 
-Request metadata supplies routing and trace headers. HTTP credentials are not
-forwarded over gRPC. A cancelled call aborts the engine request through
-`api.v1.Abort` when the router owns its rid. Router errors arrive as gRPC statuses
-with an `x-router-error-code` trailer; engine statuses pass through unchanged.
-Batch-item failures remain `GenerateStreamItem` errors and do not terminate the
-other items. A worker without `--grpc-port` cannot serve gRPC calls: registration
-warns, and a routed call fails with `UNAVAILABLE`.
+| RPC | Routed like |
+|---|---|
+| `ChatComplete` | `/v1/chat/completions`: same rendering, `input_ids` forwarding, PD and DP-rank handling |
+| `Complete` | `/v1/completions` |
+| `Generate`, `TextGenerate` | `/generate` with `input_ids` or `text` |
+| `Embed`, `TextEmbed`, `OpenAIEmbed` | `/v1/embeddings` |
+| `Classify`, `OpenAIClassify` | `/v1/classify` |
+| `Rerank` | `/v1/rerank` |
+
+The OpenAI RPCs carry the HTTP route's JSON body, so they are prepared exactly as
+over HTTP. A typed RPC is prepared from its fields with the same rules, and the
+router's additions (rid, PD bootstrap, DP rank, sampling defaults) are set on the
+proto it forwards. A text prompt is tokenized once, as its HTTP route forwards
+`input_ids`: `TextGenerate` is sent as `Generate` with `return_text`, so the engine
+still supplies the text, and `TextEmbed` as `Embed`. They stay text RPCs under
+`--disable-input-ids-forwarding`, without a tokenizer, or, for `TextGenerate`, with
+`return_text_in_logprobs`. Other RPCs, such as
+`Tokenize`, `HealthCheck` and the admin RPCs, answer `UNIMPLEMENTED`. Request metadata and `trace_headers`
+act as HTTP headers for routing and forwarding, and a cancelled call aborts the
+engine request. Router errors arrive as a gRPC status carrying the HTTP path's
+message and an `x-router-error-code` trailer; an engine's status passes through
+unchanged. An engine without `--grpc-port` (including one launched with
+`--api-key`, which native gRPC rejects) cannot serve gRPC calls: the router warns
+when it registers, and calls routed to it fail with `UNAVAILABLE`.
 
 ## Upgrading from `cache_aware_zmq`
 

@@ -9,7 +9,7 @@ use super::preparation::{
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
-use crate::proxy::grpc::{EngineRpc, GrpcResponse};
+use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
+use sglang_api_types::runtime::v1::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -225,12 +226,29 @@ async fn dispatch<T: Transport>(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
+    let additions = Additions {
+        rid: engine_rid.clone(),
+        bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
+            bootstrap_host: bootstrap.host.clone(),
+            bootstrap_port: bootstrap.port.map_or(0, i32::from),
+            bootstrap_room: bootstrap.room as i64,
+        }),
+        sampling_defaults: request.sampling_defaults(),
+        routed_dp_rank: None,
+    };
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_leg = Leg::new(dp_aware, headers.clone(), &body, prefill_rank, None);
+    let prefill_leg = Leg::new(
+        dp_aware,
+        headers.clone(),
+        &body,
+        &additions,
+        prefill_rank,
+        None,
+    );
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -291,7 +309,14 @@ async fn dispatch<T: Transport>(
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let decode_leg = Leg::new(dp_aware, headers, &body, decode_rank, prefill_rank);
+            let decode_leg = Leg::new(
+                dp_aware,
+                headers,
+                &body,
+                &additions,
+                decode_rank,
+                prefill_rank,
+            );
             (
                 decode,
                 decode_leg,
@@ -450,10 +475,11 @@ trait Transport: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
 }
 
-/// One worker's request, prepared identically for HTTP and gRPC.
+/// One worker's request: the HTTP body, and the same additions as typed fields.
 struct Leg {
     headers: HeaderMap,
     body: Bytes,
+    additions: Additions,
 }
 
 impl Leg {
@@ -461,11 +487,21 @@ impl Leg {
         dp_aware: bool,
         headers: HeaderMap,
         body: &Bytes,
+        additions: &Additions,
         rank: Option<u32>,
         prefill_rank: Option<u32>,
     ) -> Self {
         let (headers, body) = with_dp_rank(dp_aware, headers, body, rank, prefill_rank);
-        Self { headers, body }
+        let routed_dp_rank = dp_aware.then_some(rank);
+        let additions = Additions {
+            routed_dp_rank,
+            ..additions.clone()
+        };
+        Self {
+            headers,
+            body,
+            additions,
+        }
     }
 }
 
@@ -597,6 +633,7 @@ impl<R: EngineRpc> Transport for Grpc<R> {
                 &*self.0,
                 &leg.headers,
                 leg.body,
+                &leg.additions,
                 engine_rid,
                 metrics.streaming,
                 Some(guards),
@@ -615,10 +652,11 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         _path: &'static str,
         leg: Leg,
     ) -> PrefillFailure<Self::Response> {
-        let (headers, body) = (&leg.headers, leg.body);
+        let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, None, false, None, None, None, None, None,
+                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                None,
             )
             .await;
         let status = match result {

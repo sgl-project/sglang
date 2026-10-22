@@ -287,11 +287,10 @@ and [rerank](REFERENCE.md#rerank).
 
 ### Native gRPC
 
-`--grpc-port` serves `sglang.api.v1.SglangService/Generate`, using the same
-schema and routing pipeline as HTTP `/generate`. Engines must expose the native
-Rust server's `--grpc-port`. The legacy `sglang.runtime.v1` service is no longer
-served. Other native RPCs currently answer `UNIMPLEMENTED`; HTTP OpenAI,
-Messages, embeddings, classify and rerank routes remain available. See
+`--grpc-port` serves native `sglang.api.v1.SglangService/Generate` alongside the
+existing `sglang.runtime.v1.SglangService`. Each RPC is
+routed like its HTTP route and forwarded to the same RPC on the engine's own
+native gRPC port, so engines must run with `--grpc-port` too. See
 [native gRPC](REFERENCE.md#native-grpc).
 
 ### Bucket file
