@@ -182,6 +182,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         result = SimpleNamespace(
             logits_output=SimpleNamespace(hidden_states=torch.zeros(3, 2)),
             accept_lens=torch.tensor([1]),
+            new_seq_lens=torch.tensor([5]),
             next_token_ids=torch.tensor([3]),
             next_draft_input=SimpleNamespace(),
             prepared_draft_extend_inputs=None,
@@ -328,7 +329,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         self.assertEqual(tuple(info.draft_probs.shape), (0, 128))
         self.assertEqual(tuple(info.draft_prob_token_ids.shape), (0, 128))
 
-    def _build_runner(self, backend):
+    def _build_runner(self, backend, graph_output=None):
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
         runner.synthid_mixed = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
@@ -365,7 +366,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         def replay_graph_stub(shape_key, forward_batch):
             # Observe again during graph replay to catch a premature restore.
             backend.observe("graph_replay", forward_batch)
-            return None
+            return graph_output
 
         runner._replay_graph = replay_graph_stub
         return runner
@@ -614,6 +615,82 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 runner = self._build_synthid_graph_gate(sparse=True)
                 runner.synthid_graph_supported = supported
                 self.assertEqual(runner.can_run_graph(batch), supported)
+
+    def test_seeded_draft_dispatch_preserves_seed_position_and_step(self):
+        """The SynthID dispatch must not discard upstream's per-request RNG keys."""
+        from sglang.srt.speculative.spec_utils import fast_sample
+
+        def hash_coordinates(seed, position, columns):
+            state = (
+                seed.to(torch.int64)[:, None]
+                ^ (position.to(torch.int64)[:, None] * 0x9E3779B9)
+                ^ (columns.to(torch.int64)[None, :] * 0x85EBCA6B)
+            )
+            state = state ^ (state >> 16)
+            return ((state * 0x7FEB352D) & 0xFFFFFFFF).to(torch.uint32)
+
+        seeds = torch.arange(16, dtype=torch.int64)
+        positions = torch.arange(20, 36, dtype=torch.int64)
+        probs = torch.full((16, 2), 0.5)
+        sparse_tokens = torch.tensor([[13, 11]]).expand(16, -1)
+        self.enterContext(
+            patch(
+                "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32",
+                side_effect=hash_coordinates,
+            )
+        )
+        expected_probs, expected_indices = fast_sample(
+            probs, sampling_seed=seeds, positions=positions, draft_step=2
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(watermarked=enabled),
+                get_context().override_server_args(
+                    speculative_use_rejection_sampling=True
+                ),
+                torch.random.fork_rng(devices=[]),
+            ):
+                worker = EagleDraftWorker.__new__(EagleDraftWorker)
+                worker.topk = 1
+                info = SimpleNamespace(
+                    synthid_state=object() if enabled else None,
+                    sampling_seed=seeds,
+                    temperatures=torch.ones(16, 1),
+                    top_ks=torch.full((16,), TOP_K_ALL),
+                    is_all_greedy=False,
+                )
+                sparse = (
+                    SynthIDSparseOutput(scores=probs.log(), token_ids=sparse_tokens)
+                    if enabled
+                    else None
+                )
+                expected_tokens = (
+                    sparse_tokens.sort(dim=-1).values.gather(1, expected_indices)
+                    if enabled
+                    else expected_indices
+                )
+                for rng_seed in (7, 99):
+                    torch.manual_seed(rng_seed)
+                    _, _, actual_probs, actual_tokens = worker._sample_draft_logits(
+                        probs.log(),
+                        info,
+                        synthid_sparse_output=sparse,
+                        positions=positions,
+                        draft_step=2,
+                    )
+                    torch.testing.assert_close(actual_probs, expected_probs)
+                    torch.testing.assert_close(actual_tokens, expected_tokens)
+
+    def test_execute_leaves_graph_output_ownership_to_caller(self):
+        backend = _RecordingDraftBackend()
+        pooled_probs = torch.ones(CAPTURE_BS, NUM_STEPS, 8)
+        graph_output = (None, None, None, pooled_probs)
+        runner = self._build_runner(backend, graph_output=graph_output)
+        forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+
+        output = runner.execute(forward_batch)
+
+        self.assertIs(output[-1], pooled_probs)
 
 
 if __name__ == "__main__":

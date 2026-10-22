@@ -83,6 +83,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_index: torch.Tensor
     draft_probs: Optional[torch.Tensor]
     draft_prob_token_ids: Optional[torch.Tensor]
+    sampling_seed: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -259,6 +260,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 draft_probs = None
                 draft_prob_token_ids = None
+            sampling_seed = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if get_exec().deterministic.enable_deterministic_inference
+                and get_spec().speculative_use_rejection_sampling
+                else None
+            )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
                 model_runner
             )
@@ -331,6 +338,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index=topk_index,
             draft_probs=draft_probs,
             draft_prob_token_ids=draft_prob_token_ids,
+            sampling_seed=sampling_seed,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -556,6 +564,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             synthid_state=synthid_state,
             synthid_force_dense_draft_probs=(
                 self.synthid_watermark is not None and not self.synthid_graph_supported
+            ),
+            sampling_seed=(
+                self.buffers.sampling_seed[:num_seqs]
+                if self.buffers.sampling_seed is not None
+                else None
             ),
         )
 
@@ -813,6 +826,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            if self.buffers.sampling_seed is not None:
+                self.buffers.sampling_seed[:raw_bs].copy_(
+                    forward_batch.sampling_info.sampling_seed[:raw_bs]
+                )
             self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded

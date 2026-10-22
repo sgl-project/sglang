@@ -221,7 +221,7 @@ def apply_synthid_to_draft_logits(
     if has_filters and sampling_info.is_any_greedy:
         _pin_greedy_logits(logits, sampling_info, 1)
     if is_mixed(sampling_info.synthid_state):
-        if not has_filters:
+        if not has_filters and sampling_info.sampling_seed is None:
             sample = processor.try_sample_mixed_draft(
                 logits=logits,
                 temperatures=sampling_info.temperatures,
@@ -263,6 +263,7 @@ def apply_synthid_to_draft_logits(
         return None, None
     if (
         get_spec().speculative_use_rejection_sampling
+        and sampling_info.sampling_seed is None
         and processor.supports_fused_sampling(logits)
         and not has_filters
     ):
@@ -311,6 +312,8 @@ def sample_synthid_draft_logits(
     ],
     use_rejection_sampling: bool,
     topk: int,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
 ):
     from sglang.srt.speculative.spec_utils import fast_sample
 
@@ -337,7 +340,13 @@ def sample_synthid_draft_logits(
                 1, topk_index, 1.0
             )
         else:
-            topk_p, topk_index = fast_sample(proposal_probs, num_samples=1)
+            topk_p, topk_index = fast_sample(
+                proposal_probs,
+                num_samples=1,
+                sampling_seed=sampling_info.sampling_seed,
+                positions=positions,
+                draft_step=draft_step,
+            )
         return proposal_probs, None, topk_p, topk_index
 
     proposal_probs = torch.softmax(sparse_output.scores, dim=-1)
@@ -356,7 +365,13 @@ def sample_synthid_draft_logits(
         sampled_indices = sorted_probs.argmax(dim=-1, keepdim=True)
         sampled_probs = sorted_probs.gather(1, sampled_indices)
     else:
-        sampled_probs, sampled_indices = fast_sample(sorted_probs, num_samples=1)
+        sampled_probs, sampled_indices = fast_sample(
+            sorted_probs,
+            num_samples=1,
+            sampling_seed=sampling_info.sampling_seed,
+            positions=positions,
+            draft_step=draft_step,
+        )
 
     return (
         sorted_probs,

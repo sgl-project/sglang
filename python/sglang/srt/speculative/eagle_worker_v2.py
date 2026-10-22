@@ -242,6 +242,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         synthid_sparse_output=None,
         fused_draft_sample=None,
         positions=None,
+        draft_step: int = 0,
     ):
         if (
             is_enabled(sampling_info.synthid_state)
@@ -256,11 +257,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 fused_draft_sample=fused_draft_sample,
                 use_rejection_sampling=use_rejection_sampling,
                 topk=self.topk if not use_rejection_sampling else 1,
+                positions=positions,
+                draft_step=draft_step,
             )
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
         if use_rejection_sampling:
             draft_probs, topk_p, topk_index = sample_draft_proposal(
-                logits, sampling_info.temperatures, sampling_info.top_ks
+                logits,
+                sampling_info.temperatures,
+                sampling_info.top_ks,
+                sampling_seed=sampling_info.sampling_seed,
+                positions=positions,
+                draft_step=draft_step,
             )
             return draft_probs, None, topk_p, topk_index
         probs = renorm_draft_probs(logits, sampling_info, False)
@@ -945,7 +953,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch.sampling_info,
                         sparse_output,
                         fused_sample,
-                        positions=forward_batch.positions,
+                        positions=forward_batch.positions + 1,
+                        draft_step=i + 1,
                     )
                     if needs_draft_probs:
                         if (
@@ -963,6 +972,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
+                        sampling_seed=forward_batch.sampling_info.sampling_seed,
+                        positions=forward_batch.positions + 1,
+                        draft_step=i + 1,
                     )
                     draft_probs_list.append(probs)
                     draft_prob_token_ids_list.append(None)
@@ -1397,12 +1409,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info,
                 sparse_output,
                 fused_sample,
+                positions=batch_result.new_seq_lens,
             )
         elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch_result.new_seq_lens,
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
@@ -1427,7 +1442,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ) = self._sample_draft_logits(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
-                positions=batch.seq_lens,
+                positions=batch_result.new_seq_lens,
             )
         (
             ret_draft_probs,
