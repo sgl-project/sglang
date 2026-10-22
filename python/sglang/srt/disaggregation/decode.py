@@ -805,7 +805,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         slot_layer_ids=slot_layer_ids,
                     )
         if get_disagg().nixl_use_cpu_buffer:
-            kv_manager.set_cpu_kv_buffers(self.token_to_kv_pool)
+            kv_manager.set_cpu_kv_buffers(
+                self.token_to_kv_pool,
+                restore_stream=(
+                    self.scheduler.tp_worker.model_runner.forward_stream
+                    if self.scheduler.enable_overlap
+                    else None
+                ),
+            )
         return kv_manager
 
     def add(

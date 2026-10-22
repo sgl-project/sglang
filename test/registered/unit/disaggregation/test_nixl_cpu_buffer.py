@@ -1,6 +1,7 @@
 """CPU-buffer PD data integrity and ownership regressions (no GPU required)."""
 
 import ctypes
+import json
 import struct
 import threading
 import unittest
@@ -13,10 +14,11 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
     NixlKVSender,
@@ -45,7 +47,14 @@ def manager(size=1024):
     mgr._deferred_abort_generation = 0
     mgr._deferred_abort_ack_tracker = {}
     mgr.attn_tp_size = 1
-    mgr.kv_args = SimpleNamespace(kv_item_lens=[4], kv_layer_ids=[0])
+    mgr.kv_args = SimpleNamespace(
+        kv_item_lens=[4],
+        kv_layer_ids=[0],
+        state_types=[],
+        state_data_ptrs=[],
+        state_item_lens=[],
+    )
+    mgr._cpu_state_views = []
     mgr._cpu_views = [torch.arange(32, dtype=torch.uint8).reshape(8, 4)]
     return mgr
 
@@ -270,6 +279,44 @@ class TestCpuBufferConfiguration(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "CPU.buffer|cpu.buffer"):
                     handle_pd_disaggregation(ServerArgs(**values))
 
+    def test_state_types_wire_extension_preserves_normal_registration(self):
+        msg = [
+            b"0",
+            b"localhost",
+            b"1",
+            b"peer",
+            b"metadata",
+            struct.pack("Q", 4096),
+            b"",
+            b"",
+            b"0",
+            b"2",
+            b"0",
+            b"4",
+            b"",
+            b"",
+            b"",
+            b"0",
+            b"",
+            b"VRAM",
+            struct.pack("Q", 4),
+            b"",
+            b"",
+            b"1",
+            b"0",
+            b"",
+        ]
+        old = KVArgsRegisterInfo.from_zmq(msg)
+        types = [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED]
+        new = KVArgsRegisterInfo.from_zmq(
+            msg + [CPU_BUFFER_VERSION, json.dumps(types).encode()]
+        )
+        self.assertEqual(old.cpu_buffer_version, b"")
+        self.assertEqual(old.dst_state_types, [])
+        self.assertEqual(new.cpu_buffer_version, CPU_BUFFER_VERSION)
+        self.assertEqual(new.dst_state_types, types)
+        self.assertEqual(old.dst_kv_ptrs, new.dst_kv_ptrs)
+
     def test_optional_receive_region_preserves_existing_wire_frames(self):
         msg = [
             b"7",
@@ -486,6 +533,7 @@ class TestCpuBufferMambaState(CustomTestCase):
         recurrent = torch.zeros((4, 2, 2), dtype=torch.float32)
         mgr.kv_args.kv_data_ptrs = [value.data_ptr(), key.data_ptr()]
         mgr.kv_args.kv_item_lens = [4, 4]
+        mgr.kv_args.state_types = [StateType.MAMBA]
         mgr.kv_args.state_data_ptrs = [[recurrent.data_ptr(), conv.data_ptr()]]
         mgr.kv_args.state_item_lens = [[16, 6]]
         pool = SimpleNamespace(
@@ -500,24 +548,28 @@ class TestCpuBufferMambaState(CustomTestCase):
         self.assertEqual(
             [v.data_ptr() for v in mgr._cpu_views], mgr.kv_args.kv_data_ptrs
         )
-        self.assertEqual([v.shape[1] for v in mgr._cpu_state_views], [16, 6])
+        self.assertEqual([v.shape[1] for v in mgr._cpu_state_views[0]], [16, 6])
         self.assertEqual(
-            [v.data_ptr() for v in mgr._cpu_state_views], mgr.kv_args.state_data_ptrs[0]
+            [v.data_ptr() for v in mgr._cpu_state_views[0]],
+            mgr.kv_args.state_data_ptrs[0],
         )
 
     def test_state_roundtrip_and_abort_share_receive_ownership(self):
         mgr = manager(512)
+        mgr.kv_args.state_types = [StateType.MAMBA]
         mgr._cpu_state_views = [
-            torch.zeros((4, 6), dtype=torch.uint8),
-            torch.zeros((4, 8), dtype=torch.uint8),
+            [
+                torch.zeros((4, 6), dtype=torch.uint8),
+                torch.zeros((4, 8), dtype=torch.uint8),
+            ]
         ]
         region = mgr._allocate_cpu_receive(9, np.array([2]), 2, [[3]])
         region.buffer.copy_(torch.arange(18, dtype=torch.uint8))
         mgr._finish_cpu_receive(9)
         self.assertEqual(mgr._cpu_views[0][2].tolist(), list(range(4)))
-        self.assertEqual(mgr._cpu_state_views[0][3].tolist(), list(range(4, 10)))
-        self.assertEqual(mgr._cpu_state_views[1][3].tolist(), list(range(10, 18)))
-        self.assertEqual(mgr._cpu_state_views[0][:3].count_nonzero(), 0)
+        self.assertEqual(mgr._cpu_state_views[0][0][3].tolist(), list(range(4, 10)))
+        self.assertEqual(mgr._cpu_state_views[0][1][3].tolist(), list(range(10, 18)))
+        self.assertEqual(mgr._cpu_state_views[0][0][:3].count_nonzero(), 0)
         region = mgr._allocate_cpu_receive(10, np.array([], dtype=np.int32), 2, [[1]])
         self.assertEqual(region.buffer.numel(), 14)  # Final state without KV pages.
         region.published = True
@@ -530,7 +582,8 @@ class TestCpuBufferMambaState(CustomTestCase):
 
     def test_state_post_failure_retains_source_and_validates_layout(self):
         mgr = manager(256)
-        mgr._cpu_state_views = [torch.arange(16, dtype=torch.uint8).reshape(4, 4)]
+        mgr.kv_args.state_types = [StateType.MAMBA]
+        mgr._cpu_state_views = [[torch.arange(16, dtype=torch.uint8).reshape(4, 4)]]
         mgr.kv_args.state_item_lens = [[4]]
         mgr.kv_args.state_layer_ids = [[1]]
         mgr.kv_args.state_dim_per_tensor = [[2]]
@@ -540,6 +593,7 @@ class TestCpuBufferMambaState(CustomTestCase):
             dst_dcp_size=1,
             dst_kv_item_lens=[4],
             dst_kv_layer_ids=[0],
+            dst_state_types=[StateType.MAMBA],
             dst_state_item_lens=[[4]],
             dst_state_layer_ids=[[1]],
             dst_state_dim_per_tensor=[[2]],
@@ -573,6 +627,252 @@ class TestCpuBufferMambaState(CustomTestCase):
             with self.subTest(indices=indices), self.assertRaises(ValueError):
                 mgr._allocate_cpu_receive(11, np.array([0]), 1, indices)
         self.assertNotIn(11, mgr._cpu_receives)
+
+
+class TestCpuBufferQsaState(CustomTestCase):
+    def make_manager(self, size=2048):
+        mgr = manager(size)
+        mgr.kv_args.state_types = [
+            StateType.MAMBA,
+            StateType.QSA_PENDING,
+            StateType.QSA_COMPRESSED,
+        ]
+        mgr._cpu_state_views = [
+            [torch.zeros((8, 6), dtype=torch.uint8)],
+            [
+                torch.zeros((8, 16), dtype=torch.uint8),
+                torch.zeros((8, 32), dtype=torch.uint8),
+            ],
+            [
+                torch.zeros((8, 8), dtype=torch.uint8),
+                torch.zeros((8, 4), dtype=torch.uint8),
+            ],
+        ]
+        mgr.kv_args.state_item_lens = [[6], [16, 32], [8, 4]]
+        return mgr
+
+    def test_pending_ring_and_compressed_page_mapping(self):
+        mgr = manager()
+        ratio, page_size = 4, 64
+        key = torch.zeros((128, 2), dtype=torch.bfloat16)
+        pending = torch.zeros((8 * ratio, 2), dtype=torch.bfloat16)
+        positions = torch.zeros((8 * ratio,), dtype=torch.int64)
+        compressed = torch.zeros((128 // ratio, 3), dtype=torch.bfloat16)
+        mgr.kv_args.kv_data_ptrs = [key.data_ptr()]
+        mgr.kv_args.kv_item_lens = [page_size * key[0].nbytes]
+        mgr.kv_args.state_types = [StateType.QSA_PENDING, StateType.QSA_COMPRESSED]
+        mgr.kv_args.state_data_ptrs = [
+            [positions.data_ptr(), pending.data_ptr()],
+            [compressed.data_ptr()],
+        ]
+        mgr.kv_args.state_item_lens = [
+            [ratio * 8, ratio * pending[0].nbytes],
+            [page_size // ratio * compressed[0].nbytes],
+        ]
+        pool = SimpleNamespace(
+            kv_buffer=[key],
+            qsa_key_state_buffer_pool=[pending],
+            qsa_rope_position_buffer=positions,
+            qsa_compressed_k_buffer_pool=[compressed],
+        )
+        mgr.set_cpu_kv_buffers(pool)
+        self.assertEqual(
+            [tuple(v.shape) for v in mgr._cpu_state_views[0]], [(8, 32), (8, 16)]
+        )
+        self.assertEqual(tuple(mgr._cpu_state_views[1][0].shape), (2, 96))
+        # Pending slots are request rows; compressed slots are full-KV pages.
+        mgr._cpu_state_views[0][0][3].fill_(1)
+        self.assertEqual(
+            positions.view(torch.uint8)[3 * 32 : 4 * 32].tolist(), [1] * 32
+        )
+        self.assertEqual(positions[: 3 * ratio].count_nonzero(), 0)
+
+    def test_sparse_multicomponent_transfer_and_reclamation(self):
+        sender, receiver = self.make_manager(), self.make_manager()
+        src_ids = [np.array([5]), np.array([2]), np.array([6, 1, 4])]
+        dst_ids = [np.array([1]), np.array([7]), np.array([0, 5, 2])]
+        for group in sender._cpu_state_views:
+            for view in group:
+                view.copy_(
+                    torch.arange(view.numel(), dtype=torch.uint8).reshape(view.shape)
+                )
+        region = receiver._allocate_cpu_receive(9, np.array([3]), 1, dst_ids)
+        # Exercise sender packing and the exact advertised remote address.
+        sender.agent = MagicMock()
+        sender.agent.get_xfer_descs.side_effect = lambda descs, kind: descs
+
+        def copy_to_remote(op, src, dst, agent, notif):
+            self.assertEqual(op, "WRITE")
+            self.assertEqual(src[0][1], dst[0][1])
+            ctypes.memmove(dst[0][0], src[0][0], src[0][1])
+            return "state"
+
+        sender.agent.initialize_xfer.side_effect = copy_to_remote
+        sender.agent.check_xfer_state.return_value = "DONE"
+        peer = SimpleNamespace(
+            cpu_buffer_version=CPU_BUFFER_VERSION,
+            decode_tp_size=1,
+            dst_dcp_size=1,
+            dst_kv_item_lens=[4],
+            dst_kv_layer_ids=[0],
+            dst_state_types=sender.kv_args.state_types,
+            dst_state_item_lens=sender.kv_args.state_item_lens,
+        )
+        req = SimpleNamespace(
+            cpu_buffer_pages=1,
+            dst_kv_indices=[3],
+            dst_state_indices=dst_ids,
+            cpu_buffer_ptr=region.buffer.data_ptr(),
+            agent_name="peer",
+        )
+        handles = []
+        sender._send_cpu_state(
+            req, peer, SimpleNamespace(state_indices=src_ids), "9_state_0", handles
+        )
+        self.assertEqual(handles, ["state"])
+        receiver._finish_cpu_receive(9)
+        for source, target, si, di in zip(
+            sender._cpu_state_views, receiver._cpu_state_views, src_ids, dst_ids
+        ):
+            for before, after in zip(source, target):
+                self.assertTrue(torch.equal(before[si], after[di]))
+                untouched = [i for i in range(8) if i not in di]
+                self.assertEqual(after[untouched].count_nonzero(), 0)
+        sender._cpu_pool.reap(sender.agent)
+        self.assertFalse(sender._cpu_pool._ranges)
+        self.assertFalse(receiver._cpu_pool._ranges)
+        peer.dst_state_types = list(reversed(peer.dst_state_types))
+        with self.assertRaisesRegex(ValueError, "state layouts"):
+            sender._validate_cpu_peer(peer)
+        peer.dst_state_types = sender.kv_args.state_types
+        peer.cpu_buffer_version = b"cpu-buffer-v2"
+        with self.assertRaises(ValueError):
+            sender._validate_cpu_peer(peer)
+
+    def test_state_pressure_and_all_rank_abort_barrier(self):
+        mgr = self.make_manager(256)
+        indices = [[1], [2], [0, 3, 5]]
+        region = mgr._allocate_cpu_receive(1, np.array([1]), 2, indices)
+        with self.assertRaises(BufferError):
+            mgr._allocate_cpu_receive(2, np.array([2]), 2, indices)
+        self.assertNotIn(2, mgr._cpu_receives)
+        region.published = True
+        generation = mgr.register_deferred_abort_room(1)
+        mgr._clear_cpu_receive(1)
+        mgr.note_abort_ack(1, 0, generation)
+        self.assertIn(1, mgr._cpu_receives)
+        mgr.note_abort_ack(1, 1, generation)
+        self.assertFalse(mgr._cpu_pool._ranges)
+        mgr._allocate_cpu_receive(3, np.array([2]), 2, indices)
+        mgr._clear_cpu_receive(3)
+        self.assertFalse(mgr._cpu_pool._ranges)
+
+    def test_invalid_components_never_allocate(self):
+        mgr = self.make_manager()
+        for ids in (
+            [[1], [2]],
+            [[1, 2], [2], [0]],
+            [[1], [8], [0]],
+            [[1], [2], [-1]],
+            [[1], [2], [0.5]],
+        ):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                mgr._allocate_cpu_receive(1, np.array([0]), 1, ids)
+        self.assertFalse(mgr._cpu_pool._ranges)
+        self.assertFalse(mgr._cpu_receives)
+
+    def test_qsa_retraction_restores_to_new_physical_slots(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+                pool.qsa_compress_ratio = 4
+                pool.qsa_key_state_buffer_pool = [
+                    torch.arange(64).to(torch.bfloat16).reshape(32, 2)
+                ]
+                pool.qsa_rope_position_buffer = torch.arange(
+                    96, dtype=torch.int64
+                ).reshape(32, 3)
+                pool.qsa_compressed_k_buffer_pool = [
+                    torch.arange(48).to(dtype).reshape(16, 3)
+                ]
+                src = torch.tensor([20, 21, 22, 23, 24, 25, 26, 27, 4, 5, 6])
+                dst = torch.tensor([32, 33, 34, 35, 36, 37, 38, 39, 12, 13, 14])
+                tensors = [
+                    *pool.qsa_key_state_buffer_pool,
+                    pool.qsa_rope_position_buffer,
+                    *pool.qsa_compressed_k_buffer_pool,
+                ]
+                original = [t.clone() for t in tensors]
+                with patch.object(
+                    HybridLinearKVPool, "get_cpu_copy", return_value="base"
+                ) as get_base:
+                    backup = pool.get_cpu_copy(src, mamba_indices=5, req_pool_index=2)
+                get_base.assert_called_once_with(src, 5, 2)
+                for tensor in tensors:
+                    tensor.zero_()
+                with patch.object(HybridLinearKVPool, "load_cpu_copy") as load_base:
+                    pool.load_cpu_copy(backup, dst, mamba_indices=1, req_pool_index=6)
+                load_base.assert_called_once_with("base", dst, 1, 6)
+                for before, after in zip(original[:2], tensors[:2]):
+                    self.assertTrue(torch.equal(before[8:12], after[24:28]))
+                    self.assertEqual(after[:24].count_nonzero(), 0)
+                self.assertTrue(
+                    torch.equal(
+                        original[2].view(torch.uint8)[[5, 6, 1]],
+                        tensors[2].view(torch.uint8)[[8, 9, 3]],
+                    )
+                )
+                self.assertEqual(
+                    tensors[2]
+                    .view(torch.uint8)[[0, 1, 2, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15]]
+                    .count_nonzero(),
+                    0,
+                )
+                with self.assertRaisesRegex(ValueError, "request pool index"):
+                    pool.get_cpu_copy(src)
+
+    def test_cpu_buffer_model_override_keeps_ple_on_gpu(self):
+        from sglang.srt.arg_groups.model_overrides.qwen4_exp import _qwen4_exp_overrides
+
+        for enabled in (False, True):
+            args = ServerArgs(
+                model_path="dummy", device="cuda", nixl_use_cpu_buffer=enabled
+            )
+            with (
+                patch(
+                    "sglang.srt.arg_groups.model_overrides.qwen4_exp.get_platform",
+                    return_value=SimpleNamespace(is_cuda=True, is_sm100=False),
+                ),
+                patch(
+                    "sglang.srt.arg_groups.model_overrides.qwen4_exp.model_config_of",
+                    return_value=SimpleNamespace(dtype=torch.bfloat16),
+                ),
+                patch(
+                    "sglang.srt.layers.attention.qsa.config.parse_qsa_profile",
+                    return_value=None,
+                ),
+            ):
+                overrides = _qwen4_exp_overrides(args, SimpleNamespace())
+            self.assertEqual(overrides["ple_offload_embedding"], not enabled)
+
+    def test_ple_offload_rejected_only_for_cpu_buffer(self):
+        from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
+
+        for enabled in (False, True):
+            args = ServerArgs(
+                model_path="dummy",
+                device="cuda",
+                nixl_use_cpu_buffer=enabled,
+                ple_offload_embedding=True,
+            )
+            if enabled:
+                with self.assertRaisesRegex(ValueError, "CPU-buffer PD.*ple-offload"):
+                    handle_offload_compatibility(args)
+            else:
+                handle_offload_compatibility(args)
 
 
 if __name__ == "__main__":

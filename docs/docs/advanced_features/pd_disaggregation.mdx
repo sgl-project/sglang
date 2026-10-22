@@ -58,28 +58,39 @@ transfers through UCX.
 
 Use the same SGLang revision, model, KV layout, page size, and attention TP size
 on both sides. This initial path supports contiguous MHA and MLA KV buffers with
-PP, CP, and DCP sizes of one. Hybrid GDN models such as Qwen3.5 are supported
-when their only extra state component is Mamba/GDN state. The final prefill chunk
-sends the conv and recurrent state through the same host pool; decode restores
-both KV and state before allowing generation. Both sides must have identical
-state layouts and attention TP sizes.
+PP, CP, and DCP sizes of one. Hybrid GDN models such as Qwen3.5 and
+Qwen3.8-Flash-Next are supported.
+The final prefill chunk sends the conv and recurrent state, including
+request-scoped PLE state, through the same host pool. For Qwen3.8-Flash-Next,
+it also sends the QSA pending key and RoPE rings and the compressed index-key
+pages for the full prompt. Decode restores both KV and state before allowing
+generation. Both sides must have identical state layouts and attention TP sizes.
+With `--disaggregation-enable-kv-checksum`, verification includes all three state
+components using their respective physical indices.
 
 It does not support speculative decoding, hybrid MLA layouts, other extra state
-components (including QSA), HiCache,
+components beyond Mamba/GDN and QSA, PLE embedding offload, HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
 Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.
 Sharding produces noncontiguous send positions, while CPU-buffer transfers
 require contiguous send slices. The server rejects this combination at startup.
+For Qwen3.8-Flash-Next, PLE embedding offload defaults to disabled in this
+mode; explicitly enabling it is rejected. Keep the embedding table on the
+GPU and budget GPU memory accordingly. With the official FP8 checkpoint, pair
+TP2 with EP2 (`--tp-size 2 --ep-size 2`) to keep expert projections aligned with
+the checkpoint's quantization blocks.
 Unsupported local configurations and peer layouts fail explicitly.
 
 On decode, this mode defaults `--disaggregation-decode-retraction-backup` to
-`cpu_tensor`, which uses per-request CPU tensors. An explicit `none` value is
-preserved. The `host_pool` backend is rejected because it allocates a
+`cpu_tensor`, which uses per-request CPU tensors and preserves QSA pending
+and compressed state when a decode request is retracted. An explicit `none`
+value is preserved. The `host_pool` backend is rejected because it allocates a
 CUDA-registered HiCache pool even when incoming KV uses CPU buffers.
 
 Size the pool for concurrent requests: decode holds every received KV page for
-a request, together with its Mamba/GDN state when present, until GPU restoration completes, while prefill holds each packed
-chunk until its NIXL transfer settles. Pool exhaustion fails the affected
+a request, together with its Mamba/GDN and QSA state when present, until GPU
+restoration completes. Prefill holds each packed chunk until its NIXL transfer
+settles. Pool exhaustion fails the affected
 request instead of waiting for pool space. An aborted decode request
 keeps its host region, GPU KV slots, and auxiliary slot until all TP ranks
 confirm that the required prefill abort acknowledgments have arrived. A timeout

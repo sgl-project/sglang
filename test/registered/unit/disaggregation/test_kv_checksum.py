@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
+    state_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -169,6 +170,43 @@ class TestKvChecksumComputer(unittest.TestCase):
         value = _make_computer(kv, item_len).compute(idx)
         expected = _ref_strided_adler32(kv, [idx] * len(kv), [item_len] * len(kv))
         self.assertEqual(value, expected)
+
+    def test_qsa_components_use_independent_indices(self):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.get_state_buf_infos = lambda: ([1, 2], [], [])
+        pool.get_qsa_pending_state_buf_infos = lambda: ([3, 4], [], [])
+        pool.get_qsa_compressed_state_buf_infos = lambda: ([5], [], [])
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: pool, page_size=4
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_index_to_mamba_index_mapping=torch.tensor(
+                    [0, 0, 5], device=self.device
+                ),
+                req_to_token=torch.tensor(
+                    [[0] * 8, [0] * 8, [12, 13, 14, 15, 4, 5, 6, 7]], device=self.device
+                ),
+            ),
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2))
+        ids = state_indices_for_request(scheduler, req, 8)
+        self.assertEqual([v.tolist() for v in ids], [[5], [5], [2], [2], [3, 1]])
+        suffix_ids = state_indices_for_request(scheduler, req, 8, start_idx=4)
+        self.assertEqual([v.tolist() for v in suffix_ids], [[5], [5], [2], [2], [1]])
+        tensors = [torch.randn(8, 16, device=self.device) for _ in ids]
+        widths = [t[0].nbytes for t in tensors]
+        computer = _make_computer([], 0, tensors, widths)
+        empty = torch.empty(0, dtype=torch.int64, device=self.device)
+        value = computer.compute(empty, ids)
+        self.assertEqual(value, _ref_strided_adler32(tensors, ids, widths))
+        for tensor, selected in zip(tensors, ids):
+            tensor[selected[0], 0] += 1
+            updated = computer.compute(empty, ids)
+            self.assertNotEqual(value, updated)
+            value = updated
 
     def test_kv_corruption_detected(self):
         kv = _make_kv(num_layers=2, num_pages=16, page_elems=64)

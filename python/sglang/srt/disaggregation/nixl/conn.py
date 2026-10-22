@@ -388,6 +388,7 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
     cpu_buffer_version: bytes = b""
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -431,6 +432,11 @@ class KVArgsRegisterInfo:
 
         return cls(
             cpu_buffer_version=msg[24] if len(msg) > 24 else b"",
+            dst_state_types=(
+                [StateType(value) for value in json.loads(msg[25])]
+                if len(msg) > 25
+                else []
+            ),
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -548,11 +554,19 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
     ):
         # Reject unsupported state before common initialization starts listeners.
         if get_disagg().nixl_use_cpu_buffer and (
-            (args.state_data_ptrs and args.state_types != [StateType.MAMBA])
+            any(
+                state_type
+                not in (
+                    StateType.MAMBA,
+                    StateType.QSA_PENDING,
+                    StateType.QSA_COMPRESSED,
+                )
+                for state_type in (args.state_types or [])
+            )
             or args.is_hybrid_mla_backend
         ):
             raise ValueError(
-                "CPU-buffer PD supports only Mamba/GDN extra state, without hybrid MLA layouts"
+                "CPU-buffer PD supports only Mamba/GDN and QSA extra state, without hybrid MLA layouts"
             )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self._cpu_pool = None
@@ -3914,7 +3928,12 @@ class NixlKVReceiver(CommonKVReceiver):
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
                             packed_state_data_lens,
                             *(
-                                [CPU_BUFFER_VERSION]
+                                [
+                                    CPU_BUFFER_VERSION,
+                                    json.dumps(
+                                        self.kv_mgr.kv_args.state_types or []
+                                    ).encode("ascii"),
+                                ]
                                 if self.kv_mgr.cpu_buffer_enabled
                                 else []
                             ),
