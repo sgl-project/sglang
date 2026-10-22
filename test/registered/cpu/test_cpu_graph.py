@@ -47,6 +47,7 @@ class TestCPUGraph(CustomTestCase):
         n_numa_node = len(get_cpu_ids_by_node())
         # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
         # fall back to the original one-rank-per-numa-node default.
+        tp_size = 6
         bind = get_tp_cpu_bind(n_numa_node)
         process = popen_launch_server(
             model,
@@ -64,7 +65,7 @@ class TestCPUGraph(CustomTestCase):
                 "--cuda-graph-bs-decode",
                 "2",
                 "--tp",
-                "6",
+                f"{tp_size}",
             ],
             env={"SGLANG_CPU_OMP_THREADS_BIND": bind if bind is not None else "all"},
         )
