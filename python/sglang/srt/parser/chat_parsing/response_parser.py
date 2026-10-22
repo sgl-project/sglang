@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .content_parsers import STREAMABLE_PARSERS, process_field
@@ -50,9 +51,11 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
                 try:
                     return int(raw)
                 except ValueError:
-                    # JSON Schema integers include whole numbers written as floats, e.g. "3.0"
-                    number = float(raw)
-                    if not number.is_integer():
+                    # The float range check bounds exponent expansion before exact decimal conversion.
+                    if not float(raw).is_integer():
+                        continue
+                    number = Decimal(raw)
+                    if number != number.to_integral_value():
                         continue
                     return int(number)
             if type_name == "number":
@@ -69,7 +72,7 @@ def _coerce(raw: str, types: tuple[str, ...]) -> Any:
                 decoded = json.loads(raw)
                 if isinstance(decoded, dict if type_name == "object" else list):
                     return decoded
-        except (ValueError, RecursionError):
+        except (ValueError, RecursionError, InvalidOperation):
             continue
     return raw  # `string` params, unknown types and failed casts all keep the original text
 
