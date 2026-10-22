@@ -62,6 +62,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.cutlass_prepare_moe_input",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.cutlass_prepare_moe_input:cutlass_prepare_moe_input",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shuffle_weighted_sum",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",

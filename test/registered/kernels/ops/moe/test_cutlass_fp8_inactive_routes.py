@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.moe.cutlass_prepare_moe_input import cutlass_prepare_moe_input
 from sglang.kernels.ops.moe.shuffle_weighted_sum import (
     _shuffle_weighted_sum_kernel,
     shuffle_weighted_sum,
@@ -19,6 +20,159 @@ register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestCutlassFp8InactiveRoutes(CustomTestCase):
+    def test_prepare_completes_maps_across_route_changes(self):
+        """Every live route is gathered once; inactive and unused capacity is defined."""
+        experts, tokens, topk, n, k = 3, 265, 2, 96, 160
+        patterns = (
+            [0, 1, 2, -1, -7, experts, 1, 2, 0, 0],
+            [-1, -9, experts, 99],
+            [0, 1, 2, 0, 1, 2],
+        )
+        states = [
+            torch.tensor(
+                (pattern * ((tokens * topk + len(pattern) - 1) // len(pattern)))[
+                    : tokens * topk
+                ],
+                device="cuda",
+                dtype=torch.int32,
+            ).view(tokens, topk)
+            for pattern in patterns
+        ]
+        ids = states[0].clone()
+        offsets = torch.full((experts + 1,), -999, device="cuda", dtype=torch.int32)
+        sizes1 = torch.full((experts, 3), -999, device="cuda", dtype=torch.int32)
+        sizes2 = torch.full_like(sizes1, -999)
+        a_map = torch.full((ids.numel(),), -999, device="cuda", dtype=torch.int32)
+        c_map = torch.full_like(a_map, -999)
+        block_offsets = torch.full_like(offsets, -999)
+
+        def prepare(blocks):
+            cutlass_prepare_moe_input(
+                ids, offsets, sizes1, sizes2, a_map, c_map, experts, n, k, blocks
+            )
+
+        def check():
+            flat_ids = ids.flatten()
+            live_mask = (flat_ids >= 0) & (flat_ids < experts)
+            counts = torch.bincount(flat_ids[live_mask], minlength=experts)
+            expected_offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+            torch.testing.assert_close(offsets, expected_offsets.int(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                sizes1,
+                torch.stack(
+                    (
+                        counts,
+                        counts.new_full((experts,), 2 * n),
+                        counts.new_full((experts,), k),
+                    ),
+                    dim=1,
+                ).int(),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                sizes2,
+                torch.stack(
+                    (
+                        counts,
+                        counts.new_full((experts,), k),
+                        counts.new_full((experts,), n),
+                    ),
+                    dim=1,
+                ).int(),
+                rtol=0,
+                atol=0,
+            )
+            live = int(expected_offsets[-1])
+            torch.testing.assert_close(
+                c_map[live_mask].sort().values,
+                torch.arange(live, device="cuda", dtype=torch.int32),
+                rtol=0,
+                atol=0,
+            )
+            self.assertTrue(bool((c_map[~live_mask] == -1).all()))
+            routes = torch.arange(ids.numel(), device="cuda")[live_mask]
+            torch.testing.assert_close(
+                a_map[c_map[live_mask].long()], (routes // topk).int(), rtol=0, atol=0
+            )
+            self.assertTrue(bool((a_map[live:] == 0).all()))
+            for expert in range(experts):
+                destinations = c_map[flat_ids == expert]
+                self.assertTrue(bool((destinations >= offsets[expert]).all()))
+                self.assertTrue(bool((destinations < offsets[expert + 1]).all()))
+            return counts
+
+        for blocks in (None, block_offsets):
+            with self.subTest(blockscale=blocks is not None):
+                prepare(blocks)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    prepare(blocks)
+                for state in (*states, states[0]):
+                    ids.copy_(state)
+                    a_map.fill_(-999)
+                    c_map.fill_(-999)
+                    offsets.fill_(-999)
+                    sizes1.fill_(-999)
+                    sizes2.fill_(-999)
+                    if blocks is not None:
+                        blocks.fill_(-999)
+                    graph.replay()
+                    counts = check()
+                    if blocks is not None:
+                        expected = torch.cat(
+                            (
+                                counts.new_zeros(1),
+                                (((counts + 127) // 128) * 128).cumsum(0),
+                            )
+                        )
+                        torch.testing.assert_close(
+                            blocks, expected.int(), rtol=0, atol=0
+                        )
+
+        for shape in ((0, topk), (tokens, 0)):
+            with self.subTest(shape=shape):
+                empty_ids = torch.empty(shape, device="cuda", dtype=torch.int32)
+                empty_map = torch.empty((0,), device="cuda", dtype=torch.int32)
+                cutlass_prepare_moe_input(
+                    empty_ids,
+                    offsets,
+                    sizes1,
+                    sizes2,
+                    empty_map,
+                    empty_map,
+                    experts,
+                    n,
+                    k,
+                    block_offsets,
+                )
+                self.assertEqual(int(offsets.count_nonzero()), 0)
+                self.assertEqual(int(block_offsets.count_nonzero()), 0)
+                self.assertEqual(int(sizes1[:, 0].count_nonzero()), 0)
+                self.assertEqual(int(sizes2[:, 0].count_nonzero()), 0)
+
+    def test_prepare_rejects_noncontiguous_metadata(self):
+        """Reject layouts whose physical order differs from the route-map contract."""
+        ids = torch.tensor([[0, 1], [1, -1], [2, 0]], device="cuda", dtype=torch.int32)
+        offsets = torch.empty(4, device="cuda", dtype=torch.int32)
+        sizes1 = torch.empty((3, 3), device="cuda", dtype=torch.int32)
+        sizes2 = torch.empty_like(sizes1)
+        a_map = torch.empty(ids.numel(), device="cuda", dtype=torch.int32)
+        c_map = torch.empty_like(a_map)
+        block_offsets = torch.empty_like(offsets)
+        args = [ids, offsets, sizes1, sizes2, a_map, c_map, 3, 96, 160, block_offsets]
+        for index in (0, 1, 2, 3, 4, 5, 9):
+            value = args[index]
+            strided = torch.empty((*value.shape, 2), device="cuda", dtype=torch.int32)[
+                ..., 0
+            ]
+            strided.copy_(value)
+            with self.subTest(argument=index):
+                invalid_args = args.copy()
+                invalid_args[index] = strided
+                with self.assertRaisesRegex((RuntimeError, ValueError), "contiguous"):
+                    cutlass_prepare_moe_input(*invalid_args)
+
     def test_masked_reduction_ignores_poisoned_slots(self):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
@@ -223,7 +377,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
             )
 
         reference = run(inputs.nan_to_num(), ids.clamp_min(0), weights.nan_to_num())
-        prepare = cutlass_moe.prepare_moe_input
+        prepare = cutlass_moe.cutlass_prepare_moe_input
 
         def checked_prepare(*args):
             prepare(*args)
@@ -245,7 +399,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
         # The pre-fix map allocation fails checked_prepare before an unsafe gather.
         with (
             patch.object(torch, "empty", poisoned_empty),
-            patch.object(cutlass_moe, "prepare_moe_input", checked_prepare),
+            patch.object(cutlass_moe, "cutlass_prepare_moe_input", checked_prepare),
         ):
             actual = run(inputs, ids, weights)
         torch.testing.assert_close(actual, reference, rtol=0.025, atol=0.01)
@@ -268,6 +422,12 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
         graph.replay()
         self.assertTrue(bool(torch.isfinite(result).all()))
         self.assertEqual(int(torch.count_nonzero(result)), 0)
+
+        empty_result = run(inputs[:0], ids[:0], weights[:0])
+        self.assertEqual(empty_result.shape, (0, hidden))
+        no_route_result = run(inputs, ids[:, :0], weights[:, :0])
+        self.assertTrue(bool(torch.isfinite(no_route_result).all()))
+        self.assertEqual(int(torch.count_nonzero(no_route_result)), 0)
 
 
 if __name__ == "__main__":
