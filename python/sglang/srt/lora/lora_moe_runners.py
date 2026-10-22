@@ -362,6 +362,7 @@ def _add_lora_gate_up_delta(
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
             a_output_slices=2 if is_gated else 1,
         )
     else:
@@ -438,6 +439,7 @@ def _add_lora_down_delta(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)

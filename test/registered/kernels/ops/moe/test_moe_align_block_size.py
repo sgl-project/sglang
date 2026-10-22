@@ -286,5 +286,124 @@ def test_moe_align_block_size_pad_fill_stays_in_bounds(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "rows,num_experts",
+    [(17, 8), (512, 65), (32, 1025), (17, 129), (0, 8), (0, 129)],
+)
+def test_moe_align_inactive_prefix_count_graph(rows, num_experts, dtype):
+    """Owned count pairs describe only the used prefix, including replay changes."""
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size as align,
+    )
+
+    block_size, topk = 8, 3
+    valid = (torch.arange(rows * topk, dtype=dtype) % num_experts).view(rows, topk)
+    ids = valid.cuda()
+
+    def run():
+        return align(
+            ids,
+            block_size,
+            num_experts,
+            return_inactive_prefix_count=True,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sorted_ids, expert_ids, counts = run()
+    assert counts.shape == (2,) and counts.dtype == torch.int32
+    assert counts.is_contiguous() and counts.data_ptr() % 8 == 0
+
+    mixed = valid.clone()
+    mixed.reshape(-1)[::3] = -1
+    inactive = torch.full_like(valid, -1)
+    for routes in (mixed, inactive, valid, mixed):
+        ids.copy_(routes)
+        # Both words must be published on every replay, including empty inputs.
+        counts.fill_(-123)
+        graph.replay()
+        expected_groups = []
+        flat = routes.reshape(-1)
+        for expert in sorted(set(flat.tolist())):
+            positions = (flat == expert).nonzero().reshape(-1).tolist()
+            padded = ceil_div(len(positions), block_size) * block_size
+            expected_groups.append((expert, positions, padded))
+        expected_total = sum(padded for _, _, padded in expected_groups)
+        expected_prefix = sum(
+            padded // block_size
+            for expert, _, padded in expected_groups
+            if expert == -1
+        )
+        assert counts.cpu().tolist() == [expected_total, expected_prefix]
+        used_experts = expert_ids[: expected_total // block_size].cpu().tolist()
+        expected_experts = [
+            expert
+            for expert, _, padded in expected_groups
+            for _ in range(padded // block_size)
+        ]
+        assert used_experts == expected_experts
+        used_ids = sorted_ids[:expected_total].cpu()
+        offset = 0
+        for _, positions, padded in expected_groups:
+            group = used_ids[offset : offset + padded]
+            assert sorted(group[group < flat.numel()].tolist()) == positions
+            assert (group[group >= flat.numel()] == flat.numel()).all()
+            offset += padded
+
+
+@pytest.mark.parametrize("route_ids", [(-1, -1, -1), (2, -1, 0), (2, 0, 1)])
+def test_moe_align_single_token_inactive_prefix_count(route_ids):
+    from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
+
+    block_size = 8
+    ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+    sorted_ids, expert_ids, counts = moe_align_single_token(
+        ids, block_size, return_inactive_prefix_count=True
+    )
+    assert counts.cpu().tolist() == [len(route_ids) * block_size, route_ids.count(-1)]
+    assert expert_ids.cpu().tolist() == sorted(route_ids)
+    positions = sorted_ids.view(len(route_ids), block_size).cpu()
+    assert (positions[:, 1:] == len(route_ids)).all()
+    order = positions[:, 0].tolist()
+    assert sorted(order) == list(range(len(route_ids)))
+    assert [route_ids[i] for i in order] == sorted(route_ids)
+
+
+@pytest.mark.parametrize("num_experts", [8, 65, 1025])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("write_inactive_prefix_count", [False, True])
+def test_moe_align_count_publication_bounds(
+    num_experts, empty, write_inactive_prefix_count
+):
+    """Empty producers publish zero; legacy capacity never certifies word 1."""
+    ids = torch.tensor(
+        [] if empty else [[-1, 0, num_experts - 1]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_size = 8
+    total = 0 if empty else 24
+    sorted_ids = torch.empty(total, device="cuda", dtype=torch.int32)
+    expert_ids = torch.empty(total // block_size, device="cuda", dtype=torch.int32)
+    count_backing = torch.full((2,), -123, device="cuda", dtype=torch.int32)
+    cumsum = torch.empty(num_experts + 2, device="cuda", dtype=torch.int32)
+    moe_align_block_size(
+        ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        count_backing if write_inactive_prefix_count else count_backing[:1],
+        cumsum,
+        True,
+        write_inactive_prefix_count=write_inactive_prefix_count,
+    )
+    prefix = (0 if empty else 1) if write_inactive_prefix_count else -123
+    assert count_backing.cpu().tolist() == [total, prefix]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

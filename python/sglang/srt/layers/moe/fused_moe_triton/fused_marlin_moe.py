@@ -275,11 +275,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=True
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=expert_map is None,
         )
 
     if workspace is None:
@@ -340,6 +343,7 @@ def fused_marlin_moe(
         mul_topk_weights=False,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -403,6 +407,7 @@ def fused_marlin_moe(
         zero_inactive_output=True,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
