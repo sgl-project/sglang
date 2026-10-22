@@ -27,12 +27,19 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImage2512SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
@@ -43,6 +50,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Attention,
+    QwenImage21TransformerBlock,
     build_layout,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
@@ -78,6 +86,133 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 )
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+
+
+@pytest.fixture
+def qwen21_server_args():
+    return SimpleNamespace(
+        model_path="Qwen/Qwen-Image-2.1-Turbo",
+        model_id=None,
+        backend="sglang",
+        performance_mode="manual",
+        pipeline_class_name=None,
+        pipeline_config=QwenImage21PipelineConfig(),
+        output_path=None,
+        comfyui_mode=True,
+        enable_cfg_parallel=False,
+        enable_breakable_cuda_graph=False,
+        enable_torch_compile=False,
+        enable_trace=False,
+        attention_backend_config={},
+        num_gpus=1,
+        warmup_steps=8,
+        warmup_num_frames=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        ((1280, 720), (1280, 704)),
+        ((1279, 735), (1248, 704)),
+        ((1024, 1024), (1024, 1024)),
+        ((1, 31), (32, 32)),
+    ],
+)
+def test_qwen21_resolution_alignment(requested, expected):
+    sampling = QwenImage21SamplingParams(width=requested[0], height=requested[1])
+    assert (sampling.width, sampling.height) == expected
+
+
+def test_request_alignment_precedes_pipeline_validation(qwen21_server_args):
+    """A 720p request must reach validation with dimensions divisible by 32."""
+    sampling = QwenImage21SamplingParams(prompt="a coffee shop", width=1280, height=720)
+    batch = prepare_request(qwen21_server_args, sampling)
+    QwenImage21InputValidationStage().forward(batch, qwen21_server_args)
+    assert (batch.width, batch.height) == (1280, 704)
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [
+        ({"size": "1280x720"}, (1280, 704)),
+        ({"width": 1279, "height": 735}, (1248, 704)),
+        ({"size": "1280x720", "height": 769}, (1280, 768)),
+    ],
+)
+def test_http_size_merging_preserves_alignment(qwen21_server_args, fields, expected):
+    with (
+        patch.object(
+            openai_utils, "get_global_server_args", return_value=qwen21_server_args
+        ),
+        patch.object(
+            SamplingParams, "from_pretrained", return_value=QwenImage21SamplingParams()
+        ),
+    ):
+        sampling = openai_utils.build_sampling_params(
+            "size-regression",
+            prompt="a coffee shop",
+            request_data_type=DataType.IMAGE,
+            **fields,
+        )
+    assert (sampling.width, sampling.height) == expected
+
+
+def test_cli_720p_shortcut_preserves_alignment(qwen21_server_args):
+    cli = QwenImage21SamplingParams.get_cli_args(
+        argparse.Namespace(resolution_720p=True, width=None, height=None)
+    )
+    with patch.object(
+        SamplingParams, "from_pretrained", return_value=QwenImage21SamplingParams()
+    ):
+        sampling = SamplingParams.from_user_sampling_params_args(
+            model_path=qwen21_server_args.model_path,
+            server_args=qwen21_server_args,
+            prompt="a coffee shop",
+            **cli,
+        )
+    assert (sampling.width, sampling.height) == (1280, 704)
+
+
+@pytest.mark.parametrize("dimension", ["width", "height"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_alignment_does_not_make_invalid_dimensions_positive(
+    qwen21_server_args, dimension, value
+):
+    sampling = QwenImage21SamplingParams(prompt="a coffee shop", **{dimension: value})
+    with pytest.raises(ValueError, match="must be positive"):
+        prepare_request(qwen21_server_args, sampling)
+
+
+@pytest.mark.parametrize("bcg", [False, True])
+def test_synthetic_warmup_uses_the_same_grid_as_serving(
+    qwen21_server_args, tmp_path, bcg
+):
+    """Warmup's post-construction size overrides must not restore invalid 720p."""
+    defaults = QwenImage21SamplingParams()
+    image_path = tmp_path / "warmup.png"
+    Image.new("RGB", (64, 64)).save(image_path)
+    qwen21_server_args.enable_breakable_cuda_graph = bcg
+    with patch(
+        "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+        return_value=defaults,
+    ):
+        reqs = build_warmup_reqs(
+            qwen21_server_args,
+            warmup_resolutions=["1280x720"],
+            warmup_input_path=str(image_path),
+            server_based_warmup=True,
+        )
+    assert len(reqs) == 1
+    assert (reqs[0].width, reqs[0].height) == (1280, 704)
+    QwenImage21InputValidationStage().forward(reqs[0], qwen21_server_args)
+    assert (defaults.width, defaults.height) == (1024, 1024)
+
+
+def test_legacy_qwen_keeps_its_720p_resolution():
+    sampling = QwenImage2512SamplingParams(width=1280, height=720)
+    assert (sampling.width, sampling.height) == (1280, 720)
 
 
 @pytest.mark.parametrize("steps", [2, 40])
@@ -363,19 +498,27 @@ def test_condition_slots_expand_to_actual_latent_grid():
     torch.testing.assert_close(collapsed[slots][0], hidden[2])
 
 
-class _RecordingBlock(torch.nn.Module):
-    def __init__(self, layer_id):
-        super().__init__()
-        self._layer_id = layer_id
-        self.seen = None
+class _RecordingAttention(torch.nn.Module):
+    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+        self.seen = caches
+        return torch.zeros_like(x), [None] * len(caches)
 
-    def forward(self, hidden_states, *args):
-        caches = [cache[self._layer_id] for cache in args[-1]]
-        self.seen = caches[0]
-        return hidden_states
+
+def _block_recording_caches(layer_id, dim=4):
+    # The real block forward with its attention swapped for a recorder.
+    block = QwenImage21TransformerBlock.__new__(QwenImage21TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block._layer_id = layer_id
+    block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
+    block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
+    block.attn = _RecordingAttention()
+    block.img_mlp = torch.nn.Identity()
+    return block
 
 
 class _UnifiedBlocks(torch.nn.Module):
+    """Cache-DiT's wrapper: every wrapped block receives the same extras."""
+
     def __init__(self, blocks):
         super().__init__()
         self.transformer_blocks = torch.nn.ModuleList(blocks)
@@ -387,49 +530,21 @@ class _UnifiedBlocks(torch.nn.Module):
         return x
 
 
-def _run_blocks(blocks, prefix_caches):
-    x = torch.zeros(1)
-    for block in blocks:
-        x = block(x, prefix_caches)
-    return x
-
-
-def test_cache_dit_wrapper_keeps_per_layer_prefix_kv():
-    inner = [_RecordingBlock(0), _RecordingBlock(1), _RecordingBlock(2)]
-    wrapped = torch.nn.ModuleList([_UnifiedBlocks(inner)])
+@pytest.mark.parametrize("cache_dit_wrapped", [False, True])
+def test_blocks_keep_per_layer_prefix_kv(cache_dit_wrapped):
+    blocks = [_block_recording_caches(layer_id) for layer_id in range(3)]
+    runners = [_UnifiedBlocks(blocks)] if cache_dit_wrapped else blocks
     prefix_caches = [[{"layer": 0}, {"layer": 1}, {"layer": 2}]]
-
-    _run_blocks(wrapped, prefix_caches)
-    assert [block.seen for block in inner] == prefix_caches[0]
-
-
-def test_plain_blocks_still_get_per_layer_prefix_kv():
-    blocks = torch.nn.ModuleList([_RecordingBlock(0), _RecordingBlock(1)])
-    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
-
-    _run_blocks(blocks, prefix_caches)
-    assert [block.seen for block in blocks] == prefix_caches[0]
-
-
-class _FirstSlotBlock(torch.nn.Module):
-    """Old loop body: take caches[0] and broadcast it to every layer."""
-
-    def __init__(self):
-        super().__init__()
-        self.seen = None
-
-    def forward(self, hidden_states, *args):
-        self.seen = args[-1][0]
-        return hidden_states
-
-
-def test_first_slot_only_caches_are_shared_across_layers():
-    inner = [_FirstSlotBlock(), _FirstSlotBlock()]
-    unified = _UnifiedBlocks(inner)
-    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
-
-    unified(torch.zeros(1), [cache[0] for cache in prefix_caches])
-    assert [block.seen for block in inner] == [prefix_caches[0][0], prefix_caches[0][0]]
+    x = torch.zeros(1, 2, 4)
+    modulation = (torch.zeros(1, 1, 4),) * 4
+    prefix_states = [{"hidden_states": None}]
+    for runner in runners:
+        x = runner(
+            x, modulation, prefix_states, None, [None], [None], prefix_caches, None
+        )
+    assert [block.attn.seen for block in blocks] == [
+        [cache] for cache in prefix_caches[0]
+    ]
 
 
 def test_adjacent_image_slots_stay_distinct():

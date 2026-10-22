@@ -649,9 +649,10 @@ public:
     // Save result to `smem.reconstruct_pivot_bucket` and `smem.reconstruct_num_should_select`
     // If `CHECK_IF_SHOULD_SELECT_WHOLE_BUCKET`, return whether we should select all elements in that bucket.
     // Should be called by a whole warp
-    template<bool CHECK_IF_SHOULD_SELECT_WHOLE_BUCKET>
+    // [SGLang] Any plan with `reconstruct_pivot_bucket` and `reconstruct_num_should_select` will do
+    template<bool CHECK_IF_SHOULD_SELECT_WHOLE_BUCKET, typename PlanT>
     static __device__ __forceinline__
-    bool find_pivot_in_histogram(SharedMemoryPlanBase &smem, const uint32_t *bucket_counter, uint32_t topk, uint32_t lane_idx) {
+    bool find_pivot_in_histogram(PlanT &smem, const uint32_t *bucket_counter, uint32_t topk, uint32_t lane_idx) {
         bool should_select_whole_bucket = false;
         // Each lane loads 8 counters
         static_assert(NUM_RECONSTRUCT_BUCKETS == 32 * 8);
@@ -954,8 +955,10 @@ public:
         );
     }
 
-    // Take the appropriate action when we see a NaN (i.e. `trap()` or write 0x3f3f3f3f)
-    static __device__ __forceinline__
+    // Take the appropriate action when we see a NaN: `trap()`, or [SGLang] write the row as if every selected
+    // index were 0, so downstream gathers stay in range. Called by the whole CTA; out of line, since inlined copies
+    // of this cold path only cost instruction fetch on every launch.
+    static __device__ __noinline__
     void take_action_when_have_nan(const TopkSelectArgs &args, uint32_t batch_idx) {
         if (args.abort_when_nan_found) {
             if (threadIdx.x == 0) {
@@ -964,8 +967,19 @@ public:
             __syncthreads();
             ku::trap();
         } else {
-            if (threadIdx.x == 0) {
-                *((OutIdxT*)args.output_index + batch_idx * args.stride_output_index_batch) = 0x3F3F3F3F;
+            OutIdxT* result_indices = (OutIdxT*)args.output_index + (uint64_t)batch_idx * args.stride_output_index_batch;
+            OutIdxT index0;
+            if constexpr (Config::page_transform) {
+                const int* page_table_row = args.page_table + (uint64_t)batch_idx * args.stride_page_table_batch;
+                index0 = (OutIdxT)EpilogueT::page_transform_index(0u, true, 0, page_table_row, args.page_bits);
+            } else {
+                index0 = (OutIdxT)(args.output_idx_offset != nullptr ? __ldg(args.output_idx_offset + batch_idx) : 0);
+            }
+            for (uint32_t i = threadIdx.x; i < args.topk; i += NUM_THREADS) result_indices[i] = index0;
+            if constexpr (Config::return_value) {
+                const ValueT value0 = ((const ValueT*)args.input)[(uint64_t)batch_idx * args.stride_input_batch];
+                ValueT* result_values = (ValueT*)args.output_value + (uint64_t)batch_idx * args.stride_output_value_batch;
+                for (uint32_t i = threadIdx.x; i < args.topk; i += NUM_THREADS) result_values[i] = value0;
             }
         }
     }

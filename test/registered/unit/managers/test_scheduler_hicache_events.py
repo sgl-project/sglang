@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, call
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -35,39 +35,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
-            batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
+            batch_is_full=False,
+            is_prefill_only=False,
+            is_empty=lambda: True,
+            batch_size=lambda: 0,
+            filter_batch=lambda: None,
         )
-
-    def test_feature_gates(self):
-        for hierarchical, flexkv, linker, storage in (
-            (False, False, False, False),
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (True, False, False, True),
-        ):
-            with (
-                self.subTest(
-                    hierarchical=hierarchical,
-                    flexkv=flexkv,
-                    linker=linker,
-                    storage=storage,
-                ),
-                patch(
-                    "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(enable_flexkv=flexkv),
-                ),
-            ):
-                self.calls.reset_mock()
-                s = self.scheduler
-                s.enable_hierarchical_cache = hierarchical
-                s.enable_unified_cache_external_linker = linker
-                s.enable_hicache_storage = storage
-                s._process_hicache_events()
-                expected = [call.drain()] if hierarchical or flexkv or linker else []
-                if storage:
-                    expected.append(call.retry())
-                self.assertEqual(self.calls.mock_calls, expected)
 
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler

@@ -486,6 +486,23 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def draft_attn_parallel_group() -> str:
+    """The group an attention-owning draft uses, resolved in the target scope.
+
+    With CP and no attention DP, the draft runs on full TP without CP.
+    Otherwise it stays within attention TP, preserving independent DP drafts.
+    """
+    parallel = get_parallel()
+    return (
+        "tp" if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1 else "attn_tp"
+    )
+
+
+def draft_attn_tp_size() -> int:
+    """The width of ``draft_attn_parallel_group()`` in the target scope."""
+    return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -557,19 +574,7 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
-    # The shared-experts-fusion decision, per runner — the runner_backend /
-    # speculative_runner_backend shape. Both leaves are seeded from the config
-    # intent by ``initialize_moe_config``; each MoE model's gate
-    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
-    # before its layers build and read it. ``speculative_moe_backend_context``
-    # brackets a draft's build: on exit the draft's effective decision is
-    # persisted onto the speculative leaf (inspectable afterwards) and the
-    # target's ACTIVE value returns.
-    disable_shared_experts_fusion: bool | None = None
-    speculative_disable_shared_experts_fusion: bool | None = None
-    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
-    # speculative_moe_backend_context is active, so a draft gate's write also
-    # lands on the speculative leaf.
+    # True while draft construction/backend scopes are active.
     in_speculative_scope: bool = False
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
@@ -644,7 +649,6 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
-    flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None

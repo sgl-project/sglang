@@ -485,7 +485,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=4),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -493,13 +493,14 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags.use_world_group_for_gather = False
         self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        # After a scale-up the gather spans the expanded WORLD, and the joining
-        # cohort is numbered from its offset.
+        # After scale-up the gather spans expanded WORLD, but its slots remain
+        # logical DP replicas. Physical ranks 8 and 9 therefore share DP slot 4.
         dp_flags.use_world_group_for_gather = True
         dp_flags.joiner_skip_all_gather = False
         parallel.override_permanently(ep_join_rank_offset=8)
-        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
-        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(dp_gather_slot(), (8 + parallel.tp_rank) // 2)
+        self.assertEqual(parallel.attn_dp_size, 4)
+        self.assertEqual(parallel.attn_tp_size, 2)
         self.assertEqual(parallel.tp_size, 8)
 
     def test_a_scale_up_writes_no_width(self):
@@ -1160,6 +1161,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
+
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (

@@ -74,7 +74,7 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "prompt_tokens": prompt,
         "total_tokens": prompt + completion,
         "completion_tokens": completion,
-        "prompt_tokens_details": cached.filter(|&n| n > 0).map(|n| json!({"cached_tokens": n})),
+        "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
     })
 }
@@ -238,4 +238,16 @@ pub(super) fn without_nulls(value: Value) -> Value {
 
 pub(super) fn meta_u64(meta: &Value, key: &str) -> u64 {
     meta.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_report_keeps_zero_cached_tokens() {
+        let details = |cached| usage(3, 2, 0, cached)["prompt_tokens_details"].clone();
+        assert_eq!(details(Some(0)), json!({"cached_tokens": 0}));
+        assert_eq!(details(None), Value::Null);
+    }
 }

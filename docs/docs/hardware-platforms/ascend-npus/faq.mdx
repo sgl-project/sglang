@@ -297,9 +297,10 @@ Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B
 
 Docker images for Ascend NPU are available in two types:
 
-- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16`.
-  Recommended for production deployments.
-- **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann8.5.0-a3`. Use this
+{/* TODO: CANN 9.1.0 has no stable image yet, so the stable release entry below has no example tag for now. Once the stable image is published, add it back. */}
+
+- **Stable release** — validated version with a specific tag. Recommended for production deployments.
+- **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann9.1.0-a3`. Use this
   if you need the latest features or bug fixes that have not yet been included in a stable release.
 
 If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
