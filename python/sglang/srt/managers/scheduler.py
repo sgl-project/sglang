@@ -6402,6 +6402,11 @@ class Scheduler(
         if token_id is None:
             self._report_recovery_warmup_result(operation_id, success=False)
             return
+        sampling_params = SamplingParams(max_new_tokens=1, temperature=0.0, top_k=1)
+        # Internal warmup requests bypass TokenizerManager preprocessing, so
+        # establish the same normalized contract expected by ScheduleBatch.
+        sampling_params.normalize(self.tokenizer)
+        sampling_params.verify(self.model_config.vocab_size)
         self.handle_generate_request(
             TokenizedGenerateReqInput(
                 rid=f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{operation_id}",
@@ -6410,9 +6415,7 @@ class Scheduler(
                 input_embeds=None,
                 mm_inputs=None,
                 token_type_ids=None,
-                sampling_params=SamplingParams(
-                    max_new_tokens=1, temperature=0.0, top_k=1
-                ),
+                sampling_params=sampling_params,
                 return_logprob=False,
                 logprob_start_len=0,
                 top_logprobs_num=0,

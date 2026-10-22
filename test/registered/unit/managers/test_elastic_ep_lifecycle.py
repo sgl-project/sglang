@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.tokenizer_manager import (
     MembershipObservationTimeout,
@@ -1806,7 +1807,7 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
     def test_tokenizerless_scheduler_uses_model_eos_for_warmup(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tokenizer = None
-        scheduler.model_config = MagicMock(hf_eos_token_id={7})
+        scheduler.model_config = MagicMock(hf_eos_token_id={7}, vocab_size=32)
         scheduler.handle_generate_request = MagicMock()
         self.state.recovery_operation_id = "recover-1"
         self.state.recovery_phase = "slot_restored"
@@ -1815,6 +1816,12 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
 
         request = scheduler.handle_generate_request.call_args.args[0]
         self.assertEqual(list(request.input_ids), [7])
+        self.assertTrue(request.sampling_params.is_normalized)
+        self.assertEqual(request.sampling_params.stop_strs, [])
+        self.assertEqual(request.sampling_params.stop_regex_strs, [])
+        finish_probe = Req.__new__(Req)
+        finish_probe.sampling_params = request.sampling_params
+        self.assertFalse(finish_probe._check_str_based_finish())
 
     def test_scheduler_reports_failure_when_no_warmup_token_exists(self):
         scheduler = Scheduler.__new__(Scheduler)
