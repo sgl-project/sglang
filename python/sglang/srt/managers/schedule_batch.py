@@ -1141,6 +1141,7 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
         self.bidir_prefix_len = bidir_prefix_len
+        self.bidir_state_key = None  # set by the scheduler, see _bidir_state_key
         self.decision_layout = decision_layout
 
         # For req-level memory management

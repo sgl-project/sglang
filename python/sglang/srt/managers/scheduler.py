@@ -3991,22 +3991,25 @@ class Scheduler(
 
     @staticmethod
     def _bidir_state_key(req: Req):
-        return (
-            req.extra_key,
-            hash(tuple(req.origin_input_ids[: req.bidir_prefix_len])),
-        )
+        if req.bidir_state_key is None:
+            req.bidir_state_key = (
+                req.extra_key,
+                hash(tuple(req.origin_input_ids[: req.bidir_prefix_len])),
+            )
+        return req.bidir_state_key
+
+    def _prune_bidir_states_in_flight(self):
+        if self.bidir_states_in_flight:
+            self.bidir_states_in_flight = {
+                k: r for k, r in self.bidir_states_in_flight.items() if not r.finished()
+            }
 
     def _bidir_state_in_flight(self, req: Req) -> bool:
         """True if another request is still prefilling this request's state block."""
         if req.bidir_prefix_len <= 0 or not self.bidir_states_in_flight:
             return False
         owner = self.bidir_states_in_flight.get(self._bidir_state_key(req))
-        if owner is None:
-            return False
-        if owner.finished():
-            del self.bidir_states_in_flight[self._bidir_state_key(req)]
-            return False
-        return True
+        return owner is not None and not owner.finished()
 
     def _note_bidir_state_in_flight(self, req: Req):
         if req.prefix_len < req.bidir_prefix_len:
@@ -4164,6 +4167,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
+        self._prune_bidir_states_in_flight()
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.

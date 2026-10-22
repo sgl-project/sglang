@@ -150,6 +150,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
+    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -1433,10 +1434,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
-                if self.server_args.attention_backend not in (None, "triton"):
+                if attention_backends()[0] != "triton":
                     raise ValueError(
                         "bidir_prefix_len (block-bidirectional attention) is only "
-                        "supported by the triton attention backend."
+                        "supported by the triton attention backend; launch with "
+                        "--attention-backend triton."
+                    )
+                prompt_len = len(input_ids) if input_ids is not None else 0
+                if obj.bidir_prefix_len > prompt_len:
+                    raise ValueError(
+                        f"bidir_prefix_len ({obj.bidir_prefix_len}) exceeds the "
+                        f"prompt length ({prompt_len})."
                     )
                 chunk = self.server_args.chunked_prefill_size
                 if chunk is not None and 0 < chunk < input_token_num:
