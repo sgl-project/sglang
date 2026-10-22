@@ -765,6 +765,9 @@ pub enum TreeCoreRuntimeError {
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
+    /// Overlap preparation must complete before incoming values can be consumed.
+    #[error("invalid insert overlap: {0}")]
+    InvalidInsertOverlap(&'static str),
     /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]

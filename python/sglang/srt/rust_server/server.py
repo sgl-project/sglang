@@ -383,6 +383,10 @@ class RustServer:
 
         self.server.push_control_result(recv_req.rid, encoded)
 
+    def push_health_ack(self) -> None:
+        """Acknowledge the health probes skipped while the scheduler was busy."""
+        self.server.push_health_ack()
+
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
