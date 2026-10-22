@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "75992dbf1d6eaeacbc1c2cd6beb48f77dd7ae4f7"
+SGL_TEST_FILES_CI_DATA_REVISION = "252df4958ae6cc9f6b146b2f70382f75459235ad"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3
@@ -207,6 +207,9 @@ DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers
 DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST = (
     "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
+)
+DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"
 )
 
 # MOVA video generation models

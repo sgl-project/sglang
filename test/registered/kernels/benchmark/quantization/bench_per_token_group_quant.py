@@ -7,8 +7,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_min,
 )
 
-# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
-# kernel is kept only as the perf baseline for this benchmark.
+# per_token_group_quant_8bit_v2 is the perf baseline; production only routes
+# fp32 UE8M0 scales to it.
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
