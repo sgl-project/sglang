@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
@@ -575,6 +576,7 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            device_type=get_device().device,
             include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens

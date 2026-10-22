@@ -51,6 +51,18 @@ class TestDraftTpContext(CustomTestCase):
                 self.assertEqual(parallel.attn_dp_size, 2)
                 self.assertFalse(parallel_state._TP_STATE_PATCHED)
 
+    def test_cp_does_not_join_independent_dp_drafts(self):
+        attn_tp = _group(world_size=1, rank=0)
+        with get_parallel().override(
+            tp_group=self.whole_tp,
+            attn_tp_group=attn_tp,
+            attn_tp_size=1,
+            attn_cp_size=2,
+        ):
+            with draft_tp_context(True):
+                self.assertIs(get_parallel().tp_group, attn_tp)
+                self.assertEqual(get_parallel().attn_cp_size, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

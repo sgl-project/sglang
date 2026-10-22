@@ -72,6 +72,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_memory,
     get_observability,
     get_schedule,
@@ -85,6 +86,15 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+
+@dataclasses.dataclass
+class FailedSessionProbe:
+    """Probe schedule of one blacklisted session, in time.monotonic()."""
+
+    last_requested: float
+    next_probe_at: float
+    interval: float
 
 
 # decode
@@ -269,9 +279,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        # Checked in every role, so a bad value fails startup rather than a
+        # later decode -> prefill role switch.
+        self.enable_failed_session_probe = envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+        if self.enable_failed_session_probe:
+            self.failed_session_probe_interval = (
+                envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
+            )
+            self.failed_session_probe_max_interval = (
+                envs.SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S.get()
+            )
+            self.failed_session_idle_timeout = (
+                envs.SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S.get()
+            )
+            if not (
+                0
+                < self.failed_session_probe_interval
+                <= self.failed_session_probe_max_interval
+            ):
+                raise ValueError(
+                    "Need 0 < SGLANG_FAILED_SESSION_PROBE_INTERVAL_S <= "
+                    "SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S"
+                )
+            if self.failed_session_idle_timeout <= 0:
+                raise ValueError(
+                    "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
+                )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            # Only the probe loop fills this; empty when the probe is off.
+            self.failed_session_probes: Dict[str, FailedSessionProbe] = {}
             # Separate from failed_sessions, which _run_one_probe_pass clears
             # on a successful probe: an incompatible decode is still reachable,
             # so only a re-registration may lift this.
@@ -329,13 +367,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 t.start()
                 self._worker_threads.append(t)
-            self.enable_failed_session_probe = (
-                envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
-            )
             if self.enable_failed_session_probe:
-                self.failed_session_probe_interval = (
-                    envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
-                )
                 self._failed_session_probe_shutdown = threading.Event()
                 t = threading.Thread(
                     target=self._failed_session_probe_loop,
@@ -526,6 +558,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -537,6 +570,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -759,7 +793,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         if pairs is None:
@@ -897,8 +930,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
         with self.session_lock:
-            self.failed_sessions.discard(mooncake_session_id)
-            self.session_failures.pop(mooncake_session_id, None)
+            self._unblacklist_session(mooncake_session_id)
             self.state_layout_rejections.pop(mooncake_session_id, None)
             self.state_strides_validated.discard(mooncake_session_id)
             if mismatch is not None:
@@ -2523,6 +2555,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 layout_rejection is not None
                                 or req.mooncake_session_id in self.failed_sessions
                             ):
+                                probe = self.failed_session_probes.get(
+                                    req.mooncake_session_id
+                                )
+                                if probe is not None:
+                                    probe.last_requested = time.monotonic()
                                 self.conclude_failure(
                                     bootstrap_room=kv_chunk.room,
                                     failure_reason=layout_rejection
@@ -3081,31 +3118,68 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def get_session_id(self):
         return self.engine.get_session_id()
 
+    def _unblacklist_session(self, session_id: str) -> None:
+        """Caller holds session_lock."""
+        self.failed_sessions.discard(session_id)
+        self.session_failures.pop(session_id, None)
+        self.failed_session_probes.pop(session_id, None)
+
+    def _send_probe(self, session_id: str) -> int:
+        try:
+            return self.engine.send_probe(session_id)
+        except Exception as e:
+            logger.warning("send_probe(%s) raised: %s", session_id, e)
+            return -1
+
     def _run_one_probe_pass(self) -> None:
+        """Probe due sessions with per-session exponential backoff, and drop
+        sessions no request has targeted within the idle timeout: a restarted
+        decode comes back under a new session id, so its old one never
+        re-registers."""
+        now = time.monotonic()
+        due = []
         with self.session_lock:
-            snapshot = list(self.failed_sessions)
-        for session_id in snapshot:
-            send_probe = getattr(self.engine, "send_probe", None)
-            if send_probe is None:
-                rc = -1
-            else:
-                try:
-                    rc = send_probe(session_id)
-                except Exception as e:
-                    logger.warning("send_probe(%s) raised: %s", session_id, e)
-                    continue
-            if rc == 0:
-                with self.session_lock:
-                    was_blacklisted = session_id in self.failed_sessions
-                    self.failed_sessions.discard(session_id)
-                    self.session_failures.pop(session_id, None)
-                if was_blacklisted:
+            for session_id in list(self.failed_session_probes):
+                if session_id not in self.failed_sessions:
+                    del self.failed_session_probes[session_id]
+            for session_id in list(self.failed_sessions):
+                probe = self.failed_session_probes.setdefault(
+                    session_id,
+                    FailedSessionProbe(
+                        last_requested=now,
+                        next_probe_at=now,
+                        interval=self.failed_session_probe_interval,
+                    ),
+                )
+                if now - probe.last_requested >= self.failed_session_idle_timeout:
+                    self._unblacklist_session(session_id)
                     logger.info(
-                        "Session %s recovered via probe; un-blacklisted",
+                        "Dropped blacklisted session %s: no request for %.0fs",
                         session_id,
+                        now - probe.last_requested,
                     )
-                    FAILED_SESSION_RECOVERIES.inc()
-            else:
+                elif now >= probe.next_probe_at:
+                    due.append(session_id)
+        for session_id in due:
+            rc = self._send_probe(session_id)
+            with self.session_lock:
+                if rc == 0:
+                    was_blacklisted = session_id in self.failed_sessions
+                    self._unblacklist_session(session_id)
+                else:
+                    was_blacklisted = False
+                    probe = self.failed_session_probes.get(session_id)
+                    if probe is not None:
+                        probe.interval = min(
+                            2 * probe.interval, self.failed_session_probe_max_interval
+                        )
+                        probe.next_probe_at = time.monotonic() + probe.interval
+            if was_blacklisted:
+                logger.info(
+                    "Session %s recovered via probe; un-blacklisted", session_id
+                )
+                FAILED_SESSION_RECOVERIES.inc()
+            elif rc != 0:
                 logger.debug("Probe still failing for %s (rc=%d)", session_id, rc)
 
     def _failed_session_probe_loop(self) -> None:
