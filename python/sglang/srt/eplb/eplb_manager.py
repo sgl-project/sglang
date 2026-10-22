@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch.cuda
@@ -18,7 +19,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
+    # A coupled placement policy (the L2 expression names its L1 half, e.g.
+    # ultraep) re-plans each layer from the batch it is about to route, every
+    # `eplb_rebalance_num_iterations` representative batches, instead of the
+    # periodic whole-model rebalance.
+    refreshes_per_layer = False
+    _forward_batch = None
+
     def __init__(
         self,
         *,
@@ -35,11 +43,13 @@ class EPLBManager:
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
         get_expert_backup_client: Callable[[], Any],
         get_weight_updater: Callable[[], Any],
+        moe_load_balancer=None,
     ):
         super().__init__()
         # These collaborators are set on ModelRunner AFTER EPLBManager is
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
+        self._moe_load_balancer = moe_load_balancer
         self._model_config = model_config
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
@@ -51,6 +61,15 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
+        self.refreshes_per_layer = (
+            moe_load_balancer is not None
+            and moe_load_balancer.placement_policy is not None
+        )
+        self._refresh_gate = None
+        if self.refreshes_per_layer:
+            from evenmoe.policies.l1 import RefreshGate
+
+            self._refresh_gate = RefreshGate(self._rebalance_num_iterations)
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -69,8 +88,84 @@ class EPLBManager:
 
         self._main_generator = self._entrypoint()
 
+    def on_forward_pass_start(self, forward_batch):
+        self._forward_batch = forward_batch
+
     def on_forward_pass_end(self):
-        next(self._main_generator)
+        self._forward_batch = None
+        if not self.refreshes_per_layer:
+            next(self._main_generator)
+
+    def refresh_layer(self, layer_id, logical_topk_ids):
+        """Re-plan one layer from its current TopK and commit weights + placement
+        before that layer dispatches. Every EP rank must take the same branch:
+        the gate, the gather and the weight move are collectives."""
+        # TopK does not see the batch; ModelRunner.forward published it.
+        forward_batch = self._forward_batch
+        if (
+            forward_batch is None
+            or self._rebalance_disabled_reason is not None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
+        # Decode-only passes (idle DP ranks included) do not count as batches.
+        if (
+            mode.is_decode() or mode.is_idle()
+        ) and not forward_batch.is_extend_in_batch:
+            return
+        if not self._refresh_gate.is_due(layer_id):
+            return
+        counts = forward_batch.original_global_num_tokens_cpu
+        if counts is None:
+            counts = forward_batch.global_num_tokens_cpu
+        num_tokens = (
+            sum(counts)
+            if counts is not None
+            else forward_batch.global_num_token_non_padded_cpu
+        )
+        if not self._refresh_gate.should_refresh(
+            layer_id, representative=num_tokens >= 512
+        ):
+            return
+
+        from evenmoe.adapters.sglang import (
+            commit_placement,
+            to_placement_request,
+            to_sglang_maps,
+        )
+        from evenmoe.kernels.ops.counting import count_logical_experts
+
+        live = get_global_expert_location_metadata()
+        local_count = count_logical_experts(
+            logical_topk_ids, live.num_logical_experts, dtype=torch.int32
+        )
+        per_rank_count = local_count.new_empty((live.ep_size, live.num_logical_experts))
+        dist.all_gather_into_tensor(
+            per_rank_count,
+            local_count.contiguous(),
+            group=get_parallel().moe_ep_group.device_group,
+        )
+        plan = self._moe_load_balancer.plan_placement(
+            to_placement_request(per_rank_count[:, None, :], context=get_context())
+        )
+        maps = to_sglang_maps(plan)
+        layer_metadata = ExpertLocationMetadata._init_raw(
+            ep_size=live.ep_size,
+            physical_to_logical_map=maps.physical_to_logical_map,
+            logical_to_all_physical_map=maps.logical_to_all_physical_map,
+            mlb_routing_metadata={
+                layer_id: value for value in maps.routing_metadata.values()
+            },
+        )
+        self._get_expert_location_updater().update_layer(
+            self._get_model().routed_experts_weights_of_layer[layer_id],
+            layer_metadata,
+            layer_id,
+            nnodes=get_parallel().nnodes,
+            rank=get_parallel().tp_rank,
+        )
+        commit_placement(self._moe_load_balancer, get_context(), [layer_id])
 
     def reset_generator(self):
         self._main_generator = self._entrypoint()
@@ -141,6 +236,14 @@ class EPLBManager:
             init_lplb_solvers,
         )
 
+        on_placement_committed = None
+        if self._moe_load_balancer is not None:
+            from evenmoe.adapters.sglang import commit_placement
+
+            on_placement_committed = partial(
+                commit_placement, self._moe_load_balancer, get_context()
+            )
+
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         all_update_layer_ids = [
             layer_id for chunk in update_layer_ids_chunks for layer_id in chunk
@@ -153,6 +256,7 @@ class EPLBManager:
             if len(update_layer_ids_chunks) > 1:
                 yield
             update_expert_location_with_recovery(
+                on_placement_committed=on_placement_committed,
                 expert_location_updater=self._get_expert_location_updater(),
                 model=self._get_model(),
                 new_expert_location_metadata=expert_location_metadata,
@@ -191,6 +295,7 @@ class EPLBManager:
             return ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                moe_load_balancer=self._moe_load_balancer,
             )
 
         current_metadata = get_global_expert_location_metadata()
@@ -201,6 +306,7 @@ class EPLBManager:
             computed_metadata = ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                moe_load_balancer=self._moe_load_balancer,
                 # Arbitrary append topologies may not preserve node divisibility.
                 use_flat_topology=True,
             )
@@ -307,6 +413,7 @@ def update_expert_location_with_recovery(
     update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
+    on_placement_committed=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -342,6 +449,9 @@ def update_expert_location_with_recovery(
                 get_model().load_format,
                 weight_name_filter=weight_name_filter,
             )
+
+    if on_placement_committed is not None:
+        on_placement_committed(update_layer_ids)
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
