@@ -10,6 +10,7 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+from .options import SGLDOptions
 
 
 def _enable_gguf_in_diffusion_models() -> None:
@@ -25,144 +26,47 @@ from .utils import (
     convert_video_to_comfy_video,
     get_image_path,
     is_empty_image,
+    resolve_video_path,
 )
 
+# The server clamps n to this range (image_api.py).
+MAX_SERVER_IMAGES = 10
 
-class SGLDOptions:
+
+def _decode_image_batch(response: dict, num_images: int) -> torch.Tensor:
+    """Decode the server's images, in order, into one ComfyUI IMAGE batch."""
+    items = [item.get("b64_json") for item in response.get("data") or []]
+    if not items or not all(items):
+        raise RuntimeError("No image data in response")
+    if len(items) < num_images:
+        raise RuntimeError(
+            f"Requested {num_images} images but the server returned {len(items)}"
+        )
+    images = [convert_b64_to_tensor_image(b64) for b64 in items[:num_images]]
+    shapes = {tuple(image.shape[1:]) for image in images}
+    if len(shapes) > 1:
+        raise RuntimeError(
+            f"Server returned images of different sizes {sorted(shapes)}; "
+            "they cannot be combined into one IMAGE batch"
+        )
+    return torch.cat(images, dim=0)
+
+
+class SGLDH3DistilledSigmas:
+    """The checkpoint's trained rectified-flow grid, independent of scheduler presets."""
+
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {},
-            "optional": {
-                "model_type": (
-                    [
-                        "auto-detect",
-                        "qwen_image",
-                        "qwen_image_edit",
-                        "flux",
-                        "lumina2",
-                        "minimax_h3",
-                    ],
-                    {"default": "auto-detect"},
-                ),
-                "enable_torch_compile": (
-                    "BOOLEAN",
-                    {"default": False},
-                ),
-                "num_gpus": ("INT", {"default": 1, "min": 1, "step": 1}),
-                "tp_size": ("INT", {"default": -1, "min": -1, "step": 1}),
-                "sp_degree": ("INT", {"default": -1, "min": -1, "step": 1}),
-                "ulysses_degree": (
-                    "INT",
-                    {
-                        "default": -1,
-                        "min": -1,
-                        "step": 1,
-                    },
-                ),
-                "ring_degree": (
-                    "INT",
-                    {
-                        "default": -1,
-                        "min": -1,
-                        "step": 1,
-                    },
-                ),
-                "dp_size": ("INT", {"default": 1, "min": 1, "step": 1}),
-                "dp_degree": ("INT", {"default": 1, "min": 1, "step": 1}),
-                "enable_cfg_parallel": (
-                    "BOOLEAN",
-                    {"default": False},
-                ),
-                "attention_backend": (
-                    "STRING",
-                    {"default": ""},
-                ),
-                "dit_layerwise_offload": (
-                    "BOOLEAN",
-                    {"default": False},
-                ),
-                "enable_cache_dit": (
-                    "BOOLEAN",
-                    {"default": False},
-                ),
-                "quantization": (
-                    "STRING",
-                    {"default": ""},
-                ),
-                "transformer_weights_path": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                    },
-                ),
-            },
-        }
+        return {"required": {"model_type": (["fast_h3", "vdn_h3"],)}}
 
-    RETURN_TYPES = ("SGLD_OPTIONS",)
-    RETURN_NAMES = ("sgld_options",)
-    FUNCTION = "create_options"
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "build"
     CATEGORY = "SGLDiffusion"
 
-    def create_options(
-        self,
-        model_type: str = "auto-detect",
-        enable_torch_compile: bool = False,
-        num_gpus: int = 1,
-        tp_size: int = -1,
-        sp_degree: int = -1,
-        ulysses_degree: int = -1,
-        ring_degree: int = -1,
-        dp_size: int = 1,
-        dp_degree: int = 1,
-        enable_cfg_parallel: bool = False,
-        attention_backend: str = "",
-        dit_layerwise_offload: bool = False,
-        enable_cache_dit: bool = False,
-        quantization: str = "",
-        transformer_weights_path: str = "",
-    ):
-        """
-        Build a dictionary of SGLang Diffusion runtime options.
-        """
-        # Convert -1 to None for optional parameters (matching ServerArgs defaults)
-        ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
-        ring_degree = None if ring_degree == -1 else ring_degree
-        tp_size = None if tp_size == -1 else tp_size
-        sp_degree = None if sp_degree == -1 else sp_degree
-        attention_backend = None if attention_backend == "" else attention_backend
-        # dp_degree is a leftover alias; ServerArgs only has dp_size.
-        if dp_degree not in (None, 1) and dp_size in (None, 1):
-            dp_size = dp_degree
+    def build(self, model_type):
+        from .executors.minimax_h3 import distilled_h3_sigmas
 
-        options = {
-            "model_type": model_type,
-            "enable_torch_compile": enable_torch_compile,
-            "num_gpus": num_gpus,
-            "tp_size": tp_size,
-            "sp_degree": sp_degree,
-            "ulysses_degree": ulysses_degree,
-            "ring_degree": ring_degree,
-            "dp_size": dp_size,
-            "enable_cfg_parallel": enable_cfg_parallel,
-            "attention_backend": attention_backend,
-            "dit_layerwise_offload": dit_layerwise_offload,
-        }
-        if enable_cache_dit:
-            options["enable_cache_dit"] = True
-        quantization = (quantization or "").strip()
-        if quantization:
-            options["quantization"] = quantization
-        transformer_weights_path = (transformer_weights_path or "").strip()
-        if transformer_weights_path:
-            # Same selector as `sglang serve --transformer-weights-path`:
-            # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
-            options["transformer_weights_path"] = transformer_weights_path
-
-        # Strip None to keep payload clean
-        options = {k: v for k, v in options.items() if v is not None}
-        return (options,)
+        return (torch.tensor(distilled_h3_sigmas(model_type)),)
 
 
 class SGLDLoraLoader:
@@ -213,9 +117,17 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
-        # call the SGLang Diffusion API
-        model.model.diffusion_model.set_lora(**lora_input)
-        return (model,)
+        targets = set(lora_input["target"])
+        if "all" in targets and len(targets) > 1:
+            # set_lora groups adapters per target string; "all" overlapping a
+            # named target makes the worker keep only one group on that module.
+            raise ValueError(
+                "Chained SGLDLoraLoader nodes mix target 'all' with "
+                f"{sorted(targets - {'all'})}; use the same target on every node"
+            )
+        # The shared worker is bound to the selected MODEL at sampling time.
+        bi.model_options["sgld_lora_input"] = lora_input
+        return (bi,)
 
 
 class SGLDUNETLoader:
@@ -252,6 +164,30 @@ class SGLDUNETLoader:
             unet_path, model_options=model_options, sgld_options=sgld_options
         )
         return (model,)
+
+
+class SGLDNativeModelLoader:
+    """Native SGLang model directories (FastH3, VDN-H3) that have no ComfyUI single file."""
+
+    def __init__(self):
+        self.generator = SGLDiffusionGenerator.shared()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {"model_dir": ("STRING", {"default": ""})},
+            "optional": {"sgld_options": ("SGLD_OPTIONS",)},
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "SGLDiffusion"
+
+    def load(self, model_dir, sgld_options: dict = None):
+        model_dir = os.path.abspath(os.path.expanduser(model_dir.strip()))
+        if not os.path.isfile(os.path.join(model_dir, "model_index.json")):
+            raise ValueError(f"{model_dir} is not a native model directory")
+        return (self.generator.load_model(model_dir, sgld_options=sgld_options),)
 
 
 class SGLDiffusionServerModel:
@@ -379,6 +315,16 @@ class SGLDiffusionGenerateImage:
                         "default": False,
                     },
                 ),
+                "num_images": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": MAX_SERVER_IMAGES,
+                        "tooltip": "Images to generate in one request, returned as "
+                        "one IMAGE batch. Image i uses seed + i.",
+                    },
+                ),
             },
         }
 
@@ -400,10 +346,15 @@ class SGLDiffusionGenerateImage:
         width: int = 1024,
         height: int = 1024,
         enable_teacache: bool = False,
+        num_images: int = 1,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
+        if not 1 <= num_images <= MAX_SERVER_IMAGES:
+            raise ValueError(
+                f"num_images must be between 1 and {MAX_SERVER_IMAGES}, got {num_images}"
+            )
 
         size = f"{width}x{height}"
 
@@ -411,6 +362,7 @@ class SGLDiffusionGenerateImage:
         request_params = {
             "prompt": positive_prompt,
             "size": size,
+            "n": num_images,
             "response_format": "b64_json",
         }
 
@@ -440,13 +392,7 @@ class SGLDiffusionGenerateImage:
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
-        # Decode base64 image
-        if not response["data"] or not response["data"][0]["b64_json"]:
-            raise RuntimeError("No image data in response")
-        image_data = response["data"][0]["b64_json"]
-        image = convert_b64_to_tensor_image(image_data)
-
-        return (image,)
+        return (_decode_image_batch(response, num_images),)
 
 
 class SGLDiffusionGenerateVideo:
@@ -623,7 +569,9 @@ class SGLDiffusionGenerateVideo:
         # Call API
         try:
             response = sgld_client.generate_video(**request_params)
-            video_path = response.get("file_path", "")
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
             video = convert_video_to_comfy_video(video_path, height, width)
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
@@ -831,10 +779,12 @@ class SGLDiffusionGenerateH3:
 
         try:
             response = sgld_client.generate_video(**request_params)
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 
-        video_path = response.get("file_path", "")
         # H3 aligns the canvas server-side, so the resolved size is only known
         # from the response; short_edge and aspect_ratio cannot reconstruct it
         resolved_size = response.get("size", "")
@@ -964,6 +914,7 @@ class SGLDiffusionServerUnsetLora:
 
 # Register nodes
 NODE_CLASS_MAPPINGS = {
+    "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
@@ -971,6 +922,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
+    "SGLDNativeModelLoader": SGLDNativeModelLoader,
     "SGLDOptions": SGLDOptions,
     "SGLDLoraLoader": SGLDLoraLoader,
 }
@@ -983,6 +935,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
+    "SGLDNativeModelLoader": "SGLDiffusion Native Model Loader",
     "SGLDOptions": "SGLDiffusion Options",
     "SGLDLoraLoader": "SGLDiffusion LoRA Loader",
 }

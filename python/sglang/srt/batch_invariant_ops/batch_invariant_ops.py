@@ -602,6 +602,12 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
+def mm_out_batch_invariant(
+    a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    return out.copy_(matmul_persistent(a, b))
+
+
 def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
 
@@ -1014,6 +1020,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     if not _is_npu:
         # Register for detected device
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl(
             "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key

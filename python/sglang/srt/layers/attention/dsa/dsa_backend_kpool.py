@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
     update_pooled_paged_mqa_metadata,
 )
+from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -38,6 +39,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
         dsa_impl: _DSA_IMPL_T,
         phase: str,
     ) -> None:
+        # q8 prefill consumes the tail columns as ragged ids, like the history
+        # picks. Only over a bfloat16 pool: gathering packed fp8 rows through
+        # kpool tail columns is untested, so that combination keeps the guard.
+        if (
+            dsa_impl == "flashmla_sparse_q8"
+            and phase == "prefill"
+            and not self.dsa_kv_cache_store_fp8
+        ):
+            return
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
@@ -100,6 +110,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
+                **local_query_inputs(forward_batch, metadata),
             )
 
         metadata = init_pooled_paged_mqa_metadata(
