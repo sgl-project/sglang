@@ -944,7 +944,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_tree_after_verify,
         )
 

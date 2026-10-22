@@ -3,10 +3,10 @@
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_kda_conv_tree_transform import (
+from sglang.kernels.ops.attention.linear.fused_kda_conv_tree_transform import (
     fused_kda_conv_tree_transform,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_tree_transform_kernel,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update

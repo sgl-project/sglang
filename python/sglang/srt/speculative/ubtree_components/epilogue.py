@@ -11,7 +11,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
     commit_kda_tree_after_verify,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (

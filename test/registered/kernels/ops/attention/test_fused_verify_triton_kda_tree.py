@@ -6,7 +6,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -127,7 +127,7 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
 def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     width, cache_width, lower_bound
 ):
-    from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+    from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
         commit_kda_replayssm_tree_all_layers,
     )
 
