@@ -3,11 +3,17 @@ backend and KV pool, and a source replaced after capture is caught."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.megakernels import binding as mb
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -58,7 +64,7 @@ class FullPool:
         ]
 
 
-class TokenPool:
+class TokenPool(HybridLinearKVPool):
     use_mla = True
     post_capture_active = True
 
@@ -83,7 +89,7 @@ class MambaPool:
         self.temporal = torch.zeros(2, self.size, 4)
 
 
-class RequestPool:
+class RequestPool(HybridReqToTokenPool):
     def __init__(self):
         self.mamba_pool = MambaPool()
         self.mamba_map = {0: 0, 2: 1}
@@ -104,25 +110,27 @@ def hybrid_backend():
     )
     tracked = []
 
-    def child(**kw):
-        return SimpleNamespace(
+    def child(cls, **kw):
+        return Mock(
+            spec=cls,
             token_to_kv_pool=token_pool,
             req_to_token_pool=request_pool,
             **kw,
         )
 
-    full = child(forward_decode_metadata=full_metadata)
+    full = child(TRTLLMMLABackend, forward_decode_metadata=full_metadata)
 
     def track(*args):
         tracked.append(args)
 
     linear = child(
+        KDAAttnBackend,
         forward_metadata=SimpleNamespace(
             mamba_cache_indices=torch.zeros(2, dtype=torch.int32)
         ),
         _track_mamba_state_decode=track,
     )
-    value = backend(token_pool)
+    value = Mock(spec=HybridLinearAttnBackend, token_to_kv_pool=token_pool)
     value.req_to_token_pool = request_pool
     value.full_attn_backend = full
     value.linear_attn_backend = linear
@@ -152,6 +160,40 @@ def forward_batch():
 
 
 class TestMegakernelBinding(CustomTestCase):
+    def test_hybrid_preparation_requires_the_supported_backend_and_pool_types(self):
+        cases = {
+            "lookalike": lambda f: setattr(
+                f.runner,
+                "attn_backend",
+                SimpleNamespace(
+                    full_attn_backend=f.full,
+                    linear_attn_backend=f.linear,
+                    attn_backend_list=[f.full, f.linear],
+                    token_to_kv_pool=f.token_pool,
+                    req_to_token_pool=f.request_pool,
+                ),
+            ),
+            "other_full_backend": lambda f: setattr(
+                f.backend, "full_attn_backend", SimpleNamespace()
+            ),
+            "other_linear_backend": lambda f: setattr(
+                f.backend, "linear_attn_backend", SimpleNamespace()
+            ),
+            "other_token_pool": lambda f: setattr(
+                f.backend, "token_to_kv_pool", SimpleNamespace()
+            ),
+            "other_request_pool": lambda f: setattr(
+                f.backend, "req_to_token_pool", SimpleNamespace()
+            ),
+            "non_mla_pool": lambda f: setattr(f.token_pool, "use_mla", False),
+        }
+        for name, replace in cases.items():
+            with self.subTest(name=name):
+                fixture = hybrid_backend()
+                replace(fixture)
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                self.assertIsNone(binding.preparation_view(fixture.runner).hybrid)
+
     def test_the_view_is_the_running_forwards_backend_and_pool(self):
         pool = Pool()
         with patch(BACKEND, return_value=backend(pool)):
@@ -354,6 +396,90 @@ class TestMegakernelBinding(CustomTestCase):
                     replace(fixture, batch)
                     with self.assertRaisesRegex(RuntimeError, expected):
                         binding.assert_live()
+
+    def test_required_metadata_fields_are_distinct_from_unset_values(self):
+        fields = (
+            ("mla", "block_kv_indices"),
+            ("mla", "seq_lens_k"),
+            ("batch", "out_cache_loc"),
+            ("kda", "mamba_cache_indices"),
+        )
+        for owner, field in fields:
+            for missing in (False, True):
+                with self.subTest(owner=owner, field=field, missing=missing):
+                    fixture = hybrid_backend()
+                    binding = mb.MegakernelBinding(model=torch.nn.Module())
+                    binding.preparation_view(fixture.runner)
+                    batch = forward_batch()
+                    target = {
+                        "mla": fixture.full.forward_decode_metadata,
+                        "kda": fixture.linear.forward_metadata,
+                        "batch": batch,
+                    }[owner]
+                    if missing:
+                        delattr(target, field)
+                        error, message = AttributeError, field
+                    else:
+                        setattr(target, field, None)
+                        error, message = RuntimeError, "metadata is incomplete"
+                    with (
+                        patch(BACKEND, return_value=fixture.backend),
+                        self.assertRaisesRegex(error, message),
+                    ):
+                        binding.forward_view(batch)
+
+    def test_uninitialized_metadata_is_rejected(self):
+        for kind in ("MLA", "KDA"):
+            with self.subTest(kind=kind):
+                fixture = hybrid_backend()
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                binding.preparation_view(fixture.runner)
+                if kind == "MLA":
+                    fixture.full.forward_decode_metadata = None
+                else:
+                    fixture.linear.forward_metadata = None
+                with (
+                    patch(BACKEND, return_value=fixture.backend),
+                    self.assertRaisesRegex(
+                        RuntimeError, f"{kind} decode metadata is unavailable"
+                    ),
+                ):
+                    binding.forward_view(forward_batch())
+
+    def test_capture_keeps_each_metadata_owner_and_honors_the_batch_override(self):
+        fixture = hybrid_backend()
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        binding.preparation_view(fixture.runner)
+        first_batch = forward_batch()
+        first_mla = fixture.full.forward_decode_metadata
+        first_kda = fixture.linear.forward_metadata
+        with patch(BACKEND, return_value=fixture.backend):
+            binding.seal_capture_view(first_batch, binding.forward_view(first_batch))
+            fixture.full.forward_decode_metadata = SimpleNamespace(
+                block_kv_indices=torch.zeros(1, 4, dtype=torch.int32),
+                seq_lens_k=torch.zeros(1, dtype=torch.int32),
+            )
+            fixture.linear.forward_metadata = SimpleNamespace(
+                mamba_cache_indices=torch.zeros(1, dtype=torch.int32)
+            )
+            second_batch = forward_batch()
+            second_batch.batch_size = 1
+            second_batch.out_cache_loc = torch.zeros(1, dtype=torch.int32)
+            binding.seal_capture_view(second_batch, binding.forward_view(second_batch))
+            binding.assert_live()
+
+            # A batch-owned eager stamp still takes precedence over the backend's
+            # subsequently selected metadata; captured owners remain unchanged.
+            first_batch.decode_trtllm_mla_metadata = first_mla
+            self.assertIs(
+                binding.forward_view(first_batch).hybrid.mla.block_table,
+                first_mla.block_kv_indices,
+            )
+            first_kda.mamba_cache_indices = torch.zeros_like(
+                first_kda.mamba_cache_indices
+            )
+            with self.assertRaisesRegex(RuntimeError, "kda.state_indices"):
+                binding.assert_live()
 
     def test_each_hybrid_source_family_is_sealed(self):
         cases = [

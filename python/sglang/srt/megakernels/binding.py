@@ -14,11 +14,33 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardMetadata as KdaForwardMetadata,
+    )
+    from sglang.srt.layers.attention.trtllm_mla_backend import (
+        TRTLLMMLABackend,
+        TRTLLMMLADecodeMetadata,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        HybridReqToTokenPool,
+        KVCache,
+        MambaPool,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Called by a megakernel, tolerated until offered as data (its contract test pins
 # both lists).
@@ -245,14 +267,14 @@ class _SealedSource:
 
 @dataclass(frozen=True)
 class _HybridSources:
-    model_runner: Any
-    backend: Any
-    full_backend: Any
-    linear_backend: Any
-    token_pool: Any
-    full_pool: Any
-    request_pool: Any
-    mamba_pool: Any
+    model_runner: ModelRunner
+    backend: HybridLinearAttnBackend
+    full_backend: TRTLLMMLABackend
+    linear_backend: KDAAttnBackend
+    token_pool: HybridLinearKVPool
+    full_pool: KVCache
+    request_pool: HybridReqToTokenPool
+    mamba_pool: MambaPool
 
 
 class MegakernelBinding:
@@ -266,7 +288,7 @@ class MegakernelBinding:
         self._preparation: Optional[PreparationView] = None
         self._hybrid_sources: Optional[_HybridSources] = None
 
-    def preparation_view(self, model_runner: Any) -> PreparationView:
+    def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
         """The post-pool, pre-capture resources for an optional build hook."""
         self._seal("model_runner", model_runner)
         if self._preparation is not None:
@@ -277,7 +299,7 @@ class MegakernelBinding:
         self._preparation = PreparationView(hybrid=hybrid)
         return self._preparation
 
-    def forward_view(self, forward_batch: Any = None) -> ForwardView:
+    def forward_view(self, forward_batch: Optional[ForwardBatch] = None) -> ForwardView:
         """The view of the forward running now (a target step or a draft step)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -296,12 +318,12 @@ class MegakernelBinding:
         view = ForwardView(backend, hybrid=hybrid, legacy=not hybrid_family)
         return view
 
-    def seal_capture_view(self, forward_batch: Any, view: ForwardView) -> None:
+    def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
         """Seal graph-static step tensors for this mode and batch-size bucket."""
         if view.hybrid is None:
             return
         self.assert_live()
-        mode = str(getattr(forward_batch, "forward_mode", "unknown"))
+        mode = str(forward_batch.forward_mode)
         key = f"{mode}:{int(forward_batch.batch_size)}"
         mla, kda = view.hybrid.mla, view.hybrid.kda
         getters = self._capture_getters(forward_batch)
@@ -353,34 +375,39 @@ class MegakernelBinding:
             identity=identity, current=current or (lambda value=value: value)
         )
 
-    def _prepare_hybrid(self, model_runner: Any) -> Optional[HybridPoolView]:
-        backend = model_runner.attn_backend
-        required = (
-            "full_attn_backend",
-            "linear_attn_backend",
-            "attn_backend_list",
-            "token_to_kv_pool",
-            "req_to_token_pool",
+    def _prepare_hybrid(self, model_runner: ModelRunner) -> Optional[HybridPoolView]:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
         )
-        if not all(hasattr(backend, name) for name in required):
+
+        backend = model_runner.attn_backend
+        if not isinstance(backend, HybridLinearAttnBackend):
             return None
+
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            HybridReqToTokenPool,
+        )
 
         full_backend = backend.full_attn_backend
         linear_backend = backend.linear_attn_backend
         token_pool = backend.token_to_kv_pool
         request_pool = backend.req_to_token_pool
-        full_pool = getattr(token_pool, "full_kv_pool", None)
-        mamba_pool = getattr(request_pool, "mamba_pool", None)
-        full_mapping = getattr(token_pool, "full_attention_layer_id_mapping", None)
-        mamba_mapping = getattr(request_pool, "mamba_map", None)
+        # This view describes the MLA/KDA layout, not arbitrary hybrid backends.
         if (
-            full_pool is None
-            or mamba_pool is None
-            or not isinstance(full_mapping, Mapping)
-            or not isinstance(mamba_mapping, Mapping)
-            or not getattr(token_pool, "use_mla", False)
+            not isinstance(full_backend, TRTLLMMLABackend)
+            or not isinstance(linear_backend, KDAAttnBackend)
+            or not isinstance(token_pool, HybridLinearKVPool)
+            or not isinstance(request_pool, HybridReqToTokenPool)
+            or not token_pool.use_mla
         ):
             return None
+        full_pool = token_pool.full_kv_pool
+        mamba_pool = request_pool.mamba_pool
+        full_mapping = token_pool.full_attention_layer_id_mapping
+        mamba_mapping = request_pool.mamba_map
         for role, child in (("full", full_backend), ("linear", linear_backend)):
             if child.token_to_kv_pool is not token_pool:
                 raise ValueError(f"megakernel binding: {role} backend KV pool differs")
@@ -548,16 +575,22 @@ class MegakernelBinding:
             mamba_pool=backend.req_to_token_pool.mamba_pool,
         )
 
-    def _hybrid_step(self, backend: Any, forward_batch: Any) -> HybridStepView:
+    def _hybrid_step(
+        self, backend: AttentionBackend, forward_batch: ForwardBatch
+    ) -> HybridStepView:
         sources = self._current_hybrid_sources()
         if backend is not sources.backend:
             raise RuntimeError("megakernel binding: running hybrid backend changed")
         mla_metadata = self._mla_metadata(sources, forward_batch)
-        kda_metadata = sources.linear_backend.forward_metadata
-        block_table = getattr(mla_metadata, "block_kv_indices", None)
-        sequence_lengths = getattr(mla_metadata, "seq_lens_k", None)
-        write_slots = getattr(forward_batch, "out_cache_loc", None)
-        state_indices = getattr(kda_metadata, "mamba_cache_indices", None)
+        kda_metadata: Optional[KdaForwardMetadata] = (
+            sources.linear_backend.forward_metadata
+        )
+        if kda_metadata is None:
+            raise RuntimeError("megakernel binding: KDA decode metadata is unavailable")
+        block_table = mla_metadata.block_kv_indices
+        sequence_lengths = mla_metadata.seq_lens_k
+        write_slots = forward_batch.out_cache_loc
+        state_indices = kda_metadata.mamba_cache_indices
         if any(
             value is None
             for value in (block_table, sequence_lengths, write_slots, state_indices)
@@ -565,7 +598,7 @@ class MegakernelBinding:
             raise RuntimeError(
                 "megakernel binding: hybrid decode metadata is incomplete"
             )
-        if not getattr(forward_batch, "out_cache_loc_is_physical", False):
+        if not forward_batch.out_cache_loc_is_physical:
             raise RuntimeError(
                 "megakernel binding: hybrid MLA write slots are not physical"
             )
@@ -595,16 +628,22 @@ class MegakernelBinding:
             ),
         )
 
-    def _mla_metadata(self, sources: _HybridSources, forward_batch: Any) -> Any:
-        metadata = getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+    def _mla_metadata(
+        self, sources: _HybridSources, forward_batch: ForwardBatch
+    ) -> TRTLLMMLADecodeMetadata:
+        # The backend optionally stamps this per-batch owner during eager decode;
+        # graph capture instead selects its metadata on the backend itself.
+        metadata: Optional[TRTLLMMLADecodeMetadata] = getattr(
+            forward_batch, "decode_trtllm_mla_metadata", None
+        )
         if metadata is None:
-            metadata = getattr(sources.full_backend, "forward_decode_metadata", None)
+            metadata = sources.full_backend.forward_decode_metadata
         if metadata is None:
             raise RuntimeError("megakernel binding: MLA decode metadata is unavailable")
         return metadata
 
     def _capture_getters(
-        self, forward_batch: Any
+        self, forward_batch: ForwardBatch
     ) -> dict[str, Callable[[], torch.Tensor]]:
         """Live tensor reads from the exact metadata objects used for this graph.
 
@@ -650,13 +689,13 @@ def _identity(value: Any) -> tuple:
     return (id(value),)
 
 
-def _paged_mla_cache(pool: Any, layer_id: int) -> torch.Tensor:
+def _paged_mla_cache(pool: HybridLinearKVPool, layer_id: int) -> torch.Tensor:
     cache = _mla_storage_cache(pool, layer_id)
     page_size = int(pool.full_kv_pool.page_size)
     return paged_row_view(cache, page_size)
 
 
-def _mla_storage_cache(pool: Any, layer_id: int) -> torch.Tensor:
+def _mla_storage_cache(pool: HybridLinearKVPool, layer_id: int) -> torch.Tensor:
     """Return one MLA layer as a zero-copy view of its physical storage dtype.
 
     Read through the pool's public getter first so its layer mapping and pending
