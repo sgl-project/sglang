@@ -34,9 +34,16 @@ pub(super) fn apply_tool_constraint(
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
+    reasoning_parser: bool,
 ) -> Result<(), String> {
-    let constraint = tool_constraint(parser, tool_choice, tools, parallel_tool_calls)
-        .map_err(|error| error.to_string())?;
+    let constraint = tool_constraint(
+        parser,
+        tool_choice,
+        tools,
+        parallel_tool_calls,
+        reasoning_parser,
+    )
+    .map_err(|error| error.to_string())?;
     match constraint {
         Some(ToolConstraint::StructuralTag(tag)) => sampling.structural_tag = Some(tag),
         Some(ToolConstraint::JsonSchema(schema)) => sampling.json_schema = Some(schema),

@@ -378,6 +378,7 @@ pub(super) fn chat_sampling(
         tool_choice,
         tools,
         parallel_tool_calls,
+        server_args.reasoning_parser.is_some(),
     )?;
     sampling
         .normalize(
