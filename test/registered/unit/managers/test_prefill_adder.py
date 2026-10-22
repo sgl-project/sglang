@@ -130,6 +130,7 @@ class TestPrefillAdder(CustomTestCase):
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
         req.prefix_len = 0
+        req.bidir_prefix_len = -1
         # A spec=Req mock gets a per-instance class; derive extend_len like Req.
         type(req).extend_len = Req.extend_len
         req.extend_end = None
