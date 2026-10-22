@@ -14,22 +14,31 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _module(world_size: int, hidden_size: int, topk: int):
+def _module(world_size: int, hidden_size: int, cluster: int, topk: int):
     return load_jit(
         "beam_all_reduce_norm",
         str(world_size),
         str(hidden_size),
+        str(cluster),
         str(topk),
         cuda_files=["distributed/beam_all_reduce.cuh"],
         cuda_wrappers=[
             (
                 "run",
-                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {topk}>::run",
+                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {cluster}, {topk}>::run",
             )
         ],
         # Round every multiply and add separately, as the unfused norm does.
         extra_cuda_cflags=["--fmad=false"],
     )
+
+
+def _cluster_size(world_size: int, rows: int, topk: int) -> int:
+    # Measured on 8xH200: 5-CTA clusters win at TP8 up to 8 rows (top-k 1) or
+    # 16 rows (top-k 8); one CTA per row wins elsewhere and at TP2/TP4.
+    if world_size == 8:
+        return 5 if rows <= (16 if topk == 8 else 8) else 1
+    return 1
 
 
 def beam_all_reduce_norm(
@@ -60,7 +69,12 @@ def beam_all_reduce_norm(
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual) if next_weight is not None else None
     if branch.shape[0]:
-        _module(comm.world_size, branch.shape[-1], topk).run(
+        _module(
+            comm.world_size,
+            branch.shape[-1],
+            _cluster_size(comm.world_size, branch.shape[0], topk),
+            topk,
+        ).run(
             comm,
             branch,
             residual,
