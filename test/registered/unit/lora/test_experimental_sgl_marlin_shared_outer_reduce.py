@@ -25,7 +25,10 @@ _ATOL = 1e-3
 
 @pytest.mark.skipif(not _CUDA_BF16_AVAILABLE, reason="CUDA BF16 required")
 @pytest.mark.parametrize("mapping_dtype", [torch.int32, torch.int64])
-def test_gate_delta_activation_skips_unwritten_routes_and_adapters(mapping_dtype):
+@pytest.mark.parametrize("num_slots", [1, 3])
+def test_gate_delta_activation_skips_unwritten_routes_and_adapters(
+    mapping_dtype, num_slots
+):
     """Private poisoned rows stay unread; adapter0 remains a real adapter slot."""
     from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
@@ -38,10 +41,10 @@ def test_gate_delta_activation_skips_unwritten_routes_and_adapters(mapping_dtype
     producer_ids = torch.tensor([[0, 1]] * tokens, device=device, dtype=torch.int32)
     producer_mapping = torch.tensor(
         [0, 1, 2, 0, 1, 0], device=device, dtype=torch.int32
-    )
-    a = torch.zeros((3, 1, 2 * rank, hidden), device=device, dtype=dtype)
-    b = torch.zeros((3, experts, 2 * width, rank), device=device, dtype=dtype)
-    for slot in range(2):
+    ).remainder(num_slots)
+    a = torch.zeros((num_slots, 1, 2 * rank, hidden), device=device, dtype=dtype)
+    b = torch.zeros((num_slots, experts, 2 * width, rank), device=device, dtype=dtype)
+    for slot in range(min(2, num_slots)):
         a[slot, 0, 0, 0], a[slot, 0, rank, 0] = 2 + slot, 4 + slot
         b[slot, :, :width, 0], b[slot, :, width:, 0] = 3 + slot, 5 + slot
     hidden_states = torch.zeros((tokens, hidden), device=device, dtype=dtype)
@@ -91,11 +94,12 @@ def test_gate_delta_activation_skips_unwritten_routes_and_adapters(mapping_dtype
 
     base_saved, delta_saved = torch.full_like(delta, 0.5), delta.clone()
     base = base_saved.clone()
-    ids = torch.empty((tokens, topk * 2), device=device, dtype=torch.int32)[:, ::2]
+    ids = torch.full((tokens, topk * 2), -1, device=device, dtype=torch.int32)[:, ::2]
     ids.copy_(producer_ids)
-    mapping = torch.empty(tokens * 2, device=device, dtype=mapping_dtype)[::2]
+    mapping = torch.full((tokens * 2,), -1, device=device, dtype=mapping_dtype)[::2]
     mapping.copy_(producer_mapping)
-    enabled = torch.ones(6, device=device, dtype=torch.int32)[::2]
+    enabled = torch.zeros(num_slots * 2, device=device, dtype=torch.int32)[::2]
+    enabled.fill_(1)
     output = torch.empty((tokens * topk, width), device=device, dtype=dtype)
 
     def run():
@@ -118,13 +122,17 @@ def test_gate_delta_activation_skips_unwritten_routes_and_adapters(mapping_dtype
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for state in ("mixed", "all-inactive", "valid"):
+    for state in ("mixed", "disabled", "all-inactive", "valid"):
         ids.copy_(torch.tensor([[0, 1]] * tokens, device=device, dtype=ids.dtype))
         mapping.copy_(producer_mapping)
         enabled.fill_(1)
         if state == "mixed":
             ids[0, 0], ids[2, 0], ids[3, 1], ids[5] = -1, -1, -1, -1
-            mapping[3], mapping[4], enabled[2] = -1, 3, 0
+            mapping[3], mapping[4] = -1, num_slots
+            if num_slots > 1:
+                enabled[num_slots - 1] = 0
+        elif state == "disabled":
+            enabled.zero_()
         elif state == "all-inactive":
             ids.fill_(-1)
         active_route = ids >= 0
