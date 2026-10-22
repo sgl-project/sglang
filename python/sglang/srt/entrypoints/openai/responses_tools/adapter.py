@@ -55,10 +55,6 @@ class ResponseToolAdapter:
         """Return the model's template options without changing the API request."""
         return request.chat_template_kwargs
 
-    def render(self, request):
-        """Return template kwargs and tools to render; None keeps request.tools."""
-        return request.chat_template_kwargs, None
-
     def choice(self):
         return self.public_choice
 

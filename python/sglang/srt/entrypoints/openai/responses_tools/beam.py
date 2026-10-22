@@ -53,30 +53,6 @@ class BeamToolAdapter(ResponseToolAdapter):
                 )
         return request.chat_template_kwargs
 
-    def render(self, request):
-        """Pass built-ins separately for the template's system tool block."""
-        if not self.builtins:
-            return request.chat_template_kwargs, None
-        tools = request.tools or []
-        if request.tool_choice == "none":
-            tools = []
-        elif not isinstance(request.tool_choice, str):
-            tools = [
-                t for t in tools if t.function.name == request.tool_choice.function.name
-            ]
-        functions, builtins = [], []
-        for tool in tools:
-            definition = tool.model_dump(exclude_none=True)
-            if tool.function.name in self.builtins:
-                builtins.append(definition)
-            else:
-                functions.append(definition)
-        kwargs = dict(request.chat_template_kwargs or {})
-        for key, value in (("tools", functions), ("builtin_tools", builtins)):
-            if kwargs.pop(key, value) != value:
-                raise ValueError(f"{key} is managed by Responses built-in tools")
-        return {**kwargs, "builtin_tools": builtins}, functions
-
     def _builtin(self, name, kind, description, parameters):
         self._add(
             {

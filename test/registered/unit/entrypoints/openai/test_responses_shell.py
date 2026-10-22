@@ -209,11 +209,10 @@ def test_beam_shell_call_and_client_result_continuation(
         assert call == done
         assert call["type"] == "shell_call" and call["action"]["commands"] == [command]
         assert call["action"]["timeout_ms"] == 600000
-        assert [
-            t["function"]["name"] for t in seen[0].chat_template_kwargs["builtin_tools"]
-        ] == ["bash"]
+        # The template declares the trained bash for a plain bash in `tools=`.
+        assert "builtin_tools" not in seen[0].chat_template_kwargs
         assert [t["function"]["name"] for t in rendered[0]] == (
-            [] if isinstance(choice, dict) else ["other"]
+            ["bash"] if isinstance(choice, dict) else ["bash", "other"]
         )
         output = {
             "type": "shell_call_output",
@@ -250,7 +249,7 @@ def test_beam_shell_call_and_client_result_continuation(
                 }
                 assert json.loads(messages[-1].content) == output
                 if next_choice == "none":
-                    assert seen[-1].chat_template_kwargs["builtin_tools"] == []
+                    assert rendered[-1] is None
                 elif not tools:
                     assert not seen[-1].tools
 
@@ -453,9 +452,7 @@ def test_truncated_shell_history_can_be_continued(shell_serving, stream):
 @pytest.mark.parametrize(
     "choice", ["auto", "none", {"type": "function", "name": "run_command"}]
 )
-def test_native_shell_and_client_function_use_separate_declarations(
-    shell_serving, choice
-):
+def test_native_shell_declares_bash_with_the_client_tools(shell_serving, choice):
     serving, seen, rendered = shell_serving
     client = {
         "type": "function",
@@ -487,41 +484,19 @@ def test_native_shell_and_client_function_use_separate_declarations(
     )
     data = response.model_dump()
     calls = [i for i in data["output"] if i["type"] != "reasoning"]
-    kwargs = seen[0].chat_template_kwargs
+    assert "builtin_tools" not in seen[0].chat_template_kwargs
     if choice == "none":
         assert [i["type"] for i in calls] == ["message"]
-        assert rendered[0] == kwargs["builtin_tools"] == []
+        assert rendered[0] is None
+    elif choice == "auto":
+        assert [i["type"] for i in calls] == ["shell_call", "function_call"]
+        assert calls[-1]["name"] == "run_command"
+        assert [t["function"]["name"] for t in rendered[0]] == ["bash", "run_command"]
     else:
-        assert (
-            calls[-1]["type"] == "function_call" and calls[-1]["name"] == "run_command"
-        )
+        assert [(i["type"], i["name"]) for i in calls] == [
+            ("function_call", "run_command")
+        ]
         assert [t["function"]["name"] for t in rendered[0]] == ["run_command"]
-        if choice == "auto":
-            assert calls[0]["type"] == "shell_call"
-            assert [t["function"]["name"] for t in kwargs["builtin_tools"]] == ["bash"]
-        else:
-            assert kwargs["builtin_tools"] == []
-            assert len(calls) == 1
-
-
-@pytest.mark.parametrize("kwargs", [{"builtin_tools": ["bash"]}, {"tools": []}])
-def test_native_shell_rejects_conflicting_template_tool_definitions(
-    shell_serving, kwargs
-):
-    serving, _, _ = shell_serving
-    response = asyncio.run(
-        serving.create_responses(
-            ResponsesRequest(
-                model="x",
-                input="Run",
-                tools=[SHELL, {"type": "function", "name": "other"}],
-                chat_template_kwargs=kwargs,
-            )
-        )
-    )
-    assert response.status_code == 400
-    assert "managed by Responses built-in tools" in response.body.decode()
-    serving.tokenizer_manager.generate_request.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -772,12 +772,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
-        render_tools = None
-        if tool_adapter is not None:
-            chat_request.chat_template_kwargs, render_tools = tool_adapter.render(
-                chat_request
-            )
-
         media_error = self._validate_media_content(chat_request)
         if media_error:
             raise _MediaInputValidationError(media_error)
@@ -787,7 +781,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_request,
             is_multimodal,
             output_constrained=request.has_json_schema_constraint(),
-            render_tools=render_tools,
         )
         # ``_process_messages`` merges server defaults into the temporary Chat
         # request before rendering. Response parsing happens later from the
