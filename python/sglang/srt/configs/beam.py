@@ -138,18 +138,6 @@ class BeamConfig(PretrainedConfig):
 
         self._validate_beam_config()
 
-    def validate(self):
-        # Workaround for transformers < 5.16: its save-time validate_rope() cannot
-        # handle the None full_attention entry; drop once the pin moves past it.
-        rope_parameters = self.rope_parameters
-        self.rope_parameters = {
-            "sliding_attention": dict(rope_parameters["sliding_attention"])
-        }
-        try:
-            super().validate()
-        finally:
-            self.rope_parameters = rope_parameters
-
     def _validate_layer_schedules(self):
         for name in ("layer_types", "mlp_layer_types"):
             if len(getattr(self, name)) != self.num_hidden_layers:

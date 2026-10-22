@@ -14,7 +14,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -48,7 +47,7 @@ def _jit_tiny_gemm_module(
     max_m: int,
     n_split: int,
     out_dtype: torch.dtype,
-    weight_dtype: torch.dtype = torch.bfloat16,
+    weight_dtype: torch.dtype,
 ) -> Module:
     use_k_variant = _prefer_k_variant(n, k)
     if weight_dtype not in (torch.bfloat16, torch.float32):
@@ -107,13 +106,7 @@ def _supports_k_variant(n: int, k: int) -> bool:
 
 
 @cache_once
-def _default_n_gemm_n_split(
-    n: int, k: int, max_m: int, weight_dtype: torch.dtype = torch.bfloat16, m: int = 16
-) -> int:
-    if weight_dtype == torch.float32 and (n, k) == (256, 5120) and max_m <= 16:
-        # Rotating 49 FP32 router weights under CUDA graph replay.
-        small_m = 8 if get_jit_cuda_arch().major == 10 else 4
-        return 1 if m <= small_m else 2
+def _default_n_gemm_n_split(n: int, k: int, max_m: int) -> int:
     split_cap = _n_gemm_block_threads(k) // max_m
     candidates = [d for d in range(1, min(n, split_cap) + 1) if n % d == 0]
     if not candidates:
@@ -200,7 +193,7 @@ def tiny_gemm_bf16(
         n_split = (
             _default_k_gemm_n_split(n, k)
             if _prefer_k_variant(n, k)
-            else _default_n_gemm_n_split(n, k, max_m, w.dtype, x.shape[0])
+            else _default_n_gemm_n_split(n, k, max_m)
         )
     _tiny_gemm_custom_op(x, w, out, max_m, n_split)
     return out

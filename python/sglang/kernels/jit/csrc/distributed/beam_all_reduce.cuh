@@ -1,4 +1,4 @@
-// Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 // Beam's BF16 sandwich norm over the existing CustomAllReduceV2 push protocol.
 #pragma once
 #include <sgl_kernel/tensor.h>
@@ -28,6 +28,13 @@ struct Params {
   uint32_t rows, rank, counters;
   device::distributed::PushWorkSpace<World> workspace;
 };
+
+SGL_DEVICE void cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+SGL_DEVICE void cluster_wait() {
+  asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+}
 
 /// Every thread holds eight adjacent BF16 values of one row.
 template <uint32_t Hidden, uint32_t Cluster>
@@ -77,6 +84,8 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     device::PDLTriggerSecondary<true>();
     return;
   }
+  // inv_rms writes peers' shared memory, which is valid only once every CTA in the cluster has started.
+  if constexpr (Cluster > 1) cluster_arrive_relaxed();
   const auto idx = row * (Hidden / 8) + tx;
   Vec value;
   if constexpr (TopK == 1) {
@@ -106,7 +115,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     for (uint32_t rank = 0; rank < World; ++rank)
       ptx::st_relaxed_16B(value, epoch.slot_ptr(rank, p.rank), idx);
   }
-  // Fetch epilogue inputs while the peers publish their rank-local payloads.
+  // Fetch epilogue inputs while the peers publish; asm loads stay ahead of the poll.
   Vec post, residual;
   ptx::ld_relaxed_16B(post, p.post_weight, tx);
   ptx::ld_relaxed_16B(residual, p.residual, idx);
@@ -131,6 +140,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     }
     value[j] = cast<bf16x2_t>(sum);
   }
+  if constexpr (Cluster > 1) cluster_wait();
   const float post_rstd = inv_rms<Hidden, Cluster>(value, p.eps);
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {
@@ -174,6 +184,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
 template <uint32_t World, uint32_t Hidden, uint32_t Cluster, uint32_t TopK>
 struct BeamAllReduceNorm {
   static_assert(World == 2 || World == 4 || World == 8);
+  // Whole warps per CTA, and at most 32 in a cluster so inv_rms reduces them in one warp.
   static_assert(Hidden % (Cluster * 256) == 0 && Hidden <= 8192);
   static void
   run(host::distributed::CommunicatorRef ref,

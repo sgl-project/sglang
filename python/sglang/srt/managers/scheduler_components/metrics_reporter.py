@@ -60,6 +60,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE,
     SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
@@ -465,11 +466,7 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            seq_lens = batch.seq_lens_cpu
-            if seq_lens is None:
-                # Speculative decode may omit CPU lengths; avoid a GPU sync.
-                seq_lens = (req.seqlen for req in batch.reqs)
-            for sl in seq_lens:
+            for sl in batch.seq_lens_cpu:
                 decode_kv.add(int(sl))
 
         return ScheduledRequestMetrics(

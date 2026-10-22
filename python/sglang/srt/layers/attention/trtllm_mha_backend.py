@@ -1927,6 +1927,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out = out.view_as(q)
                 prefix_reqs = self.forward_metadata.mixed_prefill_reqs
                 prefix_tokens = self.forward_metadata.mixed_prefill_tokens
+                # FMHA-v2 platforms (SM90/SM120) never get here, so the FP8 tail
+                # runs on trtllm-gen only and never hands an FP8 Q to XQA.
                 if (
                     prefix_reqs >= 0
                     and self.data_type

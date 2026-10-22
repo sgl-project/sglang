@@ -2572,8 +2572,8 @@ def is_hybrid_swa_model(
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         if "BeamForCausalLM" in model_architectures and hf_text_config is not None:
-            # Pure full-attention fixtures use an ordinary KV pool. The SWA
-            # pool also supports all-sliding schedules, with no full-layer pool.
+            # A schedule without sliding layers uses the ordinary KV pool; the
+            # SWA pool also serves all-sliding schedules.
             return "sliding_attention" in hf_text_config.layer_types
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
         if (

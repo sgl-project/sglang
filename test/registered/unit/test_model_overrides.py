@@ -3922,11 +3922,7 @@ class TestBeamOverrides(CustomTestCase):
             (None, {}, attention),
             ("NVFP4", {"moe_runner_backend": "flashinfer_cutlass"}, attention),
         )
-        with (
-            override_platform(is_sm90=False),
-            override_platform(is_sm100=True),
-            override_platform(is_sm120=False),
-        ):
+        with override_platform(is_sm90=False, is_sm100=True, is_sm120=False):
             for quant_algo, overrides, expected in cases:
                 with self.subTest(quant_algo=quant_algo, **overrides):
                     hf_config = SimpleNamespace(architectures=["BeamForCausalLM"])

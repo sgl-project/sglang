@@ -1,4 +1,4 @@
-# Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+# SPDX-License-Identifier: Apache-2.0
 """Private Triton activation helpers with CUDA fast-math rounding."""
 
 import triton
@@ -7,10 +7,10 @@ import triton.language as tl
 
 @triton.jit
 def _silu_fast_math(gate):
-    # Preserve the fused MoE epilogue's __fdividef(x, 1 + __expf(-x)): accurate
-    # exp/div can move the result across a BF16 rounding boundary. silu_and_mul
-    # matches it only before SM100, where it is built with --use_fast_math.
+    # Matches CUDA silu_and_mul, whose --use_fast_math build computes
+    # __fdividef(x, 1 + __expf(-x)); accurate exp/div can move BF16 results.
     # Keep SiLU in FP32; callers apply the multiply before the final BF16 store.
+    # __expf(-x) == ex2.approx(x * -log2(e)); 0fBFB8AA3B is -log2(e).
     exp_neg_gate = tl.inline_asm_elementwise(
         "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
         "=f,f",

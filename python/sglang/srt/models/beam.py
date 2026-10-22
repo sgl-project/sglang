@@ -86,7 +86,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_parallel
-from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    make_layers,
+    print_warning_once,
+    set_weight_attrs,
+)
 
 _is_cuda = is_cuda()
 
@@ -338,6 +344,22 @@ class BeamMoE(nn.Module):
             quant_method=BeamUnquantizedFusedMoEMethod() if bf16_experts else None,
             prefix=add_prefix("experts", prefix),
         )
+        # Static eligibility for the opt-in single-token GEMV on this SM103 shard;
+        # forward also needs one contiguous BF16 token and interleaved w13.
+        self.use_decode_gemv = (
+            envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
+            and _is_cuda
+            and self.tp_size == 4
+            and self.ep_size == 1
+            and self.experts.w13_weight.dtype == torch.bfloat16
+            and tuple(self.experts.w13_weight.shape) == (256, 1280, 5120)
+            and torch.cuda.get_device_capability() == (10, 3)
+        )
+        if envs.SGLANG_OPT_BEAM_DECODE_GEMV.get() and not self.use_decode_gemv:
+            print_warning_once(
+                "SGLANG_OPT_BEAM_DECODE_GEMV is unused: it needs BF16 experts "
+                "with MoE TP4/EP1 on SM103."
+            )
         # Some expert methods consume routing weights with scale already applied.
         if self.experts.should_fuse_routed_scaling_factor_in_topk:
             self.topk.topk_config.routed_scaling_factor = config.routed_scaling_factor
@@ -418,15 +440,12 @@ class BeamMoE(nn.Module):
             )
         if defer_sum:
             if (
-                envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
-                and hidden_states.shape == (1, 5120)
+                self.use_decode_gemv
+                and hidden_states.shape[0] == 1
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
-                and self.tp_size == 4
-                and self.ep_size == 1
+                # Interleaving is decided after weight loading.
                 and self.experts.quant_method.w13_swiglu_interleaved
-                and self.experts.w13_weight.shape == (256, 1280, 5120)
-                and torch.cuda.get_device_capability() == (10, 3)
             ):
                 from sglang.kernels.ops.moe.beam_decode_gemv import beam_decode_gemv
 
@@ -450,7 +469,6 @@ class BeamMoE(nn.Module):
                 inplace=False,
                 filter_expert=False,
                 defer_sum=True,
-                routed_scaling_factor=self.config.routed_scaling_factor,
                 fuse_swiglu_interleaved=self.experts.quant_method.w13_swiglu_interleaved,
             )
         output = self.experts(hidden_states, topk_output)
@@ -1061,8 +1079,8 @@ class BeamModel(nn.Module):
             if architecture == 9
             else (64, 64)
         )
-        # GB300 TP4 batch64 failed the trained-model decode consistency gate.
-        # Keep its original reduction/norm until the fused norm tree is aligned.
+        # On GB300 TP4 the fused norm's reduction order changed trained-model
+        # decode output at 64 tokens; cap it at 32 until the orders match.
         if capability == (10, 3) and parallel.tp_size == 4:
             attention_max_tokens = min(attention_max_tokens, 32)
             topk_max_tokens = min(topk_max_tokens, 32)
@@ -1179,8 +1197,6 @@ class BeamModel(nn.Module):
                 # attention's, so it fuses under the same limit.
                 if self._can_replace_mlp_all_reduce():
                     mlp_beam_ar_comm = comm
-        # FlashInfer's MNNVL all-reduce replaces CustomAR inside the measured token
-        # band (_FLASHINFER_AR_TOKEN_BAND); None outside it.
         attention_flashinfer_ar = self._flashinfer_ar_for(hidden_states)
         mlp_flashinfer_ar = None
         if attention_flashinfer_ar is not None and self._can_replace_mlp_all_reduce():
@@ -1222,8 +1238,6 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
     if quant_config is None:
         return "bf16"
     if quant_config.get_name() == "compressed_tensors":
-        if quant_config.quant_format == "nvfp4-pack-quantized":
-            return "nvfp4"
         if (
             quant_config.quant_format != "float-quantized"
             or quant_config.linear_fp8_config is not None
@@ -1282,8 +1296,8 @@ class BeamForCausalLM(nn.Module):
         if get_beam_quantization(quant_config) is None:
             raise NotImplementedError(
                 "Beam supports BF16, compressed-tensors FP8 (per-channel "
-                "weights and dynamic per-token activations), or serialized W4A4 "
-                "NVFP4 from compressed-tensors or ModelOpt"
+                "weights and dynamic per-token activations), or ModelOpt "
+                "serialized W4A4 NVFP4"
             )
         if get_parallel().moe_dense_tp_size == 1:
             raise NotImplementedError(

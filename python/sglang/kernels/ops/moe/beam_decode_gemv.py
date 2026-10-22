@@ -1,4 +1,4 @@
-# Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+# SPDX-License-Identifier: Apache-2.0
 """SM103 single-token Beam MoE with weighted expert outputs.
 
 Gate/up and activation retain BF16 rounding boundaries. The down projection

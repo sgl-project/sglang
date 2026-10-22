@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    # Beam is validated on TRT-LLM MHA (Hopper and SM120 FMHA-v2/XQA,
-    # Blackwell trtllm-gen); the generic Hopper default (fa3) is not. Other
+    # Beam serves on TRT-LLM MHA (FMHA-v2/XQA on Hopper and SM120, trtllm-gen
+    # on Blackwell) rather than the generic Hopper default (fa3). Other
     # platforms keep the generic selection.
     if is_attention_backend_not_set(cfg) and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
@@ -34,10 +34,8 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     quant_config = getattr(hf_config, "quantization_config", None) or {}
     if quantization == "modelopt":
         quantization = quant_config.get("quant_algo")
-    elif quantization in ("compressed-tensors", "compressed_tensors"):
-        quantization = quant_config.get("format")
     if (
-        quantization in ("modelopt_fp4", "NVFP4", "nvfp4-pack-quantized")
+        quantization in ("modelopt_fp4", "NVFP4")
         and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"
