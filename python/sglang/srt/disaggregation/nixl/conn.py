@@ -1879,7 +1879,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
-                        if kv_chunk.state_indices:
+                        if kv_chunk.state_indices and (
+                            not self.kv_shard_state_peer_only
+                            or self._is_state_peer(
+                                dst_tp_rank=dst_info.decode_tp_rank,
+                                dst_attn_tp_size=decode_tp_size,
+                            )
+                        ):
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
                                 kv_chunk.state_indices,
