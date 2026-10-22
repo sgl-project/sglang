@@ -261,3 +261,15 @@ def test_lazy_node_registration(monkeypatch, first):
     assert module.NODE_DISPLAY_NAME_MAPPINGS is nodes.NODE_DISPLAY_NAME_MAPPINGS
     with pytest.raises(AttributeError):
         module.unknown_attribute
+
+
+def test_reviewed_h3_source_matches_checkout():
+    import hashlib
+    from pathlib import Path
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
+        SOURCE_SHA256,
+    )
+
+    source = Path(patches.__file__).parents[3] / "runtime/models/dits/minimax_h3.py"
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == SOURCE_SHA256
