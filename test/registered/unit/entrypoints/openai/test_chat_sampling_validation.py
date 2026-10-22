@@ -116,6 +116,17 @@ class TestChatSamplingValidation(CustomTestCase):
         )
         self._assert_validation_error(response, "temperature")
 
+    def test_negative_output_limits_return_400(self):
+        """A preferred completion limit previously hid a negative legacy limit."""
+        for params, field in (
+            ({"max_tokens": -1}, "max_tokens"),
+            ({"max_completion_tokens": -1}, "max_completion_tokens"),
+            ({"max_tokens": -1, "max_completion_tokens": 1}, "max_tokens"),
+        ):
+            with self.subTest(params=params):
+                response = self._post(**params)
+                self._assert_validation_error(response, field)
+
     def test_openai_limits_are_deliberately_not_enforced(self):
         """The engine applies these values as expected, so they must not 400."""
         for params in (

@@ -509,6 +509,25 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_zero_output_limits_preserve_precedence(self):
+        """An explicit zero completion limit must survive request conversion."""
+        for params, expected in (
+            ({}, None),
+            ({"max_tokens": None, "max_completion_tokens": None}, None),
+            ({"max_tokens": 0}, 0),
+            ({"max_completion_tokens": 0}, 0),
+            ({"max_tokens": 5, "max_completion_tokens": 0}, 0),
+            ({"max_tokens": 0, "max_completion_tokens": 5}, 5),
+            ({"max_tokens": 5, "max_completion_tokens": None}, 5),
+        ):
+            with self.subTest(params=params):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}], **params
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                sampling_params.verify(vocab_size=32)
+                self.assertEqual(sampling_params.max_new_tokens, expected)
+
     def test_chat_stop_token_id_bounds_are_validated(self):
         """Chat stop_token_ids must reach SamplingParams validation."""
         for token_id in (-1, 32, 33):
