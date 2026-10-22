@@ -926,17 +926,58 @@ class ServingChatTestCase(CustomTestCase):
                     ("Plan", '{"a": 1}', []),
                 )
 
-    def test_tool_markup_inside_json_answer_is_answer_data(self):
-        """Tool markup inside a JSON answer must stay in the answer, never become a
-        call, whether the opener arrives split or together with the JSON."""
+    def test_tool_markup_inside_an_answer_is_answer_data(self):
+        """Tool markup inside a text or JSON answer must stay in the answer, never
+        become a call, whether the opener arrives split or together with the
+        answer and whether or not the reasoning is separated. A call instead of
+        the answer stays a call."""
         self._use_delimited_response_template("beam")
-        payload = json.dumps({"note": '<call:get_weather>{"city": "Paris"}</call>'})
+        markup = '<call:get_weather>{"city": "Paris"}'
+        payload = json.dumps({"note": markup + "</call>"})
+        json_object = {"response_format": {"type": "json_object"}}
+        call = self._stopped_on_token("<think>Plan</think>" + markup + "</call>", 7)
+        for answer, response_format in (
+            ("A call looks like " + markup + " and that is all.", {}),
+            (payload, json_object),
+        ):
+            answered = "<think>Plan</think><answer>" + answer
+            output = self._stopped_on_token(answered, 2)
+            fields = {"tools": [_WEATHER_TOOL], **response_format}
+            for separate in (True, False):
+                reasoning = "Plan" if separate else ""
+                cases = (
+                    (output, (reasoning, answer if separate else answered, [])),
+                    (
+                        call,
+                        (
+                            reasoning,
+                            "" if separate else "<think>Plan</think>",
+                            [("get_weather", {"city": "Paris"})],
+                        ),
+                    ),
+                )
+                for served_output, expected in cases:
+                    for stream, incremental in (
+                        (False, False),
+                        (True, False),
+                        (True, True),
+                    ):
+                        with self.subTest(
+                            text=served_output["text"],
+                            separate=separate,
+                            stream=stream,
+                            incremental=incremental,
+                        ):
+                            served = self._served(
+                                served_output,
+                                stream,
+                                incremental=incremental,
+                                separate_reasoning=separate,
+                                **fields,
+                            )
+                            self.assertEqual(served, expected)
+        fields = {"tools": [_WEATHER_TOOL], **json_object}
         output = self._stopped_on_token("<think>Plan</think><answer>" + payload, 2)
-        fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
-        for stream, incremental in ((False, False), (True, False), (True, True)):
-            with self.subTest(stream=stream, incremental=incremental):
-                served = self._served(output, stream, incremental=incremental, **fields)
-                self.assertEqual(served, ("Plan", payload, []))
         adapted, request = self._convert_rendered_as(
             "<assistant>", stream=True, **fields
         )

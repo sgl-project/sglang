@@ -76,6 +76,7 @@ class _ServingTemplates(msgspec.Struct, frozen=True):
     reasoning_only: ResponseTemplate | None
     reasoning_to_answer: ResponseTemplate | None
     tool_extraction: ResponseTemplate | None
+    tool_to_answer: ResponseTemplate | None
 
 
 def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
@@ -94,6 +95,7 @@ def _derive_serving_templates_from_json(template_json: str) -> _ServingTemplates
     loaded = load_response_template(template)
     _check_serving_fields(loaded)
     content = loaded.fields.get(_CONTENT_FIELD)
+    answer_opens = content is not None and content.open_re is not None
     return _ServingTemplates(
         source=loaded,
         streaming=_streaming_template(template),
@@ -105,14 +107,17 @@ def _derive_serving_templates_from_json(template_json: str) -> _ServingTemplates
         # Only an answer with an opener can end the reasoning-only parse.
         reasoning_to_answer=(
             _reasoning_only_template(template, ends_at_answer=True)
-            if _THINKING_FIELD in loaded.fields
-            and content is not None
-            and content.open_re is not None
+            if _THINKING_FIELD in loaded.fields and answer_opens
             else None
         ),
         tool_extraction=(
             _tool_extraction_template(template)
             if _TOOL_FIELD in loaded.fields
+            else None
+        ),
+        tool_to_answer=(
+            _tool_extraction_template(template, ends_at_answer=True)
+            if _TOOL_FIELD in loaded.fields and answer_opens
             else None
         ),
     )
@@ -224,7 +229,9 @@ def _reasoning_only_template(
     )
 
 
-def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
+def _tool_extraction_template(
+    template: dict[str, Any], *, ends_at_answer: bool = False
+) -> ResponseTemplate:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
     tool_field["optional"] = True
     # The tool detector transforms each member itself, so one malformed member
@@ -232,14 +239,17 @@ def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
     # parsed list and keeps named groups in the delimiters valid.
     if tool_field.pop("transform_each", False):
         tool_field["transform"] = "{content}"
+    fields = {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field}
+    if ends_at_answer:
+        fields[_CONTENT_FIELD] = {
+            **copy.deepcopy(template["fields"][_CONTENT_FIELD]),
+            "optional": True,
+        }
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
     return load_response_template(
-        {
-            anchor_name: template[anchor_name],
-            "fields": {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field},
-        }
+        {anchor_name: template[anchor_name], "fields": fields}
     )
 
 
@@ -286,6 +296,8 @@ class ResponseTemplateStreamAdapter:
         self._grammar_start = grammar_start
         # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
+        # Whether the output wrote the answer's opener.
+        self.answer_opened = False
 
     def _start(self, tools: Sequence[Any] | None) -> list[dict]:
         """Create the parser and replay a tool region left open by the prefix."""
@@ -332,6 +344,8 @@ class ResponseTemplateStreamAdapter:
         for event in events:
             if event["type"] == "region_open":
                 self._open_region = event
+                if event["field"] == _CONTENT_FIELD and event["end"] > event["start"]:
+                    self.answer_opened = True
             elif event["type"] in ("region_close", "region_malformed"):
                 self._open_region = None
         return events
@@ -451,6 +465,11 @@ class ResponseTemplateStreamAdapter:
                 normal_parts.append(event["text"])
                 if on_text is not None:
                     on_text(event["text"])
+            elif field == _CONTENT_FIELD and etype == "region_open":
+                # The answer's opener stays text, like the answer after it.
+                normal_parts.append(self._generated_text(event))
+                if on_text is not None:
+                    on_text(normal_parts[-1])
             elif field != _TOOL_FIELD or etype == "region_chunk":
                 continue
             elif etype == "region_open":
@@ -579,8 +598,8 @@ class ResponseTemplateReasoningDetector:
         self._tools = tools
         self._constrained = constrained
         self._adapter = self._new_adapter()
-        # Whether the parsed output opened the answer that a JSON-answer grammar
-        # admits instead of calls, so that none of its text is a call.
+        # Whether the parsed output opened the answer that the grammar admits
+        # instead of calls, so that none of its text is a call.
         self.answer_started = False
 
     def _new_adapter(self) -> ResponseTemplateStreamAdapter:
@@ -670,10 +689,9 @@ class ResponseTemplateReasoningDetector:
         return result
 
     def _record_answer(self, adapter: ResponseTemplateStreamAdapter) -> None:
-        # The parse turns verbatim at the answer opener, outside any call.
-        self.answer_started = (
-            self._grammar_start == GRAMMAR_AT_ANSWER and adapter._verbatim
-        )
+        # A grammar that holds the calls admits them or an answer, so no call
+        # follows the answer's opener.
+        self.answer_started = self._constrained and adapter.answer_opened
 
     def _track_open_reasoning(self, events: list[dict]) -> str | None:
         """Accumulate open thinking text; return the text of a region `events` close."""
@@ -710,7 +728,14 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         self.response_template = template
         if templates.tool_extraction is None:
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
-        self._template = templates.tool_extraction
+        # Under a grammar that admits calls or an answer, no call follows the
+        # answer's opener, so the parse ends there.
+        self._ends_at_answer = constrained and templates.tool_to_answer is not None
+        self._template = (
+            templates.tool_to_answer
+            if self._ends_at_answer
+            else templates.tool_extraction
+        )
         self._prefix = prefix
         self._tools = tools
         self._constrained = constrained
@@ -732,6 +757,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         return ResponseTemplateStreamAdapter(
             self._template,
             prefix=self._prefix,
+            grammar_start=GRAMMAR_AT_ANSWER if self._ends_at_answer else None,
             each_transform=self._each_transform,
             constrained=self._constrained,
             held_by=self._tool_field if self.strict_arguments else None,

@@ -1097,8 +1097,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
-        """Whether the output opened a JSON answer framed by the template's
-        grammar, after which no text is a call."""
+        """Whether the output opened the answer that the template's grammar
+        admits instead of calls, after which no text is a call."""
         return reasoning_parser is not None and (
             isinstance(reasoning_parser.detector, ResponseTemplateReasoningDetector)
             and reasoning_parser.detector.answer_started

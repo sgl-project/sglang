@@ -805,12 +805,16 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         serving.default_chat_template_kwargs = None
         serving.reasoning_parser = reasoning_parser
         serving.tool_call_parser = tool_call_parser
-        serving._reasoning_detector = ReasoningParser.DetectorMap[reasoning_parser](
-            response_template=self.TEMPLATE
+        serving._reasoning_detector = (
+            ReasoningParser.DetectorMap[reasoning_parser](
+                response_template=self.TEMPLATE
+            )
+            if reasoning_parser
+            else None
         )
         # Always-on reasoning: the output grammar starts after the reasoning.
-        serving.template_manager.reasoning_config = ReasoningToggleConfig(
-            special_case="always"
+        serving.template_manager.reasoning_config = (
+            ReasoningToggleConfig(special_case="always") if reasoning_parser else None
         )
         tokenizer = serving.tokenizer_manager.tokenizer
         tokenizer.response_template = self.TEMPLATE
@@ -1124,37 +1128,79 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         self.assertEqual(message["type"], "message")
         self.assertEqual(message["content"][0]["text"], '{"a": 1}')
 
-    def test_tool_markup_inside_json_answer_is_answer_data(self):
-        """Tool markup inside a JSON answer must stay in the answer, never become a
-        call, whether the opener arrives split or together with the JSON."""
-        payload = orjson.dumps({"note": self._CALL.split("</think>")[1]}).decode()
-        text = "<think>Check the forecast.</think><answer>" + payload
-        whole = self._output(text, matched=2)
-        cut = text.index("<answer>") + len("<ans")
-        first = {
-            **whole,
-            "text": text[:cut],
-            "meta_info": {**whole["meta_info"], "finish_reason": None},
-        }
-        split = [first, {**whole, "text": text[cut:]}]
-        fields = {**self._BEAM, "text": {"format": {"type": "json_object"}}}
-        for stream, output in ((False, whole), (True, whole), (True, split)):
-            with self.subTest(stream=stream, split=output is split):
-                if output is split:
-                    make_serving()
-                    enter_override(
-                        self,
-                        get_context().override_server_args(
-                            incremental_streaming_output=True
-                        ),
-                    )
-                response = self._respond(stream, output=output, **fields)
+    def test_tool_markup_inside_an_answer_is_answer_data(self):
+        """Tool markup inside a text or JSON answer must stay in the answer, never
+        become a call, whether the opener arrives split or together with the
+        answer and whether or not a reasoning parser separates the reasoning. A
+        call instead of the answer stays a call."""
+        reasoning = "<think>Check the forecast.</think>"
+        markup = self._CALL.removeprefix(reasoning)
+        payload = orjson.dumps({"note": markup}).decode()
+        call = self._output(self._CALL, matched=7)
+        text_answer = "A call looks like " + markup.removesuffix("</call>") + "."
+        for answer, response_format, reasoning_parsers in (
+            (text_answer, {}, ("beam", None)),
+            # Without a reasoning parser, JSON output starts at the first token.
+            (payload, {"text": {"format": {"type": "json_object"}}}, ("beam",)),
+        ):
+            text = reasoning + "<answer>" + answer
+            whole = self._output(text, matched=2)
+            cut = text.index("<answer>") + len("<ans")
+            first = {
+                **whole,
+                "text": text[:cut],
+                "meta_info": {**whole["meta_info"], "finish_reason": None},
+            }
+            split = [first, {**whole, "text": text[cut:]}]
+            for reasoning_parser in reasoning_parsers:
+                if reasoning_parser:
+                    answered = [("reasoning", None), ("message", answer)]
+                    called = [("reasoning", None), ("function_call", "get_weather")]
+                else:
+                    answered = [("message", text)]
+                    called = [("message", reasoning), ("function_call", "get_weather")]
+                for stream, output in (
+                    (False, whole),
+                    (True, whole),
+                    (True, split),
+                    (False, call),
+                    (True, call),
+                ):
+                    with self.subTest(
+                        answer=answer,
+                        reasoning_parser=reasoning_parser,
+                        stream=stream,
+                        split=output is split,
+                        call=output is call,
+                    ):
+                        if output is split:
+                            make_serving()
+                            enter_override(
+                                self,
+                                get_context().override_server_args(
+                                    incremental_streaming_output=True
+                                ),
+                            )
+                        response = self._respond(
+                            stream,
+                            output=output,
+                            reasoning_parser=reasoning_parser,
+                            tool_call_parser="beam",
+                            **response_format,
+                        )
 
-                self.assertEqual(
-                    [item["type"] for item in response["output"]],
-                    ["reasoning", "message"],
-                )
-                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+                        self.assertEqual(
+                            [
+                                (
+                                    item["type"],
+                                    item["content"][0]["text"]
+                                    if item["type"] == "message"
+                                    else item.get("name"),
+                                )
+                                for item in response["output"]
+                            ],
+                            called if output is call else answered,
+                        )
 
 
 class InputItemNormalizationTestCase(CustomTestCase):

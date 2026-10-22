@@ -9,6 +9,7 @@ from xgrammar.testing import _is_grammar_accept_string
 from sglang.srt.entrypoints.openai.protocol import Function, Tool, ToolChoice
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -236,6 +237,28 @@ class TestBeamResponseTemplate(CustomTestCase):
                 self.assertEqual(content, "")
                 self.assertEqual([call.name for call in calls], [name])
                 self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
+
+    def test_call_opener_quoted_in_a_held_answer_stays_text(self):
+        """Under a grammar that admits calls or an answer, a call opener quoted in
+        the answer is answer text, whether the reasoning is parsed first or the
+        tool parser reads the whole output."""
+        answer = "A call looks like:" + _continuation_call(
+            "get_weather", _parameter("city", "Paris"), terminator=" and more."
+        )
+        generation = (
+            "<|channel|>analysis<|message|>Plan<|end|><|start|>assistant"
+            "<|channel|>final<|message|>" + answer
+        )
+        reasoning = BeamReasoningDetector(prefix=PREFIX, constrained=True)
+        tool_parser = FunctionCallParser(
+            tools=[_tool()], tool_call_parser="beam", prefix=PREFIX, constrained=True
+        )
+
+        parsed = reasoning.detect_and_parse(generation)
+
+        self.assertEqual((parsed.reasoning_text, parsed.normal_text), ("Plan", answer))
+        self.assertTrue(reasoning.answer_started)
+        self.assertEqual(tool_parser.parse_non_stream(generation), (generation, []))
 
     def test_undeclared_tool_calls_follow_the_forwarding_setting(self):
         command = _parameter("command", "pwd")
