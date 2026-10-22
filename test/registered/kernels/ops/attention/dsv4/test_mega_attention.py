@@ -45,6 +45,246 @@ def paged_view(raw, page_size, bytes_per_token):
     "MegaAttention requires SM100/SM103",
 )
 class TestMegaAttention(CustomTestCase):
+    def test_gathered_decode_preserves_paged_output_and_empty_tiles(self):
+        from sglang.kernels.ops.attention.dsv4.mega_gather import MegaGatherPlan
+
+        torch.manual_seed(742)
+        main = paged_view(
+            quantize_k_cache_v41(
+                torch.randn(1, 128, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            128,
+            528,
+        )
+        extra = paged_view(
+            quantize_k_cache_v41_fp4(
+                torch.randn(1, 64, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            64,
+            288,
+        )
+        angle = (
+            torch.arange(256, device="cuda")[:, None]
+            / torch.arange(1, 33, device="cuda")[None]
+        )
+        table = torch.cat((angle.cos(), angle.sin()), dim=-1).float()
+        sink = torch.randn(64, device="cuda", dtype=torch.float32)
+        for heads in (8, 16, 32):
+            for lengths in ((0, 0), (1, 1), (64, 32), (65, 33), (96, 64), (128, 64)):
+                with self.subTest(heads=heads, lengths=lengths):
+                    q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
+                    indices = torch.arange(
+                        128, device="cuda", dtype=torch.int32
+                    ).repeat(3, 1)
+                    extra_indices = torch.arange(
+                        64, device="cuda", dtype=torch.int32
+                    ).repeat(3, 1)
+                    indices[:, 16:24] = -1
+                    extra_indices[:, 8:16] = -1
+                    main_lengths = torch.full(
+                        (3,), lengths[0], device="cuda", dtype=torch.int32
+                    )
+                    extra_lengths = torch.full(
+                        (3,), lengths[1], device="cuda", dtype=torch.int32
+                    )
+                    positions = torch.tensor(
+                        [0, 7, 127], device="cuda", dtype=torch.int32
+                    )
+                    expected = flash_mla_mega_decode(
+                        pack_query(q, 64),
+                        main,
+                        indices,
+                        positions,
+                        table,
+                        512**-0.5,
+                        attn_sink=sink,
+                        topk_length=main_lengths,
+                        extra_kv=extra,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_lengths,
+                    )
+                    plan = MegaGatherPlan(3, 128, 64, q.device)
+                    actual = plan.forward(
+                        q,
+                        main,
+                        extra,
+                        indices,
+                        extra_indices,
+                        main_lengths,
+                        extra_lengths,
+                        positions,
+                        table,
+                        512**-0.5,
+                        sink,
+                    )
+                    torch.testing.assert_close(
+                        actual[0].view(torch.uint8),
+                        expected[0].view(torch.uint8),
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+    def test_gathered_decode_batch16_preserves_distinct_request_selections(self):
+        from sglang.kernels.ops.attention.dsv4.mega_gather import MegaGatherPlan
+
+        torch.manual_seed(743)
+        main = paged_view(
+            quantize_k_cache_v41(
+                torch.randn(2, 128, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            128,
+            528,
+        )
+        extra = paged_view(
+            quantize_k_cache_v41_fp4(
+                torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            64,
+            288,
+        )
+        q = torch.randn(16, 8, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.randperm(256, device="cuda", dtype=torch.int32)[:128].repeat(
+            16, 1
+        )
+        extra_indices = torch.stack(
+            [
+                torch.randperm(128, device="cuda", dtype=torch.int32)[:64]
+                for _ in range(16)
+            ]
+        )
+        indices[::2, 16:24] = -1
+        extra_indices[1::2, 8:16] = -1
+        main_lengths = torch.arange(16, device="cuda", dtype=torch.int32) * 8 + 1
+        extra_lengths = torch.arange(16, device="cuda", dtype=torch.int32) * 4
+        positions = torch.arange(16, device="cuda", dtype=torch.int32) * 7
+        angles = (
+            torch.arange(256, device="cuda")[:, None]
+            / torch.arange(1, 33, device="cuda")[None]
+        )
+        table = torch.cat((angles.cos(), angles.sin()), dim=-1).float()
+        sink = torch.randn(64, device="cuda", dtype=torch.float32)
+        expected = flash_mla_mega_decode(
+            pack_query(q, 64),
+            main,
+            indices,
+            positions,
+            table,
+            512**-0.5,
+            attn_sink=sink,
+            topk_length=main_lengths,
+            extra_kv=extra,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_lengths,
+        )
+        plan = MegaGatherPlan(16, 128, 64, q.device)
+        actual = plan.forward(
+            q,
+            main,
+            extra,
+            indices,
+            extra_indices,
+            main_lengths,
+            extra_lengths,
+            positions,
+            table,
+            512**-0.5,
+            sink,
+        )
+        torch.testing.assert_close(
+            actual[0].view(torch.uint8), expected[0].view(torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+    def test_unpacked_decode_is_bit_exact_with_packed_query(self):
+        torch.manual_seed(741)
+        main = paged_view(
+            quantize_k_cache_v41(
+                torch.randn(1, 128, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            128,
+            528,
+        )
+        extra = paged_view(
+            quantize_k_cache_v41_fp4(
+                torch.randn(1, 64, 512, device="cuda", dtype=torch.bfloat16)
+            ),
+            64,
+            288,
+        )
+        angle = (
+            torch.arange(256, device="cuda")[:, None]
+            / torch.arange(1, 33, device="cuda")[None]
+        )
+        table = torch.cat((angle.cos(), angle.sin()), dim=-1).float()
+        sink = torch.randn(64, device="cuda", dtype=torch.float32)
+        for tokens in (1, 3, 128):
+            for heads in (8, 16, 32, 64):
+                for has_extra in (False, True):
+                    with self.subTest(tokens=tokens, heads=heads, extra=has_extra):
+                        q = torch.randn(
+                            tokens * 2, heads, 512, device="cuda", dtype=torch.bfloat16
+                        )[::2]
+                        indices = torch.arange(
+                            128, device="cuda", dtype=torch.int32
+                        ).repeat(tokens, 1)
+                        indices[:, 48:64] = -1
+                        positions = torch.arange(
+                            tokens, device="cuda", dtype=torch.int32
+                        )
+                        lengths = torch.full(
+                            (tokens,), 96, device="cuda", dtype=torch.int32
+                        )
+                        extra_indices = torch.arange(
+                            64, device="cuda", dtype=torch.int32
+                        ).repeat(tokens, 1)
+                        extra_lengths = torch.full(
+                            (tokens,), 32, device="cuda", dtype=torch.int32
+                        )
+                        kwargs = dict(
+                            attn_sink=sink,
+                            topk_length=lengths,
+                            extra_kv=extra if has_extra else None,
+                            extra_indices=extra_indices if has_extra else None,
+                            extra_topk_length=extra_lengths if has_extra else None,
+                        )
+                        expected = flash_mla_mega_decode(
+                            pack_query(q, 64),
+                            main,
+                            indices,
+                            positions,
+                            table,
+                            512**-0.5,
+                            **kwargs,
+                        )
+                        actual = (
+                            torch.ops.sgl_kernel.flash_mla_mega_decode_unpacked.default(
+                                q,
+                                main,
+                                indices,
+                                positions,
+                                table,
+                                512**-0.5,
+                                sink,
+                                lengths,
+                                kwargs["extra_kv"],
+                                kwargs["extra_indices"],
+                                kwargs["extra_topk_length"],
+                            )
+                        )
+                        torch.testing.assert_close(
+                            actual[0].view(torch.uint8),
+                            expected[0].view(torch.uint8),
+                            rtol=0,
+                            atol=0,
+                        )
+                        torch.testing.assert_close(
+                            actual[1], expected[1], rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            actual[2], expected[2], rtol=0, atol=0
+                        )
+
     def test_wq_b_permutation_matches_gemm_then_pack(self):
         from sglang.srt.layers.quantization import fp8_utils
         from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod

@@ -204,6 +204,41 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_skipped_warmup_does_not_route_gc_before_listener_start(self):
+        for skip_warmup, joiner in ((True, False), (False, True)):
+            with self.subTest(skip_warmup=skip_warmup, joiner=joiner):
+                server_args = mock.Mock()
+                manager = SimpleNamespace(server_status=None)
+                callback = mock.Mock()
+                execution = mock.Mock(moe=mock.Mock(is_ep_scale_joiner=joiner))
+                with (
+                    get_context().override_server_args(
+                        checkpoint_engine_wait_weights_before_ready=False,
+                        delete_ckpt_after_loading=False,
+                        skip_server_warmup=skip_warmup,
+                        debug_tensor_dump_input_file=None,
+                    ),
+                    mock.patch.object(http_server, "get_exec", return_value=execution),
+                    mock.patch.object(
+                        http_server,
+                        "_global_state",
+                        SimpleNamespace(tokenizer_manager=manager),
+                    ),
+                    mock.patch.object(
+                        http_server, "_freeze_gc_after_server_warmup"
+                    ) as freeze,
+                ):
+                    warmup = mock.Mock(return_value=True)
+                    http_server._wait_and_warmup(
+                        server_args,
+                        execute_warmup_func=warmup,
+                        post_warmup_callback=callback,
+                    )
+                warmup.assert_not_called()
+                freeze.assert_not_called()
+                callback.assert_called_once()
+                self.assertEqual(manager.server_status, http_server.ServerStatus.Up)
+
     def test_each_tokenizer_worker_freezes_locally(self):
         threshold = [700, 10, 1000]
         server_args = mock.Mock(gc_threshold=threshold)

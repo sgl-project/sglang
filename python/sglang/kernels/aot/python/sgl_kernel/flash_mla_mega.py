@@ -88,6 +88,39 @@ def permute_mega_q_weight(
     )
 
 
+def flash_mla_mega_decode_unpacked(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: torch.Tensor,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read canonical TP-local queries; interleave and pad in kernel registers."""
+    _require_mega()
+    return tuple(
+        torch.ops.sgl_kernel.flash_mla_mega_decode_unpacked.default(
+            q,
+            kv,
+            indices,
+            positions,
+            cos_sin_cache,
+            softmax_scale,
+            attn_sink,
+            topk_length,
+            extra_kv,
+            extra_indices,
+            extra_topk_length,
+        )
+    )
+
+
 def permute_mega_wo_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,

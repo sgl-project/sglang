@@ -66,6 +66,7 @@ struct TopKBF16Config {
     uint32_t count_gt_eq;  // packed (gt << 16 | eq), the block-wide census prefix
     uint32_t pivot_bin;
     uint32_t pivot_remain;
+    uint32_t warp_prefix[kNumWarps];
     union {
       alignas(16) uint32_t histogram[2][kHistStride];
       alignas(16) uint32_t stage[kMaxTopK];
@@ -315,13 +316,20 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   const uint32_t cnt_gt = __popc(gt_mask);
   const uint32_t cnt_eq = __popc(eq_mask);
 
-  // Block-wide exclusive prefix of (gt, eq), packed: one warp scan plus one shared atomic per
-  // warp. Warps land in arrival order, which is fine since the output is unordered.
+  // A warp's arrival order must not choose which tied keys survive the quota.
+  // Scan warp totals in warp-id order, then reuse the array for their prefixes.
   const uint32_t local = cnt_gt << 16 | cnt_eq;
   const uint32_t warp_inc = warp::inclusive_sum(local, lane_id);
-  uint32_t warp_base = 0;
-  if (lane_id == kWarpThreads - 1) warp_base = atomicAdd(&smem.count_gt_eq, warp_inc);
-  warp_base = __shfl_sync(warp::kFullMask, warp_base, kWarpThreads - 1);
+  if (lane_id == kWarpThreads - 1) smem.warp_prefix[warp_id] = warp_inc;
+  __syncthreads();
+  if (warp_id == 0) {
+    const uint32_t total = lane_id < C::kNumWarps ? smem.warp_prefix[lane_id] : 0;
+    const uint32_t prefix = warp::inclusive_sum(total, lane_id);
+    if (lane_id < C::kNumWarps) smem.warp_prefix[lane_id] = prefix - total;
+    if (lane_id == C::kNumWarps - 1) smem.count_gt_eq = prefix;
+  }
+  __syncthreads();
+  const uint32_t warp_base = smem.warp_prefix[warp_id];
   const uint32_t before = warp_base + warp_inc - local;
 
   // Everything above the pivot is taken, plus `remain` of the elements equal to it.
