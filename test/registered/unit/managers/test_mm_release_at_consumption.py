@@ -8,11 +8,13 @@ until request completion.
 
 from __future__ import annotations
 
+import sys
 from array import array
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -253,3 +255,7 @@ def test_retraction_holds_prompt_kv_after_media_release() -> None:
         assert cached_len() == 0
     finally:
         override.restore()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
