@@ -50,7 +50,6 @@ class TestHcConsumer(unittest.TestCase):
         model.pp_group = SimpleNamespace(world_size=1)
         model.engram_hasher = model.late_layer_start = None
         model.dspark_layers_to_capture = [1]
-        model.config = SimpleNamespace(model_type="deepseek_v4", vision_n_layers=0)
         positions = torch.arange(3)
         batch = SimpleNamespace(
             positions=positions,

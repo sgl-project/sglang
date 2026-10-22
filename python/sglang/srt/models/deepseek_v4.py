@@ -858,6 +858,13 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def _engram_image_token_id(config) -> Optional[int]:
+    """The image token Engram hashes as blocked and leaves ungated (V4.1 vision)."""
+    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        return config.image_token_id
+    return None
+
+
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
     # backend onto the tail metadata of the *live* batch (the captured args hold
@@ -3095,6 +3102,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                 engram_layout,
                 quant_config=quant_config,
                 prefix=add_prefix("engram", prefix),
+                image_token_id=_engram_image_token_id(config),
             )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
@@ -3396,17 +3404,6 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
             and mhc.can_fuse_post(self.hc_cfg)
         )
-
-
-def _batch_may_hold_image_rows(
-    forward_batch: ForwardBatch, image_token_id: int
-) -> bool:
-    """False only when the host copy of a prefill batch's ids proves no row is an
-    image token (a literal image token id or a multimodal pad id)."""
-    ids = forward_batch.prefill_input_ids_host
-    if ids is None or get_is_capture_mode():
-        return True
-    return bool(((ids == image_token_id) | (ids >= MM_PAD_SHIFT_VALUE)).any())
 
 
 def _gather_late_layer_ids(
@@ -3740,12 +3737,7 @@ class DeepseekV4Model(nn.Module):
             self.engram_hasher = EngramHasher.from_config(
                 config,
                 self.engram_layout,
-                image_token_id=(
-                    config.image_token_id
-                    if config.model_type == "deepseek_v41"
-                    and config.vision_n_layers > 0
-                    else None
-                ),
+                image_token_id=_engram_image_token_id(config),
             )
 
         if not _is_cuda:
@@ -3952,11 +3944,6 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
-        keep_image_rows = (
-            self.config.model_type == "deepseek_v41"
-            and self.config.vision_n_layers > 0
-            and _batch_may_hold_image_rows(forward_batch, self.config.image_token_id)
-        )
         for i in range(self.start_layer, self.end_layer):
             if _is_cuda:
                 layer = self.layers[i]
@@ -4083,14 +4070,9 @@ class DeepseekV4Model(nn.Module):
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
+                    input_ids=input_ids,
                     cp_all_tokens=cp_extend,
                 )
-                if keep_image_rows:
-                    hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
-                        state.residual,
-                        hidden_states,
-                    )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)

@@ -2518,8 +2518,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
-    # Host copy of a pure-prefill forward's ids, kept for host-side checks.
-    prefill_input_ids_host: Optional[torch.Tensor] = None
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None

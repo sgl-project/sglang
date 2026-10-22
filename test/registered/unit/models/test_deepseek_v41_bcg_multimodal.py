@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.deepseek_v4 as dsv4
+from sglang.srt.layers.engram import engram_gate
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -73,12 +74,16 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
         image_id = 42
         ids = torch.tensor([7, image_id, 9])
         hidden = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+        kv = torch.ones(3, 4)
+        weight = torch.ones(1, 2)
 
         class Engram:
             layer_hash_index = 0
 
-            def __call__(self, residual, *args, **kwargs):
-                return residual + 10
+            def __call__(self, residual, *args, input_ids, **kwargs):
+                return engram_gate(
+                    residual, kv, weight, weight, 1e-6, 1e-6, input_ids, image_id
+                )
 
         layer = SimpleNamespace(
             engram=Engram(),
@@ -97,13 +102,12 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                 model_type="deepseek_v41", vision_n_layers=1, image_token_id=image_id
             ),
         )
-        expected = hidden + 10
+        expected = engram_gate(hidden, kv, weight, weight, 1e-6, 1e-6)
+        self.assertFalse(torch.equal(expected[1], hidden[1]))
         expected[1] = hidden[1]
         for contains_mm in (False, True):
             batch = SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                contains_mm_inputs=lambda: contains_mm,
-                prefill_input_ids_host=ids,
+                forward_mode=ForwardMode.EXTEND, contains_mm_inputs=lambda: contains_mm
             )
             with (
                 patch.object(dsv4, "is_cp_active", return_value=False),
@@ -118,23 +122,6 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
-
-    def test_image_row_select_is_skipped_only_for_text_only_host_ids(self):
-        image_id = 42
-        cases = [
-            (None, False, True),  # no host ids: decode, verify, or a mixed batch
-            (torch.tensor([7, 9]), True, True),  # graph capture
-            (torch.tensor([7, image_id]), False, True),
-            (torch.tensor([7, dsv4.MM_PAD_SHIFT_VALUE + 1]), False, True),
-            (torch.tensor([7, 9]), False, False),
-        ]
-        for ids, capturing, expected in cases:
-            with self.subTest(ids=ids, capturing=capturing):
-                batch = SimpleNamespace(prefill_input_ids_host=ids)
-                with patch.object(dsv4, "get_is_capture_mode", return_value=capturing):
-                    self.assertEqual(
-                        dsv4._batch_may_hold_image_rows(batch, image_id), expected
-                    )
 
 
 if __name__ == "__main__":
