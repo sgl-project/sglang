@@ -307,31 +307,10 @@ class TestMultiStepDraftCompressedLocs(unittest.TestCase):
 
 
 class TestC4StateTransferLayout(unittest.TestCase):
-    @patch(
-        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
-        return_value=True,
-    )
-    def test_a5_payload_carries_c128_and_c4_state(self, _):
+    def test_payload_only_carries_c128_state(self):
         req_pool = SimpleNamespace(
             c128_page_size=1,
             req_to_c128_sidecar=torch.zeros((4, 1), dtype=torch.int32),
-            req_to_token=torch.zeros((4, 16), dtype=torch.int64),
-        )
-        payloads = dsv4_state_payloads(req_pool, 2, 13, page_size=1)
-        self.assertEqual(
-            {state_type.value for state_type in payloads},
-            {"dsv4_c128", "dsv4_c4_state"},
-        )
-
-    @patch(
-        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
-        return_value=False,
-    )
-    def test_a3_payload_carries_only_c128_state(self, _):
-        req_pool = SimpleNamespace(
-            c128_page_size=1,
-            req_to_c128_sidecar=torch.zeros((4, 1), dtype=torch.int32),
-            req_to_token=torch.zeros((4, 16), dtype=torch.int64),
         )
         payloads = dsv4_state_payloads(req_pool, 2, 13, page_size=1)
         self.assertEqual({state_type.value for state_type in payloads}, {"dsv4_c128"})
@@ -344,77 +323,7 @@ class TestC4StateTransferLayout(unittest.TestCase):
         self.assertEqual(req_pool.get_dsv4_c4_state_ring_size(), 16)
         req_pool._dsv4_allocator.get_kvcache().get_ring_size.assert_called_once_with(4)
 
-    @patch(
-        "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.is_npu_arch35",
-        return_value=True,
-    )
-    def test_a5_swa_payload_excludes_c4_state_rows(self, _):
-        swa_state = torch.empty((16, 5), dtype=torch.float32)
-        attn_state = torch.empty((32, 5), dtype=torch.float32)
-        indexer_state = torch.empty((32, 7), dtype=torch.float32)
-        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
-        pool.swa_kv_pool = SimpleNamespace(kv_buffer=[swa_state])
-        pool.compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=attn_state),
-            )
-        ]
-        pool.indexer_compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=indexer_state),
-            )
-        ]
-
-        data_ptrs, data_lens, item_lens = pool.get_state_buf_infos()
-
-        self.assertEqual(data_ptrs, [swa_state.data_ptr()])
-        self.assertEqual(data_lens, [swa_state.nbytes])
-        self.assertEqual(item_lens, [swa_state[0].nbytes])
-
-    @patch(
-        "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.is_npu_arch35",
-        return_value=False,
-    )
-    def test_a3_swa_payload_keeps_c4_state_rows(self, _):
-        swa_state = torch.empty((16, 5), dtype=torch.float32)
-        attn_state = torch.empty((32, 5), dtype=torch.float32)
-        indexer_state = torch.empty((32, 7), dtype=torch.float32)
-        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
-        pool.swa_kv_pool = SimpleNamespace(kv_buffer=[swa_state])
-        pool.compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=attn_state),
-            )
-        ]
-        pool.indexer_compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=indexer_state),
-            )
-        ]
-
-        _, data_lens, item_lens = pool.get_state_buf_infos()
-
-        self.assertEqual(
-            data_lens, [swa_state.nbytes, attn_state.nbytes, indexer_state.nbytes]
-        )
-        self.assertEqual(
-            item_lens,
-            [
-                swa_state[0].nbytes,
-                attn_state[0].nbytes * 8,
-                indexer_state[0].nbytes * 8,
-            ],
-        )
-
-    def test_c4_state_buf_infos_register_one_row_per_item(self):
+    def test_swa_payload_registers_c4_state_rows(self):
         attn_state = torch.empty((32, 5), dtype=torch.float32)
         indexer_state = torch.empty((32, 7), dtype=torch.float32)
         pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
@@ -434,12 +343,12 @@ class TestC4StateTransferLayout(unittest.TestCase):
             )
         ]
 
-        _, data_lens, item_lens = pool.get_c4_state_buf_infos()
+        _, data_lens, item_lens = pool.get_state_buf_infos()
 
         self.assertEqual(data_lens, [attn_state.nbytes, indexer_state.nbytes])
         self.assertEqual(
             item_lens,
-            [attn_state[0].nbytes, indexer_state[0].nbytes],
+            [attn_state[0].nbytes * 8, indexer_state[0].nbytes * 8],
         )
 
 
