@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
 import socket
@@ -175,6 +176,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             )
         # Opt-in asserts identical source attention-TP widths and rank-zero base ports.
         self._source_rank_offset = tp_rank if route_replicated else 0
+        full_gc_threshold = options.pop("gc_full_collection_threshold", 1_000_000)
+        if type(full_gc_threshold) is not int or full_gc_threshold < 0:
+            raise ValueError(
+                "KVCR gc_full_collection_threshold must be a non-negative integer"
+            )
+        self._full_gc_threshold = full_gc_threshold
         self._make_runtime = lambda: (runtime_factory or KVCRRuntime)(
             self.layout, options, rank=rank
         )
@@ -472,7 +479,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if self._gc_frozen:
             return
         # Keep the mature model graph out of GC scans triggered by transfer metadata.
-        freeze_gc("KVCR direct linker")
+        # Full collections rescan post-freeze transfer metadata (100-200 ms on DSv4),
+        # at different times per rank, stalling the rest of the TP group in collectives.
+        gen0, gen1, _ = gc.get_threshold()
+        freeze_gc(
+            "KVCR direct linker",
+            (gen0, gen1, self._full_gc_threshold) if self._full_gc_threshold else None,
+        )
         self._gc_frozen = True
 
     def start_layer_wise_loading(self):
