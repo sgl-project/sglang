@@ -620,14 +620,18 @@ def handle_a2a_moe(server_args: Any):
 
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
-    """Reject an explicit or inherited DeepEP v2 draft backend."""
+    """Reject an explicit or inherited DeepEP v2 draft backend, except DSpark."""
     view = resolved_view(server_args)
     draft_backend = view.speculative_moe_a2a_backend
-    if draft_backend is None and view.speculative_algorithm:
+    if view.speculative_algorithm:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
-        if not algorithm.is_ngram():
+        # DSpark draft stages run in the target's MoE path and share its
+        # ElasticBuffer (sized for the larger top-k), so they need no own backend.
+        if algorithm.is_dspark():
+            return
+        if draft_backend is None and not algorithm.is_ngram():
             draft_backend = view.moe_a2a_backend
     if draft_backend == "deepep_v2":
         raise ValueError(

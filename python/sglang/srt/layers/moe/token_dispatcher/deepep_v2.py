@@ -151,7 +151,7 @@ class DeepEPv2Buffer:
         buffers = get_resources().buffers
         state = buffers.get(cls._STATE_KEY)
         if state is None:
-            state = SimpleNamespace(buffer=None, key=None)
+            state = SimpleNamespace(buffer=None, key=None, num_topk=0)
             buffers[cls._STATE_KEY] = state
         return state
 
@@ -170,18 +170,25 @@ class DeepEPv2Buffer:
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
-        # A key change rebuilds ElasticBuffer collectively on every rank.
+        # A key change rebuilds ElasticBuffer collectively on every rank. The top-k
+        # only sizes the buffer, so layers with a smaller top-k (the DSpark draft)
+        # share it instead of rebuilding on every target/draft switch.
         key = (
             group,
             hidden_size,
-            router_topk,
             num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch,
             allow_hybrid_mode,
             dist.get_world_size(group),
         )
-        if state.buffer is not None and state.key == key:
+        if (
+            state.buffer is not None
+            and state.key == key
+            and state.num_topk >= router_topk
+        ):
             return state.buffer
+        if state.buffer is not None and state.key == key:
+            router_topk = max(router_topk, state.num_topk)
 
         # Native explicit teardown is unavailable unless explicitly_destroy=True.
         cls.destroy()
@@ -201,6 +208,7 @@ class DeepEPv2Buffer:
         # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
+        state.num_topk = router_topk
         logger.info(
             "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
@@ -220,6 +228,7 @@ class DeepEPv2Buffer:
         state = cls._state()
         state.buffer = None
         state.key = None
+        state.num_topk = 0
 
 
 class _DeepEPv2Impl:

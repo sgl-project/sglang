@@ -96,7 +96,6 @@ def test_deepep_v2_quant_contract_accepts_blockwise_fp8(
         ({"activation_scheme": "static"}, "activation_scheme"),
         ({"weight_block_size": None}, "weight_block_size"),
         ({"weight_block_size": (128, 128), "use_mxfp8": True}, "MXFP8"),
-        ({"is_fp4_expert": True}, "FP4 experts"),
     ],
 )
 def test_deepep_v2_quant_contract_rejects_incompatible_fp8(
@@ -109,6 +108,34 @@ def test_deepep_v2_quant_contract_rejects_incompatible_fp8(
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
     with pytest.raises(ValueError, match=expected):
         _validate_deepep_v2_quant_method(_fp8_method(**overrides))
+
+
+@pytest.mark.parametrize(
+    ("scale_ue8m0", "activation_scheme", "expected"),
+    [
+        (True, "dynamic", None),
+        (False, "dynamic", "without DeepGEMM UE8M0"),
+        (True, "static", "activation_scheme"),
+    ],
+)
+def test_deepep_v2_quant_contract_fp4_experts(
+    _moe_flags, monkeypatch, scale_ue8m0, activation_scheme, expected
+):
+    """FP4 experts feed DeepGEMM's FP8 x FP4 GEMM only with UE8M0 scales."""
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        _validate_deepep_v2_quant_method,
+    )
+
+    monkeypatch.setattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", scale_ue8m0)
+    _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
+    # FP4-expert checkpoints carry the 128x128 block size of their dense layers.
+    method = _fp8_method(is_fp4_expert=True, activation_scheme=activation_scheme)
+    if expected is None:
+        _validate_deepep_v2_quant_method(method)
+    else:
+        with pytest.raises(ValueError, match=expected):
+            _validate_deepep_v2_quant_method(method)
 
 
 def test_deepep_v2_quant_contract_accepts_unquantized_bf16(_moe_flags):

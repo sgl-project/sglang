@@ -1547,6 +1547,13 @@ def _varlen_deep_gemm_situ_mul_quant(
     return down_input, down_input_scale
 
 
+def _clamp_swiglu_gateup_(gateup_output: torch.Tensor, *, swiglu_limit: float) -> None:
+    """Apply the SwiGLU limit to a [..., gate | up] GEMM workspace in place."""
+    gate, up = gateup_output.chunk(2, dim=-1)
+    gate.clamp_(max=swiglu_limit)
+    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+
+
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
@@ -1611,6 +1618,17 @@ def _varlen_deep_gemm_silu_mul_quant(
         if use_packed:
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
+
+    # The DSV4 JIT kernel packs four scale groups per int32, so D = 2304
+    # (DeepSeek-V4.1-Flash, G = 18) clamps here and takes the generic quantizer.
+    if (
+        swiglu_limit is not None
+        and not swizzle
+        and not silu_mul_keep_fp32
+        and G % 4 != 0
+    ):
+        _clamp_swiglu_gateup_(gateup_output, swiglu_limit=swiglu_limit)
+        swiglu_limit = None
 
     # Only explicit precision requests opt additional callers into this kernel;
     # the generic fused quantizer rounds its SiLU intermediates to BF16.

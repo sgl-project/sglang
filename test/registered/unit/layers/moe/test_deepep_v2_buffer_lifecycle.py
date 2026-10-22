@@ -76,6 +76,31 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         self.assertIsNot(second, third)
         self.assertEqual(len(_FakeBuffer.instances), 3)
 
+    def test_draft_topk_shares_target_buffer(self):
+        """Alternating target/draft layers with different top-k must not rebuild.
+
+        A rebuild is a collective ElasticBuffer construction, so one per
+        target/draft switch stalls every DSpark step (and breaks graph replay).
+        """
+        group = _FakeGroup()
+        target = self._get(group, router_topk=6)
+        for _ in range(3):
+            self.assertIs(self._get(group, router_topk=3), target)
+            self.assertIs(self._get(group, router_topk=6), target)
+        self.assertEqual(
+            [b.kwargs["num_topk"] for b in _FakeBuffer.instances], [6]
+        )
+
+    def test_larger_topk_rebuilds_once_at_the_max(self):
+        """A smaller top-k built first is outgrown once, then stays shared."""
+        group = _FakeGroup()
+        self._get(group, router_topk=3)
+        grown = self._get(group, router_topk=6)
+        self.assertIs(self._get(group, router_topk=3), grown)
+        self.assertEqual(
+            [b.kwargs["num_topk"] for b in _FakeBuffer.instances], [3, 6]
+        )
+
     def test_key_keeps_process_group_object(self):
         group = _FakeGroup()
         self._get(group)

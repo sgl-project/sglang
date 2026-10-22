@@ -3376,6 +3376,16 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "speculative draft backend"):
             validate_deepep_v2_speculative_draft(args)
 
+    def test_dspark_draft_shares_the_target_backend(self):
+        """DSpark draft stages run in the target's DeepEP v2 path; not a separate draft backend."""
+        for draft_backend in (None, "deepep_v2"):
+            args = self._args(
+                moe_runner_backend="deep_gemm",
+                speculative_algorithm="DSPARK",
+                speculative_moe_a2a_backend=draft_backend,
+            )
+            validate_deepep_v2_speculative_draft(args)
+
     def test_ngram_does_not_inherit_a_draft_backend(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
