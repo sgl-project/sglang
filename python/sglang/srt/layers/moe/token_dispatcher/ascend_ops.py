@@ -320,11 +320,13 @@ class AscendOpsDispatcher(BaseDispatcher):
         num_tokens: int,
         padded_bs: int,
     ):
-        """Zero-pad the batch into buffers reused across steps.
+        """Copy the batch into buffers reused across steps.
 
         ``padded_bs`` differs from ``num_tokens`` whenever EP ranks disagree on
         the batch size (DP attention), so the buffers are allocated once per
-        shape and only the changed region is rewritten afterwards.
+        shape and afterwards only the rows that changed are touched: the active
+        prefix is overwritten, and the tail is cleared only when the previous
+        call filled more rows than this one.
         """
         key = (padded_bs, hidden_states.shape[1], topk_ids.shape[1])
         bufs = self._pad_buffers.get(key)
@@ -334,21 +336,29 @@ class AscendOpsDispatcher(BaseDispatcher):
                 topk_ids.new_zeros((padded_bs, topk_ids.shape[1])),
                 topk_weights.new_zeros((padded_bs, topk_weights.shape[1])),
                 torch.zeros(padded_bs, dtype=torch.bool, device=hidden_states.device),
+                0,
             )
-            self._pad_buffers[key] = bufs
-        padded_x, padded_ids, padded_weights, mask = bufs
+        padded_x, padded_ids, padded_weights, mask, filled = bufs
 
-        # A previous step may have filled more rows, so the tail is cleared too.
         padded_x[:num_tokens] = hidden_states
-        padded_x[num_tokens:] = 0
         padded_ids[:num_tokens] = topk_ids
-        padded_ids[num_tokens:] = 0
         padded_weights[:num_tokens] = topk_weights
-        padded_weights[num_tokens:] = 0
 
-        # Inactive rows must be the trailing ones.
-        mask.zero_()
+        # Inactive rows must be the trailing ones and must stay zeroed.
         mask[:num_tokens] = True
+        if filled > num_tokens:
+            padded_x[num_tokens:filled] = 0
+            padded_ids[num_tokens:filled] = 0
+            padded_weights[num_tokens:filled] = 0
+            mask[num_tokens:filled] = False
+
+        self._pad_buffers[key] = (
+            padded_x,
+            padded_ids,
+            padded_weights,
+            mask,
+            num_tokens,
+        )
         return padded_x, padded_ids, padded_weights, mask
 
     def _mc2_combine(self, combine_input: AscendOpsCombineInput) -> torch.Tensor:
