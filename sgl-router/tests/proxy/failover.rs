@@ -50,6 +50,7 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            chat_encoding_backend: Default::default(),
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),

@@ -38,6 +38,8 @@ pub use render::{
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
+#[cfg(feature = "recipe")]
+pub use render::{RecipeFormatter, RecipeModel, RecipeRender};
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]

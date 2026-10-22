@@ -132,6 +132,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            chat_encoding_backend: Default::default(),
             tokenizer: Default::default(),
             policy: sgl_router::config::PolicyKind::RoundRobin,
             decode_policy: Default::default(),

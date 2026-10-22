@@ -1,11 +1,11 @@
 """Fill tests/fixtures/parity/*.json from SGLang's own serving path.
 
 Each fixture names a checkpoint (`model`, `revision`, optionally the server's
-`tool_call_parser`) and request `cases`, each optionally with the server's
-`default_chat_template_kwargs`. This validates and renders every case with
-`OpenAIServingChat` on that checkpoint and records the prompt and its token ids,
-or the error SGLang raises, plus the `config.json` fields the processor reads
-and the Jinja template a checkpoint renders with.
+`tool_call_parser` and `chat_encoding_backend`) and request `cases`, each
+optionally with the server's `default_chat_template_kwargs`. This validates and
+renders every case with `OpenAIServingChat` on that checkpoint and records the
+prompt and its token ids, or the error SGLang raises, plus the `config.json`
+fields the processor reads and the Jinja template a checkpoint renders with.
 
 Run from rust/sglang-processor in a SGLang Python environment with the
 checkpoints cached:
@@ -64,14 +64,31 @@ class RecordingTokenizer:
         return getattr(self.tokenizer, name)
 
 
+def record_render(adapter, texts):
+    """Append the prompt text of every render to `texts`."""
+    render = adapter.render
+
+    def recording(**kwargs):
+        rendered = render(**kwargs)
+        texts.append(rendered.prompt)
+        return rendered
+
+    adapter.render = recording
+
+
 def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
     a reasoning parser. Served text-only: the processor leaves media to the engine."""
     server = object.__new__(OpenAIServingChat)
+    hf_config = SimpleNamespace(
+        model_type=config.get("model_type"),
+        architectures=config.get("architectures"),
+    )
     server.tokenizer_manager = SimpleNamespace(
         tokenizer=tokenizer,
         processor=None,
-        model_config=SimpleNamespace(is_multimodal=False),
+        model_config=SimpleNamespace(is_multimodal=False, hf_config=hf_config),
+        model_path=path,
     )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
@@ -80,13 +97,12 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server._reasoning_detector = None
     server.is_gpt_oss = server.is_gemma4 = False
     server.chat_encoding_spec = chat_encoding.resolve_chat_encoding_spec(
-        hf_config=SimpleNamespace(
-            model_type=config.get("model_type"),
-            architectures=config.get("architectures"),
-        ),
+        hf_config=hf_config,
         tokenizer=tokenizer,
         tool_call_parser=tool_call_parser,
     )
+    server.default_chat_template_kwargs = None
+    server._encoding_adapter = server._build_chat_encoding_adapter()
     server._dsv4_reasoning_effort_profile = (
         chat_encoding.resolve_dsv4_reasoning_effort_profile(
             model_path=path, revision=revision, override=config.get(DSV4_PROFILE)
@@ -114,9 +130,17 @@ def generate(fixture_path):
         allow_patterns=["*.json", "*.jinja", "*.py", "*.model", "*.tiktoken"],
     )
     config = json.loads(Path(path, "config.json").read_text())
-    # The server args `_validate_request` reads.
+    # What `_validate_request` and the chat encoding adapter read; `device` so
+    # resolution does not look for an accelerator.
     reset_context()
-    publish(ServerArgs(model_path=path), role="tokenizer")
+    publish(
+        ServerArgs(
+            model_path=path,
+            device="cpu",
+            chat_encoding_backend=fixture.get("chat_encoding_backend", "builtin"),
+        ),
+        role="tokenizer",
+    )
     tok = RecordingTokenizer(
         AutoTokenizer.from_pretrained(
             path, local_files_only=True, trust_remote_code=True
@@ -146,6 +170,11 @@ def generate(fixture_path):
     for case in fixture["cases"]:
         tok.texts.clear()
         server.default_chat_template_kwargs = case.get("default_chat_template_kwargs")
+        if server._encoding_adapter is not None:
+            # Adapters take the server defaults when built and may tokenize themselves.
+            server._encoding_adapter = server._build_chat_encoding_adapter()
+            if hasattr(server._encoding_adapter, "render"):
+                record_render(server._encoding_adapter, tok.texts)
         try:
             request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
             # Validation also rewrites tool schemas the prompt shows.
@@ -174,6 +203,7 @@ def generate(fixture_path):
         "model",
         "revision",
         "tool_call_parser",
+        "chat_encoding_backend",
         "config",
         "bos_token_id",
         "chat_template",

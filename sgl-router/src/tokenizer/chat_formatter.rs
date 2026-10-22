@@ -19,7 +19,9 @@ use dynamo_renderer::{
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
-use sglang_processor::{ChatFormatter as ProcessorFormatter, DeepSeekV4Profile};
+use sglang_processor::{
+    ChatFormatter as ProcessorFormatter, DeepSeekV4Profile, RecipeFormatter, RecipeModel,
+};
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -283,6 +285,28 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render and tokenize
+    /// through deepseek-recipe; other models keep their formatter, as the engine does.
+    pub fn with_recipe_backend(mut self, tokenizer_json: Option<&str>) -> Result<Self> {
+        let model = match self.processor {
+            Some(ProcessorFormatter::DeepSeekV41) => RecipeModel::V41,
+            Some(ProcessorFormatter::DeepSeekV4(_)) => RecipeModel::V4,
+            _ => return Ok(self),
+        };
+        let json = tokenizer_json
+            .context("--chat-encoding-backend recipe needs the model's tokenizer.json")?;
+        let formatter = RecipeFormatter::from_tokenizer_json(model, json)
+            .map_err(anyhow::Error::msg)
+            .context("--chat-encoding-backend recipe")?;
+        self.processor = Some(ProcessorFormatter::DeepSeekRecipe(formatter));
+        Ok(self)
+    }
+
+    /// Whether prompts render through deepseek-recipe, which the workers must match.
+    pub fn is_recipe(&self) -> bool {
+        matches!(self.processor, Some(ProcessorFormatter::DeepSeekRecipe(_)))
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
@@ -400,6 +424,14 @@ impl ChatFormatter {
     }
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+        if let Some(formatter @ ProcessorFormatter::DeepSeekRecipe(_)) = &self.processor {
+            let render = formatter
+                .render_recipe(request.clone(), &self.worker_defaults)
+                .context("render chat")?;
+            return render
+                .token_ids
+                .context("deepseek-recipe formatter has no tokenizer");
+        }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
             Some(segments) if self.is_kimi_k3() => super::kimi::encode(tokenizer, &segments)?,
@@ -780,6 +812,37 @@ mod tests {
     #[test]
     fn missing_messages_is_an_error() {
         assert!(deepseek_v4().render(&json!({"model": "m"})).is_err());
+    }
+
+    /// `--chat-encoding-backend recipe` swaps only the DeepSeek-V4 family's encoder.
+    #[test]
+    fn recipe_backend_applies_to_deepseek_v4_only() {
+        let tokenizer_json = include_str!("../../tests/fixtures/tiny_tokenizer.json");
+        let v41 = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias")
+            .unwrap()
+            .with_recipe_backend(Some(tokenizer_json))
+            .unwrap();
+        assert!(v41.is_recipe());
+        assert_eq!(
+            v41.forwarding_scope(),
+            super::super::ForwardingScope::AllText
+        );
+        let v4 = ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").unwrap();
+        assert!(v4.with_recipe_backend(None).is_err());
+        let v32 = ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2")
+            .unwrap()
+            .with_recipe_backend(None)
+            .unwrap();
+        assert!(!v32.is_recipe());
+        // The recipe parity fixture's `a1_empty_chat`: recipe's own prompt, not Dynamo's.
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": ""}],
+            "chat_template_kwargs": {"thinking": false},
+        });
+        assert_eq!(
+            v41.render(&request).unwrap(),
+            "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>"
+        );
     }
 
     #[test]

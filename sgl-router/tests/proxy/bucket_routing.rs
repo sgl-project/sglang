@@ -62,6 +62,7 @@ fn build_app_context(
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
+            chat_encoding_backend: Default::default(),
             tokenizer: Default::default(),
             policy,
             decode_policy: Default::default(),
