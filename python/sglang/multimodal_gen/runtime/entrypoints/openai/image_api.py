@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from PIL import Image
+from pydantic import Json
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -417,6 +418,8 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_cache_dit: Optional[bool] = Form(None),
+    cache_dit_params: Optional[Json[dict]] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
@@ -490,6 +493,8 @@ async def edits(
             true_cfg_scale=true_cfg_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
             num_frames=num_frames,
             quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,

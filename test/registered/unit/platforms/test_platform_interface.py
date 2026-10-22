@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang import _platform_stubs
+from sglang.kernels.jit.utils.arch import _sail_arch_suffix
 from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -23,6 +24,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -231,6 +233,36 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
+
+
+class TestSailDeviceMixin(CustomTestCase):
+    """Tests for SAIL device operation defaults (CUDA-compatible surface)."""
+
+    def test_sail_identity_overrides_cuda_identity(self):
+        base = SailSRTPlatform()
+        self.assertEqual(base._enum, PlatformEnum.SAIL)
+        self.assertEqual(base.device_name, "sail")
+        # device_type stays "cuda" — torch.device("cuda") is the only valid
+        # device-type string for SAIL devices in PyTorch.
+        self.assertEqual(base.device_type, "cuda")
+        self.assertTrue(base.is_sail())
+        self.assertTrue(base.is_cuda_alike())
+
+    def test_sail_srt_platform_capabilities(self):
+        base = SailSRTPlatform()
+        self.assertTrue(base.capabilities.supports_triton)
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
+
+    def test_sail_arch_suffix_below_sm89(self):
+        # SAIL devices below the SM89 capability require the arch-specific
+        # target variant for JIT compilation.
+        self.assertEqual(_sail_arch_suffix(8, 0), "a")
+        self.assertEqual(_sail_arch_suffix(8, 8), "a")
+
+    def test_sail_arch_suffix_sm89_and_above(self):
+        self.assertEqual(_sail_arch_suffix(8, 9), "")
+        self.assertEqual(_sail_arch_suffix(9, 0), "")
 
 
 class TestXpuDeviceMixin(CustomTestCase):
