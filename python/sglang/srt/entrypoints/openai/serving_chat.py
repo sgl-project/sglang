@@ -490,7 +490,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
         backend = get_serving().chat_encoding_backend
-        # Like the Rust hosts: a backend the model's spec does not offer is ignored.
         if (
             backend != "builtin"
             and not chat_encoding_adapters.has_chat_encoding_backend(

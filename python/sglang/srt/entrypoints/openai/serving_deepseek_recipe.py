@@ -26,12 +26,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# recipe resolves the model version from the request `model`; SGLang's `model` is
-# whatever the client sent.
 MODEL_NAMES = {"v4": "DeepSeek-V4-Pro", "v41": "DeepSeek-V4.1-Flash"}
 # The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it <｜image｜>.
 IMAGE_TOKEN = "<｜deepseek_image｜>"
-# The efforts recipe accepts; numbers are rejected as the API rejects them.
 REASONING_EFFORTS = (
     "none",
     "minimal",
@@ -74,7 +71,6 @@ def pre_normalize(
             "task is not supported by the deepseek-recipe chat encoding backend"
         )
 
-    # protocol.normalize_reasoning_inputs
     kwargs = dict(request.pop("chat_template_kwargs", None) or {})
     reasoning = request.pop("reasoning", None)
     thinking = None
@@ -98,7 +94,6 @@ def pre_normalize(
         thinking = effort != "none"
     if thinking is not None:
         kwargs.setdefault("thinking", thinking)
-    # serving_chat: the kwargs effort replaces the request's, the defaults fill in.
     effort = kwargs.pop("reasoning_effort", None)
     if effort is not None:
         request["reasoning_effort"] = effort
@@ -106,7 +101,6 @@ def pre_normalize(
         kwargs.setdefault(key, value)
     if request.get("reasoning_effort") is None and "reasoning_effort" in kwargs:
         request["reasoning_effort"] = kwargs["reasoning_effort"]
-    # The dsv41 branch reads the kwargs flag; the API's own `thinking` object wins.
     if request.get("thinking") is None and "thinking" in kwargs:
         request["thinking"] = {"type": "enabled" if kwargs["thinking"] else "disabled"}
 
@@ -198,7 +192,6 @@ class RecipeEncoder:
         except deepseek_recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
         conversation = converted.conversation
-        # The binding encodes from the conversation, not from the rendered text.
         return RecipeRender(
             prompt=self._encoding.render_conversation(conversation).prompt,
             prompt_ids=self._encoding.encode(conversation) if encode else None,

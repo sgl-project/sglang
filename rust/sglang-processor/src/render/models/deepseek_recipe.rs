@@ -128,7 +128,6 @@ pub(crate) fn pre_normalize(
         return Err("task is not supported by the deepseek-recipe chat encoding backend".into());
     }
 
-    // protocol.normalize_reasoning_inputs
     let mut kwargs = match request.remove("chat_template_kwargs") {
         Some(Value::Object(kwargs)) => kwargs,
         _ => serde_json::Map::new(),
@@ -143,7 +142,6 @@ pub(crate) fn pre_normalize(
     if let Some(thinking) = requested_thinking(&reasoning_view) {
         kwargs.entry("thinking").or_insert(Value::Bool(thinking));
     }
-    // serving_chat: the kwargs effort replaces the request's, the defaults fill in.
     if let Some(effort) = kwargs
         .remove("reasoning_effort")
         .filter(|effort| !effort.is_null())
@@ -158,7 +156,6 @@ pub(crate) fn pre_normalize(
     {
         request.insert("reasoning_effort".into(), effort.clone());
     }
-    // The dsv41 branch reads the kwargs flag; the API's own `thinking` object wins.
     if request.get("thinking").is_none_or(Value::is_null)
         && let Some(flag) = kwargs.get("thinking")
     {
@@ -359,7 +356,6 @@ mod tests {
         request["reasoning_effort"] = json!("high");
         request["chat_template_kwargs"] = json!({"reasoning_effort": 30});
         pre_normalize(&mut request, &HashMap::new()).unwrap();
-        // Verbatim; recipe rejects the number as the API does.
         assert_eq!(request["reasoning_effort"], 30);
     }
 

@@ -56,7 +56,6 @@ impl ChatFormatter {
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
             ChatFormatter::Recipe(formatter) => {
-                // The typed request plus the fields its type does not carry.
                 let mut body =
                     serde_json::to_value(request).map_err(|error| TemplateError::Renderer {
                         message: format!("failed to serialize the request: {error}"),
