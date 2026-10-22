@@ -268,6 +268,10 @@ def _resolve_dflash_draft_cell_size(
                 get_spec().speculative_draft_attention_backend
             ),
         )
+        # The draft KV pool builders shard heads at the draft attention width,
+        # so the reservation must price the same width. Under DP attention it is
+        # smaller than tp_size by attn_dp_size, and budgeting the raw tp_size
+        # under-counts the draft pool by that factor (#38202).
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
