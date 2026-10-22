@@ -123,7 +123,6 @@ def make_candidate_indexer(
 
     sparse_table = SparseTableBackend(
         token_to_kv_pool=token_to_kv_pool,
-        req_to_token=req_to_token,
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,

@@ -104,6 +104,30 @@ GSM8K is too easy for many state-of-the-art models, so use a more challenging or
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling).
 
+## Pull request titles
+
+Use the repository-wide format checked by CI:
+
+```text
+[Type] scope: title
+[Type] [Hardware] scope: title
+```
+
+- **Type**: `Feat`, `Fix`, `Refactor`, `Perf`, `Doc`, `Test`, `CI`, or `Chore`.
+- **Scope**: A required module or model name. Use `/` for submodules, such as `diffusion/scheduler`; there is no fixed scope list or letter-case requirement.
+- **Hardware**: Optional, for hardware-specific changes only. Use a single uppercase tag, such as `AMD` or `NVIDIA`, except for the canonical spellings `Intel`, `Apple`, `Huawei`, and `Ascend`.
+- **Title**: A short, clear description in the imperative mood. Use one space between fields and after the colon, with no leading or trailing whitespace.
+
+For example:
+
+```text
+[Fix] attention: Fix KV cache indexing
+[Perf] diffusion/scheduler: Reduce scheduling overhead
+[Perf] [AMD] diffusion/attention: Optimize decode performance
+```
+
+For reverts, keep GitHub's default `Revert "original title"` format. The PR-title check validates PR titles, not individual development commit messages.
+
 ## Requesting a review for merge
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
@@ -125,6 +149,7 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/run-extra-ci`: Extra CI **only**. Applies both labels, then reruns just `PR Test Extra`, leaving baseline CI runs alone. Use it when baseline is already green and you only need the extra tier.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. `--changed` (short form `-c`) adds every test file the PR itself adds or modifies (under `test/registered/` or the multimodal test directory), so a PR that touches several tests can rerun them all without listing them. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, `/rerun-test test_*backend*.py`, `/rerun-test --changed`, or `/rerun-test -c`.
 - `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group rust-server`) and dispatches their tests through the same selective-rerun workflow. Groups are defined in [`scripts/ci/rerun_test_groups.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/rerun_test_groups.json).
+- `/run-cpu-ci`: Runs only the CPU unit suite (`base-a-test-cpu`) against the PR head, partitioned the same way as in PR CI, without the `run-ci` label or any GPU stage. For a small PR, `/run-cpu-ci` plus `/rerun-group <module>` covers the unit tests and the affected module's tests. Alias: `/rerun-cpu-ci`.
 
 The rerun commands have the following permission rules:
 
@@ -132,7 +157,7 @@ The rerun commands have the following permission rules:
 | --- | --- | --- | --- |
 | `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
 | `/run-full-ci`, `/run-extra-ci` | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
-| `/rerun-test`, `/rerun-group` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
+| `/rerun-test`, `/rerun-group`, `/run-cpu-ci` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
 
 <Warning>
 Selective reruns do not build or install a PR-local `sglang-kernel` wheel. If a PR changes `python/sglang/kernels/aot/` or code that depends on that AOT change, use the normal/full PR CI workflow. A `/rerun-test` or `/rerun-group` result may use the pinned released kernel and does not validate the combined change.

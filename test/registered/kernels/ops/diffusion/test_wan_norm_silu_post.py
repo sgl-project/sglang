@@ -75,6 +75,27 @@ class TestWanNormSiLUPost(CustomTestCase):
                             self.assertTrue(torch.equal(original + 0.125, x))
 
     @torch.inference_mode()
+    def test_deferred_conv_bias_precedes_lossless_norm_post_ops(self):
+        for dtype in (torch.bfloat16, torch.float32):
+            for layout in (torch.contiguous_format, torch.channels_last_3d):
+                with self.subTest(dtype=dtype, layout=layout):
+                    module = self.module(bias=True, dtype=torch.float32)
+                    x = torch.randn(2, 64, 3, 8, 12, device="cuda", dtype=dtype).to(
+                        memory_format=layout
+                    )
+                    original = x.clone()
+                    conv_bias = torch.randn(64, device="cuda", dtype=torch.float32)
+                    biased = x.clone().add_(conv_bias.to(dtype).view(1, -1, 1, 1, 1))
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        expected = reference(
+                            biased, module.gamma, module.bias, module.scale
+                        )
+                        self.assertBitsEqual(module(x, conv_bias=conv_bias), expected)
+                    self.assertTrue(module._post_gate.verified)
+                    self.assertFalse(module._post_gate.disabled)
+                    self.assertTrue(torch.equal(x, original))
+
+    @torch.inference_mode()
     def test_first_sight_check_runs_once_per_layout(self):
         # a request at a new resolution must not pay the reference chain and
         # the host sync again

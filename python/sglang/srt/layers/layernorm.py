@@ -182,7 +182,6 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
     try:
         from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
@@ -191,13 +190,8 @@ if _is_npu:
         # landed expose only the torch_npu operator, which is exactly what that
         # provider binds to on A2/A3 — so those deployments keep working
         # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
-        # forward fails loudly, same as before this indirection existed. The
-        # kernels registry (sglang/kernels/ops/layernorm) deliberately does not
-        # fall back: a backend selected by name there must not silently run a
-        # different provenance.
+        # forward fails loudly, same as before this indirection existed.
         npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
-
-_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
 
 
 @lru_cache(maxsize=1)
@@ -1250,15 +1244,9 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                gamma = self.gemma_weight.to(x.dtype)
-                norm_out, _, residual = torch_npu.npu_add_rms_norm(
-                    residual, x, gamma, self.variance_epsilon
-                )
-            else:
-                norm_out, residual = add_gemma_rms_norm(
-                    x, self.weight, residual, self.variance_epsilon
-                )
+            norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                residual, x, self.gemma_weight.to(x.dtype), self.variance_epsilon
+            )
             return norm_out, residual
 
         x, _ = npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
@@ -1365,9 +1353,13 @@ class Gemma3RMSNorm(BaseFusedOp):
             # output and residual becomes x + residual for the next layer.
             gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
             return x, residual
-        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
-        # can all go through it directly without a Python-side reshape.
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs go
+        # through directly without a Python-side reshape. It handles
+        # non-contiguous batch/row strides but requires a contiguous last dim,
+        # which a permuted hidden state may not have.
         elif residual is None and x.dim() in (2, 3, 4):
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x, residual)
 
@@ -1381,6 +1373,8 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+            return self.forward_native(x, residual)
         if residual is not None:
             return self.forward_native(x, residual)
         output, _ = npu_gemma_rms_norm(x, self.weight, self.eps)

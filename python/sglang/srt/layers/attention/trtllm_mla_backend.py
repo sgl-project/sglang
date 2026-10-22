@@ -13,7 +13,15 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import (
+    _jit_fixup_module,
+    fixup_zero_kv_rows,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -38,11 +46,6 @@ from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     mla_quantize_without_rope_for_fp8,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
@@ -244,6 +247,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        # Prebuild: the first zero-KV prefix chunk otherwise JITs ~6s mid-serving.
+        _jit_fixup_module(self.q_data_type)
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
@@ -1012,8 +1017,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             raise NotImplementedError(
                 "trtllm_mla cannot forward a global causal bound to its decode "
                 "kernel, which is required for DCP with q_len > 1 (speculative "
-                "target-verify / draft-extend); select cutedsl_mla or "
-                "tokenspeed_mla for a DCP speculative run"
+                "target-verify / draft-extend); select cutedsl_mla "
+                "for a DCP speculative run"
             )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
@@ -1068,10 +1073,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
-        in model-native dtype; subclasses do any kernel-specific quantization.
+        in model-native dtype, or already FP8 from a model-side prefill hook;
+        subclasses do any kernel-specific quantization.
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
+        if self.data_type == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,

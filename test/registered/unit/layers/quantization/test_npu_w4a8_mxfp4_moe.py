@@ -1,16 +1,25 @@
 """CPU regression tests for W4A8 MXFP4 MoE support on Ascend NPU."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization import moe_methods
+# Initialize quantization before importing its NPU helpers (cold-import cycle).
+import sglang.srt.layers.quantization  # noqa: F401
+from sglang.srt.hardware_backend.npu.quantization import (
+    moe_methods,
+    online_moe_methods,
+)
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
     NPUW4A8MXFP4OnlineMoEMethod,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimW4A8MXFP4MoE
+from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +37,78 @@ class TestNPUW4A8MXFP4MoE(CustomTestCase):
         self.assertTrue(
             issubclass(NPUW4A8MXFP4OnlineMoEMethod, UnquantizedFusedMoEMethod)
         )
+
+    def test_config_selects_online_experts_and_respects_ignored_layers(self):
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer.use_triton_kernels = False
+        layer.use_flashinfer_trtllm_moe = False
+        prefix = "model.layers.0.mlp.experts"
+        with (
+            patch("sglang.srt.layers.quantization.npu_mxfp4.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+        ):
+            method = Mxfp4W4A8Config().get_quant_method(layer, prefix)
+            skipped = Mxfp4W4A8Config(ignored_layers=[prefix]).get_quant_method(
+                layer, prefix
+            )
+        self.assertIsInstance(method, NPUW4A8MXFP4OnlineMoEMethod)
+        self.assertIs(type(skipped), UnquantizedFusedMoEMethod)
+
+    def test_runner_installs_w4_kernels_for_auto_and_ascend(self):
+        for backend in (MoeRunnerBackend.AUTO, MoeRunnerBackend.ASCEND):
+            with (
+                self.subTest(backend=backend),
+                patch(
+                    "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                    return_value=backend,
+                ),
+                patch.object(
+                    online_moe_methods, "get_moe_runner_backend", return_value=backend
+                ),
+                patch.object(online_moe_methods, "MoeRunner") as runner,
+            ):
+                method = NPUW4A8MXFP4OnlineMoEMethod()
+                layer = torch.nn.Module()
+                config = SimpleNamespace(layer=None, is_gated=True)
+                method.create_moe_runner(layer, config)
+                self.assertIsInstance(
+                    layer.w13_kernel, moe_methods.NPUW4A8MXFP4MoEMethod
+                )
+                self.assertIsInstance(
+                    layer.w2_kernel, moe_methods.NPUW4A8MXFP4MoEMethod
+                )
+                self.assertIs(config.layer, layer)
+                runner.assert_called_once_with(MoeRunnerBackend.ASCEND, config)
+                self.assertIsNone(method._aiter_runner)
+                layer.moe_runner_config = config
+                method.create_weights(layer, 2, 128, 64, torch.bfloat16)
+                self.assertEqual(layer.w13_weight.shape, (2, 128, 128))
+                self.assertEqual(layer.w2_weight.shape, (2, 128, 64))
+                self.assertEqual(layer.w13_weight.dtype, torch.bfloat16)
+                self.assertFalse(hasattr(layer, "w13_weight_scale"))
+
+    def test_runner_rejects_incompatible_backends_before_binding(self):
+        backend = MoeRunnerBackend.FLASHINFER_CUTLASS
+        with (
+            patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                return_value=backend,
+            ),
+            patch.object(
+                online_moe_methods, "get_moe_runner_backend", return_value=backend
+            ),
+            patch.object(online_moe_methods, "MoeRunner") as runner,
+        ):
+            method = NPUW4A8MXFP4OnlineMoEMethod()
+            layer = torch.nn.Module()
+            with self.assertRaisesRegex(ValueError, "requires --moe-runner-backend"):
+                method.create_moe_runner(layer, SimpleNamespace(layer=None))
+            runner.assert_not_called()
+            self.assertFalse(hasattr(layer, "w13_kernel"))
 
     def test_online_and_offline_weights_share_gmm_layout(self):
         packed = (

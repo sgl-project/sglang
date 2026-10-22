@@ -331,7 +331,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
 
         weight = getattr(layer, f"{weight_prefix}_weight")
-        if weight.data.dtype in (torch.float16, torch.bfloat16):
+        online = weight.data.dtype in (torch.float16, torch.bfloat16)
+        if online:
             # Online entry: UnquantizedFusedMoEMethod created BF16 experts and no
             # scale parameter, so make both here and share the re-layout below.
             packed, block_scale = self._quantize_weight_online(
@@ -353,6 +354,15 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight.data, weight_scale.data = prepare_w4a8_mxfp_weight(
             weight.data, weight_scale.data
         )
+        if online:
+            logger.info(
+                "Prepared online W4A8 MXFP MoE %s: packed weight=%s %s, scale=%s %s.",
+                weight_prefix,
+                tuple(weight.shape),
+                weight.dtype,
+                tuple(weight_scale.shape),
+                weight_scale.dtype,
+            )
 
         # A5 DeepEP low-latency dispatch quantizes the valid received rows to
         # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode

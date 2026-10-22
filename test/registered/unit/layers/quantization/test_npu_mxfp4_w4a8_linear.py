@@ -4,6 +4,8 @@ import unittest
 
 import torch
 
+# Initialize quantization before importing its NPU helpers (cold-import cycle).
+import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _prepare_mxfp4_w4a8_bias,
 )
