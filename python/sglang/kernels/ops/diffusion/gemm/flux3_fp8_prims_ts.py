@@ -9,6 +9,7 @@ import torch
 from flashinfer.prims_ts import gemm as prims_ts_gemm
 
 from sglang.kernels.ops.diffusion.gemm.flux3_prims_ts_config import (
+    delta_kwargs,
     flux3_prims_ts_config,
 )
 from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_fp8
@@ -90,6 +91,8 @@ def flux3_fused_mlp_up(
     packed_weight: torch.Tensor,
     packed_weight_scale: torch.Tensor,
     quantized: QuantizedActivation | None = None,
+    *,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run fused FP8 GEMM + SwiGLU, quantizing BF16 rows when needed."""
     if x.dtype != torch.bfloat16:
@@ -103,6 +106,7 @@ def flux3_fused_mlp_up(
         config=_flux3_gemm_config(
             x, epilogue="swiglu", k=packed_weight.shape[1], n=packed_weight.shape[0]
         ),
+        **delta_kwargs(delta),
         skip_check=True,
     )
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -114,6 +118,8 @@ def flux3_clustered_fp8_linear(
     packed_weight_scale: torch.Tensor,
     quantized: QuantizedActivation | None = None,
     qkv_scale: torch.Tensor | None = None,
+    *,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a PrimsTS FP8 GEMM, optionally scaling packed Q/K/V thirds."""
     if x.dtype != torch.bfloat16:
@@ -132,6 +138,7 @@ def flux3_clustered_fp8_linear(
             n=packed_weight.shape[0],
             qkv_scale=qkv_scale is not None,
         ),
+        **delta_kwargs(delta),
         skip_check=True,
     )
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -149,6 +156,7 @@ def flux3_clustered_fp8_qkv_qknorm_rope(
     qkv_scale: torch.Tensor | None = None,
     *,
     separate_qkv_output: bool = False,
+    delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse QKV GEMM, QK RMSNorm, and RoPE, quantizing rows when needed."""
     if x.dtype != torch.bfloat16:
@@ -194,6 +202,7 @@ def flux3_clustered_fp8_qkv_qknorm_rope(
         head_dim=q_norm_weight.numel(),
         qkv_scale=qkv_scale,
         config=config,
+        **delta_kwargs(delta),
         skip_check=True,
     )
     if separate_qkv_output:

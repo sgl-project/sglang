@@ -13,13 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion import (
-    mount_helios_gated_residual,
-    unmount_helios_gated_residual,
-)
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -30,6 +23,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    toggle_quality_fusions,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -110,27 +106,14 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
-        self._quality_fusions_mounted = False
+        self._mounted_quality = "exact"
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
-        # The gated-residual fusion rounds the FP32 gate and update to BF16
-        # before multiplying, which moves a rounding without lowering the
-        # reference's own operand precision: tier "lossless". The "exact"
-        # default keeps the reference FP32-multiply form bit-for-bit.
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        want = quality_allows(quality, "lossless")
-        if want == self._quality_fusions_mounted:
+        if quality == self._mounted_quality:
             return
-        self._quality_fusions_mounted = want
-        if self.transformer is None:
-            return
-        if want:
-            if mount_helios_gated_residual(self.transformer):
-                logger.debug(
-                    "Mounted Helios per-token gated residual for quality=%s", quality
-                )
-        else:
-            unmount_helios_gated_residual(self.transformer)
+        toggle_quality_fusions([self.transformer], quality)
+        self._mounted_quality = quality
 
     @property
     def role_affinity(self) -> RoleType:
@@ -770,9 +753,5 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         # separately to avoid temporal artifacts at chunk boundaries.
         batch.latent_chunks = chunk_latents_list
         batch.latents = history_latents[:, :, -total_generated_latent_frames:]
-        batch.record_stage_iterations(
-            global_step_offset,
-            global_step_offset if is_enable_stage2 else None,
-        )
 
         return batch

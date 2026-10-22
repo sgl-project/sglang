@@ -93,16 +93,27 @@ def kernel_attrs(node) -> tuple[tuple[str, object], ...]:
 def kernel_node_payload(node):
     assert cuda_drv is not None
     params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
+    attrs = kernel_attrs(node)
+    attr_values = dict(attrs)
+    # Some drivers cannot read preferredClusterDim and silently retain its old
+    # value after cudaGraphExecUpdate. Even identical kernel handles and grids
+    # can have different preferred clusters (e.g. Blackwell cuBLAS TF32 GEMMs).
+    # Keep these captures separate rather than updating an executable with an
+    # unknown cluster layout. Ordinary, non-clustered kernels still deduplicate.
+    # Verified on B300: driver 590.48.01 needs this fallback; user-space driver
+    # 595.58.03 reads preferredClusterDim via the driver API and updates correctly,
+    # so matching captures still share executables without a version check.
+    opaque_cluster = (
+        any(attr_values.get("clusterDim", (0, 0, 0)))
+        and "preferredClusterDim" not in attr_values
+    )
     # Grid dimensions vary across buckets and are validated by the exec update.
-    # The handles subsume the kernel name; they are here because
-    # cuGraphKernelNodeGetAttribute cannot read preferred cluster dimension back
-    # and cudaGraphExecUpdate reports success when it changes (sgl-project/sglang#37657).
-    # Once the driver reports that mismatch, the handles can go too.
     return (
         (int(params.kern), int(params.func)),
         (int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)),
         int(params.sharedMemBytes),
-        kernel_attrs(node),
+        attrs,
+        int(node) if opaque_cluster else None,
     )
 
 
