@@ -25,7 +25,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.mm_utils import hash_feature
+from sglang.srt.managers.mm_utils import apply_caller_mm_hashes, hash_feature
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
@@ -118,6 +118,24 @@ class TestMmHashesContract(CustomTestCase):
         expected = MultimodalDataItem(modality=Modality.IMAGE, hash=0xBBBB)
         expected.set_pad_value()
         self.assertEqual(item.padding_values(), expected.padding_values())
+
+    def test_caller_hashes_keep_a_processor_owned_identity(self):
+        """A caller hash must not replace an identity the processor assigned (Kimi)."""
+        owned = MultimodalDataItem(modality=Modality.IMAGE)
+        owned.set_identity(bytes(range(32)))
+        owned_pads = owned.padding_values()
+        plain = MultimodalDataItem(modality=Modality.IMAGE)
+        mm_inputs = SimpleNamespace(mm_items=[owned, plain])
+
+        apply_caller_mm_hashes(
+            mm_inputs=mm_inputs, mm_hashes=["07", "00c0ffee12345678"]
+        )
+
+        self.assertEqual(owned.identity, bytes(range(32)))
+        self.assertEqual(owned.padding_values(), owned_pads)
+        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=0x00C0FFEE12345678)
+        expected.set_pad_value()
+        self.assertEqual(plain.padding_values(), expected.padding_values())
 
     def test_wide_padding_is_shared_by_all_modalities(self):
         expected = (

@@ -971,7 +971,8 @@ def apply_caller_mm_hashes(
         )
         return
     for item, hex_hash in zip(mm_items, mm_hashes):
-        if not isinstance(item, MultimodalDataItem):
+        # A processor-owned identity (Kimi) is the cache key; a caller hash must not replace it.
+        if not isinstance(item, MultimodalDataItem) or item.identity is not None:
             continue
         try:
             item.set_hash(int(hex_hash, 16))
