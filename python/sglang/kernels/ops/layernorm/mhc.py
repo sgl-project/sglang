@@ -858,7 +858,11 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_schedule().chunked_prefill_size
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    if max_num_tokens is None or max_num_tokens <= 0:
+        # Chunked prefill disabled: bound by the prefill token budget.
+        max_num_tokens = schedule.max_prefill_tokens
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )
@@ -2155,7 +2159,7 @@ def npu_hc_pre(
 
 
 @triton.jit
-def _hc_combine_kernel(
+def _mhc_combine_kernel(
     x_ptr,
     pre_ptr,
     y_ptr,
@@ -2710,7 +2714,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
-def hc_combine(
+def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
@@ -2718,7 +2722,7 @@ def hc_combine(
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
-    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+    _mhc_combine_kernel[(m, triton.cdiv(h, block_h))](
         x_flat,
         pre,
         y,
