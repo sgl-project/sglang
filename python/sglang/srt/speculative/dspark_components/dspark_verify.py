@@ -871,10 +871,13 @@ def build_accept_outs(
     tp_sync.sync(sync_site, bonus)
     tp_sync.sync(sync_site, cap_trim_lens)
 
+    # with ``out``, the kernels write the static buffers themselves
     finalized = FinalizeAcceptLens.execute(
         correct_len=correct_len,
         cap_trim_lens=cap_trim_lens,
         prefix_lens=prefix_lens,
+        bonus=bonus,
+        out=out,
     )
     out_tokens = BuildOutTokens.execute(
         draft_tokens=draft_tokens,
@@ -882,8 +885,11 @@ def build_accept_outs(
         bonus=bonus,
         verify_num_draft_tokens=verify_num_draft_tokens,
         gamma=gamma,
+        out=None if out is None else out.out_tokens,
     )
-    accept = AcceptOuts(
+    if out is not None:
+        return out
+    return AcceptOuts(
         correct_len=correct_len,
         bonus=bonus,
         cap_trim_lens=finalized.cap_trim_lens,
@@ -891,15 +897,6 @@ def build_accept_outs(
         new_seq_lens=finalized.new_seq_lens,
         out_tokens=out_tokens,
     )
-    if out is not None:
-        out.correct_len.copy_(accept.correct_len)
-        out.bonus.copy_(accept.bonus)
-        out.cap_trim_lens.copy_(accept.cap_trim_lens)
-        out.commit_lens.copy_(accept.commit_lens)
-        out.new_seq_lens.copy_(accept.new_seq_lens)
-        out.out_tokens.copy_(accept.out_tokens)
-        return out
-    return accept
 
 
 def sample_simulated_bonus(

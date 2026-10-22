@@ -6,7 +6,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    MarkovBiasGemv,
+    MarkovSampleStep,
+)
 from sglang.test.test_utils import CustomTestCase
 
 DEVICE = torch.device("cuda")
@@ -227,56 +230,126 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
-    def test_kept_sharded_logits_match_full_vocab(self):
-        # Kept logits are gathered whole and every rank picks from them: the
-        # same tokens and the same logits as the full vocab, both backends.
-        g = torch.Generator(device=DEVICE).manual_seed(2)
-        rows, shard = 32, 5000
-        vocab = 2 * shard - 7
-        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE)
-        bias = torch.randn(rows, vocab, generator=g, device=DEVICE)
-        temps = torch.rand(rows, generator=g, device=DEVICE)
-        temps[:8] = 0.0
+    def test_shards_keeping_their_logits_match_full_vocab(self):
+        # Each shard keeps its own logits and picks through candidates: the full
+        # vocab's tokens and logits, so the logits can cross ranks once a block.
+        g = torch.Generator(device=DEVICE).manual_seed(5)
+        rows, shard, rank = 20, 3000, 256
+        vocab = 3 * shard - 40
+        w1 = torch.randint(-2, 3, (512, rank), generator=g, device=DEVICE)
+        w2 = torch.randint(-2, 3, (vocab, rank), generator=g, device=DEVICE)
+        w1, w2 = w1.to(torch.bfloat16), w2.to(torch.bfloat16)
+        prev = torch.randint(0, 512, (rows,), generator=g, device=DEVICE)
+        bias = MarkovBiasGemv(prev_tokens=prev, w1=w1, w2=w2).materialize()
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE) * 16
+        temps = torch.rand(rows, generator=g, device=DEVICE) + 0.2
+        temps[::3] = 0.0
+        kwargs = dict(temps=temps, step_dtype=torch.float32)
         full_logits = torch.empty(rows, vocab, device=DEVICE)
         full = _call(
             MarkovSampleStep.triton,
             base=base[:, :vocab].contiguous(),
             bias=bias,
-            temps=temps,
-            step_dtype=torch.float32,
             logits_out=full_logits,
+            **kwargs,
         )
+        # the bias as a tensor, and left for the fused launch to compute
+        shard_bias = [
+            lambda start: bias[:, start : start + shard].contiguous(),
+            lambda start: MarkovBiasGemv(
+                prev_tokens=prev, w1=w1, w2=w2[start : start + shard]
+            ),
+        ]
         for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
-            locals_ = {}
+            for bias_of in shard_bias:
+                partials = {}
 
-            def run(rank, gather_logits):
-                start = rank * shard
-                logits_out = torch.empty(rows, vocab, device=DEVICE)
-                tokens = _call(
+                def run(rank, gather):
+                    start = rank * shard
+                    logits_out = torch.empty(rows, shard, device=DEVICE)
+                    tokens = _call(
+                        impl,
+                        base=base[:, start : start + shard].contiguous(),
+                        bias=bias_of(start),
+                        vocab_start=start,
+                        gather=gather,
+                        logits_out=logits_out,
+                        **kwargs,
+                    )
+                    return tokens, logits_out
+
+                for rank in range(3):
+                    run(rank, lambda part, rank=rank: partials.setdefault(rank, part))
+                if impl is MarkovSampleStep.triton:
+                    # the custom all-gather takes only 16-byte multiples
+                    self.assertEqual(partials[0][0].nbytes % 16, 0)
+                stacked = torch.cat([partials[rank] for rank in range(3)])
+                kept = []
+                for rank in range(3):
+                    tokens, logits_out = run(rank, lambda _: stacked)
+                    self.assertTrue(torch.equal(tokens, full))
+                    kept.append(logits_out)
+                kept = torch.cat(kept, dim=1)[:, :vocab]
+                self.assertTrue(torch.equal(kept, full_logits))
+
+    def test_bias_gemv_matches_its_materialized_bias(self):
+        # Integer weights keep the GEMV exact in any summation order, so the
+        # fused bias is bit for bit the one F.linear materializes.
+        g = torch.Generator(device=DEVICE).manual_seed(4)
+        padded, width, rank, start = 9000, 8990, 256, 100
+        w1 = torch.randint(-2, 3, (4096, rank), generator=g, device=DEVICE)
+        w2 = torch.randint(-2, 3, (width, rank), generator=g, device=DEVICE)
+        w1, w2 = w1.to(torch.bfloat16), w2.to(torch.bfloat16)
+        # 20 rows span two row blocks of the GEMV.
+        for rows in (1, 5, 20):
+            prev = torch.randint(0, 4096, (rows,), generator=g, device=DEVICE)
+            gemv = MarkovBiasGemv(prev_tokens=prev, w1=w1, w2=w2)
+            bias = gemv.materialize()
+            base = torch.randn(rows, padded, generator=g, device=DEVICE) * 64
+            # The lowest NaN wins; then the lowest of tied maxima.
+            base[0, 3] = base[0, 9] = float("nan")
+            if rows > 1:
+                base[1, :width] = -bias[1].float()
+                base[1, 4000] += 1.0
+                base[1, 7000] += 1.0
+            temps = torch.rand(rows, generator=g, device=DEVICE)
+            temps[::2] = 0.0
+            kwargs = dict(base=base, temps=temps, step_dtype=torch.float32)
+            greedy = _call(
+                MarkovSampleStep.triton,
+                bias=bias,
+                vocab_start=start,
+                has_sampled_rows=False,
+                **kwargs,
+            )
+            self.assertEqual(greedy[0].item(), start + 3)
+            if rows > 1:
+                self.assertEqual(greedy[1].item(), start + 4000)
+            for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+                fused = _call(
                     impl,
-                    base=base[:, start : start + shard].contiguous(),
-                    bias=bias[:, start : start + shard].contiguous(),
-                    temps=temps,
-                    step_dtype=torch.float32,
+                    bias=gemv,
                     vocab_start=start,
-                    gather=lambda _: self.fail("candidates gathered"),
-                    gather_logits=gather_logits,
+                    has_sampled_rows=False,
+                    **kwargs,
+                )
+                self.assertTrue(torch.equal(fused, greedy))
+            # Kept logits: the fused launch stores them and samples the rows.
+            kept = []
+            for b in (bias, gemv):
+                logits_out = torch.empty(rows, padded, device=DEVICE)
+                tokens = _call(
+                    MarkovSampleStep.triton,
+                    bias=b,
+                    vocab_start=start,
                     logits_out=logits_out,
+                    **kwargs,
                 )
-                return tokens, logits_out
-
-            for rank in range(3):
-                run(
-                    rank,
-                    lambda local, rank=rank: locals_.setdefault(
-                        rank, local.clone()
-                    ).repeat(1, 3),
-                )
-            stacked = torch.cat([locals_[rank] for rank in range(3)], dim=1)
-            for rank in range(3):
-                tokens, logits_out = run(rank, lambda _: stacked)
-                self.assertTrue(torch.equal(tokens, full))
-                self.assertTrue(torch.equal(logits_out, full_logits))
+                kept.append((tokens, logits_out))
+            self.assertTrue(torch.equal(kept[0][0], kept[1][0]))
+            torch.testing.assert_close(
+                kept[1][1], kept[0][1], rtol=0, atol=0, equal_nan=True
+            )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
     draft_markov_block,
+    gather_step_logits,
     resolve_draft_params,
     select_draft_hidden_without_anchor,
     step_logits_width,
@@ -79,6 +80,9 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        # SGLang's block's [max_bs, gamma, base logits width] step logits: a
+        # sharded vocab's shard, sized on the first call
+        self.block_step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
         if megakernel_sampler is not None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
@@ -110,7 +114,7 @@ class DsparkDraftSampler:
         return steps
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
-        if self.step_logits is None:
+        if self.block_step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
             # torch.cuda's capture query raises on XPU builds.
             capturing = (
@@ -119,12 +123,20 @@ class DsparkDraftSampler:
                 else torch.cuda.is_current_stream_capturing()
             )
             assert not capturing
-            self.step_logits = torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+            self.block_step_logits = torch.empty(
+                (self.max_bs, self.gamma, base_logits.shape[-1]),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
-        return self.step_logits
+        return self.block_step_logits
+
+    def corrected_logits(self, bs: int) -> torch.Tensor:
+        """The last replay's ``bs``-row step logits over the whole vocab: the
+        megakernel writes them whole, SGLang's block a sharded vocab's shards,
+        which this gathers (a collective, so every rank calls it alike)."""
+        if self._megakernel_steps is not None and self._megakernel_steps(bs):
+            return self.step_logits[:bs]
+        return gather_step_logits(self.markov_head, self.block_step_logits[:bs])
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""

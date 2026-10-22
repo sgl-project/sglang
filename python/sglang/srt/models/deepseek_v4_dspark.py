@@ -12,6 +12,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovBiasGemv
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
@@ -519,6 +520,16 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             return F.linear(latent.to(weight_local.dtype), weight_local), state
         return F.linear(latent.float(), weight_local), state
 
+    def bias_gemv(self, prev_tokens: torch.Tensor) -> Optional[MarkovBiasGemv]:
+        w1 = self.markov_w1.weight
+        if not self._opt_markov_w2_bf16 or w1.dtype != torch.bfloat16:
+            return None
+        w2 = self.markov_w2.weight
+        shard = self._tp_shard
+        if shard is not None:
+            w2 = w2[shard.org_vocab_start : shard.org_vocab_end]
+        return MarkovBiasGemv(prev_tokens=prev_tokens.long(), w1=w1, w2=w2)
+
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         # The bias is FP32 or upcast into an FP32 add, sharded or not.
         del base_dtype
@@ -858,7 +869,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
             allow_strided_output=(
-                get_platform().is_blackwell
+                (get_platform().is_blackwell or get_platform().is_hip)
                 and not is_unified_kv_triton()
                 and not pool.uniform_fp8
             ),
