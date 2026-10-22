@@ -1259,6 +1259,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 "this item will fall back to hash_feature().",
                                 hex_hash,
                             )
+            caller_routing_labels = getattr(obj, "mm_routing_labels", None)
+            if caller_routing_labels and mm_inputs and mm_inputs.mm_items:
+                if len(caller_routing_labels) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_routing_labels length (%d) != mm_items length (%d); "
+                        "ignoring routing labels for this request.",
+                        len(caller_routing_labels),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, label in zip(mm_inputs.mm_items, caller_routing_labels):
+                        if isinstance(item, MultimodalDataItem) and isinstance(
+                            label, str
+                        ):
+                            item.routing_label = label or None
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs

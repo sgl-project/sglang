@@ -386,6 +386,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     # pad_value remains the first sentinel for scalar-padding consumers
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
+    # Caller routing label (routing metadata only; never part of identity).
+    routing_label: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.hash is not None:
@@ -811,6 +813,10 @@ class MultimodalInputs:
 
         for item in mm_items:
             item.set_pad_value()
+
+        from sglang.srt.mem_cache.events import register_mm_routing_labels
+
+        register_mm_routing_labels(mm_items)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:

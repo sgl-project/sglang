@@ -213,6 +213,10 @@ class GenerateReqInput:
     # sglang's prefix-cache key to align. When unset, behavior is unchanged
     # (sglang hashes the processor feature tensor).
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
+    # Optional caller routing labels, one opaque string per multimodal item.
+    # Routing metadata only: they never affect identity, caching or reuse, and
+    # are reported back as `mm_routing_spans` on BlockStored KV events.
+    mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None
     # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
     # mm_hashes, these identify processor inputs and never replace the
     # processor-output feature hash used by the embedding/prefix cache.
@@ -686,7 +690,7 @@ class GenerateReqInput:
 
     def _normalize_mm_hashes(self, num):
         """Align per-media hashes with normalized batched image inputs."""
-        for field_name in ("mm_hashes", "mm_content_hashes"):
+        for field_name in ("mm_hashes", "mm_content_hashes", "mm_routing_labels"):
             hashes = getattr(self, field_name)
             if hashes is None:
                 setattr(self, field_name, [None] * num)
@@ -974,6 +978,11 @@ class GenerateReqInput:
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
+            mm_routing_labels=(
+                self.mm_routing_labels[i]
+                if self.mm_routing_labels is not None
+                else None
+            ),
             mm_content_hashes=(
                 self.mm_content_hashes[i]
                 if self.mm_content_hashes is not None

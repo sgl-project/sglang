@@ -293,6 +293,10 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
+    # Per block (aligned with block_hashes): [start, length, label] runs of
+    # multimodal tokens whose item carried a caller routing label. Labels are
+    # routing metadata only and never affect hashes or reuse.
+    mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
 
 
 class BlockRemoved(KVCacheEvent):
