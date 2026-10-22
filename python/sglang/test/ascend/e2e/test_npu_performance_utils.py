@@ -646,7 +646,7 @@ def run_bench_serving(
             float(min_host_hit_rate_pct),
             labels={"type": "perf"},
         )
-        assert float(host_hit) >= float(min_host_hit_rate_pct), (
+        assert float(host_hit) > float(min_host_hit_rate_pct), (
             f"L2 host hit rate {host_hit}% is below {min_host_hit_rate_pct}%"
         )
 
