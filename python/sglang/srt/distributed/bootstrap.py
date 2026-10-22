@@ -295,7 +295,10 @@ def _init_cpu_threads_env(
                 )
 
         # Bind OpenMP threads to CPU cores and bind memory to the target NUMA node
-        torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid, node_mem_bind)
+        if node_mem_bind < 0:
+            torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
+        else:
+            torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid, node_mem_bind)
 
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(parallel.tp_size)
