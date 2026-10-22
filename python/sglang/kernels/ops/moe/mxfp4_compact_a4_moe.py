@@ -103,14 +103,26 @@ def _scatter_a4(
 
 
 @triton.jit
-def _w_offset(n, k, SHUF: tl.constexpr):
-    """[K bytes, N] offsets in one expert's [N, 2048] packed E2M1 rows. Preshuffled: [N/16, 2048/16, 16 n, 16 bytes]
-    (aiter shuffle_weight (16, 16) and shuffle_weight_a16w4 (16) agree on this layout for K 2048)."""
+def _load_w(W, n0, k0, BN: tl.constexpr, KB: tl.constexpr, SHUF: tl.constexpr):
+    """[KB bytes, BN rows] tile of one expert's [N, 2048] packed E2M1 rows from row n0, byte k0. Preshuffled layout:
+    [N/16, 2048/16, 16 rows, 16 bytes] (aiter shuffle_weight (16, 16) and shuffle_weight_a16w4 (16) agree on it for
+    K 2048), loaded as whole contiguous 16-row groups and permuted in registers."""
     if SHUF:
-        return ((n // 16) * 32768 + (n % 16) * 16)[None, :] + (
-            (k // 16) * 256 + k % 16
-        )[:, None]
-    return n[None, :] * 2048 + k[:, None]
+        g = tl.arange(0, BN // 16)
+        kc = tl.arange(0, KB // 16)
+        r = tl.arange(0, 16)
+        b = tl.arange(0, 16)
+        offset = (
+            ((n0 // 16 + g) * 32768)[:, None, None, None]
+            + ((k0 // 16 + kc) * 256)[None, :, None, None]
+            + (r * 16)[None, None, :, None]
+            + b[None, None, None, :]
+        )
+        x = tl.permute(tl.load(W + offset), (1, 3, 0, 2))
+        return tl.reshape(x, (KB, BN))
+    n = n0 + tl.arange(0, BN)
+    k = k0 + tl.arange(0, KB)
+    return tl.load(W + n[None, :] * 2048 + k[:, None])
 
 
 @triton.jit
@@ -168,18 +180,26 @@ def _expert_a4(
                 valid[:, None],
                 other=127,
             )
-            w = tl.load(
-                W + expert * (wn * 2048) + _w_offset(n, tile * (BK // 2) + kp, SHUF)
+            w = _load_w(
+                W + expert * (wn * 2048),
+                n_block * BN,
+                tile * (BK // 2),
+                BN,
+                BK // 2,
+                SHUF,
             )
             ws = tl.load(
                 WS + expert * (wn * 128) + _s_offset(n, tile * (BK // 32) + ks, SHUF)
             )
             acc = tl.dot_scaled(a, asc, "e2m1", w, ws, "e2m1", acc)
             if ACT:
-                wu = tl.load(
-                    W
-                    + expert * (wn * 2048)
-                    + _w_offset(n + 4096, tile * (BK // 2) + kp, SHUF)
+                wu = _load_w(
+                    W + expert * (wn * 2048),
+                    n_block * BN + 4096,
+                    tile * (BK // 2),
+                    BN,
+                    BK // 2,
+                    SHUF,
                 )
                 wsu = tl.load(
                     WS
