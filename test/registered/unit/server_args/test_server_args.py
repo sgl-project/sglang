@@ -28,11 +28,13 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
+from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
 )
@@ -124,6 +126,61 @@ _mock_device = patch(
     "sglang.srt.arg_groups.serving_hook.get_device", return_value="cuda"
 )
 _mock_device.start()
+
+
+class TestServerArgsPositionalOrder(CustomTestCase):
+    def test_new_parallel_flag_preserves_existing_positional_slots(self):
+        """New options must not reinterpret existing positional constructor calls."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (95, "disable_attn_tp_gather"),
+            (96, "enable_p2p_check"),
+            (97, "device"),
+            (535, "grpc_response_timeout_secs"),
+            (536, "enable_paged_experts"),
+            (537, "paged_experts_num_resident"),
+            (538, "enable_nvidia_megakernel"),
+            (539, "enable_megamoe_for_layernorm_sp"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        # Surviving legacy inputs retain their slots after an intentional removal.
+        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional[95] = True
+        positional[96] = False
+        positional[97] = "cpu"
+        positional[535] = 123.0
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.disable_attn_tp_gather)
+        self.assertFalse(args.enable_p2p_check)
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.grpc_response_timeout_secs, 123.0)
+        self.assertFalse(args.enable_megamoe_for_layernorm_sp)
+
+    def test_builtin_fields_have_explicit_positional_slots(self):
+        """New namespace fields cannot shift previously appended built-in options."""
+        self.assertEqual(
+            tuple(field.name for field in msgspec.structs.fields(ServerArgs)),
+            POSITIONAL_FIELD_ORDER,
+        )
+
+    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                keyword_args = ServerArgs(
+                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
+                )
+                argv = ["--model-path", "dummy"]
+                if enabled:
+                    argv.append("--enable-megamoe-for-layernorm-sp")
+                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
+                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
+                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -354,6 +411,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 ),
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=draft_tokens,
+                max_running_requests=None,
             )
 
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
@@ -362,6 +420,54 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
+
+    def test_megamoe_decode_budget_clamps_to_request_pool(self):
+        """A DP16 pool of 256 requests per rank was validated as 4096 graph requests."""
+        from sglang.srt.arg_groups.mega_moe_hook import (
+            mega_moe_decode_tokens_per_rank,
+            validate_mega_moe_token_budget,
+        )
+
+        def view(tp_size, dp_size, requests, graph_bs):
+            return SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(max_bs=graph_bs)
+                ),
+                max_running_requests=requests,
+                attn_dp_size=dp_size,
+                tp_size=tp_size,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                moe_a2a_backend="megamoe",
+                disaggregation_mode="decode",
+            )
+
+        self.assertEqual(
+            mega_moe_decode_tokens_per_rank(view(16, 16, 4096, 4096)), 1536
+        )
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 16, 4096, 128)), 768)
+        # The pool is padded to attn TP after the DP divide: 1 -> 8, 36 // 4 = 9 -> 12.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(8, 1, 1, 4096)), 48)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 4, 36, 4096)), 72)
+
+        with (
+            override_platform(is_hip=False),
+            patch(
+                "sglang.srt.arg_groups.mega_moe_hook.resolving_view",
+                return_value=view(16, 16, 4096, 4096),
+            ),
+        ):
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                1536
+            ):
+                validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
+            with (
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    1535
+                ),
+                self.assertRaisesRegex(ValueError, "largest decode / verify"),
+            ):
+                validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
@@ -602,6 +708,43 @@ class TestImageProcessorBackend(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "conflicts.*torchvision"):
             handle_deprecated_args(server_args)
+
+
+class TestTokenspeedMlaAlias(CustomTestCase):
+    def test_maps_to_cutedsl_with_fp8_kv(self):
+        server_args = ServerArgs(model_path="dummy", attention_backend="tokenspeed_mla")
+
+        with self.assertLogs(serving_hook.logger, level="WARNING"):
+            handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(resolution_result(server_args, "kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "prefill"
+        )
+
+    def test_speculative_verify_moves_to_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            decode_attention_backend="tokenspeed_mla",
+            prefill_attention_backend="tokenspeed_mla",
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="EAGLE3",
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "decode_attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "prefill_attention_backend"), "trtllm_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "decode"
+        )
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -1242,6 +1385,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
 
+class TestPdDecodeExtraSlots(CustomTestCase):
+    """The in-transfer slot reserve is this worker's share of the global
+    --max-running-requests, and must agree with how the request pool is sized:
+    floored, but never below 1. A bare floor reserved zero headroom whenever
+    the cap fell below the dp size.
+    """
+
+    def _extra_slots(self, **kwargs) -> int:
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            **kwargs,
+        )
+        handle_pd_disaggregation(server_args)
+        return resolution_result(server_args, "disaggregation_decode_extra_slots")
+
+    def test_cap_below_dp_size_still_reserves_headroom(self):
+        # 1 // 4 floored to zero per-worker requests, and so to zero headroom.
+        self.assertEqual(self._extra_slots(max_running_requests=1, dp_size=4), 2)
+
+    def test_uneven_split_floors_like_the_request_pool(self):
+        # 100 // 8 == 12; every pool splits the cap the same way, so does this.
+        self.assertEqual(self._extra_slots(max_running_requests=100, dp_size=8), 24)
+
+
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
         server_args = ServerArgs(
@@ -1407,6 +1576,32 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             validate_hisparse_kv_cache_dtype(server_args)
 
+    def test_hisparse_rejects_adaptive_speculation(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_adaptive=True,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
+                validate_hisparse(server_args)
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
@@ -1560,7 +1755,10 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             attn_dp_size=4,
             tp_size=4,
         )
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+        )
         return server_args
 
     def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
@@ -1589,7 +1787,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1622,7 +1820,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1729,6 +1927,9 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Glm4MoeForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "KimiK3ForConditionalGeneration",
+            "KimiK3LinearForCausalLM",
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
             "Qwen2MoeForCausalLM",
@@ -2028,6 +2229,13 @@ class TestSSLArgs(unittest.TestCase):
         self.assertIn("--enable-ssl-refresh", str(context.exception))
         self.assertIn("--ssl-certfile", str(context.exception))
 
+    def test_http_worker_reuseport_requires_multiple_uvicorn_workers(self):
+        for kwargs in ({}, {"tokenizer_worker_num": 2, "enable_http2": True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError) as context:
+                self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
+            self.assertIn("--enable-http-worker-reuseport", str(context.exception))
+        self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
+
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
         server_args = self._validate_ssl(
@@ -2245,6 +2453,28 @@ class TestHiCacheArgs(CustomTestCase):
                 },
                 "expected_io_backend": "direct",
                 "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "unified_memory_with_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_mem_layout": "page_first_direct",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "unified_memory_mooncake_with_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
             },
             {
                 "name": "fa3_kernel_with_explicit_decode_backend",
@@ -4254,6 +4484,31 @@ class TestNoneMeansUnset(CustomTestCase):
             model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
         )
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
+
+
+class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
+    """Under the Rust server every attention-DP leader hosts its own listener;
+    a control request (abort, server info) sent to a leader other than rank 0
+    must reach its scheduler instead of being overwritten by rank 0's
+    broadcast."""
+
+    def test_rust_server_broadcasts_control_within_each_dp_group(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            attn_dp_size=2,
+            tp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        with envs.SGLANG_RUST_SERVER.override(True):
+            parallel_hook.handle_data_parallelism(server_args)
+        self.assertTrue(
+            resolution_result(
+                server_args, "enable_dp_attention_local_control_broadcast", False
+            )
+        )
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):

@@ -71,20 +71,24 @@ pub(super) struct JsonSchemaFormat {
 }
 
 /// The `json_schema` sampling param a `response_format` sets.
+/// `renderer_handles_response_format`: the renderer shows the model a
+/// `json_schema` format, so `strict: false` goes unconstrained.
 pub(super) fn format_json_schema(
     format: Option<&ResponseFormat>,
+    renderer_handles_response_format: bool,
 ) -> Result<Option<String>, Unsupported> {
     let Some(format) = format else {
         return Ok(None);
     };
     Ok(match format.kind {
         FormatKind::JsonSchema => {
-            let schema = format
-                .json_schema
-                .as_ref()
+            let json_schema = format.json_schema.as_ref();
+            let schema = json_schema
                 .and_then(|json_schema| json_schema.schema.clone())
                 .ok_or(Unsupported("invalid_request"))?;
-            Some(python_json(&Value::Object(schema), true))
+            let unconstrained = renderer_handles_response_format
+                && json_schema.is_some_and(|json_schema| json_schema.strict == Some(false));
+            (!unconstrained).then(|| python_json(&Value::Object(schema), true))
         }
         FormatKind::JsonObject => Some(r#"{"type": "object"}"#.into()),
         FormatKind::Text => None,

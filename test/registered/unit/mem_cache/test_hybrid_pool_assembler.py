@@ -1,6 +1,7 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from functools import partial
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,13 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, EvictParams
+from sglang.srt.configs.inkling import (
+    InklingConvCacheParams,
+    InklingConvStateShape,
+    InklingStateDType,
+)
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -22,25 +29,27 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_declared_pools_present,
     _DsaStrategy,
-    _evict_mamba_for_device_alloc,
-    _evict_swa_for_device_alloc,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
-    _split_hicache_size,
     _SwaStrategy,
     _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HybridLinearKVPool,
+    MambaPool,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     make_kv_pool_decl,
 )
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -64,64 +73,6 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
             physical_page_size=256,
             consumer="test consumer",
         )
-
-
-class _Pool:
-    def __init__(self, kv_bytes):
-        self._kv_bytes = kv_bytes
-
-    def get_kv_size_bytes(self):
-        return self._kv_bytes
-
-
-class TestDeviceAllocEviction(CustomTestCase):
-    def test_swa_evicts_only_allocation_shortfall(self):
-        cache = MagicMock()
-        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8
-
-        _evict_swa_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_called_once_with(EvictParams(swa_num_tokens=2))
-        cache.evict.assert_not_called()
-
-    def test_mamba_evicts_only_allocation_shortfall(self):
-        cache = MagicMock()
-        allocator = cache.req_to_token_pool.mamba_allocator
-        allocator.schedulable_available_size.return_value = 8
-
-        _evict_mamba_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_called_once_with(EvictParams(mamba_num=2))
-        cache.evict.assert_not_called()
-
-    def test_sufficient_capacity_skips_eviction(self):
-        cache = MagicMock()
-        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 10
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = 10
-
-        _evict_swa_for_device_alloc(cache, required_size=10)
-        _evict_mamba_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_not_called()
-        cache.evict.assert_not_called()
-
-
-class TestSplitHicacheSize(CustomTestCase):
-    def test_splits_total_budget_by_device_bytes(self):
-        # scalar and (k, v) tuple return shapes both supported
-        shares = _split_hicache_size(
-            100, (_Pool(75 * 10**9), _Pool((15 * 10**9, 10 * 10**9)))
-        )
-        self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
-        self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
-
-    def test_splits_total_budget_by_device_bytes_three_pools(self):
-        # scalar and (k, v) tuple return shapes both supported
-        shares = _split_hicache_size(
-            100, (_Pool(55 * 10**9), _Pool((15 * 10**9, 10 * 10**9)), _Pool(20 * 10**9))
-        )
-        self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
-        self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
 
 
 class TestHybridStageLayerMappings(CustomTestCase):
@@ -169,7 +120,6 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         host_pool_decls=lambda: (),
                     )
                     req_pool = SimpleNamespace(
-                        mamba_map=global_maps.get("mamba", {}).copy(),
                         mamba_pool=object(),
                     )
                     params = SimpleNamespace(
@@ -195,7 +145,13 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         )
 
                     build_stack.assert_called_once()
+                    if "mamba" in local_maps:
+                        self.assertEqual(
+                            build_stack.call_args.kwargs["start_layer"], start_layer
+                        )
                     for name, mapping in local_maps.items():
+                        if name == "mamba":
+                            continue
                         self.assertEqual(
                             build_stack.call_args.kwargs[f"{name}_layer_mapping"],
                             mapping,
@@ -205,7 +161,189 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         kvcache.full_attention_layer_id_mapping, global_maps["full"]
                     )
                     self.assertEqual(kvcache.layers_mapping, layers_mapping)
-                    self.assertEqual(req_pool.mamba_map, global_maps.get("mamba", {}))
+
+
+class TestMambaInfoRouting(CustomTestCase):
+    def test_checkpoint_axis_routes_stage_layers_for_both_stacks(self):
+        for tri_pool in (False, True):
+            for start_layer in (0, 8):
+                for local_ids in ((4, 2, 3), ()):
+                    with self.subTest(
+                        tri_pool=tri_pool, start=start_layer, layers=local_ids
+                    ):
+
+                        def make_pool(ids):
+                            return MambaPool(
+                                size=8,
+                                spec_state_size=0,
+                                cache_params=InklingConvCacheParams(
+                                    shape=InklingConvStateShape(
+                                        conv=[(2,)], temporal=(2,)
+                                    ),
+                                    layers=list(ids),
+                                    dtype=InklingStateDType(
+                                        conv=torch.float32, temporal=torch.float32
+                                    ),
+                                ),
+                                mamba_layer_ids=list(ids),
+                                device="cpu",
+                            )
+
+                        mamba_pool = make_pool(
+                            tuple(layer + start_layer for layer in local_ids)
+                        )
+                        temporal = mamba_pool.mamba_cache.temporal
+                        temporal.copy_(
+                            torch.arange(temporal.numel()).reshape(temporal.shape)
+                        )
+                        # Buffer-only capacity may exceed the physical checkpoint slots.
+                        mamba_pool.host_capacity_tokens = 16 if start_layer else None
+                        drafts = (
+                            tuple(
+                                make_pool([start_layer + 5 + depth])
+                                for depth in range(2)
+                            )
+                            if local_ids
+                            else ()
+                        )
+                        captured = []
+                        original_provider = mamba_pool.get_device_pool_infos
+
+                        def capture():
+                            result = original_provider()
+                            captured.append(result[0])
+                            return result
+
+                        provider = MagicMock(side_effect=capture)
+                        kv = SimpleNamespace(layer_num=1, size=8)
+                        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+                        params = SimpleNamespace(
+                            page_size=1,
+                            mtp_draft_device_pools=(),
+                            mtp_draft_mamba_pools=drafts,
+                            token_to_kv_pool_allocator=SimpleNamespace(
+                                swa_attn_allocator=allocator
+                            ),
+                            req_to_token_pool=SimpleNamespace(
+                                mamba_allocator=allocator
+                            ),
+                            tp_cache_group=None,
+                            pp_cache_group=None,
+                            attn_cp_cache_group=None,
+                            attn_tp_cache_group=None,
+                        )
+                        memory = SimpleNamespace(
+                            hicache_size=0,
+                            hicache_ratio=2,
+                            hicache_mem_layout="page_first_direct",
+                            hicache_write_policy="write_through",
+                            hicache_io_backend="direct",
+                            hicache_host_memory_mode="cache",
+                            enable_unified_memory=False,
+                        )
+                        with (
+                            patch.object(mamba_pool, "get_device_pool_infos", provider),
+                            patch.object(
+                                hybrid_pool_assembler, "get_memory", return_value=memory
+                            ),
+                            patch.object(
+                                hybrid_pool_assembler,
+                                "_get_allocator_type",
+                                return_value="default",
+                            ),
+                            patch.object(
+                                hybrid_pool_assembler,
+                                "build_kv_host_pool",
+                                return_value=SimpleNamespace(
+                                    layer_num=1,
+                                    layout="page_first_direct",
+                                    page_size=1,
+                                    device="cpu",
+                                    size=17,
+                                    logical_size=17,
+                                    can_use_write_back_jit=False,
+                                ),
+                            ),
+                            patch.object(
+                                hybrid_pool_assembler,
+                                "MambaPoolHost",
+                                partial(MambaPoolHost, pin_memory=False),
+                            ),
+                            patch.object(
+                                hybrid_pool_assembler, "HybridCacheController"
+                            ),
+                        ):
+                            common = dict(
+                                params=params,
+                                mamba_pool=mamba_pool,
+                                full_layer_mapping={0: 0},
+                                start_layer=start_layer,
+                                load_cache_event=None,
+                                storage_backend=None,
+                            )
+                            if tri_pool:
+                                group, _ = (
+                                    hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                                        **common,
+                                        full_kv_pool=kv,
+                                        swa_kv_pool=kv,
+                                        swa_layer_mapping={1: 0},
+                                        page_size=1,
+                                        tp_group=None,
+                                    )
+                                )
+                            else:
+                                group, _, _ = (
+                                    hybrid_pool_assembler.build_hybrid_mamba_stack(
+                                        **common,
+                                        decls=(make_kv_pool_decl(kv),),
+                                        use_mla=False,
+                                    )
+                                )
+                        entry = group.entry_map[PoolName.MAMBA]
+                        host = entry.host_pool
+                        try:
+                            info = captured[0]
+                            self.assertIs(host.buffer_info, info.buffer_info)
+                            self.assertEqual(
+                                host.size, (16 if start_layer else 8) * 2 + 1
+                            )
+                            self.assertEqual(
+                                len(host.mtp_draft_buffer_infos), len(drafts)
+                            )
+                            for depth, draft in enumerate(drafts):
+                                self.assertIs(
+                                    host.mtp_draft_buffer_infos[depth].temporal,
+                                    draft.mamba_cache.temporal,
+                                )
+                                self.assertEqual(
+                                    entry.layer_mapper(5 + depth),
+                                    len(local_ids) + depth,
+                                )
+                                self.assertEqual(
+                                    host.temporal_device_layers[
+                                        len(local_ids) + depth
+                                    ].data_ptr(),
+                                    draft.mamba_cache.temporal[0].data_ptr(),
+                                )
+                            self.assertEqual(provider.call_count, 1)
+                            self.assertEqual(
+                                info.layer_ids,
+                                tuple(layer + start_layer for layer in local_ids),
+                            )
+                            self.assertIs(entry.device_alloc_fn, allocator.alloc)
+                            self.assertIs(entry.device_free_fn, allocator.free)
+                            for layer in range(-1, 5):
+                                slot = entry.layer_mapper(layer)
+                                if layer not in local_ids:
+                                    self.assertIsNone(slot)
+                                else:
+                                    torch.testing.assert_close(
+                                        host.buffer_info.temporal[slot],
+                                        temporal[local_ids.index(layer)],
+                                    )
+                        finally:
+                            host.destroy()
 
 
 class TestDraftSidecarPoolDispatch(CustomTestCase):
@@ -444,21 +582,44 @@ class TestDeclaredStackStructure(CustomTestCase):
     packed drafts, mirror geometry, controller arguments, sidecars."""
 
     def _run(self, *, pool, drafts, full_layer_mapping, page_size=64):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import (
+            MLAHostAllocation,
+            MLATokenToKVPoolHost,
+        )
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
         def dummy_kv_host(**kwargs):
+            pool = kwargs["kv_pool"]
+            drafts = kwargs["mtp_draft_device_pools"]
+            width = kwargs["kv_pool"].kv_cache_dim or (
+                pool.kv_lora_rank + pool.qk_rope_head_dim
+            )
+            target_layer_num = (
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            )
             return MLATokenToKVPoolHost(
-                kwargs["kv_pool"],
+                MLAHostAllocation(
+                    dtype=pool.store_dtype,
+                    kv_lora_rank=pool.kv_lora_rank,
+                    qk_rope_head_dim=pool.qk_rope_head_dim,
+                    kv_cache_dim=width,
+                    size_per_token=width
+                    * pool.store_dtype.itemsize
+                    * (target_layer_num + len(drafts)),
+                    draft_layer_num=len(drafts),
+                ),
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                target_layer_num=target_layer_num,
                 host_to_device_ratio=2,
                 host_size=0,
                 page_size=kwargs["page_size"],
                 layout="page_first",
                 pin_memory=False,
-                is_dummy=True,
-                override_kv_cache_dim=kwargs["kv_pool"].kv_cache_dim,
-                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
         def dummy_indexer_host(
@@ -694,10 +855,30 @@ class TestKvHostPoolRow(CustomTestCase):
 
     def _build(self, pool, drafts=()):
         seen = {}
+        for device_pool in (pool, *drafts):
+            device_pool.model_layer_ids = tuple(range(device_pool.layer_num))
+            device_pool.kv_buffer = [
+                torch.empty(
+                    (
+                        device_pool.size + device_pool.page_size,
+                        1,
+                        device_pool.kv_cache_dim,
+                    ),
+                    dtype=device_pool.store_dtype,
+                )
+                for _ in range(device_pool.layer_num)
+            ]
+            device_pool.data_ptrs = torch.tensor(
+                [buffer.data_ptr() for buffer in device_pool.kv_buffer],
+                dtype=torch.uint64,
+            )
+            device_pool.kv_scale_buffer = None
+            device_pool.dsa_kv_cache_store_fp8 = False
+            device_pool.host_capacity_tokens = None
 
-        def fake_host(kv_pool, ratio, size, page_size, layout, **kwargs):
+        def fake_host(buffer_info, ratio, size, page_size, layout, **kwargs):
             seen.update(kwargs)
-            return SimpleNamespace(layer_num=kv_pool.layer_num)
+            return SimpleNamespace(layer_num=kwargs["target_layer_num"])
 
         with (
             patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
@@ -744,14 +925,24 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
     DSA layers that own index buffers."""
 
     def test_stack_declares_indexer_and_skips_empty_layers(self):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import (
+            MLAHostAllocation,
+            MLATokenToKVPoolHost,
+        )
 
         kv_pool = _dsa_pool_stub(layer_num=3)
         kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
-        mamba_pool = SimpleNamespace(layer_num=2, num_mamba_layers=2, size=8)
+        mamba_info = DevicePoolInfo(
+            pool_name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            layer_ids=(1, 3),
+            buffer_info=MambaStateBufferInfo(
+                temporal=torch.zeros(2, 9, 4), conv=(torch.zeros(2, 9, 4),)
+            ),
+        )
+        mamba_pool = SimpleNamespace(get_device_pool_infos=lambda: (mamba_info,))
         # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
         full_mapping = {0: 0, 2: 1, 4: 2}
-        mamba_mapping = {1: 0, 3: 1}
         params = SimpleNamespace(
             page_size=64,
             mtp_draft_device_pools=(),
@@ -770,16 +961,29 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
         def dummy_kv_host(**kwargs):
+            pool = kwargs["kv_pool"]
+            drafts = kwargs["mtp_draft_device_pools"]
+            width = None or (pool.kv_lora_rank + pool.qk_rope_head_dim)
             return MLATokenToKVPoolHost(
-                kwargs["kv_pool"],
+                MLAHostAllocation(
+                    dtype=pool.store_dtype,
+                    kv_lora_rank=pool.kv_lora_rank,
+                    qk_rope_head_dim=pool.qk_rope_head_dim,
+                    kv_cache_dim=width,
+                    size_per_token=width
+                    * pool.store_dtype.itemsize
+                    * (pool.layer_num + len(drafts)),
+                    draft_layer_num=len(drafts),
+                ),
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                target_layer_num=pool.layer_num,
                 host_to_device_ratio=2,
                 host_size=0,
                 page_size=kwargs["page_size"],
                 layout="page_first",
                 pin_memory=False,
-                is_dummy=True,
-                override_kv_cache_dim=None,
-                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
         def dummy_indexer_host(
@@ -824,7 +1028,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 decls=kv_pool.host_pool_decls(),
                 mamba_pool=mamba_pool,
                 full_layer_mapping=full_mapping,
-                mamba_layer_mapping=mamba_mapping,
+                start_layer=0,
                 load_cache_event=None,
                 storage_backend=None,
                 use_mla=True,
@@ -1250,7 +1454,12 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 operation.hash_value = list(hashes)
                 operation.storage_hit_count = hit_tokens
                 operation.sidecar_hash_values = None
+                operation.prefetch_kv_page_offset = 0
                 cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertEqual(
+                    operation.prefetch_kv_page_offset,
+                    (hit_tokens - full_tokens) // page_size,
+                )
                 self.assertTrue(
                     cc.can_fit_prefetch_host_buffers(operation, full_tokens)
                 )
@@ -1310,6 +1519,100 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestMtpMhaPhysicalConstruction(CustomTestCase):
+    def test_full_token_draft_swa_preserves_capacity_and_physical_rows(self):
+        """MTP sidecars keep their capacity override and both draft allocations."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        original_init = MHATokenToKVPoolHost.__init__
+        allocated = []
+
+        def unpinned(host, *args, **kwargs):
+            kwargs["pin_memory"] = False
+            original_init(host, *args, **kwargs)
+            allocated.append(host)
+
+        def pool(size, layers, start, heads):
+            return MHATokenToKVPool(
+                size=size,
+                page_size=4,
+                dtype=torch.float16,
+                head_num=heads,
+                head_dim=8,
+                layer_num=layers,
+                device="cpu",
+                enable_memory_saver=False,
+                start_layer=start,
+                end_layer=start + layers,
+            )
+
+        for layout in ("layer_first", "page_first"):
+            with self.subTest(layout=layout):
+                full = pool(32, 2, 20, 2)
+                swa = pool(16, 1, 20, 1)
+                first, second = pool(16, 1, 23, 1), pool(16, 1, 24, 1)
+                first.host_capacity_tokens = 32
+                try:
+                    with (
+                        patch.object(MHATokenToKVPoolHost, "__init__", unpinned),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_memory",
+                            return_value=SimpleNamespace(
+                                hicache_ratio=1.0,
+                                hicache_size=0,
+                                hicache_mem_layout=layout,
+                            ),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_parallel",
+                            return_value=SimpleNamespace(dcp_enabled=False),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "_get_allocator_type",
+                            return_value="default",
+                        ),
+                    ):
+                        group = build_hybrid_swa_group(
+                            page_size=4,
+                            full_kv_pool=full,
+                            swa_kv_pool=swa,
+                            full_layer_mapping={0: 0, 2: 1},
+                            swa_layer_mapping={1: 0},
+                            use_mla=False,
+                            mtp_swa_full_device_pools=(first, second),
+                            transfer_layer_id_max=3,
+                        )
+                    host = group.get_pool(PoolName.DRAFT_SWA)
+                    self.assertEqual(group.get_pool(PoolName.KV).size, 36)
+                    self.assertEqual(host.device_capacity_tokens, 32)
+                    self.assertEqual(host.size, 76)
+                    self.assertEqual((host.start_layer, host.end_layer), (23, 24))
+                    self.assertEqual((host.target_layer_num, host.layer_num), (1, 2))
+                    self.assertIs(host.device_k_buffers[0], first.k_buffer[0])
+                    self.assertIs(host.device_k_buffers[1], second.k_buffer[0])
+                    self.assertIs(host.device_v_buffers[0], first.v_buffer[0])
+                    self.assertIs(host.device_v_buffers[1], second.v_buffer[0])
+                    self.assertEqual(
+                        [
+                            group.get_entry(PoolName.DRAFT_SWA).layer_mapper(i)
+                            for i in (0, 3)
+                        ],
+                        [0, 1],
+                    )
+                    self.assertEqual(
+                        group.get_entry(PoolName.DRAFT_SWA).packed_draft_device_pools,
+                        (second,),
+                    )
+                finally:
+                    for host in allocated:
+                        host.destroy()
+                    allocated.clear()
 
 
 if __name__ == "__main__":

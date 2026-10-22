@@ -84,7 +84,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
+    "tokenspeed_mla",  # Deprecated alias for "cutedsl_mla"
     "trtllm_mha",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
@@ -130,7 +130,8 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
+BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
+SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -233,7 +234,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutedsl_mla",
     "trtllm_mla",
-    "tokenspeed_mla",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

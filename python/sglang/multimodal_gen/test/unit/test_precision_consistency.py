@@ -1,6 +1,9 @@
+import gc
 import unittest
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -15,6 +18,8 @@ resolve_component_precision = precision.resolve_component_precision
 resolve_decode_precision = precision.resolve_decode_precision
 resolve_precision = precision.resolve_precision
 temporary_module_dtype = precision.temporary_module_dtype
+temporary_module_fp32_dtype = precision.temporary_module_fp32_dtype
+temporary_modules_fp32_dtype = precision.temporary_modules_fp32_dtype
 
 
 class _DtypedNoParameterModule(torch.nn.Module):
@@ -223,6 +228,188 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         with temporary_module_dtype(module, torch.float16, enabled=False) as casted:
             self.assertIs(casted, module)
             self.assertEqual(module.weight.dtype, torch.float32)
+
+    def test_temp_fp32_module_handles_mixed_parameter_dtypes(self):
+        class MixedDtypeModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+                self.second = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+
+        module = MixedDtypeModule()
+        self.assertEqual(module.first.dtype, torch.float32)
+        self.assertEqual(module.second.dtype, torch.bfloat16)
+
+        with temporary_module_fp32_dtype(module):
+            self.assertEqual(module.first.dtype, torch.float32)
+            self.assertEqual(module.second.dtype, torch.float32)
+
+        self.assertEqual(module.first.dtype, torch.float32)
+        self.assertEqual(module.second.dtype, torch.bfloat16)
+
+    def test_temporary_module_fp32_dtype_only_casts_non_fp32_state(self):
+        class MixedDtypeModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fp32_weight = torch.nn.Parameter(torch.ones(2))
+                self.bf16_weight = torch.nn.Parameter(
+                    torch.full((2,), 2, dtype=torch.bfloat16)
+                )
+                self.register_buffer("bf16_buffer", torch.ones(2, dtype=torch.bfloat16))
+
+        module = MixedDtypeModule()
+        fp32_weight = module.fp32_weight
+        original_bf16_weight = module.bf16_weight.detach().clone()
+        original_bf16_buffer = module.bf16_buffer.detach().clone()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertIs(module.fp32_weight, fp32_weight)
+            self.assertEqual(module.fp32_weight.dtype, torch.float32)
+            self.assertEqual(module.bf16_weight.dtype, torch.float32)
+            self.assertEqual(module.bf16_buffer.dtype, torch.float32)
+
+        self.assertIs(module.fp32_weight, fp32_weight)
+        self.assertEqual(module.bf16_weight.dtype, torch.bfloat16)
+        self.assertEqual(module.bf16_buffer.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(module.bf16_weight, original_bf16_weight))
+        self.assertTrue(torch.equal(module.bf16_buffer, original_bf16_buffer))
+
+    def test_temporary_module_fp32_dtype_restores_original_storage(self):
+        module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        original_ptr = module.weight.data_ptr()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertNotEqual(module.weight.data_ptr(), original_ptr)
+
+        self.assertEqual(module.weight.dtype, torch.bfloat16)
+        self.assertEqual(module.weight.data_ptr(), original_ptr)
+
+    def test_temporary_modules_fp32_dtype_rolls_back_on_conversion_error(self):
+        first = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        second = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        original_ptr = first.weight.data_ptr()
+        original_cache = precision._module_fp32_cache
+
+        def fail_on_second_call(module):
+            if module is second:
+                raise RuntimeError("conversion failed")
+            return original_cache(module)
+
+        with mock.patch.object(
+            precision, "_module_fp32_cache", side_effect=fail_on_second_call
+        ):
+            with self.assertRaisesRegex(RuntimeError, "conversion failed"):
+                with temporary_modules_fp32_dtype([first, second]):
+                    pass
+
+        self.assertEqual(first.weight.dtype, torch.bfloat16)
+        self.assertEqual(first.weight.data_ptr(), original_ptr)
+
+    def test_temporary_module_fp32_dtype_cache_excludes_fp32_state(self):
+        class MixedDtypeModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fp32_weight = torch.nn.Parameter(torch.ones(2))
+                self.bf16_weight = torch.nn.Parameter(
+                    torch.ones(2, dtype=torch.bfloat16)
+                )
+
+        module = MixedDtypeModule()
+        captured_cache = {}
+        original_cache = precision._module_fp32_cache
+
+        def capture_cache(module):
+            cache = original_cache(module)
+            captured_cache.update(
+                {
+                    "parameters": set(cache["parameters"]),
+                    "buffers": set(cache["buffers"]),
+                }
+            )
+            return cache
+
+        with mock.patch.object(
+            precision, "_module_fp32_cache", side_effect=capture_cache
+        ):
+            with temporary_module_fp32_dtype(module):
+                self.assertEqual(module.fp32_weight.dtype, torch.float32)
+                self.assertEqual(module.bf16_weight.dtype, torch.float32)
+
+        self.assertEqual(captured_cache["parameters"], {"bf16_weight"})
+        self.assertEqual(captured_cache["buffers"], set())
+
+    def test_temporary_module_fp32_dtype_supports_multiple_calls(self):
+        module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        original_weight = module.weight.detach().clone()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertEqual(module.weight.dtype, torch.float32)
+            with temporary_module_fp32_dtype(module):
+                self.assertEqual(module.weight.dtype, torch.float32)
+            self.assertEqual(module.weight.dtype, torch.float32)
+
+        self.assertEqual(module.weight.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(module.weight, original_weight))
+
+        with temporary_module_fp32_dtype(module):
+            self.assertEqual(module.weight.dtype, torch.float32)
+
+        self.assertEqual(module.weight.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(module.weight, original_weight))
+
+    def test_temporary_module_fp32_dtype_releases_cached_tensor_on_exit(self):
+        module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+        with temporary_module_fp32_dtype(module):
+            # No strong local ref is kept, so the fp32 cache tensor is the only owner.
+            cached_ref = weakref.ref(module.weight.data)
+
+        gc.collect()
+        self.assertIsNone(cached_ref())
+
+    def test_temporary_module_fp32_dtype_doubles_then_restores_param_bytes(self):
+        # bf16 is 2 bytes/elem, fp32 is 4 bytes/elem; cast must exactly double footprint.
+        module = torch.nn.Linear(4, 4, bias=False).to(dtype=torch.bfloat16)
+        original_nbytes = module.weight.numel() * module.weight.element_size()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertEqual(
+                module.weight.numel() * module.weight.element_size(),
+                original_nbytes * 2,
+            )
+
+        self.assertEqual(
+            module.weight.numel() * module.weight.element_size(), original_nbytes
+        )
+
+    def test_temporary_modules_fp32_dtype_releases_cached_tensors_on_exit(self):
+        first = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        second = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+        with temporary_modules_fp32_dtype([first, second]):
+            first_ref = weakref.ref(first.weight.data)
+            second_ref = weakref.ref(second.weight.data)
+
+        gc.collect()
+        self.assertIsNone(first_ref())
+        self.assertIsNone(second_ref())
+
+    def test_temporary_modules_fp32_dtype_honors_per_module_enabled(self):
+        enabled_module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        disabled_module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        disabled_weight = disabled_module.weight
+        enabled_original_weight = enabled_module.weight.detach().clone()
+
+        with temporary_modules_fp32_dtype(
+            [enabled_module, disabled_module], enabled=[True, False]
+        ):
+            self.assertEqual(enabled_module.weight.dtype, torch.float32)
+            self.assertEqual(disabled_module.weight.dtype, torch.bfloat16)
+            self.assertIs(disabled_module.weight, disabled_weight)
+
+        self.assertEqual(enabled_module.weight.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(enabled_module.weight, enabled_original_weight))
+        self.assertEqual(disabled_module.weight.dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

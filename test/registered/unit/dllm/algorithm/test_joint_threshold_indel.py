@@ -57,6 +57,7 @@ def make_batch(blocks):
     return SimpleNamespace(
         batch_size=input_ids.shape[0],
         input_ids=input_ids.flatten(),
+        dllm_prompt_mask=None,
     )
 
 
@@ -96,6 +97,35 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         self.assertEqual(state["num_update_steps"], 0)
         self.assertEqual(algorithm.max_regular_update_steps, 9)
         self.assertEqual(algorithm.max_steps(6), 11)
+
+    def test_literal_prompt_masks_are_immutable_and_not_original_masks(self):
+        for fdfo in (False, True):
+            with self.subTest(fdfo=fdfo):
+                algorithm = JointThresholdInDel(make_config(block_size=4, fdfo=fdfo))
+                batch = make_batch([[MASK, 3, MASK, MASK]])
+                batch.dllm_prompt_mask = torch.tensor([[True, True, False, False]])
+                state = algorithm.init_step_state(batch)[0]
+                self.assertEqual(state["prompt_len"], 2)
+                self.assertEqual(
+                    state["is_orig_mask"].tolist(), [False, False, True, True]
+                )
+                runner = Mock()
+                runner.forward.side_effect = lambda *args, **kwargs: make_model_output(
+                    make_logits([[7]] * 4)
+                )
+                states = None
+                for _ in range(32):
+                    _, output, accepted, states, _ = algorithm.run(
+                        runner, batch, states
+                    )
+                    self.assertEqual(batch.input_ids[:2].tolist(), [MASK, 3])
+                    if not fdfo or accepted == [4]:
+                        break
+                else:
+                    self.fail("denoising did not finish")
+                self.assertEqual(batch.input_ids.tolist(), [MASK, 3, 7, 7])
+                if not fdfo:
+                    self.assertEqual(output[0].tolist(), [7, 7])
 
     def test_prompt_is_the_contiguous_prefix_not_every_initial_non_mask(self):
         algorithm = JointThresholdInDel(make_config(block_size=5))
