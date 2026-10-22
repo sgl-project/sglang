@@ -494,6 +494,14 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "--prefill-decode-interval-min-bs must be non-negative",
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval_min_bs=-1
+            ).resolve_once()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(
