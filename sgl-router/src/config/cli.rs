@@ -14,12 +14,13 @@ use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_port,
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
-    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    CacheAwareConfig, CachePrefixProvider, ChatEncodingBackend, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -85,6 +86,12 @@ pub struct ModelArgs {
     /// decoding, falling back to hf when fastokens cannot load the tokenizer.
     #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
     pub tokenizer_backend: TokenizerBackend,
+
+    /// Encoder for DeepSeek-V4 / V4.1 chat prompts: builtin is the engine's port of the
+    /// checkpoint encoder, recipe is deepseek-recipe (matches the official API). Same as
+    /// SGLang's --chat-encoding-backend; must match the workers. Other models ignore it.
+    #[arg(long, value_enum, default_value = "builtin", value_name = "BACKEND")]
+    pub chat_encoding_backend: ChatEncodingBackend,
 
     /// L1 prefix-tokenization cache budget in MiB; 0 disables it. Reuses the tokens of a
     /// previously encoded prompt up to its deepest shared special-token boundary, so a
@@ -639,6 +646,7 @@ impl Cli {
                 }),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                chat_encoding_backend: self.model.chat_encoding_backend,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
                     l1_cache_mb: self.model.tokenizer_l1_cache_mb,
@@ -3304,6 +3312,26 @@ mod tests {
                 backend: TokenizerBackend::Fast,
                 l1_cache_mb: 4096,
             }
+        );
+    }
+
+    #[test]
+    fn chat_encoding_backend_is_plumbed() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(
+            defaults.model.chat_encoding_backend,
+            ChatEncodingBackend::Builtin
+        );
+        let recipe = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--chat-encoding-backend",
+            "recipe",
+        ]))
+        .unwrap();
+        assert_eq!(
+            recipe.model.chat_encoding_backend,
+            ChatEncodingBackend::Recipe
         );
     }
 

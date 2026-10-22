@@ -69,6 +69,7 @@ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
     "low": 50,
     "high": 75,
     "xhigh": 75,
+    "ultra": 100,
     "max": 100,
 }
 DEFAULT_REASONING_EFFORT = "high"

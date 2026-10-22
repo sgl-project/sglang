@@ -741,6 +741,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DeepSeek API: continue this final assistant message (deepseek-recipe backend).
+    prefix: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -834,9 +836,10 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
+# /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"
 ]
 # The typed /v1/responses stream events validate against OpenAI's narrower
 # ``Reasoning.effort``; echoing a tier outside this set kills the stream.
@@ -922,7 +925,7 @@ class ChatCompletionRequest(PDRoutingFields):
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -953,6 +956,11 @@ class ChatCompletionRequest(PDRoutingFields):
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    thinking: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="DeepSeek API thinking control, e.g. {'type': 'disabled'} "
+        "(deepseek-recipe chat encoding backend).",
+    )
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -1051,6 +1059,7 @@ class ChatCompletionRequest(PDRoutingFields):
                 "medium",
                 "high",
                 "xhigh",
+                "ultra",
                 "max",
             }:
                 values["reasoning_effort"] = effort
@@ -1766,7 +1775,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','minimal','low','medium','high','xhigh','ultra','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,

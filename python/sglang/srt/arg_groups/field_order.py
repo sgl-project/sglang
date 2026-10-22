@@ -547,5 +547,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_nvidia_megakernel",
     "enable_megamoe_for_layernorm_sp",
     "enable_http_worker_reuseport",
+    "chat_encoding_backend",
 )
 # fmt: on

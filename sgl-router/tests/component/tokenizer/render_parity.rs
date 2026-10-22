@@ -113,6 +113,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             id: model_id.into(),
             tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
             disable_input_ids_forwarding: false,
+            chat_encoding_backend: Default::default(),
             tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),

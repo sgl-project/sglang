@@ -6,7 +6,7 @@ pub mod chat_formatter;
 mod kimi;
 pub mod stats;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
@@ -168,7 +168,22 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                let mut formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                if m.chat_encoding_backend == crate::config::ChatEncodingBackend::Recipe {
+                    let tokenizer_json = files
+                        .text("tokenizer.json")
+                        .context("--chat-encoding-backend recipe reads tokenizer.json")?;
+                    formatter = formatter.with_recipe_backend(tokenizer_json.as_deref())?;
+                    if formatter.is_recipe() {
+                        tracing::info!(model = %m.id,
+                            "chat prompts render through deepseek-recipe; the workers must run \
+                             --chat-encoding-backend recipe too");
+                    } else {
+                        tracing::warn!(model = %m.id,
+                            "--chat-encoding-backend recipe applies to DeepSeek-V4 / V4.1 only; \
+                             this model keeps its own chat formatter");
+                    }
+                }
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -322,6 +337,7 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
+                chat_encoding_backend: crate::config::ChatEncodingBackend::Builtin,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
