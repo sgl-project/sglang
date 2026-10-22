@@ -74,7 +74,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-            # The backend details below apply to GPU; Ascend uses its own decode backend.
             # DSPARK target-verify + draft-extend must run on the decode
             # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
             # signature (causal_seqs / cp_world / cp_rank). The default
