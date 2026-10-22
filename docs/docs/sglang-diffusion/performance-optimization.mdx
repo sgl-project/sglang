@@ -20,12 +20,15 @@ The docs use "output-preserving" instead of promising bit-exact "lossless" becau
 
 ## Image and Video Input Processing
 
-Eligible RGB inputs use GPU Lanczos resize, crop, and normalization before
+Eligible RGB inputs on NVIDIA CUDA use GPU Lanczos resize, crop, and normalization before
 encoding. This path retains Pillow's uint8 rounding, model-specific crop
 geometry, and the encoder input layout.
 It covers Cosmos3 image/video conditioning, Wan TI2V, FLUX.2/Klein reference
 images, Qwen-Image-Edit 2509/2511 VAE inputs, and RGB conversion in the shared
 image-VAE stage. Small images and unsupported image modes keep the CPU path.
+GPU preprocessing uses temporary device buffers and compiles its kernels on first
+use. Measure warmed-up end-to-end requests as well as peak memory; faster input
+processing does not imply the same speedup for the full generation pipeline.
 
 Set `SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1` before starting the process to
 compare against CPU preprocessing or troubleshoot a numerical issue. This does
