@@ -590,5 +590,103 @@ class TestAttnBankOnShards(CustomTestCase):
                 self.assertIs(fusions[1], scatter)
 
 
+class _QuantReadBank:
+    """Records the out_norm each aggregation was asked for."""
+
+    def __init__(self, unnormed: bool):
+        self.unnormed = unnormed
+        self.out_norms = []
+        self.block_residual = torch.zeros(2, 1, 4)
+
+    def aggregates_unnormed(self, hidden_size):
+        return self.unnormed
+
+    def forward(self, hidden, residual, score_proj, score_norm, out_norm, **kw):
+        self.out_norms.append(out_norm)
+        mixed = hidden + 1
+        return (mixed if out_norm is None else out_norm(mixed)), hidden
+
+
+def _quant_read_state(bank, *, reads_slices=False):
+    return AttnBankState(
+        bank=SimpleNamespace(require=lambda: bank),
+        attn_score_proj=None,
+        attn_score_norm=None,
+        ffn_score_proj=None,
+        ffn_score_norm=None,
+        reads_slices=reads_slices,
+    )
+
+
+def _fake_norm_quant_kernel(quant_format):
+    def run(norm, hidden, residual, post_residual_addition):
+        assert residual is None and post_residual_addition is None
+        return (quant_format, norm(hidden)), hidden
+
+    return run
+
+
+class TestAttnBankQuantRead(CustomTestCase):
+    """A quant_format bank read aggregates without the norm and runs the norm
+    fused with that quantization where it can; elsewhere it reads plainly."""
+
+    def setUp(self):
+        self.norm = lambda x: x * 2
+        self.x = torch.ones(2, 4)
+
+    def _read(self, bank, x, **state_kwargs):
+        readout = _quant_read_state(bank, **state_kwargs).residual_ops().attn_readout
+        with patch.object(attn_bank, "norm_quant_kernel", _fake_norm_quant_kernel):
+            out, _ = readout.read(x, self.norm, quant_format="fp8_per_token")
+        return out
+
+    def test_quantized_read_fuses_the_norm_with_the_quant(self):
+        bank = _QuantReadBank(unnormed=True)
+        out = self._read(bank, self.x)
+        self.assertEqual(bank.out_norms, [None])
+        self.assertEqual(out[0], "fp8_per_token")
+        torch.testing.assert_close(out[1], (self.x + 1) * 2)
+
+    def test_bank_that_must_norm_reads_plainly(self):
+        bank = _QuantReadBank(unnormed=False)
+        out = self._read(bank, self.x)
+        self.assertEqual(bank.out_norms, [self.norm])
+        torch.testing.assert_close(out, (self.x + 1) * 2)
+
+    def test_read_gathered_afterwards_reads_plainly(self):
+        bank = _QuantReadBank(unnormed=True)
+        out = self._read(bank, self.x, reads_slices=True)
+        self.assertEqual(bank.out_norms, [self.norm])
+        self.assertIsInstance(out, torch.Tensor)
+
+    def test_empty_batch_reads_plainly(self):
+        bank = _QuantReadBank(unnormed=True)
+        bank.block_residual = torch.zeros(0, 1, 4)
+        out = self._read(bank, torch.ones(0, 4))
+        self.assertIsInstance(out, torch.Tensor)
+
+    def test_ffn_read_still_refuses_a_quant_format(self):
+        readout = (
+            _quant_read_state(_QuantReadBank(unnormed=True)).residual_ops().ffn_readout
+        )
+        with self.assertRaises(NotImplementedError):
+            readout.read(self.x, self.norm, quant_format="fp8_per_token")
+
+
+class TestAggregatesUnnormed(CustomTestCase):
+    def test_empty_bank_can_always_leave_the_norm_out(self):
+        bank = attn_residual.AttnResidual(torch.zeros(2, 4), block_num=2)
+        with patch.object(attn_residual, "_use_hip_fused", return_value=False):
+            self.assertTrue(bank.aggregates_unnormed(4))
+
+    def test_filled_bank_needs_the_rocm_kernel(self):
+        bank = attn_residual.AttnResidual(torch.zeros(2, 4), block_num=2)
+        bank.write(torch.zeros(2, 4))
+        with patch.object(attn_residual, "_use_hip_fused", return_value=False):
+            self.assertFalse(bank.aggregates_unnormed(4))
+        with patch.object(attn_residual, "_use_hip_fused", return_value=True):
+            self.assertTrue(bank.aggregates_unnormed(4))
+
+
 if __name__ == "__main__":
     unittest.main()

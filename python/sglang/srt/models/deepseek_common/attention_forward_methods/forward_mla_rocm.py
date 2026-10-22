@@ -489,6 +489,34 @@ def _fused_bmm_rope_cat_and_cache(
     )
 
 
+def _fused_qk_rmsnorm_ptpc_fp8(
+    attn, q: torch.Tensor, k_nope: torch.Tensor, *, keep_unquantized_q: bool
+):
+    """q_a and kv_a RMSNorms in one launch, q emitted as (fp8, per-token scale)."""
+    from aiter import dtypes as aiter_dtypes
+    from aiter.ops.fused_qk_rmsnorm_group_quant import (
+        fused_qk_rmsnorm_per_token_quant,
+    )
+
+    q_fp8 = torch.empty(q.shape, dtype=aiter_dtypes.fp8, device=q.device)
+    q_scale = torch.empty((q.shape[0], 1), dtype=torch.float32, device=q.device)
+    k_out = torch.empty_like(k_nope)
+    q_unquantized = torch.empty_like(q) if keep_unquantized_q else None
+    fused_qk_rmsnorm_per_token_quant(
+        q_fp8,
+        q_scale,
+        q,
+        attn.q_a_layernorm.weight,
+        attn.q_a_layernorm.variance_epsilon,
+        q_out_unquantized=q_unquantized,
+        k_out=k_out,
+        k=k_nope,
+        k_weight=attn.kv_a_layernorm.weight,
+        k_epsilon=attn.kv_a_layernorm.variance_epsilon,
+    )
+    return (q_fp8, q_scale), k_out, q_unquantized
+
+
 class DeepseekMLARocmForwardMixin:
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -581,6 +609,12 @@ class DeepseekMLARocmForwardMixin:
                         q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
                     elif _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif _use_aiter and self._q_b_takes_ptpc_fp8(q.shape[0]):
+                q, k_nope, q_unquantized = _fused_qk_rmsnorm_ptpc_fp8(
+                    self, q, k_nope, keep_unquantized_q=self.use_dsa
+                )
+                if self.use_dsa:
+                    q_lora = q_unquantized
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
@@ -972,7 +1006,28 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            q = k = None
+            if (
+                self.current_attention_backend in ("aiter", "triton", "triton_mla")
+                and not get_parallel().dcp_enabled
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+            ):
+                fused = self._try_fused_mla_q_cache(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    positions,
+                    forward_batch.out_cache_loc,
+                )
+                if fused is not None:
+                    q, k = fused
+                    save_kv_cache = False
+
+            if q is None and self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
@@ -983,7 +1038,7 @@ class DeepseekMLARocmForwardMixin:
                     forward_batch.out_cache_loc,
                 )
                 save_kv_cache = False
-            else:
+            elif q is None:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 
@@ -1108,6 +1163,23 @@ class DeepseekMLARocmForwardMixin:
                 or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")
             )
         )
+
+    def _q_b_takes_ptpc_fp8(self: DeepseekV2AttentionMLA, num_tokens: int) -> bool:
+        """Model hook: emit the q_a norm as (fp8, per-token scale) for q_b_proj."""
+        return False
+
+    def _try_fused_mla_q_cache(
+        self: DeepseekV2AttentionMLA,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Model hook: (q, k placeholder) after writing Q and the KV cache in one
+        fused decode launch, or None to keep the split rope/concat/cache chain."""
+        return None
 
     def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
         """

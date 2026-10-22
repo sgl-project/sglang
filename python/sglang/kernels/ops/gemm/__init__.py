@@ -525,3 +525,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.ptpc_fp8",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.gemm.ptpc_fp8_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)

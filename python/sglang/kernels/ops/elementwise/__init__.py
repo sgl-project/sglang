@@ -78,3 +78,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="elementwise.kimi_k3_mla_output_gate_fp8_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.mla_output_gate_fp8_quant_hip:kimi_k3_mla_output_gate_fp8_quant",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)

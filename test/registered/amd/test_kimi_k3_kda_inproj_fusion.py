@@ -133,7 +133,9 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             _bfa_b_size=HEADS_TP,
             _qkvgbfa_sizes=self.all_sizes,
             _qkvgbfa_bs_limit=256,
-            _qkvgbfa_layer=None,
+            # Dense carrier for the merged projection; apply() ignores it.
+            _qkvgbfa_layer=object(),
+            _qkvgbfa_ptpc=None,
             _bfa_f_b_w=self.f_b_w,
             _bfa_alt_stream=None,
             fused_qkvg_proj=SimpleNamespace(
