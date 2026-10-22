@@ -1263,6 +1263,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def get_page_buffer_meta(self, indices):
         """Return local buffer pointers and byte sizes for logical storage pages."""
+        if self.layout == "page_unified":
+            return self._page_unified_buffer_meta(indices)
         if self.dcp_size > 1 and self.layout == "page_first_kv_split":
             raise NotImplementedError(
                 "DCP L3 zero-copy storage does not support split KV buffers."

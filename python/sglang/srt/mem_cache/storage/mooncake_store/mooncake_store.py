@@ -659,6 +659,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
+            # Unified keys: one object per grid chunk (K and V together), keyed by
+            # its coordinate instead of by this rank.
+            self.unified_suffixes = storage_config.unified_suffixes
+            self.unified_chunk_spans = storage_config.unified_chunk_spans
+            if self.unified_suffixes is not None and (
+                self.unified_chunk_spans is None
+                or len(self.unified_chunk_spans) != len(self.unified_suffixes)
+            ):
+                raise ValueError(
+                    "the unified key scheme needs one chunk span per unified "
+                    f"suffix; got spans {self.unified_chunk_spans} for "
+                    f"suffixes {self.unified_suffixes}."
+                )
+
             self.registered_pools = {}
 
             self.gb_per_page = None
@@ -758,6 +772,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
+        if self.unified_chunk_spans is not None:
+            # A unified page is every chunk this rank owns, K and V together.
+            bytes_per_page = sum(length for _, length in self.unified_chunk_spans)
         self.gb_per_page = bytes_per_page / (1 << 30)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
@@ -926,6 +943,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
+        if self.unified_suffixes is not None:
+            # Rank-suffixed sidecar keys would break the topology-free contract.
+            raise NotImplementedError(
+                "The unified key scheme does not support hybrid pools: "
+                f"{transfer.name} has no unified keys."
+            )
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
@@ -1334,6 +1357,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _unified_object_keys(self, keys: List[str]) -> List[str]:
+        # Page-major / chunk-minor, the order _get_unified_buffer_meta emits.
+        return [f"{key}_{suffix}" for key in keys for suffix in self.unified_suffixes]
+
+    def _get_unified_buffer_meta(self, keys, indices):
+        # Each chunk is one run of its page block, so it is a plain
+        # (pointer, size) pair at the block's address plus the chunk offset.
+        page_ptrs, _ = self.mem_pool_host.get_page_buffer_meta(indices)
+        assert len(page_ptrs) == len(keys)
+        ptr_list = [
+            page_ptr + offset
+            for page_ptr in page_ptrs
+            for offset, _ in self.unified_chunk_spans
+        ]
+        element_size_list = [
+            length for _ in page_ptrs for _, length in self.unified_chunk_spans
+        ]
+        return self._unified_object_keys(keys), ptr_list, element_size_list
+
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         page_size = (
@@ -1342,6 +1384,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else self.mem_pool_host.page_size
         )
         assert len(keys) == len(host_indices) // page_size
+        if self.unified_suffixes is not None:
+            return self._get_unified_buffer_meta(keys, host_indices)
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1361,7 +1405,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             where each element is 0 on success, or a negative value on error
         """
         if key_multiplier is None:
-            if self.is_mla_backend:
+            if self.unified_suffixes is not None:
+                key_multiplier = len(self.unified_suffixes)
+            elif self.is_mla_backend:
                 key_multiplier = 1
             else:
                 key_multiplier = 2
@@ -1458,9 +1504,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             end_time = time.perf_counter()
 
             if self.enable_storage_metrics:
-                self.backup_pgs.append(len(set_keys))
+                backup_pages = len(set_keys)
+                if self.unified_suffixes is not None:
+                    # A unified object is one chunk of a page.
+                    backup_pages /= key_multiplier
+                self.backup_pgs.append(backup_pages)
                 self.backup_bandwidth.append(
-                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                    backup_pages / (end_time - start_time) * self.gb_per_page
                 )
 
             for i in range(len(set_indices)):
@@ -1597,7 +1647,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.is_mla_backend:
+        if self.unified_suffixes is not None:
+            # A page is a hit only when every chunk this rank owns exists.
+            query_keys = self._unified_object_keys(keys)
+            key_multiplier = len(self.unified_suffixes)
+        elif self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
         else:

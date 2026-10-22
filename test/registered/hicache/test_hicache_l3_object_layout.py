@@ -80,6 +80,8 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store.dcp_size = 1
         store.config_prefix = "tag_my-model"
         store.should_split_heads = False
+        store.unified_suffixes = None
+        store.unified_chunk_spans = None
         store.enable_storage_metrics = False
         store._use_group_semantics = False
         return store
