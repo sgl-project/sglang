@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 # both phases (no steady-state phase):
 #   Phase 1 (pure prefill): cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s.
 #   Phase 2 (pure decode, low-latency tier): 131072 shared prefix in /
-#   1024 out, C12/N12, mean TPOT <= 30 ms. run_aisbench.sh is invoked with
-#   --repeat_rate 100, which regenerates the dataset as identical prompts,
-#   runs a warm pass (output-len=1) that primes the KV cache of every DP
-#   rank, and only streams the measured pass to the metric parser.
+#   1024 out, C12/N12, mean TPOT <= 30 ms. run_aisbench.sh detects
+#   --repeat_rate 100 and switches to the aisbench_auto_tools_prefix
+#   toolkit: it generates the prefix_cache dataset (shared prefix +
+#   distinct tails), runs --prefix_test to prime the prefix on every DP
+#   rank (--dp) and only the full-dataset pass counts as the measurement.
 #
 # Concurrency note: the acceptance table leaves the decode concurrency open;
 # 12 keeps the 4-DP ranks evenly loaded (dev measured 23.2-25.9 ms TPOT at
@@ -147,6 +148,11 @@ class TestNPUKimiK3W4A832PMixIn128kPrefillThenDecode(
     dataset_path = None
     random_range_ratio = 1
     request_rate = 0
+    # Prefix mode warm-up coverage: run_aisbench.sh forwards --dp to
+    # aisbench_test.py so the shared prefix is primed on ALL 4 DP ranks
+    # before the measured pass (default 1 would leave 3 ranks cold and
+    # poison the measured TPOT).
+    dp = 4
 
     @staticmethod
     def _flush_cache(base_url: str) -> None:
