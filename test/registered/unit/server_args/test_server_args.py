@@ -203,16 +203,6 @@ class TestPrepareServerArgs(CustomTestCase):
                     resolution_result(args, "optimistic_prefill_attempts"), expected
                 )
 
-    def test_rust_server_refuses_default_chat_template_kwargs(self):
-        args = ServerArgs(
-            model_path="dummy",
-            default_chat_template_kwargs={"enable_thinking": False},
-        )
-        handle_other_validations(args)
-        with envs.SGLANG_RUST_SERVER.override(True):
-            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
-                handle_other_validations(args)
-
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(

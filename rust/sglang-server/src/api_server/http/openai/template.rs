@@ -27,6 +27,7 @@ pub(super) fn render_chat(
     body: Value,
     request: &CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
+    defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
     match formatter {
         ChatFormatter::DeepSeekV4(_)
@@ -34,8 +35,7 @@ pub(super) fn render_chat(
         | ChatFormatter::Glm53(_)
         | ChatFormatter::KimiK3
         | ChatFormatter::Qwen38 { .. } => {
-            // `--default-chat-template-kwargs` is refused at launch.
-            let (prompt, mut continuation) = formatter.render_request(body, &HashMap::new())?;
+            let (prompt, mut continuation) = formatter.render_request(body, defaults)?;
             // SGLang tokenizes the DeepSeek-V4 prefix on its own and drops its leading BOS.
             if matches!(
                 formatter,
@@ -49,12 +49,18 @@ pub(super) fn render_chat(
                 continuation,
             })
         }
-        _ => formatter
-            .render_prompt(&TemplateRequest { request, kwargs })
-            .map(|prompt| RenderedChat {
-                prompt,
-                continuation: String::new(),
-            }),
+        _ => {
+            // Python's `_process_messages`: the defaults under the request's own.
+            let mut merged = defaults.clone();
+            merged.extend(kwargs.cloned().unwrap_or_default());
+            let kwargs = (!merged.is_empty()).then_some(&merged);
+            formatter
+                .render_prompt(&TemplateRequest { request, kwargs })
+                .map(|prompt| RenderedChat {
+                    prompt,
+                    continuation: String::new(),
+                })
+        }
     }
 }
 

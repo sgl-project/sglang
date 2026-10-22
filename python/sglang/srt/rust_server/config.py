@@ -129,6 +129,9 @@ def _build_server_args(
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,

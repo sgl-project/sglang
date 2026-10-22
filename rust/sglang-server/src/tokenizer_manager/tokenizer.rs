@@ -34,6 +34,11 @@ pub trait TextTokenizer: Send + Sync {
         Vec::new()
     }
 
+    /// Python's `tokenizer.bos_token_id`.
+    fn bos_token_id(&self) -> Option<i64> {
+        self.auto_specials().first().copied()
+    }
+
     /// Encode rendered segments, each with its own special-token policy.
     fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
         self.encode(
@@ -64,11 +69,25 @@ pub fn load_tokenizer(
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
     inner: dynamo_tokenizers::Tokenizer,
+    bos: Option<i64>,
 }
 
 impl DynamoTokenizer {
-    pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
-        Self { inner }
+    /// `bos_token` comes from `tokenizer_config.json`, as Python's does.
+    pub fn new(inner: dynamo_tokenizers::Tokenizer, path: &str, revision: Option<&str>) -> Self {
+        let bos = sglang_processor::resolve_model_file(path, revision, "tokenizer_config.json")
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|config| {
+                let bos = &config["bos_token"];
+                let bos = bos.as_str().or_else(|| bos["content"].as_str())?.to_owned();
+                // The last id: an auto-added BOS may precede it.
+                let ids = inner
+                    .encode_segments(&[EncodeSegment::new(&bos, true)])
+                    .ok()?;
+                ids.token_ids().last().map(|&id| i64::from(id))
+            });
+        Self { inner, bos }
     }
 }
 
@@ -105,6 +124,10 @@ impl TextTokenizer for DynamoTokenizer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn bos_token_id(&self) -> Option<i64> {
+        self.bos
     }
 
     fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
@@ -188,8 +211,8 @@ impl TokenizerWorker {
         let mut ids = strip_auto_specials(ids, &self.auto_specials);
         if !chat.continuation.is_empty() {
             let suffix = self.tokenizer.encode(&chat.continuation)?;
-            let bos = self.auto_specials.first();
-            let skip = usize::from(bos.is_some() && suffix.first() == bos);
+            let bos = self.tokenizer.bos_token_id();
+            let skip = usize::from(bos.is_some() && suffix.first() == bos.as_ref());
             ids.extend_from_slice(&suffix[skip..]);
         }
         Ok(ids)

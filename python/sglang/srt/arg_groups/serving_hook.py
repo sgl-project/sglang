@@ -504,11 +504,6 @@ def handle_other_validations(server_args: Any):
         cfg.default_chat_template_kwargs, dict
     ):
         raise ValueError("--default-chat-template-kwargs must decode to a JSON object")
-    # Not plumbed into the Rust server's chat rendering.
-    if cfg.default_chat_template_kwargs and envs.SGLANG_RUST_SERVER.get():
-        raise ValueError(
-            "--default-chat-template-kwargs is not supported with SGLANG_RUST_SERVER"
-        )
 
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":

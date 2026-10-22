@@ -18,7 +18,7 @@
 //! Python-facing code in this file;
 //! the rest is pure Rust.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -127,6 +127,8 @@ pub struct ServerArgs {
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     pub chat_template: Option<String>,
+    /// `--default-chat-template-kwargs`, under each request's own.
+    pub default_chat_template_kwargs: HashMap<String, serde_json::Value>,
     /// Parser selected by `--tool-call-parser`.
     pub tool_call_parser: Option<String>,
     /// Reasoning splitter selected by `--reasoning-parser` (e.g. deepseek-r1).
@@ -234,6 +236,7 @@ impl ServerArgs {
         log_level,
         log_level_http,
         chat_template,
+        default_chat_template_kwargs,
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
@@ -286,6 +289,7 @@ impl ServerArgs {
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
+        default_chat_template_kwargs: String,
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
@@ -336,6 +340,8 @@ impl ServerArgs {
             log_level,
             log_level_http,
             chat_template,
+            default_chat_template_kwargs: serde_json::from_str(&default_chat_template_kwargs)
+                .expect("default_chat_template_kwargs is a JSON object"),
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
@@ -394,6 +400,7 @@ impl Default for ServerArgs {
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
+            default_chat_template_kwargs: HashMap::new(),
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
