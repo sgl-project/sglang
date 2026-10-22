@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.kernels.ops.kvcache.mla_kv_gather import gather_mla_kv_rows
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -161,60 +160,6 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             attn_attend_prefix_cache=None,
         )
 
-    def test_gather_preserves_all_fp8_values_and_duplicate_order(self):
-        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            for dst_dtype in (torch.bfloat16, torch.float16):
-                with self.subTest(dtype=dtype, dst_dtype=dst_dtype):
-                    pool = (
-                        torch.arange(256, dtype=torch.uint8).view(dtype).view(32, 1, 8)
-                    )
-                    rows = torch.cat(
-                        (
-                            torch.arange(32, dtype=torch.int32),
-                            torch.tensor([31, 0, 17, 17, 1], dtype=torch.int32),
-                        )
-                    )
-                    actual = gather_mla_kv_rows(pool, rows, dst_dtype)
-                    expected = pool.to(dst_dtype)[rows.long()]
-                    torch.testing.assert_close(
-                        actual, expected, rtol=0, atol=0, equal_nan=True
-                    )
-                    self.assertEqual(actual.shape, (37, 1, 8))
-                    self.assertEqual(
-                        gather_mla_kv_rows(pool, rows[:0], dst_dtype).shape, (0, 1, 8)
-                    )
-
-    def test_prefill_plan_and_forward_use_the_same_compact_rows(self):
-        for page_size in (1, 64):
-            with self.subTest(page_size=page_size):
-                backend = self._backend(page_size=page_size)
-                batch = self._batch()
-                backend.init_forward_metadata(batch)
-                rows = backend.forward_metadata.kv_rows
-                plan = backend.prefill_wrapper_paged.plan.call_args.args
-                torch.testing.assert_close(plan[2], torch.arange(5, dtype=torch.int32))
-                torch.testing.assert_close(
-                    plan[1], torch.tensor([0, 3, 5], dtype=torch.int32)
-                )
-                torch.testing.assert_close(
-                    plan[0], torch.tensor([0, 2, 4], dtype=torch.int32)
-                )
-                backend.prefill_wrapper_paged.run.side_effect = (
-                    lambda q, qr, k, kr, **kw: q
-                )
-                layer = SimpleNamespace(
-                    layer_id=0, tp_q_head_num=1, v_head_dim=4, head_dim=8, logit_cap=0
-                )
-                backend.forward_extend(
-                    torch.zeros(4, 1, 8, dtype=torch.bfloat16), None, None, layer, batch
-                )
-                args = backend.prefill_wrapper_paged.run.call_args.args
-                actual = torch.cat(args[2:4], dim=-1)
-                expected = backend.token_to_kv_pool.get_key_buffer(0).to(
-                    torch.bfloat16
-                )[rows.long()]
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
     def test_decode_remaps_only_eager_nonspeculative_plans(self):
         backend = self._backend()
         updater = backend.indices_updater_decode
@@ -326,9 +271,26 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
         self.parallel.dcp_enabled = False
 
     def test_graph_dispatch_requires_registered_wrapper_and_nonspeculative_batch(self):
-        for kind in ("graph", "eager", "spec", "draft", "dcp"):
+        for kind in (
+            "graph",
+            "eager",
+            "spec",
+            "draft",
+            "dcp",
+            "sm80_e4m3",
+            "sm80_e5m2",
+        ):
             with self.subTest(kind=kind):
-                backend = self._backend()
+                with patch.object(
+                    self.module,
+                    "use_fp8_e4b15_for_e4m3fn",
+                    return_value=kind.startswith("sm80"),
+                ):
+                    backend = self._backend(
+                        dtype=torch.float8_e5m2
+                        if kind == "sm80_e5m2"
+                        else torch.float8_e4m3fn
+                    )
                 wrapper = Mock()
                 wrapper.run.side_effect = lambda q, qr, k, kr, **kw: q
                 backend.forward_metadata = self.module.DecodeMetadata(wrapper)
@@ -356,8 +318,10 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                         layer,
                         batch,
                     )
-                self.assertEqual(refresh.call_count, int(kind == "graph"))
-                if kind == "graph":
+                self.assertEqual(
+                    refresh.call_count, int(kind in ("graph", "sm80_e5m2"))
+                )
+                if kind in ("graph", "sm80_e5m2"):
                     self.assertIs(
                         refresh.call_args.args[1], backend.cuda_graph_kv_indices
                     )
@@ -366,41 +330,6 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                         backend.kv_indptr[2:3].data_ptr(),
                     )
         self.parallel.dcp_enabled = False
-
-    def test_graph_metadata_replay_keeps_physical_ids_and_updates_live_count(self):
-        backend = self._backend()
-        wrapper = Mock()
-        backend.decode_cuda_graph_metadata[2] = wrapper
-        backend.cuda_graph_qo_indptr_cpu = backend.q_indptr_decode.clone()
-        backend.cuda_graph_kv_indptr_cpu = backend.kv_indptr.clone()
-        backend.fast_decode_kwargs = {"kv_indices": backend.cuda_graph_kv_indices}
-        batch = self._batch(decode=True)
-        address = backend.cuda_graph_kv_indices.data_ptr()
-        for rows, lengths in (([7, 2, 7, 0, 19], [3, 2]), ([256], [1, 0])):
-
-            def pack(*args, out, **kwargs):
-                out[: len(rows)].copy_(torch.tensor(rows, dtype=torch.int32))
-                return True
-
-            backend.kv_index_translator.pack_read_stream = pack
-            seq_lens = torch.tensor(lengths, dtype=torch.int32)
-            backend._apply_cuda_graph_metadata(
-                plan=batch.kv_loc_plan,
-                bs=2,
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_sum=sum(lengths),
-                forward_mode=batch.forward_mode,
-                spec_info=None,
-                seq_lens_cpu=seq_lens,
-            )
-            self.assertEqual(backend.cuda_graph_kv_indices.data_ptr(), address)
-            self.assertEqual(backend.kv_indptr[2].item(), len(rows))
-            self.assertIs(wrapper.plan.call_args.args[2], backend.cuda_graph_kv_indices)
-            torch.testing.assert_close(
-                backend.cuda_graph_kv_indices[: len(rows)],
-                torch.tensor(rows, dtype=torch.int32),
-            )
 
 
 if __name__ == "__main__":

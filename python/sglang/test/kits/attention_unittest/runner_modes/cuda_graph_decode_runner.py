@@ -550,6 +550,7 @@ def run_mla_cuda_graph_decode_case(
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
     device: str = MLA_DEFAULT_DEVICE,
+    fp8_kv_cache: bool = False,
     cuda_graph_capture_batch_size: int = MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
 ):
     adapter = CudaGraphDecodeAdapter(
@@ -577,6 +578,7 @@ def run_mla_cuda_graph_decode_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            fp8_kv_cache=fp8_kv_cache,
         ),
         capture_batch_size=cuda_graph_capture_batch_size,
         max_context_len=max_context_len,
