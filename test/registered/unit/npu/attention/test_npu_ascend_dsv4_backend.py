@@ -402,10 +402,16 @@ class TestC4StateTransferLayout(unittest.TestCase):
 
         _, data_lens, item_lens = pool.get_state_buf_infos()
 
-        self.assertEqual(data_lens, [swa_state.nbytes, attn_state.nbytes, indexer_state.nbytes])
+        self.assertEqual(
+            data_lens, [swa_state.nbytes, attn_state.nbytes, indexer_state.nbytes]
+        )
         self.assertEqual(
             item_lens,
-            [swa_state[0].nbytes, attn_state[0].nbytes * 8, indexer_state[0].nbytes * 8],
+            [
+                swa_state[0].nbytes,
+                attn_state[0].nbytes * 8,
+                indexer_state[0].nbytes * 8,
+            ],
         )
 
     def test_c4_state_buf_infos_register_one_row_per_item(self):
