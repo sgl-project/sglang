@@ -2684,15 +2684,19 @@ def _granian_http1_settings():
 
     Granian has no separate HTTP/1.1 keep-alive timeout: its HTTP library
     (hyper) re-arms ``header_read_timeout`` whenever a keep-alive connection
-    goes idle, so that timeout also closes idle connections. Use the
-    keep-alive timeout when it is longer than Granian's default and never go
-    below the default, so the 5 s env default changes nothing here.
+    goes idle, so that timeout also closes idle connections. Apply the
+    variable only when it is set explicitly; otherwise keep Granian's default.
     """
     from granian.http import HTTP1Settings
 
-    default_ms = HTTP1Settings().header_read_timeout
-    keep_alive_ms = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get() * 1000
-    return HTTP1Settings(header_read_timeout=max(default_ms, keep_alive_ms))
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
 
 
 def _run_granian_server(

@@ -1,6 +1,6 @@
 """With --enable-http2, Granian closes an idle HTTP/1.1 keep-alive connection
-when its header read timeout fires, so SGLANG_TIMEOUT_KEEP_ALIVE must reach
-that timeout without ever lowering Granian's default.
+when its header read timeout fires, so an explicitly set
+SGLANG_TIMEOUT_KEEP_ALIVE must reach that timeout; unset keeps Granian's default.
 """
 
 import os
@@ -36,24 +36,35 @@ class TestGranianHTTP1Settings(CustomTestCase):
         settings = http_server._granian_http1_settings()
         self.assertEqual(settings, HTTP1Settings())
 
-    def test_long_keep_alive_raises_header_read_timeout(self):
-        with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(1800):
-            settings = http_server._granian_http1_settings()
-        # Seconds become milliseconds; the other HTTP/1.1 settings keep their defaults.
-        self.assertEqual(settings, HTTP1Settings(header_read_timeout=1_800_000))
-
-    def test_short_keep_alive_never_lowers_granian_default(self):
-        for keep_alive in (-1, 0, 5, 30):
+    def test_explicit_value_sets_header_read_timeout(self):
+        # Seconds become milliseconds, in both directions from Granian's 30 s default.
+        for keep_alive, expected_ms in (
+            (1800, 1_800_000),
+            (300, 300_000),
+            (10, 10_000),
+        ):
             with self.subTest(keep_alive=keep_alive):
                 with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(keep_alive):
                     settings = http_server._granian_http1_settings()
-                self.assertEqual(settings, HTTP1Settings())
+                self.assertEqual(
+                    settings, HTTP1Settings(header_read_timeout=expected_ms)
+                )
 
-    def test_invalid_value_keeps_granian_default(self):
+    def test_non_positive_value_is_rejected(self):
+        for keep_alive in (0, -1):
+            with self.subTest(keep_alive=keep_alive):
+                with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(keep_alive):
+                    with self.assertRaisesRegex(
+                        ValueError, "SGLANG_TIMEOUT_KEEP_ALIVE must be a positive"
+                    ):
+                        http_server._granian_http1_settings()
+
+    def test_unparsable_value_uses_the_variable_default(self):
+        # Same fallback as the uvicorn path: a warning, then the variable's default (5 s).
         os.environ["SGLANG_TIMEOUT_KEEP_ALIVE"] = "abc"
         with self.assertWarns(UserWarning):
             settings = http_server._granian_http1_settings()
-        self.assertEqual(settings, HTTP1Settings())
+        self.assertEqual(settings, HTTP1Settings(header_read_timeout=5_000))
 
     def _granian_kwargs(self, server_cls, tokenizer_worker_num):
         # The embedded server is driven by uvloop.run; close the coroutine instead.

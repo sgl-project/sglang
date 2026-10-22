@@ -2197,7 +2197,7 @@ MPS and does not read them.
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TIMEOUT_KEEP_ALIVE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>HTTP keep-alive timeout (seconds). With <code>--enable-http2</code> (Granian), it sets the HTTP/1.1 idle timeout only when it is longer than Granian's 30-second default. The same Granian timeout also bounds how long a client may take to send request headers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>HTTP keep-alive timeout (seconds). With <code>--enable-http2</code>, it also sets Granian's HTTP/1.1 idle timeout when set explicitly; unset keeps Granian's 30-second default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>5</code></td>
     </tr>
     <tr>
