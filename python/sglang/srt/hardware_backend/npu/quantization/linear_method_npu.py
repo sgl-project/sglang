@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
-# MindIE-SD C7 defaults; kept local to avoid an SRT dependency on multimodal_gen.
 MXFP4_C7_ACTIVATION_QUANT_DEFAULTS = {"scale_alg": 2, "dst_type_max": 7.25}
 
 
@@ -606,8 +605,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     returns a 3D ``[tokens, in//64, 2]`` block scale so the matmul needs no extra
     scale-layout normalization.
 
-    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On
-    A5 (aclnn-only SoCs, soc_version >= 260) torch_npu itself forces
+    On A5 (aclnn-only SoCs, soc_version >= 260) torch_npu itself forces
     ``allow_internal_format=False`` — a request for True is reverted with a
     warning by torch_npu's option register — and the NZ cast still produces a
     ``FRACTAL_NZ_C0_16`` tensor, which is fine. Older torch_npu (e.g.

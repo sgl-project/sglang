@@ -52,7 +52,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
-    resolve_precision,
+    uses_mxfp4_attention,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -488,15 +488,11 @@ class WanTransformerBlock(nn.Module):
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
         attention_prefix = add_prefix("attn1", prefix)
-        self.attention_quant_scheme = (
-            quant_config.get_attention_scheme(attention_prefix)
-            if hasattr(quant_config, "get_attention_scheme")
-            else None
-        )
+        self.use_mxfp4_attention = uses_mxfp4_attention(quant_config, attention_prefix)
         self.attention_quant_description = (
             getattr(quant_config, "quant_description", {}) or {}
         )
-        if self.attention_quant_scheme == "MXFP4" and (
+        if self.use_mxfp4_attention and (
             not current_platform.is_npu() or attention_type != "original"
         ):
             raise NotImplementedError(
@@ -542,9 +538,7 @@ class WanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 is_cross_attention=False,
                 required_attention_backend=(
-                    AttentionBackendEnum.FA
-                    if self.attention_quant_scheme == "MXFP4"
-                    else None
+                    AttentionBackendEnum.FA if self.use_mxfp4_attention else None
                 ),
             )
 
@@ -749,22 +743,8 @@ class WanTransformerBlock(nn.Module):
                 _apply_rotary_emb(key, cos, sin, is_neox_style=False),
             )
 
-        from sglang.multimodal_gen import envs
-
-        if self.use_offline_qk_rotation and (
-            (
-                self.attention_quant_scheme == "MXFP4"
-                and resolve_precision(self.attention_quant_description, "fa", "MXFP4")
-                != "FLOAT"
-            )
-            or (
-                self.attention_quant_scheme is None
-                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
-                and getattr(self.attn1, "backend", None) is AttentionBackendEnum.FA
-                and query.shape[1:3] == key.shape[1:3]
-                and key.shape == value.shape
-                and (query.shape[0] * query.shape[1]) % 64 == 0
-            )
+        if self.use_offline_qk_rotation and self.attn1.should_apply_qk_rot(
+            query, key, value
         ):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
             self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)

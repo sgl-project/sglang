@@ -14,6 +14,24 @@ _ALLOWED_POLICY_PRECISIONS: dict[PrecisionPolicyTarget, frozenset[str]] = {
 }
 
 
+def uses_mxfp4_attention(quant_config, prefix: str) -> bool:
+    description = getattr(quant_config, "quant_description", {}) or {}
+    prefix = prefix.removesuffix(".impl")
+    descriptor = next(
+        (
+            description[key]
+            for key in (prefix, prefix + ".quant_type", prefix + ".fa_q.scale")
+            if key in description
+        ),
+        None,
+    )
+    if descriptor is None or descriptor == "FLOAT":
+        return False
+    if descriptor != "MXFP4_DYNAMIC":
+        raise ValueError(f"Unsupported attention descriptor for {prefix}: {descriptor}")
+    return True
+
+
 def default_mxfp4_policy(num_steps: int) -> dict[str, str]:
     """Use W4A8 for the first two and last two steps, as in MindIE-SD."""
     return {

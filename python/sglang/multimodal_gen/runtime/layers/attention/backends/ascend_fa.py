@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
     mxfp4_quant_kwargs,
     resolve_precision,
+    uses_mxfp4_attention,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -30,23 +31,23 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def resolve_mx_fa_scheme(quant_config) -> str | None:
-    """Resolve the opt-in MXFP8 attention scheme for an NPU quant config."""
+def _can_use_mxfp8_attention(quant_config) -> bool:
+    """Check the opt-in MXFP8 attention requirements."""
     if (
         quant_config is None
         or not current_platform.is_npu()
         or not envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
     ):
-        return None
+        return False
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
-        return None
+        return False
 
     if torch.npu.get_soc_version() < 260:
         logger.warning_once(
             "MXFP8 attention is disabled because MXFP8 quantization is only "
             "supported on Ascend 950 (A5) devices."
         )
-        return None
+        return False
 
     required_ops = (
         "npu_dynamic_mx_quant",
@@ -62,8 +63,8 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
             f"provide the required APIs: {', '.join(missing_features)}. "
             "Please install torch==2.10.0, torch_npu>=2.10.0.post4, and CANN>=9.1.1."
         )
-        return None
-    return "MXFP8"
+        return False
+    return True
 
 
 def _packed_boundaries(
@@ -216,12 +217,107 @@ def _attention_quant_kwargs(description: dict, quant_op) -> dict:
     return kwargs
 
 
-class AscendMXFP4Attention:
-    """MXFP4 self-attention through the experimental CANN quant_flash_attn kernel.
+@dataclass
+class AscendFAMetadata:
+    pass
 
-    Real seqused_q/seqused_kv lengths exclude padding from the softmax."""
 
-    def __init__(self, description: dict, head_size: int, causal: bool) -> None:
+class AscendFAMetadataBuilder(AttentionMetadataBuilder):
+    def build(
+        self,
+        **kwargs: dict[str, Any],
+    ) -> AttentionMetadata:
+        return AscendFAMetadata()
+
+
+class AscendFABackend(AttentionBackend):
+    @staticmethod
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.FA
+
+    @staticmethod
+    def get_impl_cls() -> type["AscendFAImpl"]:
+        return AscendFAImpl
+
+    @staticmethod
+    def get_metadata_cls() -> type["AttentionMetadata"]:
+        raise NotImplementedError
+
+    @staticmethod
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
+        return AscendFAMetadataBuilder
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether this backend can serve as the ring-attention kernel; the
+        per-hop online-softmax merge needs the kernel's softmax LSE."""
+        return True
+
+
+class AscendFAImpl(AttentionImpl):
+    # FA v2 uses per-token-group quantization (mode 6) for Q/K and
+    # per-channel-group quantization (mode 8) for V in the packed TND path.
+    _MXFP8_LAYOUT = "TND"
+    _MXFP8_QK_QUANT_AXIS = -1
+    _MXFP8_V_QUANT_AXIS = 0
+    _MXFP8_QK_QUANT_MODE = 6
+    _MXFP8_V_QUANT_MODE = 8
+
+    # Online Q/K rotations are deterministic CPU FP32 tensors shared
+    # by all backend instances and keyed by head size. Applying the same
+    # orthogonal matrix R preserves scores:
+    # (Q @ R) @ (K @ R).T = Q @ R @ R.T @ K.T = Q @ K.T.
+    # Offline checkpoint rotations do not use this generated-matrix cache.
+    _rot_matrices: ClassVar[dict[int, torch.Tensor]] = {}
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        causal: bool,
+        softmax_scale: float,
+        num_kv_heads: int | None = None,
+        prefix: str = "",
+        **extra_impl_args,
+    ) -> None:
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        quant_config = extra_impl_args.get("quant_config")
+        self.use_mxfp4_attention = uses_mxfp4_attention(quant_config, prefix)
+        self._attention_description = (
+            getattr(quant_config, "quant_description", {}) or {}
+        )
+        self._use_mxfp8_attention = (
+            not self.use_mxfp4_attention and _can_use_mxfp8_attention(quant_config)
+        )
+        attention_prefix = prefix.removesuffix(".impl")
+        self.use_offline_qk_rotation = all(
+            any(
+                self._attention_description.get(f"{attention_prefix}.{name}") == "FLOAT"
+                for name in names
+            )
+            for names in (("to_q_rot", "q_rot"), ("to_k_rot", "k_rot"))
+        ) or (
+            not attention_prefix
+            and getattr(quant_config, "use_offline_qk_rotation", False)
+        )
+        self._is_cross_attention = bool(
+            extra_impl_args.get("is_cross_attention", False)
+        )
+        if self.use_mxfp4_attention:
+            if self._is_cross_attention:
+                raise NotImplementedError(
+                    "Quantized MXFP4 attention is supported only for self-attention"
+                )
+            self._init_mxfp4_attention(head_size, causal)
+        if self._use_mxfp8_attention:
+            self._head_size = head_size
+            self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
+            self._rot_device: torch.Tensor | None = None
+            if not self.use_offline_qk_rotation:
+                self._ensure_rot_matrix(head_size)
+
+    def _init_mxfp4_attention(self, head_size: int, causal: bool) -> None:
         if causal or head_size != 128 or get_ring_parallel_world_size() > 1:
             raise NotImplementedError(
                 "MXFP4 attention requires unmasked D=128 attention without "
@@ -233,8 +329,7 @@ class AscendMXFP4Attention:
             raise RuntimeError(
                 "MXFP4 attention requires PyTorch with float8_e8m0fnu support"
             )
-        self.description = description
-        self.pad_base = self.description.get("mxfp4_attention_pad_size", 512)
+        self.pad_base = self._attention_description.get("mxfp4_attention_pad_size", 512)
         if self.pad_base not in (256, 512):
             raise ValueError("mxfp4_attention_pad_size must be 256 or 512")
         import torch_npu
@@ -264,10 +359,10 @@ class AscendMXFP4Attention:
                 "experimental MXFP4 extension"
             )
         self._quant_kwargs = _attention_quant_kwargs(
-            self.description, torch_npu.npu_dynamic_mx_quant
+            self._attention_description, torch_npu.npu_dynamic_mx_quant
         )
 
-    def forward(
+    def _forward_mxfp4(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -280,15 +375,15 @@ class AscendMXFP4Attention:
             raise NotImplementedError("MXFP4 attention does not support softmax LSE")
         if query.ndim != 4 or query.shape != key.shape or key.shape != value.shape:
             raise ValueError("MXFP4 attention requires matching BSND Q/K/V shapes")
-        self._validate(query, key, value)
+        self._validate_mxfp4(query, key, value)
         batch, length = query.shape[0], query.shape[1]
         q, k, v = (t.transpose(1, 2).contiguous() for t in (query, key, value))
-        q, k, v = self._pad(q, k, v)
+        q, k, v = self._pad_mxfp4(q, k, v)
         seqused = torch.full((batch,), length, dtype=torch.int32, device=q.device)
-        output = self._run(q, k, v, scale, seqused)
+        output = self._run_mxfp4(q, k, v, scale, seqused)
         return output[:, :, :length].transpose(1, 2).to(query.dtype)
 
-    def forward_varlen(
+    def _forward_mxfp4_varlen(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -301,12 +396,14 @@ class AscendMXFP4Attention:
             raise ValueError(
                 "Packed MXFP4 attention requires matching [T, N, D] Q/K/V shapes"
             )
-        self._validate(query, key, value)
+        self._validate_mxfp4(query, key, value)
         output = torch.empty_like(query)
         buckets: dict[int, list[int]] = {}
         for index, (start, stop) in enumerate(pairwise(boundaries)):
             if stop > start:
-                buckets.setdefault(self._padded_length(stop - start), []).append(index)
+                buckets.setdefault(self._mxfp4_padded_length(stop - start), []).append(
+                    index
+                )
         for padded_length, indices in buckets.items():
             segments = [boundaries[index : index + 2] for index in indices]
             q, k, v = (
@@ -326,7 +423,7 @@ class AscendMXFP4Attention:
                 dtype=torch.int32,
                 device=q.device,
             )
-            bucket_output = self._run(q, k, v, scale, seqused)
+            bucket_output = self._run_mxfp4(q, k, v, scale, seqused)
             for position, index in enumerate(indices):
                 start, stop = boundaries[index], boundaries[index + 1]
                 output[start:stop] = bucket_output[
@@ -334,7 +431,7 @@ class AscendMXFP4Attention:
                 ].transpose(0, 1)
         return output
 
-    def _validate(self, query, key, value) -> None:
+    def _validate_mxfp4(self, query, key, value) -> None:
         if query.device.type != "npu" or not (
             query.device == key.device == value.device
         ):
@@ -346,16 +443,16 @@ class AscendMXFP4Attention:
         if query.shape[-1] != 128 or query.shape[-2] == 0 or query.shape[0] == 0:
             raise ValueError("MXFP4 attention requires nonempty Q/K/V with D=128")
 
-    def _padded_length(self, length: int) -> int:
+    def _mxfp4_padded_length(self, length: int) -> int:
         return -(-length // self.pad_base) * self.pad_base
 
-    def _pad(self, q, k, v):
+    def _pad_mxfp4(self, q, k, v):
         padding = (-q.shape[2]) % self.pad_base
         if padding:
             q, k, v = (F.pad(t, (0, 0, 0, padding)) for t in (q, k, v))
         return q, k, v
 
-    def _run(self, q, k, v, scale, seqused) -> torch.Tensor:
+    def _run_mxfp4(self, q, k, v, scale, seqused) -> torch.Tensor:
         """Quantize padded BNSD Q/K/V and invoke the quantized-attention kernel."""
         import torch_npu
 
@@ -426,115 +523,21 @@ class AscendMXFP4Attention:
             **common,
         )[0]
 
-
-@dataclass
-class AscendFAMetadata:
-    pass
-
-
-class AscendFAMetadataBuilder(AttentionMetadataBuilder):
-    def build(
-        self,
-        **kwargs: dict[str, Any],
-    ) -> AttentionMetadata:
-        return AscendFAMetadata()
-
-
-class AscendFABackend(AttentionBackend):
-    @staticmethod
-    def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.FA
-
-    @staticmethod
-    def get_impl_cls() -> type["AscendFAImpl"]:
-        return AscendFAImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        return AscendFAMetadataBuilder
-
-    @classmethod
-    def supports_ring_rotation(cls) -> bool:
-        """Whether this backend can serve as the ring-attention kernel; the
-        per-hop online-softmax merge needs the kernel's softmax LSE."""
-        return True
-
-
-class AscendFAImpl(AttentionImpl):
-    # FA v2 uses per-token-group quantization (mode 6) for Q/K and
-    # per-channel-group quantization (mode 8) for V in the packed TND path.
-    _MXFP8_LAYOUT = "TND"
-    _MXFP8_QK_QUANT_AXIS = -1
-    _MXFP8_V_QUANT_AXIS = 0
-    _MXFP8_QK_QUANT_MODE = 6
-    _MXFP8_V_QUANT_MODE = 8
-
-    # Online Q/K rotations are deterministic CPU FP32 tensors shared
-    # by all backend instances and keyed by head size. Applying the same
-    # orthogonal matrix R preserves scores:
-    # (Q @ R) @ (K @ R).T = Q @ R @ R.T @ K.T = Q @ K.T.
-    # Offline checkpoint rotations do not use this generated-matrix cache.
-    _rot_matrices: ClassVar[dict[int, torch.Tensor]] = {}
-
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        causal: bool,
-        softmax_scale: float,
-        num_kv_heads: int | None = None,
-        prefix: str = "",
-        **extra_impl_args,
-    ) -> None:
-        self.causal = causal
-        self.softmax_scale = softmax_scale
-        quant_config = extra_impl_args.get("quant_config")
-        self._attention_scheme = (
-            quant_config.get_attention_scheme(prefix)
-            if hasattr(quant_config, "get_attention_scheme")
-            else None
-        )
-        self._attention_description = (
-            getattr(quant_config, "quant_description", {}) or {}
-        )
-        self._mxfp4_attention = None
-        self._quant_scheme = (
-            resolve_mx_fa_scheme(quant_config)
-            if self._attention_scheme is None
-            else None
-        )
-        attention_prefix = prefix.removesuffix(".impl")
-        self.use_offline_qk_rotation = all(
-            any(
-                self._attention_description.get(f"{attention_prefix}.{name}") == "FLOAT"
-                for name in names
+    def should_apply_qk_rot(self, query, key, value) -> bool:
+        if not self.use_offline_qk_rotation:
+            return False
+        if self.use_mxfp4_attention:
+            return (
+                resolve_precision(self._attention_description, "fa", "MXFP4") == "MXFP4"
             )
-            for names in (("to_q_rot", "q_rot"), ("to_k_rot", "k_rot"))
-        ) or (
-            not attention_prefix
-            and getattr(quant_config, "use_offline_qk_rotation", False)
+        return (
+            self._use_mxfp8_attention
+            and not self.causal
+            and not self._is_cross_attention
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
         )
-        self._is_cross_attention = bool(
-            extra_impl_args.get("is_cross_attention", False)
-        )
-        if self._attention_scheme == "MXFP4":
-            if self._is_cross_attention:
-                raise NotImplementedError(
-                    "Quantized MXFP4 attention is supported only for self-attention"
-                )
-            self._mxfp4_attention = AscendMXFP4Attention(
-                self._attention_description, head_size, causal
-            )
-        if self._quant_scheme is not None:
-            self._head_size = head_size
-            self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
-            self._rot_device: torch.Tensor | None = None
-            if not self.use_offline_qk_rotation:
-                self._ensure_rot_matrix(head_size)
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -573,14 +576,14 @@ class AscendFAImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         if (
-            self._mxfp4_attention is not None
+            self.use_mxfp4_attention
             and resolve_precision(self._attention_description, "fa", "MXFP4") == "MXFP4"
         ):
-            return self._mxfp4_attention.forward(
+            return self._forward_mxfp4(
                 query, key, value, self.softmax_scale, return_softmax_lse
             )
         if (
-            self._quant_scheme == "MXFP8"
+            self._use_mxfp8_attention
             and not self.causal
             and not self._is_cross_attention
             and query.shape[1:3] == key.shape[1:3]
@@ -644,17 +647,17 @@ class AscendFAImpl(AttentionImpl):
     ) -> torch.Tensor:
         del max_seqlen
         if (
-            self._mxfp4_attention is not None
+            self.use_mxfp4_attention
             and resolve_precision(self._attention_description, "fa", "MXFP4") == "MXFP4"
         ):
             boundaries = _packed_boundaries(
                 cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
             )
-            return self._mxfp4_attention.forward_varlen(
+            return self._forward_mxfp4_varlen(
                 query, key, value, self.softmax_scale, boundaries
             )
         if (
-            self._quant_scheme == "MXFP8"
+            self._use_mxfp8_attention
             and not self.causal
             and not self._is_cross_attention
             and query.shape == key.shape

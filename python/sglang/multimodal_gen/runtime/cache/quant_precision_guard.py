@@ -16,7 +16,7 @@ def set_quant_precision_guard(transformer):
     attention_policies = []
     policies = []
     for module in modules():
-        if getattr(module, "attention_quant_scheme", None) == "MXFP4":
+        if getattr(module, "use_mxfp4_attention", False):
             attention_policies.append(module.attention_quant_description)
         scheme = getattr(module, "scheme", None)
         target = getattr(scheme, "precision_policy_target", None)
