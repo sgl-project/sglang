@@ -1,6 +1,6 @@
 """Compact A4W4 MoE experts for small target-verify batches (MXFP4 weights and activations, gfx950).
 
-TP8 / EP8 Muse Spark layout: 32 local experts, top-8 routing, hidden 4096, intermediate 4096, Quark MXFP4
+Muse Spark EP8 / EP4 layout: 32 or 64 local experts, top-8 routing, hidden 4096, intermediate 4096, Quark MXFP4
 checkpoint weights (per-32 E8M0 scales) used as stored. For M (a multiple of 8, up to MAX_ROWS) rows:
 
 1. ``_prepare_a4``: per-expert route counts -> 16-row block map, and per-row MXFP4 quantization of the input;
@@ -38,13 +38,14 @@ def _prepare_a4(
     S: tl.constexpr,
     PER_E: tl.constexpr,
     BM: tl.constexpr,
+    E: tl.constexpr,
 ):
     # Program 0: per-expert route counts -> block offsets and the block->expert map; the rank scan and
     # scatter run per expert in _scatter_a4. Programs 1..4M quantize activation rows.
     pid = tl.program_id(0)
     if pid == 0:
         r = tl.arange(0, S)
-        e = tl.arange(0, 32)
+        e = tl.arange(0, E)
         ids = tl.load(IDS + r, r < M * 8, other=-1)
         hits = (ids[None, :] == START + e[:, None]) & (r[None, :] < M * 8)
         blocks = tl.cdiv(tl.sum(hits.to(tl.int32), axis=1), BM)
@@ -182,14 +183,16 @@ def _expert_a4(
 
 
 def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
+    e = w13.shape[0]
     return (
         0 < m <= MAX_ROWS
         and m % 8 == 0
         and h == 4096
-        and w13.shape == (32, 8192, 2048)
-        and w2.shape == (32, 4096, 2048)
-        and s13.shape == (32, 8192, 128)
-        and s2.shape == (32, 4096, 128)
+        and e in (32, 64)
+        and w13.shape == (e, 8192, 2048)
+        and w2.shape == (e, 4096, 2048)
+        and s13.shape == (e, 8192, 128)
+        and s2.shape == (e, 4096, 128)
         and all(
             t.dtype == torch.uint8 and t.is_contiguous() for t in (w13, w2, s13, s2)
         )
@@ -197,7 +200,7 @@ def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
 
 
 def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
-    """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 local experts starting at ``local_start``."""
+    """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 or 64 local experts starting at ``local_start``."""
     m, h = x.shape
     if not (
         compact_a4_applies(m, h, w13, w2, s13, s2)
@@ -205,10 +208,10 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         and ids.shape == (m, 8)
     ):
         raise ValueError(
-            f"A4 requires M a multiple of 8 up to {MAX_ROWS}, native TP8 local32 checkpoint weights"
+            f"A4 requires M a multiple of 8 up to {MAX_ROWS}, native local32 / local64 checkpoint weights"
         )
-    bm = BLOCK_M
-    rows, cap = m * 8, m * 8 + 32 * (bm - 1)
+    bm, e_local = BLOCK_M, w13.shape[0]
+    rows, cap = m * 8, m * 8 + e_local * (bm - 1)
     nb = triton.cdiv(cap, bm)
     sid = torch.empty(cap, device=x.device, dtype=torch.int32)
     eid = torch.empty(nb, device=x.device, dtype=torch.int32)
@@ -218,7 +221,7 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
     inter = torch.empty((rows, 2048), device=x.device, dtype=torch.uint8)
     inter_scale = torch.empty((rows, 128), device=x.device, dtype=torch.uint8)
     y = torch.empty((rows, h), device=x.device, dtype=torch.bfloat16)
-    first = torch.empty(32, device=x.device, dtype=torch.int32)
+    first = torch.empty(e_local, device=x.device, dtype=torch.int32)
     s_pow2, per_e = (
         triton.next_power_of_2(rows),
         triton.next_power_of_2(triton.cdiv(rows, bm)),
@@ -238,9 +241,12 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         s_pow2,
         per_e,
         bm,
+        e_local,
         num_warps=4,
     )
-    _scatter_a4[(32,)](ids, sid, first, m, local_start, s_pow2, per_e, bm, num_warps=4)
+    _scatter_a4[(e_local,)](
+        ids, sid, first, m, local_start, s_pow2, per_e, bm, num_warps=4
+    )
     grid = (4096 // 64, nb)
     options = dict(num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
     _expert_a4[grid](

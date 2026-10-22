@@ -42,7 +42,7 @@ from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
 )
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -328,6 +328,9 @@ _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+# Device memory kept free for the KV pool, CUDA graphs and activations when not every layer gets an a4w4
+# expert copy (TP4: about 103 GB for all layers); arbitrary, not tuned.
+_A4W4_RESERVE_BYTES = 64 << 30
 _dense_tuned_logged: set = set()
 
 
@@ -1045,8 +1048,8 @@ class MuseSpark1xMoE(nn.Module):
             mxfp4_moe.COMPACT_A4_ENABLED
             and target_verify
             and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 8
-            and self.num_local_experts == 32
+            and self.tp_size == self.ep_size
+            and self.num_local_experts in (32, 64)
             and self.top_k == 8
             and expert_input.shape[0] % 8 == 0
             and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
@@ -1247,16 +1250,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def _can_fuse_unpool_boundary(
         self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
     ) -> bool:
-        """Unpooler + FFN boundary fusion: TP8/EP8 MoE layers at up to 16 rows."""
+        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows (replicated unpooler, any TP)."""
         if not self.is_moe_layer or boundary is None:
             return False
-        moe = self.mlp
-        proj = moe.post_expert_proj
+        proj = self.mlp.post_expert_proj
         return (
             proj is not None
             and proj.bias is None
-            and moe.tp_size == 8
-            and moe.ep_size == 8
             and 0 < x.shape[0] <= 16
             and x.dtype == torch.bfloat16
             and x.shape[1] == 8192
@@ -1431,6 +1431,39 @@ class MuseSparkModel(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.language_model(*args, **kwargs)
+
+
+def _a4w4_layer_budget(experts: list) -> int:
+    """How many MoE layers get an a4w4 copy: all when they fit above the reserve, else as many as fit
+    (the same count on every TP rank so each layer takes one path everywhere)."""
+    if not experts:
+        return 0
+    free, _ = torch.cuda.mem_get_info()
+    free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    first = experts[0]
+    per_layer = sum(
+        t.numel() * t.element_size()
+        for t in (
+            first.w13_weight,
+            first.w2_weight,
+            first.w13_weight_scale,
+            first.w2_weight_scale,
+        )
+    )
+    fit = max(0, (free - _A4W4_RESERVE_BYTES) // per_layer)
+    count = torch.tensor([min(len(experts), fit)], dtype=torch.int64)
+    torch.distributed.all_reduce(
+        count, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group
+    )
+    budget = int(count.item())
+    logger.info(
+        "Muse a4w4 prefill MoE copies: %d of %d layers (%.1f GB each, %.1f GB free)",
+        budget,
+        len(experts),
+        per_layer / 1e9,
+        free / 1e9,
+    )
+    return budget
 
 
 class MuseSparkTextForCausalLM(nn.Module):
@@ -1846,9 +1879,13 @@ class MuseSparkTextForCausalLM(nn.Module):
             for moe in moe_layers:
                 router_pooler.prepare_joint_router_pooler(moe)
         if mxfp4_moe.A4W4_ENABLED:
-            for module in self.model.modules():
-                if isinstance(module, MuseSpark1xMxfp4Experts):
-                    mxfp4_moe.prepare_a4w4_weights(module)
+            experts = [
+                module
+                for module in self.model.modules()
+                if isinstance(module, MuseSpark1xMxfp4Experts)
+            ]
+            for module in experts[: _a4w4_layer_budget(experts)]:
+                mxfp4_moe.prepare_a4w4_weights(module)
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):

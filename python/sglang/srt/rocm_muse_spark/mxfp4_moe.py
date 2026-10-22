@@ -5,7 +5,7 @@ produce unweighted per-(token, slot) expert rows; Muse's FlyDSL finalize then ap
 with input scale before the route-weighted sum, which a combining MoE epilogue cannot express.
 
 * Compact A4 (``SGLANG_MUSE_COMPACT_A4_VERIFY``): target-verify batches (a multiple of 8 rows, up to 512) at
-  TP8 / EP8 run the Triton ``mxfp4_compact_a4_moe`` experts on the checkpoint weights as stored.
+  TP8 / EP8 or TP4 / EP4 run the Triton ``mxfp4_compact_a4_moe`` experts on the checkpoint weights as stored.
 * a4w4 (``SGLANG_MUSE_A4W4_MOE``): prefill batches of at least ``A4W4_MIN_ROWS`` rows run aiter's FlyDSL
   stage-1 / stage-2 MXFP4 kernels on weights shuffled once at load into aiter's preshuffle layout (an extra copy
   beside the native one); stage 1 writes MXFP4 + sorted scales itself.
