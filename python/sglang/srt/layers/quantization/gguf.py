@@ -88,7 +88,9 @@ class GGUFConfig(QuantizationConfig):
         if _is_hip:
             warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
         elif not (_is_cuda or _is_musa or _is_npu):
-            warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+            warnings.warn(
+                f"Only CUDA, MUSA and NPU support GGUF quantization currently."
+            )
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
