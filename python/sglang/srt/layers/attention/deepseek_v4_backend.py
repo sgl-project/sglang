@@ -83,7 +83,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
-    has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1017,8 +1016,8 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
-# The candidate window (2,048 blocks of 8 tokens): inside it the captured full
-# top-k equals the two-level selection.
+# The replayed context limit when the prefill graph's metadata is built at a fixed
+# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
 _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
@@ -1085,30 +1084,15 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
 
-    def refresh_for_breakable_cuda_graph_replay_(
-        self,
-        static_metadata: DSV4Metadata,
-        *,
-        two_level: bool,
-    ):
+    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
-        if not two_level:
-            # The captured full top-k fallback reads the ratio-1/2 lengths and
-            # page tables by address: refresh them in place.
-            maybe_copy_inplace(
-                self.c1_indexer_metadata, src=static_metadata.c1_indexer_metadata
-            )
-            maybe_copy_inplace(
-                self.c2_indexer_metadata, src=static_metadata.c2_indexer_metadata
-            )
-        else:
-            # Two-level candidates: only the eager full top-k breaks read these, so
-            # they take the live objects; captured consumers read the bridge tensors.
-            self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
-            self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
+        # Only the eager full top-k breaks read these, so they take the live objects;
+        # the captured consumers read the bridge tensors.
+        self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
+        self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
         maybe_copy_inplace(
             self.low_ratio_req_indices, src=static_metadata.low_ratio_req_indices
         )
@@ -1654,12 +1638,12 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
-        return (
-            bool(self.low_ratios)
-            and has_dense_fp4_indexer()
-            and is_sm100_or_newer()
-            and get_parallel().attn_cp_size == 1
+        """Whether ratio-1/2 sources run in the prefill graph with two-level candidates:
+        the full top-k layers score at eager breaks, and the consumers score the
+        published candidate blocks in the graph. Otherwise the sources are one eager
+        break."""
+        return bool(self.low_ratios) and isinstance(
+            self.prefill_candidates, SparseTableBackend
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -3128,10 +3112,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
-        capture_metadata.refresh_for_breakable_cuda_graph_replay_(
-            static_metadata,
-            two_level=self._prefill_graph_two_level(),
-        )
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
@@ -3156,10 +3137,7 @@ class DeepseekV4AttnBackend(
         if held is None:
             self._bcg_tail_metadata[rows] = fresh
             return fresh
-        held.refresh_for_breakable_cuda_graph_replay_(
-            fresh,
-            two_level=self._prefill_graph_two_level(),
-        )
+        held.refresh_for_breakable_cuda_graph_replay_(fresh)
         held.core_attn_metadata.swa_out_cache_loc = (
             fresh.core_attn_metadata.swa_out_cache_loc
         )
@@ -3302,11 +3280,10 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            two_level = self._prefill_graph_two_level()
             captured_index = (
                 run_indexer
                 and layer.indexer is not None
-                and (layer.indexer.uses_candidates or not two_level)
+                and layer.indexer.uses_candidates
             )
             _bcg_low_ratio_source_projections(
                 layer, x, q_lora, pos, bufs, run_compressor, captured_index
@@ -3776,20 +3753,10 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        # At any width: inside the candidate window the published table is the
-        # identity, and past it the full top-k would be wrong.
-        if indexer.uses_candidates and self._prefill_graph_two_level():
-            self.prefill_candidates.consume_prefill_captured(
-                inputs, self.forward_metadata.candidate_metadata
-            )
-            return
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Inside the window every block is a candidate: the full top-k applies.
-            width = metadata.max_compressed_seq_len
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
-        self.full_topk_indexer.topk_prefill_captured(inputs)
+        # At any width: the consumer scores only the blocks the source published.
+        self.prefill_candidates.consume_prefill_captured(
+            inputs, self.forward_metadata.candidate_metadata
+        )
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
@@ -3888,25 +3855,15 @@ class DeepseekV4AttnBackend(
             return
         self.forward_metadata.candidate_metadata = published
 
-    def _prefill_graph_two_level(self) -> bool:
-        """Whether the full top-k layers score at eager breaks and the consumers score
-        the published candidate blocks inside the prefill graph."""
-        return isinstance(self.prefill_candidates, SparseTableBackend)
-
     def _prefill_graph_replays_any_context(self) -> bool:
         """Whether a prefill graph replay admits any context length: with two-level
         candidates only c4/c128 compress metadata would be captured at a width."""
-        return (
-            self.low_ratio_prefill_graph
-            and self._prefill_graph_two_level()
-            and not self.has_c4
-            and not self.has_c128
-        )
+        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
 
     @property
     def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's captured indexer width; prefill context parallelism builds
-        its own metadata and needs none."""
+        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
+        context parallelism builds its own metadata and needs none."""
         if (
             self.low_ratios != (1, 2)
             or get_parallel().attn_cp_size > 1
