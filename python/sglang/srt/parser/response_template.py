@@ -57,6 +57,7 @@ _THINKING_FIELD = "thinking"
 _CONTENT_FIELD = "content"
 _TOOL_FIELD = "tool_calls"
 _PASSTHROUGH_FIELD = "normal"
+_RAW_MEMBERS_KEY = "members"
 _SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
     {_THINKING_FIELD, _CONTENT_FIELD, _TOOL_FIELD}
 )
@@ -234,11 +235,11 @@ def _tool_extraction_template(
 ) -> ResponseTemplate:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
     tool_field["optional"] = True
-    # The tool detector transforms each member itself, so one malformed member
-    # does not discard the whole region. The pass-through transform keeps the
-    # parsed list and keeps named groups in the delimiters valid.
+    # The detector transforms each member itself, so a malformed member drops alone;
+    # the envelope keeps delimiter captures valid and hides raw members from schema
+    # coercion, which must only see the call each member's transform produces.
     if tool_field.pop("transform_each", False):
-        tool_field["transform"] = "{content}"
+        tool_field["transform"] = {_RAW_MEMBERS_KEY: "{content}"}
     fields = {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field}
     if ends_at_answer:
         # The answer opens only outside the reasoning, which stays text.
@@ -526,6 +527,7 @@ class ResponseTemplateStreamAdapter:
         the tool schemas as the parser does for transformed regions."""
         if self._each_transform is None:
             return value
+        value = value[_RAW_MEMBERS_KEY]
         if not isinstance(value, list):
             logger.warning("response_template: malformed tool call value: %r", value)
             return []
