@@ -1003,11 +1003,6 @@ class DenoisingStage(PipelineStage):
         (e.g. Wan2.2) get per-transformer configs.
         """
         requested = self._cache_dit_requested_for_batch(batch)
-        comfyui_run = (
-            comfyui_cache_dit_run(batch) if self.server_args.comfyui_mode else None
-        )
-        if comfyui_run is not None:
-            num_inference_steps = comfyui_run[0]
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
@@ -1017,6 +1012,11 @@ class DenoisingStage(PipelineStage):
                     "CUDA graphs are enabled."
                 )
             return
+        comfyui_run = (
+            comfyui_cache_dit_run(batch) if self.server_args.comfyui_mode else None
+        )
+        if comfyui_run is not None:
+            num_inference_steps = comfyui_run[0]
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )

@@ -381,13 +381,16 @@ def test_loader_cache_dit_flag_change_reuses_worker() -> None:
         "sgld_options": {},
         "set_model_type": None,
         "runtime_model_path": None,
+        "int8_kernel": "auto",
+        "worker_patch_identity": (),
     }
+    runtime.model_type = "minimax_h3"
     runtime.generator = object()
     runtime._patcher = patcher
     runtime.executor = SimpleNamespace(enable_cache_dit=None)
     runtime._is_live = lambda: True
-    for flag in (True, False):
-        got = runtime.load_model("h3.safetensors", {}, {"enable_cache_dit": flag})
+    for mode, flag in (("cache_dit", True), ("off", False)):
+        got = runtime.load_model("h3.safetensors", {}, {"cache_mode": mode})
         assert got is patcher
         assert runtime.executor.enable_cache_dit is flag
 

@@ -35,7 +35,9 @@ def test_cache_mode_reaches_the_h3_request() -> None:
 
     executor = object.__new__(MiniMaxH3Executor)
     torch.nn.Module.__init__(executor)
-    packed = SimpleNamespace(guidance_scale=1.0, height=512, width=512)
+    packed = SimpleNamespace(
+        guidance_scale=1.0, height=512, width=512, cache_options={}
+    )
     for values, cache_dit, spectrum in (
         ({"cache_mode": "cache_dit", "cache_dit_tuning": "manual"}, True, False),
         ({"cache_mode": "spectrum"}, False, True),
