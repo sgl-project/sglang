@@ -7,6 +7,7 @@ drained.
 
 import unittest
 from array import array
+from unittest.mock import MagicMock
 
 import torch
 
@@ -20,6 +21,10 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Req,
     ScheduleBatch,
 )
+from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
+    _reset_windows_and_collect_hits,
+    folded_replay_rows,
+)
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -28,14 +33,13 @@ class _FakeReq:
     """Carries the fill-id state convert_decode_to_extend touches, with the
     real Req methods so the array bookkeeping is not re-implemented here."""
 
-    _refresh_fill_ids = Req._refresh_fill_ids
-    set_extend_range = Req.set_extend_range
+    refresh_fill_ids = Req.refresh_fill_ids
 
     def __init__(self, *, num_prompt_tokens: int, num_output_tokens: int):
         self.origin_input_ids = array("l", range(num_prompt_tokens))
         self.output_ids = list(range(num_output_tokens))
         self.full_untruncated_fill_ids = array("l", self.origin_input_ids)
-        self.extend_range = None
+        self.extend_end = None
         self.beam_group = None
 
 
@@ -68,7 +72,7 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(batch.extend_lens, [1] * len(seq_lens))
         self.assertEqual(batch.extend_num_tokens, len(seq_lens))
         for req, seq_len in zip(batch.reqs, seq_lens, strict=True):
-            self.assertEqual(tuple(req.extend_range), (seq_len - 1, seq_len))
+            self.assertEqual(req.extend_end, seq_len)
         # What the attention path actually consumes: arange(prefix, prefix+len)
         # must land on the slot prepare_for_decode allocated, at seq_len - 1.
         for prefix_len, extend_len, seq_len in zip(
@@ -102,6 +106,26 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(len(batch.seq_lens_cpu), len(seq_lens) + 3)
         self.assertEqual(len(batch.prefix_lens), len(batch.reqs))
         self._assert_geometry(batch, seq_lens)
+
+    def test_stale_encoder_swa_resets_fold_no_rows(self):
+        """The running batch keeps its prefill-time encoder SWA reset list; a
+        converted decode must not fold replay rows the DP vote did not count,
+        reset live windows, or trip the odd-prefix check."""
+        reqs = [_FakeReq(num_prompt_tokens=6, num_output_tokens=1) for _ in range(2)]
+        batch = ScheduleBatch(reqs=reqs)
+        batch.forward_mode = ForwardMode.DECODE
+        batch.enable_overlap = True
+        batch.seq_lens_cpu = torch.tensor([8, 97], dtype=torch.int64)
+        batch.req_pool_indices = torch.tensor([3, 4])
+        # Left by the prefill that placed the first request.
+        batch.encoder_swa_reset = [True]
+        batch.convert_decode_to_extend()
+
+        self.assertEqual(folded_replay_rows(batch), 0)
+        window = MagicMock()
+        rows = _reset_windows_and_collect_hits(batch=batch, window=window)
+        self.assertEqual(rows, [])
+        window.reset.assert_not_called()
 
     def test_short_seq_lens_fails_loudly(self):
         """A row/req divergence the slice cannot explain must raise, not

@@ -8,6 +8,9 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -19,8 +22,29 @@ def maybe_enable_inductor_compute_comm_overlap() -> None:
         pass
 
 
+def apply_inductor_config(overrides: dict[str, Any]) -> None:
+    """Apply a model's torch._inductor.config overrides before it is compiled."""
+    import torch._inductor.config as _inductor_cfg
+
+    for name, value in overrides.items():
+        if not hasattr(_inductor_cfg, name):
+            logger.warning("Unknown torch._inductor.config option %r, ignoring", name)
+            continue
+        setattr(_inductor_cfg, name, value)
+    if overrides.get("multi_kernel_hints"):
+        # torch reads its saved multi-kernel pick through sub-kernels an
+        # FX-graph cache hit has not restored yet (triton _hash_lock is None),
+        # so every warm restart fails the compile -- under TP on one rank only,
+        # which deadlocks the others. Without the saved pick, each process
+        # re-picks during warmup.
+        os.environ.setdefault("TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE", "1")
+
+
 def build_torch_compile_kwargs(
-    *, mode: str | None, module: nn.Module | None = None
+    *,
+    mode: str | None,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
 ) -> dict[str, object]:
     compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
     if current_platform.is_out_of_tree():
@@ -43,6 +67,11 @@ def build_torch_compile_kwargs(
         compile_kwargs["dynamic"] = False
     elif mode is not None:
         compile_kwargs["mode"] = mode
+    if (
+        enable_inductor_compute_comm_overlap
+        and compile_kwargs.get("backend", "inductor") == "inductor"
+    ):
+        maybe_enable_inductor_compute_comm_overlap()
     return compile_kwargs
 
 
@@ -59,6 +88,24 @@ def resolve_torch_compile_mode(
     if mode:
         return mode
     return default
+
+
+def resolve_torch_compile_kwargs(
+    *env_names: str,
+    config: object | None = None,
+    default: str,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
+) -> tuple[dict[str, object], str | None]:
+    mode = None
+    if not current_platform.is_npu():
+        mode = resolve_torch_compile_mode(*env_names, config=config, default=default)
+    compile_kwargs = build_torch_compile_kwargs(
+        mode=mode,
+        module=module,
+        enable_inductor_compute_comm_overlap=enable_inductor_compute_comm_overlap,
+    )
+    return compile_kwargs, mode
 
 
 def compile_matching_submodules(

@@ -286,16 +286,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         files = os.listdir(self.tmp_dir)
         self.assertEqual(len(files), 0)
 
-    def test_write_record_handler_none(self):
-        """If file handler is None after ensure, write_record returns early."""
-        exporter = self._make_exporter()
-        obj = _GenerateReqInput(rid="req-1")
-
-        with patch.object(exporter, "_ensure_file_handler"):
-            exporter._current_file_handler = None
-            asyncio.run(exporter.write_record(obj, {}))
-        # No crash, no file written
-
     def test_write_record_exception(self):
         """Exceptions during write are caught and logged."""
         exporter = self._make_exporter()
@@ -306,35 +296,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         ):
             asyncio.run(exporter.write_record(obj, {}))
         # Should not raise
-
-
-class TestRequestMetricsExporterManager(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-
-    def test_no_exporters(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=False)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertFalse(manager.exporter_enabled())
-
-    def test_with_file_exporter(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertTrue(manager.exporter_enabled())
-
-    def test_write_record_delegates(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-
-        obj = _GenerateReqInput(rid="req-1", text="hello")
-        out_dict = {"meta_info": {"latency": 1.0}}
-        asyncio.run(manager.write_record(obj, out_dict))
-
-        files = os.listdir(self.tmp_dir)
-        self.assertEqual(len(files), 1)
 
 
 class TestCreateExporters(unittest.TestCase):

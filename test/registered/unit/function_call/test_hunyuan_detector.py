@@ -86,6 +86,11 @@ class _Hy4Tokenizer:
         }
 
 
+class _Hy3Tokenizer(_Hy4Tokenizer):
+    def get_vocab(self):
+        return {**super().get_vocab(), "<tool_sep:opensource>": 6}
+
+
 class TestHunyuanDetectorHasToolCall(CustomTestCase):
     def setUp(self):
         self.detector = HunyuanDetector()
@@ -518,23 +523,6 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(collected[0]["name"], "get_current_date")
         self.assertEqual(json.loads(collected[0]["parameters"]), {})
 
-    def test_streaming_with_args_char_by_char(self):
-        detector = self._new_detector()
-        full = (
-            "<tool_calls><tool_call>get_weather<tool_sep>"
-            "<arg_key>city</arg_key><arg_value>NYC</arg_value>"
-            "</tool_call></tool_calls>"
-        )
-        all_calls = []
-        for ch in full:
-            result = detector.parse_streaming_increment(ch, self.tools)
-            all_calls.extend(result.calls)
-
-        collected = _collect_streamed_tool_calls(all_calls)
-        self.assertEqual(len(collected), 1)
-        args = json.loads(collected[0]["parameters"])
-        self.assertEqual(args["city"], "NYC")
-
     def test_streaming_three_tools_sequential(self):
         """Three different tool calls arriving sequentially."""
         detector = self._new_detector()
@@ -684,6 +672,7 @@ class TestHunyuanDetectorStructureInfo(CustomTestCase):
 
 class TestHunyuanDetectorTypeArrays(CustomTestCase):
     def test_type_arrays_preserve_arguments_in_both_modes(self):
+        """Array-valued schema types must not drop calls or interrupt argument streams."""
         cases = (
             (["integer", "null"], "7", 7),
             (["null", "integer"], "null", None),
@@ -696,62 +685,76 @@ class TestHunyuanDetectorTypeArrays(CustomTestCase):
             (["integer", "string"], "plain text", "plain text"),
             (["string", "array"], "[1,2]", [1, 2]),
         )
-        for types, raw_value, expected in cases:
-            for schema in (
-                {"type": types},
-                {"anyOf": [{"type": types}]},
-                {"oneOf": [{"type": types}]},
-            ):
-                for chunk_size in (1, 7, 10000):
-                    with self.subTest(
-                        schema=schema, value=raw_value, chunk_size=chunk_size
-                    ):
-                        tools = [
-                            Tool(
-                                type="function",
-                                function=Function(
-                                    name="echo",
-                                    parameters={
-                                        "type": "object",
-                                        "properties": {"value": schema},
-                                    },
-                                ),
-                            )
-                        ]
-                        call = (
-                            "<tool_call>echo<tool_sep>"
-                            f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value>"
-                            "</tool_call>"
-                        )
-                        # Repeated calls must reset streaming argument state.
-                        text = "<tool_calls>" + call + call + "</tool_calls>"
-                        with self.subTest(mode="nonstream"):
-                            result = HunyuanDetector().detect_and_parse(text, tools)
-                            self.assertEqual(len(result.calls), 2)
-                            for parsed in result.calls:
-                                self.assertEqual(parsed.name, "echo")
-                                value = json.loads(parsed.parameters)["value"]
-                                self.assertEqual(value, expected)
-                                self.assertIs(type(value), type(expected))
-
-                        with self.subTest(mode="stream"):
-                            detector = HunyuanDetector()
-                            deltas = []
-                            for start in range(0, len(text), chunk_size):
-                                deltas.extend(
-                                    detector.parse_streaming_increment(
-                                        text[start : start + chunk_size], tools
-                                    ).calls
+        for tokenizer, suffix, separator in (
+            (None, "", "<tool_sep>"),
+            (_Hy3Tokenizer(), ":opensource", "<tool_sep:opensource>"),
+            (_Hy4Tokenizer(), ":opensource", ""),
+        ):
+            for types, raw_value, expected in cases:
+                for schema in (
+                    {"type": types},
+                    {"anyOf": [{"type": types}]},
+                    {"oneOf": [{"type": types}]},
+                ):
+                    for chunk_size in (1, 7, 10000):
+                        with self.subTest(
+                            schema=schema,
+                            value=raw_value,
+                            chunk_size=chunk_size,
+                            tokenizer=type(tokenizer).__name__,
+                        ):
+                            tools = [
+                                Tool(
+                                    type="function",
+                                    function=Function(
+                                        name="echo",
+                                        parameters={
+                                            "type": "object",
+                                            "properties": {"value": schema},
+                                        },
+                                    ),
                                 )
-                            collected = _collect_streamed_tool_calls(deltas)
-                            self.assertEqual(len(collected), 2)
-                            for parsed in collected:
-                                self.assertEqual(parsed["name"], "echo")
-                                value = json.loads(parsed["parameters"])["value"]
-                                self.assertEqual(value, expected)
-                                self.assertIs(type(value), type(expected))
+                            ]
+                            call = (
+                                f"<tool_call{suffix}>echo{separator}"
+                                f"<arg_key{suffix}>value</arg_key{suffix}>"
+                                f"<arg_value{suffix}>{raw_value}</arg_value{suffix}>"
+                                f"</tool_call{suffix}>"
+                            )
+                            # Repeated calls must reset streaming argument state.
+                            text = (
+                                f"<tool_calls{suffix}>{call}{call}</tool_calls{suffix}>"
+                            )
+                            with self.subTest(mode="nonstream"):
+                                result = HunyuanDetector(tokenizer).detect_and_parse(
+                                    text, tools
+                                )
+                                self.assertEqual(len(result.calls), 2)
+                                for parsed in result.calls:
+                                    self.assertEqual(parsed.name, "echo")
+                                    value = json.loads(parsed.parameters)["value"]
+                                    self.assertEqual(value, expected)
+                                    self.assertIs(type(value), type(expected))
+
+                            with self.subTest(mode="stream"):
+                                detector = HunyuanDetector(tokenizer)
+                                deltas = []
+                                for start in range(0, len(text), chunk_size):
+                                    deltas.extend(
+                                        detector.parse_streaming_increment(
+                                            text[start : start + chunk_size], tools
+                                        ).calls
+                                    )
+                                collected = _collect_streamed_tool_calls(deltas)
+                                self.assertEqual(len(collected), 2)
+                                for parsed in collected:
+                                    self.assertEqual(parsed["name"], "echo")
+                                    value = json.loads(parsed["parameters"])["value"]
+                                    self.assertEqual(value, expected)
+                                    self.assertIs(type(value), type(expected))
 
     def test_type_array_normalization_matches_scalar_options(self):
+        """Type arrays must preserve aliases and unions without treating lists as keys."""
         schemas = (
             {"type": ["int32", "null"]},
             {"anyOf": [{"type": ["int32", "null"]}, {"type": "boolean"}]},

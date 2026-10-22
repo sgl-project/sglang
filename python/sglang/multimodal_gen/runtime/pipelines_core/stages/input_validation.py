@@ -15,6 +15,7 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.configs.task_type import get_request_task_type
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )
@@ -77,6 +78,9 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
+    def load_condition_image(self, image):
+        return load_image(image)
+
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
     ) -> Iterator[Req]:
@@ -87,13 +91,15 @@ class InputValidationStage(PipelineStage):
         if num_outputs == 1:
             return iter((batch,))
 
-        return iter(
-            expand_request_outputs(
-                batch,
-                reuse_parent_trace_ctx=True,
-                preserve_parent_metrics=True,
-            )
+        outputs = expand_request_outputs(
+            batch,
+            reuse_parent_trace_ctx=True,
+            preserve_parent_metrics=True,
         )
+        # expansion resets generators after this stage has already validated them
+        for output in outputs:
+            self._generate_seeds(output, server_args)
+        return iter(outputs)
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -187,8 +193,10 @@ class InputValidationStage(PipelineStage):
         NOTE: condition image resizing is only allowed in InputValidationStage
         """
         if batch.condition_image is not None and (
-            server_args.pipeline_config.task_type == ModelTaskType.I2I
-            or server_args.pipeline_config.task_type == ModelTaskType.TI2I
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2I
+            or get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2I
         ):
             # calculate new condition image size
             if not isinstance(batch.condition_image, list):
@@ -230,7 +238,10 @@ class InputValidationStage(PipelineStage):
                 batch.width = width
                 batch.height = height
 
-        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+        elif (
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2V
+        ):
             if server_args.pipeline_config.skip_input_image_preprocess:
                 return
             # duplicate with vae_image_processor
@@ -355,7 +366,8 @@ class InputValidationStage(PipelineStage):
         self._generate_seeds(batch, server_args)
 
         if (
-            server_args.pipeline_config.task_type == ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2M
             and batch.num_inference_steps is None
             and hasattr(server_args.pipeline_config, "shape_num_inference_steps")
         ):
@@ -365,7 +377,8 @@ class InputValidationStage(PipelineStage):
 
         # Ensure prompt is properly formatted (I2M can be image-only)
         if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
             and batch.prompt is None
             and batch.prompt_embeds is None
         ):
@@ -394,34 +407,30 @@ class InputValidationStage(PipelineStage):
                 f"Guidance scale must be positive, but got {batch.guidance_scale}"
             )
 
-        # Reject requests that do not enable CFG on a server launched with
-        # --enable-cfg-parallel. CFG-parallel splits cond/uncond across ranks,
-        # so rank 1 has no work and returns None for noise_pred, which crashes
-        # scheduler.step() ~30 minutes later under a gloo broadcast timeout.
-        # Earlier, field-specific checks above (negative_prompt missing,
-        # guidance_scale < 0) fire first and produce better messages for those
-        # cases; this is the catch-all for any combination that still leaves
-        # do_classifier_free_guidance=False under cfg-parallel.
+        # A request that leaves CFG off is servable under CFG parallelism: the
+        # dispatcher gives branch 0 to rank 0, and every other rank runs branch 0
+        # too so the all-gather has shapes to work with. Both ranks then read the
+        # owner's prediction, so the answer is the single-branch answer and the
+        # extra ranks are only redundant.
+        #
+        # This used to raise. That guard was added for a warmup hang (#23198)
+        # two weeks BEFORE the multi-branch refactor (#23736) taught the
+        # dispatcher to handle a single branch, and the warmup path has since
+        # grown its own fix -- the warmup builder forces CFG on whenever
+        # cfg-parallel is enabled. What was left was a server refusing traffic
+        # it could serve, and the runtime AUTO-enables cfg-parallel from the
+        # model's default sampling params, so `sglang serve --num-gpus 2` on a
+        # CFG-defaulting model rejected every guidance_scale=1.0 request while
+        # blaming a flag the user never passed.
         if server_args.enable_cfg_parallel and not batch.do_classifier_free_guidance:
-            neg_prompt_state = (
-                "not set"
-                if batch.negative_prompt is None
-                else "empty"
-                if batch.negative_prompt == ""
-                else "set"
-            )
-            raise ValueError(
-                f"Server was launched with --enable-cfg-parallel but this "
-                f"request does not use classifier-free guidance "
-                f"(do_classifier_free_guidance={batch.do_classifier_free_guidance}, "
-                f"guidance_scale={batch.guidance_scale}, "
-                f"true_cfg_scale={batch.true_cfg_scale}, "
-                f"negative_prompt={neg_prompt_state}). "
-                f"CFG-parallel splits cond/uncond across ranks and requires "
-                f"both to be active. Either disable --enable-cfg-parallel or "
-                f"ensure the request enables CFG (set guidance_scale > 1.0 or "
-                f"true_cfg_scale > 1.0, with a non-empty negative_prompt or "
-                f"negative_prompt_embeds)."
+            logger.warning_once(
+                "CFG parallelism is enabled but this request does not use "
+                "classifier-free guidance (guidance_scale=%s, true_cfg_scale=%s), "
+                "so it has one branch and the other CFG rank(s) recompute it "
+                "redundantly. Pass --cfg-parallel-size 1 to spend those GPUs on "
+                "another parallelism instead.",
+                batch.guidance_scale,
+                batch.true_cfg_scale,
             )
 
         # for i2v, get image from image_path
@@ -433,7 +442,7 @@ class InputValidationStage(PipelineStage):
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = self.load_condition_image(path)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -447,7 +456,7 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,
@@ -455,7 +464,10 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.original_condition_image_size = image.size
 
-            if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            if (
+                get_request_task_type(batch, server_args.pipeline_config)
+                != ModelTaskType.I2M
+            ):
                 self.preprocess_condition_image(
                     batch, server_args, condition_image_width, condition_image_height
                 )
@@ -491,7 +503,10 @@ class InputValidationStage(PipelineStage):
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "prompt_or_embeds",
                 None,
@@ -501,7 +516,10 @@ class InputValidationStage(PipelineStage):
                 ),
             )
 
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "num_inference_steps", batch.num_inference_steps, V.positive_int
             )

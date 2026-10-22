@@ -1,9 +1,10 @@
 import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Iterator, Optional, Union
+from typing import Iterator, List, Optional, Union
 
 import torch
+import torch.nn as nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -185,6 +186,91 @@ def align_tensor_to_module_dtype(
     if not tensor.is_floating_point():
         return tensor.to(device=device)
     return tensor.to(device=device, dtype=dtype)
+
+
+def _restore_module_value_state(cache):
+    with torch.no_grad():
+        for param, value in cache["parameters"].values():
+            param.data = value
+        for buffer, value in cache["buffers"].values():
+            buffer.data = value
+
+
+def _module_fp32_cache(module):
+    cache = {"parameters": {}, "buffers": {}}
+
+    try:
+        with torch.no_grad():
+            for name, param in module.named_parameters(recurse=True):
+                if param.is_floating_point() and param.dtype != torch.float32:
+                    value = param.data
+                    cache["parameters"][name] = (param, value)
+                    param.data = value.to(dtype=torch.float32)
+            for name, buffer in module.named_buffers(recurse=True):
+                if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                    value = buffer.data
+                    cache["buffers"][name] = (buffer, value)
+                    buffer.data = value.to(dtype=torch.float32)
+    except BaseException:
+        _restore_module_value_state(cache)
+        cache.clear()
+        raise
+
+    return cache
+
+
+@contextmanager
+def temporary_module_fp32_dtype(
+    module,
+    *,
+    enabled: bool = True,
+) -> Iterator:
+    """Temporarily cast a module's floating parameters and buffers to fp32 for the scope.
+
+    The module is restored to its exact original state on exit, including original dtypes and
+    values. This is intended for inference-only, short-lived CPU workarounds where fp32 math is
+    required but the module should not be left in a permanently altered state.
+    """
+    if not enabled:
+        yield module
+        return
+
+    cache = _module_fp32_cache(module)
+    try:
+        yield module
+    finally:
+        _restore_module_value_state(cache)
+        cache.clear()
+
+
+@contextmanager
+def temporary_modules_fp32_dtype(
+    modules: List[nn.Module],
+    *,
+    enabled: Union[bool, List[bool]] = True,
+) -> Iterator[List[nn.Module]]:
+    """Temporarily cast a set of modules to fp32 while preserving their original state.
+
+    This mirrors the single-module helper for multi-module workloads: each module is only
+    converted if it contains non-fp32 floating values, and every restored module is returned to
+    the exact original dtype/value state after the context exits.
+    """
+    enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
+    if len(enabled_list) != len(modules):
+        raise ValueError("enabled must have one entry per module")
+    caches = [None] * len(modules)
+
+    try:
+        for index, (module, is_enabled) in enumerate(zip(modules, enabled_list)):
+            if is_enabled:
+                caches[index] = _module_fp32_cache(module)
+        yield modules
+    finally:
+        for cache, is_enabled in zip(caches, enabled_list):
+            if not is_enabled or cache is None:
+                continue
+            _restore_module_value_state(cache)
+            cache.clear()
 
 
 @contextmanager
