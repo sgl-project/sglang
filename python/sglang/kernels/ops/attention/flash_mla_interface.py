@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Union
 import flash_mla
 import torch
 from flash_mla import fused_norm_rope_attn_rope_cast as _mega
+from flash_mla._loader import get_ops
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
@@ -103,8 +104,7 @@ def flash_mla_with_kvcache(
             tile_scheduler_metadata=tile_scheduler_metadata,
             softmax_scale=softmax_scale,
             causal=causal,
-            # The scheduler-object dense path is bf16 only.
-            is_fp8_kvcache=is_fp8_kvcache if indices is not None else False,
+            is_fp8_kvcache=is_fp8_kvcache,
             indices=indices,
             attn_sink=attn_sink,
             extra_k_cache=extra_k_cache,
@@ -169,7 +169,7 @@ def _flash_mla_with_kvcache_tensor_meta(
     assert (descale_q is None) == (descale_k is None), (
         "descale_q and descale_k should be both None or both not None"
     )
-    ops = torch.ops.flash_mla_legacy
+    ops = get_ops(use_legacy=True)
     if indices is not None:
         assert not causal, "causal must be False if sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
