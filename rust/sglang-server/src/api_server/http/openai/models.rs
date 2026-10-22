@@ -9,6 +9,8 @@ use axum::{
 };
 use std::sync::Arc;
 
+use sglang_api_types::api::v1 as api;
+
 use super::{AppState, openai_error, unix_seconds_u32};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -17,33 +19,42 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/v1/models/{model}", get(retrieve_model))
 }
 
-/// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
+/// `GET /v1/models` — OpenAI-compatible model list. Served from core metadata;
 /// no scheduler round-trip.
 async fn available_models(State(state): State<Arc<AppState>>) -> Response {
-    let base = model_card(&state);
-    Json(serde_json::json!({ "object": "list", "data": [base] })).into_response()
+    let models: Vec<_> = state
+        .core
+        .list_models()
+        .into_iter()
+        .map(model_card)
+        .collect();
+    Json(serde_json::json!({ "object": "list", "data": models })).into_response()
 }
 
 async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
-    if model != state.server_args.served_model_name {
+    let Some(card) = state
+        .core
+        .list_models()
+        .into_iter()
+        .find(|card| card.id == model)
+    else {
         return openai_error(
             StatusCode::NOT_FOUND,
             format!("The model `{model}` does not exist"),
             false,
         );
-    }
-    Json(model_card(&state)).into_response()
+    };
+    Json(model_card(card)).into_response()
 }
 
-fn model_card(state: &AppState) -> serde_json::Value {
-    let name = &state.server_args.served_model_name;
+fn model_card(card: api::ModelCard) -> serde_json::Value {
     serde_json::json!({
-        "id": name,
+        "id": card.id,
         "object": "model",
         "created": unix_seconds_u32(),
         "owned_by": "sglang",
-        "root": name,
-        "parent": serde_json::Value::Null,
-        "max_model_len": state.server_args.model_config.context_len,
+        "root": card.root,
+        "parent": card.parent,
+        "max_model_len": card.max_model_len,
     })
 }

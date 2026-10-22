@@ -7,11 +7,20 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
     _peer_cuda_device,
     _Unsupported,
     ipc_a2a_ready,
+    ipc_shareable_zeros,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _IPC = "sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a"
 
+# ipc_a2a_ready() only sets up the transport on CUDA. Elsewhere the platform may
+# lack is_full_nvlink and torch may lack the accelerator allocator-settings API.
+requires_cuda = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the IPC all-to-all transport is CUDA-only"
+)
 
+
+@requires_cuda
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("nvlink", [False, True])
 def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlink):
@@ -137,3 +146,24 @@ def test_drop_a2a_staging_buffers_clears_the_ulysses_cache():
         usp.drop_a2a_staging_buffers()
         usp.drop_a2a_staging_buffers()  # idempotent on an empty cache
     assert usp._A2A_STAGING_BUFFERS == {}
+
+
+@requires_cuda
+@pytest.mark.parametrize("expandable", [False, True])
+def test_ipc_buffers_are_allocated_outside_expandable_segments(expandable):
+    settings = "expandable_segments:True" if expandable else ""
+    calls = []
+    with (
+        patch(
+            f"{_IPC}.torch._C._accelerator_getAllocatorSettings",
+            return_value=settings,
+        ),
+        patch(
+            f"{_IPC}.torch._C._accelerator_setAllocatorSettings",
+            side_effect=lambda conf: calls.append(conf),
+        ),
+        patch(f"{_IPC}.torch.zeros", side_effect=lambda *a, **k: calls.append("alloc")),
+    ):
+        ipc_shareable_zeros(2, 8, dtype=None)
+    expected = ["expandable_segments:False", "alloc", "expandable_segments:True"]
+    assert calls == (expected if expandable else ["alloc"])

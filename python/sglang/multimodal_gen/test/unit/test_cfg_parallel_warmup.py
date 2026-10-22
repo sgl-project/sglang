@@ -22,6 +22,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+    Flux3ImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -1061,6 +1064,35 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs[0].image_path,
             ["/tmp/warmup.png", "/tmp/warmup.png"],
         )
+
+    def test_breakable_warmup_uses_configured_references(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = True
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+        references = ["first.png", "second.png"]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(
+                width=512,
+                height=512,
+                image_path=references,
+                flux3_mode="i2i",
+                num_inference_steps=16,
+            ),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+
+        self.assertEqual(req.image_path, references)
+        self.assertEqual(req.flux3_mode, "i2i")
+        self.assertEqual(req.sampling_params._explicit_fields, {"width", "height"})
 
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()

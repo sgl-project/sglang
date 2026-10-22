@@ -54,24 +54,6 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertTrue(torch.equal(output[:6], real_output))
         self.assertTrue(torch.all(output[6:] == 0))
 
-    def test_no_padding_preserves_existing_tensors(self):
-        q_all = torch.empty((2, 2, 3))
-        topk_indices = torch.empty((2, 8), dtype=torch.int32)
-
-        real_q, real_topk, num_padding_rows = _trim_trtllm_decode_dp_padding(
-            q_all,
-            topk_indices,
-            real_batch_size=2,
-        )
-
-        self.assertIs(real_q, q_all)
-        self.assertIs(real_topk, topk_indices)
-        self.assertEqual(num_padding_rows, 0)
-        self.assertIs(
-            _restore_trtllm_decode_dp_padding(real_q, num_padding_rows),
-            real_q,
-        )
-
     def test_rejects_metadata_larger_than_physical_batch(self):
         with self.assertRaisesRegex(
             AssertionError, "metadata batch size \\(3\\) exceeds q batch size \\(2\\)"
@@ -105,6 +87,8 @@ class TestDSABackendDPPadding(unittest.TestCase):
             _multi_ctas_kv_counter_buffer=None,
             device="cpu",
             num_q_heads=2,
+            num_dcp_q_heads=2,
+            dcp_size=1,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend

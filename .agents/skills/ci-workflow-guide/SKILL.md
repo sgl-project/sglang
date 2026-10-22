@@ -167,7 +167,7 @@ describes what each one does.
 3. If any matched job has `conclusion === 'failure'` → fail immediately (fail-fast)
 4. If all matched jobs are completed and count matches `expected_count` → success
 5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
-6. Timeout after `max-wait-minutes` (240 min for base-a, 480 min for base-b)
+6. Timeout after `max-wait-minutes` of wall-clock time (240 min for base-a, 350 min for base-b). Keep budgets under the 6h hard cap on GitHub-hosted runners: a wait killed by the cap ends `cancelled`, not `timeout`, and `timeout-minutes` cannot raise it. The base-b wait sets `fail-on-timeout: 'false'`, so a timeout lets base-c start; `pr-test-finish` fails the run on any base-b failure regardless
 
 **Job specs example** (base-b):
 ```json
@@ -378,7 +378,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 |---------|-------------|---------------|
 | All stage-B/C jobs green but steps skipped | Earlier job failed, `check-pr-test-health` triggered | Find the actual failed job (red X) |
 | `wait-for-base-b` timeout | `expected_count` doesn't match matrix size | Verify job spec counts match `matrix:` array length |
-| `pr-test-finish` fails but all jobs green | A job was `cancelled` (counts as failure in finish) | Check concurrency cancellation |
+| `pr-test-finish` fails but all jobs green | A job was `cancelled` (counts as failure in finish) | Check concurrency cancellation, and whether a `wait-for-base-*` job hit the 6h hosted-runner cap |
 | Tests pass locally but fail in CI | Partition assignment, runner GPU type, or `est_time` inaccuracy | Check which partition the test lands in; verify runner label |
 | Flaky test retried and passed | Retriable failure (accuracy/perf) | Check `[CI Retry]` markers in job logs |
 | Flaky test NOT retried | Matched non-retriable pattern | Check if error matches `NON_RETRIABLE_PATTERNS` in `ci_utils.py` |
@@ -398,6 +398,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
+| `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
