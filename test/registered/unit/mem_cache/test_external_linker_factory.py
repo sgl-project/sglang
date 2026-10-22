@@ -39,9 +39,11 @@ _PLUGIN = """
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
 class ExternalLinker(UnifiedCacheLinker):
-    def __init__(self, server_args, params, *, components, extra_config):
+    def __init__(self, server_args, params, *, components, extra_config, forward_stream):
         self.args = (server_args, params, components, extra_config)
         self.layer_done_counter = object()
+        self.forward_stream = forward_stream
+        self.pools = {}
 
     def noop(self, *args):
         pass
@@ -199,13 +201,19 @@ class TestExternalLinkerFactory(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "test_external_linker_plugin", None)
         importlib.invalidate_caches()
 
-    def _create(self, **config):
+    def _create(self, *, forward_stream=None, **config):
         with get_context().override_server_args(
             enable_unified_cache_external_linker=True,
             unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config={**_CONFIG, **config},
         ):
-            return create_unified_cache_linker("args", "params", components={"full"})
+            return create_unified_cache_linker(
+                "args", "params", components={"full"}, forward_stream=forward_stream
+            )
+
+    def test_passes_forward_stream_to_plugin(self):
+        stream = object()
+        self.assertIs(self._create(forward_stream=stream).forward_stream, stream)
 
     def test_loads_unregistered_module_and_copies_extra_config(self):
         linker = self._create()
@@ -237,6 +245,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
                 self._create()
 
     def test_builtin_selection_and_private_config(self):
+        stream = object()
         for backend, target in (
             (
                 "mooncake",
@@ -258,10 +267,14 @@ class TestExternalLinkerFactory(unittest.TestCase):
                     patch(target) as constructor,
                 ):
                     result = create_unified_cache_linker(
-                        "args", "params", components={"full"}
+                        "args", "params", components={"full"}, forward_stream=stream
                     )
                     constructor.assert_called_once_with(
-                        "args", "params", components={"full"}, extra_config=config
+                        "args",
+                        "params",
+                        components={"full"},
+                        extra_config=config,
+                        forward_stream=stream,
                     )
                     self.assertIs(result, constructor.return_value)
                     passed_config = constructor.call_args.kwargs["extra_config"]

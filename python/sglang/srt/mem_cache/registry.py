@@ -204,7 +204,10 @@ def create_unified_radix_cache(
 
         cache.init_cache_linker(
             create_unified_cache_linker(
-                server_args, params, components=set(cache.components)
+                server_args,
+                params,
+                components=set(cache.components),
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
         )
         counter = cache.linker.layer_done_counter

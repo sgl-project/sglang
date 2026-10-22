@@ -11,6 +11,8 @@ from sglang.srt.mem_cache.unified_cache.linker_config import UnifiedCacheLinkerC
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
@@ -24,6 +26,7 @@ def create_unified_cache_linker(
     params: CacheInitParams,
     *,
     components: set[ComponentType],
+    forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
     memory = get_memory()
     backend = memory.unified_cache_external_linker_backend
@@ -55,6 +58,7 @@ def create_unified_cache_linker(
             params,
             components=components,
             extra_config=deepcopy(config.linker_extra_config),
+            forward_stream=forward_stream,
         )
 
     if backend == "mooncake":
@@ -76,4 +80,5 @@ def create_unified_cache_linker(
         params,
         components=components,
         extra_config=deepcopy(memory.unified_cache_external_linker_config),
+        forward_stream=forward_stream,
     )

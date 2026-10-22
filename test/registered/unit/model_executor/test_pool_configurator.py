@@ -835,6 +835,49 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
+class TestPerWorkerRequestSplit(CustomTestCase):
+    """A --max-running-requests cap below the attention DP size must still leave
+    every worker one request slot, not zero."""
+
+    def test_max_num_reqs_keeps_one_slot_below_dp_size(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, max_running_requests=1)
+        kvc = SimpleNamespace(
+            attn_dp_size=4,
+            mambaish_config=None,
+            model_config=SimpleNamespace(context_len=8192),
+        )
+        self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(kvc, 1 << 20), 1)
+
+    def test_chunk_cache_cap_sizes_one_request_below_dp_size(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=1000,
+            sliding_window_size=4,
+            page_size=1,
+            max_running_requests=1,
+            disaggregation_mode="decode",
+        )
+        mr.attn_dp_size = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1_000_000, page_size=1)
+
+        # One request per worker at 4 + 1 + 4 + 1 = 10 SWA tokens, the same
+        # per-request cost as test_chunk_cache_cap_drops_prefill_for_disagg_decode.
+        self.assertEqual(config.swa_max_total_num_tokens, 10)
+
+
 class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
@@ -1041,6 +1084,49 @@ class TestEagleConfigurator(CustomTestCase):
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_non_arch35_npu_budget_uses_compact_indexer_capacity(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+            "shared",
+            "shared",
+        ]
+        available_bytes = 1_000_000
+
+        with (
+            mock_cpu_env(kv_size=2),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            pool_sizes = configurator.calculate_pool_sizes(
+                available_bytes,
+                page_size=1,
+            )
+
+        compact_cell_size = 576 * num_layers * 2 + 128 * 2 * 2
+        dense_cell_size = (576 + 128) * num_layers * 2
+        self.assertEqual(configurator._cell_size, compact_cell_size)
+        self.assertGreater(
+            pool_sizes.max_total_num_tokens,
+            available_bytes // dense_cell_size,
+        )
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
@@ -1539,10 +1625,10 @@ class TestSWAPoolFloor(CustomTestCase):
         paged = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 0)
         self.assertEqual(planner.swa_cap_tokens, 0)
-        # Three draft stages of one (128 + 6)-row ring per request slot.
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
         self.assertEqual(
             planner.request_window_bytes - paged.request_window_bytes,
-            (3 * (128 + 6) + 256) * 3 * 584,
+            (3 * 256 + 256) * 3 * 584,
         )
         sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, 0)
@@ -1754,6 +1840,27 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         config = cfg.calculate_pool_sizes(available, 1)
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_fused_swa_entry_replaces_the_swa_terms(self):
+        """A draft placed in the swa sub-pool is priced through the fused swa
+        entry: the separate per-layer swa draft term must go, or the draft is
+        charged twice (once inside the entry, once as a private pool)."""
+        mr, cfg = self._make(fused_entry=None, draft_layers=2)
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 2
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        self.assertEqual(fused._draft_swa_layers_num, 0)
+        self.assertEqual(fused._draft_full_layers_num, 0)
+        self.assertEqual(
+            fused._cell_size,
+            fused._full_per_token * fused._full_layers_num
+            + fused._swa_full_tokens_ratio * 4_321,
+        )
 
 
 if __name__ == "__main__":

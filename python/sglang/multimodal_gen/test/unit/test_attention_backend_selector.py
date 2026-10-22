@@ -114,6 +114,7 @@ _FAKE_BACKENDS = {
 class TestAttentionBackendFallback(unittest.TestCase):
     def setUp(self) -> None:
         _cached_get_attn_backend.cache_clear()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
         _FakePlatform.selected_backend = None
 
     def _resolve(
