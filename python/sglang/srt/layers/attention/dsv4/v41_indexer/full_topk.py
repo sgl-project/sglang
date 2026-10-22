@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.deep_select import (
+    is_deep_select_supported,
+    topk_page_transform,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -47,6 +51,9 @@ class FullTopKIndexer:
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        self.use_deep_select_decode = (
+            not use_deep_gemm_decode and is_deep_select_supported()
+        )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
         if self.use_deep_gemm_prefill:
@@ -65,7 +72,7 @@ class FullTopKIndexer:
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
@@ -78,7 +85,6 @@ class FullTopKIndexer:
         requests = prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         )
         for request, chunks in requests:
             for chunk in chunks:
@@ -92,12 +98,13 @@ class FullTopKIndexer:
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+                q, lens, table = data.paged_logits_args(metadata, rows)
                 logits = deep_gemm_fp4_paged_mqa_logits(
-                    (data.q_fp4[rows], data.q_sf[rows]),
+                    q,
                     data.k_cache,
                     data.weights[rows],
-                    metadata.compressed_seq_lens[rows],
-                    metadata.page_table[rows],
+                    lens,
+                    table,
                     plan,
                     metadata.max_compressed_seq_len,
                 )
@@ -112,12 +119,13 @@ class FullTopKIndexer:
                     ),
                 )
             return
+        q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            q,
             data.k_cache,
             data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
+            lens,
+            table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
@@ -131,8 +139,21 @@ class FullTopKIndexer:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            compute_topk_plan=not self.use_deep_select_decode,
         )
         if d is None:
+            return
+        if self.use_deep_select_decode:
+            metadata = inputs.paged_metadata
+            topk_page_transform(
+                d.scores,
+                inputs.indexer.index_topk,
+                page_table=metadata.page_table[: d.bs],
+                page_size=metadata.compressed_page_size,
+                end=d.lens.to(torch.int32),
+                sorted_index=False,
+                output_idx=inputs.out_page_indices[: d.bs],
+            )
             return
         select_decode(inputs, d, inputs.indexer.index_topk)
 

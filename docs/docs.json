@@ -10,6 +10,14 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
+      "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
+    },
+    {
+      "source": "/cookbook/autoregressive/Meta/MuseSpark",
+      "destination": "/cookbook/autoregressive/Meta/MuseSparkOpen"
+    },
+    {
       "source": "/docs/references/learn_more",
       "destination": "/"
     },
@@ -932,6 +940,7 @@
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hyperparameter_tuning",
+              "docs/advanced_features/text_watermarking",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",
@@ -948,6 +957,7 @@
               "docs/advanced_features/prefill_cp",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
+              "docs/advanced_features/paged_experts",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
               "docs/advanced_features/epd_disaggregation",
@@ -1124,6 +1134,8 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5",
@@ -1200,6 +1212,7 @@
                 ]
               },
               "docs/hardware-platforms/mthreads_gpu",
+              "docs/hardware-platforms/sail",
               "docs/hardware-platforms/tpu",
               "docs/hardware-platforms/xpu",
               "docs/hardware-platforms/plugin"
@@ -1220,6 +1233,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Reflection",
+                    "pages": [
+                      "cookbook/autoregressive/Reflection/Beam-1_0"
+                    ]
+                  },
+                  {
                     "group": "IQuestLab",
                     "pages": [
                       "cookbook/autoregressive/IQuestLab/IQuest-Q1"
@@ -1228,6 +1247,7 @@
                   {
                     "group": "IFM",
                     "pages": [
+                      "cookbook/autoregressive/IFM/Jais-3",
                       "cookbook/autoregressive/IFM/K2-Horizon"
                     ]
                   },
@@ -1307,12 +1327,14 @@
                   {
                     "group": "DeepReinforce",
                     "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.5",
                       "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
                     ]
                   },
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSparkOpen",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
@@ -1370,6 +1392,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Super",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
@@ -1394,6 +1417,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-5-Preview",
                       "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
@@ -1402,6 +1426,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.1-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
@@ -1429,6 +1454,7 @@
                   {
                     "group": "OpenBMB",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_7",
                       "cookbook/autoregressive/OpenBMB/MiniCPM5-2B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
@@ -1468,6 +1494,12 @@
                       "cookbook/autoregressive/Tencent/Hy4-Preview",
                       "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
+                  },
+                  {
+                    "group": "Recursive",
+                    "pages": [
+                      "cookbook/autoregressive/Recursive/Flint"
                     ]
                   },
                   {
@@ -1512,7 +1544,9 @@
                   },
                   {
                     "group": "FLUX",
+                    "tag": "NEW",
                     "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
@@ -1604,6 +1638,12 @@
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
+                    ]
+                  },
+                  {
+                    "group": "MOSS-Image",
+                    "pages": [
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
                     ]
                   },
                   {
