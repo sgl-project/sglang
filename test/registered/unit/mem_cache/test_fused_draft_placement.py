@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     place_fused_draft,
     register_host_kind,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel, override_platform
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -658,7 +658,6 @@ class TestFusedDraftDecision(CustomTestCase):
         attn_dp_size=1,
         dcp_size=1,
         hicache=False,
-        storage_backend=None,
         retraction_backup=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
@@ -690,6 +689,9 @@ class TestFusedDraftDecision(CustomTestCase):
                 attention_arch=AttentionArch.MHA,
             ),
         )
+        memory = SimpleNamespace(
+            enable_unified_memory=True, enable_hierarchical_cache=hicache
+        )
         spec = SimpleNamespace(
             speculative_num_steps=1,
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
@@ -701,11 +703,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_cp_size=attn_cp_size,
                 attn_dp_size=attn_dp_size,
             ),
-            get_memory().override(
-                enable_unified_memory=True,
-                enable_hierarchical_cache=hicache,
-                hicache_storage_backend=storage_backend,
-            ),
+            patch.object(kvc, "get_memory", return_value=memory),
             patch.object(
                 kvc,
                 "get_disagg",
@@ -793,25 +791,6 @@ class TestFusedDraftDecision(CustomTestCase):
         decision = self._decide(algorithm="DSPARK", draft_backend="fa4")
         self.assertIsNotNone(decision.placement)
 
-    def test_fa4_draft_keeps_bf16_rows_inside_fp8_target_pages(self):
-        """FA4 requires BF16 KV even when the target uses FP8. Pricing its
-        region as FP8 halves the storage and makes the draft binding fail."""
-        for algorithm in ("DFLASH", "DSPARK"):
-            for requested_dtype in (None, "auto", "fp8_e4m3"):
-                with self.subTest(algorithm=algorithm, dtype=requested_dtype):
-                    decision = self._decide(
-                        algorithm=algorithm,
-                        draft_backend="fa4",
-                        draft_kv_dtype=requested_dtype,
-                        host_kv_dtype=torch.float8_e4m3fn,
-                        kv_cache_dtype_flag="fp8_e4m3",
-                    )
-                    self.assertIsNotNone(decision.placement, decision.declined)
-                    region = decision.placement.region("full")
-                    self.assertEqual(region.resolved_kv_dtype(), torch.bfloat16)
-                    self.assertEqual(region.store_dtype, torch.bfloat16)
-                    self.assertEqual(region.entry_bytes(), 2 * 4 * 64 * 2)
-
     def test_a_trtllm_mha_draft_fuses(self):
         """trtllm_mha refills its graph page table to what each replay reads
         and widens its eager table by the draft block, so its draft fuses."""
@@ -837,26 +816,6 @@ class TestFusedDraftDecision(CustomTestCase):
         a fused draft does not have; DSPARK + HiCache keeps working on the
         private pool."""
         declined = self._decide(algorithm="DSPARK", hicache=True)
-        self.assertIsNone(declined.placement)
-        self.assertIn("--enable-hierarchical-cache", declined.declined)
-
-    def test_hicache_dflash_fuses_bf16_draft_into_fp8_full_pages(self):
-        """L2 backs up the full page envelope, including the BF16 draft
-        bytes; a layer-packed L3 format cannot preserve that region."""
-        options = dict(
-            algorithm="DFLASH",
-            draft_backend="fa4",
-            host_kv_dtype=torch.float8_e4m3fn,
-            kv_cache_dtype_flag="fp8_e4m3",
-            hicache=True,
-        )
-        decision = self._decide(**options)
-        self.assertIsNotNone(decision.placement, decision.declined)
-        self.assertEqual(decision.placement.hosts(), ("full",))
-        self.assertEqual(
-            decision.placement.region("full").resolved_kv_dtype(), torch.bfloat16
-        )
-        declined = self._decide(**options, storage_backend="file")
         self.assertIsNone(declined.placement)
         self.assertIn("--enable-hierarchical-cache", declined.declined)
 

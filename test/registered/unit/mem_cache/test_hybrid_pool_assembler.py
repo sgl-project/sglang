@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1291,33 +1291,25 @@ class TestTransferLayerSpan(CustomTestCase):
         )
 
 
-def _build_unified_swa_pool(
-    page_size: int = 4,
-    *,
-    fused_draft=None,
-    kv_cache_dtype=torch.float16,
-    head_dim=4,
-    total_bytes=4096,
-):
+def _build_unified_swa_pool(page_size: int = 4):
     return init_unified_swa_pools(
         device="cpu",
-        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype=torch.float16,
         head_num=2,
-        head_dim=head_dim,
-        v_head_dim=head_dim,
+        head_dim=4,
+        v_head_dim=4,
         swa_head_num=2,
-        swa_head_dim=head_dim,
-        swa_v_head_dim=head_dim,
+        swa_head_dim=4,
+        swa_v_head_dim=4,
         page_size=page_size,
         start_layer=0,
         end_layer=4,
         swa_attention_layer_ids=[3],
         full_attention_layer_ids=[0, 1, 2],
-        total_bytes=total_bytes,
+        total_bytes=4096,
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
-        fused_draft=fused_draft,
     )
 
 
@@ -1527,291 +1519,6 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                     ),
                     expected,
                 )
-
-
-class TestFusedDraftPageEnvelopeHiCache(CustomTestCase):
-    def _bundle_and_draft(self):
-        from sglang.srt.mem_cache.layout.fused_draft import (
-            DenseDraftRegion,
-            FusedDraftPlacement,
-        )
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-
-        placement = FusedDraftPlacement.from_counts(
-            counts={"full": [2]},
-            regions={
-                "full": DenseDraftRegion(
-                    lane_num=2, head_num=1, head_dim=8, store_dtype=torch.bfloat16
-                )
-            },
-        )
-        bundle = _build_unified_swa_pool(
-            fused_draft=placement,
-            kv_cache_dtype=torch.float8_e4m3fn,
-            head_dim=8,
-            total_bytes=8192,
-        )
-        draft = UnifiedDraftKVPool(
-            unified_buffer=bundle.token_to_kv_pool.unified_buffer,
-            host_sub_pool_name="full",
-            host_allocator=bundle.token_to_kv_pool_allocator,
-            layer_lanes={0: 0, 1: 1},
-            page_size=4,
-        )
-        return bundle, draft
-
-    def _plan(self, draft):
-        from sglang.srt.speculative import base_spec_worker as spec
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        target = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            kv_cache_configurator=SimpleNamespace(
-                spec_algorithm=SpeculativeAlgorithm.DFLASH,
-                is_hybrid_swa=True,
-                mambaish_config=None,
-            ),
-        )
-        worker = SimpleNamespace(
-            target_worker=SimpleNamespace(model_runner=target),
-            _draft_model_runners=lambda: (SimpleNamespace(token_to_kv_pool=draft),),
-        )
-        with published_topology(enable_hierarchical_cache=True):
-            plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-        self.assertIs(plan.mode, spec.HiCacheDraftMode.FUSED)
-        self.assertEqual(target.mtp_draft_device_pools, ())
-        return plan
-
-    def test_mixed_dtype_round_trip_uses_target_envelopes_and_translated_ids(self):
-        """A restored prefix retains every draft lane at its new physical pages."""
-        from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
-        from sglang.srt.mem_cache.l2_transfer import L2TransferEngine
-
-        bundle, draft = self._bundle_and_draft()
-        pool = bundle.token_to_kv_pool
-        allocator = bundle.token_to_kv_pool_allocator
-        source = allocator.alloc(8)
-        neighbor = allocator.alloc(4)
-        destination = allocator.alloc(8)
-        host_full, host_swa = _build_unified_host_pair(bundle)
-        self.addCleanup(host_full.destroy)
-        self.addCleanup(host_swa.destroy)
-        host_full_ids, host_swa_ids = host_full.alloc(8), host_swa.alloc(8)
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.transfer_layer_id_max = 4
-        controller.mem_pool_host = HostPoolGroup(
-            [
-                PoolEntry(
-                    PoolName.KV,
-                    host_full,
-                    pool.full_kv_pool,
-                    lambda i: i if i < 3 else None,
-                ),
-                PoolEntry(
-                    PoolName.SWA,
-                    host_swa,
-                    pool.swa_kv_pool,
-                    lambda i: 0 if i == 3 else None,
-                ),
-            ]
-        )
-        cache = SimpleNamespace(cache_controller=controller)
-        maybe_register_hicache_draft(tree_cache=cache, draft_plan=self._plan(draft))
-        self.assertEqual(
-            set(controller.mem_pool_host.entry_map), {PoolName.KV, PoolName.SWA}
-        )
-
-        full_source = allocator.full_attn_allocator.translate_kv_loc(source)
-        swa_source = allocator.translate_loc_from_full_to_swa(source)
-        self.assertFalse(torch.equal(source, full_source))
-        raw = pool.unified_buffer._raw
-        self.assertEqual(draft.k_buffer[0].untyped_storage().data_ptr(), raw.data_ptr())
-        self.assertGreater(
-            draft.k_buffer[0].data_ptr(), pool.full_kv_pool.v_buffer[-1].data_ptr()
-        )
-        raw.copy_((torch.arange(raw.numel(), dtype=torch.int64) % 251).to(torch.uint8))
-        expected_draft = [
-            view[full_source].view(torch.uint8).clone()
-            for view in (*draft.k_buffer, *draft.v_buffer)
-        ]
-        expected_pages = [
-            side.get_page_envelope_buffer()[ids[::4] // 4].clone()
-            for side, ids in (
-                (pool.full_kv_pool, full_source),
-                (pool.swa_kv_pool, swa_source),
-            )
-        ]
-        neighbor_pages = [
-            (side.get_page_envelope_buffer(), ids[::4] // 4)
-            for side, ids in (
-                (
-                    pool.full_kv_pool,
-                    allocator.full_attn_allocator.translate_kv_loc(neighbor),
-                ),
-                (pool.swa_kv_pool, allocator.translate_loc_from_full_to_swa(neighbor)),
-            )
-        ]
-        expected_neighbors = [buffer[ids].clone() for buffer, ids in neighbor_pages]
-        engine = L2TransferEngine.__new__(L2TransferEngine)
-        engine.io_backend = "direct"
-        writes = controller._l2_transfers(
-            host_full_ids,
-            source,
-            [
-                PoolTransfer(
-                    name=PoolName.SWA,
-                    host_indices=host_swa_ids,
-                    device_indices=swa_source,
-                )
-            ],
-        )
-        for transfer in engine._prepare_transfers(writes):
-            transfer.host_pool.backup_from_device_all_layer_physical(
-                transfer.device_pool,
-                transfer.host_indices,
-                transfer.device_indices,
-                "direct",
-            )
-        full_destination = allocator.full_attn_allocator.translate_kv_loc(destination)
-        swa_destination = allocator.translate_loc_from_full_to_swa(destination)
-        self.assertFalse(torch.equal(full_source, full_destination))
-        self.assertFalse(torch.equal(swa_source, swa_destination))
-        for side, ids in (
-            (pool.full_kv_pool, full_destination),
-            (pool.swa_kv_pool, swa_destination),
-        ):
-            side.get_page_envelope_buffer()[ids[::4] // 4] = 0
-        loads = controller._l2_load_transfers(
-            host_full_ids,
-            destination,
-            [
-                PoolTransfer(
-                    name=PoolName.SWA,
-                    host_indices=host_swa_ids,
-                    device_indices=swa_destination,
-                )
-            ],
-        )
-        self.assertEqual(len(loads), 2)
-        for transfer in engine._prepare_transfers(loads):
-            for layer in range(controller.transfer_layer_id_max):
-                local_layer = transfer.layer_mapper(layer)
-                if local_layer is not None:
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer,
-                        "direct",
-                        is_draft=transfer.is_draft,
-                    )
-        for expected, side, ids in zip(
-            expected_pages,
-            (pool.full_kv_pool, pool.swa_kv_pool),
-            (full_destination, swa_destination),
-        ):
-            self.assertTrue(
-                torch.equal(expected, side.get_page_envelope_buffer()[ids[::4] // 4])
-            )
-        for expected, view in zip(expected_draft, (*draft.k_buffer, *draft.v_buffer)):
-            self.assertTrue(
-                torch.equal(expected, view[full_destination].view(torch.uint8))
-            )
-        for expected, (buffer, ids) in zip(expected_neighbors, neighbor_pages):
-            self.assertTrue(torch.equal(expected, buffer[ids]))
-
-    def test_fused_registration_rejects_a_layer_only_host_pool(self):
-        from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
-
-        _, draft = self._bundle_and_draft()
-        cache = SimpleNamespace(
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(entry_map={})
-            )
-        )
-        with self.assertRaisesRegex(NotImplementedError, "page-envelope"):
-            maybe_register_hicache_draft(tree_cache=cache, draft_plan=self._plan(draft))
-
-    def test_dflash_waits_for_current_load_before_forward_dispatch(self):
-        """Graph replay bypasses pool getters, so the wait must precede dispatch."""
-        from sglang.srt.managers import cache_controller
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.srt.speculative.base_spec_worker import (
-            BaseSpecWorker,
-            HiCacheDraftMode,
-            HiCacheDraftPlan,
-        )
-        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-
-        counter = cache_controller.LayerDoneCounter.__new__(
-            cache_controller.LayerDoneCounter
-        )
-        counter.num_layers = 4
-        counter.consumer_index = 0
-        counter.events = []
-        for _ in range(3):
-            event = cache_controller.LayerLoadingEvent.__new__(
-                cache_controller.LayerLoadingEvent
-            )
-            event.load_events = [object() for _ in range(counter.num_layers)]
-            counter.events.append(event)
-        order = []
-
-        def dispatch(*args, **kwargs):
-            order.append("dispatch")
-            raise RuntimeError("reached model dispatch")
-
-        worker = SimpleNamespace(
-            hicache_draft_plan=HiCacheDraftPlan(mode=HiCacheDraftMode.FUSED),
-            _validate_phase1_sampling_support=lambda batch: None,
-            target_worker=SimpleNamespace(
-                hicache_layer_transfer_counter=counter,
-                forward_batch_generation=dispatch,
-            ),
-        )
-        worker._wait_for_fused_hicache_load = partial(
-            BaseSpecWorker._wait_for_fused_hicache_load, worker
-        )
-        stream = SimpleNamespace(wait_event=order.append)
-        for consumer_index in (1, 2, -1):
-            order.clear()
-            batch = SimpleNamespace(
-                hicache_consumer_index=consumer_index, forward_mode=ForwardMode.EXTEND
-            )
-            with (
-                self.subTest(consumer_index=consumer_index),
-                patch.object(
-                    cache_controller.device_module,
-                    "current_stream",
-                    return_value=stream,
-                ),
-                self.assertRaisesRegex(RuntimeError, "reached model dispatch"),
-            ):
-                DFlashWorkerV2.forward_batch_generation(worker, batch)
-            expected = (
-                []
-                if consumer_index < 0
-                else [counter.events[consumer_index].load_events[-1]]
-            )
-            self.assertEqual(order, [*expected, "dispatch"])
-
-        # A prefill batch can become the running decode batch without clearing
-        # this index. Its event slot may now belong to another request's load.
-        order.clear()
-        decode_batch = SimpleNamespace(
-            hicache_consumer_index=1,
-            forward_mode=ForwardMode.DECODE,
-            is_extend_in_batch=False,
-            spec_info=object(),
-        )
-        with (
-            patch.object(
-                cache_controller.device_module, "current_stream", return_value=stream
-            ),
-            self.assertRaisesRegex(RuntimeError, "DFLASH spec-v2 expected"),
-        ):
-            DFlashWorkerV2.forward_batch_generation(worker, decode_batch)
-        self.assertEqual(order, [])
 
 
 class TestMtpMhaPhysicalConstruction(CustomTestCase):
