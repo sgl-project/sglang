@@ -32,6 +32,8 @@ static __device__ __forceinline__ void moe_q(
     const int nrows_y,
     const int nrows_dst,
     const int top_k) {
+  if (blockIdx.y * mmq_x >= num_tokens_post_padded[0]) return;
+
   const int blocks_per_row_x = ncols_x / qk;
   const int blocks_per_col_y = nrows_y / QK8_1;
   const int blocks_per_warp = WARP_SIZE_GGUF / qi;
@@ -49,8 +51,22 @@ static __device__ __forceinline__ void moe_q(
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
+  if (exp_idx < 0) {
+#pragma unroll
+    for (int j = 0; j < mmq_x; j += nwarps) {
+      const int col_dst = token_offs[j / nwarps];
+      if (col_dst >= ncols_dst) continue;
+#pragma unroll
+      for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+        const auto row_dst = row_dst_0 + threadIdx.x + i;
+        if (row_dst < nrows_dst) {
+          dst[col_dst * nrows_dst + row_dst] = scalar_t(0.0f);
+        }
+      }
+    }
+    return;
+  }
+  if (exp_idx > 255) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
