@@ -55,30 +55,6 @@ _DISPATCH_COMM_ALG = "fullmesh_v1"
 _COMBINE_COMM_ALG = ""
 
 
-_DEBUG_PRINT_BUDGET = 8
-_debug_prints = 0
-
-
-def _debug_rank0() -> bool:
-    """True on global rank 0 while SGLANG_ASCEND_OPS_DEBUG is enabled.
-
-    The budget keeps the device syncs behind ``.item()`` off the per-layer hot
-    path: every print stalls the calling rank while the others keep issuing
-    collectives, which is enough to trip the HCCL execute timeout over 61 layers.
-    """
-    global _debug_prints
-    if not envs.SGLANG_ASCEND_OPS_DEBUG.get():
-        return False
-    if _debug_prints >= _DEBUG_PRINT_BUDGET:
-        return False
-    import torch.distributed as dist
-
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return False
-    _debug_prints += 1
-    return True
-
-
 class AscendOpsDispatchOutput(NamedTuple):
     """Metadata passed from Ascend Ops dispatch to the MoE runner."""
 
@@ -118,7 +94,6 @@ class _DSv2State:
     ep_send_counts: torch.Tensor
     x_active_mask: Optional[torch.Tensor]
     expand_scales: Optional[torch.Tensor]
-    expert_token_nums: torch.Tensor
 
 
 class AscendOpsDispatcher(BaseDispatcher):
@@ -336,30 +311,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         # A3 returns an uninitialised ``(a,)`` one, so never forward it.
         expand_scales = None
 
-        if _debug_rank0():
-            valid = int(expert_token_nums.sum())
-            row_amax = expand_x.float().abs().amax(dim=1)
-            deq = ""
-            if dynamic_scales.dim() == 1:
-                # Reconstruct the dispatched values from the int8 payload and its
-                # per-token scale: valid rows must recover the input magnitude.
-                deq_row_amax = (
-                    expand_x.float() * dynamic_scales.float().unsqueeze(1)
-                ).abs().amax(dim=1)
-                deq = f"deq_row_amax={deq_row_amax[:8].tolist()} "
-            print(
-                f"[ascend_ops dispatch] {self._dispatch_path} "
-                f"tokens={num_tokens} padded={padded_bs} qmode={quant_mode} "
-                f"valid={valid} in_row_amax="
-                f"{hidden_states.float().abs().amax(dim=1)[:8].tolist()} "
-                f"etoks={expert_token_nums.tolist()} "
-                f"expand_x={tuple(expand_x.shape)}:{expand_x.dtype} "
-                f"{deq}"
-                f"row_amax={row_amax[:24].tolist()} "
-                f"scales={dynamic_scales[:24].tolist()}",
-                flush=True,
-            )
-
         self._ds_state = _DSv2State(
             num_tokens=num_tokens,
             expert_ids=topk_ids,
@@ -368,7 +319,6 @@ class AscendOpsDispatcher(BaseDispatcher):
             ep_send_counts=ep_recv_counts,
             x_active_mask=x_active_mask,
             expand_scales=expand_scales,
-            expert_token_nums=expert_token_nums,
         )
         self._dispatch_output = AscendOpsDispatchOutput(
             hidden_states=expand_x,
@@ -409,20 +359,6 @@ class AscendOpsDispatcher(BaseDispatcher):
             comm_quant_mode=0,
             comm_alg=_COMBINE_COMM_ALG,
         )
-        if _debug_rank0():
-            expert_x = combine_input.hidden_states.float()
-            valid = int(state.expert_token_nums.sum())
-            print(
-                f"[ascend_ops combine] expert_x={tuple(expert_x.shape)} "
-                f"valid={valid} "
-                f"row_amax={expert_x.abs().amax(dim=1)[:24].tolist()} "
-                f"nan={int(torch.isnan(expert_x).sum())} "
-                f"wsum={float(state.expert_scales.sum()):.4f} "
-                f"out={tuple(combined.shape)} "
-                f"out_row_amax="
-                f"{combined.float().abs().amax(dim=1)[: state.num_tokens].tolist()}",
-                flush=True,
-            )
 
         self._ds_state = None
         self._dispatch_output = None

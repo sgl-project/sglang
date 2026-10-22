@@ -1331,14 +1331,9 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    # Run ascend_ops prefill through the DS v2 EP dispatch/combine path instead
-    # of the real TP alltoallv path, as an A/B control.
-    SGLANG_ASCEND_OPS_MOCK_PREFILL = EnvBool(False)
     # Pad the ascend_ops decode batch to this size (0 disables padding, which is
     # correct while every EP rank steps with the same batch size).
     SGLANG_ASCEND_OPS_DECODE_PAD_BS = EnvInt(0)
-    # Print the ascend_ops dispatch/combine/runner tensor stats from rank 0.
-    SGLANG_ASCEND_OPS_DEBUG = EnvBool(False)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
