@@ -60,6 +60,16 @@ class ReqDllmMixin:
             return fill_ids[: len(fill_ids) - len(self.dllm_incomplete_ids)]
         return fill_ids
 
+    def cacheable_checkpoint_len(self: Req, up_to: int) -> int:
+        """Clamp a checkpoint length so the in-flight denoise block stays out.
+
+        The block is the tail of ``[:extend_end]``, so the cacheable part ends
+        where the block starts (see ``get_cacheable_fill_ids``).
+        """
+        if self.dllm_incomplete_ids:
+            return min(up_to, self.extend_end - len(self.dllm_incomplete_ids))
+        return up_to
+
     def determine_dllm_phase(self: Req):
         if self.dllm_incomplete_ids:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE

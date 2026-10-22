@@ -1065,7 +1065,9 @@ class SWAComponent(TreeComponent):
             and insert_result.swa_branch_inserted
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
         ):
-            forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
+            # Measure the cacheable key: the in-flight dLLM block is never inserted.
+            cacheable_len = len(req.get_cacheable_fill_ids())
+            forward_key_len = cacheable_len - int(self.tree_core.is_eagle)
             self._free_out_of_window_slots(req, forward_key_len - 1)
 
     # ---- HiCache Hooks ----
