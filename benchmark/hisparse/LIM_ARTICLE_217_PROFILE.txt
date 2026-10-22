@@ -198,7 +198,8 @@ ready等待有超时，registry按device/context区分。修复原有SetDevice50
 早期baseline0.90内存比例启动仅剩0.26GiB，warmup额外62MiB OOM，未作为任何收益数据。
 C12288配置实际index pool被clamp至193792，不够12×64K，未发该工作负载，不将其描述成已实测OOM。
 基线独立计时第一次启动时前一个模型HBM尚未全部释放，触发TP memory-balance guard；等16设备水位恢复后重启，未采纳失败启动数据。
-callback启动失败及chunked helper无效采集均留档；只采纳通过完整请求、图计数、占用与历史校验的数据。
+callback启动失败及chunked helper无效采集均留档；正式profile与性能只采纳通过完整请求、图计数和占用校验的数据。
+精度诊断通过了完整原始logits与token历史校验，其非独占限制另行标注，未认证精度无损。
 
 证据与复现
 采集/解析/精度命令及配置注意事项见 LIM_ARTICLE_PROFILE_GUIDE.txt。
