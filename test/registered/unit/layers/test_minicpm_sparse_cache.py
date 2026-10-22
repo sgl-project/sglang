@@ -188,8 +188,9 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         swa_tokens_per_layer=None,
         max_total_num_tokens=64,
         tree_cache=SimpleNamespace(
-            supports_mamba=lambda: False,
-            protected_size=lambda: 0,
+            supports_mamba=lambda: True,
+            supports_prefix_sharing=lambda: False,
+            full_protected_size=lambda: 0,
         ),
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
@@ -213,7 +214,9 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
     pool.mamba_allocator = SimpleNamespace(available_size=lambda: 1)
     pool.mamba_pool = SimpleNamespace(size=1)
     observer = SchedulerPoolStatsObserver(
-        tree_cache=SimpleNamespace(supports_mamba=lambda: False),
+        tree_cache=SimpleNamespace(
+            supports_mamba=lambda: True, supports_prefix_sharing=lambda: False
+        ),
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         session_controller=None,
@@ -224,8 +227,6 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
         full_tokens_per_layer=None,
         swa_tokens_per_layer=None,
         max_total_num_tokens=42,
-        get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
     )
 
     stats = observer._get_mamba_token_info()
@@ -246,6 +247,7 @@ def test_streaming_session_release_frees_compressed_slots():
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         page_size=1,
+        unlock=lambda lock: None,
     )
     cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
     session = StreamingSession(cache)

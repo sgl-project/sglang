@@ -10,7 +10,6 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
-    DeviceCapability,
     Platform,
     PlatformEnum,
 )
@@ -54,10 +53,6 @@ class NPUPlatformBase(Platform):
         return torch.device(f"npu:{envs.LOCAL_RANK}")
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        return None
-
-    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return str(torch.npu.get_device_name(device_id))
 
@@ -65,17 +60,6 @@ class NPUPlatformBase(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return int(device_props.total_memory)
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable NPU "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
 
     @classmethod
     def inference_mode(cls):
@@ -114,10 +98,6 @@ class NPUPlatformBase(Platform):
             free_gpu_memory = float(tensor.item())
 
         return free_gpu_memory / (1 << 30)
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        pass
 
     @classmethod
     def get_current_memory_usage(

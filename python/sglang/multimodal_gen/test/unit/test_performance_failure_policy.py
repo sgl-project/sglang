@@ -4,12 +4,14 @@ import sys
 import textwrap
 import time
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     _estimate_failed_test_time,
+    _extract_short_test_summary,
     _is_retryable_failure,
     run_pytest,
 )
@@ -20,6 +22,42 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     ScenarioConfig,
 )
+
+
+@pytest.mark.parametrize("request_override", [None, True, False])
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_cache_selection(
+    request_override, pin_consistency_quality
+):
+    extras = {} if request_override is None else {"enable_cache_dit": request_override}
+    case = DiffusionTestCase(
+        "cached_consistency",
+        DiffusionServerArgs(
+            model_path="test",
+            modality="video",
+            env_vars={"SGLANG_CACHE_DIT_ENABLED": "true"},
+        ),
+        DiffusionSamplingParams(prompt="test", extras=extras),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    if pin_consistency_quality or request_override is False:
+        assert case.sampling_params.extras["quality"] == "exact"
+    else:
+        # An explicit quality tier suppresses the legacy MiniMax cache mode.
+        assert "quality" not in case.sampling_params.extras
+
+
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_explicit_quality(pin_consistency_quality):
+    case = DiffusionTestCase(
+        "explicit_quality",
+        DiffusionServerArgs(model_path="test", modality="video", enable_cache_dit=True),
+        DiffusionSamplingParams(prompt="test", extras={"quality": "exact"}),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    assert case.sampling_params.extras["quality"] == "exact"
 
 
 @pytest.mark.parametrize("generate_baseline", [False, True])
@@ -44,7 +82,7 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
         steps=[],
         total_duration_ms=2000 if generate_baseline else 1000,
     )
-    server._validate_and_record(case, record, load_time_ms=100)
+    server._validate_and_record(SimpleNamespace(load_time_ms=100), case, record)
     assert len(server._perf_results) == 1
     assert bool(common._PENDING_BASELINE_DUMPS) == generate_baseline
 
@@ -59,6 +97,23 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
 )
 def test_validation_failures_are_not_retryable(output):
     assert not _is_retryable_failure(output)
+
+
+def test_failure_summary_uses_outer_pytest_session():
+    output = "\n".join(
+        [
+            "=== short test summary info ===",
+            "FAILED nested/test_retry.py::test_slow - AssertionError: [performance]",
+            "=== 1 failed ===",
+            "nested failure was expected; outer test PASSED",
+            "=== short test summary info ===",
+            "FAILED test_parallel.py::test_destroy - AssertionError",
+            "=== 1 failed, 10 passed ===",
+        ]
+    )
+    assert _extract_short_test_summary(output) == [
+        "FAILED test_parallel.py::test_destroy - AssertionError"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -144,8 +199,7 @@ def test_retry_estimate_excludes_successful_cases(tmp_path):
 
 
 def test_performance_failure_survives_real_pytest_runner(tmp_path):
-    # Share interpreter startup across scenarios, retaining seven real attempts
-    # and an independent pytest fixture lifecycle for each parametrized case.
+    # share imports across failure scenarios while exercising all seven real attempts
     problems = [
         "regression",
         "missing_baseline",
@@ -157,7 +211,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
         "e2e_only_zero_baseline",
         "e2e_only_nan_baseline",
     ]
-    # exercise the validator, request loop, pytest output and retry classifier together
     test_file = tmp_path / "test_guard.py"
     test_file.write_text(
         textwrap.dedent(
@@ -173,7 +226,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
 
             @pytest.mark.parametrize("case_id", PROBLEMS)
             def test_guard(case_id, monkeypatch, tmp_path):
-                problem = case_id
                 server = common.DiffusionServerBase()
                 server._perf_results = []
                 case = DiffusionTestCase(
@@ -182,14 +234,14 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
                     DiffusionSamplingParams(prompt="test"),
                     run_lora_basic_api_check=True, perf_repeat_requests=2,
                     run_consistency_check=False, run_models_api_check=False,
-                    run_perf_check=not problem.startswith("e2e_only_") and problem not in ("missing_record", "missing_e2e", "missing_log"),
+                    run_perf_check=not case_id.startswith("e2e_only_") and case_id not in ("missing_record", "missing_e2e", "missing_log"),
                 )
                 scenario = ScenarioConfig({}, {}, 1000, 100, 100, expected_load_ms=100)
-                if problem == "e2e_only_zero_baseline":
+                if case_id == "e2e_only_zero_baseline":
                     scenario.expected_e2e_ms = 0
-                if problem == "e2e_only_nan_baseline":
+                if case_id == "e2e_only_nan_baseline":
                     scenario.expected_e2e_ms = float("nan")
-                if problem in ("missing_baseline", "e2e_only_missing_baseline"):
+                if case_id in ("missing_baseline", "e2e_only_missing_baseline"):
                     monkeypatch.delitem(common.BASELINE_CONFIG.scenarios, case_id, raising=False)
                 else:
                     monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case_id, scenario)
@@ -200,15 +252,15 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
                 lora_checks = []
                 def collect(*args, **kwargs):
                     requests.append(1)
-                    if problem == "missing_record":
+                    if case_id == "missing_record":
                         return None, b""
                     return RequestPerfRecord(
                         request_id="guard", commit_hash="test", tag="guard",
                         stages=[], steps=[100],
-                        total_duration_ms=None if problem == "missing_e2e" else 2000,
+                        total_duration_ms=None if case_id == "missing_e2e" else 2000,
                     ), b""
                 context = SimpleNamespace(load_time_ms=100)
-                if problem == "missing_log":
+                if case_id == "missing_log":
                     log_path = tmp_path / "empty-perf.jsonl"
                     log_path.write_text("")
                     context = SimpleNamespace(perf_log_path=log_path, load_time_ms=100)
@@ -247,7 +299,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
         SGLANG_GEN_BASELINE="0",
         SGLANG_GEN_GT="0",
     )
-    # This test verifies retry exhaustion, independently of the outer CI budget.
     env.pop("SGLANG_DIFFUSION_RETRY_DEADLINE", None)
     command = (
         "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; "
@@ -276,8 +327,8 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
             0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
         )
         marker = (
-            f"GUARD_CASE={problem} GUARD_REQUESTS=1 LORA_CHECKS=0 "
-            f"RETAINED_METRICS={retained}"
+            f"GUARD_CASE={problem} GUARD_REQUESTS=1 "
+            f"LORA_CHECKS=0 RETAINED_METRICS={retained}"
         )
         assert output.count(marker) == 7, output
         assert f"'{problem}': 'fail'" in output, output

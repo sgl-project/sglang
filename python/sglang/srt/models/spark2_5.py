@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -7,9 +8,9 @@ from torch import nn
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -105,7 +106,6 @@ class Spark2_5Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -139,8 +139,7 @@ class Spark2_5Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("q_k_v_proj", prefix),
         )
         if self.headwise_attn_output_gate:
@@ -149,8 +148,7 @@ class Spark2_5Attention(nn.Module):
                 self.total_num_heads,
                 bias=False,
                 quant_config=None,  # g_proj keeps bf16.
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
 
@@ -159,8 +157,7 @@ class Spark2_5Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("out_proj", prefix),
         )
@@ -264,20 +261,27 @@ class Spark2_5DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: Spark2_5Config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(sparse=False, next_layer_sparse=False),
         )
 
     def forward(
@@ -296,7 +300,7 @@ class Spark2_5DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return self.ffn_boundary.finish_complete_output(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class Spark2_5Model(nn.Module):
@@ -331,6 +335,7 @@ class Spark2_5Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(Spark2_5DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
