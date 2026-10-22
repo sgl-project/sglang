@@ -4241,20 +4241,44 @@ class TestGlmControlTokenIds(unittest.TestCase):
             parser.parse_stream_chunk(self.tokenizer.decode(ids)), ("Plan", "Done.")
         )
 
-    def _stream_reasoning(self, ids, cuts, match_mode="auto"):
-        """glm45 over ``ids`` streamed in chunks that end at each of ``cuts``."""
-        parser = self._reasoning_parser(match_mode)
-        reasoning = content = ""
+    def _stream_reasoning(
+        self,
+        ids,
+        cuts,
+        match_mode="auto",
+        *,
+        text=None,
+        skip_special_tokens=True,
+        cumulative=False,
+        stream_reasoning=True,
+    ):
+        """glm45 over ``ids`` streamed in chunks that end at each of ``cuts``,
+        each chunk's ids observed before its text is parsed. The text shown
+        ends at ``text`` (all of ``ids`` decoded by default), holding back an
+        incomplete character until the last chunk as the detokenizer does."""
+        if text is None:
+            text = self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+        parser = self._reasoning_parser(match_mode, stream_reasoning)
+        reasoning = content = sent = ""
         bounds = [0, *cuts, len(ids)]
         for start, end in zip(bounds, bounds[1:]):
-            parser.observe_stream_output_ids(ids[start:end], cumulative=False)
-            text = self.tokenizer.decode(ids[:end])
-            r, n = parser.parse_stream_chunk(
-                text[len(self.tokenizer.decode(ids[:start])) :]
+            chunk_ids = ids[:end] if cumulative else ids[start:end]
+            parser.observe_stream_output_ids(
+                chunk_ids, cumulative=cumulative, total=end
             )
-            reasoning, content = reasoning + r, content + n
+            shown = text
+            if end < len(ids):
+                decoded = self.tokenizer.decode(
+                    ids[:end], skip_special_tokens=skip_special_tokens
+                )
+                shown = decoded.rstrip("\ufffd")[: len(text)]
+            r, n = parser.parse_stream_chunk(shown[len(sent) :])
+            reasoning, content, sent = reasoning + r, content + n, shown
         r, n = parser.parse_stream_end()
         return reasoning + r, content + n
+
+    def _chunkings(self, ids):
+        return [[], *([cut] for cut in range(1, len(ids))), list(range(1, len(ids)))]
 
     def test_think_start_after_text_keeps_matching_by_id(self):
         """A <think> token after other text in one chunk was spliced out of the
@@ -4276,23 +4300,37 @@ class TestGlmControlTokenIds(unittest.TestCase):
                 self.assertEqual(self._stream_reasoning(ids, cuts), expected)
 
     def test_strict_mode_refuses_text_past_its_output_ids(self):
-        """Text beyond what the ids decode to has no source; strict fails on it
-        by the end of output. A character still held by the decoder, a special
-        token kept in the text and trimmed stop text are not unsourced."""
+        """Text the ids do not decode to has no source, whether it reads as a
+        held character or a special token; strict fails on it by the end of
+        output, one-shot or streamed in any chunking."""
         ids = self._ids(["a", "</think>"])
         text = self.tokenizer.decode(ids)
-        with self.assertRaises(ParserMatchError):
-            self._reasoning_parser("strict").parse_non_stream(
-                text + "UNBACKED", output_ids=ids
-            )
-        for chunks in ([([], "abc")], [(ids, text), ([], "UNBACKED")]):
-            with self.subTest(chunks=chunks):
-                parser = self._reasoning_parser("strict")
+        bc = self._ids(["a", "</think>", "bc"])
+        cases = {
+            "no ids, text": ([], "abc"),
+            "no ids, a held character": ([], "\ufffd"),
+            "no ids, a special token": ([], "<|assistant|>"),
+            "text past the ids": (ids, text + "UNBACKED"),
+            "no held bytes": (ids, text + "\ufffd" * 5),
+            "no special token id at the end": (ids, text + "<|user|>"),
+            "no special token id inside": (bc, text + "b<|user|>c"),
+        }
+        for name, (case_ids, case_text) in cases.items():
+            with self.subTest(name):
                 with self.assertRaises(ParserMatchError):
-                    for chunk_ids, chunk_text in chunks:
-                        parser.observe_stream_output_ids(chunk_ids, cumulative=False)
-                        parser.parse_stream_chunk(chunk_text)
-                    parser.parse_stream_end()
+                    self._reasoning_parser("strict").parse_non_stream(
+                        case_text, output_ids=case_ids
+                    )
+                for cuts in self._chunkings(case_ids):
+                    for cumulative in (False, True):
+                        with self.assertRaises(ParserMatchError):
+                            self._stream_reasoning(
+                                case_ids,
+                                cuts,
+                                "strict",
+                                text=case_text,
+                                cumulative=cumulative,
+                            )
         call = self._ids(
             self.CALL + ["<arg_value>", "x", "</arg_value>", "</tool_call>"]
         )
@@ -4304,33 +4342,65 @@ class TestGlmControlTokenIds(unittest.TestCase):
         with self.assertRaises(ParserMatchError):
             tool_parser.parse_stream_end()
 
-        held = self._ids(["a", "</think>", "b🦜"])[:-1]
-        self.assertTrue(self.tokenizer.decode(held).endswith("\ufffd"))
-        covered = {
-            "held character": (held, self.tokenizer.decode(held)),
-            "kept special token": (
-                self._ids(["a", "</think>", "b", "<|user|>"]),
-                text + "b<|user|>",
+    def test_held_bytes_and_special_tokens_source_the_end_of_text(self):
+        """At the end of output the text may show bytes of an unfinished
+        character, and special tokens the ids hold, in id order on either side;
+        stop text trimmed off is fine too. Strict parses them all in full."""
+        held = self._encode("\U0001f99c")[:-1]
+        self.assertEqual(self.tokenizer.decode(held), "\ufffd")
+        shown = "b\U0001f99c"
+        b = self._ids(["a", "</think>", shown])
+        assistant, user = self._ids(["<|assistant|>"]), self._ids(["<|user|>"])
+        held_text = shown + "\ufffd"
+        cases = {
+            "held character": (b + held, None, (held_text, held_text)),
+            "held character, special token": (
+                b + held + assistant,
+                None,
+                (held_text + "<|assistant|>", held_text),
             ),
-            "trimmed stop text": (self._ids(["a", "</think>", "b stop"]), text + "b"),
+            "special token, held character": (
+                b + assistant + held,
+                None,
+                (shown + "<|assistant|>\ufffd", held_text),
+            ),
+            "special token": (b + user, None, (shown + "<|user|>", shown)),
+            "trimmed stop text": (
+                b + self._encode(" stop"),
+                "a</think>" + shown,
+                (shown, shown),
+            ),
         }
-        for name, (covered_ids, covered_text) in covered.items():
-            with self.subTest(name):
-                self.assertEqual(
-                    self._reasoning_parser("strict").parse_non_stream(
-                        covered_text, output_ids=covered_ids
-                    )[0],
-                    "a",
-                )
-                for cuts in ([], list(range(1, len(covered_ids)))):
-                    parser = self._reasoning_parser("strict")
-                    bounds = [0, *cuts, len(covered_ids)]
-                    for start, end in zip(bounds, bounds[1:]):
-                        parser.observe_stream_output_ids(
-                            covered_ids[start:end], cumulative=False
-                        )
-                    parser.parse_stream_chunk(covered_text)
-                    parser.parse_stream_end()
+        for name, (case_ids, case_text, (kept, skipped)) in cases.items():
+            for skip_special_tokens, content in ((False, kept), (True, skipped)):
+                if case_text is None:
+                    text = self.tokenizer.decode(
+                        case_ids, skip_special_tokens=skip_special_tokens
+                    )
+                else:
+                    text = case_text
+                with self.subTest(name, skip_special_tokens=skip_special_tokens):
+                    self.assertEqual(
+                        self._reasoning_parser("strict").parse_non_stream(
+                            text, output_ids=case_ids
+                        ),
+                        ("a", content),
+                    )
+                    for cuts in self._chunkings(case_ids):
+                        for cumulative in (False, True):
+                            for stream_reasoning in (True, False):
+                                got = self._stream_reasoning(
+                                    case_ids,
+                                    cuts,
+                                    "strict",
+                                    text=text,
+                                    skip_special_tokens=skip_special_tokens,
+                                    cumulative=cumulative,
+                                    stream_reasoning=stream_reasoning,
+                                )
+                                self.assertEqual(
+                                    got, ("a", content), (cuts, cumulative)
+                                )
 
 
 class TestLing3Detector(unittest.TestCase):
