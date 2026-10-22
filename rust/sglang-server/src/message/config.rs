@@ -106,6 +106,14 @@ pub struct ServerArgs {
     /// `"default"` on the Python side, so it is present in every blob; `None`
     /// only when the blob omits the key.
     pub weight_version: Option<String>,
+    /// HiCache storage backend configured at startup.
+    pub hicache_storage_backend: Option<String>,
+    /// Backend-specific configuration as a JSON string.
+    pub hicache_storage_backend_extra_config: Option<String>,
+    /// Policy for prefetching cached entries from HiCache storage.
+    pub hicache_storage_prefetch_policy: Option<String>,
+    /// Write policy for the hierarchical cache.
+    pub hicache_write_policy: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
@@ -156,6 +164,11 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// What a `/generate` request that sends no `max_new_tokens` (and gets
+    /// none from `preferred_sampling_params`) asks for: Python's
+    /// `SamplingParams` default unless the launcher overrides it. `None` is
+    /// no limit, which the scheduler clamps to the context window.
+    pub default_max_new_tokens: Option<i64>,
     /// Native-generation launch policy normally applied by Python ingress.
     pub lora_ids: BTreeMap<String, String>,
     pub enable_strict_thinking: bool,
@@ -211,6 +224,10 @@ impl ServerArgs {
         revision,
         load_format,
         weight_version,
+        hicache_storage_backend,
+        hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy,
+        hicache_write_policy,
         host,
         port,
         grpc_port,
@@ -231,6 +248,7 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        default_max_new_tokens,
         lora_ids,
         enable_strict_thinking,
         limit_mm_data_per_request,
@@ -258,6 +276,10 @@ impl ServerArgs {
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
+        hicache_storage_backend: Option<String>,
+        hicache_storage_backend_extra_config: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
         host: String,
         port: u16,
         grpc_port: Option<u16>,
@@ -278,6 +300,7 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        default_max_new_tokens: Option<i64>,
         lora_ids: BTreeMap<String, String>,
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
@@ -303,6 +326,10 @@ impl ServerArgs {
             revision,
             load_format,
             weight_version,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
             host,
             port,
             grpc_port,
@@ -323,6 +350,7 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            default_max_new_tokens,
             lora_ids,
             enable_strict_thinking,
             limit_mm_data_per_request,
@@ -356,6 +384,10 @@ impl Default for ServerArgs {
             revision: None,
             load_format: None,
             weight_version: None,
+            hicache_storage_backend: None,
+            hicache_storage_backend_extra_config: None,
+            hicache_storage_prefetch_policy: None,
+            hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
@@ -376,6 +408,7 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),

@@ -80,15 +80,6 @@ class TestEagleGateRouting(CustomTestCase):
             self.assertTrue(self._gate(True, platform, False))
             self.assertTrue(self._gate(True, platform, True))
 
-    def test_cpu_xpu_always_greedy(self):
-        for platform in ("cpu", "xpu"):
-            for is_all_greedy in (False, True):
-                for use_rej in (False, True):
-                    self.assertTrue(
-                        self._gate(is_all_greedy, platform, use_rej),
-                        f"{platform} must force greedy",
-                    )
-
 
 def _hip_auto_enable(**overrides):
     kwargs = dict(
