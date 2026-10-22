@@ -971,7 +971,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.block_fp8_mxfp8_ready = True
 
     def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
-        """Let a FlashInfer layer also take a DeepGEMM-packed (fp8, scale) pair."""
+        """Pack the weight scale a FlashInfer layer needs for a DeepGEMM-packed input pair."""
         from sglang.srt.layers import deep_gemm_wrapper
 
         backend = self.mxfp8_dense_backend
@@ -1120,6 +1120,8 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+            if layer.deepgemm_mxfp8_input:
+                layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1318,7 +1320,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and x[1].dtype == torch.int32
             and not self.mxfp8_dense_backend.is_deep_gemm()
         ):
-            # DeepGEMM-packed scales (see prepare_deepgemm_mxfp8_input).
+            # DeepGEMM-packed activation scales; see LinearBase.deepgemm_mxfp8_input.
             return deepgemm_w8a8_mxfp8_linear_with_fallback(
                 x[0],
                 layer.weight,

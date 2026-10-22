@@ -1398,8 +1398,12 @@ class MQALayer(MqaAttentionBase):
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
         self.mega_wq_b_permuted = False
-        self.fused_mxfp8_wqkv_a = False
-        self.fused_mxfp8_wo_b = False
+        if self.use_mega_attention:
+            self.wo_b.deepgemm_mxfp8_input = (
+                self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            )
+            if self.fuse_wqa_wkv:
+                self.wqkv_a.deepgemm_mxfp8_input = True
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1465,26 +1469,9 @@ class MQALayer(MqaAttentionBase):
                 method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
-        self.fused_mxfp8_wqkv_a = (
-            self.fuse_wqa_wkv and self._prepare_deepgemm_mxfp8_input(self.wqkv_a)
-        )
-        self.fused_mxfp8_wo_b = (
-            self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
-            and self._prepare_deepgemm_mxfp8_input(self.wo_b)
-        )
-        if self.layer_id == 0:
-            logger.info(
-                "DSv4.1 fused MXFP8 producers: wqkv_a=%s wo_b=%s",
-                self.fused_mxfp8_wqkv_a,
-                self.fused_mxfp8_wo_b,
-            )
 
-    @staticmethod
-    def _prepare_deepgemm_mxfp8_input(linear) -> bool:
-        method = linear.quant_method
-        return isinstance(
-            method, Fp8LinearMethod
-        ) and method.prepare_deepgemm_mxfp8_input(linear)
+    def accepts_deepgemm_mxfp8_input(self) -> bool:
+        return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
 
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
@@ -1542,7 +1529,11 @@ class MQALayer(MqaAttentionBase):
         groups = self.n_local_groups
         rows = data.shape[0]
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
-        if allow_mxfp8_output and self.fused_mxfp8_wo_b and mhc.fused_mxfp8_rows(rows):
+        if (
+            allow_mxfp8_output
+            and self.wo_b.deepgemm_mxfp8_input
+            and mhc.fused_mxfp8_rows(rows)
+        ):
             y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
                 rows, groups * self.o_lora_rank, data.device
             )
