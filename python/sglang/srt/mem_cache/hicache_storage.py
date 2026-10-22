@@ -210,6 +210,28 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Dynamic implementations opt into DCP through class-level capabilities:
+    # mla_sharded, logical_page_indices, mamba_tp_sharded,
+    # exact_restorable_prefix_pages, draft_mla_sharded.
+    dcp_storage_capabilities: frozenset[str] = frozenset()
+
+    # A backend that registers host memory with a native client sets this so a
+    # failed close() keeps the backend around for a retried detach.
+    requires_explicit_memory_cleanup: bool = False
+
+    @classmethod
+    def validate_dcp_config(cls, storage_config, host_pools) -> None:
+        """Reject an incompatible topology, layout or pool set before __init__.
+
+        ``host_pools`` maps PoolName to the materialized host pools, including
+        sidecars registered after startup. Runs for every dynamic backend under
+        DCP and for opted-in backends at DCP1.
+        """
+        raise NotImplementedError(f"{cls.__name__} has not opted into DCP storage.")
+
+    def close(self) -> None:
+        """Release client resources on detach; default backends hold none."""
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host

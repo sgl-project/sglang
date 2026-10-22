@@ -1118,9 +1118,13 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
     class FakeStorageBackend:
         def __init__(self) -> None:
             self.registered: list[HostKVCache] = []
+            self.registered_v2: list[tuple[PoolName, HostKVCache]] = []
 
         def register_mem_pool_host(self, pool: HostKVCache) -> None:
             self.registered.append(pool)
+
+        def register_mem_host_pool_v2(self, pool: HostKVCache, name: PoolName) -> None:
+            self.registered_v2.append((name, pool))
 
         def on_host_pools_registered(self) -> None:
             pass
@@ -1160,6 +1164,7 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
     )
     controller = object.__new__(HiCacheController)
     controller.enable_storage = False
+    controller.storage_backend = None
     controller.storage_stop_event = threading.Event()
     controller.storage_host_pool = group.anchor_entry.host_pool
     controller.mem_pool_host = group
@@ -1179,6 +1184,7 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
     )
 
     assert backend.registered == [anchor]
+    assert backend.registered_v2 == [(PoolName.KV, anchor)]
     assert controller.page_get_func == controller._page_get_zero_copy
     assert controller.page_set_func == controller._page_set_zero_copy
 
