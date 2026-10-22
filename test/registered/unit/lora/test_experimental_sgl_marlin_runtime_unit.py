@@ -97,6 +97,14 @@ def test_cuda_only_kernel_imports_resolve():
     )
 
     imports: list[tuple[str, str]] = []
+    # The staged virtual helper is imported inside the entry, outside _is_cuda.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            == "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts"
+        ):
+            imports.extend((node.module, alias.name) for alias in node.names)
     for node in ast.walk(guarded[0]):
         assert not isinstance(node, ast.Import), (
             "plain `import X` inside the `if _is_cuda:` block is not covered by "
@@ -180,12 +188,14 @@ def _run_marlin_flow(
     ep: bool = False,
     slots: int = 1,
     rank: int = 1,
+    paired_prewarm: bool = True,
 ):
     """Run the real runner against recording fakes and return what it did
     (scheduling, stream ownership, buffer identity -- never kernel numerics)."""
 
     calls = SimpleNamespace(
         merged=[],
+        paired_prewarm=[],
         fused_tails=0,
         marlin_is_ep=[],
         marlin_sorted=[],
@@ -263,6 +273,46 @@ def _run_marlin_flow(
         return result
 
     monkeypatch.setattr(torch, "empty", poisoned_empty)
+    original_new_empty = torch.Tensor.new_empty
+
+    def tracked_new_empty(tensor, size, *args, **kwargs):
+        result = original_new_empty(tensor, size, *args, **kwargs)
+        calls.schedule.append(
+            ("allocate", stream_state["current"].name, tuple(size), id(result))
+        )
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", tracked_new_empty)
+
+    def prewarm_per_expert_lora_routes(
+        hidden,
+        shrink_a,
+        expand_b,
+        ids,
+        mapping,
+        routing_cache,
+        *,
+        shrink_lora_b,
+        adapter_enabled,
+        include_inactive_routes,
+        local_expert_offset,
+        local_num_experts,
+    ):
+        assert hidden is hidden_states
+        assert shrink_a is lora_info.down_lora_a_weights
+        assert expand_b is lora_info.gate_up_lora_b_weights
+        assert shrink_lora_b is lora_info.down_lora_b_weights
+        assert ids is topk_ids
+        assert mapping is lora_info.token_lora_mapping
+        assert isinstance(routing_cache, dict)
+        assert adapter_enabled is lora_info.adapter_enabled
+        assert include_inactive_routes is True
+        assert local_expert_offset == 0
+        assert local_num_experts == num_experts
+        assert stream_state["current"] is main_stream
+        calls.paired_prewarm.append(paired_prewarm)
+        calls.schedule.append(("paired_prewarm", "main", paired_prewarm))
+        return paired_prewarm
 
     def merged_experts_fused_moe_lora_add(**kwargs):
         intermediate = kwargs.get("intermediate_buffer")
@@ -293,6 +343,7 @@ def _run_marlin_flow(
         monkeypatch,
         "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts",
         merged_experts_fused_moe_lora_add=merged_experts_fused_moe_lora_add,
+        _prewarm_per_expert_lora_routes=prewarm_per_expert_lora_routes,
     )
     _stub_module(
         monkeypatch,
@@ -466,6 +517,45 @@ def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
     ]
     assert len(down_stage) == 1
     assert down_stage[0]["zero_intermediate"] is True
+
+
+@pytest.mark.parametrize("paired_prewarm", [False, True])
+def test_factored_prewarm_runs_on_main_before_rank_buffers_and_side_fork(
+    monkeypatch, paired_prewarm
+):
+    calls = _run_marlin_flow(
+        monkeypatch,
+        tokens=16,
+        two_stream=True,
+        capture=True,
+        paired_prewarm=paired_prewarm,
+    )
+    assert calls.paired_prewarm == [paired_prewarm]
+    paired_index = calls.schedule.index(("paired_prewarm", "main", paired_prewarm))
+    first_side_wait = next(
+        index
+        for index, item in enumerate(calls.schedule)
+        if item[:2] == ("wait_stream", "side")
+    )
+    activation_index = next(
+        index for index, item in enumerate(calls.schedule) if item[0] == "activation"
+    )
+    rank_allocations = [
+        (index, item)
+        for index, item in enumerate(calls.schedule)
+        if item[0] == "allocate" and item[2] in ((16, 2), (16, 2, 1))
+    ]
+    assert len(rank_allocations) == 2
+    assert all(item[1] == "main" for _, item in rank_allocations)
+    assert paired_index < min(index for index, _ in rank_allocations)
+    assert paired_index < first_side_wait < activation_index
+    routing = [call for call in calls.merged if call["stage"] == "routing"]
+    assert len(routing) == (0 if paired_prewarm else 2)
+    assert all(call["stream"] == "main" for call in routing)
+    assert [call["stage"] for call in calls.merged if call["stage"] != "routing"] == [
+        "expand",
+        "shrink",
+    ]
 
 
 def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifetime(
