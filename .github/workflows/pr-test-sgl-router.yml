@@ -271,15 +271,15 @@ jobs:
           echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
 
-  # Tier-2b — the Tair KVCache backend's live suite. The memory backend's
+  # tier-kv-indexer — the Tair KVCache backend's live suite. The memory backend's
   # tests run inside tier-2 through `cargo test --workspace`; this suite is
   # `#[ignore]`d because it needs a real Tair KVCache Manager, so this job
   # builds one from a pinned commit and runs the ignored tests against it.
   # The manager is built inside the project's own dev image (the host's newer
   # GCC turns boringssl warnings into errors), and the build cache is keyed on
   # the pinned SHA. The job sits behind the same gate as the other tiers.
-  sgl-router-tair-kvcache-live:
-    name: tier-2b — tair_kvcache live
+  sgl-router-kv-indexer:
+    name: tier-kv-indexer
     needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -331,6 +331,16 @@ jobs:
             ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1 \
             bash -lc 'bazelisk build //kv_cache_manager:kv_cache_manager_bin &&
                       cp -L bazel-bin/kv_cache_manager/kv_cache_manager_bin /out/'
+
+      # The binary tier-3 e2e drives with a real model; building it here keeps
+      # the H100 runner free of the build.
+      - name: Upload the manager binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcm-bin
+          path: ${{ runner.temp }}/kvcm-bin/kv_cache_manager_bin
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -493,7 +503,7 @@ jobs:
       - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
-      - sgl-router-tair-kvcache-live
+      - sgl-router-kv-indexer
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e

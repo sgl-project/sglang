@@ -497,8 +497,8 @@ MetaService, including one end-to-end pass behind the real `KVIndexer` service.
 
 `tests/test_tair_kvcache_live.rs` runs the backend against a real Tair KVCache
 Manager. It is `#[ignore]`d and gated on `TAIR_KVCACHE_LIVE_ENDPOINT`, so a
-normal `cargo test` never touches it. CI runs it in the `tier-2b — tair_kvcache
-live` job of `pr-test-sgl-router.yml`, which builds the manager at a pinned
+normal `cargo test` never touches it. CI runs it in the `tier-kv-indexer`
+job of `pr-test-sgl-router.yml`, which builds the manager at a pinned
 commit and executes the harness below; the other backend's tests need no such
 job because the in-memory backend has no external dependency.
 
