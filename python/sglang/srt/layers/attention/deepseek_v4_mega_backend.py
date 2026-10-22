@@ -18,6 +18,10 @@ def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
 
 
 def pack_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    if q.is_cuda:
+        from sglang.kernels.ops.attention.dsv4.mega_query import pack_query as pack
+
+        return pack(q, padded_heads)
     tokens, heads, _ = q.shape
     out = q.new_zeros(tokens, 32, padded_heads, 16)
     out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
@@ -78,9 +82,46 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
+        if (
+            q.shape[1] < 64
+            and q.shape[0] <= 16
+            and extra_k_cache is not None
+            and swa_k_cache.shape[-1] == 528
+            and extra_k_cache.shape[-1] == 288
+        ):
+            from sglang.kernels.ops.attention.dsv4.mega_gather import MegaGatherPlan
 
-        data, scale, _ = flash_mla_mega_decode(
+            key = (
+                q.shape[0],
+                swa_page_indices.shape[-1],
+                extra_indices.shape[-1],
+                q.device,
+            )
+            plans = self.__dict__.setdefault("_mega_gather_plans", {})
+            if key not in plans:
+                plans[key] = MegaGatherPlan(*key)
+            return plans[key].forward(
+                q,
+                swa_k_cache,
+                extra_k_cache,
+                swa_page_indices,
+                extra_indices,
+                swa_topk_lengths,
+                extra_topk_lengths,
+                positions,
+                cos_sin_cache,
+                self.softmax_scale,
+                attn_sink,
+            )
+        from sgl_kernel.flash_mla_mega import (
+            flash_mla_mega_decode,
+            flash_mla_mega_decode_unpacked,
+        )
+
+        operation = (
+            flash_mla_mega_decode_unpacked if q.shape[1] < 64 else flash_mla_mega_decode
+        )
+        data, scale, _ = operation(
             q,
             swa_k_cache,
             swa_page_indices,

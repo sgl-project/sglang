@@ -1,0 +1,63 @@
+--- a/csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp
++++ b/csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp
+@@ -52 +52,2 @@
+-    bool use_packed_ue8m0
++    bool use_packed_ue8m0,
++    bool unpacked_q = false
+@@ -68 +69,3 @@
+-    int h_q = q.size(1);
++    int input_heads = q.size(1);
++    int h_q = unpacked_q ? (input_heads <= 64 ? 64 : 128) : input_heads;
++    TORCH_CHECK(input_heads > 0 && input_heads <= h_q && input_heads % 8 == 0);
+@@ -96 +99 @@
+-    KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
++    KU_CHECK_SHAPE(q, s_q, input_heads, d_qk);
+@@ -168 +171,3 @@
+-        (uint32_t)int64_stride_to_int(out_sf.stride(2))
++        (uint32_t)int64_stride_to_int(out_sf.stride(2)),
++        unpacked_q,
++        (uint32_t)input_heads
+@@ -204 +209,2 @@
+-    bool use_packed_ue8m0
++    bool use_packed_ue8m0,
++    bool unpacked_q = false
+@@ -221 +227,3 @@
+-    int h_q = q.size(1);
++    int input_heads = q.size(1);
++    int h_q = unpacked_q ? (input_heads <= 64 ? 64 : 128) : input_heads;
++    TORCH_CHECK(input_heads > 0 && input_heads <= h_q && input_heads % 8 == 0);
+@@ -316 +324 @@
+-    KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
++    KU_CHECK_SHAPE(q, s_q, input_heads, d_qk);
+@@ -392 +400,3 @@
+-        (uint32_t)int64_stride_to_int(out_sf.stride(2))
++        (uint32_t)int64_stride_to_int(out_sf.stride(2)),
++        unpacked_q,
++        (uint32_t)input_heads
+--- a/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h
++++ b/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h
+@@ -50,0 +51,3 @@
++    // Read canonical TP-local queries directly, padding absent heads in registers.
++    bool unpacked_q;
++    uint32_t input_heads;
+--- a/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh
++++ b/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh
+@@ -271,5 +271,13 @@
+-                    KU_LDG_256(
+-                        q_token_base + h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q,
+-                        cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD,
+-                        ".nc", "no_allocate", "evict_first", "256B"
+-                    );
++                    bf16* destination = cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD;
++                    if (params.unpacked_q) {
++                        if (h_q_idx < params.input_heads) {
++                            KU_LDG_256(q_token_base + h_q_idx * params.stride_q_h_q + d_q_idx,
++                                destination, ".nc", "no_allocate", "evict_first", "256B");
++                        } else {
++                            reinterpret_cast<__int128_t*>(destination)[0] = 0;
++                            reinterpret_cast<__int128_t*>(destination)[1] = 0;
++                        }
++                    } else {
++                        KU_LDG_256(q_token_base + h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q,
++                            destination, ".nc", "no_allocate", "evict_first", "256B");
++                    }

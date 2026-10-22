@@ -447,6 +447,7 @@ struct TopKRadixBase : TopKConfig {
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
+    uint32_t ordered_warp_prefix[kNumWarps];
     float v_hi;
     float v_lo;
     union {
@@ -737,6 +738,37 @@ struct TopKRegister : TopKRadixBase<12> {
       __syncthreads();
     }
 
+    uint32_t local_gt = 0, local_eq = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        const auto val = local_vecs[i][j];
+        local_gt += val >= v_hi;
+        local_eq += val < v_hi && val >= v_lo;
+      }
+    }
+    // Resolve thread prefixes in warp-id order, not by atomic arrival order.
+    const auto lane = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+    const uint32_t local = (local_gt << 16) | local_eq;
+    const uint32_t warp_inc = warp::inclusive_sum(local, lane);
+    if (lane == kWarpSize - 1) smem->ordered_warp_prefix[warp_id] = warp_inc;
+    __syncthreads();
+    if (warp_id == 0) {
+      const uint32_t count = smem->ordered_warp_prefix[lane];
+      const uint32_t total = warp::inclusive_sum(count, lane);
+      smem->ordered_warp_prefix[lane] = total - count;
+      if (lane == kWarpSize - 1) {
+        smem->count_gt = total >> 16;
+        smem->count_eq = total & 0xFFFF;
+      }
+    }
+    __syncthreads();
+    const uint32_t before = smem->ordered_warp_prefix[warp_id] + warp_inc - local;
+    uint32_t next_gt = before >> 16, next_eq = before & 0xFFFF;
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
@@ -747,16 +779,14 @@ struct TopKRegister : TopKRadixBase<12> {
         const auto idx = base + j;
         const auto val = local_vecs[i][j];
         if (val >= v_hi) {
-          const auto pos = atomicAdd(&smem->count_gt, 1);
-          if (pos < topk) [[likely]] {
+          const auto pos = next_gt++;
+          if (pos < topk) [[likely]]
             problem.emit(pos, idx);
-          }
         } else if (val >= v_lo) {
-          const auto pos = atomicAdd(&smem->count_eq, 1);
+          const auto pos = next_eq++;
           if (zero_bin && __float_as_uint(val) != 0u) atomicOr(&smem->tie_nonzero, 1u);
-          if (pos < kMaxNumTie) [[likely]] {
+          if (pos < kMaxNumTie) [[likely]]
             smem->tie_values[pos] = {val, idx};
-          }
         }
       }
     }

@@ -1,0 +1,29 @@
+--- a/csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp
++++ b/csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp
+@@ -172 +171,0 @@
+-        unpacked_q,
+@@ -179 +178 @@
+-            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
++            if (unpacked_q) { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM, true}>(params); } else { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params); }
+@@ -401 +399,0 @@
+-        unpacked_q,
+@@ -408 +406 @@
+-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
++                if (unpacked_q) { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM, true}>(params); } else { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params); }
+@@ -410 +408 @@
+-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
++                if (unpacked_q) { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM, true}>(params); } else { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params); }
+@@ -412 +410 @@
+-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
++                if (unpacked_q) { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM, true}>(params); } else { sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params); }
+--- a/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h
++++ b/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h
+@@ -23,0 +24 @@
++    bool UNPACKED_Q = false;
+@@ -52 +52,0 @@
+-    bool unpacked_q;
+--- a/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh
++++ b/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh
+@@ -272 +272 @@
+-                    if (params.unpacked_q) {
++                    if constexpr (CONFIG.UNPACKED_Q) {

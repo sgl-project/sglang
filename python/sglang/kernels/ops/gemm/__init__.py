@@ -18,7 +18,10 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+        DualGemmActivationType,
+        DualGemmQuantMode,
+    )
 
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
@@ -259,12 +262,16 @@ def dual_gemm_swiglu_fp8(
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
     quant_mode: Optional["DualGemmQuantMode"] = None,
+    activation_type: Optional["DualGemmActivationType"] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
-    if quant_mode is None:
-        from .cutedsl_dual_gemm import DualGemmQuantMode
+    """Fuse FP8 gate/up projections, gated activation, and quantization."""
+    if quant_mode is None or activation_type is None:
+        from .cutedsl_dual_gemm import DualGemmActivationType, DualGemmQuantMode
 
-        quant_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
+        if quant_mode is None:
+            quant_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
+        if activation_type is None:
+            activation_type = DualGemmActivationType.SILU
     return get_kernel("gemm.dual_gemm_swiglu_fp8", KernelBackend.CUTE_DSL)(
         x,
         gate_up_weight,
@@ -272,16 +279,22 @@ def dual_gemm_swiglu_fp8(
         gate_up_weight_scale,
         output_scale,
         quant_mode,
+        activation_type,
     )
 
 
 def dual_gemm_swiglu(
     x: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    activation_type: Optional["DualGemmActivationType"] = None,
 ) -> torch.Tensor:
-    """Fuse BF16/FP16 gate/up projections followed by SwiGLU."""
+    """Fuse BF16/FP16 gate/up projections followed by a gated activation."""
+    if activation_type is None:
+        from .cutedsl_dual_gemm import DualGemmActivationType
+
+        activation_type = DualGemmActivationType.SILU
     return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
-        x, gate_up_weight
+        x, gate_up_weight, activation_type
     )
 
 

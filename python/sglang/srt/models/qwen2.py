@@ -101,7 +101,9 @@ class Qwen2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="silu"
+        )
 
     def forward(
         self,

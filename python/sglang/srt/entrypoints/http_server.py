@@ -2526,7 +2526,10 @@ def _wait_and_warmup(
             get_exec().moe.ep_join_mode,
         )
 
-    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+    run_server_warmup = (
+        not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup
+    )
+    if run_server_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
@@ -2534,7 +2537,10 @@ def _wait_and_warmup(
 
     if post_warmup_callback is not None:
         post_warmup_callback()
-    _freeze_gc_after_server_warmup(server_args)
+    # Automatic warmup waits for the listener. If it was skipped, a routed GC
+    # request can race server startup; external warmup owns the later freeze.
+    if run_server_warmup:
+        _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")

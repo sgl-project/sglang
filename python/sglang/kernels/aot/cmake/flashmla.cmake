@@ -7,6 +7,28 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# Keep the TP-local query load extension reproducible across clean builds.
+set(FLASHMLA_QUERY_SPECIALIZATION "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla_mega_query_specialization.patch")
+execute_process(COMMAND git apply --unidiff-zero --reverse --check "${FLASHMLA_QUERY_SPECIALIZATION}"
+    WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}" RESULT_VARIABLE FLASHMLA_QUERY_PATCH_APPLIED
+    OUTPUT_QUIET ERROR_QUIET)
+if(NOT FLASHMLA_QUERY_PATCH_APPLIED EQUAL 0)
+    foreach(FLASHMLA_QUERY_PATCH IN ITEMS
+            "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla_mega_unpacked_query.patch"
+            "${FLASHMLA_QUERY_SPECIALIZATION}")
+        execute_process(COMMAND git apply --unidiff-zero --reverse --check "${FLASHMLA_QUERY_PATCH}"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}" RESULT_VARIABLE FLASHMLA_QUERY_PATCH_APPLIED
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT FLASHMLA_QUERY_PATCH_APPLIED EQUAL 0)
+            execute_process(COMMAND git apply --unidiff-zero "${FLASHMLA_QUERY_PATCH}"
+                WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}" RESULT_VARIABLE FLASHMLA_QUERY_PATCH_RESULT)
+            if(NOT FLASHMLA_QUERY_PATCH_RESULT EQUAL 0)
+                message(FATAL_ERROR "Could not apply FlashMLA TP-local query patch")
+            endif()
+        endif()
+    endforeach()
+endif()
+
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass
@@ -166,6 +188,19 @@ if(FLASHMLA_ENABLE_SM100)
                 ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41_h${HEADS}_decode_${NORM}.cu
                 ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41fp4_h${HEADS}_decode_${NORM}.cu
             )
+            foreach(MODEL v4_prefill v4_decode v41_decode v41fp4_decode)
+                string(REPLACE "_" ";" MODEL_PARTS "${MODEL}")
+                list(GET MODEL_PARTS 0 MODEL_TYPE)
+                list(GET MODEL_PARTS 1 MODEL_PHASE)
+                set(QUERY_INSTANCE "${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/${MODEL_TYPE}_h${HEADS}_${MODEL_PHASE}_${NORM}.cu")
+                file(READ "${QUERY_INSTANCE}" QUERY_INSTANCE_SOURCE)
+                string(REPLACE "../kernel.h" "${FLASHMLA_MEGA_ROOT}/core_attn/kernel.h" QUERY_INSTANCE_SOURCE "${QUERY_INSTANCE_SOURCE}")
+                string(REPLACE "../kernel.cuh" "${FLASHMLA_MEGA_ROOT}/core_attn/kernel.cuh" QUERY_INSTANCE_SOURCE "${QUERY_INSTANCE_SOURCE}")
+                string(REGEX REPLACE "Config[{]([^}]+)[}]" "Config{\\1, true}" QUERY_INSTANCE_SOURCE "${QUERY_INSTANCE_SOURCE}")
+                set(QUERY_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/flashmla_mega_query/${MODEL}_h${HEADS}_${NORM}.cu")
+                file(GENERATE OUTPUT "${QUERY_GENERATED}" CONTENT "${QUERY_INSTANCE_SOURCE}")
+                list(APPEND FlashMLA_SOURCES "${QUERY_GENERATED}")
+            endforeach()
         endforeach()
     endforeach()
     list(APPEND FlashMLA_SOURCES

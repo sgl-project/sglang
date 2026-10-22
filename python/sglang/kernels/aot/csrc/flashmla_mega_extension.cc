@@ -79,6 +79,82 @@ sgl_flash_mla_mega_permute_q(const at::Tensor& weight, const at::Tensor& scale, 
   return permute_q_b_proj(weight, scale, static_cast<int>(heads), 512);
 }
 
+static std::vector<at::Tensor> sgl_flash_mla_mega_decode_unpacked(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    double sm_scale,
+    const at::Tensor& attn_sink,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length) {
+  TORCH_CHECK(
+      q.size(1) > 0 && q.size(1) <= 64 && q.size(1) % 8 == 0,
+      "Unpacked MegaAttention requires 8..64 query heads in groups of eight");
+  TORCH_CHECK(attn_sink.numel() == 64, "Unpacked MegaAttention requires 64 padded sink heads");
+  return fused_norm_rope_attn_rope_cast_decode(
+      q,
+      kv,
+      indices,
+      static_cast<float>(sm_scale),
+      512,
+      attn_sink,
+      topk_length,
+      extra_kv,
+      extra_indices,
+      extra_topk_length,
+      false,
+      0.0f,
+      positions,
+      false,
+      64,
+      cos_sin_cache,
+      8,
+      32,
+      true,
+      true,
+      true,
+      true);
+}
+
+static std::vector<at::Tensor> sgl_flash_mla_mega_prefill_unpacked(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    double sm_scale,
+    const at::Tensor& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  TORCH_CHECK(
+      q.size(1) > 0 && q.size(1) <= 64 && q.size(1) % 8 == 0,
+      "Unpacked MegaAttention requires 8..64 query heads in groups of eight");
+  TORCH_CHECK(attn_sink.numel() == 64, "Unpacked MegaAttention requires 64 padded sink heads");
+  return fused_norm_rope_attn_rope_cast_fwd(
+      q,
+      kv,
+      indices,
+      static_cast<float>(sm_scale),
+      512,
+      attn_sink,
+      topk_length,
+      false,
+      0.0f,
+      positions,
+      false,
+      64,
+      cos_sin_cache,
+      8,
+      32,
+      true,
+      true,
+      true,
+      true);
+}
+
 static std::vector<at::Tensor> sgl_flash_mla_mega_permute_wo(const at::Tensor& weight, const at::Tensor& scale) {
   return permute_wv_proj(weight, scale, 8, 512);
 }
@@ -93,6 +169,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float sm_scale, int n_wv_group, Tensor? attn_sink=None, Tensor? topk_length=None, "
       "Tensor? extra_kv=None, Tensor? extra_indices=None, Tensor? extra_topk_length=None) -> Tensor[]");
   m.impl("flash_mla_mega_decode", torch::kCUDA, &sgl_flash_mla_mega_decode);
+  m.def(
+      "flash_mla_mega_decode_unpacked(Tensor q, Tensor kv, Tensor indices, Tensor positions, Tensor cos_sin_cache, "
+      "float sm_scale, Tensor attn_sink, Tensor? topk_length=None, Tensor? extra_kv=None, "
+      "Tensor? extra_indices=None, Tensor? extra_topk_length=None) -> Tensor[]");
+  m.impl("flash_mla_mega_decode_unpacked", torch::kCUDA, &sgl_flash_mla_mega_decode_unpacked);
+  m.def(
+      "flash_mla_mega_prefill_unpacked(Tensor q, Tensor kv, Tensor indices, Tensor positions, Tensor cos_sin_cache, "
+      "float sm_scale, Tensor attn_sink, Tensor? topk_length=None) -> Tensor[]");
+  m.impl("flash_mla_mega_prefill_unpacked", torch::kCUDA, &sgl_flash_mla_mega_prefill_unpacked);
   m.def("flash_mla_mega_permute_q(Tensor weight, Tensor scale, int heads) -> Tensor[]");
   m.impl("flash_mla_mega_permute_q", torch::kCUDA, &sgl_flash_mla_mega_permute_q);
   m.def("flash_mla_mega_permute_wo(Tensor weight, Tensor scale) -> Tensor[]");
