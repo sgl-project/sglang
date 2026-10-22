@@ -3073,10 +3073,8 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIn("error", chunks[0])
 
     def test_streaming_abort_before_any_output_answers_with_its_status(self):
-        """A scheduler abort that arrives before the first output (queue full,
-        waiting timeout, validation) carries an HTTP status; the streaming
-        handler must answer with that status, as the non-streaming path does,
-        instead of a 200 whose body is one error event."""
+        """A pre-first-output abort carries an HTTP status; answer with it,
+        as the non-streaming path does."""
         err_msg = "The request queue is full."
         err_code = HTTPStatus.SERVICE_UNAVAILABLE
 
