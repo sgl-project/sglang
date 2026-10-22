@@ -158,7 +158,7 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
         MoriEPNormalDispatchOutput,
     )
 
-    fake_utils = ModuleType("sglang.kernels.ops.moe.rocm_moe_utils")
+    fake_utils = ModuleType("sglang.kernels.ops.quantization.rocm_upscale")
     fake_utils.upscale = None
     fake_utils.upscale_mxfp4 = None
     monkeypatch.setitem(sys.modules, fake_utils.__name__, fake_utils)

@@ -94,7 +94,7 @@ from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FA
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
-    _set_capture_lora_variant,
+    capture_lora_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -216,6 +216,11 @@ def build_replay_fb_view(
     )
 
 
+def _lora_backend_skips_inactive(model_runner) -> bool:
+    manager = model_runner.lora_manager
+    return manager is not None and manager.lora_backend.skip_inactive_dense_lora
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -237,7 +242,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        # Inactive dense LoRA batches replay a separate base-only graph.
+        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
+            model_runner
+        )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -334,14 +342,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
-        if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
-            self.capture_bs = sorted(
-                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
-            )
-            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -402,7 +402,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+            self.model_runner.lora_manager.init_decode_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_req=self.captured_req_width,
             )
@@ -1115,6 +1115,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        with self.model_context():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1191,11 +1195,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
-        lora_variants = (
-            [("lora", True), ("nolora", False)]
-            if self.record_nolora_graph
-            else [(None, None)]
-        )
+        lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
         variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
@@ -1211,26 +1211,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                for attention_variant in attention_variants:
-                    _set_capture_attention_variant(attention_variant)
-                    self._set_profile_trace_tag(
-                        bs, stream_idx, variant_label, attention_variant
-                    )
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=get_parallel().tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
+            for variant_label in lora_variants:
+                with capture_lora_variant(variant_label):
+                    for attention_variant in attention_variants:
+                        _set_capture_attention_variant(attention_variant)
+                        self._set_profile_trace_tag(
+                            bs, stream_idx, variant_label, attention_variant
                         )
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=get_parallel().tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                            )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1257,7 +1257,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+        ):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -1266,65 +1268,69 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook. The unified memory pool
-                # records ZERO translate nodes here: all its read/write translates
-                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
-                # the captured graph reads already-physical locs. Base no-op for triton.
-                attn_backend.init_forward_metadata_in_graph(forward_batch)
-                self._record_in_graph_metadata_prep_done()
-
-                # No invalidate_loc_cache() here: the unified pool translates its
-                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
-
-                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
-                    None
-                )
-                set_dp_buffer_len(
-                    forward_batch.global_dp_buffer_len,
-                    num_tokens,
-                    forward_batch.dp_padding_mode.is_max_len(),
-                    forward_batch.global_num_tokens_cpu,
-                )
-                set_is_extend_in_batch(False)
-
-                kwargs = {}
-                if (
-                    self.pp_size > 1
-                    and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                # Debug replay retains this callback beyond the capture scope.
+                with forward_context(
+                    ForwardContext(attn_backend=attn_backend),
+                    forward_batch=forward_batch,
                 ):
-                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                    )
-                if (
-                    (
-                        self.dllm_uses_input_embeds
-                        or (
-                            self.model_runner.spec_algorithm.is_dflash_family()
-                            and self.model_runner.is_draft_worker
-                        )
-                    )
-                    and "input_embeds" in inspect.signature(forward).parameters
-                    and not hasattr(self.model_runner.model, "forward_embed")
-                ):
-                    if self.dllm_input_preparation is None:
-                        kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
-                    else:
-                        state = self.buffer_registry.get_slot(
-                            "dllm_input_preparation_state"
-                        ).buffer[:num_tokens]
-                        kwargs["input_embeds"] = self.dllm_input_preparation(
-                            self.model_runner.model, forward_batch.input_ids, state
-                        )
+                    if forward_batch.lora_ids is not None:
+                        self.model_runner.lora_manager.reset_routing_cache()
+                    # Backends may gather live pool mappings into their static
+                    # metadata here; these nodes run before any model KV reads.
+                    attn_backend.init_forward_metadata_in_graph(forward_batch)
+                    self._record_in_graph_metadata_prep_done()
 
-                out = forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
-                for capture_hook in self.model_runner.capture_tail_hooks:
-                    capture_hook(self, out, forward_batch, num_tokens)
-                return out
+                    forward_batch.dp_local_start_pos = (
+                        forward_batch.dp_local_num_tokens
+                    ) = None
+                    set_dp_buffer_len(
+                        forward_batch.global_dp_buffer_len,
+                        num_tokens,
+                        forward_batch.dp_padding_mode.is_max_len(),
+                        forward_batch.global_num_tokens_cpu,
+                    )
+                    set_is_extend_in_batch(False)
+
+                    kwargs = {}
+                    if (
+                        self.pp_size > 1
+                        and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                    ):
+                        kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                            {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                        )
+                    if (
+                        (
+                            self.dllm_uses_input_embeds
+                            or (
+                                self.model_runner.spec_algorithm.is_dflash_family()
+                                and self.model_runner.is_draft_worker
+                            )
+                        )
+                        and "input_embeds" in inspect.signature(forward).parameters
+                        and not hasattr(self.model_runner.model, "forward_embed")
+                    ):
+                        if self.dllm_input_preparation is None:
+                            kwargs["input_embeds"] = self.buffers.input_embeds[
+                                :num_tokens
+                            ]
+                        else:
+                            state = self.buffer_registry.get_slot(
+                                "dllm_input_preparation_state"
+                            ).buffer[:num_tokens]
+                            kwargs["input_embeds"] = self.dllm_input_preparation(
+                                self.model_runner.model, forward_batch.input_ids, state
+                            )
+
+                    out = forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                    for capture_hook in self.model_runner.capture_tail_hooks:
+                        capture_hook(self, out, forward_batch, num_tokens)
+                    return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
@@ -1606,7 +1612,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
-        with timer_ctx, self.backend.replay_session():
+        with self.model_context(), timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
