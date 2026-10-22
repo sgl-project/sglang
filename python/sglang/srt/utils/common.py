@@ -4117,9 +4117,7 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif moe_a2a_backend.is_none():
             return True
-        elif (
-            get_moe_a2a_backend().is_flashinfer() or get_moe_a2a_backend().is_mscclpp()
-        ):
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mscclpp():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks

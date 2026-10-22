@@ -350,24 +350,7 @@ def pre_permute_mscclpp_latency_expert_major_to_triton(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TritonRunnerInput:
-    """Bridge an MSCCL++ EP latency dispatch output into the Triton runner.
-
-    Latency dispatch leaves a *padded expert-major* buffer ``hidden_states``
-    [num_local_experts, slots_per_expert, hidden] together with ``masked_m``
-    [num_local_experts] (the number of valid slots per local expert). The Triton
-    fused kernel is token-major, so we flatten the buffer to
-    [num_local_experts * slots_per_expert, hidden] and synthesise a ``top_k=1``
-    routing table: row ``e * slots_per_expert + j`` maps to *local* expert ``e``
-    for the first ``masked_m[e]`` slots and to ``-1`` (padding) otherwise.
-    ``TritonRunnerCore.run`` sets ``filter_expert=True`` (global ``num_experts``
-    != ``num_local_experts``), so the kernel skips the ``-1`` padding slots and
-    processes every valid slot exactly once.
-
-    Weighting is the mirror image of the HT path: the MSCCL++ latency *combine*
-    applies the routing weights, so the GEMM here runs with **unit** weights. The
-    kernel still applies ``routed_scaling_factor`` (per-slot, top_k=1), and the
-    combine applies ``topk_weights``, so each is applied exactly once.
-    """
+    """Use unit routing weights in GEMM; MSCCL++ combine applies the real weights."""
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         _prepare_fused_moe_run,
     )
@@ -385,27 +368,20 @@ def pre_permute_mscclpp_latency_expert_major_to_triton(
     num_local_experts, slots_per_expert, hidden_dim = hidden_states.shape
     device = hidden_states.device
 
-    # Flatten the masked expert-major buffer into token-major rows.
     hidden_flat = hidden_states.reshape(
         num_local_experts * slots_per_expert, hidden_dim
     )
 
-    # Synthetic top_k=1 routing in *local* expert space: expert ``e`` owns slots
-    # ``[0, masked_m[e])``; the remaining padding slots are tagged ``-1`` so the
-    # kernel's ``filter_expert`` path skips them. Use ``int32`` to match the
-    # standard SGLang topk output dtype (``moe_align_block_size`` and the
-    # activation kernel both require ``int32`` expert ids).
+    # Each dispatched slot already belongs to one expert.
+    # Alignment and activation kernels require int32 expert IDs.
     slot_arange = torch.arange(slots_per_expert, device=device).unsqueeze(0)
     valid = slot_arange < masked_m.to(torch.long).unsqueeze(1)
     expert_col = torch.arange(
         num_local_experts, device=device, dtype=torch.int32
     ).unsqueeze(1)
-    # ``torch.tensor(-1, device=...)`` builds the sentinel from a host scalar,
-    # which triggers an illegal CPU->CUDA copy during CUDA graph capture. Create
-    # the ``-1`` padding value on-device so ``torch.where`` stays capture-safe.
+    # Build padding IDs on-device to avoid host copies during CUDA graph capture.
     pad_id = expert_col.new_full((), -1)
     triton_topk_ids = torch.where(valid, expert_col, pad_id).reshape(-1, 1)
-    # Unit weights: latency combine re-applies the real routing weights.
     triton_topk_weights = torch.ones(
         (num_local_experts * slots_per_expert, 1),
         dtype=torch.float32,
@@ -460,17 +436,7 @@ def post_permute_triton_to_mscclpp_latency_expert_major(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> MSCCLPPExpertMajorLatencyCombineInput:
-    """Package the Triton runner output for the MSCCL++ EP latency combine.
-
-    The kernel produced a flat [num_local_experts * slots_per_expert, hidden]
-    output (one row per slot, ``routed_scaling_factor`` already applied, unit
-    routing weight). We reshape it back to the masked expert-major buffer
-    [num_local_experts, slots_per_expert, hidden] that ``low_latency_combine``
-    consumes. Padding-slot rows are ignored by the combine (it gathers only the
-    valid slots recorded in the dispatch handle), so their contents do not
-    matter. The combine applies ``topk_weights`` itself, so no weighting is done
-    here.
-    """
+    """Leave routing weights to MSCCL++ combine; routed scaling is already applied."""
     from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
         MSCCLPPExpertMajorLatencyCombineInput,
     )

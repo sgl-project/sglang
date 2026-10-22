@@ -36,23 +36,9 @@ class _MSCCLPPDispatcherImplBase(ABC):
 
 
 class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
-    """MSCCL++ EP low-latency all-to-all implementation.
+    """Share MSCCL++ latency resources across layers to bound memory use."""
 
-    * :meth:`dispatch` runs ``MoECommunicator.dispatch`` to scatter each token to
-      the ranks owning its top-k experts and returns an
-      :class:`MSCCLPPLatencyDispatchOutput`. Triton uses padded expert-major output;
-      FlashInfer CUTLASS uses the communicator's fixed rank-major buffers.
-    * :meth:`combine` runs ``MoECommunicator.combine`` to reduce the per-slot
-      expert outputs back to each source token.
-
-    Expert-major combine applies routing weights from the handle, so Triton runs
-    with unit weights. Rank-major CUTLASS applies weights while producing one
-    rank-local partial per row, which combine reduces on the source rank without
-    applying weights again.
-    """
-
-    # One heavy resource set per (group, geometry, capacity, layout), reused by
-    # every MoE layer. Static buffer addresses are also required by CUDA graphs.
+    # Stable buffer addresses are required for CUDA graph replay.
     _shared_resources: ClassVar[
         dict[
             tuple[
@@ -84,13 +70,13 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     @classmethod
     def _resolve_prefill_capacity(
         cls,
-        chunked_prefill_size: int,
+        prefill_buffer_tokens: int,
         attn_tp_size: int,
     ) -> int:
-        """Resolve the per-rank prefill capacity from the chunk size."""
+        """Resolve the per-rank prefill capacity from the buffer ceiling."""
         return cls._resolve_capacity_per_attention_tp(
-            chunked_prefill_size,
-            attn_tp_size,
+            num_tokens=prefill_buffer_tokens,
+            attn_tp_size=attn_tp_size,
         )
 
     @classmethod
@@ -193,19 +179,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             raise RuntimeError("MSCCL++ EP low-latency runtime is unavailable")
         moe_comm.initialize()
 
-        if output_layout == MSCCLPPEPLayout.RANK_MAJOR:
-            dispatch_output_buffer = moe_comm.get_dispatch_output_buffer()
-        else:
-            dispatch_output_buffer = torch.empty(
-                (
-                    num_local_experts,
-                    num_ranks * allocation_capacity,
-                    hidden_size,
-                ),
-                dtype=torch.bfloat16,
-                device=torch.device("cuda", torch.cuda.current_device()),
-            )
-
+        dispatch_output_buffer = moe_comm.get_dispatch_output_buffer()
         resources = (ep_group, moe_comm, dispatch_output_buffer, num_ranks)
         cls._shared_resources[key] = resources
         return resources
@@ -231,18 +205,23 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     ):
         if not isinstance(output_layout, MSCCLPPEPLayout):
             raise TypeError("output_layout must be an MSCCLPPEPLayout")
-        from sglang.srt.runtime_context import get_parallel, get_schedule
+        from sglang.srt.runtime_context import get_parallel, max_prefill_buffer_tokens
 
         parallel = get_parallel()
         self._attn_tp_size = int(parallel.attn_tp_size)
         self._prefill_capacity = self._resolve_prefill_capacity(
-            int(get_schedule().chunked_prefill_size),
-            self._attn_tp_size,
+            prefill_buffer_tokens=max_prefill_buffer_tokens(),
+            attn_tp_size=self._attn_tp_size,
         )
         self._decode_capacity = self._resolve_runtime_decode_capacity(
             self._attn_tp_size
         )
-        self._allocation_capacity = max(self._prefill_capacity, self._decode_capacity)
+        self._allocation_capacity = max(
+            0, self._prefill_capacity, self._decode_capacity
+        )
+
+        if self._allocation_capacity == 0:
+            raise ValueError("MSCCLPP Allocation capacity must be greater than 0")
 
         self.router_topk = router_topk
         self.num_experts = num_experts
@@ -257,8 +236,6 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         )
         num_blocks = (130, 32) if self.overlap_enabled else None
 
-        # Allocating these capacity-scaled resources per layer would OOM large
-        # MoE models, so Latency implementations with identical geometry share them.
         (
             self._ep_group,
             self._moe_comm,
@@ -276,11 +253,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             num_blocks,
         )
 
-        # The DispatchHandle produced by dispatch and consumed by combine
-        # (carries topk_ids / topk_weights / scatter metadata). Reset after each
-        # combine, analogous to DeepEP's ``self.handle``. Kept per-instance: MoE
-        # layers run sequentially, so each layer's dispatch->combine pair owns
-        # the shared communicator for the duration of its forward.
+        # Keep handles per layer so combine uses the matching dispatch metadata.
         self._combine_handle = None
         self._active_capacity = None
 
@@ -316,12 +289,7 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
             hidden_states,
             topk_ids,
             topk_weights,
-            output_buffer=self._dispatch_output_buffer,
-            runtime_max_tokens_per_rank=(
-                active_capacity
-                if self.output_layout == MSCCLPPEPLayout.RANK_MAJOR
-                else None
-            ),
+            runtime_max_tokens_per_rank=active_capacity,
         )
         self._combine_handle = handle
         self._active_capacity = active_capacity

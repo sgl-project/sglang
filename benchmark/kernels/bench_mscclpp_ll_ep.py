@@ -23,7 +23,6 @@ synchronization costs from router-induced expert load imbalance.
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import statistics
@@ -57,7 +56,7 @@ from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import publish_build_topology
 
 DTYPE = torch.bfloat16
-MSCCLPP_LL_HIDDEN_SIZES = (4096, 4352, 5120, 6656, 7168, 8192, 8704, 9216)
+MSCCLPP_LL_HIDDEN_SIZES = (1024, 2048, 4096, 4352, 6656, 7168, 8192, 8704, 9216)
 
 
 class BenchmarkConfig(msgspec.Struct, frozen=True):
@@ -795,7 +794,6 @@ def run_rank_major(
                 del pipeline
                 if a2a_backend == MoeA2ABackend.MSCCLPP:
                     MSCCLPPDispatcher.clear_shared_resources()
-                gc.collect()
                 torch.cuda.empty_cache()
                 clear_flashinfer_cutlass_autotune()
                 synchronize()
@@ -999,7 +997,6 @@ def run_expert_major(
             mscclpp.close()
             del mscclpp
             MSCCLPPDispatcher.clear_shared_resources()
-            gc.collect()
             torch.cuda.empty_cache()
             synchronize()
     del benchmark_stream
@@ -1084,7 +1081,6 @@ def main() -> None:
     finally:
         # Destroy cached C++ communication runtimes before the process group.
         MSCCLPPDispatcher.clear_shared_resources()
-        gc.collect()
         torch.cuda.synchronize()
         destroy_model_parallel()
         if dist.is_initialized():

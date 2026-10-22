@@ -493,6 +493,31 @@ def initialize_moe_config():
     moe.mscclpp_ep_layout = MSCCLPPEPLayout(exec_moe.mscclpp_ep_layout)
     if moe.a2a_backend.is_mscclpp():
         get_mscclpp_ep_layout()
+        mscclpp_supported_configs = (
+            (
+                MSCCLPPMode.LATENCY,
+                MSCCLPPEPLayout.RANK_MAJOR,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+            ),
+            (
+                MSCCLPPMode.LATENCY,
+                MSCCLPPEPLayout.EXPERT_MAJOR,
+                MoeRunnerBackend.TRITON,
+            ),
+        )
+        if (
+            moe.mscclpp_mode,
+            moe.mscclpp_ep_layout,
+            moe.runner_backend,
+        ) not in mscclpp_supported_configs:
+            raise ValueError(
+                "MSCCL++ requires --mscclpp-mode latency with either "
+                f"--mscclpp-ep-layout rank_major --moe-runner-backend flashinfer_cutlass "
+                f"or --mscclpp-ep-layout expert_major --moe-runner-backend triton. "
+                f"Got --mscclpp-mode {moe.mscclpp_mode.value}, "
+                f"--mscclpp-ep-layout {moe.mscclpp_ep_layout.value}, "
+                f"--moe-runner-backend {moe.runner_backend.value}."
+            )
     moe.deepep_config = exec_moe.deepep_config or ""
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
