@@ -226,6 +226,12 @@ class MegaMoeTunedForward:
         if context.records.get(profile_key) != knobs:
             context.records[profile_key] = knobs
             context.dirty = True
+        # Restore tuple-valued knobs after AutoTuner's JSON round trip, as
+        # FlashInfer's native cache loader does.
+        knobs = {
+            key: tuple(value) if isinstance(value, list) else value
+            for key, value in knobs.items()
+        }
         workspace = mega.create_workspace(capacity, knobs=knobs)
         mega.warmup(profile_inputs, workspace=workspace)
         self.workspaces[capacity] = workspace

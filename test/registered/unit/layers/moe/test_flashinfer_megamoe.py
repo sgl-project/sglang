@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -226,8 +227,13 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    initial_knobs = {"native_tactic": 7}
-    retuned_knobs = {"native_tactic": 11}
+    initial_knobs = {
+        "native_tactic": 7,
+        "mma_tiler_mnk": (256, 128, 256),
+        "cluster_shape_mnk": (2, 1, 1),
+        "epi_flag_batch": (2, 4),
+    }
+    retuned_knobs = {**initial_knobs, "native_tactic": 11}
     tuning_results = []
     namespace = "sglang_flashinfer_megamoe_knobs_v1"
     events = []
@@ -291,7 +297,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache
         ),
         publish_namespaced_records=Mock(
             side_effect=lambda namespace, values: records.__setitem__(
-                namespace, values.copy()
+                namespace, json.loads(json.dumps(values))
             )
         ),
     )
@@ -324,7 +330,9 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache
         expected_knobs = (
             retuned_knobs if phase and not keep_persistent_cache else initial_knobs
         )
-        assert list(records[namespace].values()) == [expected_knobs]
+        assert list(records[namespace].values()) == [
+            json.loads(json.dumps(expected_knobs))
+        ]
         assert tuner.get_namespaced_records.call_count == phase + 1
         tuner.get_namespaced_records.assert_called_with(namespace)
 
