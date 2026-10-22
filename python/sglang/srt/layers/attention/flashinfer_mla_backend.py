@@ -240,12 +240,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     # graphs key their wrappers by token tier (_verify_graph_key).
     supports_ragged_verify_graph: bool = True
 
+    # The draft step a multi-step draft backend runs this instance for; None
+    # for every other use.
+    speculative_step_id: Optional[int] = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        speculative_step_id: Optional[int] = None,
     ):
         super().__init__()
 
@@ -255,6 +260,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         # The paged MLA wrappers fix the mask when they plan a batch.
         self.causal = _planned_causal(model_runner.model)
+        self.speculative_step_id = speculative_step_id
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -450,6 +456,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 ragged_verify_layout=ragged_layout,
             )
 
+    def _draft_step_tokens(self, forward_mode: ForwardMode) -> int:
+        """Tokens a draft step's decode reads past the committed prefix: the
+        earlier steps' drafts and its own, which `draft_forward` writes but
+        keeps out of `seq_lens`."""
+        if self.speculative_step_id is None or not forward_mode.is_decode_or_idle():
+            return 0
+        return self.speculative_step_id + 1
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -457,6 +471,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
+                spec_info=(
+                    forward_batch.spec_info
+                    if self.speculative_step_id is not None
+                    else None
+                ),
                 req_pool_indices=forward_batch.req_pool_indices,
                 plan=forward_batch.iteration_ids,
             )
@@ -587,7 +606,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
+            step_tokens = self._draft_step_tokens(forward_mode)
+            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32) + step_tokens
             update_local_kv_lens_for_dcp(kv_len_arr_cpu)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
@@ -1220,6 +1240,10 @@ class FlashInferMLAMultiStepDraftBackend:
     draft decoding steps.
     """
 
+    # Whether the step backends build their own rank-local DCP metadata. These
+    # plan the packed draft indices as built: global, not sharded to the rank.
+    supports_dcp: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1229,6 +1253,14 @@ class FlashInferMLAMultiStepDraftBackend:
         if topk > 1:
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+            )
+        if get_parallel().dcp_enabled and not self.supports_dcp:
+            raise ValueError(
+                "FlashInfer MLA's multi-step draft decode does not support decode "
+                f"context parallelism (--dcp-size {get_parallel().attn_dcp_size}): "
+                "its draft steps would read KV rows that other ranks own. Drop "
+                "--dcp-size, or run the draft on cutedsl_mla "
+                "(--speculative-draft-attention-backend cutedsl_mla)."
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -1258,6 +1290,7 @@ class FlashInferMLAMultiStepDraftBackend:
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     q_indptr_decode_buf=self.q_indptr_decode,
+                    speculative_step_id=i,
                 )
             )
 
