@@ -2093,6 +2093,16 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
+    if (
+        envs.SGLANG_ENABLE_NPU_IMAGE_DECODE.get()
+        and is_npu()
+        and gpu_image_decode is True
+    ):
+        from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
+
+        image_tensor = decode_jpeg(image_bytes)
+        if image_tensor is not None:
+            return image_tensor
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":

@@ -18,6 +18,11 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
+      <td><code>SGLANG_ENABLE_NPU_IMAGE_DECODE</code></td>
+      <td>Enable DVPP JPEG decoding and Triton RGB conversion for tensor-capable image processors. See the JPEG decoding section below.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>
@@ -44,6 +49,44 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
   </tbody>
 </table>
+
+## Opt-in NPU JPEG decoding
+
+On Linux Ascend NPU systems, you can enable device JPEG decoding independently of the existing CUDA path. The switch is off by default and does not choose a backend based on image size, concurrency, or predicted performance.
+
+### Install and enable
+
+Follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) to provision compatible CANN, `torch`, `torch_npu`, and Triton-Ascend packages. CANN must expose the Python `acl.media` JPEGD API. Keep the NPU package versions matched; the CUDA dependencies in the default Python project are not a replacement for the NPU environment.
+
+If you already have a working NPU SGLang environment, install your checkout without replacing its accelerator dependencies:
+
+```bash
+SGLANG_BUILD_RUST_EXTS=none python -m pip install --no-deps --no-build-isolation -e python
+```
+
+This source-install command requires the build dependencies from the NPU installation guide. It disables optional Rust builds; it does not install or validate missing runtime dependencies.
+
+Set `MODEL_PATH` to your local Qwen2.5-VL-3B-Instruct directory and start a single-NPU service:
+
+```bash
+export SGLANG_ENABLE_NPU_IMAGE_DECODE=1
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --served-model-name jpeg-study \
+  --device npu --attention-backend ascend --mm-attention-backend ascend_attn \
+  --dtype bfloat16 --host 127.0.0.1 --port 30000
+```
+
+You can then send an image request using the [multimodal chat example](/docs/hardware-platforms/ascend-npus/getting-started/quick_start#multimodal-chat-completions), with `model` set to `jpeg-study`. To disable device JPEG decoding, set `SGLANG_ENABLE_NPU_IMAGE_DECODE=0` and restart the service. Unsetting the variable also restores the default behavior.
+
+### Supported inputs and behavior
+
+- The device path accepts baseline, three-component YCbCr 4:2:0 JPEGs with even width and height from 32 through 8192. Complete JPEG candidates must be at most 32 MiB and 16,777,216 pixels; exceeding those limits raises an error. These are device-path checks, not new limits on every existing PIL input.
+- PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
+- Processors that disable tensor decoding or request `nvjpeg_fancy` retain their existing loading behavior. Enabling this variable does not override those processor settings.
+- Eligible images use DVPP JPEGD followed by the Triton full-range BT.601 conversion with nearest-neighbor chroma upsampling. The result is a contiguous `uint8` CHW tensor on the worker's current NPU. This color policy can differ from PIL or high-fidelity nvJPEG upsampling.
+- Device execution failures are surfaced as request errors, rather than silently reported as successful CPU decoding. Decoder contexts belong to their worker threads; the backend does not reset or finalize a caller-owned NPU runtime.
+
+Validation is scoped to the single-NPU Qwen2.5-VL-3B-Instruct setup and the recorded JPEG contracts. It does not establish all-model compatibility or a performance improvement for every workload.
 
 ## Used in DeepEP Ascend
 
