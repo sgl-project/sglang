@@ -63,14 +63,17 @@ class RemoteInstanceWeightTransporter:
         ).to_host_port_str()
 
     def maybe_init_parallelism_config(self) -> None:
-        if self.server_args.registers_parallelism_config():
+        if self.server_args.publishes_rank_info():
             self.parallelism_config = RankParallelismConfig.from_parallel_state(
                 self.tp_rank
             )
 
-    def maybe_register_and_publish_weight_info(self, role: str) -> None:
-        """Registers this runner's weights with its transfer engine and publishes them, with its parallelism
-        config, under `role`: ``target``, or the draft role `weight_update_runners()` names."""
+    def publish_rank_info(self, role: str) -> None:
+        """Publishes this runner's rank info under `role` (``target``, or the draft role `weight_update_runners()`
+        names): its parallelism config, which the P2P weight-update client needs to map training-side parameters
+        onto this rank's shards, and, once its weights are registered with a transfer engine, their locations and the
+        session to reach them."""
+        transfer_session_id = None
         if (
             remote_instance_transfer_engine_enabled()
             # ModelExpress owns TransferEngine memory registration and metadata
@@ -81,18 +84,27 @@ class RemoteInstanceWeightTransporter:
             and self.engine is not None
             and self.weight_locations is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
             register_weight_memory(self.model, self.engine)
             self.weight_locations = describe_weight_locations(self.model)
-            self._register_to_engine_info_bootstrap(role)
-
-        # The P2P weight-update client needs each rank's parallelism layout to
-        # map training-side parameters onto this rank's shards.
-        if (
-            self.server_args.registers_parallelism_config()
+            transfer_session_id = self.session_id
+        parallelism_config = (
+            self.parallelism_config.to_dict()
+            if self.server_args.publishes_rank_info()
             and self.parallelism_config is not None
-        ):
-            self._register_parallelism_config_to_bootstrap(role)
+            else None
+        )
+        if transfer_session_id is None and parallelism_config is None:
+            return
+        self._put_rank_info(
+            role,
+            {
+                "parallelism_config": parallelism_config,
+                "weight_locations": (
+                    self.weight_locations if transfer_session_id is not None else None
+                ),
+                "transfer_session_id": transfer_session_id,
+            },
+        )
 
     def _bootstrap_url(self) -> str:
         if get_parallel().dist_init_addr:
@@ -104,79 +116,24 @@ class RemoteInstanceWeightTransporter:
         bootstrap_port = get_model().engine_info_bootstrap_port
         return NetworkAddress(bootstrap_host, bootstrap_port).to_url()
 
-    def _register_parallelism_config_to_bootstrap(self, role: str) -> None:
-        """Register this rank's parallelism config with the EngineInfoBootstrapServer."""
+    def _put_rank_info(self, role: str, rank_info: dict) -> None:
+        """Register this rank's info with the EngineInfoBootstrapServer, which runs on node_rank==0."""
         import requests as http_requests
 
-        bootstrap_url = self._bootstrap_url()
-        url = f"{bootstrap_url}/register_parallelism_config"
-        payload = {
-            "role": role,
-            "tp_rank": self.tp_rank,
-            "parallelism_config": self.parallelism_config.to_dict(),
-        }
+        url = f"{self._bootstrap_url()}/register_rank_info"
+        payload = {"role": role, "tp_rank": self.tp_rank, "rank_info": rank_info}
         try:
             resp = http_requests.put(url, json=payload, timeout=5)
             if resp.status_code == 200:
                 logger.info(
-                    f"Registered parallelism config for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_url}"
+                    f"Registered rank info for role={role} tp_rank={self.tp_rank} with the bootstrap server at {url}"
                 )
             else:
                 logger.error(
-                    f"Failed to register parallelism config for tp_rank={self.tp_rank}: "
+                    f"Failed to register rank info for role={role} tp_rank={self.tp_rank}: "
                     f"{resp.status_code}, {resp.text}"
                 )
         except Exception as e:
             logger.error(
-                f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
-            )
-
-    def _register_to_engine_info_bootstrap(
-        self: RemoteInstanceWeightTransporter, role: str
-    ):
-        """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
-
-        The bootstrap server runs on node_rank==0. For multi-node setups, the
-        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
-        """
-        import requests as http_requests
-
-        if get_parallel().dist_init_addr:
-            # Multi-node: bootstrap server is on the head node (node_rank==0).
-            # Derive host from dist_init_addr (shared across all nodes).
-            bootstrap_host = (
-                NetworkAddress.parse(get_parallel().dist_init_addr).resolved().host
-            )
-        else:
-            bootstrap_host = "127.0.0.1"
-
-        bootstrap_port = get_model().engine_info_bootstrap_port
-        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
-        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
-
-        payload = {
-            "role": role,
-            "tp_rank": self.tp_rank,
-            "transfer_engine_info": {
-                "session_id": self.session_id,
-                "weights_info_dict": self.weight_locations,
-            },
-        }
-
-        try:
-            resp = http_requests.put(url, json=payload, timeout=5)
-            if resp.status_code == 200:
-                logger.info(
-                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
-                )
-            else:
-                logger.error(
-                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
-                    f"{resp.status_code}, {resp.text}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+                f"Failed to register rank info for role={role} tp_rank={self.tp_rank}: {e}"
             )

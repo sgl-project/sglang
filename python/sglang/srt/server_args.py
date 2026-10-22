@@ -510,8 +510,8 @@ class ServerArgs:
             or self.enable_engine_info_bootstrap
         )
 
-    def registers_parallelism_config(self) -> bool:
-        """Whether this rank publishes its parallelism config to the bootstrap server."""
+    def publishes_rank_info(self) -> bool:
+        """Whether this rank publishes its rank info (parallelism config, weight locations) to the bootstrap server."""
         return (
             self.remote_instance_weight_loader_use_transfer_engine()
             or self.enable_engine_info_bootstrap

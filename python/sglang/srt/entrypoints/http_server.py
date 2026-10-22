@@ -1388,6 +1388,35 @@ async def remote_instance_transfer_engine_info(rank: int = None, role: str = "ta
     )
 
 
+@app.get("/rank_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def rank_info(rank: int = None, role: str = "target"):
+    """Get what the `role` runner (target or a draft) of one rank published: its parallelism config and, when its
+    weights are registered with a transfer engine, their locations and the session to reach them."""
+    if rank is None or rank < 0:
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    server_args = _global_state.tokenizer_manager.server_args
+    try:
+        resp = requests.get(
+            f"{server_args.engine_info_bootstrap_url}/get_rank_info",
+            params={"rank": rank, "role": role},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Failed to get rank info for role {role} rank {rank}: {e}")
+
+    return ORJSONResponse(
+        {"error": {"message": f"No rank info for role {role} rank {rank}"}},
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.get("/parallelism_config")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def parallelism_config(rank: int = None, role: str = "target"):
