@@ -287,5 +287,16 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
+        if (
+            s.is_cuda
+            and torch.version.hip is None
+            and s.dtype == weights.dtype == torch.bfloat16
+            and s.shape[1] <= 64
+        ):
+            from sglang.kernels.ops.attention.dsv4.index_score_reduce import (
+                reduce_head_scores,
+            )
+
+            return reduce_head_scores(s, weights)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
         return s.float()
