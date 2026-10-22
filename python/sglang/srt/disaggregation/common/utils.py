@@ -39,10 +39,8 @@ class TransferKVChunk:
 def bind_thread_to_device(gpu_id: int) -> None:
     """Make ``gpu_id`` the calling thread's current device.
 
-    A new thread starts on device 0, so a KV-transfer worker's first device call
-    (e.g. ``TransferKVChunk.wait_event.synchronize()``) would create device 0's
-    primary context in this process: an extra ~1 GiB context on another rank's GPU
-    for every worker whose ``gpu_id`` is not 0.
+    New threads default to device 0; binding keeps a transfer worker's device
+    calls on this rank's GPU instead of opening a context on device 0.
     """
     from sglang.srt.platforms import current_platform
 
