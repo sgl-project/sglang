@@ -1394,7 +1394,26 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
+            if (
+                self._sbo_shared_overlap
+                and self._shared_experts_tp1
+                and not fine_grained_overlap
+            ):
+                # A replicated output is read only by the tail add below, and
+                # the next layer's side-stream work waits for the forward
+                # stream before it runs, so that read is ordered before any
+                # reuse of the block.
+                # `record_stream` on the stream a block was allocated on is a
+                # no-op: this branch does not "mark it on the producing
+                # stream", it stops marking the block on the forward stream,
+                # and the block returns to the pool as soon as the Python
+                # reference drops. What is removed is the cross-stream poll,
+                # where a rank whose forward stream lagged could not reuse the
+                # block, grew the symmetric pool alone, and the window
+                # registration then ran on some ranks only.
+                shared_output.record_stream(self.alt_stream)
+            else:
+                shared_output.record_stream(current_stream)
             if self._shared_experts_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
