@@ -99,6 +99,7 @@ class RequestPool(HybridReqToTokenPool):
         return SimpleNamespace(
             conv=[self.mamba_pool.conv[0][dense]],
             temporal=self.mamba_pool.temporal[dense],
+            replayssm_d=None,
         )
 
 
@@ -235,6 +236,30 @@ class TestMegakernelBinding(CustomTestCase):
         with patch(BACKEND, return_value=backend(Pool())):
             with self.assertRaisesRegex(RuntimeError, "kv_pool"):
                 binding.assert_live()
+
+    def test_hybrid_preparation_rejects_replayssm_on_any_kda_layer(self):
+        for layer_id in (0, 2):
+            with self.subTest(layer_id=layer_id):
+                fixture = hybrid_backend()
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                layer_cache = fixture.request_pool.mamba2_layer_cache
+                replay_state = layer_cache(layer_id)
+                replay_state.replayssm_d = torch.zeros(1)
+                with (
+                    patch.object(
+                        fixture.request_pool,
+                        "mamba2_layer_cache",
+                        side_effect=lambda current_layer: (
+                            replay_state
+                            if current_layer == layer_id
+                            else layer_cache(current_layer)
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, f"KDA layer {layer_id}.*ReplaySSM"
+                    ),
+                ):
+                    binding.preparation_view(fixture.runner)
 
     def test_hybrid_preparation_is_typed_stable_and_capacity_is_live(self):
         fixture = hybrid_backend()

@@ -110,7 +110,7 @@ class KvPoolView:
 
 @dataclass(frozen=True)
 class KdaStateView:
-    """One KDA layer's SGLang-owned recurrent state."""
+    """One KDA layer's SGLang-owned, non-ReplaySSM recurrent state."""
 
     conv: tuple[torch.Tensor, ...]
     temporal: torch.Tensor
@@ -461,6 +461,12 @@ class MegakernelBinding:
         states: dict[int, KdaStateView] = {}
         for layer_id in mamba_map:
             state = request_pool.mamba2_layer_cache(layer_id)
+            if state.replayssm_d is not None:
+                raise ValueError(
+                    f"megakernel binding: KDA layer {layer_id} has ReplaySSM state; "
+                    "the hybrid state view requires --enable-linear-replayssm "
+                    "and --enable-linear-replayssm-spec to be disabled"
+                )
             conv = tuple(state.conv)
             if len(conv) != 1:
                 raise ValueError(
