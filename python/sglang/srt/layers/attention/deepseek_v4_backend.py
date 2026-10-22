@@ -2791,14 +2791,12 @@ class DeepseekV4AttnBackend(
     ) -> SharedReadEnds:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
         # first layer. CP shards the query layout that this global snapshot
-        # assumes; request-window layouts are not covered by the snapshot.
-        if self.token_to_kv_pool.request_window is not None:
-            return SharedReadEnds.UNKNOWN
+        # assumes.
         if is_cp_active(forward_batch):
             return SharedReadEnds.UNKNOWN
-        # The V4.1 low-ratio indexer reads req_to_token and HiSparse translates
-        # through full_to_hisparse in every layer, after any snapshot.
-        if self.is_dsv41 or self.hisparse_coordinator is not None:
+        # HiSparse translates through full_to_hisparse in every layer, after any
+        # snapshot.
+        if self.hisparse_coordinator is not None:
             return SharedReadEnds.UNKNOWN
 
         metadata = self.forward_metadata
@@ -2807,8 +2805,9 @@ class DeepseekV4AttnBackend(
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
             )
-        # Dense prefill reads only core_attn_metadata, which metadata init has
-        # already snapshotted, so it reaches the same boundary without a cache.
+        # Dense prefill builds no cache: like every layer, it reads only what
+        # metadata init snapshotted (core_attn_metadata, the request-window
+        # layout, the V4.1 index-K slots).
         return SharedReadEnds.PRE_REPLAY
 
     def _build_sparse_prefill_chunk_cache(
@@ -3273,6 +3272,12 @@ class DeepseekV4AttnBackend(
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
+            # DP attention pads an eager extend past the rows extend_seq_lens cover.
+            num_real = hoisted_pos.shape[0]
+            x, positions = x[:num_real], positions[:num_real]
+            if q_lora is not None:
+                q_lora = q_lora[:num_real]
         if (
             hoisted_req is not None
             and hoisted_pos is not None
@@ -3942,10 +3947,15 @@ class DeepseekV4AttnBackend(
         )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Idle always re-translates at store time: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot."""
+        """Idle never trusts its metadata, which may be stale or unset: it writes
+        the request window's idle layout, or translates the zero-padded
+        out_cache_loc to the dummy slot."""
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
+            if forward_batch.forward_mode.is_idle():
+                return self.token_to_kv_pool.request_window.activate_idle(
+                    forward_batch.out_cache_loc.shape[0]
+                )
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
             return layout.write_loc
