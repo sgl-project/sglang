@@ -399,10 +399,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        Exports only the SWA KV buffers on every arch. C4 compress state is a
-        separate PD component (:meth:`get_c4_state_buf_infos`): its rows are
-        addressed by logical token position, so they must not ride the SWA-page
-        payload when the two peers can use different ring sizes.
+        A3 keeps the C4 compress state inside this payload at whole-page
+        granularity, so both peers must agree on the ring size. A5 exports only
+        the SWA KV buffers here and ships the C4 state as a separate component
+        (:meth:`get_c4_state_buf_infos`) addressed per logical position, which
+        lets prefill and decode run different ring sizes.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -412,6 +413,19 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
+
+        if not is_npu_arch35():
+            for pools in (
+                self.compress_state_pools,
+                self.indexer_compress_state_pools,
+            ):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state = pool.kv_score_buffer.kv_score
+                    data_ptrs.append(state.data_ptr())
+                    data_lens.append(state.nbytes)
+                    item_lens.append(state[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
 

@@ -2081,7 +2081,6 @@ def _make_state_pool(*, ratio, request_scoped, online=False, ring_size=256):
 class TestDSV4C4StateIndices(unittest.TestCase):
     def test_ring_size_difference_keeps_item_count(self):
         req_to_token = torch.arange(4 * 16, dtype=torch.int64).reshape(4, 16)
-        req_pool = SimpleNamespace(req_to_token=req_to_token)
 
         src_pool = _make_state_pool(ratio=4, request_scoped=False, ring_size=8)
         src_pool.swa_page_size = 4
@@ -2097,8 +2096,14 @@ class TestDSV4C4StateIndices(unittest.TestCase):
             translate_loc_from_full_to_swa=lambda loc: loc,
         )
 
-        src = _c4_state_rows(req_pool, src_kv, 2, 13)
-        dst = _c4_state_rows(req_pool, dst_kv, 2, 13)
+        def _bound(kv):
+            return SimpleNamespace(
+                req_to_token=req_to_token,
+                _dsv4_allocator=SimpleNamespace(get_kvcache=lambda: kv),
+            )
+
+        src = _c4_state_rows(_bound(src_kv), 2, 13)
+        dst = _c4_state_rows(_bound(dst_kv), 2, 13)
 
         # The history window is ring independent: both peers ship 8 rows.
         self.assertEqual(src.size, 8)

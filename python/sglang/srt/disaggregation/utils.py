@@ -1747,10 +1747,15 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
-        # C4 state travels as single rows registered separately from the SWA
-        # payload, so P and D can map the same logical positions through their
-        # own SWA pages when their local ring sizes differ.
-        if hasattr(token_to_kv_pool, "get_c4_state_buf_infos"):
+        # A5 ships the C4 state as single rows registered separately from the
+        # SWA payload, so P and D can map the same logical positions through
+        # their own SWA pages when their local ring sizes differ. A3 keeps the
+        # C4 state inside the SWA payload.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35() and hasattr(
+            token_to_kv_pool, "get_c4_state_buf_infos"
+        ):
             c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
             if c4_ptrs:
                 append_state_component(
