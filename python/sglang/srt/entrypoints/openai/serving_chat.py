@@ -1081,6 +1081,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request.tool_choice != "none"
             and self._effective_tools(request)
             and self.tool_call_parser
+            and not request._response_parser_json_response_format
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -1403,6 +1404,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self._set_response_parser_context(
                 request,
                 adapted_request,
+                tool_call_constraint=processed_messages.tool_call_constraint,
                 tools=(
                     self._effective_tools(request)
                     if self._tool_call_parsing_active(request)
@@ -1420,6 +1422,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest | ResponsesRequest,
         adapted_request: GenerateReqInput,
         *,
+        tool_call_constraint: ToolCallConstraint | None,
         tools: List[Tool],
         template_tool_call_grammar: bool = False,
         message_start_tool_call_constraint: ToolCallConstraint | None = None,
@@ -1491,13 +1494,13 @@ class OpenAIServingChat(OpenAIServingBase):
             request._response_parser_grammar_start = (
                 GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
             )
+            # Unless the schema is the required/named tool call itself, the JSON
+            # is response data, and template syntax inside its strings is literal.
+            json_answer = (
+                tool_call_constraint is None or tool_call_constraint[0] != "json_schema"
+            )
             # A JSON answer released at the reasoning end still opens the
             # answer; the forced tool-call array stays bare JSON.
-            json_answer = (
-                request.has_json_schema_constraint()
-                if isinstance(request, ResponsesRequest)
-                else request.response_format is not None
-            )
             if (
                 reasoning_gated
                 and json_answer
@@ -1546,6 +1549,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     del sampling_params["json_schema"]
                     set_request_reasoning_in_grammar(sampling_params, from_start)
                     request._response_parser_grammar_start = GRAMMAR_AT_ANSWER
+            # The template's JSON-answer grammar admits native calls instead of
+            # the answer, which tool extraction still reads.
+            request._response_parser_json_response_format = (
+                json_answer
+                and request._response_parser_grammar_start != GRAMMAR_AT_ANSWER
+            )
 
     def _message_start_tool_call_constraint(
         self,

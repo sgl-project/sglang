@@ -755,6 +755,7 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
 
 
 class ResponseTemplateRequiredToolTestCase(CustomTestCase):
+    # Every field is delimited, so the template gives no field to the JSON.
     TEMPLATE = {
         "start_anchor": "<assistant>",
         "fields": {
@@ -773,28 +774,32 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         },
     }
 
+    # A call after the reasoning, closed by the tool closer detokenization keeps.
+    _CALL = (
+        '<think>Check the forecast.</think><call:get_weather>{"city": "Paris"}</call>'
+    )
+    _BEAM = {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+
     @staticmethod
-    def _output():
+    def _output(text, matched):
         return {
-            "text": (
-                "<think>Check the forecast.</think>"
-                '<call:get_weather>{"city": "Paris"}</call>'
-            ),
+            "text": text,
             "meta_info": {
                 "prompt_tokens": 3,
                 "completion_tokens": 9,
                 "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": 7},
+                "finish_reason": {"type": "stop", "matched": matched},
             },
         }
 
     def _respond(
         self,
         stream,
-        constraint,
-        outputs=None,
-        reasoning_parser="beam",
-        tool_call_parser="beam",
+        *,
+        output,
+        reasoning_parser="response_template",
+        tool_call_parser="response_template",
+        **request_fields,
     ):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
@@ -803,6 +808,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         serving._reasoning_detector = ReasoningParser.DetectorMap[reasoning_parser](
             response_template=self.TEMPLATE
         )
+        # Always-on reasoning: the output grammar starts after the reasoning.
         serving.template_manager.reasoning_config = ReasoningToggleConfig(
             special_case="always"
         )
@@ -817,8 +823,8 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             request_id, request_prompt, adapted_request, sampling_params, context, **_
         ):
             self.sampling_params = sampling_params
-            for output in outputs or [self._output()]:
-                context.append_output(output)
+            for item in output if isinstance(output, list) else [output]:
+                context.append_output(item)
                 yield context
 
         serving._generate_with_builtin_tools = fake_generate
@@ -837,7 +843,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             ],
             stream=stream,
             store=False,
-            **constraint,
+            **request_fields,
         )
         rendered = MessageProcessingResult(
             prompt="<assistant>",
@@ -863,9 +869,78 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         ):
             return asyncio.run(respond())
 
+    def test_required_tool_json_is_parsed_under_delimited_template(self):
+        """Required-tool JSON after the reasoning becomes a completed function
+        call, also when it ends on the tool closer that detokenization keeps."""
+        output = self._output(
+            "<think>Check the forecast.</think>"
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>',
+            matched=7,
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(stream, output=output, tool_choice="required")
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "function_call"],
+                )
+                call = response["output"][1]
+                self.assertEqual(call["name"], "get_weather")
+                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+
+    def test_json_text_format_with_auto_tools_stays_message(self):
+        """A JSON text format with automatic tools must return the JSON intact;
+        template tool syntax inside its strings is never a function call."""
+        payload = '{"example": "<call:get_weather>{}</call>"}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(
+                    stream,
+                    output=output,
+                    tool_choice="auto",
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
+    def test_json_text_format_with_natively_required_tools_stays_message(self):
+        """A required or named choice that a tool parser owns natively accepts a
+        JSON text format; the JSON answer stays a message, never a tool call."""
+        payload = '{"name": "get_weather", "parameters": {"city": "Paris"}}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for tool_choice in ("required", {"type": "function", "name": "get_weather"}):
+            with self.subTest(tool_choice=tool_choice):
+                response = self._respond(
+                    False,
+                    output=output,
+                    tool_call_parser="glm47",
+                    tool_choice=tool_choice,
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
     def test_forced_call_grammar_covers_skipped_reasoning(self):
         """Forced calls that skip the reasoning must not escape the grammar."""
-        self._respond(stream=False, constraint={"tool_choice": "required"})
+        self._respond(
+            False,
+            output=self._output(self._CALL, matched=7),
+            **self._BEAM,
+            tool_choice="required",
+        )
         params = self.sampling_params
 
         self.assertTrue(get_request_reasoning_in_grammar(params.get("custom_params")))
@@ -903,19 +978,17 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         ):
             with self.subTest(constraint=constraint):
                 self._respond(
-                    stream=False, constraint=constraint, tool_call_parser="beam"
+                    False,
+                    output=self._output(self._CALL, matched=7),
+                    **self._BEAM,
+                    **constraint,
                 )
                 grammar = Grammar.from_structural_tag(
                     self.sampling_params["structural_tag"]
                 )
                 for text, expected in accepted.items():
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
-        self._respond(
-            stream=False,
-            constraint={},
-            reasoning_parser="response_template",
-            tool_call_parser="response_template",
-        )
+        self._respond(False, output=self._output(self._CALL, matched=7))
         self.assertNotIn("structural_tag", self.sampling_params)
 
     def test_tool_call_is_parsed_under_delimited_template(self):
@@ -930,7 +1003,12 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         for constraint in constraints:
             for stream in (False, True):
                 with self.subTest(**constraint, stream=stream):
-                    response = self._respond(stream, constraint)
+                    response = self._respond(
+                        stream,
+                        output=self._output(self._CALL, matched=7),
+                        **self._BEAM,
+                        **constraint,
+                    )
 
                     self.assertEqual(response["status"], "completed")
                     self.assertEqual(
@@ -944,17 +1022,12 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
     def test_call_ended_by_another_stop_token_is_complete(self):
         """A complete call ended by a stop token other than its closer must not be
         dropped."""
-        output = self._output()
-        output = {
-            "text": output["text"].removesuffix("</call>"),
-            "meta_info": {
-                **output["meta_info"],
-                "finish_reason": {"type": "stop", "matched": 2},
-            },
-        }
+        output = self._output(self._CALL.removesuffix("</call>"), matched=2)
         for stream in (False, True):
             with self.subTest(stream=stream):
-                response = self._respond(stream, {"tool_choice": "required"}, [output])
+                response = self._respond(
+                    stream, output=output, **self._BEAM, tool_choice="required"
+                )
 
                 self.assertEqual(
                     [item["type"] for item in response["output"]],
@@ -972,7 +1045,12 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         }
         self.TEMPLATE = {**self.TEMPLATE, "fields": fields}
 
-        response = self._respond(False, {"parallel_tool_calls": False})
+        response = self._respond(
+            False,
+            output=self._output(self._CALL, matched=7),
+            **self._BEAM,
+            parallel_tool_calls=False,
+        )
 
         self.assertEqual(response.status_code, 400)
 
@@ -980,19 +1058,19 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         """Before a JSON answer, the grammar must not admit calls the tool parser cannot
         read."""
         constraint = {"text": {"format": {"type": "json_object"}}}
-        call = self._output()
-        answer = {
-            "text": '<think>Check the forecast.</think><answer>{"a": 1}',
-            "meta_info": {
-                **call["meta_info"],
-                "finish_reason": {"type": "stop", "matched": 2},
-            },
-        }
+        call = self._output(self._CALL, matched=7)
+        answer = self._output(
+            '<think>Check the forecast.</think><answer>{"a": 1}', matched=2
+        )
         for parser, reads_calls in (("response_template", True), ("hermes", False)):
             for stream in (False, True):
                 with self.subTest(parser=parser, stream=stream):
                     response = self._respond(
-                        stream, constraint, [answer], tool_call_parser=parser
+                        stream,
+                        output=answer,
+                        reasoning_parser="beam",
+                        tool_call_parser=parser,
+                        **constraint,
                     )
                     grammar = Grammar.from_structural_tag(
                         self.sampling_params["structural_tag"]
@@ -1012,7 +1090,11 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     )
         self.assertEqual(
             self._respond(
-                False, {"parallel_tool_calls": False, **constraint}
+                False,
+                output=answer,
+                **self._BEAM,
+                parallel_tool_calls=False,
+                **constraint,
             ).status_code,
             400,
         )
@@ -1024,7 +1106,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         enter_override(
             self, get_context().override_server_args(incremental_streaming_output=True)
         )
-        last = {**self._output(), "text": ": 1}</call>"}
+        last = self._output(": 1}</call>", matched=7)
         first = {
             **last,
             "text": '<think>Check the forecast.</think><answer>{"a"',
@@ -1032,7 +1114,10 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         }
 
         response = self._respond(
-            True, {"text": {"format": {"type": "json_object"}}}, [first, last]
+            True,
+            output=[first, last],
+            **self._BEAM,
+            text={"format": {"type": "json_object"}},
         )
 
         message = response["output"][-1]

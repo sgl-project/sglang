@@ -877,6 +877,7 @@ def _has_message_level_tools(messages: Any) -> bool:
 class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
@@ -1879,6 +1880,7 @@ class ResponsesRequest(PDRoutingFields):
     _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)

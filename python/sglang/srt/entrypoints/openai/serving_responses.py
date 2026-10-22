@@ -635,6 +635,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self._set_response_parser_context(
                         request,
                         adapted_request,
+                        tool_call_constraint=processed_messages.tool_call_constraint,
                         tools=(
                             self._response_tools_to_chat_tools(request)
                             if self.tool_call_parser and request.tool_choice != "none"
@@ -1226,9 +1227,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=bool(
-                    chat_tools
-                    and self.tool_call_parser
-                    and request.tool_choice != "none"
+                    self.tool_call_parser
+                    and self._tool_parsing_active(request, chat_tools)
                 ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -1256,9 +1256,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         incomplete_calls = set()
         if (
             content
-            and chat_tools
             and self.tool_call_parser
-            and request.tool_choice != "none"
+            and self._tool_parsing_active(request, chat_tools)
         ):
             parser = FunctionCallParser(
                 chat_tools,
@@ -1287,7 +1286,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if (
             content
-            and chat_tools
+            and self._tool_parsing_active(request, chat_tools)
             and is_required
             and not parsed_via_native
             and not detector_owns_format
@@ -1401,6 +1400,14 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> bool:
         return bool(
             chat_tools and self.tool_call_parser and request.tool_choice != "none"
+        )
+
+    @staticmethod
+    def _tool_parsing_active(request: ResponsesRequest, chat_tools: list) -> bool:
+        return bool(
+            chat_tools
+            and request.tool_choice != "none"
+            and not request._response_parser_json_response_format
         )
 
     @staticmethod
@@ -2289,7 +2296,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         tool_choice = request.effective_tool_choice()
-        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         required_json = self._uses_required_tool_json(request, chat_tools)
         encoding_output = self._encoding_output()
         token_stream = (
@@ -2304,33 +2310,24 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
-        if chat_tools and request.tool_choice != "none":
-            detector_owns_format = False
-            constrained = grammar_holds_calls(
-                request._response_parser_tool_grammar,
-                request._response_parser_grammar_start,
+        if required_json:
+            tool_parser = JsonArrayParser()
+        elif (
+            token_stream is None
+            and self._tool_call_parsing_enabled(request, chat_tools)
+            and not request._response_parser_json_response_format
+        ):
+            tool_parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
+                prefix=request._response_parser_prefix,
+                constrained=grammar_holds_calls(
+                    request._response_parser_tool_grammar,
+                    request._response_parser_grammar_start,
+                ),
             )
-            if self.tool_call_parser:
-                probe = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                    prefix=request._response_parser_prefix,
-                    constrained=constrained,
-                )
-                detector_owns_format = self._tool_parser_owns_format(probe)
-            if is_required and not detector_owns_format:
-                tool_parser = JsonArrayParser()
-            elif self.tool_call_parser and token_stream is None:
-                tool_parser = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                    prefix=request._response_parser_prefix,
-                    constrained=constrained,
-                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(

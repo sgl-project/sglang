@@ -129,6 +129,28 @@ DELIMITED_TEMPLATE = {
     },
 }
 
+TRANSFORM_EACH_RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<calls id=(?P<id>\w+)>",
+            "close": "</calls>",
+            "content": "json",
+            "repeats": True,
+            "transform_each": True,
+            "transform": {
+                "id": "{id}",
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{arguments}",
+                },
+            },
+        },
+    },
+}
+
 
 def _tool(name: str = "get_weather") -> Tool:
     return Tool(
@@ -767,29 +789,14 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertTrue(_is_grammar_accept_string(grammar, call))
 
     def test_transform_each_tool_region_emits_all_calls(self):
-        template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content": "text"},
-                "tool_calls": {
-                    "open": "<calls>",
-                    "close": "</calls>",
-                    "content": "json",
-                    "transform_each": True,
-                    "transform": {
-                        "type": "function",
-                        "function": {
-                            "name": "{name}",
-                            "arguments": "{arguments}",
-                        },
-                    },
-                },
-            },
-        }
+        """Each member is transformed with the opener's captures, and its
+        arguments are cast to the tool schema."""
+        template = TRANSFORM_EACH_RESPONSE_TEMPLATE
         tools = [_tool(), _tool("get_forecast")]
+        opener = "<calls id=1>"
         text = (
-            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
-            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+            opener + '[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"get_forecast","arguments":{"days":"3"}}]</calls>'
         )
         detector = ResponseTemplateToolDetector(
             response_template=template,
@@ -811,9 +818,9 @@ class TestResponseTemplateAdapters(CustomTestCase):
             response_template=template,
             prefix="<assistant>",
         )
-        opened = streaming.parse_streaming_increment("<calls>", tools)
+        opened = streaming.parse_streaming_increment(opener, tools)
         closed = streaming.parse_streaming_increment(
-            text.removeprefix("<calls>"),
+            text.removeprefix(opener),
             tools,
         )
         self.assertEqual(opened.calls, [])
@@ -824,6 +831,44 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 ("get_forecast", {"days": 3}),
             ],
         )
+
+    def test_unknown_function_in_array_keeps_valid_siblings(self):
+        """An undefined or malformed member of a parallel-call array drops only
+        itself; its valid siblings and later calls keep consecutive indices."""
+        tools = [_tool(), _tool("get_forecast")]
+        text = (
+            '<calls id=1>[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"unknown","arguments":{}},'
+            '{"name":"get_weather"},{"arguments":{}},null,'
+            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+            '<calls id=2>[{"name":"get_weather","arguments":{"location":"Rome"}}]</calls>'
+        )
+        expected = [
+            (0, "get_weather", {"location": "Paris"}),
+            (1, "get_forecast", {"days": 3}),
+            (2, "get_weather", {"location": "Rome"}),
+        ]
+
+        parsed = ResponseTemplateToolDetector(
+            response_template=TRANSFORM_EACH_RESPONSE_TEMPLATE,
+            prefix="<assistant>",
+        ).detect_and_parse(text, tools)
+        streaming = ResponseTemplateToolDetector(
+            response_template=TRANSFORM_EACH_RESPONSE_TEMPLATE,
+            prefix="<assistant>",
+        )
+        streamed = streaming.parse_streaming_increment(text, tools).calls
+        streamed += streaming.finish(tools).calls
+
+        for calls in (parsed.calls, streamed):
+            self.assertEqual(
+                [
+                    (call.tool_index, call.name, json.loads(call.parameters))
+                    for call in calls
+                ],
+                expected,
+            )
+        self.assertEqual(streaming.incomplete_tool_call_indices, set())
 
     def test_malformed_call_is_dropped(self):
         detector = ResponseTemplateToolDetector(
@@ -1069,6 +1114,37 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(text, "hello<end>")
         self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
+
+    def test_end_of_input_closer_completes_the_call(self):
+        """A closer that matches only at end of input, such as `\\Z`, closes the
+        last call instead of marking it cut off."""
+        template = copy.deepcopy(XML_TOOL_TEMPLATE)
+        del template["fields"]["tool_calls"]["close"]
+        template["fields"]["tool_calls"]["close_pattern"] = r"\Z"
+        text = "hello<call:get_weather><arg:location>Paris</arg>"
+
+        def new_parser():
+            return FunctionCallParser(
+                tools=[_tool()],
+                tool_call_parser="response_template",
+                tokenizer=SimpleNamespace(response_template=template),
+            )
+
+        normal_text, calls = new_parser().parse_non_stream(text)
+        self.assertEqual(normal_text, "hello")
+        self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
+
+        streaming = new_parser()
+        streamed = [streaming.parse_stream_chunk(char) for char in text]
+        streamed.append(streaming.parse_stream_end())
+        calls = [call for _, chunk_calls in streamed for call in chunk_calls]
+        self.assertEqual("".join(chunk_text for chunk_text, _ in streamed), "hello")
+        self.assertEqual("".join(call.name or "" for call in calls), "get_weather")
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls)),
+            {"location": "Paris"},
+        )
+        self.assertEqual(streaming.detector.incomplete_tool_call_indices, set())
 
     def test_streamed_call_without_closer_stays_incomplete(self):
         for template, first_call, cut_call in (
