@@ -97,8 +97,7 @@ def _project_candidate_logits(
     if not use_quant_head:
         weight = lm_head.weight
         hidden = hidden.to(weight.dtype)
-        # Same guard as UnquantizedLinearMethod.apply: the tuned dispatch picks
-        # kernels by shape only and is bf16-only.
+        # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
         backend = get_bf16_gemm_backend()
         if (
             (backend.is_cutedsl() or backend.is_gemv())
