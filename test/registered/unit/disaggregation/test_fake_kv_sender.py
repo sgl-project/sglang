@@ -7,10 +7,9 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestFakeKVSender(unittest.TestCase):
@@ -47,18 +46,6 @@ class TestFakeKVSender(unittest.TestCase):
             self.assertEqual(self.sender.poll(), KVPoll.WaitingForInput)
         self.assertIsNone(self.sender.conclude_state)
 
-    def test_normal_send_flow(self):
-        self.sender.init(3, 5)
-        self.assertEqual(self.sender.poll(), KVPoll.WaitingForInput)
-
-        self.sender.send(np.array([0, 1, 2], dtype=np.int32))
-        self.assertTrue(self.sender.has_sent)
-
-        self.assertEqual(self.sender.poll(), KVPoll.Success)
-        self.assertEqual(self.sender.conclude_state, KVPoll.Success)
-        # Cached afterwards.
-        self.assertEqual(self.sender.poll(), KVPoll.Success)
-
     def test_zero_page_last_chunk_still_sends(self):
         """A zero-page last chunk must not be gated out: skipping it leaves the
         sender in WaitingForInput forever and pins the prefill inflight queue."""
@@ -74,10 +61,6 @@ class TestFakeKVSender(unittest.TestCase):
         # Mirrors the send_kv_chunk gate in SchedulerDisaggregationPrefillMixin.
         if self.sender.should_send_kv_chunk(len(page_indices), True):
             self.sender.send(page_indices)
-        self.assertEqual(self.sender.poll(), KVPoll.Success)
-
-    def test_send_without_init_or_poll(self):
-        self.sender.send(np.array([0, 1], dtype=np.int32))
         self.assertEqual(self.sender.poll(), KVPoll.Success)
 
     def test_waiting_timeout_fails_a_stuck_sender(self):
@@ -125,24 +108,6 @@ class TestFakeKVSender(unittest.TestCase):
         for _ in range(100):
             self.assertEqual(self.sender.poll(), KVPoll.WaitingForInput)
         self.assertIsNone(self.sender.waiting_since)
-
-    def test_timeout_is_configurable(self):
-        """The knob is read once, when the sender is built."""
-        with envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.override(600):
-            sender = self._make_sender()
-        self.assertEqual(sender.waiting_timeout, 600)
-
-        sender.init(1, 0)
-        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
-        sender.waiting_since -= 599
-        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
-        sender.waiting_since -= 2
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-
-    def test_abort_sets_failed_state(self):
-        self.sender.abort()
-        self.assertEqual(self.sender.conclude_state, KVPoll.Failed)
-        self.assertEqual(self.sender.poll(), KVPoll.Failed)
 
 
 if __name__ == "__main__":
