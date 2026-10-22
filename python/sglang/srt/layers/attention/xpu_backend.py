@@ -230,6 +230,13 @@ class XPUAttentionBackend(AttentionBackend):
             self.dcp_group = get_parallel().dcp_group
             self.dcp_comm_backend = get_parallel().dcp_comm_backend
             self._assert_dcp_supported()
+        # Paged KV kernels are exact only at page 1/64/128; index per token otherwise.
+        if (
+            not self.use_mla
+            and self.dcp_size == 1
+            and self.page_size not in (1, 64, 128)
+        ):
+            self.page_size = 1
 
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
