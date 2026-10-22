@@ -180,7 +180,7 @@ def test_schedule_at_shared_memory_boundary(offset):
     expected = []
     for i in range(parts):
         begin, end = min(i * per_part, b), min((i + 1) * per_part, b)
-        expected.append([begin, end - 1, int(begin == b), 2, 0, 0, 0])
+        expected.append([begin, end - 1, 0, 2, 0, 0, 0])
     torch.testing.assert_close(
         meta[:, DEFINED].cpu(), torch.tensor(expected, dtype=torch.int32)
     )
