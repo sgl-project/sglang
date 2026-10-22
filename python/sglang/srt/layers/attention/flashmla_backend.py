@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )
+from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -439,21 +440,41 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc.for_batch(forward_batch),
-                    k,
-                    v,
-                )
+                cache_loc = KVWriteLoc.for_batch(forward_batch)
+                if k_rope is not None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+
         bs = forward_batch.batch_size
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
+        if q_rope is not None:
+            q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q = concat_mla_absorb_q_general(q, q_rope)
+
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+
         if self.is_fp8_kvcache:
             assert self.dcp_world_size == 1, (
                 "FlashMLA does not support DCP for FP8 kv cache"
@@ -519,21 +540,44 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
         else:
             # target_verify / draft_extend_v2: fixed-q decode-style kernel.
 
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc.for_batch(forward_batch), k, v
-                    )
+                    cache_loc = KVWriteLoc.for_batch(forward_batch)
+                    if k_rope is not None:
+                        self.token_to_kv_pool.set_mla_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            k_rope,
+                        )
+                    else:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            v,
+                        )
 
             bs = forward_batch.batch_size
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+            if q_rope is not None:
+                q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+                q = concat_mla_absorb_q_general(q, q_rope)
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # prepare_for_draft_extend always emits the fixed q window.
