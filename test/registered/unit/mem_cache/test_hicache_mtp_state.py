@@ -4,7 +4,6 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig

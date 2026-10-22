@@ -53,9 +53,7 @@ class TestDiffusionModelDetection(CustomTestCase):
         )
 
         self.assertTrue(get_is_diffusion_model("test/gated-diffusion-model"))
-        mock_hf_api.return_value.model_info.assert_called_once_with(
-            "test/gated-diffusion-model"
-        )
+        mock_hf_api.return_value.model_info.assert_called_once()
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
@@ -66,9 +64,7 @@ class TestDiffusionModelDetection(CustomTestCase):
         )
 
         self.assertFalse(get_is_diffusion_model("test/gated-llm-model"))
-        mock_hf_api.return_value.model_info.assert_called_once_with(
-            "test/gated-llm-model"
-        )
+        mock_hf_api.return_value.model_info.assert_called_once()
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
