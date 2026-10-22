@@ -1004,9 +1004,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        if loc.numel() == 0:
-            return
-
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1045,6 +1042,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and self.index_head_dim is None
             and self.dtype in (torch.float16, torch.bfloat16)
         ):
+            if loc.numel() == 0:
+                return
+
             # KVLocPlan has already localized page-interleaved slots. This
             # fixed-shape store only skips -1 rows; it does not shard again.
             loc = loc.contiguous()
