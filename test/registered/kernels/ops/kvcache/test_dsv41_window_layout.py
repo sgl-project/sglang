@@ -22,7 +22,7 @@ class TestWindowLayout(unittest.TestCase):
                 self.assertEqual(a, b, name)
 
     def test_reference(self):
-        for sizes in ([1], [3, 1, 260, 7], [4224], [4224] * 8):
+        for sizes in ([1], [3, 1, 260, 7], [4096], [4096] * 8):
             for window in (7, 128):
                 for dtype in (torch.int32, torch.int64):
                     req = torch.cat(
