@@ -1055,7 +1055,6 @@ def test_offload_skips_node_already_stored_by_tree_core():
 
 class TestMooncakeSessionCleanup(CustomTestCase):
     def test_partial_session_start_releases_successful_sessions(self):
-        """A missing key must not leave other sessions open in a failed load."""
         for previous_batch in (False, True):
             with self.subTest(previous_batch=previous_batch):
                 sessions = set()
