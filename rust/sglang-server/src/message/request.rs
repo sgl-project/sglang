@@ -430,6 +430,9 @@ pub fn into_requests(
                 // chat flow sets this explicitly.
                 skip_special_tokens: false,
                 sampling_params,
+                // The decoded request no longer shows which keys the client sent;
+                // the adapter marks this from the body it received.
+                max_new_tokens_defaulted: false,
                 stream,
                 // Python `GenerateReqInput` defaults.
                 return_logprob: return_logprob.unwrap_or(false),
@@ -574,6 +577,14 @@ pub struct GenerateRequest {
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
+    /// `sampling_params.max_new_tokens` is not the client's: the request sent
+    /// none, so it holds a launch-time preferred value, the launch default
+    /// (HTTP), or the schema default (gRPC). Only a client's own value is
+    /// checked against the context window, as the Python TokenizerManager
+    /// does; this one reaches the scheduler as is, which clamps it to the
+    /// window. A preferred or default value as large as the window would
+    /// otherwise reject every request that leaves the limit to the server.
+    pub max_new_tokens_defaulted: bool,
     /// Whether the caller requested incremental output.
     pub stream: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
