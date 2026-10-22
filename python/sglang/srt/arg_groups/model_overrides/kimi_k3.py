@@ -50,11 +50,6 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
-    if (
-        not get_platform().is_npu
-        and getattr(hf_config, "architectures", None) == ["KimiK3LinearForCausalLM"]
-    ):
-        return {}
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
         overrides = {}
