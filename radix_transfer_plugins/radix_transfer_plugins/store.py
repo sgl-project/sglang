@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Iterator, Mapping, Optional, Sequence, TypeVar
 
+import numpy as np
+
 from radix_transfer_plugins.backend import StorageBackend
 from radix_transfer_plugins.codec import IDENTITY, get_codec
 from radix_transfer_plugins.schema import FieldSpec, RawField, Stash, StoreRef
@@ -182,10 +184,12 @@ class OutputStore:
                 field = get_codec(s.codec).decode(
                     data[s.name] if s.nbytes else _EMPTY, spec=s
                 )
+                # numpy copies without holding the GIL;
+                # bytearray() would hold it for the whole field and stall other threads.
                 out[i][s.name] = RawField(
                     dtype=field.dtype,
                     shape=field.shape,
-                    data=memoryview(bytearray(field.data)),
+                    data=memoryview(np.frombuffer(field.data, dtype=np.uint8).copy()),
                 )
 
 
