@@ -1146,30 +1146,30 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
-        effective_seq_lens = seq_lens[:bs]
         if self.dense_mla_dcp_target:
-            effective_seq_lens = effective_seq_lens.to(torch.int64)
-        if forward_mode.is_target_verify():
-            effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
-
-        if self.dense_mla_dcp_target:
-            cycle_size = self.page_size * self.dcp_size
-            max_local_len = max_len // cycle_size * self.page_size + min(
-                self.page_size,
-                max(0, max_len % cycle_size - self.dcp_rank * self.page_size),
-            )
+            effective_seq_lens = seq_lens[:bs].to(torch.int64)
+            if forward_mode.is_target_verify():
+                effective_seq_lens = (
+                    effective_seq_lens + self.speculative_num_draft_tokens
+                )
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                effective_seq_lens = (
+                    effective_seq_lens + self.speculative_step_offset_npu
+                )
             active_num_pages = min(
                 metadata.block_tables.shape[1],
-                max(1, (max_local_len + self.page_size - 1) // self.page_size),
+                max(
+                    1,
+                    (max_seq_pages + self.dcp_size - 1 - self.dcp_rank)
+                    // self.dcp_size,
+                ),
             )
-            metadata.block_tables.zero_()
             local_seq_lens, _ = self._get_kv_lens_and_block_tables(
                 effective_seq_lens,
                 req_pool_indices[:bs],
                 block_tables=metadata.block_tables[:, :active_num_pages],
             )
+            metadata.block_tables[:, active_num_pages:].zero_()
             metadata.seq_lens.copy_(local_seq_lens)
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
             if in_capture:
@@ -1273,6 +1273,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
             # length; refresh the graph-bound list from that CPU tensor.
             # Other spec algorithms keep the capture-time list (graph_runner
@@ -1283,9 +1284,11 @@ class AscendAttnBackend(AttentionBackend):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:
-                    kv_lens = effective_seq_lens
+                    kv_lens = seq_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
-        metadata.seq_lens[:bs].copy_(effective_seq_lens)
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            seq_lens = seq_lens + self.speculative_step_offset_npu
+        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
 
