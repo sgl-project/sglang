@@ -636,6 +636,7 @@ def _jit_v41_module(
     data_bytes: int,
     scale_bytes: int,
     page_bits: int,
+    verify: bool,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -645,6 +646,7 @@ def _jit_v41_module(
         data_bytes,
         scale_bytes,
         page_bits,
+        verify,
     )
     return load_jit(
         "sparse_cache_v41",
@@ -673,13 +675,14 @@ def load_cache_to_device_buffer_v41(
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     num_real_reqs: torch.Tensor,
-    error_count: torch.Tensor,
+    stats: torch.Tensor,
     num_top_k: int,
     compress_ratio: int,
     data_bytes: int,
     scale_bytes: int,
     page_size: int,
     block_size: int = 512,
+    verify: bool = False,
 ) -> None:
     """HiSparse V2 swap-in for one DeepSeek-V4.1 compressed KV layer.
 
@@ -690,6 +693,10 @@ def load_cache_to_device_buffer_v41(
     ratio`` on a miss. ``device_buffer`` is the pool layer's ``[pages, page_bytes]``
     paged buffer and ``host_binding`` the run-time ``[base address, page stride]`` of
     the same layer in the HiCache host pool. Results land in ``top_k_device_locs``.
+    ``stats`` (int64 ``[3]``) accumulates positions neither tier holds, host rows
+    copied, and copies skipped for a hot slot outside the pool; ``verify`` (debug)
+    also counts demoted selections whose slot does not end up holding the host row
+    into ``stats[0]``.
     """
     if compress_ratio not in (1, 2):
         raise ValueError(f"compress_ratio must be 1 or 2, got {compress_ratio}")
@@ -711,7 +718,7 @@ def load_cache_to_device_buffer_v41(
         ("device_buffer", device_buffer, torch.uint8),
         ("top_k_device_locs", top_k_device_locs, torch.int32),
         ("num_real_reqs", num_real_reqs, torch.int32),
-        ("error_count", error_count, torch.int32),
+        ("stats", stats, torch.int64),
     ):
         if tensor.dtype != dtype:
             raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
@@ -740,6 +747,7 @@ def load_cache_to_device_buffer_v41(
         data_bytes,
         scale_bytes,
         page_bits,
+        verify,
     )
     module.load_cache_to_device_buffer_v41(
         top_k_tokens,
@@ -754,7 +762,7 @@ def load_cache_to_device_buffer_v41(
         device_buffer,
         top_k_device_locs,
         num_real_reqs,
-        error_count,
+        stats,
     )
 
 

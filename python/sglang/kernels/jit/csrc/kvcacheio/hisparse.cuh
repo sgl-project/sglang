@@ -1101,6 +1101,7 @@ template <
     int DATA_BYTES,
     int SCALE_BYTES,
     int PAGE_BITS,
+    bool VERIFY,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_v41_kernel(
     const int32_t* __restrict__ top_k,
@@ -1119,10 +1120,11 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
     int64_t lru_stride,
     const int64_t* __restrict__ host_binding,
     uint8_t* __restrict__ device_buffer,
+    int64_t num_device_pages,
     int32_t* __restrict__ out,
     int64_t out_stride,
     const int32_t* __restrict__ num_real_reqs,
-    int32_t* __restrict__ error_count) {
+    unsigned long long* __restrict__ stats) {
   using Rows = V41PagedRows<DATA_BYTES, SCALE_BYTES, PAGE_BITS>;
   static_assert(HOT_BUFFER_SIZE >= NUM_TOP_K, "the hot buffer must hold one full selection");
   static_assert(HOT_BUFFER_SIZE <= 32767, "LRU slots are int16");
@@ -1204,7 +1206,7 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
       // indexing out of the pool, and let the host side report it.
       s_top_k_tokens[i] = TOKEN_HIT;
       req_out[i] = 0;
-      atomicAdd(error_count, 1);
+      atomicAdd(&stats[0], 1ull);
       continue;
     }
     has_demoted = 1;
@@ -1234,7 +1236,7 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
     const int16_t buf_slot = has_valid_slot ? req_lru[slot_idx] : -1;
-    const int32_t my_buffer_token = (buf_slot >= 0) ? req_residency[buf_slot] : -1;
+    const int32_t my_buffer_token = (buf_slot >= 0 && buf_slot < HOT_BUFFER_SIZE) ? req_residency[buf_slot] : -1;
     int my_found_top_k_idx = -1;
     if (my_buffer_token >= 0) {
       int h = hash_slot(my_buffer_token, HASH_SIZE);
@@ -1357,6 +1359,9 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
   __syncthreads();
 
   total_misses = s_total_misses;
+  if (tid == 0 && total_misses > 0) {
+    atomicAdd(&stats[1], static_cast<unsigned long long>(total_misses));
+  }
   // Write the LRU order back: stale evictables first, fresh misses, then hits.
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -1378,13 +1383,54 @@ __global__ void load_cache_to_device_buffer_v41_kernel(
     const int32_t miss_token = s_top_k_tokens[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
     const int64_t src_row = req_host[static_cast<int64_t>(miss_token) * COMPRESS_RATIO] / COMPRESS_RATIO;
-    const int64_t dst_row = req_hot_slots[evict_slot];
+    const int64_t dst_row =
+        (evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE) ? req_hot_slots[evict_slot] : int64_t{-1};
+    // A hot slot outside the request's pages would write rows every request reads.
+    if (dst_row < Rows::kSlots || (dst_row >> PAGE_BITS) >= num_device_pages || src_row < 0) {
+      if (lane_id == 0) {
+        atomicAdd(&stats[2], 1ull);
+      }
+      continue;
+    }
     copy_v41_row_warp<DATA_BYTES, SCALE_BYTES, PAGE_BITS>(
         lane_id,
         host_base + (src_row >> PAGE_BITS) * host_page_stride,
         src_row & kSlotMask,
         device_buffer + (dst_row >> PAGE_BITS) * Rows::kPageBytes,
         dst_row & kSlotMask);
+  }
+
+  // Debug: every demoted selection's slot now holds its host row.
+  if constexpr (VERIFY) {
+    __syncthreads();
+    for (int i = warp_id; i < NUM_TOP_K; i += NUM_WARPS) {
+      const int32_t token = req_top_k[i];
+      if (token < 0 || token >= seq_len) {
+        continue;
+      }
+      const int64_t full_pos = static_cast<int64_t>(token) * COMPRESS_RATIO;
+      if (req_r2t[full_pos] >= 0 || req_host[full_pos] < 0) {
+        continue;
+      }
+      const int64_t src_row = req_host[full_pos] / COMPRESS_RATIO;
+      const int64_t dst_row = req_out[i];
+      const uint8_t* src_page = host_base + (src_row >> PAGE_BITS) * host_page_stride;
+      const uint8_t* dst_page = device_buffer + (dst_row >> PAGE_BITS) * Rows::kPageBytes;
+      const auto* src_data = reinterpret_cast<const int64_t*>(src_page + (src_row & kSlotMask) * DATA_BYTES);
+      const auto* dst_data = reinterpret_cast<const int64_t*>(dst_page + (dst_row & kSlotMask) * DATA_BYTES);
+      const auto* src_scale =
+          reinterpret_cast<const int64_t*>(src_page + Rows::kScaleBase + (src_row & kSlotMask) * SCALE_BYTES);
+      const auto* dst_scale =
+          reinterpret_cast<const int64_t*>(dst_page + Rows::kScaleBase + (dst_row & kSlotMask) * SCALE_BYTES);
+      bool differs = false;
+      for (int32_t w = lane_id; w < Rows::kTotalWords; w += WARP_SIZE) {
+        differs |= w < Rows::kDataWords ? src_data[w] != dst_data[w]
+                                        : src_scale[w - Rows::kDataWords] != dst_scale[w - Rows::kDataWords];
+      }
+      if (__ballot_sync(FULL_WARP_MASK, differs) != 0 && lane_id == 0) {
+        atomicAdd(&stats[0], 1ull);
+      }
+    }
   }
 }
 
@@ -1395,7 +1441,8 @@ template <
     int COMPRESS_RATIO,
     int DATA_BYTES,
     int SCALE_BYTES,
-    int PAGE_BITS>
+    int PAGE_BITS,
+    bool VERIFY>
 void load_cache_to_device_buffer_v41(
     tvm::ffi::TensorView top_k,
     tvm::ffi::TensorView seq_lens,
@@ -1409,7 +1456,7 @@ void load_cache_to_device_buffer_v41(
     tvm::ffi::TensorView device_buffer,
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView num_real_reqs,
-    tvm::ffi::TensorView error_count) {
+    tvm::ffi::TensorView stats) {
   using namespace host;
   using Rows = V41PagedRows<DATA_BYTES, SCALE_BYTES, PAGE_BITS>;
   const int64_t bs = top_k.shape()[0];
@@ -1445,10 +1492,11 @@ void load_cache_to_device_buffer_v41(
         lru_slots.strides()[0],
         static_cast<const int64_t*>(host_binding.data_ptr()),
         static_cast<uint8_t*>(device_buffer.data_ptr()),
+        static_cast<int64_t>(device_buffer.shape()[0]),
         static_cast<int32_t*>(out.data_ptr()),
         out.strides()[0],
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-        static_cast<int32_t*>(error_count.data_ptr()));
+        static_cast<unsigned long long*>(stats.data_ptr()));
   };
   const auto rpi_dtype = req_pool_indices.dtype();
   if (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64) {
@@ -1461,6 +1509,7 @@ void load_cache_to_device_buffer_v41(
             DATA_BYTES,
             SCALE_BYTES,
             PAGE_BITS,
+            VERIFY,
             int64_t>,
         static_cast<const int64_t*>(req_pool_indices.data_ptr()));
   } else {
@@ -1473,6 +1522,7 @@ void load_cache_to_device_buffer_v41(
             DATA_BYTES,
             SCALE_BYTES,
             PAGE_BITS,
+            VERIFY,
             int32_t>,
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }

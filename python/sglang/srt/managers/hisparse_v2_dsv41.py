@@ -14,6 +14,7 @@ its end, so the SWA window decode reads stays request-owned and on GPU.
 from __future__ import annotations
 
 import logging
+import os
 from typing import NamedTuple
 
 import torch
@@ -25,6 +26,8 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 logger = logging.getLogger(__name__)
 
 _HOST_POOL_NAMES = {1: PoolName.DEEPSEEK_V4_C1, 2: PoolName.DEEPSEEK_V4_C2}
+# Debug: the swap-in kernel re-reads every demoted selection against its host row.
+_VERIFY = os.environ.get("SGLANG_HISPARSE_V2_VERIFY", "0") == "1"
 
 
 class _SwapLayer(NamedTuple):
@@ -124,7 +127,9 @@ class HiSparseV2DSV41Cache:
             * self.page_size
         )
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
-        self.error_count = torch.zeros(1, dtype=torch.int32, device=device)
+        # [positions neither tier holds, host rows swapped in, copies skipped for a
+        # hot slot outside the pool]
+        self.stats = torch.zeros(3, dtype=torch.int64, device=device)
         # HiCache attaches after decode graphs are captured.
         self.host_bindings = torch.zeros((num_layers, 2), dtype=torch.int64, device=device)
         self.host_pool = None
@@ -247,13 +252,14 @@ class HiSparseV2DSV41Cache:
             device_buffer=spec.device_buffer,
             top_k_device_locs=page_indices,
             num_real_reqs=self.num_real_reqs,
-            error_count=self.error_count,
+            stats=self.stats,
             num_top_k=self.top_k,
             compress_ratio=spec.ratio,
             data_bytes=spec.data_bytes,
             scale_bytes=spec.scale_bytes,
             page_size=spec.slots_per_page,
             block_size=self.block_size,
+            verify=_VERIFY,
         )
 
 
@@ -410,11 +416,21 @@ class HiSparseV2DSV41Coordinator(HiSparseV2Coordinator):
             return
         self._finish_count += 1
         if self._finish_count % 64 == 0:
-            errors = int(self.cache.error_count.item())
-            if errors:
+            missing, swapped, skipped = self.cache.stats.tolist()
+            if missing:
                 logger.error(
-                    "HiSparse V2 selected %d rows held by neither tier", errors
+                    "HiSparse V2 selected %d rows held by neither tier", missing
                 )
+            if skipped:
+                logger.error(
+                    "HiSparse V2 skipped %d swap-ins with a hot slot outside the pool",
+                    skipped,
+                )
+            logger.debug(
+                "HiSparse V2: %d admitted requests finished, %d host rows swapped in",
+                self._finish_count,
+                swapped,
+            )
 
 
 def build_hisparse_v2_dsv41(*, model_runner):
