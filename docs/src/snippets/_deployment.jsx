@@ -9,7 +9,8 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd | npu.
+//                      vendor picks the selector group: blackwell | hopper | amd |
+//                      npu | cpu (cpu also drops GPU passthrough from docker run).
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -41,7 +42,9 @@
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
 //                      autoTopology(sel), validateTopology(sel)},
-//                      resolveDeployment(sel)}. The resolver returns a cell plus
+//                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
+//                      to qualify the recommendation badge by checkpoint or mode.
+//                      The resolver returns a cell plus
 //                      `builder` metadata (topologySummary, errors, warnings,
 //                      verification, resolvedSettings). UI-only scope/expand and
 //                      local head-address/rank state never enter the URL hash.
@@ -926,6 +929,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             "  -v /etc/ascend_install.info:/etc/ascend_install.info",
             "  -v /var/queue_schedule:/var/queue_schedule",
             "  -v ~/.cache/:/root/.cache/",
+          ]
+        : vendorOf(sel.hw) === "cpu"
+        ? [
+            // CPU-only platform: no GPU device passthrough. --privileged and a
+            // large /dev/shm are what the CPU TP ranks need for their shared
+            // memory transport.
+            "docker run --privileged",
+            "  --shm-size 32g",
           ]
         : [
             "docker run --gpus all",
@@ -1881,6 +1892,8 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       || sel[dim.id]
       || "—";
     const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
+      && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -2004,7 +2017,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -2016,10 +2029,10 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               </strong>
             </div>
             <div>
-              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
+              {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
             </div>
           </section>
         )}
@@ -2366,6 +2379,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             {builderScope !== "serve" && renderOutputCard("request")}
           </div>
         </div>
+
+        {builderScope === "serve" && (
+          <p className="sgd-builder-docs-tip">
+            <strong>Tip:</strong> For more server options, see the{" "}
+            <a href="/docs/sglang-diffusion/api/cli">CLI reference</a>.
+          </p>
+        )}
 
         {modal === "env" && (
           <div style={s.modalBackdrop} onClick={() => setModal(null)}>

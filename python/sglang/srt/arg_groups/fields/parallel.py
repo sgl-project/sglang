@@ -129,10 +129,10 @@ class Parallel(msgspec.Struct):
         Arg(
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
+            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
@@ -161,6 +161,17 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -169,6 +180,14 @@ class Parallel(msgspec.Struct):
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+    ] = False
+    enable_kv_cache_sharding: A[
+        bool,
+        "Shard at-rest KV cache storage at page granularity across the group "
+        "that currently replicates it (attention-CP ranks for GQA models "
+        "under prefill CP; attention-TP ranks for MLA models), multiplying "
+        "the group's unique KV capacity. Prefill workers of PD "
+        "disaggregation only.",
     ] = False
     # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
     # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
@@ -226,7 +245,19 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
+        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
+        "NVLink/NVSwitch.",
+    ] = False
+    enable_megamoe_for_layernorm_sp: A[
+        bool,
+        "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+        "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+        "MoE runner and all-reduce, sharing expert weights with prefill. "
+        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+        "and NVLink/NVSwitch. "
+        "No FlashInfer A2A backend is required when enabled.",
     ] = False
     disable_attn_tp_gather: A[
         bool,

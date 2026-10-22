@@ -18,7 +18,7 @@ Checks the Triton kernel against a per-row torch reference:
 import pytest
 import torch
 
-from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     combine_topk_swa_indices,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

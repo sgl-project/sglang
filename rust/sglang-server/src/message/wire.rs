@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use sglang_api_types::api::v1 as api;
 
-use super::multimodal::{MmDataInput, MmItem};
-use super::sampling::{CustomParamValue, SamplingParams};
+use super::multimodal::{MediaHints, MmDataInput, MmItem};
+use super::request::GenerateRequest;
+use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
 use super::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
 
@@ -81,10 +82,13 @@ pub fn string_list_or_list(v: api::StringListOrList) -> Option<OneOrMany<Vec<Str
 pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
     use api::media_item::Value;
     match item.value {
-        // Only `url` reaches the Rust MM pipeline: the hints are read by model
-        // families it does not run (Python's `load_image` reduces an item to
-        // `.url` the same way).
-        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref { url: r.url }),
+        // Only `url` and the hints a Rust processor reads reach the MM
+        // pipeline; the rest serve model families it does not run (Python's
+        // `load_image` reduces an item to `.url` the same way).
+        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
+            url: r.url,
+            hints: MediaHints { fps: r.fps },
+        }),
         Some(Value::Ref(_)) => Err(Error::Validation(
             "a multimodal item object needs a non-empty `url`".into(),
         )),
@@ -123,8 +127,28 @@ pub fn media_input(input: api::MediaInput) -> Result<MmDataInput, Error> {
 impl TryFrom<api::SamplingParams> for SamplingParams {
     type Error = String;
 
-    fn try_from(p: api::SamplingParams) -> Result<Self, String> {
+    fn try_from(mut p: api::SamplingParams) -> Result<Self, String> {
         let defaults = SamplingParams::default();
+        if !p.choice.is_empty() {
+            if p.regex.is_some()
+                || p.json_schema.is_some()
+                || p.ebnf.is_some()
+                || p.structural_tag.is_some()
+            {
+                return Err(
+                    "choice cannot be combined with regex, json_schema, ebnf, or structural_tag"
+                        .into(),
+                );
+            }
+            p.regex = Some(format!(
+                "(?:{})",
+                p.choice
+                    .iter()
+                    .map(|choice| regex_escape(choice))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ));
+        }
         let custom_params: Option<BTreeMap<String, CustomParamValue>> = match p.custom_params {
             None => None,
             Some(text) => {
@@ -162,9 +186,28 @@ impl TryFrom<api::SamplingParams> for SamplingParams {
             logit_bias: (!p.logit_bias.is_empty()).then(|| p.logit_bias.into_iter().collect()),
             sampling_seed: p.sampling_seed,
             custom_params,
+            watermark: p.watermark.map(|watermark| WatermarkRequestConfig {
+                enabled: watermark.enabled,
+                key: watermark.key,
+                context_window: watermark.context_window,
+            }),
             ..defaults
         })
     }
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// `sampling_params` as sent: one object (a broadcast in a batch) or one per
@@ -249,6 +292,57 @@ pub fn fill_preferred_sampling(
     }
     merge_preferred_sampling(&mut body, preferred)?;
     serde_json::from_value(body["sampling_params"].take()).map_err(|e| e.to_string())
+}
+
+/// Which requests of a `/generate` body sent their own `max_new_tokens`, read
+/// before any launch-time fill: a single (or absent) `sampling_params` object
+/// answers for every item, a list answers per object. Only a value the client
+/// sent is checked against the context window; see
+/// [`GenerateRequest::max_new_tokens_defaulted`].
+#[derive(Debug)]
+pub enum ClientMaxNewTokens {
+    One(bool),
+    Many(Vec<bool>),
+}
+
+impl ClientMaxNewTokens {
+    /// From a JSON body: a present key counts, even an explicit null.
+    pub fn of_json(body: &serde_json::Value) -> Self {
+        let sent = |params: &serde_json::Value| params.get("max_new_tokens").is_some();
+        match body.get("sampling_params") {
+            Some(serde_json::Value::Array(items)) => Self::Many(items.iter().map(sent).collect()),
+            Some(params) => Self::One(sent(params)),
+            None => Self::One(false),
+        }
+    }
+
+    /// From a protobuf request, which has no null: a set field counts.
+    pub fn of_proto(params: Option<&api::SamplingParamsOrList>) -> Self {
+        use api::sampling_params_or_list::Value;
+        let sent = |params: &api::SamplingParams| params.max_new_tokens.is_some();
+        match params.and_then(|params| params.value.as_ref()) {
+            Some(Value::Many(list)) => Self::Many(list.items.iter().map(sent).collect()),
+            Some(Value::One(params)) => Self::One(sent(params)),
+            None => Self::One(false),
+        }
+    }
+
+    /// Mark the requests `into_requests` fanned the body out to, which has
+    /// matched a list's length to the batch.
+    pub fn mark(&self, requests: &mut [GenerateRequest]) {
+        match self {
+            Self::One(sent) => {
+                for request in requests {
+                    request.max_new_tokens_defaulted = !sent;
+                }
+            }
+            Self::Many(sent) => {
+                for (request, sent) in requests.iter_mut().zip(sent) {
+                    request.max_new_tokens_defaulted = !sent;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -348,8 +442,11 @@ mod tests {
         let src = |s: &str| MmItem::Source(s.to_owned());
         assert_eq!(conv(r#""u""#), MmDataInput::One(src("u")));
         assert_eq!(
-            conv(r#"{"url": "u", "detail": "high"}"#),
-            MmDataInput::One(MmItem::Ref { url: "u".into() })
+            conv(r#"{"url": "u", "detail": "high", "fps": 2.0}"#),
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                hints: MediaHints { fps: Some(2.0) },
+            })
         );
         assert_eq!(
             conv(r#"["a", null, "b"]"#),
@@ -378,6 +475,28 @@ mod tests {
             Some(1.5)
         );
         assert_eq!(p.temperature, 1.0, "schema default applied by the decoder");
+    }
+
+    #[test]
+    fn choices_lower_to_an_escaped_regex() {
+        let p: api::SamplingParams = serde_json::from_str(r#"{"choice":["a.b","x+y"]}"#).unwrap();
+        let p = SamplingParams::try_from(p).unwrap();
+        assert_eq!(p.regex.as_deref(), Some(r"(?:a\.b|x\+y)"));
+    }
+
+    #[test]
+    fn watermark_crosses_generated_schema() {
+        let key = "0123456789abcdef";
+        let p: api::SamplingParams = serde_json::from_value(serde_json::json!({
+            "watermark": {"enabled": true, "key": key, "context_window": 4}
+        }))
+        .unwrap();
+        let p = SamplingParams::try_from(p).unwrap();
+        let watermark = p.watermark.as_ref().unwrap();
+        assert_eq!(watermark.enabled, Some(true));
+        assert_eq!(watermark.key.as_deref(), Some(key));
+        assert_eq!(watermark.context_window, Some(4));
+        assert!(!format!("{p:?}").contains(key));
     }
 
     /// The protobuf entry fills the same keys the JSON entry does: a set field
