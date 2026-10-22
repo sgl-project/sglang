@@ -30,13 +30,13 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.quantization.mxfp8_input import (
-    Mxfp8DeepGemmInput,
-    Mxfp8SwizzledInput,
-)
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput
@@ -51,6 +51,30 @@ _is_xpu = is_xpu()
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
 FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
+
+
+def fused_mxfp8_rows(rows: int) -> bool:
+    """Decode and verify batches the fused MXFP8 producers cover."""
+    fwd = get_forward()
+    return 0 < rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS and not (
+        fwd.is_extend_in_batch or fwd.sp_active
+    )
+
+
+def empty_deepgemm_mxfp8_pair(
+    rows: int, cols: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
+    scales = create_per_token_group_quant_fp8_output_scale(
+        (rows, cols),
+        device,
+        32,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    return data, scales
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -104,10 +128,11 @@ class HcNormed(NamedTuple):
 
 
 class HcQuantized(NamedTuple):
-    """Normed, and already swizzled for the sublayer's first projection."""
+    """Normed, and already quantized for the sublayer's first projection."""
 
     rows: torch.Tensor
-    swizzled: Union[Mxfp8SwizzledInput, Mxfp8DeepGemmInput]
+    # An Mxfp8SwizzledInput (FlashInfer 128x4) or a DeepGEMM-packed (fp8, scale) pair.
+    pair: Tuple[torch.Tensor, torch.Tensor]
 
 
 HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
@@ -240,7 +265,7 @@ def make_boundary(
             and norm.weight.is_contiguous()
         ),
         hc=hc,
-        accepts_mxfp8_deepgemm=accepts_mxfp8 and accepts_mxfp8_deepgemm,
+        accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
     )
 
 
@@ -404,10 +429,8 @@ def combine(
     whatever the previous post left in ``state.input``."""
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
-        if quantized is None and isinstance(shortcut.swizzled, Mxfp8DeepGemmInput):
-            return shortcut.rows
-        assert quantized is not None
-        quantized.append(shortcut.swizzled)
+        if quantized is not None:
+            quantized.append(shortcut.pair)
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
         return shortcut.rows
@@ -629,13 +652,10 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
-        emit_mxfp8 = (
-            next.accepts_mxfp8_deepgemm
-            and y.shape[0] <= FUSED_MXFP8_PRODUCER_MAX_ROWS
-            and not get_forward().is_extend_in_batch
-            and not get_forward().sp_active
-        )
-        out = mhc_mega_boundary(
+        y_fp8 = y_sf = None
+        if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
+            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
+        updated, normalized, stats = mhc_mega_boundary(
             y,
             residual,
             pre,
@@ -649,17 +669,11 @@ def _post_fusion(
             next_hc.cfg.eps,
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
-            emit_mxfp8=emit_mxfp8,
+            y_fp8=y_fp8,
+            y_gemm_sf=y_sf,
         )
-        if emit_mxfp8:
-            updated, normalized, stats, (y_fp8, y_sf) = out
-            return HcState(
-                updated,
-                pre,
-                HcQuantized(normalized, Mxfp8DeepGemmInput(y_fp8, y_sf)),
-                stats,
-            )
-        updated, normalized, stats = out
+        if y_fp8 is not None:
+            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

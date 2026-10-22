@@ -104,10 +104,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import (
-    Mxfp8DeepGemmInput,
-    Mxfp8SwizzledInput,
-)
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -668,17 +665,20 @@ def _fp8_wo_a_einsum(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     recipe: Tuple[int, int, int],
-) -> torch.Tensor:
+    out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
     import deep_gemm
 
-    groups, rank = weight.shape[:2]
-    output = torch.empty(
-        o_fp8.shape[0], groups, rank, device=o_fp8.device, dtype=torch.bfloat16
-    )
+    if out is None:
+        groups, rank = weight.shape[:2]
+        out = torch.empty(
+            o_fp8.shape[0], groups, rank, device=o_fp8.device, dtype=torch.bfloat16
+        )
     deep_gemm.fp8_einsum(
-        "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), output, recipe=recipe
+        "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), out, recipe=recipe
     )
-    return output
+    return out
 
 
 def _apply_gguf_grouped_wo_a(
@@ -1528,7 +1528,7 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         allow_mxfp8_output: bool = False,
-    ) -> torch.Tensor | Mxfp8DeepGemmInput:
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1542,37 +1542,20 @@ class MQALayer(MqaAttentionBase):
         )
         groups = self.n_local_groups
         rows = data.shape[0]
-        if (
-            allow_mxfp8_output
-            and 0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
-            and self.fused_mxfp8_wo_b
-            and not get_forward().is_extend_in_batch
-            and not get_forward().sp_active
-        ):
-            import deep_gemm
-
-            out = torch.empty(
-                (rows, groups, self.o_lora_rank),
-                dtype=torch.float8_e4m3fn,
-                device=data.device,
+        o_fp8, o_s = data[:, :groups], scale[:, :groups]
+        if allow_mxfp8_output and self.fused_mxfp8_wo_b and mhc.fused_mxfp8_rows(rows):
+            y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+                rows, groups * self.o_lora_rank, data.device
             )
-            out_scale = torch.empty_strided(
-                (rows, groups * self.o_lora_rank // 128),
-                (1, deep_gemm.get_tma_aligned_size(rows, 4)),
-                dtype=torch.int32,
-                device=data.device,
-            )
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (data[:, :groups], scale[:, :groups]),
-                self.mega_wo_a,
-                (out, out_scale),
+            _fp8_wo_a_einsum(
+                o_fp8,
+                o_s,
+                *self.mega_wo_a,
                 recipe=(1, 1, 32),
+                out=(y.view(rows, groups, -1), y_sf),
             )
-            return Mxfp8DeepGemmInput(out.view(rows, -1), out_scale)
-        return _fp8_wo_a_einsum(
-            data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
-        )
+            return y, y_sf
+        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32))
 
     def _get_npu_rope_position_cache(
         self,

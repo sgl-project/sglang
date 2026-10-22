@@ -61,8 +61,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
-    deepgemm_mxfp8_prequantized_linear,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    deepgemm_w8a8_mxfp8_linear_with_fallback,
     dense_mxscale_wanted,
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    pack_mxfp8_weight_scale_for_deepgemm,
     prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
@@ -79,10 +80,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
-from sglang.srt.layers.quantization.mxfp8_input import (
-    Mxfp8DeepGemmInput,
-    Mxfp8SwizzledInput,
-)
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -973,7 +971,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.block_fp8_mxfp8_ready = True
 
     def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
-        """Pack the DeepGEMM-side weight scale for Mxfp8DeepGemmInput."""
+        """Let a FlashInfer layer also take a DeepGEMM-packed (fp8, scale) pair."""
         from sglang.srt.layers import deep_gemm_wrapper
 
         backend = self.mxfp8_dense_backend
@@ -997,19 +995,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         else:
             return False
-        import deep_gemm.utils.layout
-
-        scale_fp32 = (
-            (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
-            .view(torch.float32)
-            .view(n, k // 32)
-        )
         copy_or_rebind_param(
             layer,
-            "weight_scale_inv_deepgemm_input",
-            deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-                scale_fp32
-            ),
+            "weight_scale_inv_deepgemm",
+            pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k),
         )
         return True
 
@@ -1099,22 +1088,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv_swizzled",
                     block_scale_interleave(scale_u8.contiguous()).contiguous(),
                 )
-            scale_fp32 = (
-                (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
-                .view(torch.float32)
-                .view(n, k // 32)
-            )
             if DEEPGEMM_SCALE_UE8M0:
                 # Pre-packed; GEMM must be called with disable_ue8m0_cast=True.
-                import deep_gemm.utils.layout
-
-                scale_packed = (
-                    deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-                        scale_fp32
-                    )
-                )
+                scale_packed = pack_mxfp8_weight_scale_for_deepgemm(scale_u8, n, k)
             else:
-                scale_packed = scale_fp32
+                scale_packed = (
+                    (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+                    .view(torch.float32)
+                    .view(n, k // 32)
+                )
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
@@ -1318,9 +1300,6 @@ class Fp8LinearMethod(LinearMethodBase):
         if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
             return fp8_hip.apply_dense(self, layer, x, bias)
 
-        if isinstance(x, Mxfp8DeepGemmInput):
-            return deepgemm_mxfp8_prequantized_linear(layer, x, bias)
-
         mxfp8_view = self.use_mxfp8 or (
             self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
         )
@@ -1333,6 +1312,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     "Mxfp8SwizzledInput needs a layer with an MXFP8 view on a "
                     "FlashInfer CUTLASS / CuTe-DSL backend"
                 )
+        elif (
+            mxfp8_view
+            and isinstance(x, tuple)
+            and x[1].dtype == torch.int32
+            and not self.mxfp8_dense_backend.is_deep_gemm()
+        ):
+            # DeepGEMM-packed scales (see prepare_deepgemm_mxfp8_input).
+            return deepgemm_w8a8_mxfp8_linear_with_fallback(
+                x[0],
+                layer.weight,
+                layer.weight_scale_inv_deepgemm,
+                input_scale=x[1],
+                bias=bias,
+            )
         elif self.block_fp8_as_mxfp8 and isinstance(x, tuple):
             # A legacy (q, scale) block-fp8 pair keeps the block kernel.
             mxfp8_view = False
