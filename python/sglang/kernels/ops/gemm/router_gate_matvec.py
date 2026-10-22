@@ -5,6 +5,14 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.gemm.router_gate_matvec_cuda import (
+    router_gate_matvec_cuda,
+    use_router_gate_matvec_cuda,
+)
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm90_supported
+
+_is_sm90 = is_sm90_supported()
 
 
 @triton.jit
@@ -107,6 +115,12 @@ def router_gate_matvec(
         )
         and weight.is_contiguous()
     )
+    if (
+        _is_sm90
+        and envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get()
+        and use_router_gate_matvec_cuda(hidden_states, weight)
+    ):
+        return router_gate_matvec_cuda(hidden_states, weight)
     M, K = hidden_states.shape
     E = weight.shape[0]
     out = torch.empty((M, E), dtype=torch.float32, device=hidden_states.device)

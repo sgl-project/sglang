@@ -13,6 +13,10 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.kernels.ops.gemm.hopper_fp8_block_gemv import (
+    hopper_fp8_block_gemv,
+    use_hopper_fp8_block_gemv,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     dequant_group_fp8_to_bf16,
     fp8_dtype,
@@ -1446,6 +1450,35 @@ def _ue8m0_deepgemm_skips_block32(
     return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
 
 
+def _fp8_block_gemv_enabled() -> bool:
+    return envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get() and get_platform().is_sm90
+
+
+def _use_fp8_block_gemv(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+) -> bool:
+    return (
+        _fp8_block_gemv_enabled()
+        and input_2d.is_cuda
+        and input_2d.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.dtype == torch.float32
+        and weight.device == input_2d.device == weight_scale.device
+        and weight.is_contiguous()
+        and weight_scale.is_contiguous()
+        and input_2d.is_contiguous()
+        and input_2d.shape[1] == weight.shape[1]
+        and weight_scale.shape
+        == ((weight.shape[0] + 127) // 128, weight.shape[1] // 128)
+        and use_hopper_fp8_block_gemv(
+            input_2d.shape[0], weight.shape[0], weight.shape[1], block_size
+        )
+    )
+
+
 def _deepgemm_block_fp8_supported(
     weight_shape: Tuple[int, int], block_size: List[int], output_dtype: torch.dtype
 ) -> bool:
@@ -1489,6 +1522,30 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    input_2d = input.view(-1, input.shape[-1])
+    if (
+        input_scale is not None
+        and input_scale.dtype == torch.float32
+        and input_scale.device == input.device
+        and input_scale.shape == (input_2d.shape[0], input_2d.shape[1] // block_size[1])
+        and input_scale.is_contiguous()
+        and _use_fp8_block_gemv(input_2d, weight, weight_scale, block_size)
+    ):
+        output = hopper_fp8_block_gemv(input_2d, input_scale, weight, weight_scale)
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
+    if input_scale is None and _use_fp8_block_gemv(
+        input_2d, weight, weight_scale, block_size
+    ):
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], scale_ue8m0=act_scale_ue8m0
+        )
+        output = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
+
     deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
         weight.shape, block_size, output_dtype
     )
