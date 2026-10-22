@@ -500,8 +500,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         # The c16 server leaves SGLANG_AITER_MLA_PERSIST=0 so the target stays
-        # on the DCP ASM kernel. The K3 draft block is qlen 4; the
-        # non-persistent qseqlen4 kernel reads a fourth query row and faults.
+        # on the DCP ASM kernel. The non-persistent qseqlen4 kernel reads a
+        # fourth query row and faults.
         # Turn persistent on only while this draft backend is built. Forwards
         # read the flag stored on that backend.
         persist_restore = None
@@ -526,12 +526,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if getattr(self, "_k3_dspark_draft", False):
             draft_backend = self.draft_model_runner.attn_backend
             query_width = int(self.query_token_num)
-            if (
-                draft_backend is not None
-                and query_width > 0
-                and getattr(draft_backend, "num_draft_tokens", None) != query_width
-            ):
-                draft_backend.num_draft_tokens = query_width
+            if draft_backend is not None and query_width > 0:
+                if getattr(draft_backend, "num_draft_tokens", None) != query_width:
+                    draft_backend.num_draft_tokens = query_width
+                if hasattr(draft_backend, "configure_k3_draft_query_width"):
+                    draft_backend.configure_k3_draft_query_width(query_width)
                 if get_parallel().tp_rank == 0:
                     logger.info(
                         "K3DSpark draft attention width is %s; target verify width stays %s.",

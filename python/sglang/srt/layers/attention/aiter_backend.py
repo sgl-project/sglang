@@ -630,6 +630,9 @@ class AiterAttnBackend(AttentionBackend):
             # qh16 v3. On gfx950, fp8 qlen 4 with the count left at 8 selects
             # the qh32 tile (s_MQA=8). v1_0 folds 8 up to 16 and then faults
             # against that launch, so this path's metadata uses v1_2.
+            # v1_2 only accepts that 8-head count at max_seqlen_qo == 4.
+            # configure_k3_draft_query_width turns this back off for any
+            # other draft query width and repeats the heads to 16.
             self._draft_native_gqa8 = False
             if (
                 self.is_draft_worker
@@ -723,6 +726,32 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
             self.use_mla_ps_kernel = bool(_use_mla_ps_kernel)
+
+    def configure_k3_draft_query_width(self, query_width: int) -> None:
+        """Keep the native 8-head tile only for a 4-token K3 draft block.
+
+        ``get_mla_metadata_v1_2_device`` accepts 8 heads only when
+        ``max_seqlen_qo`` is 4. A block of 7 captures the draft graph at
+        width 7 and aborts. Repeating those heads to 16 puts the count in
+        the kernel's unrestricted set, and the long-qlen fp8 launch already
+        requires the padded count to be 16.
+        """
+        if not getattr(self, "_draft_native_gqa8", False):
+            return
+        if int(query_width) == _MLA_ASM_PS_MAX_QLEN:
+            return
+        self._draft_native_gqa8 = False
+        self.num_head_padded = 16
+        self.mla_kernel_num_head_padded = 16
+        self.head_pad_mode = "repeat"
+        self.head_repeat_factor = 16 // self.num_head
+        logger.info(
+            "aiter K3 draft query width %d is not the 8-head qlen-%d kernel; "
+            "repeating %d heads to 16",
+            int(query_width),
+            _MLA_ASM_PS_MAX_QLEN,
+            self.num_head,
+        )
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
