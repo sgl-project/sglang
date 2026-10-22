@@ -237,9 +237,8 @@ struct FusedKIndexerNormRopeStoreParams {
   float eps;
 };
 
-// kRoundScale rounds the per-token scale up to a power of two; kPackScale stores it
-// as packed UE8M0 (its exponent byte for each of the 4 32-channel groups, MXFP8)
-template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, bool kRoundScale, bool kPackScale>
+// kScaleFmt is one of the deepseek_v4::fp8::kIndexKScale* formats
+template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, int kScaleFmt>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -329,9 +328,9 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   for (int i = 1; i < kVecSize; ++i)
     local_max = math::max(local_max, math::abs(data[i]));
   const auto abs_max = warp::reduce_max(local_max);
-  auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-  if constexpr (kRoundScale) scale = exp2f(ceilf(log2f(scale)));
-  const auto inv_scale = 1.0f / scale;
+  uint32_t stored_scale;
+  const auto inv_scale =
+      deepseek_v4::fp8::quant_index_k_scale<kScaleFmt>(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX, stored_scale);
 
   const auto index = static_cast<const int64_t*>(params.indices)[work_id];
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
@@ -344,25 +343,17 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
   result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
   reinterpret_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  if (lane_id == 0) {
-    if constexpr (kPackScale) {
-      static_assert(kRoundScale, "UE8M0 scales must be powers of two");
-      *reinterpret_cast<uint32_t*>(scale_ptr) = ((__float_as_uint(scale) >> 23) & 0xFFu) * 0x01010101u;
-    } else {
-      *reinterpret_cast<float*>(scale_ptr) = scale;
-    }
-  }
+  if (lane_id == 0) *reinterpret_cast<uint32_t*>(scale_ptr) = stored_scale;
 }
 
-template <typename DType, bool kUsePDL, uint32_t kPageSize, bool kRoundScale, bool kPackScale>
+template <typename DType, bool kUsePDL, uint32_t kPageSize, int kScaleFmt>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132ll * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <typename PosT>
-  static constexpr auto kernel =
-      fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kRoundScale, kPackScale>;
+  static constexpr auto kernel = fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kScaleFmt>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,

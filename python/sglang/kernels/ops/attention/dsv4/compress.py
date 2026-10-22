@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.attention.fused_store_index_cache import index_k_scale_fmt
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -52,8 +53,7 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
-    round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    indexer_scale_fmt: int = 0,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -64,8 +64,7 @@ def _jit_compress_norm_rope_module(
         bf16_store,
         layout.cpp_name,
         is_arch_support_pdl(),
-        round_scale,
-        ue8m0_scale,
+        indexer_scale_fmt,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -465,7 +464,7 @@ def compress_norm_rope_store(
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
-    # FP8 indexer only: power-of-two scale, and packed UE8M0 storage (MXFP8)
+    # FP8 indexer only: power-of-two scale, and packed UE8M0 storage (MXFP8, implies round_scale)
     round_scale: bool = False,
     ue8m0_scale: bool = False,
 ) -> None:
@@ -531,8 +530,7 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
-            round_scale,
-            ue8m0_scale,
+            index_k_scale_fmt(round_scale, ue8m0_scale),
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()
