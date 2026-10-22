@@ -130,6 +130,66 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
 
+class TestHostTensorIndicesEvent(CustomTestCase):
+    def test_indices_event_comes_from_the_scheduler_device_module(self):
+        """The D2H indices event is created and recorded on the scheduler's device.
+
+        A sender that takes host-tensor indices gets a pinned host copy plus an
+        event the transfer worker waits on. Building that event with torch.cuda
+        crashes every non-CUDA prefill scheduler on its first KV send.
+        """
+        page_size, total = 64, 128
+        stream = object()
+
+        class _Event:
+            def record(self, recorded_on):
+                self.recorded_on = recorded_on
+
+        sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=SimpleNamespace(enable_all_cp_ranks_for_transfer=False),
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="host-indices",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * total,
+            extend_end=total,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            device_module=SimpleNamespace(Event=_Event, current_stream=lambda: stream),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=page_size,
+                translate_kv_indices_for_transfer=lambda x: x,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(total).reshape(1, -1)
+            ),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        real_empty = torch.empty
+
+        def empty_unpinned(*args, pin_memory=False, **kwargs):
+            # Pinned host memory needs an accelerator, which the CPU runner lacks.
+            return real_empty(*args, **kwargs)
+
+        with patch("torch.empty", side_effect=empty_unpinned):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=False
+            )
+
+        event = sender.send.call_args.kwargs["indices_event"]
+        self.assertIsInstance(event, _Event)
+        self.assertIs(event.recorded_on, stream)
+        np.testing.assert_array_equal(sender.send.call_args.args[0], [0, 1])
+
+
 class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_fixed_regions_for_each_dcp_rank(self):
         self.assertEqual(

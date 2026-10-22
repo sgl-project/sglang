@@ -1745,8 +1745,8 @@ class SchedulerDisaggregationPrefillMixin:
                     pin_memory=True,
                 )
                 page_indices.copy_(page_indices_dev, non_blocking=True)
-                indices_event = torch.cuda.Event()
-                indices_event.record(torch.cuda.current_stream())
+                indices_event = self.device_module.Event()
+                indices_event.record(self.device_module.current_stream())
             else:
                 page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
