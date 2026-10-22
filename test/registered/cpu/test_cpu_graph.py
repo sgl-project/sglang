@@ -4,8 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+
 import torch
 
+import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
 import sglang.srt.model_executor.cpu_graph_runner as cpu_graph_runner_module
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 from sglang.srt.arg_groups.cuda_graph_hook import (
@@ -15,16 +18,29 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.model_executor.cpu_graph_runner import (
+    CPUGraphRunner,
+    _mark_dynamic,
+    cpu_graph_patch_boundary_classes,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
     default_prefill_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
@@ -68,6 +84,39 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
         ),
         mm_inputs=None,
     )
+
+
+class _MiniTransformerBlock(torch.nn.Module):
+    """Minimal transformer block incorporating RoPE, linears, MLP, and layer boundary."""
+
+    def __init__(self, rope):
+        super().__init__()
+        self.rope = rope
+        self.q_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
+        self.k_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
+        self.v_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
+        self.out_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
+        self.mlp_gate = torch.nn.Linear(2048, 4096, bias=False, dtype=torch.bfloat16)
+        self.mlp_down = torch.nn.Linear(4096, 2048, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, input_ids, positions, forward_batch):
+        # Access active forward context
+        _ = get_forward_context()
+        q = self.q_proj(input_ids)
+        k = self.k_proj(input_ids)
+        v = self.v_proj(input_ids)
+        q, k = self.rope.forward_cpu(positions, q, k)
+        attn = q * k + v
+        hidden = self.out_proj(attn)
+
+        # Layer boundary / residual stream compatibility
+        contrib = stream_mod.Contribution(hidden, hidden)
+        decl = stream_mod.DeclaredSum("group", complete_sum=lambda x: x + 1.0)
+        normed = decl.complete(contrib.value)
+
+        # Non-linear activation & MLP projection
+        gate = torch.relu(self.mlp_gate(normed))
+        return self.mlp_down(gate) + normed
 
 
 class TestCPUGraph(CustomTestCase):
@@ -265,6 +314,105 @@ class TestCPUGraph(CustomTestCase):
             self.assertTrue(torch.allclose(output, input_ids.sin() + 1))
 
         self.assertEqual(compile_count, 1)
+
+    def test_cpu_graph_transformer_layer_has_no_graph_break(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        rope = RotaryEmbedding(128, 128, 2048, 10000, True, torch.bfloat16)
+        model = _MiniTransformerBlock(rope)
+
+        num_tokens = 8
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.randn(num_tokens, 2048, dtype=torch.bfloat16),
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int64),
+            out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens_sum=num_tokens,
+        )
+
+        with cpu_graph_patch_boundary_classes():
+            with forward_context(ForwardContext(attn_backend=None), forward_batch=fb):
+                explanation = torch._dynamo.explain(model)(
+                    fb.input_ids, fb.positions, fb
+                )
+
+        self.assertEqual(
+            explanation.graph_count,
+            1,
+            f"Expected exactly 1 compiled graph, got {explanation.graph_count}. "
+            f"Break reasons: {explanation.break_reasons}",
+        )
+        self.assertEqual(
+            len(explanation.break_reasons),
+            0,
+            f"Unexpected graph break(s) detected: {explanation.break_reasons}",
+        )
+
+    def test_cpu_graph_dynamic_shapes_have_no_unexpected_recompilation(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        rope = RotaryEmbedding(128, 128, 2048, 10000, True, torch.bfloat16)
+        model = _MiniTransformerBlock(rope)
+
+        compile_count = [0]
+
+        def count_backend(graph_module, example_inputs):
+            compile_count[0] += 1
+            return graph_module.forward
+
+        with cpu_graph_patch_boundary_classes():
+            # A. Prefill dynamic token sequence length changes (8 -> 16 -> 24 -> 8)
+            torch._dynamo.reset()
+            compile_count[0] = 0
+            compiled_prefill = torch.compile(model, backend=count_backend, dynamic=True)
+            for n in (8, 16, 24, 8):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.randn(n, 2048, dtype=torch.bfloat16),
+                    positions=torch.arange(n, dtype=torch.int64),
+                    seq_lens=torch.tensor([n], dtype=torch.int64),
+                    out_cache_loc=torch.arange(n, dtype=torch.int64),
+                    req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                    seq_lens_sum=n,
+                )
+                _mark_dynamic(fb.input_ids, fb.positions, max_value=64)
+                with forward_context(
+                    ForwardContext(attn_backend=None), forward_batch=fb
+                ):
+                    _ = compiled_prefill(fb.input_ids, fb.positions, fb)
+                self.assertEqual(
+                    compile_count[0],
+                    1,
+                    f"Unexpected recompile on prefill token count {n}: count={compile_count[0]}",
+                )
+
+            # B. Decode dynamic batch size changes (2 -> 3 -> 4 -> 2)
+            torch._dynamo.reset()
+            compile_count[0] = 0
+            compiled_decode = torch.compile(model, backend=count_backend, dynamic=True)
+            for bs in (2, 3, 4, 2):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=bs,
+                    input_ids=torch.randn(bs, 2048, dtype=torch.bfloat16),
+                    positions=torch.zeros(bs, dtype=torch.int64),
+                    seq_lens=torch.ones(bs, dtype=torch.int64),
+                    out_cache_loc=torch.arange(bs, dtype=torch.int64),
+                    req_pool_indices=torch.arange(bs, dtype=torch.int64),
+                    seq_lens_sum=bs,
+                )
+                _mark_dynamic(fb.input_ids, fb.positions, max_value=16)
+                with forward_context(
+                    ForwardContext(attn_backend=None), forward_batch=fb
+                ):
+                    _ = compiled_decode(fb.input_ids, fb.positions, fb)
+                self.assertEqual(
+                    compile_count[0],
+                    1,
+                    f"Unexpected recompile on decode batch size {bs}: count={compile_count[0]}",
+                )
 
     def test_cpu_graph_default_decode_buckets_are_generated(self):
         args = self._resolve_cpu_graph_args()
