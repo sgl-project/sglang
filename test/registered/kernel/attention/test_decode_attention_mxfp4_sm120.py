@@ -617,5 +617,72 @@ class TestMxfp4TritonCudaGraphSafety(CustomTestCase):
             )
 
 
+class TestE2M1ScaleLut(CustomTestCase):
+    """The fused dequant table must agree with the production eager codec.
+
+    Enumerates all 4096 (E8M0 byte, E2M1 code) pairs through
+    ``MXFP4KVQuantizeUtil.batched_dequantize`` and compares bit patterns with
+    ``e2m1_scale_lut``. A mismatch here means the decode kernel dequantizes
+    different values than the write path and the rest of the stack.
+    """
+
+    def test_lut_matches_eager_codec(self):
+        from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
+            e2m1_scale_lut,
+        )
+
+        rows = 1 << 12
+        idx = torch.arange(rows, device=_DEVICE)
+        codes = (idx & 0x0F).to(torch.uint8)
+        sbytes = (idx >> 4).to(torch.uint8)
+        # One 32-element block per row: byte 0 low nibble = code, the rest zero.
+        packed = torch.zeros((rows, 1, 16), dtype=torch.uint8, device=_DEVICE)
+        packed[:, 0, 0] = codes
+        scales = sbytes.view(rows, 1, 1)
+
+        b = sbytes.to(torch.int32)
+        reachable = (b >= 1) & (b <= 254)  # written by the quantizer
+        all_zero_codes = (codes & 0x07) == 0
+
+        for dtype, int_dtype in (
+            (torch.bfloat16, torch.int16),
+            (torch.float32, torch.int32),
+        ):
+            ref = MXFP4KVQuantizeUtil.batched_dequantize(
+                packed, scales, logical_dim=32, dtype=dtype
+            )[:, 0, 0]
+            got = e2m1_scale_lut(_DEVICE, dtype)[idx]
+
+            # Every (scale, code) pair the write path can produce must be
+            # bit-identical to the eager codec, NaN scale byte included.
+            self.assertTrue(
+                torch.equal(
+                    got.view(int_dtype)[reachable], ref.view(int_dtype)[reachable]
+                ),
+                f"{dtype}: LUT dequant is not bit-exact with the eager codec",
+            )
+            # Scale byte 0xFF is E8M0 NaN: NaN for every code, like the codec.
+            self.assertTrue(
+                torch.equal(torch.isnan(got[b == 255]), torch.isnan(ref[b == 255]))
+            )
+            # Scale byte 0 (2^-127) is unreachable: amax == 0 quantizes to all-zero
+            # codes. It is the one domain where the kernel's bit construction and
+            # the codec's torch.exp2 disagree (fp32 subnormal rounding), so pin the
+            # signed-zero rows and leave the rest documented-but-unconstrained.
+            self.assertTrue((got[(b == 0) & all_zero_codes] == 0).all())
+
+        # The fp32 table must be the exact widening of the bf16 one (NaN rows
+        # compared by pattern, since NaN != NaN).
+        bf16_bits = e2m1_scale_lut(_DEVICE, torch.bfloat16).float()
+        fp32_bits = e2m1_scale_lut(_DEVICE, torch.float32)
+        nan = torch.isnan(bf16_bits)
+        self.assertTrue(torch.equal(torch.isnan(fp32_bits), nan))
+        self.assertTrue(
+            torch.equal(
+                bf16_bits.view(torch.int32)[~nan], fp32_bits.view(torch.int32)[~nan]
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

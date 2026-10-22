@@ -796,6 +796,16 @@ class MXFP4KVCacheMethod(KVCacheQuantMethodBase):
             )
             for _ in range(layer_num)
         ]
+        # Materialize the native decode kernel's fused E2M1 x E8M0 dequant table
+        # here (eager init): it is built on first use, and a capture-time build
+        # would be baked into the CUDA graph.
+        if torch.device(device).type == "cuda":
+            from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
+                e2m1_scale_lut,
+            )
+
+            e2m1_scale_lut(device, torch.bfloat16)
+            e2m1_scale_lut(device, torch.float32)
         return {
             "k_buffer": k_buffer,
             "v_buffer": v_buffer,

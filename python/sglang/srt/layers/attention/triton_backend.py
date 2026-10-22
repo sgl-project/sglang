@@ -332,12 +332,41 @@ class TritonAttnBackend(AttentionBackend):
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
         if self.mxfp4_native_decode:
-            # The native kernel is latency-bound at the default 8 splits:
-            # bs=1 long-context grid is only kv_heads * splits CTAs (4*8=32
-            # vs 170 SMs on SM120), and the stage-1 kernel drops from ~155us
-            # to ~67us at 4096 seq when raising splits to 32. Raise the
-            # floor; an explicit larger --triton-attention-num-kv-splits wins.
-            self.max_kv_splits = max(self.max_kv_splits, 32)
+            # The native kernel is latency-bound at the default 8 splits: a bs=1
+            # long-context grid is only head_tiles * splits CTAs (4*8=32 vs 170
+            # SMs on SM120). Raise the floor to fill a whole number of CTA
+            # waves -- stage 1 is register-bound, so the grid
+            # (batch, head_tiles, splits) wants to stay within
+            # SMs * CTAs-per-SM, and overshooting by a single CTA buys another
+            # wave that the entire kernel then waits on. Measured on SM120
+            # (170 SMs), bs=1, 24Q/4KV, head_dim 256, 100k context, grouped
+            # path at 2 CTAs/SM (a 340-CTA wave): 32 splits (128 CTAs)
+            # 0.179 ms, 42 (168) 0.145, 84 (336) 0.120, 88 (352) 0.186.
+            #
+            # The device-side schedule in get_num_kv_splits_triton inflates the
+            # core count by log2(seq_len/64) before dividing by the head grid,
+            # which suits the bf16 kernel's lighter CTAs but massively
+            # overshoots here, so the wave bound has to come from this cap. An
+            # explicit larger --triton-attention-num-kv-splits still wins.
+            from sglang.kernels.ops.attention.decode_attention_mxfp4_sm120 import (
+                _GROUPED_BLOCK_H,
+                stage1_launch_config,
+            )
+
+            if kv_group_num == 1:
+                # MHA takes the per-head grid: one tile per query head.
+                head_tiles = self.num_head
+            else:
+                head_tiles = triton.cdiv(
+                    self.num_head, min(_GROUPED_BLOCK_H, kv_group_num)
+                )
+            _, ctas_per_sm = stage1_launch_config(kv_group_num, model_runner.gpu_id)
+            wave_kv_splits = (
+                max(1, ctas_per_sm * self.device_core_count // head_tiles)
+                if self.device_core_count > 0
+                else 32
+            )
+            self.max_kv_splits = max(self.max_kv_splits, wave_kv_splits)
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:
@@ -2273,7 +2302,6 @@ class TritonAttnBackend(AttentionBackend):
                 layer.scaling,
                 page_size=self.page_size,
                 max_kv_splits=self.max_kv_splits,
-                num_warps=8,
                 attn_logits=attn_logits,
                 attn_lse=self.forward_metadata.attn_lse,
                 num_kv_splits=self.forward_metadata.num_kv_splits,

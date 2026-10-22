@@ -12,9 +12,10 @@ throughout).
 Codec semantics (must stay bit-compatible with the production codec and the
 oracle): low nibble of a packed byte = even-index element, high nibble =
 odd-index element; E2M1 code magnitude table (0, .5, 1, 1.5, 2, 3, 4, 6)
-with bit 3 = sign; E8M0 scale = 2^(byte - 127), applied by exact fp32 bit
-construction (``_e8m0_to_f32``). A NaN scale byte (0xFF) propagates NaN
-exactly like the oracle.
+with bit 3 = sign; E8M0 scale = 2^(byte - 127). The code x scale product is
+applied through a 4096-entry lookup table (``e2m1_scale_lut``) whose values
+are produced by the exact bit-construction routine ``_e2m1_scale_to_bf16``.
+A NaN scale byte (0xFF) propagates NaN exactly like the oracle.
 
 Intentionally NOT implemented: lean attention, score_mod,
 DCP, sliding window, logit cap, xai temperature, MLA, extend/prefill.
@@ -25,15 +26,51 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
-from sglang.kernels.ops.quantization.mxfp4_quant import e8m0_to_f32 as _e8m0_to_f32
 
 MXFP4_BLOCK_SIZE = 32
 # Kernel-side mirror of MXFP4_BLOCK_SIZE: @triton.jit functions may only read
-# tl.constexpr globals.
+# tl.constexpr globals. The half-block form is the same bound counted in packed
+# bytes, used by the nibble-interleaved loads.
 _MXFP4_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE)
+_MXFP4_HALF_BLOCK = tl.constexpr(MXFP4_BLOCK_SIZE // 2)
 _MIN_BLOCK_KV = 32
 _BLOCK_N = 64
 _GROUPED_BLOCK_H = 16
+
+# Production launch config for the two stage-1 paths, plus the compiled
+# footprint that decides how many CTAs reside per SM. These live next to the
+# kernels because the attention backend derives its kv-split schedule from
+# them (it aims for a whole number of CTA waves), so retuning a kernel without
+# updating these would silently desync that schedule.
+#
+# Measured on SM120 / triton 3.7.1 (24Q/4KV, head_dim 256, BLOCK_N 64):
+#   grouped, nibble-interleaved : 4 warps, 178 regs, 0 spills, 43,008 B smem
+#   per-head (MHA, fp32 LUT)    : 8 warps, 255 regs, 16 spills, 43,008 B smem
+# The grouped path needs only half the threads of the per-head one and stays
+# well under the 255-register ISA ceiling, so two of its CTAs fit per SM.
+_GROUPED_NUM_WARPS = 4
+_GROUPED_REGS_PER_THREAD = 178
+_PERHEAD_NUM_WARPS = 8
+_PERHEAD_REGS_PER_THREAD = 255
+_STAGE1_SMEM_BYTES = 43008
+
+
+def stage1_launch_config(kv_group_num: int, device=None) -> tuple[int, int]:
+    """``(num_warps, ctas_per_sm)`` for the stage-1 path ``kv_group_num`` picks.
+
+    ``ctas_per_sm`` is the residency the compiled kernel actually achieves on
+    this device, derived from the measured register/shared-memory footprint
+    above. Callers use it to size a full CTA wave; it is a scheduling hint
+    only, never a correctness input.
+    """
+    if kv_group_num > 1:
+        num_warps, regs = _GROUPED_NUM_WARPS, _GROUPED_REGS_PER_THREAD
+    else:
+        num_warps, regs = _PERHEAD_NUM_WARPS, _PERHEAD_REGS_PER_THREAD
+    props = torch.cuda.get_device_properties(device)
+    by_regs = props.regs_per_multiprocessor // (regs * num_warps * 32)
+    by_smem = props.shared_memory_per_multiprocessor // _STAGE1_SMEM_BYTES
+    return num_warps, max(1, min(by_regs, by_smem))
 
 
 @triton.jit
@@ -78,6 +115,53 @@ def _e2m1_scale_to_bf16(code, sbytes):
 
 
 # ---------------------------------------------------------------------------
+# E2M1 code x E8M0 scale lookup table
+# ---------------------------------------------------------------------------
+# The dequantized value is a pure function of 4 code bits + 8 scale bits, so
+# the entire domain is 4096 entries (8 KiB in bf16 / 16 KiB in fp32 -- hot in
+# L1 for every program). One gather replaces the ~20-op bit-construction chain
+# above, of which the online-softmax decode loop runs two instances per
+# (token, block) for K and V.
+#
+# The table is built by ``_e2m1_scale_to_bf16`` itself, so it is bit-identical
+# to the ALU path by construction: the E8M0 NaN byte, the fp32-subnormal scale
+# (2^-127) and the bf16 subnormal/inf encodings all come from the same code.
+# Index layout ``(scale_byte << 4) | code`` keeps the 16 codes of one block in
+# one 32 B sector (bf16), i.e. blocks read one sector per gather.
+_LUT_SIZE = 1 << 12
+_LUT_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+@triton.jit
+def _build_e2m1_scale_lut_kernel(LUT, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    code = offs & 0x0F
+    sbyte = (offs >> 4).to(tl.uint8)
+    tl.store(LUT + offs, _e2m1_scale_to_bf16(code, sbyte))
+
+
+def e2m1_scale_lut(device=None, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """``(scale_byte << 4) | e2m1_code`` -> dequantized value, built on first use.
+
+    Cached per (device index, dtype); the fp32 variant is an exact widening of
+    the bf16 one (E2M1 x power-of-two never needs more than 8 significand bits).
+    """
+    dev = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device is None
+        else torch.device(device)
+    )
+    key = (dev.index, dtype)
+    lut = _LUT_CACHE.get(key)
+    if lut is None:
+        table = torch.empty(_LUT_SIZE, dtype=torch.bfloat16, device=dev)
+        _build_e2m1_scale_lut_kernel[(1,)](table, BLOCK=_LUT_SIZE, num_warps=4)
+        lut = table.to(dtype)
+        _LUT_CACHE[key] = lut
+    return lut
+
+
+# ---------------------------------------------------------------------------
 # Native MXFP4 decode attention (two-stage split-KV)
 # ---------------------------------------------------------------------------
 
@@ -89,6 +173,7 @@ def _mxfp4_decode_stage1_kernel(
     V_Packed,
     K_Scales,
     V_Scales,
+    E2M1_LUT,
     sm_scale,
     kv_indptr,
     kv_indices,
@@ -188,7 +273,7 @@ def _mxfp4_decode_stage1_kernel(
             ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
             vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
 
-            # --- K tile: packed bytes -> E2M1 magnitudes -> E8M0 scale -> fp32
+            # --- K tile: packed bytes -> E2M1 code -> fused dequant LUT (fp32)
             kbyte = tl.load(
                 K_Packed + k_row[:, None] + byte_idx_k[None, :],
                 mask=tok_mask[:, None] & (byte_idx_k[None, :] < PACKED_K_DIM),
@@ -196,21 +281,15 @@ def _mxfp4_decode_stage1_kernel(
             )
             is_odd_k = (offs_d % 2) == 1
             kcode = tl.where(is_odd_k[None, :], (kbyte >> 4) & 0x0F, kbyte & 0x0F)
-            kmant = (kcode & 0x1).to(tl.float32)
-            kexp = (kcode >> 1) & 0x3
-            knormal = tl.exp2(kexp.to(tl.float32) - 1.0) * (1.0 + 0.5 * kmant)
-            ksub = 0.5 * kmant
-            kmag = tl.where(kexp == 0, ksub, knormal)
-            k = tl.where((kcode & 0x8) != 0, -kmag, kmag)
-            k = tl.where(mask_d[None, :], k, 0.0)
 
             ksbytes = tl.load(
                 K_Scales + ks_row[:, None] + blk_idx_k[None, :],
                 mask=tok_mask[:, None] & (blk_idx_k[None, :] < NUM_K_BLOCKS),
                 other=0,
             )
-            ksf = _e8m0_to_f32(ksbytes)
-            k = k * ksf
+            # E2M1 code x E8M0 scale -> fp32 in one gather (see e2m1_scale_lut)
+            k = tl.load(E2M1_LUT + ((ksbytes.to(tl.int32) << 4) | kcode))
+            k = tl.where(mask_d[None, :], k, 0.0)
 
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
@@ -224,21 +303,14 @@ def _mxfp4_decode_stage1_kernel(
             )
             is_odd_v = (offs_dv % 2) == 1
             vcode = tl.where(is_odd_v[None, :], (vbyte >> 4) & 0x0F, vbyte & 0x0F)
-            vmant = (vcode & 0x1).to(tl.float32)
-            vexp = (vcode >> 1) & 0x3
-            vnormal = tl.exp2(vexp.to(tl.float32) - 1.0) * (1.0 + 0.5 * vmant)
-            vsub = 0.5 * vmant
-            vmag = tl.where(vexp == 0, vsub, vnormal)
-            v = tl.where((vcode & 0x8) != 0, -vmag, vmag)
-            v = tl.where(mask_dv[None, :], v, 0.0)
 
             vsbytes = tl.load(
                 V_Scales + vs_row[:, None] + blk_idx_v[None, :],
                 mask=tok_mask[:, None] & (blk_idx_v[None, :] < NUM_V_BLOCKS),
                 other=0,
             )
-            vsf = _e8m0_to_f32(vsbytes)
-            v = v * vsf
+            v = tl.load(E2M1_LUT + ((vsbytes.to(tl.int32) << 4) | vcode))
+            v = tl.where(mask_dv[None, :], v, 0.0)
 
             # --- online softmax, fp32 (same recurrence as the stock kernel)
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
@@ -273,6 +345,7 @@ def _mxfp4_grouped_decode_stage1_kernel(
     V_Packed,
     K_Scales,
     V_Scales,
+    E2M1_LUT,
     sm_scale,
     kv_indptr,
     kv_indices,
@@ -301,6 +374,8 @@ def _mxfp4_grouped_decode_stage1_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    HALF_D: tl.constexpr,
+    HALF_DV: tl.constexpr,
     PACKED_K_DIM: tl.constexpr,
     PACKED_V_DIM: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
@@ -319,6 +394,11 @@ def _mxfp4_grouped_decode_stage1_kernel(
     # grouped kernel: Q/K/V tiles in bf16 (EXACT for dequantized E2M1 values:
     # 2-bit mantissa x power-of-two scale always fits bf16's 8-bit
     # significand), tl.dot with fp32 accumulation, online softmax in fp32.
+    #
+    # Tiles are nibble-interleaved: each packed byte is loaded once and both of
+    # its nibbles are expanded in place, instead of addressing elements by
+    # ``offs_d // 2`` (which reads every byte twice and needs a select to pick
+    # the nibble). See the comment at the index setup below.
     cur_batch = tl.program_id(0).to(tl.int64)
     cur_head_id = tl.program_id(1)
     split_kv_id = tl.program_id(2)
@@ -333,20 +413,37 @@ def _mxfp4_grouped_decode_stage1_kernel(
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_d = offs_d < Lk
-    mask_dv = offs_dv < Lv
-    byte_idx_k = offs_d // 2
-    byte_idx_v = offs_dv // 2
-    blk_idx_k = offs_d // _MXFP4_BLOCK
-    blk_idx_v = offs_dv // _MXFP4_BLOCK
+    # Nibble-interleaved element order: lane j of the low half holds logical
+    # element 2j, lane j of the high half holds 2j + 1. Both halves index the
+    # SAME packed byte and the SAME E8M0 block -- a 32-element block spans 16
+    # packed bytes, and 2j + 1 (odd) can never cross a block boundary that 2j
+    # did not -- so one byte load plus one scale load serve both nibbles.
+    # The contraction in ``tl.dot(q, k^T)`` is invariant under a permutation of
+    # the K dim, so Q is simply loaded in the same even/odd order. For V the
+    # permutation lands on the OUTPUT dim instead, and is undone by the two
+    # strided stores at the end of the kernel.
+    offs_half = tl.arange(0, HALF_D)
+    offs_halfv = tl.arange(0, HALF_DV)
+    offs_k_lo = offs_half * 2
+    offs_k_hi = offs_k_lo + 1
+    offs_v_lo = offs_halfv * 2
+    offs_v_hi = offs_v_lo + 1
+    mask_k_lo = offs_k_lo < Lk
+    mask_k_hi = offs_k_hi < Lk
+    mask_v_lo = offs_v_lo < Lv
+    mask_v_hi = offs_v_hi < Lv
+    byte_mask_k = offs_half < PACKED_K_DIM
+    byte_mask_v = offs_halfv < PACKED_V_DIM
+    blk_idx_k = offs_half // _MXFP4_HALF_BLOCK
+    blk_idx_v = offs_halfv // _MXFP4_HALF_BLOCK
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
-    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    off_q_base = cur_batch * stride_qbs + cur_head[:, None] * stride_qh
+    offs_q_lo = off_q_base + offs_k_lo[None, :]
+    offs_q_hi = off_q_base + offs_k_hi[None, :]
 
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
@@ -356,10 +453,16 @@ def _mxfp4_grouped_decode_stage1_kernel(
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+    acc_lo = tl.zeros([BLOCK_H, HALF_DV], dtype=tl.float32)
+    acc_hi = tl.zeros([BLOCK_H, HALF_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+        q_lo = tl.load(
+            Q + offs_q_lo, mask=mask_h[:, None] & mask_k_lo[None, :], other=0.0
+        )
+        q_hi = tl.load(
+            Q + offs_q_hi, mask=mask_h[:, None] & mask_k_hi[None, :], other=0.0
+        )
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -388,26 +491,27 @@ def _mxfp4_grouped_decode_stage1_kernel(
             ks_row = kv_loc * stride_ks_bs + cur_kv_head * stride_ks_h
             vs_row = kv_loc * stride_vs_bs + cur_kv_head * stride_vs_h
 
-            # --- K: integer bit-construct dequant straight to bf16 (no SFU
-            # exp2 / fp32 multiply; see _e2m1_scale_to_bf16), then a single
-            # bf16 dot shared by the whole query group
+            # --- K: one byte load + one scale load feed two LUT gathers (see
+            # e2m1_scale_lut); the group shares the resulting bf16 tiles.
             kbyte = tl.load(
-                K_Packed + k_row[:, None] + byte_idx_k[None, :],
-                mask=tok_mask[:, None] & (byte_idx_k[None, :] < PACKED_K_DIM),
+                K_Packed + k_row[:, None] + offs_half[None, :],
+                mask=tok_mask[:, None] & byte_mask_k[None, :],
                 other=0,
             )
-            is_odd_k = (offs_d % 2) == 1
-            kcode = tl.where(is_odd_k[None, :], (kbyte >> 4) & 0x0F, kbyte & 0x0F)
-
             ksbytes = tl.load(
                 K_Scales + ks_row[:, None] + blk_idx_k[None, :],
                 mask=tok_mask[:, None] & (blk_idx_k[None, :] < NUM_K_BLOCKS),
                 other=0,
             )
-            k = _e2m1_scale_to_bf16(kcode, ksbytes)
-            k = tl.where(mask_d[None, :], k, 0.0)
+            k_scale_base = ksbytes.to(tl.int32) << 4
+            k_lo = tl.load(E2M1_LUT + (k_scale_base | (kbyte & 0x0F)))
+            k_hi = tl.load(E2M1_LUT + (k_scale_base | ((kbyte >> 4) & 0x0F)))
+            k_lo = tl.where(mask_k_lo[None, :], k_lo, 0.0)
+            k_hi = tl.where(mask_k_hi[None, :], k_hi, 0.0)
 
-            qk = tl.dot(q, tl.trans(k))
+            # The two halves are disjoint slices of the same contraction, so
+            # their partial dots simply add.
+            qk = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))
             qk *= sm_scale
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end),
@@ -415,44 +519,52 @@ def _mxfp4_grouped_decode_stage1_kernel(
                 float("-inf"),
             )
 
-            # --- V: integer bit-construct dequant to bf16; p goes to bf16
-            # for the dot (stock semantics)
+            # --- V: same single-load expansion; p goes to bf16 for the dot
             vbyte = tl.load(
-                V_Packed + v_row[:, None] + byte_idx_v[None, :],
-                mask=tok_mask[:, None] & (byte_idx_v[None, :] < PACKED_V_DIM),
+                V_Packed + v_row[:, None] + offs_halfv[None, :],
+                mask=tok_mask[:, None] & byte_mask_v[None, :],
                 other=0,
             )
-            is_odd_v = (offs_dv % 2) == 1
-            vcode = tl.where(is_odd_v[None, :], (vbyte >> 4) & 0x0F, vbyte & 0x0F)
-
             vsbytes = tl.load(
                 V_Scales + vs_row[:, None] + blk_idx_v[None, :],
                 mask=tok_mask[:, None] & (blk_idx_v[None, :] < NUM_V_BLOCKS),
                 other=0,
             )
-            v = _e2m1_scale_to_bf16(vcode, vsbytes)
-            v = tl.where(mask_dv[None, :], v, 0.0)
+            v_scale_base = vsbytes.to(tl.int32) << 4
+            v_lo = tl.load(E2M1_LUT + (v_scale_base | (vbyte & 0x0F)))
+            v_hi = tl.load(E2M1_LUT + (v_scale_base | ((vbyte >> 4) & 0x0F)))
+            v_lo = tl.where(mask_v_lo[None, :], v_lo, 0.0)
+            v_hi = tl.where(mask_v_hi[None, :], v_hi, 0.0)
 
             # --- online softmax (fp32), same recurrence as the stock kernel
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            p_cast = p.to(v_lo.dtype)
+            acc_lo *= re_scale[:, None]
+            acc_lo += tl.dot(p_cast, v_lo)
+            acc_hi *= re_scale[:, None]
+            acc_hi += tl.dot(p_cast, v_hi)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
-        offs_mid_o = (
+        # Undo the V-side permutation: the two accumulators own the even and
+        # odd output dims, so they go out as two strided stores.
+        offs_mid_base = (
             cur_batch * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + offs_dv[None, :]
         )
         tl.store(
-            Att_Out + offs_mid_o,
-            acc / e_sum[:, None],
-            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+            Att_Out + offs_mid_base + offs_v_lo[None, :],
+            acc_lo / e_sum[:, None],
+            mask=mask_h[:, None] & mask_v_lo[None, :],
+        )
+        tl.store(
+            Att_Out + offs_mid_base + offs_v_hi[None, :],
+            acc_hi / e_sum[:, None],
+            mask=mask_h[:, None] & mask_v_hi[None, :],
         )
 
         offs_mid_o_1 = (
@@ -556,7 +668,7 @@ def mxfp4_decode_attention_fwd(
     attn_lse: torch.Tensor | None = None,
     num_kv_splits: torch.Tensor | None = None,
     block_n: int = _BLOCK_N,
-    num_warps: int = 4,
+    num_warps: int | None = None,
 ):
     """Native MXFP4 decode attention over packed paged KV.
 
@@ -574,7 +686,9 @@ def mxfp4_decode_attention_fwd(
 
     Note: ``num_kv_splits=None`` derives the schedule on the host (prototype
     convenience; involves a device->host sync). The backend passes its
-    on-device schedule instead.
+    on-device schedule instead. ``num_warps=None`` takes the per-path
+    production value from ``stage1_launch_config``; pass an explicit value
+    only to sweep configs.
     """
     batch, head_num, head_dim = q.shape
     kv_head_num = k_packed.shape[1]
@@ -583,6 +697,8 @@ def mxfp4_decode_attention_fwd(
             f"GQA requires q_heads % kv_heads == 0, got {head_num} % {kv_head_num}"
         )
     kv_group_num = head_num // kv_head_num
+    if num_warps is None:
+        num_warps, _ = stage1_launch_config(kv_group_num, q.device)
     logical_k = head_dim
     logical_v = o.shape[-1]
     packed_k_dim = k_packed.shape[-1]
@@ -606,6 +722,10 @@ def mxfp4_decode_attention_fwd(
         seq_lens_cpu = (kv_indptr[1:] - kv_indptr[:-1]).cpu().tolist()
         splits = _host_num_kv_splits(seq_lens_cpu, max_kv_splits)
         num_kv_splits = torch.tensor(splits, dtype=torch.int32, device=q.device)
+    # Same order as ``attn_logits``/``attn_lse`` liveness: the LUT is a tiny
+    # module-level cache, materialized on first decode of the process.
+    lut_dtype = torch.float32 if kv_group_num == 1 else torch.bfloat16
+    e2m1_lut = e2m1_scale_lut(q.device, lut_dtype)
     if attn_logits is None:
         attn_logits = torch.empty(
             (batch, head_num, max_kv_splits, logical_v),
@@ -647,6 +767,7 @@ def mxfp4_decode_attention_fwd(
             v_packed,
             k_scales,
             v_scales,
+            e2m1_lut,
             sm_scale,
             kv_indptr,
             kv_indices,
@@ -697,6 +818,7 @@ def mxfp4_decode_attention_fwd(
             v_packed,
             k_scales,
             v_scales,
+            e2m1_lut,
             sm_scale,
             kv_indptr,
             kv_indices,
@@ -725,6 +847,10 @@ def mxfp4_decode_attention_fwd(
             BLOCK_H=_GROUPED_BLOCK_H,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DV=BLOCK_DV,
+            # Nibble-interleaved tiles address packed bytes, so each lane owns
+            # two logical elements.
+            HALF_D=max(1, BLOCK_DMODEL // 2),
+            HALF_DV=max(1, BLOCK_DV // 2),
             PACKED_K_DIM=packed_k_dim,
             PACKED_V_DIM=packed_v_dim,
             NUM_K_BLOCKS=num_k_blocks,
