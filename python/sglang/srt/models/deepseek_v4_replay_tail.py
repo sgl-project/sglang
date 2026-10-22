@@ -650,6 +650,10 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
+    if get_flags().dp.capturing_prefill_graph:
+        # The tail captures its row-bucket graphs on first use, behind TP-group
+        # barriers that an eager idle rank never reaches.
+        get_flags().dp.prefill_graph_has_rank_barrier = True
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
