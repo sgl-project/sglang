@@ -1,4 +1,4 @@
-"""Standalone smoke test for the torch_npu DS v2 MoE distribute ops.
+"""Standalone smoke test for the torch_npu MC2 MoE distribute ops.
 
 It validates the contract the ``ascend_ops`` dispatcher relies on:
 

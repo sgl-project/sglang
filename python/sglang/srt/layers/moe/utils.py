@@ -120,8 +120,12 @@ class AscendOpsConfig:
     Selects the prefill and decode execution paths:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
-    - ``decode``: ``low_latency`` (EP DS v2 dispatch_v2 -> gmm -> activation ->
+    - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
       gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+    - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
+      MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
+      ones recommended by the operator owners (full-mesh dispatch, default
+      combine).
     """
 
     PREFILL_CHOICES = ("allgather", "alltoallv")
@@ -129,6 +133,8 @@ class AscendOpsConfig:
 
     prefill: str = "alltoallv"
     decode: str = "low_latency"
+    ll_dispatch_alg: str = "fullmesh_v1"
+    ll_combine_alg: str = ""
 
     def __post_init__(self) -> None:
         if self.prefill not in self.PREFILL_CHOICES:
@@ -159,15 +165,23 @@ class AscendOpsConfig:
             raise ValueError(
                 f"ascend-ops-config must be a JSON object, got {type(data).__name__}"
             )
-        unknown = set(data) - {"prefill", "decode"}
+        unknown = set(data) - {
+            "prefill",
+            "decode",
+            "ll_dispatch_alg",
+            "ll_combine_alg",
+        }
         if unknown:
             raise ValueError(
                 f"ascend-ops-config has unknown keys {sorted(unknown)}; "
-                f"only 'prefill' and 'decode' are supported"
+                "only 'prefill', 'decode', 'll_dispatch_alg' and "
+                "'ll_combine_alg' are supported"
             )
         return cls(
             prefill=data.get("prefill", cls.prefill),
             decode=data.get("decode", cls.decode),
+            ll_dispatch_alg=data.get("ll_dispatch_alg", cls.ll_dispatch_alg),
+            ll_combine_alg=data.get("ll_combine_alg", cls.ll_combine_alg),
         )
 
 

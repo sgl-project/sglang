@@ -4,7 +4,7 @@ Prefill and decode use different communication paths:
 
 * prefill: TP-scoped ``allgather`` or ``alltoallv``, built on
   ``npu_moe_init_routing_v2`` plus ``all_to_all_single``.
-* decode ``low_latency``: the torch_npu MoE distribute v2 ops
+* decode ``low_latency``: the MC2 MoE distribute ops
   (``npu_moe_distribute_dispatch_v2`` / ``npu_moe_distribute_combine_v2``),
   which perform the EP all-to-all (with optional int8/MX quantisation) around
   the expert GEMMs.
@@ -40,19 +40,14 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
 from sglang.srt.runtime_context import get_parallel
 
-# ``quant_mode`` of the DS v2 distribute ops, matching the enum used by
+# ``quant_mode`` of the MC2 distribute ops, matching the enum used by
 # ``npu_moe_distribute_dispatch_setup``: 0 unquant, 1 static, 2 per-token
 # dynamic int8, 3 per-group dynamic fp8, 4 MX (e8m0 block scales).
-_DS_QUANT_MODE = {
+_MC2_QUANT_MODE = {
     DispatcherOutputDtype.BF16: 0,
     DispatcherOutputDtype.INT8: 2,
     DispatcherOutputDtype.MXFP8: 4,
 }
-
-# ``comm_alg`` recommended by the Ascend DS v2 owners: dispatch uses the
-# full-mesh algorithm, combine keeps the op's default.
-_DISPATCH_COMM_ALG = "fullmesh_v1"
-_COMBINE_COMM_ALG = ""
 
 
 class AscendOpsDispatchOutput(NamedTuple):
@@ -84,12 +79,14 @@ class AscendOpsCombineInput(NamedTuple):
 
 
 @dataclass
-class _DSv2State:
-    """Per-forward state the DS v2 combine needs from the matching dispatch."""
+class _MC2State:
+    """Per-forward state the MC2 combine needs from the matching dispatch.
+
+    The top-k ids and weights are not repeated here: the dispatch output already
+    carries the (possibly padded) copies and both are cleared together.
+    """
 
     num_tokens: int
-    expert_ids: torch.Tensor
-    expert_scales: torch.Tensor
     assist_info_for_combine: torch.Tensor
     ep_send_counts: torch.Tensor
     x_active_mask: Optional[torch.Tensor]
@@ -127,7 +124,8 @@ class AscendOpsDispatcher(BaseDispatcher):
         self._dispatch_path: Optional[str] = None
         self._dispatch_group = None
         self._ep_comm_name: Optional[str] = None
-        self._ds_state: Optional[_DSv2State] = None
+        self._mc2_state: Optional[_MC2State] = None
+        self._pad_buffers: dict[tuple, tuple] = {}
         self._alltoall_state: Optional[dict[str, Any]] = None
         self._init_routing = NPUMoEInitRouting_v2(quant_mode=-1)
         self._finalize_routing = NPUFinalizeRouting(drop_pad_mode=2)
@@ -201,7 +199,7 @@ class AscendOpsDispatcher(BaseDispatcher):
                 f"SGLANG_ASCEND_OPS_DECODE_PAD_BS pads the batch to {pad_bs}; "
                 "raise it or lower the decode batch size."
             )
-        return self._ds_dispatch(
+        return self._mc2_dispatch(
             hidden_states,
             topk_ids,
             topk_weights,
@@ -224,14 +222,14 @@ class AscendOpsDispatcher(BaseDispatcher):
         return self._combine_alltoallv(combine_input.hidden_states)
 
     def _combine_decode_low_latency(self, combine_input):
-        return self._ds_combine(combine_input)
+        return self._mc2_combine(combine_input)
 
     def _combine_decode_fused_op(self, combine_input):
         raise NotImplementedError("Ascend Ops decode fused-op combine is pending")
 
-    # DS v2 dispatch/combine ---------------------------------------------------
+    # MC2 dispatch/combine -----------------------------------------------------
 
-    def _ds_dispatch(
+    def _mc2_dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -254,27 +252,9 @@ class AscendOpsDispatcher(BaseDispatcher):
 
         x_active_mask = None
         if padded_bs != num_tokens:
-            padded_hidden_states = hidden_states.new_zeros(
-                (padded_bs, hidden_states.shape[1])
+            hidden_states, topk_ids, topk_weights, x_active_mask = self._pad_batch(
+                hidden_states, topk_ids, topk_weights, num_tokens, padded_bs
             )
-            padded_hidden_states[:num_tokens] = hidden_states
-            hidden_states = padded_hidden_states
-
-            padded_ids = topk_ids.new_zeros((padded_bs, topk_ids.shape[1]))
-            padded_ids[:num_tokens] = topk_ids
-            topk_ids = padded_ids
-
-            padded_weights = topk_weights.new_zeros(
-                (padded_bs, topk_weights.shape[1])
-            )
-            padded_weights[:num_tokens] = topk_weights
-            topk_weights = padded_weights
-
-            # Inactive rows must be the trailing ones.
-            x_active_mask = torch.zeros(
-                padded_bs, dtype=torch.bool, device=hidden_states.device
-            )
-            x_active_mask[:num_tokens] = True
 
         (
             expand_x,
@@ -296,7 +276,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             global_bs=0,
             # Per-expert counts, matching ``group_list_type=1`` of the runner.
             expert_token_nums_type=1,
-            comm_alg=_DISPATCH_COMM_ALG,
+            comm_alg=self.ascend_ops_config.ll_dispatch_alg,
         )
 
         if quant_mode == 4 and hidden_states.shape[1] % 64 == 0:
@@ -311,10 +291,8 @@ class AscendOpsDispatcher(BaseDispatcher):
         # A3 returns an uninitialised ``(a,)`` one, so never forward it.
         expand_scales = None
 
-        self._ds_state = _DSv2State(
+        self._mc2_state = _MC2State(
             num_tokens=num_tokens,
-            expert_ids=topk_ids,
-            expert_scales=topk_weights,
             assist_info_for_combine=assist_info_for_combine,
             ep_send_counts=ep_recv_counts,
             x_active_mask=x_active_mask,
@@ -334,21 +312,61 @@ class AscendOpsDispatcher(BaseDispatcher):
         )
         return self._dispatch_output
 
-    def _ds_combine(self, combine_input: AscendOpsCombineInput) -> torch.Tensor:
+    def _pad_batch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_tokens: int,
+        padded_bs: int,
+    ):
+        """Zero-pad the batch into buffers reused across steps.
+
+        ``padded_bs`` differs from ``num_tokens`` whenever EP ranks disagree on
+        the batch size (DP attention), so the buffers are allocated once per
+        shape and only the changed region is rewritten afterwards.
+        """
+        key = (padded_bs, hidden_states.shape[1], topk_ids.shape[1])
+        bufs = self._pad_buffers.get(key)
+        if bufs is None:
+            bufs = (
+                hidden_states.new_zeros((padded_bs, hidden_states.shape[1])),
+                topk_ids.new_zeros((padded_bs, topk_ids.shape[1])),
+                topk_weights.new_zeros((padded_bs, topk_weights.shape[1])),
+                torch.zeros(padded_bs, dtype=torch.bool, device=hidden_states.device),
+            )
+            self._pad_buffers[key] = bufs
+        padded_x, padded_ids, padded_weights, mask = bufs
+
+        # A previous step may have filled more rows, so the tail is cleared too.
+        padded_x[:num_tokens] = hidden_states
+        padded_x[num_tokens:] = 0
+        padded_ids[:num_tokens] = topk_ids
+        padded_ids[num_tokens:] = 0
+        padded_weights[:num_tokens] = topk_weights
+        padded_weights[num_tokens:] = 0
+
+        # Inactive rows must be the trailing ones.
+        mask.zero_()
+        mask[:num_tokens] = True
+        return padded_x, padded_ids, padded_weights, mask
+
+    def _mc2_combine(self, combine_input: AscendOpsCombineInput) -> torch.Tensor:
         """Run ``npu_moe_distribute_combine_v2`` for the batch dispatched last."""
         import torch_npu
 
-        state = self._ds_state
-        if state is None:
+        state = self._mc2_state
+        output = self._dispatch_output
+        if state is None or output is None:
             raise RuntimeError("Ascend Ops combine called before dispatch")
 
         # The combine op applies the top-k weights itself.
         combined = torch_npu.npu_moe_distribute_combine_v2(
             combine_input.hidden_states,
-            state.expert_ids,
+            output.topk_ids,
             state.assist_info_for_combine,
             state.ep_send_counts,
-            state.expert_scales,
+            output.topk_weights,
             self._get_ep_comm_name(),
             self.ep_size,
             self.ep_rank,
@@ -357,20 +375,20 @@ class AscendOpsDispatcher(BaseDispatcher):
             expand_scales=state.expand_scales,
             global_bs=0,
             comm_quant_mode=0,
-            comm_alg=_COMBINE_COMM_ALG,
+            comm_alg=self.ascend_ops_config.ll_combine_alg,
         )
 
-        self._ds_state = None
+        self._mc2_state = None
         self._dispatch_output = None
         return combined[: state.num_tokens]
 
     def _quant_mode(self, dtype_mode: str) -> int:
         dtype = self._resolve_dispatch_dtype(dtype_mode)
         try:
-            return _DS_QUANT_MODE[dtype]
+            return _MC2_QUANT_MODE[dtype]
         except KeyError:
             raise NotImplementedError(
-                "ascend_ops DS v2 dispatch does not support dispatcher output "
+                "ascend_ops MC2 dispatch does not support dispatcher output "
                 f"dtype {dtype.value}; supported: bf16, int8, mxfp8"
             ) from None
 
