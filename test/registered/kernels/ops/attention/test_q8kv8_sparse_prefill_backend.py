@@ -723,7 +723,6 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         FlashMLASchedMeta,
         flash_mla_with_kvcache,
     )
-
     from sglang.srt.mem_cache.dsv41_request_window import window_layout
     from sglang.srt.runtime_context import get_platform
 

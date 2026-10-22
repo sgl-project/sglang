@@ -142,7 +142,6 @@ from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
-
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -4143,11 +4142,13 @@ class DeepseekV4AttnBackend(
                     from sglang.kernels.ops.attention import flash_mla_interface
 
                     flash_mla_with_kvcache = functools.partial(
-                        flash_mla_interface.flash_mla_with_kvcache, use_legacy=not interleaved
+                        flash_mla_interface.flash_mla_with_kvcache,
+                        use_legacy=not interleaved,
                     )
 
                 if self.is_dsv41 and (
-                    not interleaved or _flashmla_v41_splits_kv(swa_page_indices, extra_indices)
+                    not interleaved
+                    or _flashmla_v41_splits_kv(swa_page_indices, extra_indices)
                 ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
@@ -4195,7 +4196,9 @@ class DeepseekV4AttnBackend(
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
-            from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
+            from sglang.kernels.ops.attention.flash_mla_interface import (
+                flash_mla_sparse_fwd,
+            )
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)

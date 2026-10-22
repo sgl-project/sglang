@@ -7,14 +7,13 @@ import triton
 import triton.testing
 
 from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     sparse_mla_q8kv8_prefill_fwd,
 )
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
-
-from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

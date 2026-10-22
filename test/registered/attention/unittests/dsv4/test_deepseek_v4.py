@@ -19,8 +19,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
@@ -40,6 +38,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")

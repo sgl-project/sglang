@@ -12,9 +12,8 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 
 from typing import Optional, Tuple, Union
 
-import torch
-
 import flash_mla
+import torch
 from flash_mla import fused_norm_rope_attn_rope_cast as _mega
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
 

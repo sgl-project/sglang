@@ -15,10 +15,9 @@ from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
     sparse_mla_prefill,
 )
+from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
-
-from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
 try:
     # Same form as the kernel under test, but reachable only on gfx950. Kept as
@@ -35,7 +34,10 @@ except ImportError:
 def _flashmla_runnable() -> bool:
     # The op refuses anything but SM90a / SM100f at call time, so gate on the
     # device rather than on the import succeeding.
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (
+        9,
+        10,
+    )
 
 
 HAS_FLASHMLA = _flashmla_runnable()
