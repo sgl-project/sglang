@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from queue import Empty, Queue
 
@@ -358,25 +359,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             ]
             for group in groups:
                 group_futures = []
+                futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
                     meta = self._group_range_meta(name, locations, group)
                     if meta is not None:
                         group_futures.extend(self._submit_range_gets(name, keys, *meta))
-                futures.append(group_futures)
             for group, group_futures in zip(groups, futures):
                 for future in group_futures:
                     future.result()
                 for layer in group:
                     self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
-            self.layer_done_counter.fail(counter_index, error)
-            logger.exception("Mooncake layer-wise load batch failed")
-        finally:
-            # Reads still in flight write into device rows; end sessions only after them.
+            # Failure wakes consumers, which may release the destination rows.
+            # Stop every submitted write before publishing it.
             pending = [future for group_futures in futures for future in group_futures]
             for future in pending:
                 future.cancel()
             wait(pending)
+            self.layer_done_counter.fail(counter_index, error)
+            logger.exception("Mooncake layer-wise load batch failed")
+        finally:
             for keys in started:
                 try:
                     self.storage.store.batch_get_session_end(keys)
@@ -400,12 +402,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def _submit_range_gets(
         self, name: PoolName, keys: list[str], ptrs, sizes, offsets
-    ) -> list[Future]:
+    ) -> Iterator[Future]:
         if not keys:
-            return []
+            return
         step = -(-len(keys) // self.load_threads)
-        return [
-            self.load_io_executor.submit(
+        # Yield each future so the caller retains it even if a later submit fails.
+        for start in range(0, len(keys), step):
+            yield self.load_io_executor.submit(
                 self._range_get,
                 name,
                 keys[start : start + step],
@@ -413,8 +416,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 sizes[start : start + step],
                 offsets[start : start + step],
             )
-            for start in range(0, len(keys), step)
-        ]
 
     def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
         result = self.storage.store.batch_get_into_multi_buffer_ranges(

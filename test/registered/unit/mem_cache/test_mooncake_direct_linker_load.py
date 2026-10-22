@@ -3,7 +3,8 @@
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
@@ -118,6 +119,7 @@ class TestGroupedLoad(CustomTestCase):
             threads=2,
             pools={PoolName.KV: FakePool(), PoolName.INDEXER: FakePool({1, 2})},
         )
+        self.addCleanup(linker.load_io_executor.shutdown)
         keys = [f"k{i}" for i in range(3)]
         index = load(
             linker,
@@ -147,25 +149,80 @@ class TestGroupedLoad(CustomTestCase):
             threads=4,
             pools={PoolName.KV: FakePool()},
         )
+        self.addCleanup(linker.load_io_executor.shutdown)
         index = load(linker, [[transfer(PoolName.KV, ["k0"])]])
         self.assertTrue(linker.layer_done_counter.finish(index))
         self.assertEqual(linker.layer_done_counter.order, [0, 1, 2, 3])
 
-    def test_failure_ends_sessions_after_inflight_reads(self):
-        store = FakeStore(
-            delay=lambda keys: 0.2 if keys == ["slow"] else 0, fail_key="bad"
-        )
-        linker = make_linker(
-            store,
-            num_layers=1,
-            layer_group=1,
-            threads=2,
-            pools={PoolName.KV: FakePool()},
-        )
-        index = load(linker, [[transfer(PoolName.KV, ["bad", "slow"])]])
-        self.assertFalse(linker.layer_done_counter.finish(index))
+    def test_failure_waits_for_inflight_reads_before_releasing_consumers(self):
+        """Failed loads must stop writing before consumers can recycle their rows."""
+        for failure in ("read", "metadata", "submit"):
+            with self.subTest(failure=failure):
+                self._check_failure_drains_reads(failure)
+
+    def _check_failure_drains_reads(self, failure):
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        failure_triggered = threading.Event()
+
+        def fail():
+            if not slow_started.wait(5):
+                raise TimeoutError("Slow read did not start")
+            failure_triggered.set()
+            raise RuntimeError("Injected load failure")
+
+        class BlockingStore(FakeStore):
+            def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+                if keys == ["slow"]:
+                    slow_started.set()
+                    if not release_slow.wait(5):
+                        raise TimeoutError("Slow read was not released")
+                else:
+                    fail()
+                return super().batch_get_into_multi_buffer_ranges(
+                    keys, ptrs, sizes, offsets
+                )
+
+        class FailingPool(FakePool):
+            def get_prepared_layer_range_meta(self, locations, layer):
+                fail()
+
+        store = BlockingStore()
+        pools = {PoolName.KV: FakePool()}
+        keys = ["bad", "slow"] if failure == "read" else ["slow", "bad"]
+        transfers = [transfer(PoolName.KV, keys)]
+        if failure == "metadata":
+            pools[PoolName.INDEXER] = FailingPool()
+            transfers = [
+                transfer(PoolName.KV, ["slow"]),
+                transfer(PoolName.INDEXER, ["bad"]),
+            ]
+        linker = make_linker(store, num_layers=1, layer_group=1, threads=2, pools=pools)
+        self.addCleanup(linker.load_io_executor.shutdown)
+        submit = linker.load_io_executor.submit
+
+        def submit_or_fail(fn, name, keys, *args):
+            if failure == "submit" and keys == ["bad"]:
+                fail()
+            return submit(fn, name, keys, *args)
+
+        index = linker.layer_done_counter.update_producer()
+        with patch.object(linker.load_io_executor, "submit", submit_or_fail):
+            with ThreadPoolExecutor(2) as consumers:
+                loading = consumers.submit(linker.load_layer_wise, index, [transfers])
+                finishing = consumers.submit(linker.finish_layer_wise_loading, index)
+                try:
+                    self.assertTrue(failure_triggered.wait(5))
+                    # The failed request still owns rows that the slow read writes.
+                    with self.assertRaises(TimeoutError):
+                        finishing.result(timeout=0.1)
+                    self.assertFalse(any(kind == "end" for kind, _ in store.events))
+                finally:
+                    release_slow.set()
+                loading.result(timeout=5)
+                self.assertFalse(finishing.result(timeout=5))
+
         self.assertEqual(linker.layer_done_counter.order, [])
-        linker.load_io_executor.shutdown(wait=True)
         last_get = max(t for kind, t in store.events if kind == "get")
         first_end = min(t for kind, t in store.events if kind == "end")
         self.assertGreater(first_end, last_get)
