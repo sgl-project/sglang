@@ -131,7 +131,9 @@ class TestPreNormalize(CustomTestCase):
             }
         )
         call = body["messages"][1]["tool_calls"][0]
-        self.assertEqual(call["function"]["arguments"], '{"location":"Paris","days":1.5}')
+        self.assertEqual(
+            call["function"]["arguments"], '{"location":"Paris","days":1.5}'
+        )
         self.assertTrue(body["messages"][3]["prefix"])
         self.assertNotIn("continue_final_message", body)
         self.assertNotIn("response_format", body)
@@ -221,7 +223,9 @@ class TestAdapterRegistry(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "reasoning_effort=60"):
             registry.build_chat_encoding_adapter(
-                self._context("dsv41", "recipe", default_kwargs={"reasoning_effort": 60})
+                self._context(
+                    "dsv41", "recipe", default_kwargs={"reasoning_effort": 60}
+                )
             )
 
     @unittest.skipUnless(
@@ -243,7 +247,9 @@ class TestAdapterRegistry(CustomTestCase):
         tokenizer = Tokenizer.from_file(tokenizer_file)
         adapter = registry.build_chat_encoding_adapter(
             self._context(
-                "dsv41", "recipe", tokenizer=SimpleNamespace(backend_tokenizer=tokenizer)
+                "dsv41",
+                "recipe",
+                tokenizer=SimpleNamespace(backend_tokenizer=tokenizer),
             )
         )
         self.assertFalse(adapter.strict_tool_call_arguments)
@@ -272,7 +278,10 @@ class TestAdapterRegistry(CustomTestCase):
         )
         params = {"max_new_tokens": None}
         adapter.apply_sampling(
-            request=request, sampling_params=params, prompt_tokens=4, context_length=100_000
+            request=request,
+            sampling_params=params,
+            prompt_tokens=4,
+            context_length=100_000,
         )
         self.assertEqual(params["max_new_tokens"], 8192)
         # The handler's tool dumps carry None for unset fields; recipe must see the
