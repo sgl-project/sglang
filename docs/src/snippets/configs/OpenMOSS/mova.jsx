@@ -52,12 +52,7 @@ export const config = (() => {
         default: "360p",
         options: [
           { id: "360p", label: "360p" },
-          {
-            id: "720p",
-            label: "720p",
-            disabled: (s) => s.hw === "xeon",
-            disableReason: "MOVA-720p is not yet supported on Intel Xeon CPUs.",
-          },
+          { id: "720p", label: "720p" },
         ],
       },
     ],

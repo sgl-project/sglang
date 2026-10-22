@@ -57,12 +57,7 @@ export const config = (() => {
         default: "ltx23",
         options: [
           { id: "ltx23", label: "LTX-2.3" },
-          {
-            id: "ltx2",
-            label: "LTX-2",
-            disabled: (s) => s.hw === "xeon",
-            disableReason: "LTX-2 is not yet supported on Intel Xeon CPUs.",
-          },
+          { id: "ltx2", label: "LTX-2" },
         ],
       },
       {
