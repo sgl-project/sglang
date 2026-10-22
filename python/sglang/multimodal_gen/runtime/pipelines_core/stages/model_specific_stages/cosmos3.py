@@ -59,8 +59,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
-    RolloutDenoisingMixin,
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
+    prepare_rollout_if_enabled,
+    rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -1059,7 +1062,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+class Cosmos3DenoisingStage(PipelineStage):
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -1502,23 +1505,24 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-            self._maybe_prepare_rollout(batch)
-            self._maybe_init_denoising_env_collection(
-                batch=batch,
-                pipeline_config=server_args.pipeline_config,
-                image_kwargs={},
-                pos_cond_kwargs={
-                    "text_ids": cond_text_ids,
-                    "text_mask": cond_text_mask,
-                    "fps": fps,
-                },
-                neg_cond_kwargs={
-                    "text_ids": uncond_text_ids,
-                    "text_mask": uncond_text_mask,
-                    "fps": fps,
-                },
-                guidance=None,
-            )
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs={},
+            pos_cond_kwargs={
+                "text_ids": cond_text_ids,
+                "text_mask": cond_text_mask,
+                "fps": fps,
+            },
+            neg_cond_kwargs={
+                "text_ids": uncond_text_ids,
+                "text_mask": uncond_text_mask,
+                "fps": fps,
+            },
+            guidance=None,
+        )
 
         do_cfg = guidance_scale > 1.0
         # Control-CFG runs even when text guidance is off (its own extra
@@ -1779,31 +1783,14 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            if batch.rollout:
-                # Capture the pre-step x_{t_i} before the scheduler advances it.
-                batch._rollout_loop_step_index = i
-                self._maybe_append_dit_trajectory_step(
-                    batch=batch,
-                    latents=latents,
-                    timestep_value=t,
-                    step_index=i,
-                )
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=batch.generator,
-                    batch=batch,
-                    return_dict=False,
-                )[0]
-            else:
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=generator,
-                    return_dict=False,
-                )[0]
+            latents = scheduler.step(
+                noise_pred,
+                t,
+                latents,
+                generator=generator,
+                **rollout_step_kwargs(batch),
+                return_dict=False,
+            )[0]
 
             if action_noise_pred is not None:
                 # Zero the velocity at conditioned (clean) action tokens and at
@@ -1852,14 +1839,13 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # next request's steps.
         self.transformer.reset_denoising_step()
 
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=latents,
-                num_inference_steps=len(timesteps),
-                final_timestep=timesteps.new_zeros(()).cpu(),
-                server_args=server_args,
-            )
+        finalize_rollout_if_enabled(
+            batch=batch,
+            latents=latents,
+            num_inference_steps=len(timesteps),
+            final_timestep=timesteps.new_zeros(()),
+            pipeline_config=server_args.pipeline_config,
+        )
 
         batch.latents = latents
         if action_latents is not None:
