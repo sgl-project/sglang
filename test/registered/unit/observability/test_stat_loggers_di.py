@@ -566,6 +566,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         reporter.scheduler.running_batch = SimpleNamespace(reqs=[])
         reporter.scheduler.waiting_queue = []
         reporter.scheduler.grammar_manager = []
+        reporter.scheduler.enable_fpm = False
         reporter.scheduler.enable_priority_scheduling = False
         reporter.scheduler.pool_stats_observer = SimpleNamespace(
             get_pool_stats=lambda: SimpleNamespace(
