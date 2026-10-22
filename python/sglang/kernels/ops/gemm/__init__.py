@@ -527,6 +527,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.router_gemm_bf16x3_cublas",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
