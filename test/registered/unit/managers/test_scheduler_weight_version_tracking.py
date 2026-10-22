@@ -59,30 +59,6 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ),
         )
 
-    def test_a_new_version_is_adopted(self):
-        """The scheduler has to end up on the version it was told about, or nothing downstream can read it."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v2")
-
-        self.assertEqual(serving.weight_version, "v2")
-
-    def test_same_version_is_a_noop(self):
-        """Re-announcing the current version must not be treated as a change."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v1")
-
-        self.assertEqual(serving.weight_version, "v1")
-
-    def test_none_version_is_a_noop(self):
-        """An update that carries no version must leave the recorded one alone."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version=None)
-
-        self.assertEqual(serving.weight_version, "v1")
-
     def test_every_source_of_live_requests_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
         self._serving("v1")

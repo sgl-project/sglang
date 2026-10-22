@@ -188,6 +188,12 @@ metatags:
     img="/cards/logos/tencent.png"
   />
   <Card
+    title="Recursive"
+    mode="card"
+    href="/cookbook/autoregressive/Recursive/Flint"
+    img="/cards/logos/recursive.png"
+  />
+  <Card
     title="Poolside"
     mode="card"
     href="/cookbook/autoregressive/Poolside/Laguna-S-2.1"
@@ -204,5 +210,10 @@ metatags:
     mode="card"
     href="/cookbook/autoregressive/Cloudflare/clef"
     img="/cards/logos/cloudflare.png"
+  />
+  <Card
+    title="Kev"
+    mode="card"
+    href="/cookbook/autoregressive/Kev/kev"
   />
 </CardGroup>
