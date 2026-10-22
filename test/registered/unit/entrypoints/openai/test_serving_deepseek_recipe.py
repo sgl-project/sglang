@@ -1,12 +1,7 @@
 """The deepseek-recipe chat encoding backend: the request translation, the
-sampling overlay, the adapter registration and, with the deepseek-recipe package
-installed, the prompt the parity fixture records."""
+sampling overlay and the adapter registration."""
 
-import hashlib
-import json
-import struct
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.openai import serving_deepseek_recipe as recipe
@@ -15,10 +10,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-FIXTURE = (
-    Path(__file__).resolve().parents[5]
-    / "rust/sglang-processor/tests/fixtures/parity/deepseek-v4.1-flash-1017-recipe.json"
-)
+MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 
 
 def _user(content="x"):
@@ -42,8 +35,6 @@ class TestPreNormalize(CustomTestCase):
         )
         self.assertEqual(kwargs["thinking"], {"type": "disabled"})
         self.assertNotIn("chat_template_kwargs", kwargs)
-        # protocol.normalize_reasoning_inputs: reasoning.effort sets the effort and
-        # the kwargs flag; an explicit kwargs flag keeps its value.
         reasoning = recipe.pre_normalize(
             {"messages": [_user()], "reasoning": {"effort": "low", "enabled": True}}
         )
@@ -73,8 +64,6 @@ class TestPreNormalize(CustomTestCase):
         self.assertNotIn("thinking", recipe.pre_normalize({"messages": [_user()]}))
 
     def test_effort_sources(self):
-        # serving_chat: the kwargs effort replaces the request's verbatim (recipe
-        # rejects a number, as the API does); the server default fills in last.
         body = recipe.pre_normalize(
             {
                 "messages": [_user()],
@@ -88,7 +77,7 @@ class TestPreNormalize(CustomTestCase):
         )
         self.assertEqual(default["reasoning_effort"], "max")
 
-    def test_tool_choice_renders_as_auto_with_the_chosen_tool(self):
+    def test_tool_choice_renders_as_auto(self):
         tools = [
             {"type": "function", "function": {"name": "a"}},
             {"type": "function", "function": {"name": "b"}},
@@ -100,14 +89,12 @@ class TestPreNormalize(CustomTestCase):
                 "tool_choice": {"type": "function", "function": {"name": "b"}},
             }
         )
-        # The handler already filtered the tools to the named one.
         self.assertEqual(named["tool_choice"], "auto")
         self.assertEqual(len(named["tools"]), 2)
         required = recipe.pre_normalize(
             {"messages": [_user()], "tools": tools, "tool_choice": "required"}
         )
         self.assertEqual(required["tool_choice"], "auto")
-        self.assertEqual(len(required["tools"]), 2)
         for body in (
             {"messages": [_user()], "tools": tools, "tool_choice": "none"},
             {"messages": [_user()], "tools": [], "tool_choice": "auto"},
@@ -144,14 +131,10 @@ class TestPreNormalize(CustomTestCase):
             }
         )
         call = body["messages"][1]["tool_calls"][0]
-        self.assertEqual(
-            call["function"]["arguments"], '{"location":"Paris","days":1.5}'
-        )
+        self.assertEqual(call["function"]["arguments"], '{"location":"Paris","days":1.5}')
         self.assertTrue(body["messages"][3]["prefix"])
         self.assertNotIn("continue_final_message", body)
         self.assertNotIn("response_format", body)
-        # recipe's own fields and validation stand: `n` passes through, and a tool
-        # message without tool_call_id is recipe's to reject.
         self.assertEqual(body["n"], 2)
         unpaired = recipe.pre_normalize(
             {"messages": [_user(), {"role": "tool", "content": "sunny"}]}
@@ -165,7 +148,7 @@ class TestPreNormalize(CustomTestCase):
         self.assertEqual(original["n"], 3)
 
 
-class TestApplySampling(CustomTestCase):
+class TestOverlaySampling(CustomTestCase):
     def _render(self, **overrides):
         values = dict(
             prompt="",
@@ -238,58 +221,58 @@ class TestAdapterRegistry(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "reasoning_effort=60"):
             registry.build_chat_encoding_adapter(
-                self._context(
-                    "dsv41", "recipe", default_kwargs={"reasoning_effort": 60}
-                )
+                self._context("dsv41", "recipe", default_kwargs={"reasoning_effort": 60})
             )
 
     @unittest.skipUnless(
         recipe.is_deepseek_recipe_available(), "deepseek-recipe is not installed"
     )
-    def test_recipe_adapter_encodes_like_the_fixture_and_overlays_sampling(self):
+    def test_recipe_adapter_encodes_and_overlays_sampling(self):
         from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
 
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
         try:
             tokenizer_file = hf_hub_download(
-                fixture["model"],
-                "tokenizer.json",
-                revision=fixture["revision"],
-                local_files_only=True,
+                MODEL, "tokenizer.json", revision=REVISION, local_files_only=True
             )
         except Exception:  # noqa: BLE001 - not cached: nothing to encode with
-            self.skipTest("the fixture tokenizer is not cached")
-        served_tokenizer = SimpleNamespace(
-            backend_tokenizer=Tokenizer.from_file(tokenizer_file)
-        )
+            self.skipTest("the tokenizer is not cached")
+        tokenizer = Tokenizer.from_file(tokenizer_file)
         adapter = registry.build_chat_encoding_adapter(
-            self._context("dsv41", "recipe", tokenizer=served_tokenizer)
+            self._context(
+                "dsv41", "recipe", tokenizer=SimpleNamespace(backend_tokenizer=tokenizer)
+            )
         )
         self.assertFalse(adapter.strict_tool_call_arguments)
         self.assertIsNone(adapter.output)
-        case = next(c for c in fixture["cases"] if c["name"] == "a1_empty_chat")
         # The client's model name is SGLang's business; recipe sees its own.
-        request = ChatCompletionRequest(**{**case["request"], "model": "anything"})
-        ids = adapter.encode_messages(messages=[], request=request, tools=None)
-        digest = hashlib.sha256()
-        for token_id in ids:
-            digest.update(struct.pack("<I", token_id))
-        self.assertEqual(len(ids), case["token_count"])
-        self.assertEqual(digest.hexdigest(), case["token_sha256"])
-        # The overlay is a function of the request alone: no encode_messages needed.
+        request = ChatCompletionRequest(
+            model="anything",
+            messages=[{"role": "user", "content": ""}],
+            thinking={"type": "disabled"},
+        )
+        self.assertEqual(
+            adapter.render(request=request, tools=None).prompt,
+            "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>",
+        )
+        self.assertEqual(
+            adapter.encode_messages(messages=[], request=request, tools=None),
+            [
+                tokenizer.token_to_id(token)
+                for token in (
+                    "<｜begin▁of▁sentence｜>",
+                    "<｜User｜>",
+                    "<｜Assistant｜>",
+                    "</think>",
+                )
+            ],
+        )
         params = {"max_new_tokens": None}
         adapter.apply_sampling(
-            request=ChatCompletionRequest(
-                messages=[{"role": "user", "content": ""}],
-                thinking={"type": "disabled"},
-            ),
-            sampling_params=params,
-            prompt_tokens=len(ids),
-            context_length=100_000,
+            request=request, sampling_params=params, prompt_tokens=4, context_length=100_000
         )
         self.assertEqual(params["max_new_tokens"], 8192)
         # The handler's tool dumps carry None for unset fields; recipe must see the

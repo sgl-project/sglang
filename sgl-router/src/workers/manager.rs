@@ -668,7 +668,6 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: Some("/tmp/x".into()),
                 disable_input_ids_forwarding: false,
-                chat_encoding_backend: crate::config::ChatEncodingBackend::Builtin,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
