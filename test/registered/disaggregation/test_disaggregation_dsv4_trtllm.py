@@ -1,4 +1,4 @@
-"""test_disaggregation_dsv4.py with --dsv4-attn-backend trtllm on one B200 node."""
+"""test_disaggregation_dsv4.py with --dsv4-attn-backend trtllm on one B300 node."""
 
 import unittest
 
@@ -6,7 +6,7 @@ import test_disaggregation_dsv4 as dsv4_pd
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-b300")
 
 
 class TestDisaggregationDSV4Trtllm(dsv4_pd.TestDisaggregationDSV4):
