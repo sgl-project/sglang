@@ -109,6 +109,7 @@ class ForwardMetadata:
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     flash_mla_seq_lens: Optional[torch.Tensor] = None
     flash_mla_seqused_q: Optional[torch.Tensor] = None
+    flash_mla_cu_seqlens_q: Optional[torch.Tensor] = None
     flash_mla_metadata: Optional[torch.Tensor] = None
 
     # DCP decode inputs
@@ -1262,18 +1263,27 @@ class AscendAttnBackend(AttentionBackend):
         if seq_lens.numel() == 0:
             metadata.flash_mla_metadata = torch.empty_like(seq_lens, dtype=torch.int32)
             return
+        # TND layout requires cu_seqlens_q (cumulative query lengths).
+        bs = seq_lens.shape[0]
+        if (
+            metadata.flash_mla_cu_seqlens_q is None
+            or metadata.flash_mla_cu_seqlens_q.numel() != bs + 1
+        ):
+            metadata.flash_mla_cu_seqlens_q = torch.arange(
+                0, (bs + 1) * query_len, query_len, dtype=torch.int32, device=seq_lens.device
+            )
         schedule = self.flash_mla_metadata(
             cache_seqlens=metadata.flash_mla_seq_lens,
             num_heads_q=self.tp_q_head_num,
             num_heads_kv=1,
-            cu_seqlens_q=None,
+            cu_seqlens_q=metadata.flash_mla_cu_seqlens_q,
             seqused_q=metadata.flash_mla_seqused_q,
             max_seqlen_q=-1,
             max_seqlen_kv=-1,
             head_dim_qk=self.kv_lora_rank + self.qk_rope_head_dim,
             head_dim_v=self.kv_lora_rank,
             mask_mode=3,
-            layout_q="BSND",
+            layout_q="TND",
         )
         if metadata.flash_mla_metadata is None:
             metadata.flash_mla_metadata = torch.empty_like(schedule)
@@ -1295,6 +1305,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         if q_nope.shape[0] < num_tokens:
             raise ValueError("NPU FlashMLA requires one fixed query block per request")
+        # FlashMLA (CANN) only accepts TND layout: [T, N, D]
         query = torch.cat(
             (
                 q_nope[:num_tokens],
@@ -1303,13 +1314,13 @@ class AscendAttnBackend(AttentionBackend):
                 ],
             ),
             dim=-1,
-        ).view(batch_size, query_len, layer.tp_q_head_num, -1)
+        )
         output, _ = self.flash_mla(
             query,
             self.token_to_kv_pool.get_flash_mla_buffer(layer.layer_id),
             block_table=metadata.block_tables,
             cache_seqlens=metadata.flash_mla_seq_lens,
-            cu_seqlens_q=None,
+            cu_seqlens_q=metadata.flash_mla_cu_seqlens_q,
             seqused_q=metadata.flash_mla_seqused_q,
             attn_mask=self.flash_mla_mask,
             metadata=metadata.flash_mla_metadata,
@@ -1318,14 +1329,23 @@ class AscendAttnBackend(AttentionBackend):
             mask_mode=3,
             max_seqlen_q=-1,
             max_seqlen_kv=-1,
-            layout_q="BSND",
+            layout_q="TND",
             layout_kv="PA_BBND",
-            layout_out="BSND",
+            # Doc: layout_q=TND requires layout_out=NTD, attn_out is (Q_N, Q_T, DV)
+            layout_out="NTD",
             return_softmax_lse=False,
         )
-        output = output.masked_fill(
-            (metadata.flash_mla_seqused_q == 0).view(batch_size, 1, 1, 1), 0
-        ).reshape(num_tokens, -1)
+        # NTD (Q_N, Q_T, DV) -> token-major (Q_T, Q_N, DV)
+        output = output.permute(1, 0, 2).contiguous()
+        # Zero out rows of inactive (padded) requests. seqused_q has one entry
+        # per batch, so it must be broadcast across the query block width.
+        inactive = (
+            (metadata.flash_mla_seqused_q == 0)
+            .view(batch_size, 1, 1, 1)
+            .expand(batch_size, query_len, 1, 1)
+            .reshape(num_tokens, 1, 1)
+        )
+        output = output.masked_fill(inactive, 0).reshape(num_tokens, -1)
         if q_nope.shape[0] > num_tokens:
             output = torch.cat(
                 (

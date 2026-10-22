@@ -53,9 +53,17 @@ def backend():
     obj.flash_mla_metadata = Mock(side_effect=lambda **kw: kw["cache_seqlens"].clone())
 
     def attention(query, cache, **kwargs):
-        output = torch.ones(*query.shape[:-1], 512, dtype=query.dtype)
-        output[kwargs["seqused_q"] == 0] = float("nan")
-        return output, None
+        # The CANN operator takes TND query (Q_T, Q_N, D) and returns NTD
+        # attn_out (Q_N, Q_T, DV).
+        assert kwargs["layout_q"] == "TND"
+        assert kwargs["layout_out"] == "NTD"
+        assert query.dim() == 3
+        q_t, q_n, _ = query.shape
+        output = torch.ones(q_n, q_t, 512, dtype=query.dtype)
+        q_len = kwargs["cu_seqlens_q"].diff()
+        inactive = (kwargs["seqused_q"] == 0).repeat_interleave(q_len)
+        output[:, inactive] = float("nan")
+        return output, torch.empty(0, dtype=torch.float32)
 
     obj.flash_mla = Mock(side_effect=attention)
     obj.token_to_kv_pool = SimpleNamespace(
@@ -153,9 +161,11 @@ def test_decode_and_verify_dispatch_to_flash_mla_and_zero_padding(backend, entry
     torch.testing.assert_close(output[:width], torch.ones_like(output[:width]))
     assert torch.count_nonzero(output[width:]) == 0
     args, kwargs = backend.flash_mla.call_args
-    assert args[0].shape == (2, width, 2, 576)
+    assert args[0].shape == (2 * width, 2, 576)
     assert kwargs["cache_seqlens"] is metadata.flash_mla_seq_lens
     assert kwargs["seqused_q"] is metadata.flash_mla_seqused_q
+    assert kwargs["cu_seqlens_q"] is metadata.flash_mla_cu_seqlens_q
+    assert kwargs["cu_seqlens_q"].tolist() == [0, width, 2 * width]
     assert kwargs["layout_kv"] == "PA_BBND"
 
 
@@ -416,3 +426,30 @@ def test_unsupported_cache_configurations_fail_before_allocation(
 ):
     with pytest.raises(ValueError, match="ordinary BF16 MLA"):
         pool_factory(**overrides)
+
+
+def test_verify_mask_broadcasts_across_query_block(backend):
+    """seqused_q is per batch; the padding mask must cover the whole query block.
+
+    DSpark verify runs query_len > 1, so a non-broadcast view over seqused_q
+    would either raise or silently mask the wrong rows.
+    """
+    metadata = mod.ForwardMetadata(block_tables=torch.zeros(3, 4, dtype=torch.int32))
+    mode = ForwardMode.TARGET_VERIFY
+    batch = make_batch(mode, [125, 0, 40])
+    backend._prepare_flash_mla_metadata(metadata, batch.seq_lens, mode, batch.spec_info)
+    backend.forward_metadata = metadata
+    width = 8
+    tokens = 3 * width
+    q = torch.zeros(tokens, 2, 512, dtype=torch.bfloat16)
+    rope = torch.zeros(tokens, 2, 64, dtype=torch.bfloat16)
+    layer = SimpleNamespace(layer_id=0, tp_q_head_num=2, v_head_dim=512, scaling=0.1)
+
+    output = backend._forward_flash_mla(q, rope, layer, batch)
+
+    assert output.shape == (tokens, 1024)
+    torch.testing.assert_close(output[:width], torch.ones_like(output[:width]))
+    assert torch.count_nonzero(output[width : 2 * width]) == 0
+    torch.testing.assert_close(
+        output[2 * width :], torch.ones_like(output[2 * width :])
+    )
