@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -287,6 +288,11 @@ def _try_gluon_tp_ar_norm_quant(
     way ``ca_comm`` is. Returns the same tuple shapes as the aiter path so the
     caller is agnostic to which backend ran.
     """
+    # Gate before importing: this runs on every backend that reaches the fused
+    # quant path, and only gfx950 with aiter can serve it. Probing first would
+    # load the backend and query the device on CUDA and on other AMD parts.
+    if not (_use_aiter and is_gfx95_supported()):
+        return None
     try:
         from sglang.srt.distributed.device_communicators import (
             gluon_tp_ar_norm_quant as _gluon_ar,
@@ -391,8 +397,9 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
     # Preferred backend on gfx950/TP4: a single Gluon kernel that performs the
     # all-reduce itself over HIP IPC, so there is no separate collective launch.
-    # is_supported() is strict (arch, TP size, hidden size, M, eps, and
-    # non-bpreshuffle only); anything else drops through to the aiter chain.
+    # is_supported() is strict (arch, TP size, hidden size, M and eps);
+    # anything else drops through to the aiter chain. ROCm >= 7.2 is
+    # supported: the scale is relaid out for the bpreshuffle GEMM.
     fused = _try_gluon_tp_ar_norm_quant(
         x,
         residual,
