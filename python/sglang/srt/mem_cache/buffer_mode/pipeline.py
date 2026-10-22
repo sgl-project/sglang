@@ -565,13 +565,13 @@ class BufferModePipeline:
         self, snapshot: BufferBackupSnapshot
     ) -> dict[PoolName, list[str]]:
         """Admission view of the keys a backup writes per pool: the KV chain,
-        each aux component's BACKUP_HOST transfers, component overrides on
+        each aux component's BACKUP_HOST transfers, pool overrides on
         top, the SWA tail under tail-only backups, every sidecar under its
         source's keys."""
         hash_values = snapshot.hash_values
         tree_core = self._cache.tree_core
         pool_keys: dict[PoolName, list[str]] = {PoolName.KV: list(hash_values)}
-        overrides = tree_core.buffer_backup_pool_keys(snapshot.node_id, hash_values)
+        overrides = self._backup_pool_key_overrides(snapshot)
         for ct in self._cache.components:
             # A component that names its pools' keys spares the transfer build.
             if ct == ComponentType.FULL or ct in overrides:
@@ -598,6 +598,14 @@ class BufferModePipeline:
             if source:
                 pool_keys[spec.pool_name] = list(source)
         return pool_keys
+
+    def _backup_pool_key_overrides(
+        self, snapshot: BufferBackupSnapshot
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        """Return per-component pool keys used when admitting a backup."""
+        return self._cache.tree_core.buffer_backup_pool_keys(
+            snapshot.node_id, snapshot.hash_values
+        )
 
     @staticmethod
     def _pool_order(pool: PoolName) -> tuple[bool, str]:
@@ -977,7 +985,7 @@ class BufferModePipeline:
     ) -> tuple[
         torch.Tensor, dict[ComponentType, list[PoolTransfer]], Optional[list[str]]
     ]:
-        """The node's D2H spec. A FULL component's BACKUP_HOST KV transfer
+        """The node's D2H spec. A FULL backup KV transfer
         replaces the KV rows (its keys name their pages); its other transfers
         ride as aux pools. A KV intent skips the other components' transfers."""
         tree_core = self._cache.tree_core
@@ -988,9 +996,7 @@ class BufferModePipeline:
             comp_xfers = {}
         else:
             device_value, comp_xfers = tree_core.build_backup_spec(node_id)
-        full_xfers = tree_core.build_hicache_transfers(
-            ComponentType.FULL, node_id, CacheTransferPhase.BACKUP_HOST
-        )
+        full_xfers = self._full_backup_transfers(node_id)
         kv_keys = None
         aux: list[PoolTransfer] = []
         for transfer in full_xfers or ():
@@ -1006,6 +1012,12 @@ class BufferModePipeline:
         if aux:
             comp_xfers[ComponentType.FULL] = aux
         return device_value, comp_xfers, kv_keys
+
+    def _full_backup_transfers(self, node_id: NodeId) -> Optional[list[PoolTransfer]]:
+        """Return FULL transfers that replace KV rows or add auxiliary pools."""
+        return self._cache.tree_core.build_hicache_transfers(
+            ComponentType.FULL, node_id, CacheTransferPhase.BACKUP_HOST
+        )
 
     def _launch_transfers(
         self, intent: _UnifiedBackupIntent
