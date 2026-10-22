@@ -5,6 +5,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_sequence_parallel_group,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -148,9 +151,13 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        # Stage 2 is distilled and always runs with CFG disabled, so non-main
-        # CFG ranks only need the result when the decoder will use all ranks.
+        # stage 2 is distilled and runs without CFG. Stage 1 leaves the same
+        # latents on every CFG rank, so pure-CFG ranks shard it as one Ulysses
+        # group; CFG ranks with SP of their own leave it to the main rank, which
+        # sends the result only when the decoder uses every rank
         if self.server_args.enable_cfg_parallel:
+            if get_cfg_sequence_parallel_group() is not None:
+                return StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
             if (
                 model_parallel_is_initialized()
                 and get_decode_parallel_world_size() > 1
