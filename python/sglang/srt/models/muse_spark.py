@@ -130,6 +130,11 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 True,
             ).to(output_dtype)
         else:
+            if out is not None and out.shape != (
+                hidden_states.shape[0],
+                lm_head.weight.shape[0],
+            ):
+                out = None
             logits = torch.mm(
                 hidden_states.to(lm_head.weight.dtype),
                 lm_head.weight.T,
