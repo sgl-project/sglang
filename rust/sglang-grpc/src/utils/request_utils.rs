@@ -332,13 +332,12 @@ pub(crate) fn build_generate_dict(
         && (req.mm_hashes.len() != req.image_data.len()
             || !req.video_data.is_empty()
             || !req.audio_data.is_empty()
-            || req
-                .mm_hashes
-                .iter()
-                .any(|hash| hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit())))
+            || req.mm_hashes.iter().any(|hash| {
+                hash.is_empty() || hash.len() > 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            }))
     {
         return Err(
-            "mm_hashes needs one hex entry per image_data entry and no video_data or audio_data"
+            "mm_hashes needs one hex entry of at most 16 digits per image_data entry and no video_data or audio_data"
                 .into(),
         );
     }
@@ -758,6 +757,11 @@ mod tests {
             proto::GenerateRequest {
                 image_data: vec!["https://x/a.png".to_string()],
                 mm_hashes: vec!["zz".to_string()],
+                ..Default::default()
+            },
+            proto::GenerateRequest {
+                image_data: vec!["https://x/a.png".to_string()],
+                mm_hashes: vec!["100112233aabbccdd".to_string()],
                 ..Default::default()
             },
             proto::GenerateRequest {
