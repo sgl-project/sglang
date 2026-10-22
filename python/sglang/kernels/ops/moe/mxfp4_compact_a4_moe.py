@@ -8,6 +8,9 @@ checkpoint weights (per-32 E8M0 scales) used as stored. For M (a multiple of 8, 
 3. ``_expert_a4`` (ACT): gate/up ``dot_scaled`` GEMMs, SiLU-and-mul rounded to BF16, MXFP4 re-quantization;
 4. ``_expert_a4``: down GEMM into unweighted per-(token, slot) BF16 rows.
 
+Weights are read either as stored in the checkpoint or in aiter's FlyDSL a4w4 preshuffle layout (``shuffled``), so a
+rank short on memory keeps one copy for both paths.
+
 ``compact_a4_experts`` returns those per-slot rows ``[M * 8, 4096]``; the caller's finalize applies the
 per-expert norm and the route-weighted sum. Quark MXFP4 declares dynamic MXFP4 activations, so A4 is the
 checkpoint numerics.
@@ -100,6 +103,31 @@ def _scatter_a4(
 
 
 @triton.jit
+def _w_offset(n, k, SHUF: tl.constexpr):
+    """[K bytes, N] offsets in one expert's [N, 2048] packed E2M1 rows. Preshuffled: [N/16, 2048/16, 16 n, 16 bytes]
+    (aiter shuffle_weight (16, 16) and shuffle_weight_a16w4 (16) agree on this layout for K 2048)."""
+    if SHUF:
+        return ((n // 16) * 32768 + (n % 16) * 16)[None, :] + (
+            (k // 16) * 256 + k % 16
+        )[:, None]
+    return n[None, :] * 2048 + k[:, None]
+
+
+@triton.jit
+def _s_offset(n, c, SHUF: tl.constexpr):
+    """[N, scale col] offsets in one expert's [N, 128] E8M0 scales. Preshuffled (aiter shuffle_scale, plain and a16w4
+    alike): [N/32, 128/8, 4 (c % 4), 16 (n % 16), 2 ((c % 8) // 4), 2 ((n % 32) // 16)]."""
+    if SHUF:
+        n2, c2 = n[:, None], c[None, :]
+        return (
+            ((((n2 // 32) * 16 + c2 // 8) * 4 + c2 % 4) * 16 + n2 % 16) * 4
+            + ((c2 % 8) // 4) * 2
+            + (n2 % 32) // 16
+        )
+    return n[:, None] * 128 + c[None, :]
+
+
+@triton.jit
 def _expert_a4(
     A,
     AS,
@@ -114,6 +142,7 @@ def _expert_a4(
     BK: tl.constexpr,
     ACT: tl.constexpr,
     BM: tl.constexpr,
+    SHUF: tl.constexpr,
 ):
     expert_block, n_block = tl.program_id(1), tl.program_id(0)
     expert = tl.load(EXPERT + expert_block)
@@ -140,34 +169,22 @@ def _expert_a4(
                 other=127,
             )
             w = tl.load(
-                W
-                + expert * (wn * 2048)
-                + n[None, :] * 2048
-                + tile * (BK // 2)
-                + kp[:, None]
+                W + expert * (wn * 2048) + _w_offset(n, tile * (BK // 2) + kp, SHUF)
             )
             ws = tl.load(
-                WS
-                + expert * (wn * 128)
-                + n[:, None] * 128
-                + tile * (BK // 32)
-                + ks[None, :]
+                WS + expert * (wn * 128) + _s_offset(n, tile * (BK // 32) + ks, SHUF)
             )
             acc = tl.dot_scaled(a, asc, "e2m1", w, ws, "e2m1", acc)
             if ACT:
                 wu = tl.load(
                     W
                     + expert * (wn * 2048)
-                    + (n[None, :] + 4096) * 2048
-                    + tile * (BK // 2)
-                    + kp[:, None]
+                    + _w_offset(n + 4096, tile * (BK // 2) + kp, SHUF)
                 )
                 wsu = tl.load(
                     WS
                     + expert * (wn * 128)
-                    + (n[:, None] + 4096) * 128
-                    + tile * (BK // 32)
-                    + ks[None, :]
+                    + _s_offset(n + 4096, tile * (BK // 32) + ks, SHUF)
                 )
                 up = tl.dot_scaled(a, asc, "e2m1", wu, wsu, "e2m1", up)
         if ACT:
@@ -199,8 +216,10 @@ def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
     )
 
 
-def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
-    """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 or 64 local experts starting at ``local_start``."""
+def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start, shuffled=False):
+    """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 or 64 local experts starting at ``local_start``.
+
+    Weights and scales are uint8 [E, N, K] views, as stored or (``shuffled``) in the a4w4 preshuffle layout."""
     m, h = x.shape
     if not (
         compact_a4_applies(m, h, w13, w2, s13, s2)
@@ -208,7 +227,7 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         and ids.shape == (m, 8)
     ):
         raise ValueError(
-            f"A4 requires M a multiple of 8 up to {MAX_ROWS}, native local32 / local64 checkpoint weights"
+            f"A4 requires M a multiple of 8 up to {MAX_ROWS}, local32 / local64 MXFP4 expert weights"
         )
     bm, e_local = BLOCK_M, w13.shape[0]
     rows, cap = m * 8, m * 8 + e_local * (bm - 1)
@@ -263,9 +282,24 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         512,
         True,
         bm,
+        shuffled,
         **options,
     )
     _expert_a4[grid](
-        inter, inter_scale, w2, s2, sid, eid, y, y, rows, 64, 512, False, bm, **options
+        inter,
+        inter_scale,
+        w2,
+        s2,
+        sid,
+        eid,
+        y,
+        y,
+        rows,
+        64,
+        512,
+        False,
+        bm,
+        shuffled,
+        **options,
     )
     return y

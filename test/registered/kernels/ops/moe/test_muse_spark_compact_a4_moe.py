@@ -55,3 +55,39 @@ def test_compact_a4_local64_matches_two_local32(m):
         rows = ((flat >= lo) & (flat < lo + 32)).nonzero().flatten()
         assert rows.numel() > 0
         assert torch.equal(got[rows], ref[rows])
+
+
+@pytest.mark.parametrize("experts", [32, 64])
+@pytest.mark.parametrize("m", [8, 128, 512])
+def test_compact_a4_reads_a4w4_preshuffled_weights(experts, m):
+    """The a4w4 preshuffled copy (the only one kept when both do not fit) gives the stored-layout result."""
+    from aiter import dtypes
+    from aiter.ops.shuffle import (
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
+
+    start = experts
+    x, ids, w13, w2, s13, s2 = _inputs(m, start, experts)
+    e = experts
+    shuffled = (
+        shuffle_weight(w13.view(dtypes.fp4x2), (16, 16)),
+        shuffle_weight_a16w4(w2.view(dtypes.fp4x2), 16, False),
+        e8m0_shuffle(s13.view(dtypes.fp8_e8m0).view(e * 8192, 128)),
+        shuffle_scale_a16w4(s2.view(dtypes.fp8_e8m0).view(e * 4096, 128), e, False),
+    )
+    views = [
+        t.view(torch.uint8).view(e, n, k)
+        for t, (n, k) in zip(
+            shuffled, ((8192, 2048), (4096, 2048), (8192, 128), (4096, 128))
+        )
+    ]
+    ref = compact_a4_experts(x, ids, w13, w2, s13, s2, local_start=start)
+    got = compact_a4_experts(x, ids, *views, local_start=start, shuffled=True)
+    flat = ids.flatten()
+    rows = ((flat >= start) & (flat < start + e)).nonzero().flatten()
+    assert torch.equal(got[rows], ref[rows])

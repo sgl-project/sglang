@@ -69,22 +69,42 @@ def _finalize_per_slot(
 def run_compact_a4(x, scores, ids, experts, local_start, norm_weight, eps, gain):
     """Compact A4 target-verify experts of this rank, finalized; partial sums before the TP reduction."""
     y = compact_a4_experts(
-        x,
-        ids,
-        experts.w13_weight,
-        experts.w2_weight,
-        experts.w13_weight_scale,
-        experts.w2_weight_scale,
-        local_start=local_start,
-    )
+        x, ids, *_compact_a4_operands(experts), local_start=local_start,
+        shuffled=experts.native_dropped,
+    )  # fmt: skip
     return _finalize_per_slot(
-        y, norm_weight, scores, ids, local_start, experts.w13_weight.shape[0], eps, gain
+        y, norm_weight, scores, ids, local_start, experts.num_local_experts, eps, gain
+    )
+
+
+def _compact_a4_operands(experts):
+    """(w13, w2, s13, s2) as uint8 [E, N, K] views: the stored tensors, or the a4w4 preshuffled copies when the
+    stored ones were dropped (the preshuffled scales are [E * N, K] with each expert's block contiguous)."""
+    if not experts.native_dropped:
+        return (
+            experts.w13_weight,
+            experts.w2_weight,
+            experts.w13_weight_scale,
+            experts.w2_weight_scale,
+        )
+    e, h, i = (
+        experts.num_local_experts,
+        experts.expert_hidden_size,
+        experts.intermediate_size,
+    )
+    w13, w2, s13, s2 = experts.a4w4_weights
+    return (
+        w13.view(torch.uint8).view(e, 2 * i, h // 2),
+        w2.view(torch.uint8).view(e, h, i // 2),
+        s13.view(torch.uint8).view(e, 2 * i, h // 32),
+        s2.view(torch.uint8).view(e, h, i // 32),
     )
 
 
 @torch.no_grad()
-def prepare_a4w4_weights(experts) -> None:
-    """Shuffle the MXFP4 expert weights and scales into aiter's FlyDSL preshuffle layout (a second copy)."""
+def prepare_a4w4_weights(experts, *, keep_native: bool = True) -> None:
+    """Shuffle the MXFP4 expert weights and scales into aiter's FlyDSL preshuffle layout: a second copy, or
+    (``keep_native`` False) the only one, with every path of these experts reading the preshuffled tensors."""
     from aiter import dtypes
     from aiter.ops.shuffle import (
         shuffle_scale_a16w4,
@@ -103,6 +123,10 @@ def prepare_a4w4_weights(experts) -> None:
         e8m0_shuffle(s13.view(dtypes.fp8_e8m0).view(e * two_i, h_half * 2 // 32)),
         shuffle_scale_a16w4(s2.view(dtypes.fp8_e8m0).view(e * h, i // 32), e, False),
     )
+    if not keep_native:
+        for param in (w13, w2, s13, s2):
+            param.data = param.data.new_empty(0)
+        experts.native_dropped = True
 
 
 def quantize_rows(x):
@@ -120,9 +144,9 @@ def run_a4w4(
     from aiter.utility.fp4_utils import moe_mxfp4_sort
 
     w1s, w2s, s1s, s2s = experts.a4w4_weights
-    m, h = ids.shape[0], experts.w2_weight.shape[1]
+    m, h = ids.shape[0], experts.expert_hidden_size
     topk = ids.shape[1]
-    e_local = experts.w13_weight.shape[0]
+    e_local = experts.num_local_experts
     block_m = 32 if m <= 1024 else 64
     mask = torch.zeros(256, dtype=torch.int32, device=ids.device)
     mask[local_start : local_start + e_local] = 1
