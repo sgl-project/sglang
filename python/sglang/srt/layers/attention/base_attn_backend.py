@@ -211,7 +211,11 @@ class AttentionBackend(ABC):
             or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
         ):
             return SharedReadEnds.UNKNOWN
-        if forward_batch.forward_mode != ForwardMode.EXTEND:
+        # MIXED only for a verify-merged mixed step; main's own mixed step stays off.
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            and forward_batch.mixed_num_prefill_tokens is None
+        ):
             return SharedReadEnds.UNKNOWN
         if build_snapshot:
             return self._snapshot_prefill_shared_reads(
