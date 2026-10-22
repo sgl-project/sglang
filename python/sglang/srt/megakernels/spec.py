@@ -1,5 +1,5 @@
-# The pinned sgl-nvidia-mega imports this path; drop once it imports
-# sglang.kernels.plugin_kernels.nvidia.
+# The pinned sgl-nvidia-mega imports this path; drop once it uses
+# sglang.kernels.plugin_kernels.nvidia.spec.
 import sys
 
 from sglang.kernels.plugin_kernels.nvidia import spec

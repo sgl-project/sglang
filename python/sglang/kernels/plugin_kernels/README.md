@@ -1,6 +1,6 @@
 # `plugin_kernels` — plugin kernel backend
 
-The integration of external kernel libraries that load as SGLang plugins and
+The contracts of external kernel libraries that load as SGLang plugins and
 replace a model's step with kernels specialized for one model, configuration
 and platform. Today they serve small-batch decode and verify steps; prefill or
 high-throughput specializations fit here too. `KernelBackend.PLUGIN` records
@@ -10,10 +10,17 @@ device.
 
 ## Layout
 
+The code is split at the kernel/runtime boundary.
+
 ```
-plugin_kernels/
-  <hardware>/    # the whole-step interface to that hardware's library
-    <model>/     # model-specific integration code
+kernels/plugin_kernels/      # what a plugin implements; imports nothing from srt
+  <hardware>/spec.py         #   registration, API version, requirements,
+                             #   capabilities and widths, build/forward contract
+  <hardware>/<model>/        #   thin wrappers around the library's kernels
+srt/kernel_plugins/          # SGLang's integration
+  <hardware>/integration.py  #   startup checks, weight observation, TP agreement,
+                             #   CUDA graph coverage, forward dispatch and fallback
+  nvidia/binding.py          #   the runtime state handed to a megakernel
 ```
 
 | Hardware | Server flag | Library |
@@ -21,21 +28,21 @@ plugin_kernels/
 | `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
 | `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
 
-## Whole-step interfaces
+## How a plugin runs
 
-Each interface replaces a covered model's forward for the steps its library
-serves; every other step runs the model's own forward. It holds the spec
-contract the library implements (`spec.py`), the startup checks run at
-argument resolution, before the weights load (`guards.py`), and the build and
-per-step routing installed on the model (`runtime.py`; `nvidia/binding.py` is
-the runtime state handed to a megakernel). An unsupported setup stops the
-server at startup and lists every reason.
+A library registers its specs through the `sglang.srt.plugins` entry point.
+With its server flag set, `srt/kernel_plugins/<hardware>/integration.py`:
+- checks the spec against the resolved configuration at argument resolution,
+  before the weights load, and stops the server listing every reason it cannot
+  serve;
+- builds the spec once the model is prepared;
+- replaces that model's forward for the steps the spec covers; every other step
+  runs the model's own forward.
 
-The kernels stay in their libraries, which register their specs through the
-`sglang.srt.plugins` entry point. The library versions that `docker/Dockerfile`
-and `python/pyproject_other.toml` pin import these modules as
+The kernels stay in their libraries. The library versions that
+`docker/Dockerfile` and `python/pyproject_other.toml` pin import these modules as
 `sglang.srt.megakernels` and `sglang.srt.monokernels`, which alias them. Unit
-tests are in `test/registered/unit/kernels/plugin_kernels/<hardware>/`.
+tests are in `test/registered/unit/kernel_plugins/<hardware>/`.
 
 ## Operators
 

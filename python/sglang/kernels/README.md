@@ -28,8 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
-  plugin_kernels/  # plugin kernel backend: external kernel libraries,
-                   # as <hardware>/<model>/
+  plugin_kernels/  # plugin kernel backend: contracts of external kernel
+                   # libraries, as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -86,9 +86,9 @@ Runtime integration that owns process groups, symmetric buffers, workspace
 classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
 collective-GEMM communication adapters and workspaces live in
 `srt/layers/communication/`, while their callable kernels live in
-`kernels/ops/communication/` and take that state as arguments. The exception
-is the whole-step interfaces in `plugin_kernels/` (see below), which replace
-a model's forward. Reference/test oracles belong in
+`kernels/ops/communication/` and take that state as arguments. Likewise the
+integration of kernel plugins lives in `srt/kernel_plugins/`, and their
+contracts in `kernels/plugin_kernels/` (see below). Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
@@ -133,30 +133,33 @@ agent_kernels = [
 
 ## Plugin kernel backend: `plugin_kernels/`
 
-This directory integrates external kernel libraries that load as SGLang
-plugins (the `sglang.srt.plugins` entry point) and replace a model's step with
-kernels specialized for one model, configuration and platform: today the
+This directory holds the contracts of external kernel libraries that load as
+SGLang plugins (the `sglang.srt.plugins` entry point) and replace a model's step
+with kernels specialized for one model, configuration and platform: today the
 small-batch decode and verify steps, possibly prefill or high-throughput steps
-later. The kernels stay in the libraries; SGLang keeps the contract they plug
-into, and `KernelBackend.PLUGIN` records them. These are kernel plugins, not
-the platform plugins that add a device. The directory is organized by
-hardware, then model: `plugin_kernels/<hardware>/` holds the whole-step
-interface to that hardware's library and `<hardware>/<model>/` its
-model-specific integration (details in `plugin_kernels/README.md`).
+later. `KernelBackend.PLUGIN` records them. These are kernel plugins, not the
+platform plugins that add a device. The kernels stay in the libraries, and the
+code is split at the kernel/runtime boundary:
 
-- `nvidia/` (`--enable-nvidia-megakernel`) integrates
-  [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega).
-- `amd/` (`--enable-amd-monokernel`) integrates
-  [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono).
+- `kernels/plugin_kernels/<hardware>/` holds what a plugin implements and
+  registers: its spec (registration, API version, requirements, capability and
+  width declarations, the build and forward contract) and any thin wrappers
+  around its kernels, under `<hardware>/<model>/`. It imports nothing from
+  `srt`.
+- `srt/kernel_plugins/<hardware>/` holds SGLang's integration: it reads the
+  server configuration at argument resolution, observes weight loading,
+  coordinates TP ranks, plans CUDA graph coverage, installs the model-forward
+  dispatch with its fallback, and hands a plugin the runtime state it may use
+  (`nvidia/binding.py`).
 
-Each interface checks the configuration at argument resolution, builds the
-library's spec once the model is prepared, and routes the covered steps
-through it. Because they
-replace a model's forward, these interfaces read `srt` runtime state and `srt`
-imports them directly; operator kernels must not. An operator exposed from
-here registers into its logical group with
+| Hardware | Server flag | Library |
+| --- | --- | --- |
+| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
+
+An operator exposed from here registers into its logical group with
 `KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
-`test_kernels_namespace.py` enforces the pairing.
+`test_kernels_namespace.py` enforces the pairing. See `plugin_kernels/README.md`.
 
 ## How it works
 

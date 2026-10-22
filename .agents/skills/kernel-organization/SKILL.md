@@ -45,10 +45,13 @@ logical grouping and remove the old `_jit_` filename prefix.
   logical group with a `KernelSpec` whose target points into them, and do not
   reorganize those directories.
 - External kernel libraries that load as SGLang plugins and replace a model's
-  step are integrated in `kernels/plugin_kernels/<hardware>/<model>/`
-  (`KernelBackend.PLUGIN`), a backend like the agent ones. `nvidia/` and `amd/` hold the whole-step
-  interfaces behind `--enable-nvidia-megakernel` and `--enable-amd-monokernel`;
-  the kernels stay in sgl-nvidia-mega and sgl-amd-mono. An op exposed from there
+  step (sgl-nvidia-mega behind `--enable-nvidia-megakernel`, sgl-amd-mono behind
+  `--enable-amd-monokernel`) are split at the kernel/runtime boundary. Their
+  contracts (spec, registration, capability declarations, thin kernel wrappers)
+  live in `kernels/plugin_kernels/<hardware>/<model>/` (`KernelBackend.PLUGIN`)
+  and import nothing from `srt`. SGLang's integration (config checks, weight
+  observation, CUDA graph coverage, forward dispatch, the runtime binding) lives
+  in `srt/kernel_plugins/<hardware>/`. An op exposed from the contract side
   registers in its logical group with a `KernelSpec` that points into it.
 - Keep shared build/runtime infrastructure (including the Helion runtime
   helper) in `kernels/jit`; operator wrappers call it from their logical group.
@@ -56,8 +59,7 @@ logical grouping and remove the old `_jit_` filename prefix.
   and buffer ownership in `srt` (`srt/layers/communication/` for the K3 and Muse
   Spark adapters); kernels must not import srt runtime modules to inspect
   model objects, so pass flags in. Adapters there need not pretend to be generic
-  interfaces. The whole-step interfaces in `plugin_kernels/` are the one
-  exception: they replace a model's forward.
+  interfaces.
 
 ## Register the public entry point
 

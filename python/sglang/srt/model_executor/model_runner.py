@@ -25,10 +25,6 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.plugin_kernels.amd.runtime import (
-    install_monokernel_forward,
-)
-from sglang.kernels.plugin_kernels.nvidia.runtime import install_megakernel
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -80,6 +76,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.kernel_plugins.amd.integration import (
+    install_monokernel_forward,
+)
+from sglang.srt.kernel_plugins.nvidia.integration import install_megakernel
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env

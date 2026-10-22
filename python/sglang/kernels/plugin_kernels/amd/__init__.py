@@ -1,6 +1,2 @@
-"""Experimental full-forward dispatch for vendor monokernel plugins.
-
-General plugins register specs through the sglang.srt.plugins entry point.
-The runtime validates configuration, observes weight loading, and routes
-supported steps through the selected spec; other steps use the model forward.
-"""
+"""The contract an AMD monokernel plugin implements (``spec``); SGLang's
+integration lives in ``sglang.srt.kernel_plugins.amd``."""

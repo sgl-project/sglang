@@ -9,15 +9,7 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.plugin_kernels.amd import guards, runtime
 from sglang.kernels.plugin_kernels.amd import spec as registry
-from sglang.kernels.plugin_kernels.amd.guards import (
-    MAX_DEADLINE_S,
-    covered_capture_sizes,
-    deadline_s,
-    features_in_use,
-    monokernel_disable_reasons,
-)
 from sglang.kernels.plugin_kernels.amd.spec import (
     DeviceLimits,
     Feature,
@@ -29,6 +21,14 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     StepMetadata,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd import integration
+from sglang.srt.kernel_plugins.amd.integration import (
+    MAX_DEADLINE_S,
+    covered_capture_sizes,
+    deadline_s,
+    features_in_use,
+    monokernel_disable_reasons,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     default_cuda_graph_config,
@@ -124,14 +124,14 @@ def install(*, archs, lookups=None, is_load_observed=False):
     gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
     gpu = SimpleNamespace(multi_processor_count=256)
     with (
-        patch.object(runtime, "_backend", return_value=BACKEND),
-        patch.object(runtime, "device_isa", return_value="gfx950"),
-        patch.object(runtime, "_gather_tp", **gather),
+        patch.object(integration, "_backend", return_value=BACKEND),
+        patch.object(integration, "device_isa", return_value="gfx950"),
+        patch.object(integration, "_gather_tp", **gather),
         patch.object(torch.cuda, "current_device", return_value=0),
         patch.object(torch.cuda, "get_device_properties", return_value=gpu),
         patch.object(torch.cuda, "memory_allocated", return_value=0),
     ):
-        runtime.install_monokernel_forward(
+        integration.install_monokernel_forward(
             model=lm,
             hf_config=SimpleNamespace(architectures=archs),
             capture_tail_hooks=[],
@@ -152,8 +152,8 @@ class Lm(torch.nn.Module):
 def switched(mode="decode", tokens=1, spec=SPEC):
     """Build a fake model whose steps of this mode and tokens per request route."""
     lm, built = Lm(), FakeBuilt()
-    served = runtime._served_keys(mode=mode, widths=WIDTHS, tokens=tokens)
-    runtime._install_forward(model=lm, built=built, served=served, spec=spec)
+    served = integration._served_keys(mode=mode, widths=WIDTHS, tokens=tokens)
+    integration._install_forward(model=lm, built=built, served=served, spec=spec)
     return lm, built
 
 
@@ -232,7 +232,7 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(reasons_for(server_args())[1], [])
         # a spec whose requirements state every check it needs has no config hook
         bare = replace(SPEC, config_disable_reasons=None)
-        with patch.object(guards, "find_spec", return_value=(bare, "")):
+        with patch.object(integration, "find_spec", return_value=(bare, "")):
             self.assertEqual(reasons_for(server_args(context_length=7))[1], [])
         self.assertIsNone(reasons_for(server_args(), arch="Other")[0])
         self.assertEqual(
@@ -246,7 +246,7 @@ class TestMonokernelFramework(CustomTestCase):
             SPEC,
             numerics=Numerics(kind=NumericsKind.TOLERANCE, bounds={"k1.q.rel": 5e-3}),
         )
-        with patch.object(guards, "find_spec", return_value=(tolerance, "")):
+        with patch.object(integration, "find_spec", return_value=(tolerance, "")):
             _, reasons = reasons_for(server_args(**modes))
         for flag in ("--enable-deterministic-inference", "--rl-on-policy-target"):
             self.assertTrue(any(flag in r for r in reasons), (flag, reasons))
@@ -293,20 +293,22 @@ class TestMonokernelFramework(CustomTestCase):
     def test_only_routed_steps_skip_the_metadata_a_spec_never_reads(self):
         schedule = StepMetadata.LOW_RATIO_DECODE_SCHEDULE
         lm, _ = switched(spec=replace(SPEC, unread_metadata=frozenset({schedule})))
-        self.assertTrue(runtime.is_metadata_unread(lm, batch("decode", 2, 2), schedule))
+        self.assertTrue(
+            integration.is_metadata_unread(lm, batch("decode", 2, 2), schedule)
+        )
         # a width not built runs the standard forward, which reads it
         self.assertFalse(
-            runtime.is_metadata_unread(lm, batch("decode", 3, 3), schedule)
+            integration.is_metadata_unread(lm, batch("decode", 3, 3), schedule)
         )
         reads_all, _ = switched()
         without_monokernels = Lm()
         for model in (reads_all, without_monokernels):
             self.assertFalse(
-                runtime.is_metadata_unread(model, batch("decode", 2, 2), schedule)
+                integration.is_metadata_unread(model, batch("decode", 2, 2), schedule)
             )
 
     def test_the_weights_iterator_passes_weights_through_and_keeps_copies(self):
-        iterator = runtime.monokernel_weights_iterator
+        iterator = integration.monokernel_weights_iterator
         model, other = torch.nn.Module(), torch.nn.Module()
         model.config = SimpleNamespace(architectures=[ARCH])
         other.config = SimpleNamespace(architectures=["Other"])
@@ -315,8 +317,8 @@ class TestMonokernelFramework(CustomTestCase):
             ("layers.0.other.weight", torch.ones(16)),
         ]
         with (
-            patch.object(runtime, "_backend", return_value=BACKEND),
-            patch.object(runtime, "device_isa", return_value="gfx950"),
+            patch.object(integration, "_backend", return_value=BACKEND),
+            patch.object(integration, "device_isa", return_value="gfx950"),
         ):
             watched = list(iterator(model=model, weights=iter(weights)))
             self.assertIs(iterator(model=other, weights=weights), weights)
@@ -328,7 +330,7 @@ class TestMonokernelFramework(CustomTestCase):
             list(model.__dict__["_mono_copies"]),
             [("shared expert", "layers.0.shared.weight")],
         )
-        with patch.object(runtime, "_backend", return_value=None):
+        with patch.object(integration, "_backend", return_value=None):
             self.assertIs(iterator(model=model, weights=weights), weights)
 
     def test_a_load_path_that_skips_the_observer_is_refused(self):
@@ -376,7 +378,7 @@ class TestMonokernelFramework(CustomTestCase):
             SPEC,
             requires=replace(SPEC.requires, attention_backends=frozenset({"dsv4"})),
         )
-        with patch.object(guards, "find_spec", return_value=(dsv4, "")):
+        with patch.object(integration, "find_spec", return_value=(dsv4, "")):
             _, refused = reasons_for(
                 server_args(attention_backend="dsv4", decode_attention_backend="triton")
             )
@@ -397,9 +399,9 @@ class TestMonokernelFramework(CustomTestCase):
             backend = SimpleNamespace(decode_attention_backend_str=stamped)
             with (
                 self.subTest(stamped=stamped, configured=configured),
-                patch.object(runtime, "get_attn_backend", return_value=backend),
+                patch.object(integration, "get_attn_backend", return_value=backend),
                 patch.object(
-                    runtime, "attention_backends", return_value=("x", configured)
+                    integration, "attention_backends", return_value=("x", configured)
                 ),
             ):
                 step = batch("decode", 2, 2)
@@ -417,7 +419,7 @@ class TestMonokernelFramework(CustomTestCase):
             ShapeKey(forward_mode="decode", batch_size=bs, tokens_per_request=1)
             for bs in (4, 8)
         )
-        check = runtime._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        check = integration._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
         capturing = patch.object(torch.cuda, "is_current_stream_capturing")
         with capturing as is_capturing:
             is_capturing.return_value = False  # a warmup run is not a capture
@@ -425,14 +427,14 @@ class TestMonokernelFramework(CustomTestCase):
             is_capturing.return_value = True
             with self.assertRaisesRegex(ValueError, "none of the 1 captured decode"):
                 check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
-        check = runtime._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        check = integration._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
         with capturing:
             for bs in (2, 4):  # the check waits for every captured size
                 check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
         self.assertTrue(check.is_done)
         # a step pads up to a captured graph that holds it: only a served key past
         # the largest graph of its mode runs eagerly
-        eager = runtime._eager_keys(served=served, captured=check.captured.values())
+        eager = integration._eager_keys(served=served, captured=check.captured.values())
         self.assertEqual([k.batch_size for k in eager], [8])
 
     def test_the_runtime_reads_the_published_config(self):
@@ -448,13 +450,13 @@ class TestMonokernelFramework(CustomTestCase):
             role="test",
         )
         self.addCleanup(reset_context)
-        self.assertEqual(runtime._backend(), BACKEND)
-        mode, tokens = runtime._server_step()
+        self.assertEqual(integration._backend(), BACKEND)
+        mode, tokens = integration._server_step()
         self.assertEqual((mode, tokens), ("target_verify", 6))
         self.assertEqual(
             [
                 (k.forward_mode, k.batch_size, k.rows)
-                for k in runtime._capture_keys(mode=mode, tokens=tokens)
+                for k in integration._capture_keys(mode=mode, tokens=tokens)
             ],
             [
                 ("target_verify", 1, 6),

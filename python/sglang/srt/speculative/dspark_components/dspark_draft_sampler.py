@@ -5,7 +5,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.kernels.plugin_kernels.nvidia.runtime import (
+from sglang.srt.kernel_plugins.nvidia.integration import (
     megakernel_agree,
     megakernel_draft_sampler,
 )

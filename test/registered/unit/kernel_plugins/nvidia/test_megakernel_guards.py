@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.kernels.plugin_kernels.nvidia import guards, runtime
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
-from sglang.kernels.plugin_kernels.nvidia.guards import (
+from sglang.srt.kernel_plugins.nvidia import integration
+from sglang.srt.kernel_plugins.nvidia.integration import (
     megakernel_disable_reasons,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,12 +27,12 @@ class TestMegakernelGuards(CustomTestCase):
         self.addCleanup(registry_patch.stop)
 
     def test_a_disabled_flag_looks_nothing_up_and_keeps_the_forward(self):
-        with patch.object(guards, "plugin_reasons") as plugin:
-            guards.handle_nvidia_megakernel(server_args())
+        with patch.object(integration, "plugin_reasons") as plugin:
+            integration.handle_nvidia_megakernel(server_args())
         plugin.assert_not_called()
         model = SimpleNamespace()  # any attribute read would raise
-        with patch.object(runtime, "megakernel_enabled", return_value=False):
-            runtime.install_megakernel(
+        with patch.object(integration, "megakernel_enabled", return_value=False):
+            integration.install_megakernel(
                 model=model, hf_config=None, capture_tail_hooks=[], is_draft=False
             )
         self.assertEqual(vars(model), {})

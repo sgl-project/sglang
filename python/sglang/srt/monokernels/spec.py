@@ -1,5 +1,5 @@
-# The pinned sgl-amd-mono imports this path; drop once it imports
-# sglang.kernels.plugin_kernels.amd.
+# The pinned sgl-amd-mono imports this path; drop once it uses
+# sglang.kernels.plugin_kernels.amd.spec.
 import sys
 
 from sglang.kernels.plugin_kernels.amd import spec
