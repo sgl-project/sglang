@@ -81,8 +81,6 @@ class TestDPAttentionMixedChunk(
     # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
     gsm8k_backend = "evalscope"
-    # evalscope request concurrency used when the 0.83 baseline was calibrated.
-    gsm8k_eval_batch_size = 64
 
     @classmethod
     def setUpClass(cls):

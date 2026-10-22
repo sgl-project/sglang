@@ -56,6 +56,10 @@ class NPUGSM8KMixin(GSM8KMixin):
       legacy evalscope numbers (e.g. Moonlight bf16 tp2 = 0.837).
     """
 
+    # evalscope request concurrency; 64 matches the harness the 0.83
+    # Moonlight baseline was calibrated with.
+    gsm8k_eval_batch_size = 64
+
     def _test_gsm8k_evalscope(self, threshold):
         from urllib.parse import urlparse
 
@@ -81,7 +85,7 @@ class NPUGSM8KMixin(GSM8KMixin):
                 model=os.path.basename(self.model),
                 datasets=["gsm8k"],
                 limit=limit,
-                eval_batch_size=getattr(self, "gsm8k_eval_batch_size", 64),
+                eval_batch_size=self.gsm8k_eval_batch_size,
                 generation_config=generation_config,
             )
             best = max(best, float(metrics.get("accuracy", 0.0)))
