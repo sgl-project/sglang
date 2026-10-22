@@ -1716,7 +1716,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     sa._resolved_overrides,
                 )
 
-    def test_layer_types_hybrid_swa_memory_off_on_aiter(self):
+    def test_layer_types_hybrid_swa_memory_off_on_backends_without_it(self):
         for architecture in ("Gemma3ForCausalLM", "Cohere2ForCausalLM"):
             for backends in (
                 {"attention_backend": "aiter"},
@@ -1724,6 +1724,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "prefill_attention_backend": "aiter",
                     "decode_attention_backend": "triton",
                 },
+                {"attention_backend": "wave"},
+                {"attention_backend": "flex_attention"},
             ):
                 with self.subTest(architecture=architecture, backends=backends):
                     sa = self._construct(
@@ -1732,11 +1734,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
                     self.assertIn(
                         (
-                            "_layer_types_hybrid_swa_aiter",
+                            "_hybrid_swa_memory_backend_disable",
                             {"disable_hybrid_swa_memory": True},
                         ),
                         sa._resolved_overrides,
                     )
+
+    def test_layer_types_hybrid_swa_memory_off_on_default_aiter(self):
+        # The gate has to see the default backend, which resolves after the
+        # model overrides run.
+        with override_platform(is_cuda=False, is_hip=True):
+            sa = self._construct(
+                "Gemma3ForCausalLM", "llama", config_extra=self._SWA_MIX
+            )
+        self.assertEqual(self._resolved(sa, "attention_backend"), "aiter")
+        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
 
     def test_listed_hybrid_swa_models_keep_their_pool_on_aiter(self):
         sa = self._construct(

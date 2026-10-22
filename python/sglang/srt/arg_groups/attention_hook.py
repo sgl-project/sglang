@@ -16,8 +16,8 @@ from sglang.srt.arg_groups.overrides import (
     _deterministic_attention_backend,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
+    _hybrid_swa_memory_backend_disable,
     _intel_xpu_page_constraint,
-    _layer_types_hybrid_swa_aiter,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
     attention_backends_of,
@@ -272,7 +272,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
     # Needs the final prefill and decode backends.
-    run_post_process_pass(server_args, _layer_types_hybrid_swa_aiter)
+    run_post_process_pass(server_args, _hybrid_swa_memory_backend_disable)
 
     # XPU platforms backends
     if cfg.dcp_size > 1 and get_platform().is_xpu:
