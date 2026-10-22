@@ -81,6 +81,16 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.gguf_moe_a8_vec",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.gguf_moe_vec:gguf_moe_a8_vec",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="moe.apply_gguf_moe_weights",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.gguf_moe_weights:apply_gguf_moe_weights",

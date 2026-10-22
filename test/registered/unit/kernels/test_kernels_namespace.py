@@ -42,6 +42,15 @@ def test_fp8_scaled_mm_requires_explicit_registry_backend(monkeypatch):
     )
 
 
+def test_gguf_vector_registry_is_cuda_local_jit():
+    spec = K.select_kernel("moe.gguf_moe_a8_vec")
+    assert spec.backend is KernelBackend.JIT
+    assert spec.target == "sglang.kernels.ops.moe.gguf_moe_vec:gguf_moe_a8_vec"
+    assert K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _MUSA)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 def test_unknown_op_or_backend_raises():
     with pytest.raises(KeyError):
         K.select_kernel("does_not.exist")

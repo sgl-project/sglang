@@ -49,12 +49,12 @@ if _is_cuda:
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
-        ggml_moe_a8_vec,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.moe.gguf_moe_vec import gguf_moe_a8_vec as ggml_moe_a8_vec
     from sglang.kernels.ops.moe.gguf_moe_weights import apply_gguf_moe_weights
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
@@ -239,29 +239,6 @@ def fused_mul_mat_gguf(
     return y
 
 
-def _prepare_gguf_moe_safe_ids(
-    topk_ids: torch.Tensor, out_hidden_states: torch.Tensor
-) -> torch.Tensor:
-    id_bytes = topk_ids.element_size()
-    output_bytes = out_hidden_states.element_size()
-    if (
-        _is_cuda
-        and topk_ids.dtype == torch.int32
-        and out_hidden_states.is_contiguous()
-        and out_hidden_states.stride(-1) == 1
-        and out_hidden_states.stride(0) * output_bytes % id_bytes == 0
-        and out_hidden_states.shape[-1] * output_bytes % id_bytes == 0
-        and out_hidden_states.numel() * output_bytes >= topk_ids.numel() * id_bytes
-    ):
-        # Both vector GEMMs finish reading IDs before moe_sum overwrites this output.
-        safe_ids = out_hidden_states.view(topk_ids.dtype).as_strided(
-            topk_ids.shape, (topk_ids.shape[1], 1)
-        )
-        torch.clamp_min(topk_ids, 0, out=safe_ids)
-        return safe_ids
-    return topk_ids.clamp_min(0)
-
-
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -348,7 +325,7 @@ def fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        if native_musa:
+        if _is_cuda or native_musa:
             # The vector ABI reads compact int32 IDs. Normal routes keep their
             # storage; exceptional int64 routes canonicalize negative IDs.
             safe_ids = (
@@ -358,7 +335,7 @@ def fused_moe_gguf(
             )
         else:
             # Older vector kernels form weight addresses before checking -1.
-            safe_ids = _prepare_gguf_moe_safe_ids(topk_ids, out_hidden_states)
+            safe_ids = topk_ids.clamp_min(0)
         out = ggml_moe_a8_vec(x, w1, safe_ids, top_k, qweight_type, N, num_tokens)
         out = act(out, routed=True)
 

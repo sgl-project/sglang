@@ -357,6 +357,64 @@ class TestGgufInactiveRoutes(CustomTestCase):
             )
 
     @torch.inference_mode()
+    def test_cuda_vector_uses_original_ids_without_route_preparation(self):
+        """Real CUDA projections consume negative routes without a clamp launch."""
+        from sgl_kernel.quantization import ggml_moe_a8_vec as legacy_vector
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        ids = torch.tensor(
+            [[-1, 1], [0, -3], [-1, -1]], device="cuda", dtype=torch.int32
+        )
+        scores = torch.tensor(
+            [[float("nan"), 0.75], [0.5, float("nan")], [float("nan"), float("nan")]],
+            device="cuda",
+        )
+        hidden = torch.full((3, 256), 0.25, device="cuda", dtype=torch.float16)
+        hidden[-1].fill_(float("nan"))
+        raw_ids = ids.clone()
+        route_ops = []
+        actual_vector = gguf_runtime.ggml_moe_a8_vec
+
+        class ObserveRoutePreparation(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in (
+                    torch.ops.aten.clamp_min.default,
+                    torch.ops.aten.clamp_min.out,
+                    torch.ops.aten._to_copy.default,
+                ):
+                    route_ops.append(str(func))
+                return func(*args, **(kwargs or {}))
+
+        def observe_vector(inputs, weights, routes, *args):
+            self.assertEqual(routes.data_ptr(), ids.data_ptr())
+            return actual_vector(inputs, weights, routes, *args)
+
+        for quant_type in (GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q8_0):
+            packed, _ = self._weights(quant_type)
+            with patch.object(gguf_runtime, "ggml_moe_a8_vec", legacy_vector):
+                expected = fused_moe_gguf(
+                    hidden.nan_to_num(),
+                    *packed,
+                    scores.nan_to_num(),
+                    ids.clamp_min(0),
+                    quant_type,
+                    quant_type,
+                    "silu",
+                )
+            route_ops.clear()
+            with (
+                ObserveRoutePreparation(),
+                patch.object(gguf_runtime, "ggml_moe_a8_vec", observe_vector),
+            ):
+                actual = fused_moe_gguf(
+                    hidden, *packed, scores, ids, quant_type, quant_type, "silu"
+                )
+            self.assertEqual(route_ops, [])
+            self.assertTrue(bool(torch.isfinite(actual).all()))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(ids, raw_ids, rtol=0, atol=0)
+
+    @torch.inference_mode()
     def test_musa_branch_preserves_input_and_route_budgets(self):
         """MUSA consumers exclude NaNs without input copies or route temporaries.
 
