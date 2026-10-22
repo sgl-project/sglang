@@ -7,8 +7,8 @@ use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, RenderedPrompt};
 use serde_json::{Map, Value, json};
 
 use super::deepseek_v4::{engine_message, pydantic_bool, tool_arguments};
-use super::schema_types::normalize_json_schema_types;
 use crate::render::reasoning::{requested_effort, requested_thinking};
+use crate::schema_types::normalize_json_schema_types;
 
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 const THINKING_EFFORTS: [&str; 3] = ["low", "high", "max"];

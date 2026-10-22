@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use super::ChatToolCallDelta;
 use crate::ProcessorError;
-use crate::render::models::schema_types::normalize_json_schema_types;
+use crate::schema_types::normalize_json_schema_types;
 use crate::tool_call::{ToolDetector, tool_call_id, tool_detector};
 
 /// Collect top-level and dynamic system-message tools without moving their

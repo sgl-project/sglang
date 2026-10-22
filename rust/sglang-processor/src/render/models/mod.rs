@@ -6,7 +6,6 @@ mod glm53;
 mod kimi_k25;
 mod kimi_k3;
 mod qwen38;
-pub(crate) mod schema_types;
 
 pub use self::deepseek_v4::DeepSeekV4Profile;
 pub(super) use self::deepseek_v4::{

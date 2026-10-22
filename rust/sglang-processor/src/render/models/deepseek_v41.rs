@@ -9,8 +9,8 @@ use super::deepseek_v4::{
     check_tool_arguments, drop_merged_tasks, engine_message, normalize_messages, pydantic_bool,
     renders_tools, split_continuation, thinking,
 };
-use super::schema_types::normalize_json_schema_types;
 use crate::render::reasoning::requested_effort;
+use crate::schema_types::normalize_json_schema_types;
 
 /// Render an SGLang chat request body. Returns the prompt and the
 /// `continue_final_message` prefix, which SGLang tokenizes separately.

@@ -14,7 +14,7 @@ use thiserror::Error;
 
 mod legacy;
 mod loader;
-pub(crate) mod models;
+mod models;
 mod reasoning;
 mod selection;
 mod thinking;

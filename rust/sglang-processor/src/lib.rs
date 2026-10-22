@@ -17,6 +17,8 @@ mod parser;
 mod py;
 #[cfg(feature = "render")]
 mod render;
+#[cfg(any(feature = "parser", feature = "render"))]
+mod schema_types;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod think;
 #[cfg(feature = "tokenizer")]
