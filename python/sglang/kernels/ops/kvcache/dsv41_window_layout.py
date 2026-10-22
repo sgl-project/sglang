@@ -6,7 +6,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _queries(
+def _window_layout_queries(
     Req,
     Pos,
     Floor,
@@ -23,6 +23,7 @@ def _queries(
     N,
     PAD,
     HISTORY,
+    GROUPS,
     WINDOW: tl.constexpr,
     CAPACITY: tl.constexpr,
     RS: tl.constexpr,
@@ -39,7 +40,8 @@ def _queries(
     group = tl.load(Group + row, live, 0)
     first = tl.load(First + row, live, 0)
     last = tl.load(Last + row, live, 0)
-    tl.store(Starts + group, row, live & (row == first))
+    # Starts holds num_groups slots; window_layout's invariant reports a run past them.
+    tl.store(Starts + group, row, live & (row == first) & (group < GROUPS))
     first_pos = pos - (row - first)
     lookback = tl.arange(0, W)
     seen = pos[:, None] - lookback[None, :]
@@ -63,7 +65,7 @@ def _queries(
 
 
 @triton.jit
-def _history(
+def _window_layout_history(
     Req,
     Pos,
     Floor,
@@ -90,8 +92,8 @@ def _history(
     live = mask & (start >= 0)
     end = tl.load(Last + start, live, 0)
     req = tl.load(Req + end * RS, live, 0).to(tl.int64)
-    # Every row in a contiguous request run has the same first position and
-    # floor. Use its last row, matching the CPU scatter reference.
+    # Every row of a contiguous request run carries the same first position and
+    # floor, so its last row stands for the run.
     first_pos = (
         tl.load(Pos + end * PS, live, 0).to(tl.int64) - end + tl.maximum(start, 0)
     )
@@ -142,7 +144,7 @@ def build_window_layout(
     hist_src = empty(history_rows)
     floor_arg = floor if floor is not None else pos
     strides = (req.stride(0), pos.stride(0), floor_arg.stride(0))
-    _queries[(triton.cdiv(padded, 4),)](
+    _window_layout_queries[(triton.cdiv(padded, 4),)](
         req,
         pos,
         floor_arg,
@@ -159,6 +161,7 @@ def build_window_layout(
         n,
         padded,
         history_rows,
+        groups,
         window,
         capacity,
         *strides,
@@ -167,7 +170,7 @@ def build_window_layout(
         triton.next_power_of_2(window),
         num_warps=4,
     )
-    _history[(triton.cdiv(history_rows, 256),)](
+    _window_layout_history[(triton.cdiv(history_rows, 256),)](
         req,
         pos,
         floor_arg,
@@ -187,17 +190,18 @@ def build_window_layout(
         256,
         num_warps=4,
     )
-    return (
-        out_req,
-        out_pos,
-        write,
-        indices,
-        lengths,
-        hist_req,
-        hist_pos,
-        hist_loc,
-        hist_valid,
-        hist_src,
-        commit,
-        history_rows + padded,
+    # Keyed by WindowLayout's fields.
+    return dict(
+        req=out_req,
+        pos=out_pos,
+        write_loc=write,
+        indices=indices,
+        lengths=lengths,
+        history_req=hist_req,
+        history_pos=hist_pos,
+        history_loc=hist_loc,
+        history_valid=hist_valid,
+        history_src=hist_src,
+        commit_mask=commit,
+        size=history_rows + padded,
     )
