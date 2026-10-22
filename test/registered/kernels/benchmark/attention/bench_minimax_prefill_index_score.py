@@ -1,8 +1,6 @@
 """Benchmark: MiniMax-M3 score-only prefill indexer, one split vs the split-KV launch.
 
-Score + top-k for one request of `new` tokens over a `prefix`-token cached context, one
-index head per rank (TP4). With one split, each (q tile, head) CTA loops over the whole
-prefix, so a short turn over a long prefix runs on a few CTAs.
+Score + top-k for one request over a cached prefix, one index head per rank (TP4).
 """
 
 import torch

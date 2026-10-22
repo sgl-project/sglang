@@ -22,8 +22,8 @@ from ..common.utils import (
 # gfx950 MI350X: per-page wins at <=2 pages/block, loses at >=8
 _MAX_PER_PAGE_SLOT_UNROLL = 2
 
-# Score-only prefill: target CTAs per SM for the KV split. 8 did best overall of 1,
-# 2, 4, 8 and 16 on GB300 over short turns and 16K chunks; re-tune with the kernel.
+# Target CTAs per SM for the score-only KV split.
+# Measured on GB300 over short turns and 16K chunks; re-tune with the kernel.
 _SPLIT_KV_CTAS_PER_SM = 8
 
 

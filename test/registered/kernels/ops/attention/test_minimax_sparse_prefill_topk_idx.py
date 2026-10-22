@@ -18,7 +18,7 @@ HD, BLK, TOPK, PAGE = 128, 128, 16, 128
 
 # (cached prefix, new tokens) per request
 CASES = {
-    # one or a few (q tile, head) CTAs per request without splits
+    # a few (q tile, head) CTAs per request without splits
     "short_turns": [(80_512, 305), (124_928, 773)],
     "mixed_batch": [(0, 2_000), (5_000, 1), (300_000, 1_536), (777, 129)],
     "full_chunk": [(200_000, 16_384)],
