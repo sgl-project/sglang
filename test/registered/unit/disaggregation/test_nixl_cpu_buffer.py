@@ -216,6 +216,30 @@ class TestCpuBufferConfiguration(CustomTestCase):
                     backend,
                 )
 
+    def test_kv_sharding_rejected_only_when_cpu_buffer_enabled(self):
+        for mode in ("prefill", "decode"):
+            for enabled in (False, True):
+                with self.subTest(mode=mode, cpu_buffer=enabled):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        device="cuda",
+                        tp_size=2,
+                        disaggregation_mode=mode,
+                        disaggregation_transfer_backend="nixl",
+                        nixl_use_cpu_buffer=enabled,
+                        enable_kv_cache_sharding=True,
+                    )
+                    if enabled:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "--nixl-use-cpu-buffer.*--enable-kv-cache-sharding",
+                        ):
+                            handle_pd_disaggregation(args)
+                    else:
+                        # This hook must not reject the existing NIXL path.
+                        # Sharding's own hook validates its role/topology rules.
+                        handle_pd_disaggregation(args)
+
     def test_unsupported_combinations_fail(self):
         for change in (
             {"disaggregation_mode": "null"},

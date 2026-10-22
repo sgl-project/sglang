@@ -38,6 +38,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             raise ValueError("--nixl-cpu-buffer-size-gb must be finite and positive")
         if cfg.device != "cuda":
             raise ValueError("CPU-buffer PD currently requires NVIDIA CUDA")
+        if cfg.enable_kv_cache_sharding:
+            raise ValueError(
+                "--nixl-use-cpu-buffer is incompatible with --enable-kv-cache-sharding: "
+                "CPU-buffer transfers require contiguous send slices."
+            )
         if (
             cfg.pp_size != 1
             or cfg.attn_cp_size != 1
