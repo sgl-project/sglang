@@ -876,34 +876,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if len(key) == 0:
             return self._empty_match_result
 
-        (
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-            full_kv_hit_length,
-            action,
-        ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
-            params,
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-            full_kv_hit_length,
-            action,
-        )
+        return self._match_prefix_helper(key, params)
 
     def _match_prefix_helper(
-        self, key: RadixKey
-    ) -> tuple[
-        list[torch.Tensor],
-        UnifiedTreeNode,
-        UnifiedTreeNode,
-        int,
-        int,
-        Optional[CacheAction | ComponentAction],
-    ]:
+        self, key: RadixKey, params: MatchPrefixParams
+    ) -> MatchResult:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -931,6 +908,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp.create_match_validator(match_device_only=True)
                 for comp in self.components
             )
+            device_validators = validators
 
         def _all_valid(validators, node):
             return all([v(node) for v in validators])
@@ -975,13 +953,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
 
-        return (
+        return self._match_post_processor(
+            params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            last_visited_node_id=node.id if node is not self.root_node else None,
+            device_validators=device_validators,
         )
 
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
@@ -1019,6 +1000,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_value_len: int,
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
+        last_visited_node_id: Optional[NodeId],
+        device_validators: tuple[Callable[[UnifiedTreeNode], bool], ...],
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self.components:
@@ -1045,6 +1028,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
+            last_visited_node_id=last_visited_node_id,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
         )
