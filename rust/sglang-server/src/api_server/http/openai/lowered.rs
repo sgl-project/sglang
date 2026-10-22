@@ -14,13 +14,12 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_processor::DynamoTokenizer;
-use sglang_processor::openai::{
-    ChatModel, OpenAiHeaders, OpenAiSettings, Reply, Responder, lower_chat,
-};
+use sglang_processor::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, Reply, lower_chat};
 
+use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::{render_body, render_chat};
-use super::{AppState, ChatFormatter, openai_error};
+use super::{AppState, ChatFormatter};
 use crate::api_server::http::native_api::{
     RequestTiming, drain_unary, generate_requests, generation_event_stream,
 };
@@ -145,23 +144,27 @@ pub(super) async fn chat(
             .as_array()
             .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
         if let Err(error) = check_prompt_copies(per_clone, n) {
-            return Some(openai_error(
-                StatusCode::BAD_REQUEST,
-                error.to_string(),
-                stream,
-            ));
+            return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
         }
         generate["sampling_params"]["n"] = 1.into();
         generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
     }
+    // Python's `adapted_request` takes the router's override headers.
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut generate, headers)
+    {
+        return Some(error_response(StatusCode::BAD_REQUEST, &error));
+    }
+    // Failures before the first frame answer unary even for a stream: Python
+    // awaits the first chunk before it starts the stream.
     let (requests, is_batch) = match generate_requests(state, generate) {
         Ok(requests) => requests,
-        Err((code, message, _)) => return Some(openai_error(code, message, stream)),
+        Err((code, message, _)) => return Some(error_response(code, &message)),
     };
     let timing = RequestTiming::new();
     let calls = match state.core.generate_batch(requests).await {
         Ok(calls) => calls,
-        Err(error) => return Some(openai_error(error.http_status(), error.to_string(), stream)),
+        Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
 
     if !stream {
@@ -229,24 +232,28 @@ pub(super) async fn chat(
     )
 }
 
-/// A failed unary choice, as Python's chat layer answers its abort: a 400 is
-/// the `ValueError` the processor maps; any other status is the
-/// `HTTPException` `OpenAIServingBase` answers with that status as the type.
+/// A failed unary choice, as Python's chat layer answers its abort.
 fn failed_response(status: StatusCode, body: &[u8]) -> Response {
-    if status == StatusCode::BAD_REQUEST
-        && let Some(reply) = Responder::rejected(body)
-    {
-        return reply_response(reply);
-    }
     let message = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|body| Some(body.pointer("/error/message")?.as_str()?.to_owned()))
         .unwrap_or_default();
+    error_response(status, &message)
+}
+
+/// `OpenAIServingBase.create_error_response`: a 400 is the `ValueError` it
+/// answers as a `BadRequestError`; any other status is an `HTTPException`,
+/// whose status code is the type.
+fn error_response(status: StatusCode, message: &str) -> Response {
     let code = status.as_u16();
+    let err_type = match status {
+        StatusCode::BAD_REQUEST => "BadRequestError".to_owned(),
+        _ => code.to_string(),
+    };
     let error = serde_json::json!({
         "object": "error",
         "message": message,
-        "type": code.to_string(),
+        "type": err_type,
         "param": null,
         "code": code,
     });
@@ -299,10 +306,17 @@ mod tests {
     }
 
     fn lowered_state(answer: impl Fn(&str) -> ResponseItem + Send + 'static) -> Router {
+        lowered_state_with(ServerArgs::default(), answer)
+    }
+
+    fn lowered_state_with(
+        args: ServerArgs,
+        answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    ) -> Router {
         let args = ServerArgs {
             served_model_name: "model".into(),
             reasoning_parser: Some("deepseek-v41".into()),
-            ..Default::default()
+            ..args
         };
         let formatter = ChatFormatter::DeepSeekV41;
         let state =
@@ -319,12 +333,44 @@ mod tests {
             "model": "model",
             "messages": [{"role": "user", "content": "hi"}],
             "n": i64::MAX,
+            "stream": true,
         });
         let response = post_json(app, "/v1/chat/completions", body).await;
+        // Unary, as Python answers a failure before the first chunk.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let value = body_json(response).await;
-        let message = value["error"]["message"].as_str().unwrap();
+        assert_eq!(value["type"], "BadRequestError");
+        let message = value["message"].as_str().unwrap();
         assert!(message.contains("exceeds the maximum"), "{message}");
+    }
+
+    /// The router's override headers reach the request, as they reach
+    /// Python's `adapted_request`.
+    #[tokio::test]
+    async fn override_headers_reach_the_request() {
+        let args = ServerArgs {
+            enable_request_header_overrides: true,
+            ..Default::default()
+        };
+        let app = lowered_state_with(args, |rid| chunk(rid, "ok", true));
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        let request = axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-override-rid", "routed")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["id"], "routed");
+
+        let request = axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-override-priority", "high")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A scheduler failure keeps its 500, as Python's `HTTPException` does,
