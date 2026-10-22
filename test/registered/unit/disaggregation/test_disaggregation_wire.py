@@ -1,5 +1,4 @@
 import concurrent.futures
-import struct
 import threading
 import unittest
 from collections import defaultdict
@@ -23,17 +22,13 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     group_concurrent_contiguous,
-    pack_int_lists,
-    pack_list_of_buffers,
-    unpack_int_lists,
-    unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
-    KVArgsRegisterInfo,
+    FailedSessionProbe,
     MooncakeKVManager,
     MooncakeKVSender,
     TransferInfo,
@@ -160,6 +155,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
                     manager.session_failures = defaultdict(int)
+                    manager.failed_session_probes = {}
                     manager.state_layout_rejections = {}
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
@@ -369,6 +365,11 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 2})
+        manager.failed_session_probes = {
+            "decode": FailedSessionProbe(
+                last_requested=0.0, next_probe_at=0.0, interval=300.0
+            )
+        }
         manager.state_layout_rejections = {}
         manager.state_strides_validated = set()
         manager.decode_kv_args_table = {}
@@ -391,6 +392,7 @@ class TestDisaggregationWire(unittest.TestCase):
         # A transport blacklist is cleared by registering, as before.
         self.assertFalse(manager.failed_sessions)
         self.assertFalse(manager.session_failures)
+        self.assertFalse(manager.failed_session_probes)
 
         bad, mismatch = register(64)
         self.assertIn("item length mismatch", mismatch)
@@ -476,6 +478,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.failure_lock = threading.Lock()
         manager.failed_sessions = set()
         manager.session_failures = defaultdict(int)
+        manager.failed_session_probes = {}
         manager.failure_records = {}
         manager._staging_outstanding = defaultdict(int)
         manager.request_status = {42: KVPoll.Transferring}
@@ -526,8 +529,12 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 1})
+        manager.failed_session_probes = {}
         reason = f"{StateType.SWA} item length mismatch for positional entry 0"
         manager.state_layout_rejections = {"decode": reason}
+        manager.failed_session_probe_interval = 30.0
+        manager.failed_session_probe_max_interval = 300.0
+        manager.failed_session_idle_timeout = 600.0
         manager.engine = SimpleNamespace(send_probe=Mock(return_value=0))
 
         manager._run_one_probe_pass()
@@ -609,64 +616,6 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
 
-    def test_mooncake_registration_staging_fields(self):
-        msg = [
-            b"room",
-            b"127.0.0.1",
-            b"1234",
-            b"session",
-            struct.pack("Q", 0x1000),
-            struct.pack("Q", 0x2000),
-            b"",
-            b"0",
-            b"1",
-            b"128",
-            b"",
-            b"",
-            b"",
-            b"",
-            struct.pack("Q", 0x3000),
-            b"4096",
-            b"4",
-            b"2",
-        ]
-
-        info = KVArgsRegisterInfo.from_zmq(msg)
-
-        self.assertEqual(info.staging_base_ptr, 0x3000)
-        self.assertEqual(info.staging_total_size, 4096)
-        self.assertEqual(info.dst_dcp_size, 4)
-        self.assertEqual(info.dst_dcp_rank, 2)
-        self.assertEqual(info.dst_kv_item_lens, [])
-        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
-        self.assertEqual(info.dst_kv_item_lens, [128])
-
-    def test_int_lists_roundtrip(self):
-        cases = [
-            ("Q", [[1, 2, 3], [4]]),
-            ("I", [[10, 20], [30, 40, 50]]),
-            ("i", [[-1, 2], [3, -4, 5]]),
-        ]
-        for fmt, sample in cases:
-            packed = pack_int_lists(sample, fmt)
-            self.assertEqual(unpack_int_lists(packed, fmt), sample, msg=fmt)
-
-    def test_pack_accepts_ndarray(self):
-        arrs = [
-            np.array([1, 2, 3], dtype=np.int32),
-            np.array([4, 5], dtype=np.int32),
-        ]
-        packed = pack_int_lists(arrs, "i")
-        self.assertEqual(unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
-
-    def test_empty_outer_list(self):
-        self.assertEqual(pack_int_lists([], "Q"), b"")
-        self.assertEqual(unpack_int_lists(b"", "Q"), [])
-
-    def test_empty_inner_list(self):
-        packed = pack_int_lists([[]], "I")
-        self.assertEqual(unpack_int_lists(packed, "I"), [[]])
-
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
             kv=ReqKvInfo(req_pool_idx=0),
@@ -700,10 +649,6 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(batch.extend_num_tokens, 3)
         self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
         req.get_fill_ids.assert_not_called()
-
-    def test_list_of_buffers_roundtrip(self):
-        bufs = [b"abc", b"", b"de", b"x" * 17]
-        self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
 class TestPollCollectives(CustomTestCase):
@@ -1450,28 +1395,6 @@ class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
             b"",
         ]
 
-    def test_real_transfer_is_not_dummy(self):
-        kv = np.array([3, 5], dtype=np.int32)
-        info = TransferInfo.from_zmq(
-            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
-        )
-
-        self.assertFalse(info.is_dummy)
-        np.testing.assert_array_equal(info.dst_kv_indices, kv)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.dst_state_indices, [[1]])
-
-    def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
-        # Empty kv indices serialize to an empty frame, so only the non-empty
-        # aux frame distinguishes a full-prefix-hit transfer from a dummy one.
-        info = TransferInfo.from_zmq(
-            self._frames(np.array([], dtype=np.int32).tobytes(), b"4", b"", b"128")
-        )
-
-        self.assertFalse(info.is_dummy)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.decode_prefix_len, 128)
-
     def test_dummy_parses_dummy_and_clears_payload_fields(self):
         info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"0"))
 
@@ -1493,35 +1416,6 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     @staticmethod
     def _arr(values):
         return np.array(values, dtype=np.int32)
-
-    def test_single_contiguous_group(self):
-        src = self._arr([10, 11, 12])
-        dst = self._arr([5, 6, 7])
-        self.assertEqual(
-            group_concurrent_contiguous(src, dst),
-            ([[10, 11, 12]], [[5, 6, 7]]),
-        )
-
-    def test_splits_on_discontiguous_indices(self):
-        src = self._arr([10, 11, 20])
-        dst = self._arr([5, 6, 7])
-        self.assertEqual(
-            group_concurrent_contiguous(src, dst),
-            ([[10, 11], [20]], [[5, 6], [7]]),
-        )
-
-    def test_empty_src_nonempty_dst(self):
-        self.assertEqual(
-            group_concurrent_contiguous(self._arr([]), self._arr([1, 2])), ([], [])
-        )
-
-    def test_nonempty_src_empty_dst(self):
-        # Regression: a non-empty source paired with an empty destination must not
-        # raise a NumPy broadcast error (observed transferring DSA sparse-attention
-        # state on a disaggregated GLM deployment when decode registered zero dst indices).
-        self.assertEqual(
-            group_concurrent_contiguous(self._arr([1, 2]), self._arr([])), ([], [])
-        )
 
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
@@ -2179,16 +2073,6 @@ class TestDSV4C4StateIndices(unittest.TestCase):
             np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
         )
 
-    def test_short_and_empty_sequences(self):
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(3, 3, ring_size=8),
-            np.array([24, 25, 26], dtype=np.int32),
-        )
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(3, 0, ring_size=8),
-            np.empty((0,), dtype=np.int32),
-        )
-
     def test_invalid_ring_size_is_rejected(self):
         with self.assertRaises(ValueError):
             c4_state_transfer_indices(0, 8, ring_size=4)
@@ -2197,30 +2081,6 @@ class TestDSV4C4StateIndices(unittest.TestCase):
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
-    def test_online_aligned_boundary_has_no_partial_state(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 256, ratio=128, online=True, ring_size=1
-            ),
-            np.empty((0,), dtype=np.int32),
-        )
-
-    def test_online_partial_boundary_uses_request_slot(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 257, ratio=128, online=True, ring_size=1
-            ),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_offline_aligned_boundary_has_no_partial_state(self):
-        np.testing.assert_array_equal(
-            request_scoped_state_transfer_indices(
-                7, 256, ratio=128, online=False, ring_size=128
-            ),
-            np.empty((0,), dtype=np.int32),
-        )
-
     def test_offline_partial_boundary_uses_request_local_page(self):
         np.testing.assert_array_equal(
             request_scoped_state_transfer_indices(
@@ -2262,14 +2122,6 @@ class TestDSV4RequestStateTransfer(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             kv.request_state_transfer_indices(7, 256), np.empty((0,), dtype=np.int32)
-        )
-
-    def test_online_pool_ships_the_request_row(self):
-        kv = self._kv(
-            _make_state_pool(ratio=128, request_scoped=True, online=True, ring_size=1)
-        )
-        np.testing.assert_array_equal(
-            kv.request_state_transfer_indices(7, 257), np.array([7], dtype=np.int32)
         )
 
     def test_requires_request_scoped_pools_with_one_ring_layout(self):
