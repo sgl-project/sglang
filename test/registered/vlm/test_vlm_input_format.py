@@ -39,7 +39,7 @@ from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=232, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -221,6 +221,49 @@ class VLMInputTestBase:
 class TestQwenVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
     model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
     chat_template = "qwen2-vl"
+
+    def test_colliding_low_hash_bits_do_not_reuse_image_kv(self):
+        prompt = self.processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "Name the image's color in one word."},
+                    ],
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        red = Image.new("RGB", (224, 224), "red")
+        blue = Image.new("RGB", (224, 224), "blue")
+        params = dict(temperature=0.0, max_new_tokens=16)
+        # these distinct caller hashes collapse to the same legacy 30-bit pad
+        self.engine.flush_cache()
+        cold_blue = self.engine.generate(
+            prompt=prompt,
+            image_data=[blue],
+            mm_hashes=["40000007"],
+            sampling_params=params,
+        )
+        self.engine.flush_cache()
+        red_output = self.engine.generate(
+            prompt=prompt, image_data=[red], mm_hashes=["7"], sampling_params=params
+        )
+        warm_blue = self.engine.generate(
+            prompt=prompt,
+            image_data=[blue],
+            mm_hashes=["40000007"],
+            sampling_params=params,
+        )
+        self.assertIn("red", red_output["text"].lower())
+        self.assertIn("blue", cold_blue["text"].lower())
+        self.assertEqual(warm_blue["text"], cold_blue["text"])
+        self.assertLess(
+            warm_blue["meta_info"]["cached_tokens"],
+            warm_blue["meta_info"]["prompt_tokens"] - 1,
+        )
 
     @classmethod
     def _init_visual(cls):

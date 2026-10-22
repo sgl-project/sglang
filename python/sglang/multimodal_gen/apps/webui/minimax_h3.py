@@ -38,7 +38,7 @@ def minimax_h3_tasks_for_server(server_args: "ServerArgs") -> tuple[str, ...]:
     return tuple(
         task
         for task, task_partition in MINIMAX_H3_TASK_PARTITIONS.items()
-        if task_partition == partition
+        if partition == "hybrid" or task_partition == partition
     )
 
 
@@ -157,6 +157,7 @@ def _generate_minimax_h3(
             audio=result.audio,
             audio_sample_rate=result.audio_sample_rate,
             output_compression=request.output_compression,
+            x264_preset=request.x264_preset,
         )
         sampling_params.validate_video_final_outputs(output_paths, request)
         return output_paths[0]

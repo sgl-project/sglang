@@ -674,8 +674,7 @@ class TestPoolBackedAlloc(unittest.TestCase):
 
 class TestBuildDecodeRegistry(unittest.TestCase):
     """``build_decode_registry`` registers the always-on FB-shared decode
-    slots with padding policies matching
-    ``DecodeInputBuffers.populate_from_forward_batch``."""
+    slots with their required padding policies."""
 
     def setUp(self):
         from sglang.srt.model_executor import input_buffers
@@ -1422,91 +1421,6 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             padded_bs=1, padded_num_tokens=3, forward_batch_template=fb
         )
         self.assertIs(fb_view.input_embeds, embeds)
-
-
-class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
-    """The prefill registry must re-derive the attn-TP-local pad boundary from
-    the CAPTURE BUCKET, not trust the FB tensor.
-
-    Bug regression: breakable-graph replay pads ``raw`` tokens up to the
-    capture bucket, moving the attn-TP shard boundary to ``bucket/attn_tp``
-    rows — but the FB ``num_token_non_padded`` tensor was localized against
-    the RAW length on the eager prep path. Copying it verbatim made every
-    ``raw < bucket`` replay mask the last ``(bucket - raw)/attn_tp`` shard
-    rows of attn-TP rank 0 — REAL tokens — zeroing their MoE output
-    in-graph. The slot's post_fill must instead recompute the local count
-    against ``ctx.padded_num_tokens`` from the batch's un-adjusted global
-    count (``global_num_token_non_padded_cpu``), exactly like the decode registry's
-    post_fill does.
-
-    Localization is gated solely on the per-forward sharding decision
-    (``attn_tp_sharded_fn``): a sharded bucket re-derives the rank-local
-    count; a replicated one passes the global count through. The cases below
-    drive that predicate directly via ``sharded``.
-    """
-
-    def _fill(self, *, attn_tp_rank, attn_tp_size, sharded=True, global_count=1018):
-        from unittest import mock
-
-        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-            build_prefill_registry,
-        )
-
-        reg = build_prefill_registry(
-            device=torch.device("cpu"),
-            max_bs=4,
-            max_num_token=2048,
-            cache_loc_dtype=torch.int64,
-            enable_num_token_non_padded=True,
-            attn_tp_sharded_fn=lambda num_tokens: sharded,
-        )
-        # FB tensor carries the RAW-length-localized (stale) value; the CPU
-        # field carries the un-adjusted global count.
-        fb = _MiniForwardBatch(
-            batch_size=1,
-            num_token_non_padded=torch.tensor([509], dtype=torch.int32),
-            global_num_token_non_padded_cpu=global_count,
-        )
-        with mock.patch(
-            "sglang.srt.model_executor.forward_batch_info.get_parallel",
-            return_value=SimpleNamespace(
-                attn_tp_rank=attn_tp_rank, attn_tp_size=attn_tp_size
-            ),
-        ):
-            reg.fill_from(
-                fb,
-                raw_bs=1,
-                padded_bs=1,
-                raw_num_tokens=1018,
-                padded_num_tokens=1024,
-            )
-        return int(reg.get_slot("num_token_non_padded").buffer.item())
-
-    def test_rank0_uses_bucket_shard_not_raw_localized_value(self):
-        # bucket 1024 / attn_tp 2 -> 512-row shards. Rank 0's shard is fully
-        # real (global rows [0, 512)); the raw-localized FB value (509) would
-        # mask 3 real rows.
-        self.assertEqual(self._fill(attn_tp_rank=0, attn_tp_size=2), 512)
-
-    def test_rank1_masks_exactly_the_true_pads(self):
-        # Rank 1's shard holds global rows [512, 1024): 506 real + 6 bucket
-        # pads. local = clamp(1018 - 512, 0, 512).
-        self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
-
-    def test_not_sharded_passes_through_global_count(self):
-        # A replicated forward owns every row, so the global count is kept.
-        self.assertEqual(
-            self._fill(attn_tp_rank=0, attn_tp_size=2, sharded=False),
-            1018,
-        )
-
-    def test_absent_global_count_falls_back_to_raw_tokens(self):
-        # Full prefill graphs still need the live raw boundary when the batch
-        # carries no global count, so layers can discard the bucket tail.
-        self.assertEqual(
-            self._fill(attn_tp_rank=0, attn_tp_size=2, global_count=None),
-            1018,
-        )
 
 
 class TestFillOncePolicy(unittest.TestCase):

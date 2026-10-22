@@ -11,13 +11,13 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
@@ -28,6 +28,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
+    supports_track_state_snapshot: bool = True
 
     def packed_decode(
         self,
@@ -248,4 +249,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
+            chunk_indices=kwargs.get("chunk_indices"),
+            chunk_offsets=kwargs.get("chunk_offsets"),
         )

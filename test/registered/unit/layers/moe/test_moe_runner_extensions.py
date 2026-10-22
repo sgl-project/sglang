@@ -141,13 +141,13 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
 
     def create_runner(layer, config) -> None:
         calls.append("runner")
-        method.runner = SimpleNamespace()
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
 
     monkeypatch.setattr(method, "create_moe_runner", create_runner)
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
     with (
@@ -346,7 +346,7 @@ def test_fused_moe_layer_runner_is_none_when_method_builds_no_runner(
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
     with (

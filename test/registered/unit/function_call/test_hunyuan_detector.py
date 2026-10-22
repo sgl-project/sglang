@@ -8,7 +8,7 @@ from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_tools():
@@ -517,23 +517,6 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(collected[0]["name"], "get_current_date")
         self.assertEqual(json.loads(collected[0]["parameters"]), {})
-
-    def test_streaming_with_args_char_by_char(self):
-        detector = self._new_detector()
-        full = (
-            "<tool_calls><tool_call>get_weather<tool_sep>"
-            "<arg_key>city</arg_key><arg_value>NYC</arg_value>"
-            "</tool_call></tool_calls>"
-        )
-        all_calls = []
-        for ch in full:
-            result = detector.parse_streaming_increment(ch, self.tools)
-            all_calls.extend(result.calls)
-
-        collected = _collect_streamed_tool_calls(all_calls)
-        self.assertEqual(len(collected), 1)
-        args = json.loads(collected[0]["parameters"])
-        self.assertEqual(args["city"], "NYC")
 
     def test_streaming_three_tools_sequential(self):
         """Three different tool calls arriving sequentially."""

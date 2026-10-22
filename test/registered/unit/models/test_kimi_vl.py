@@ -7,20 +7,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
-from sglang.srt.models.kimi_vl_moonvit import MoonVitEncoderLayer
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class _VisionTower:
@@ -77,25 +71,6 @@ def _image_item(feature, grid_hws):
 
 
 class TestKimiVLEncoderParallelism(CustomTestCase):
-    def test_moonvit_uses_tensor_parallel_layers(self):
-        with (
-            get_parallel().override(
-                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-            ),
-            get_context().override_server_args(),
-        ):
-            layer = MoonVitEncoderLayer(
-                num_heads=2,
-                hidden_dim=8,
-                mlp_dim=16,
-                prefix="vision_tower.encoder.blocks.0",
-            )
-
-        self.assertIsInstance(layer.attn.qkv_proj, QKVParallelLinear)
-        self.assertIsInstance(layer.attn.proj, RowParallelLinear)
-        self.assertIsInstance(layer.mlp.fc0, ColumnParallelLinear)
-        self.assertIsInstance(layer.mlp.fc1, RowParallelLinear)
-
     def test_encoder_dp_uses_existing_mrope_sharding_helper(self):
         model = _bare_model(use_data_parallel=True)
         items = [

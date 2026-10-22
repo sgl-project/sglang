@@ -122,27 +122,32 @@ struct LTX25DecoderRopeKernel {
       tvm::ffi::TensorView sin_h,
       tvm::ffi::TensorView cos_w,
       tvm::ffi::TensorView sin_w,
-      int64_t batch_size,
-      int64_t num_frames,
-      int64_t height,
-      int64_t width,
-      int64_t num_heads,
-      int64_t head_dim,
       int64_t dim_t,
       int64_t dim_h) {
     using namespace host;
     using Pair = device::AlignedVector<T, 2>;
 
-    auto N = SymbolicSize{"activation_elements"};
-    auto RT = SymbolicSize{"temporal_table_elements"};
-    auto RH = SymbolicSize{"height_table_elements"};
-    auto RW = SymbolicSize{"width_table_elements"};
+    auto B = SymbolicSize{"batch"};
+    auto F = SymbolicSize{"frames"};
+    auto H = SymbolicSize{"height"};
+    auto W = SymbolicSize{"width"};
+    auto A = SymbolicSize{"heads"};
+    auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({N}).with_dtype<T>().with_device(device).verify(q_out).verify(k_out).verify(q).verify(k);
-    TensorMatcher({RT}).with_dtype<float>().with_device(device).verify(cos_t).verify(sin_t);
-    TensorMatcher({RH}).with_dtype<float>().with_device(device).verify(cos_h).verify(sin_h);
-    TensorMatcher({RW}).with_dtype<float>().with_device(device).verify(cos_w).verify(sin_w);
+    TensorMatcher({B, F, H, W, A, D})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(q_out)
+        .verify(k_out)
+        .verify(q)
+        .verify(k);
+    const int64_t batch_size = B.unwrap();
+    const int64_t num_frames = F.unwrap();
+    const int64_t height = H.unwrap();
+    const int64_t width = W.unwrap();
+    const int64_t num_heads = A.unwrap();
+    const int64_t head_dim = D.unwrap();
 
     CHECK_HOST(batch_size > 0 && num_frames > 0 && height > 0 && width > 0 && num_heads > 0 && head_dim > 0)
         << "ltx25_decoder_rope dimensions must be positive";
@@ -150,11 +155,9 @@ struct LTX25DecoderRopeKernel {
         << "ltx25_decoder_rope dimensions must split into positive rotation pairs";
     const int64_t dim_w = head_dim - dim_t - dim_h;
     CHECK_HOST(dim_w > 0 && dim_w % 2 == 0) << "ltx25_decoder_rope width dimension must be positive and even";
-    CHECK_HOST(N.unwrap() == batch_size * num_frames * height * width * num_heads * head_dim)
-        << "ltx25_decoder_rope activation shape does not match dimensions";
-    CHECK_HOST(RT.unwrap() == num_frames * dim_t / 2) << "ltx25_decoder_rope temporal table shape mismatch";
-    CHECK_HOST(RH.unwrap() == height * dim_h / 2) << "ltx25_decoder_rope height table shape mismatch";
-    CHECK_HOST(RW.unwrap() == width * dim_w / 2) << "ltx25_decoder_rope width table shape mismatch";
+    TensorMatcher({F, dim_t / 2}).with_dtype<float>().with_device(device).verify(cos_t).verify(sin_t);
+    TensorMatcher({H, dim_h / 2}).with_dtype<float>().with_device(device).verify(cos_h).verify(sin_h);
+    TensorMatcher({W, dim_w / 2}).with_dtype<float>().with_device(device).verify(cos_w).verify(sin_w);
     CHECK_HOST(
         q_out.data_ptr() != k_out.data_ptr() && q_out.data_ptr() != q.data_ptr() && q_out.data_ptr() != k.data_ptr() &&
         k_out.data_ptr() != q.data_ptr() && k_out.data_ptr() != k.data_ptr())
@@ -166,7 +169,7 @@ struct LTX25DecoderRopeKernel {
         reinterpret_cast<uintptr_t>(k.data_ptr()) % alignof(Pair) == 0)
         << "ltx25_decoder_rope activations must be aligned to rotation pairs";
 
-    const int64_t num_pairs = N.unwrap() / 2;
+    const int64_t num_pairs = q.numel() / 2;
     const int64_t pairs_per_head = head_dim / 2;
     const auto blocks =
         static_cast<uint32_t>(std::min<int64_t>(div_ceil(num_pairs, static_cast<int64_t>(kBlockSize)), kMaxGrid));

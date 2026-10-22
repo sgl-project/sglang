@@ -40,6 +40,20 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));
     }
+    // No tokenizer pool runs under `skip_tokenizer_init` to answer it.
+    if skip_tokenizer_init && matches!(&req.kind, RequestKind::Tokenize { .. }) {
+        return Err(Error::Validation(
+            "tokenization is unavailable when skip_tokenizer_init=True".into(),
+        ));
+    }
+
+    // Python `_set_default_priority`: an unset priority takes the configured
+    // default instead of ranking as the scheduler's lowest.
+    if let RequestKind::Generate(g) = &mut req.kind
+        && g.priority.is_none()
+    {
+        g.priority = limits.default_priority;
+    }
 
     // Multimodal processors may consume sentinel ids outside the vocabulary.
     // Validate their resulting ids at PreSendValidating instead. Non-MM client
@@ -64,7 +78,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // bound — parity with the retired direct decode service: an unknown id is
     // the tokenizer's error to report, and nothing here reaches the scheduler's
     // embedding lookup.
-    if let RequestKind::Detokenize { token_ids } = &req.kind {
+    if let RequestKind::Detokenize { token_ids, .. } = &req.kind {
         for &id in token_ids {
             if u32::try_from(id).is_err() {
                 return Err(Error::Validation(format!("Token ID {id} is out of range")));
@@ -106,9 +120,10 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
 
 /// The context-window checks that need the tokenized length, mirroring Python
 /// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
-/// and the client gets a 200 with a truncated completion instead of an actionable
-/// 400.
+/// input + the client's own `max_new_tokens` must fit. Without them the
+/// scheduler silently clamps and the client gets a 200 with a truncated
+/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
+/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
 ///
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
@@ -136,6 +151,9 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
+    if g.max_new_tokens_defaulted {
+        return Ok(()); // not the client's value → the scheduler clamps it
+    }
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
         return Ok(()); // no cap requested → nothing to add to the input length
     };
