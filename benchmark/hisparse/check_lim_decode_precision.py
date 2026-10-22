@@ -9,6 +9,9 @@ Run this client in the server's filesystem namespace with a shared absolute
 stores full logits, verified HTTP results and frozen token-ID fixtures. At
 vocab=154880, 32 samples x 512 positions require about 10 GB per capture tag.
 Use a fresh tag for every capture; keep these diagnostics outside timed runs.
+For fixed chunked prefill, pass --prefill-chunk-size and use concurrency one.
+The helper validates that radix reuse and dynamic chunking are disabled, skips
+discarded intermediate-chunk sampling calls, and verifies the final token history.
 """
 
 import argparse
@@ -34,8 +37,12 @@ def processor_string():
             for row, params in enumerate(custom_param_list):
                 # Processor instances can be rebuilt at batch merges and at the
                 # prefill/decode boundary. Request custom_params outlive them.
-                step = params.get("_lim_precision_step", 0)
-                params["_lim_precision_step"] = step + 1
+                call = params.get("_lim_precision_call", 0)
+                params["_lim_precision_call"] = call + 1
+                skip = params.get("prefill_sampling_calls_to_skip", 0)
+                if call < skip:
+                    continue
+                step = call - skip
                 forced = params.get("force_ids")
                 if forced is not None and step >= len(forced):
                     raise RuntimeError("Teacher continuation exhausted")
@@ -54,6 +61,8 @@ def processor_string():
                             json.dumps(
                                 {
                                     "step": step,
+                                    "raw_sampling_call": call,
+                                    "prefill_sampling_calls_skipped": skip,
                                     "forced_token": token,
                                     "raw_argmax": int(raw.argmax()),
                                     "active_processor_rows": logits.shape[0],
@@ -86,6 +95,9 @@ def request(args, processor, row):
                 "case": row["name"],
                 "capture_root": str(args.workdir / "results/teacher-logits"),
                 "force_ids": forced,
+                "prefill_sampling_calls_to_skip": partial_prefill_sample_count(
+                    len(row["input_ids"]), args.prefill_chunk_size
+                ),
             },
         },
         "return_logprob": True,
@@ -119,6 +131,13 @@ def request(args, processor, row):
     ]
     if [r["step"] for r in steps] != list(range(args.tokens)):
         raise RuntimeError(f"Invalid processor step sequence: {row['name']}")
+    expected_skip = partial_prefill_sample_count(
+        len(row["input_ids"]), args.prefill_chunk_size
+    )
+    if [r["raw_sampling_call"] for r in steps] != list(
+        range(expected_skip, expected_skip + args.tokens)
+    ):
+        raise RuntimeError(f"Chunked sampling calls differ: {row['name']}")
     if [r["forced_token"] for r in steps] != observed:
         raise RuntimeError(f"Capture/sampler token mismatch: {row['name']}")
     return {
@@ -134,7 +153,40 @@ def request(args, processor, row):
     }
 
 
+def partial_prefill_sample_count(input_length, chunk_size):
+    return (
+        max(0, (input_length + chunk_size - 1) // chunk_size - 1)
+        if chunk_size > 0
+        else 0
+    )
+
+
+def validate_prefill_settings(base_url, chunk_size, concurrency):
+    with urllib.request.urlopen(
+        base_url.rstrip("/") + "/server_info", timeout=120
+    ) as response:
+        info = json.load(response)
+    settings = info.get("server_args", info)
+    configured = settings.get("chunked_prefill_size")
+    expected = chunk_size if chunk_size > 0 else -1
+    if configured != expected and not (expected == -1 and configured is None):
+        raise RuntimeError(
+            f"Pass the server's fixed prefill chunk size explicitly: server={configured}, requested={expected}"
+        )
+    if chunk_size > 0 and (
+        concurrency != 1
+        or not settings.get("disable_radix_cache")
+        or settings.get("enable_dynamic_chunking")
+        or settings.get("enable_mixed_chunk")
+    ):
+        raise RuntimeError(
+            "Chunked logits capture requires real concurrency 1, disabled radix cache, fixed chunks and no mixed chunks"
+        )
+    return settings
+
+
 def capture(args):
+    validate_prefill_settings(args.base_url, args.prefill_chunk_size, args.concurrency)
     source = json.loads(args.fixtures.read_text(encoding="utf-8"))
     if len(source) < args.samples:
         raise RuntimeError("Insufficient precision fixtures")
@@ -183,6 +235,8 @@ def capture(args):
                 "status": "verified",
                 "samples": len(results),
                 "tokens_per_sample": args.tokens,
+                "prefill_chunk_size": args.prefill_chunk_size,
+                "fixed_prefill_configuration_verified": True,
                 "source_sha256": hashlib.sha256(
                     Path(__file__).read_bytes()
                 ).hexdigest(),
@@ -300,6 +354,12 @@ if __name__ == "__main__":
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=0,
+        help="Fixed server chunk size; 0 requires unchunked prefill",
+    )
     parser.add_argument("--workdir", type=Path, default=Path.cwd())
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
     options = parser.parse_args()
