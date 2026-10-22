@@ -10,7 +10,16 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Union,
+)
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -1436,7 +1445,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint: ToolCallConstraint | None,
         tools: List[Tool],
         template_tool_call_grammar: bool = False,
-        message_start_tool_call_constraint: ToolCallConstraint | None = None,
+        message_start_tool_call_constraint: (
+            Callable[[], ToolCallConstraint | None] | None
+        ) = None,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill.
 
@@ -1455,10 +1466,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Output that starts the assistant message may skip the reasoning, so a
         # template grammar then covers the reasoning from the first token.
         detector = self._reasoning_detector
-        if message_start_tool_call_constraint is not None and detector.starts_message(
-            prefix
-        ):
-            tag = message_start_tool_call_constraint[1]
+        message_start_constraint = (
+            message_start_tool_call_constraint()
+            if message_start_tool_call_constraint is not None
+            and isinstance(detector, ResponseTemplateReasoningDetector)
+            and detector.starts_message(prefix)
+            else None
+        )
+        if message_start_constraint is not None:
+            tag = message_start_constraint[1]
             sampling_params["structural_tag"] = json.dumps(
                 tag.model_dump(by_alias=True)
             )
@@ -1575,8 +1591,6 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ToolCallConstraint | None:
         """The template tool-call constraint for output that starts the
         assistant message, which it then covers from the first token."""
-        if not isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
-            return None
         tag = parser.detector.get_structural_tag(
             tools=parser.structural_tag_tools(),
             tool_choice=request.tool_choice,
@@ -1891,7 +1905,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             )
             if result.template_tool_call_grammar:
-                result.message_start_tool_call_constraint = (
+                result.message_start_tool_call_constraint = lambda: (
                     self._message_start_tool_call_constraint(
                         request, result, template_tool_parser
                     )

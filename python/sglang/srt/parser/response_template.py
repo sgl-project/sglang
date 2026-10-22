@@ -931,14 +931,17 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
     ):
         return None
 
-    def validate_structure_constraint_request(
+    def request_structural_tag(
         self,
         tools: list[Tool],
         tool_choice: Any,
         parallel_tool_calls: bool,
         strict_requested: bool,
-    ) -> bool:
-        """Whether to constrain automatic tool choice."""
+        thinking_mode: bool = False,
+    ):
+        """The template's own tag for this request's tool calls, or `None` to
+        leave them to the generic constraint. Raises for a requested constraint
+        the template cannot hold."""
         if tool_choice == "auto" and not parallel_tool_calls:
             raise ValueError(
                 f"{type(self).__name__} cannot enforce "
@@ -948,7 +951,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             raise ValueError(
                 f"{type(self).__name__} does not support strict tool constraints"
             )
-        return False
+        return None
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(

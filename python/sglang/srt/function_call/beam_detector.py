@@ -67,21 +67,25 @@ class BeamDetector(ResponseTemplateToolDetector):
 
         return StructuralTag.model_validate(tag)
 
-    def validate_structure_constraint_request(
+    def request_structural_tag(
         self,
         tools: list[Tool],
         tool_choice: Any,
         parallel_tool_calls: bool,
         strict_requested: bool,
-    ) -> bool:
+        thinking_mode: bool = False,
+    ):
         if tool_choice == "auto" and parallel_tool_calls and not strict_requested:
-            return False
+            return None
         # Raises for unencodable names before the caller would log and drop
         # the error, leaving the request unconstrained.
-        tag = self.get_structural_tag(tools=tools, tool_choice=tool_choice)
-        if tool_choice != "auto":
-            return False
-        if tag is None:
+        tag = self.get_structural_tag(
+            tools=tools,
+            tool_choice=tool_choice,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+        if tag is None and tool_choice == "auto":
             requested = (
                 "strict tools" if strict_requested else "parallel_tool_calls=False"
             )
@@ -89,4 +93,4 @@ class BeamDetector(ResponseTemplateToolDetector):
                 f"{type(self).__name__} cannot enforce {requested} with "
                 "automatic tool choice for this response template"
             )
-        return True
+        return tag

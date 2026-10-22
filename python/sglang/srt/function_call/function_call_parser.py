@@ -363,12 +363,16 @@ class FunctionCallParser:
         )
         structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):
-            should_constrain_auto = self.detector.validate_structure_constraint_request(
+            structural_tag = self.detector.request_structural_tag(
                 tools=structural_tag_tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 strict_requested=should_constrain_auto,
+                thinking_mode=thinking_mode,
             )
+            if structural_tag is not None:
+                return ("structural_tag", structural_tag)
+            should_constrain_auto = False
 
         try:
             if (

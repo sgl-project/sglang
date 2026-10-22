@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import (
     Annotated,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -2410,8 +2411,11 @@ class MessageProcessingResult:
     reasoning_end_token_ids: Optional[List[int]] = None
     # The tool-call constraint is the response template's own grammar.
     template_tool_call_grammar: bool = False
-    # The tool-call constraint for output that starts the assistant message.
-    message_start_tool_call_constraint: Optional[ToolCallConstraint] = None
+    # Derives the tool-call constraint for output that starts the assistant
+    # message, so that only a prompt ending at the message start pays for it.
+    message_start_tool_call_constraint: Optional[
+        Callable[[], Optional[ToolCallConstraint]]
+    ] = None
     uses_response_template: bool = False
 
 
