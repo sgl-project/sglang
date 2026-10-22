@@ -3163,6 +3163,355 @@ impl<'de> ::serde::Deserialize<'de> for MediaInput {
     }
 }
 
+impl ::serde::Serialize for GetHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GetHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GetHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct GetHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GetHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AttachHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.hicache_storage_backend {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_storage_backend", v)?;
+        }
+        if let Some(v) = &self.hicache_storage_backend_extra_config_json {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "hicache_storage_backend_extra_config_json",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.hicache_storage_prefetch_policy {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "hicache_storage_prefetch_policy",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.hicache_write_policy {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_write_policy", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AttachHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AttachHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AttachHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_hicache_storage_backend = None;
+                let mut f_hicache_storage_backend_extra_config_json = None;
+                let mut f_hicache_storage_prefetch_policy = None;
+                let mut f_hicache_write_policy = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "hicache_storage_backend" => {
+                            if f_hicache_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend",
+                                ));
+                            }
+                            f_hicache_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_backend_extra_config_json" => {
+                            if f_hicache_storage_backend_extra_config_json.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend_extra_config_json",
+                                ));
+                            }
+                            f_hicache_storage_backend_extra_config_json =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_prefetch_policy" => {
+                            if f_hicache_storage_prefetch_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_prefetch_policy",
+                                ));
+                            }
+                            f_hicache_storage_prefetch_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_write_policy" => {
+                            if f_hicache_write_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_write_policy",
+                                ));
+                            }
+                            f_hicache_write_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AttachHiCacheStorageRequest {
+                    hicache_storage_backend: f_hicache_storage_backend.flatten(),
+                    hicache_storage_backend_extra_config_json:
+                        f_hicache_storage_backend_extra_config_json.flatten(),
+                    hicache_storage_prefetch_policy: f_hicache_storage_prefetch_policy.flatten(),
+                    hicache_write_policy: f_hicache_write_policy.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetachHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetachHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetachHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetachHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetachHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ClearHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ClearHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ClearHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ClearHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ClearHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for HiCacheStatus {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_backend",
+            &self.hicache_storage_backend,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_backend_extra_config",
+            &self.hicache_storage_backend_extra_config,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_prefetch_policy",
+            &self.hicache_storage_prefetch_policy,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_write_policy",
+            &self.hicache_write_policy,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiCacheStatus {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiCacheStatus;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct HiCacheStatus")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_hicache_storage_backend = None;
+                let mut f_hicache_storage_backend_extra_config = None;
+                let mut f_hicache_storage_prefetch_policy = None;
+                let mut f_hicache_write_policy = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "hicache_storage_backend" => {
+                            if f_hicache_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend",
+                                ));
+                            }
+                            f_hicache_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_backend_extra_config" => {
+                            if f_hicache_storage_backend_extra_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend_extra_config",
+                                ));
+                            }
+                            f_hicache_storage_backend_extra_config =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_prefetch_policy" => {
+                            if f_hicache_storage_prefetch_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_prefetch_policy",
+                                ));
+                            }
+                            f_hicache_storage_prefetch_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_write_policy" => {
+                            if f_hicache_write_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_write_policy",
+                                ));
+                            }
+                            f_hicache_write_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(HiCacheStatus {
+                    hicache_storage_backend: f_hicache_storage_backend.flatten(),
+                    hicache_storage_backend_extra_config: f_hicache_storage_backend_extra_config
+                        .flatten(),
+                    hicache_storage_prefetch_policy: f_hicache_storage_prefetch_policy.flatten(),
+                    hicache_write_policy: f_hicache_write_policy.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for HiCacheStorageResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiCacheStorageResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiCacheStorageResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct HiCacheStorageResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(HiCacheStorageResponse {
+                    success: f_success.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for ListModelsRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let map = serializer.serialize_map(None)?;
