@@ -989,10 +989,26 @@ def block_fp8_scale_to_mxfp8_e8m0(
     return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
 
 
+def pack_mxfp8_weight_scale_for_deepgemm(
+    scale_u8: torch.Tensor, n: int, k: int
+) -> torch.Tensor:
+    """UE8M0 bytes [N, K // 32] -> DeepGEMM's MN-major TMA-aligned packed scale."""
+    import deep_gemm.utils.layout
+
+    scale_fp32 = (
+        (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+        .view(torch.float32)
+        .view(n, k // 32)
+    )
+    return deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+        scale_fp32
+    )
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
-        return _deepgemm_w8a8_mxfp8_linear_with_fallback
+        return deepgemm_w8a8_mxfp8_linear_with_fallback
     elif backend.is_flashinfer_trtllm():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
     elif backend.is_flashinfer_cutlass():
@@ -1009,7 +1025,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     return dot_scaled_mxfp8_blockscaled_linear
 
 
-def _deepgemm_w8a8_mxfp8_linear_with_fallback(
+def deepgemm_w8a8_mxfp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,

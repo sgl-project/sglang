@@ -1523,6 +1523,7 @@ fn match_prefix_returns_the_full_hit() {
     assert_eq!(result.best_match_node_id, tc.arena.node(b).id);
     assert_eq!(result.host_hit_length, 0);
     assert!(result.cache_actions.is_empty());
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1532,6 +1533,7 @@ fn match_prefix_stops_at_the_matched_depth() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 9]));
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(a).id));
 }
 
 #[test]
@@ -1543,6 +1545,7 @@ fn match_prefix_miss_anchors_at_the_root() {
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(root).id);
+    assert_eq!(result.last_visited_node_id, None);
 }
 
 #[test]
@@ -1565,6 +1568,7 @@ fn match_prefix_splits_on_a_partial_match() {
         tc.arena.node(a).parent(),
         tc.arena.resolve(prefix_node).expect("live test node")
     );
+    assert_eq!(result.last_visited_node_id, Some(prefix_node));
 }
 
 #[test]
@@ -1604,6 +1608,7 @@ fn match_prefix_stops_at_a_dead_node() {
     let result = tc.match_prefix(&match_params(&vec![1, 2]));
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
+    assert_eq!(result.last_visited_node_id, None);
 }
 
 #[test]
@@ -1670,6 +1675,8 @@ fn match_prefix_empty_query_anchors_at_the_root() {
             key: &vec![],
             namespace: KeyNamespaceRef::new(extra_key, None),
         });
+        assert_eq!(result.last_visited_node_id, None);
+        assert_eq!(result.full_device_match_len, None);
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
         assert_eq!(result.last_host_node_id, root_handle);
@@ -1690,6 +1697,7 @@ fn match_prefix_skips_host_only_nodes_without_hicache() {
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1708,6 +1716,7 @@ fn match_prefix_with_hicache_advances_best_match_onto_host_nodes() {
     assert_eq!(result.last_host_node_id, tc.arena.node(b).id);
     assert_eq!(result.host_hit_length, 1);
     assert!(result.cache_actions.is_empty());
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1890,6 +1899,8 @@ fn match_prefix_swa_tombstone_holds_the_best_match_below_the_window() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(c).id));
+    assert_eq!(result.full_device_match_len, None);
 }
 
 #[test]
@@ -9474,8 +9485,10 @@ fn match_with_borrowed_validators_retains_walk_state_and_common_postprocessing()
             result.best_match_node_id,
             if enable_hicache { tail_id } else { head_id }
         );
+        assert_eq!(result.last_visited_node_id, Some(tail_id));
         assert_eq!(result.full_kv_hit_length, 4);
         assert_eq!(result.device_prefix_len, 2);
+        assert!(result.full_device_match_len.is_none());
         tc.sanity_check(&[], &[]);
     }
 }
