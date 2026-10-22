@@ -11,10 +11,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
