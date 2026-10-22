@@ -185,10 +185,18 @@ install_aisbench() {
         fi
     else
         echo "Install aisbench locally."
-        ${PIP_FOR_AISBENCH} install -U pip --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --no-index --find-links=${AISBENCH_PKG_PATH}
-        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --no-index --find-links=${AISBENCH_PKG_PATH}
+        # Offline-first with an online fallback: the PVC package cache may
+        # lag behind the benchmark repo requirements (observed: nltk needs
+        # regex>=2021.8.3 which is not in aisbench-packages), so retry each
+        # step against the Tsinghua mirror to fill the gaps.
+        ${PIP_FOR_AISBENCH} install -U pip --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -U pip -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -e ${AISBENCH_SOURCE_PATH} --use-pep517 --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/api.txt --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
+        ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --no-index --find-links=${AISBENCH_PKG_PATH} || \
+            ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/extra.txt --find-links=${AISBENCH_PKG_PATH} -i ${pip_mirror_source}
         if [ "${DATASET_TYPE}" == "bfcl" ];then
             ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/datasets/bfcl_dependencies.txt --no-index --find-links=${AISBENCH_PKG_PATH}
         fi
