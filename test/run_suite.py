@@ -24,7 +24,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
-    "mps": HWBackend.MPS,
+    # "mps": HWBackend.MPS,
     "ppu": HWBackend.PPU,
 }
 
