@@ -855,6 +855,7 @@ class C4IndexerBackendMixin:
             weights = weights.float()
             if is_xpu():
                 from sgl_kernel import fp4_paged_mqa_logits
+
                 fn = fp4_paged_mqa_logits
             elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
