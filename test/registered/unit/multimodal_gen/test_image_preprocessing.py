@@ -4,6 +4,8 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -96,6 +98,12 @@ class TestImagePreprocessing(CustomTestCase):
 
     def test_cosmos_image_stage_and_shared_vae_fallback(self):
         rng = np.random.default_rng(19)
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args",
+            return_value=SimpleNamespace(comfyui_mode=False),
+        ):
+            cosmos = Cosmos3ImagePreprocessStage()
+            stage = ImageVAEEncodingStage(vae=None)
         with TemporaryDirectory() as directory:
             source = Path(directory) / "input.png"
             for shape in ((1081, 1921), (731, 517)):
@@ -112,7 +120,7 @@ class TestImagePreprocessing(CustomTestCase):
                         height=480,
                     )
                 )
-                Cosmos3ImagePreprocessStage().forward(batch, None)
+                cosmos.forward(batch, None)
                 expected = (
                     _pil_to_normalized_tensor(_resize_crop_pil(image, 832, 480))
                     .unsqueeze(0)
@@ -123,7 +131,6 @@ class TestImagePreprocessing(CustomTestCase):
                 )
                 self.assertEqual(batch.preprocessed_image.stride(), expected.stride())
 
-        stage = ImageVAEEncodingStage(vae=None)
         for values in (np.linspace(-255, 255, 256), np.arange(256)):
             image = Image.fromarray(values.astype(np.float32).reshape(16, 16))
             expected = torch.from_numpy(np.array(image)[None, None] / 255.0)
