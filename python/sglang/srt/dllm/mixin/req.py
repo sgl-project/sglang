@@ -22,6 +22,8 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_block_id = 0
+        self.dllm_block_done = False
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
         self.dllm_has_literal_mask = False
@@ -57,19 +59,14 @@ class ReqDllmMixin:
             )
             return
 
-        min_required_length = prefix_length + self.dllm_config.block_size
-        if len(self.full_untruncated_fill_ids) < min_required_length:
-            return
-
-        # Retraction preserves output_ids while releasing KV. Re-encode all
-        # committed tokens, including literal mask IDs, before generating more.
+        block_end = prefix_length + self.dllm_config.block_size
+        # Retraction re-encodes committed outputs before opening a new block.
         committed_len = len(self.origin_input_ids) + len(self.output_ids)
-        is_prefill_phase = min_required_length <= committed_len
-
-        if is_prefill_phase:
-            self.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        else:
-            self.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.dllm_phase = (
+            DllmReqPhase.STAGING_PREFILL
+            if block_end <= committed_len
+            else DllmReqPhase.STAGING_DECODE
+        )
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_incomplete_ids:
