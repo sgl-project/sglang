@@ -471,6 +471,12 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     }
 
 
+# Persistent per-shape buffers for the a2a DCP exchange. They are allocated
+# during the uncaptured warmup and kept alive so NCCL graph registrations keep
+# referring to stable storage across replay.
+_A2A_PERSISTENT_BUFFERS: dict = {}
+
+
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -503,15 +509,26 @@ def dcp_a2a_lse_reduce(
         send_combined = cuda_graph_buffers["send_combined"]
         recv_combined = cuda_graph_buffers["recv_combined"]
     else:
-        send_combined = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            D + lpd,
-            dtype=out_dtype,
-            device=cp_attn_out.device,
-        )
-        recv_combined = torch.empty_like(send_combined)
+        key = (cp_attn_out.device.index, B, N, H_per_rank, D, out_dtype)
+        bufs = _A2A_PERSISTENT_BUFFERS.get(key)
+        if bufs is not None:
+            send_combined = bufs["send_combined"]
+            recv_combined = bufs["recv_combined"]
+        else:
+            send_combined = torch.empty(
+                N,
+                B,
+                H_per_rank,
+                D + lpd,
+                dtype=out_dtype,
+                device=cp_attn_out.device,
+            )
+            recv_combined = torch.empty_like(send_combined)
+            if not torch.cuda.is_current_stream_capturing():
+                _A2A_PERSISTENT_BUFFERS[key] = {
+                    "send_combined": send_combined,
+                    "recv_combined": recv_combined,
+                }
 
     send_words = send_combined.view(torch.float32)
     dcp_pack_a2a_send(
