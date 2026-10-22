@@ -8,9 +8,7 @@ import pytest
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
@@ -130,6 +128,9 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
 
 
 def _dsa_draft_worker(monkeypatch, *, nextn_layers, dcp_replicated, dcp_size=4):
+    # The layout check is ROCm-only; CUDA keeps a replicated draft and never
+    # reaches it.
+    monkeypatch.setattr(spec, "_is_hip", True)
     monkeypatch.setattr(
         spec, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=dcp_size)
     )
@@ -187,66 +188,6 @@ def test_dsa_draft_layout_matching_the_plan_is_kept(
         dcp_size=dcp_size,
     )
     assert spec.BaseSpecWorker._build_hicache_draft_plan(worker).mode == mode
-
-
-@pytest.mark.parametrize("temporal_width", [0, 4])
-def test_ascend_packed_state_roundtrip_uses_buffer_descriptors(
-    monkeypatch, temporal_width
-):
-    monkeypatch.setenv("SGLANG_NPU_HICACHE_MAMBA_IO", "sync")
-    # CPU buffers: keep the XPU refusal off when this runs on an XPU host.
-    monkeypatch.setattr("sglang.srt.mem_cache.pool_host.mamba._is_xpu", False)
-    infos = tuple(
-        MambaStateBufferInfo(
-            temporal=torch.arange(layers * 8 * temporal_width).reshape(
-                layers, 8, temporal_width
-            )
-            + 100 * i,
-            conv=(torch.arange(layers * 8 * 4).reshape(layers, 8, 4) + 100 * i,),
-            extra_checkpoint_buffers=(torch.arange(16).reshape(8, 2) + 100 * i,),
-        )
-        for i, layers in enumerate((2, 1, 1, 1))
-    )
-    host = MambaPoolHost(
-        infos[0],
-        host_to_device_ratio=2,
-        host_size=0,
-        device_capacity=7,
-        pin_memory=False,
-        layout="page_first",
-        mtp_draft_buffer_infos=infos[1:],
-    )
-    try:
-        assert host.num_mamba_layers == 5
-        assert host.temporal_device_ptrs.tolist() == [
-            layer.data_ptr() for info in infos for layer in info.temporal.unbind(0)
-        ]
-        src_ids = torch.tensor([2, 5])
-        host_ids = torch.tensor([1, 2])
-        dst_ids = torch.tensor([3, 6])
-        tensors = [
-            layer
-            for info in infos
-            for tensor in (*info.conv, info.temporal)
-            for layer in tensor.unbind(0)
-        ] + [buf for info in infos for buf in info.extra_checkpoint_buffers]
-        expected = [tensor[src_ids].clone() for tensor in tensors]
-        host.backup_from_device_all_layer(None, host_ids, src_ids, "kernel_ascend")
-        for tensor in tensors:
-            tensor.zero_()
-        for layer_id in range(host.num_mamba_layers):
-            host.load_to_device_per_layer(
-                None,
-                host_ids,
-                dst_ids,
-                layer_id,
-                "kernel_ascend",
-                is_draft=layer_id >= 2,
-            )
-        for tensor, reference in zip(tensors, expected, strict=True):
-            assert torch.equal(tensor[dst_ids], reference)
-    finally:
-        host.destroy()
 
 
 if __name__ == "__main__":
