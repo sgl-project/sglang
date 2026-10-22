@@ -1471,7 +1471,12 @@ def setup_state_kv_args(
                 tail_item_lens,
             )
 
-    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8) or (
+        type(token_to_kv_pool) is MHATokenToKVPool
+        and getattr(token_to_kv_pool, "k_scale_buffer", None) is not None
+    ):
+        # Block scales travel with the quantized payload they describe
+        # (MXFP8 and the per-token FP4 recipes).
         append_state_component(
             kv_args,
             StateType.BLOCK_SCALE,
