@@ -15,7 +15,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
@@ -113,6 +113,46 @@ class TestTileLangDSAZeroRope(CustomTestCase):
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(captured.squeeze(0), actual, atol=0, rtol=0)
+
+    def test_masked_nan_kv_is_ignored_in_eager_and_graph(self):
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            FP8_DTYPE,
+            tilelang_sparse_fwd,
+        )
+
+        torch.manual_seed(3)
+        for d_v, d_tail in ((256, 0), (512, 0), (512, 64)):
+            with self.subTest(d_v=d_v, d_tail=d_tail):
+                dim = d_v + d_tail
+                q = (torch.randn(6, 64, dim, device="cuda") * 0.1).to(FP8_DTYPE)
+                kv = (torch.randn(64, 1, dim, device="cuda") * 0.1).to(FP8_DTYPE)
+                indices = torch.full((6, 1, 2112), -1, dtype=torch.int32, device="cuda")
+                indices[..., :26] = torch.arange(
+                    1, 27, dtype=torch.int32, device="cuda"
+                )
+                scale = 1.0 / math.sqrt(dim)
+                kv[0] = 0
+                expected = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+                self.assertTrue(torch.isfinite(expected).all().item())
+
+                # Slot 0 is unused by every valid index. Masking only the
+                # scores still lets NaN enter QK and zero-probability * V.
+                kv[0] = float("nan")
+                actual = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+                self.assertTrue(torch.isfinite(actual).all().item())
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+
+                indices.fill_(-1)
+                empty = tilelang_sparse_fwd(q, kv, indices, scale, d_v=d_v)
+                self.assertTrue(torch.isfinite(empty).all().item())
+                self.assertEqual(torch.count_nonzero(empty).item(), 0)
 
     def test_bf16_zero_rope_matches_torch(self):
         """Before the fix the BF16 partial kernel emitted zero-extent tail copies and failed to compile."""
