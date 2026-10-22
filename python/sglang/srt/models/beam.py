@@ -344,7 +344,8 @@ class BeamMoE(nn.Module):
             quant_method=BeamUnquantizedFusedMoEMethod() if bf16_experts else None,
             prefix=add_prefix("experts", prefix),
         )
-        # The opt-in single-token GEMV is built for exactly this shard on SM103.
+        # Static eligibility for the opt-in single-token GEMV on this SM103 shard;
+        # forward also needs one contiguous BF16 token and interleaved w13.
         self.use_decode_gemv = (
             envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
             and _is_cuda
@@ -1196,8 +1197,6 @@ class BeamModel(nn.Module):
                 # attention's, so it fuses under the same limit.
                 if self._can_replace_mlp_all_reduce():
                     mlp_beam_ar_comm = comm
-        # FlashInfer's MNNVL all-reduce replaces CustomAR inside the measured token
-        # band (_FLASHINFER_AR_TOKEN_BAND); None outside it.
         attention_flashinfer_ar = self._flashinfer_ar_for(hidden_states)
         mlp_flashinfer_ar = None
         if attention_flashinfer_ar is not None and self._can_replace_mlp_all_reduce():
