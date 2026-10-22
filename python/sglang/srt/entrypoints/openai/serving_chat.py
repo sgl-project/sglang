@@ -95,6 +95,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_native import KimiK3ParseError, restore_kimik3_stop
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1973,6 +1974,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except KimiK3ParseError as e:
+            return self.create_error_response(
+                str(e), err_type="KimiK3NativeOutputError", status_code=502
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -1999,6 +2004,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        native_raw_tails = {}
 
         # State tracking for streaming
         is_firsts = {}
@@ -2068,6 +2074,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                if (
+                    self.tool_call_parser == "kimi_k3"
+                    and self._tool_call_parsing_active(request)
+                ):
+                    raw = content["text"]
+                    incremental = get_serving().incremental_streaming_output
+                    combined = (
+                        native_raw_tails.get(index, "") + raw if incremental else raw
+                    )
+                    restored = restore_kimik3_stop(
+                        combined, finish_reason, self.tokenizer_manager.tokenizer
+                    )
+                    if len(restored) > len(combined):
+                        content = dict(content, text=raw + restored[len(combined) :])
+                    native_raw_tails[index] = restored[-64:]
 
                 if return_input_ids and input_ids is None:
                     # The prompt is the full, shared prompt (same across choices
@@ -2165,6 +2187,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                 ):
                     yield chunk
+
+            if self.tool_call_parser == "kimi_k3" and not error_aborted:
+                for idx, parser in reasoning_parser_dict.items():
+                    if idx not in finish_reasons:
+                        parser.parse_stream_end()
+                for idx, parser in parser_dict.items():
+                    if idx not in finish_reasons:
+                        parser.parse_stream_end()
+                if not is_firsts or any(idx not in finish_reasons for idx in is_firsts):
+                    raise KimiK3ParseError("missing_terminal")
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -2320,6 +2352,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        except KimiK3ParseError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(
+                str(e), err_type="KimiK3NativeOutputError", status_code=502
+            )
+            yield f"data: {error}\n\n"
+            return  # A rejected native stream must not emit success or DONE.
         except ValueError as e:
             if not stream_started:
                 raise
@@ -2345,11 +2385,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
+        try:
+            response = self._build_chat_response(request, ret, int(time.time()))
+        except KimiK3ParseError as e:
+            return self.create_error_response(
+                str(e), err_type="KimiK3NativeOutputError", status_code=502
+            )
 
         return response
 
@@ -2436,6 +2477,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
 
+            if self.tool_call_parser == "kimi_k3" and self._tool_call_parsing_active(
+                request
+            ):
+                text = restore_kimik3_stop(
+                    text, finish_reason, self.tokenizer_manager.tokenizer
+                )
+
             # Handle reasoning content
             reasoning_text = None
             tool_calls = None
@@ -2461,7 +2509,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
+                    kwargs = (
+                        {"finish_reason": (finish_reason or {}).get("type")}
+                        if self.reasoning_parser == "kimi_k3"
+                        else {}
+                    )
+                    reasoning_text, text = parser.parse_non_stream(text, **kwargs)
+                except KimiK3ParseError:
+                    raise
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -2681,20 +2736,35 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
-            if should_try_parser and parser.has_tool_call(text):
+            has_native_marker = parser.has_tool_call(text)
+            if should_try_parser and (
+                self.tool_call_parser == "kimi_k3" or has_native_marker
+            ):
                 try:
-                    text, call_info_list = parser.parse_non_stream(text)
+                    kwargs = (
+                        {"finish_reason": (finish_reason or {}).get("type")}
+                        if self.tool_call_parser == "kimi_k3"
+                        else {}
+                    )
+                    text, call_info_list = parser.parse_non_stream(text, **kwargs)
                     if not call_info_list:
-                        logger.warning(
-                            "Tool call marker present but no complete call parsed "
-                            "from %s output; dropping the incomplete call",
-                            self.tool_call_parser,
-                        )
-                        logger.debug(
-                            "Unparsed tool call output (%d chars): %r",
-                            len(text),
-                            text[:2000],
-                        )
+                        if has_native_marker:
+                            logger.warning(
+                                "Tool call marker present but no complete call parsed "
+                                "from %s output; dropping the incomplete call",
+                                self.tool_call_parser,
+                            )
+                            logger.debug(
+                                "Unparsed tool call output (%d chars): %r",
+                                len(text),
+                                text[:2000],
+                            )
+                        elif is_required and detector_owns_format:
+                            logger.warning(
+                                "Required tool call missing from %s output (%d chars)",
+                                self.tool_call_parser,
+                                len(text),
+                            )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
@@ -2718,6 +2788,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except KimiK3ParseError:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
@@ -2831,7 +2903,14 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
         if finish_reason_type is not None and finish_reason_type != "abort":
-            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
+            kwargs = (
+                {"finish_reason": finish_reason_type}
+                if self.reasoning_parser == "kimi_k3"
+                else {}
+            )
+            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end(
+                **kwargs
+            )
             if end_reasoning_text:
                 reasoning_text = (reasoning_text or "") + end_reasoning_text
             if end_normal_text:
@@ -3155,7 +3234,16 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:
-                end_text, end_calls = parser.parse_stream_end()
+                kwargs = (
+                    {
+                        "finish_reason": (
+                            content["meta_info"].get("finish_reason") or {}
+                        ).get("type")
+                    }
+                    if self.tool_call_parser == "kimi_k3"
+                    else {}
+                )
+                end_text, end_calls = parser.parse_stream_end(**kwargs)
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
