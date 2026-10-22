@@ -5,12 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.kda_kernels.layernorm_modulate_triton import (
-    _fold_halves,
-    _fold_tree_32,
-    _push_vec4,
-)
 from sglang.kernels.numerics import cuda_rsqrtf, div_rn_f32, round_bf16_to_fp32
+from sglang.kernels.ops.layernorm.welford import layernorm_welford
 
 
 @triton.jit
@@ -32,48 +28,7 @@ def _layernorm_modulate_fp8_kernel(
     row_mask = row_offs < n_rows
     row_base = row_offs * D
 
-    lanes = tl.arange(0, 128)
-    mean = tl.zeros((ROWS, 128), dtype=tl.float32)
-    m2 = tl.zeros((ROWS, 128), dtype=tl.float32)
-    cnt = tl.zeros((ROWS, 128), dtype=tl.float32)
-
-    # pass 1: per-"thread" serial Welford in aten's exact element order.
-    # Out-of-range rows compute garbage that is never stored.
-    for i in tl.static_range((D + 511) // 512):
-        cols = i * 512 + lanes[:, None] * 4 + tl.arange(0, 4)[None, :]
-        if (i + 1) * 512 <= D:
-            x4 = tl.load(
-                x_ptr + row_base[:, None, None] + cols[None, :, :],
-                mask=row_mask[:, None, None],
-                other=0.0,
-            ).to(tl.float32)
-            mean, m2, cnt = _push_vec4(
-                x4, mean, m2, cnt, row_mask, ROWS, 128, MASKED=False
-            )
-        else:
-            # partial tail chunk (D % 512 != 0): aten threads whose vector
-            # index i*128+t reaches N/4 skip the iteration, leaving their
-            # Welford state untouched.
-            vec_valid = (i * 128 + lanes < D // 4)[None, :]
-            x4 = tl.load(
-                x_ptr + row_base[:, None, None] + cols[None, :, :],
-                mask=row_mask[:, None, None] & vec_valid[:, :, None],
-                other=0.0,
-            ).to(tl.float32)
-            mean, m2, cnt = _push_vec4(
-                x4, mean, m2, cnt, vec_valid, ROWS, 128, MASKED=True
-            )
-
-    # warp fold trees, then the (0,2)/(1,3)/(0,1) inter-warp combines.
-    mean = tl.reshape(mean, (ROWS * 4, 32), can_reorder=False)
-    m2 = tl.reshape(m2, (ROWS * 4, 32), can_reorder=False)
-    cnt = tl.reshape(cnt, (ROWS * 4, 32), can_reorder=False)
-    mean, m2, cnt = _fold_tree_32(mean, m2, cnt, ROWS * 4)
-    mean = tl.reshape(mean, (ROWS, 4), can_reorder=False)
-    m2 = tl.reshape(m2, (ROWS, 4), can_reorder=False)
-    cnt = tl.reshape(cnt, (ROWS, 4), can_reorder=False)
-    mean, m2, cnt = _fold_halves(mean, m2, cnt, ROWS, 2)
-    mean, m2, cnt = _fold_halves(mean, m2, cnt, ROWS, 1)
+    mean, m2 = layernorm_welford(x_ptr, row_base, row_mask, D, ROWS)
 
     denom = tl.zeros((ROWS, 1), dtype=tl.float32) + D
     rstd = cuda_rsqrtf(div_rn_f32(m2, denom) + eps)  # (ROWS, 1)

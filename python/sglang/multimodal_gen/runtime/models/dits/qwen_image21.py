@@ -340,6 +340,30 @@ def _stacked_rows(a, b):
     return a.as_strided((2 * a.shape[0], a.shape[1]), (a.shape[1], 1))
 
 
+def _can_use_dynamic_fp8_projection(layer, x):
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+
+    return (
+        type(layer.quant_method) is Fp8LinearMethod
+        and layer.quant_method.cutlass_fp8_supported
+        and not layer.quant_method.use_marlin
+        and not layer.quant_method.block_quant
+        and layer.bias is None
+        and layer.tp_size == 1
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+        and layer.weight.is_cuda
+        and layer.weight.device == x.device
+        and layer.weight.dtype is torch.float8_e4m3fn
+        and layer.weight.ndim == 2
+        and layer.weight.shape[0] == x.shape[-1]
+        and layer.weight.stride(0) == 1
+        and layer.weight.t().is_contiguous()
+        and layer.weight_scale.numel() == layer.weight.shape[1]
+        and layer.input_scale is None
+    )
+
+
 def _shared_fp8_projections(x, layers, *, norm_scale=None):
     """Quantize sibling projections' common input once, keeping each GEMM.
 
@@ -360,31 +384,13 @@ def _shared_fp8_projections(x, layers, *, norm_scale=None):
     ):
         return None
     from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
     from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
 
-    for layer in layers:
-        if not (
-            type(layer) is ColumnParallelLinear
-            and type(layer.quant_method) is Fp8LinearMethod
-            and layer.quant_method.cutlass_fp8_supported
-            and not layer.quant_method.use_marlin
-            and not layer.quant_method.block_quant
-            and layer.bias is None
-            and not layer.gather_output
-            and layer.tp_size == 1
-            and not layer._forward_pre_hooks
-            and not layer._forward_hooks
-            and layer.weight.is_cuda
-            and layer.weight.dtype is torch.float8_e4m3fn
-            and layer.weight.ndim == 2
-            and layer.weight.shape[0] == x.shape[-1]
-            and layer.weight.stride(0) == 1
-            and layer.weight.t().is_contiguous()
-            and layer.weight_scale.numel() == layer.weight.shape[1]
-            and layer.input_scale is None
-        ):
-            return None
+    if any(
+        layer.gather_output or not _can_use_dynamic_fp8_projection(layer, x)
+        for layer in layers
+    ):
+        return None
     if torch.cuda.get_device_capability(x.device) != (8, 9):
         return None
     if norm_scale is None:
@@ -480,27 +486,11 @@ def _silu_mul_fp8_projection(gate, up, layer):
     ):
         return None
     from sglang.kernels.ops.activation.silu_mul_fp8 import silu_mul_fp8
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
     from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
 
-    if not (
-        type(layer.quant_method) is Fp8LinearMethod
-        and layer.quant_method.cutlass_fp8_supported
-        and not layer.quant_method.use_marlin
-        and not layer.quant_method.block_quant
-        and layer.bias is None
-        and layer.tp_size == 1
-        and not layer._forward_pre_hooks
-        and not layer._forward_hooks
-        and layer.weight.device == gate.device
-        and layer.weight.ndim == 2
-        and layer.weight.shape[0] == gate.shape[-1]
-        and layer.weight.stride(0) == 1
-        and layer.weight.t().is_contiguous()
-        and layer.weight_scale.numel() == layer.weight.shape[1]
-        and layer.input_scale is None
-        and torch.cuda.get_device_capability(gate.device) == (8, 9)
-    ):
+    if not _can_use_dynamic_fp8_projection(
+        layer, gate
+    ) or torch.cuda.get_device_capability(gate.device) != (8, 9):
         return None
     quantized, scale = silu_mul_fp8(
         gate.view(-1, gate.shape[-1]), up.view(-1, up.shape[-1])
@@ -1081,18 +1071,20 @@ class QwenImage21TransformerBlock(nn.Module):
             if projected_qkv is not None
             else apply_modulation(hidden_states, self.img_norm1, scale1)
         )
-        attention_kwargs = (
-            {} if projected_qkv is None else {"projected_qkv": projected_qkv}
-        )
-        attention, prefix_attentions = self.attn(
-            attention_input,
-            ropes,
-            prefixes,
-            layouts,
-            caches,
-            prefix_pad,
-            **attention_kwargs,
-        )
+        if projected_qkv is None:
+            attention, prefix_attentions = self.attn(
+                attention_input, ropes, prefixes, layouts, caches, prefix_pad
+            )
+        else:
+            attention, prefix_attentions = self.attn(
+                attention_input,
+                ropes,
+                prefixes,
+                layouts,
+                caches,
+                prefix_pad,
+                projected_qkv=projected_qkv,
+            )
         hidden_states = residual_gate_add(hidden_states, attention, gate1)
         projected_gate_up = _modulation_fp8_projections(
             hidden_states,
@@ -1105,16 +1097,11 @@ class QwenImage21TransformerBlock(nn.Module):
             if projected_gate_up is not None
             else apply_modulation(hidden_states, self.img_norm2, scale2)
         )
-        mlp_kwargs = (
-            {}
-            if projected_gate_up is None
-            else {"projected_gate_up": projected_gate_up}
-        )
-        hidden_states = residual_gate_add(
-            hidden_states,
-            self.img_mlp(mlp_input, **mlp_kwargs),
-            gate2,
-        )
+        if projected_gate_up is None:
+            mlp_output = self.img_mlp(mlp_input)
+        else:
+            mlp_output = self.img_mlp(mlp_input, projected_gate_up=projected_gate_up)
+        hidden_states = residual_gate_add(hidden_states, mlp_output, gate2)
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
