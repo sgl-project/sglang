@@ -9,6 +9,20 @@ runner's static buffers, and pool tensors are persistent. Capturing the op
 sequence once per replay key collapses the per-step host cost to a single
 graph launch.
 
+Two-phase split (DFlash-family host-fed plans):
+Some backends (DFlash TARGET_VERIFY) recompute plan inputs on the host every
+replay. Capturing those host writes would freeze them at capture-time values
+(silent accept-length collapse). Those backends implement
+``prepare_host_metadata`` / ``apply_device_metadata``:
+
+- ``prepare_host_metadata`` runs **eagerly every replay** (not captured) and
+  writes current-step plan arrays into pointer-stable static/pinned buffers.
+- ``apply_device_metadata`` issues only device ops that read those buffers
+  and is what the glue graph captures.
+
+Backends that do not implement the split keep the single-phase
+``init_forward_metadata_out_graph`` path.
+
 Correctness contract:
 
 - The caller only routes here when the replay is padding-free
@@ -21,20 +35,12 @@ Correctness contract:
   happen outside capture.
 - Any capture failure (e.g. a backend syncing or reading host values inside
   its prep) permanently disables the glue graph and falls back to eager.
-- Backends whose prep computes values on the HOST each replay (e.g. the
-  DFlash-family host-fed fast verify plans) must never be glued: capture
-  records only device ops, so the host-written plan inputs would replay
-  frozen at their capture-time values. Note the failure is SILENT — capture
-  succeeds, outputs stay correct, only accept length collapses. Callers must
-  gate such configurations off before routing here
-  (``decode_cuda_graph_runner`` force-disables the glue for DFlash-family
-  spec).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -62,9 +68,22 @@ class MetadataGlueGraph:
             backends.extend(attn_backend.attn_backend_list)
         return backends
 
+    def _run_prep(self, attn_backend, fb_view, host_inputs: Optional[dict]) -> None:
+        if host_inputs is not None:
+            attn_backend.apply_device_metadata(fb_view, host_inputs)
+        else:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+
     def run(self, attn_backend, fb_view, key) -> None:
-        """Run ``init_forward_metadata_out_graph`` for this replay, through the
-        captured glue graph once it is ready."""
+        """Run metadata prep for this replay, through the captured glue graph
+        once it is ready.
+
+        Host-eager phase (``prepare_host_metadata``) always runs outside the
+        graph so DFlash-style plan inputs stay fresh. The device phase is
+        captured per key.
+        """
+        host_inputs = attn_backend.prepare_host_metadata(fb_view)
+
         st = self._states.get(key)
         if st is None:
             st = {"warmups": 0, "graph": None, "meta": None}
@@ -78,7 +97,7 @@ class MetadataGlueGraph:
 
         if st["warmups"] < self.NUM_WARMUP:
             st["warmups"] += 1
-            attn_backend.init_forward_metadata_out_graph(fb_view)
+            self._run_prep(attn_backend, fb_view, host_inputs)
             return
 
         if self._capture_stream is None:
@@ -86,7 +105,7 @@ class MetadataGlueGraph:
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.graph(graph, stream=self._capture_stream):
-                attn_backend.init_forward_metadata_out_graph(fb_view)
+                self._run_prep(attn_backend, fb_view, host_inputs)
         except Exception:
             logger.warning(
                 "Metadata glue-graph capture failed for key %s; falling back "
@@ -97,7 +116,7 @@ class MetadataGlueGraph:
             self.disabled = True
             # Ops under a failed capture were recorded, not executed — run
             # this step's prep for real.
-            attn_backend.init_forward_metadata_out_graph(fb_view)
+            self._run_prep(attn_backend, fb_view, host_inputs)
             return
 
         st["meta"] = [(b, b.forward_metadata) for b in self._leaves(attn_backend)]
