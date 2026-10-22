@@ -101,7 +101,14 @@ impl ChatFormatter {
                     }
                     args.insert("tools".into(), tools);
                 }
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+                render_oai(
+                    formatter,
+                    &TemplateArgsRequest {
+                        request,
+                        args,
+                        messages: None,
+                    },
+                )
             }
             ChatFormatter::KimiK3 => {
                 KimiK3Formatter::new(true)
@@ -303,10 +310,11 @@ fn render_oai(
 
 /// Formatter-facing request view over adapted template arguments.
 /// Native effort access and template arguments share the adapted value without
-/// changing the original request.
+/// changing the original request; `messages` replaces the request's own.
 struct TemplateArgsRequest<'a> {
     request: &'a dyn OAIChatLikeRequest,
     args: HashMap<String, Value>,
+    messages: Option<minijinja::Value>,
 }
 
 impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
@@ -315,11 +323,17 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 
     fn messages(&self) -> minijinja::Value {
-        self.request.messages()
+        match &self.messages {
+            Some(messages) => messages.clone(),
+            None => self.request.messages(),
+        }
     }
 
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
+        match self.messages {
+            Some(_) => None,
+            None => self.request.typed_messages(),
+        }
     }
 
     fn tools(&self) -> Option<minijinja::Value> {

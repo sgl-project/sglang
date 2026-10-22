@@ -135,8 +135,7 @@ impl OpenAiChat {
             Err(TemplateError::NeedsRenderFallback { .. }) => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
                 let args = TemplateArgs::new(&raw, defaults);
-                let prompt = formatter.render_template(&chat.request, &args).ok()?;
-                (prompt, String::new())
+                formatter.render_template(&chat.request, &args).ok()?
             }
             rendered => rendered.ok()?,
         };
