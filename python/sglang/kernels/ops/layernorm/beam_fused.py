@@ -1,16 +1,4 @@
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# SPDX-License-Identifier: Apache-2.0
 """Beam sandwich RMSNorm, depth-scaled residual, and next RMSNorm in one launch.
 
 The post-norm, both scaled operands, and the combined stream round to the
@@ -46,7 +34,6 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     residual_scale,
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    HAS_SANDWICH: tl.constexpr,
     HAS_OUT_NORM: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
@@ -56,8 +43,7 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     act_dtype = x_ptr.dtype.element_ty
 
     # The preceding kernel does not write the weights; load them before the PDL wait.
-    if HAS_SANDWICH:
-        w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     if HAS_OUT_NORM:
         w2 = tl.load(out_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     if USE_PDL:
@@ -67,10 +53,9 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     x = tl.load(x_ptr + row * x_stride_row + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    if HAS_SANDWICH:
-        rstd = tl.rsqrt(tl.sum(x * x, axis=0) / hidden_dim + eps)
-        # The standalone RMSNorm writes the activation dtype before the combine.
-        x = (x * rstd * w).to(act_dtype).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(x * x, axis=0) / hidden_dim + eps)
+    # The standalone RMSNorm writes the activation dtype before the combine.
+    x = (x * rstd * w).to(act_dtype).to(tl.float32)
 
     residual = tl.load(
         residual_ptr + row * residual_stride_row + offsets, mask=mask, other=0.0
@@ -92,7 +77,7 @@ def _fused_sandwich_residual_rmsnorm_kernel(
 def fused_sandwich_residual_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
-    sandwich_weight: Optional[torch.Tensor],
+    sandwich_weight: torch.Tensor,
     out_weight: Optional[torch.Tensor],
     eps: float,
     x_scale: float,
@@ -104,10 +89,10 @@ def fused_sandwich_residual_rmsnorm(
 
     `branch` and `residual` are 2-D `[tokens, hidden]` in the activation dtype.
     `sandwich_weight` is the post-norm weight applied to `branch` before the
-    combine (None skips it); `out_weight` is the following norm's weight (None
-    returns only the combined stream, for the last layer of a non-final
-    pipeline stage). `enable_pdl` launches with programmatic dependent launch;
-    the caller must check that the device supports it.
+    combine; `out_weight` is the following norm's weight (None returns only the
+    combined stream, for the last layer of a non-final pipeline stage).
+    `enable_pdl` launches with programmatic dependent launch; the caller must
+    check that the device supports it.
     """
     if branch.ndim != 2 or residual.shape != branch.shape:
         raise ValueError(
@@ -115,6 +100,8 @@ def fused_sandwich_residual_rmsnorm(
         )
     if branch.stride(1) != 1 or residual.stride(1) != 1:
         raise ValueError("branch and residual must be contiguous along hidden")
+    if branch.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("branch must be fp16, bf16 or fp32")
     hidden_dim = branch.shape[1]
     for w in (sandwich_weight, out_weight):
         if w is not None and (w.shape != (hidden_dim,) or not w.is_contiguous()):
@@ -140,7 +127,7 @@ def fused_sandwich_residual_rmsnorm(
 def _fused_sandwich_residual_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
-    sandwich_weight: Optional[torch.Tensor],
+    sandwich_weight: torch.Tensor,
     out_weight: Optional[torch.Tensor],
     eps: float,
     x_scale: float,
@@ -153,9 +140,6 @@ def _fused_sandwich_residual_rmsnorm(
     rows = branch.shape[0]
     if rows == 0:
         return
-    dummy = sandwich_weight if sandwich_weight is not None else out_weight
-    if dummy is None:
-        dummy = branch  # never dereferenced: both norm flags are off
     _fused_sandwich_residual_rmsnorm_kernel[(rows,)](
         out if out is not None else combined,
         combined,
@@ -163,14 +147,13 @@ def _fused_sandwich_residual_rmsnorm(
         residual,
         branch.stride(0),
         residual.stride(0),
-        sandwich_weight if sandwich_weight is not None else dummy,
-        out_weight if out_weight is not None else dummy,
+        sandwich_weight,
+        out_weight if out_weight is not None else sandwich_weight,
         eps=eps,
         x_scale=x_scale,
         residual_scale=residual_scale,
         hidden_dim=hidden_dim,
         BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
-        HAS_SANDWICH=sandwich_weight is not None,
         HAS_OUT_NORM=out_weight is not None,
         USE_PDL=enable_pdl,
         num_warps=8,
@@ -189,8 +172,8 @@ def _rmsnorm_native(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.
 class BeamSandwichResidualRMSNormOp(BaseFusedOp):
     """Post-normalize a branch, combine residuals, then normalize the next input.
 
-    Returns ``(normed, combined)``. Either norm weight may be None; without
-    ``out_weight``, ``normed`` is None (a non-final pipeline stage).
+    Returns ``(normed, combined)``; ``normed`` is None without ``out_weight``
+    (a non-final pipeline stage).
     """
 
     op = "layernorm.beam_sandwich_residual_rmsnorm"
@@ -202,10 +185,9 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
 
     def forward_torch_compile(self, *args, **kwargs):
         if self._compiled_native is None:
-            # Register and warm the opaque op before tracing its dispatch wrapper.
-            self.forward_triton(*args, **kwargs)
+            # Without emulated casts, Inductor drops eager's intermediate rounding.
             self._compiled_native = torch.compile(
-                self.forward_triton, options={"emulate_precision_casts": True}
+                self.forward_native, options={"emulate_precision_casts": True}
             )
         return self._compiled_native(*args, **kwargs)
 
@@ -213,13 +195,12 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         self,
         branch: torch.Tensor,
         residual: torch.Tensor,
-        sandwich_weight: Optional[torch.Tensor],
+        sandwich_weight: torch.Tensor,
         out_weight: Optional[torch.Tensor],
         eps: float,
         scales: tuple[float, float],
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-        if sandwich_weight is not None:
-            branch = _rmsnorm_native(branch, sandwich_weight, eps)
+        branch = _rmsnorm_native(branch, sandwich_weight, eps)
         residual = residual.to(branch.dtype)
         combined = branch * scales[0] + residual * scales[1]
         out = (
@@ -233,15 +214,11 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         self,
         branch: torch.Tensor,
         residual: torch.Tensor,
-        sandwich_weight: Optional[torch.Tensor],
+        sandwich_weight: torch.Tensor,
         out_weight: Optional[torch.Tensor],
         eps: float,
         scales: tuple[float, float],
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-        if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
-            return self.forward_native(
-                branch, residual, sandwich_weight, out_weight, eps, scales
-            )
         from sglang.kernels.jit.utils import is_arch_support_pdl
 
         return fused_sandwich_residual_rmsnorm(

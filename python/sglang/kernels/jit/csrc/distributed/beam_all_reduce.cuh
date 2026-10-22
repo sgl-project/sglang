@@ -1,4 +1,4 @@
-// Copyright 2026 SGLang Team. Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 // Beam's BF16 sandwich norm over the existing CustomAllReduceV2 push protocol.
 #pragma once
 #include <sgl_kernel/tensor.h>
@@ -12,8 +12,6 @@
 #include <sgl_kernel/distributed/ptx.cuh>
 
 #include <tvm/ffi/extra/stl.h>
-
-#include <cooperative_groups.h>
 
 namespace sglang {
 namespace beam_ar {
@@ -30,11 +28,11 @@ struct Params {
 };
 
 /// Every thread holds eight adjacent BF16 values of one row.
-template <uint32_t Hidden, uint32_t Cluster>
+template <uint32_t Hidden>
 SGL_DEVICE float inv_rms(const Vec& v, float eps) {
   using namespace device;
-  constexpr uint32_t warps = Hidden / 8 / Cluster / 32;
-  __shared__ float partial[Cluster][warps];
+  constexpr uint32_t warps = Hidden / 8 / 32;
+  __shared__ float partial[warps];
   float sum = 0.0f;
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {
@@ -44,36 +42,26 @@ SGL_DEVICE float inv_rms(const Vec& v, float eps) {
   }
   sum = warp::reduce_sum(sum);
   const auto lane = threadIdx.x % 32;
-  if constexpr (Cluster > 1) {
-    const auto cluster = cooperative_groups::this_cluster();
-    if (lane < Cluster) *cluster.map_shared_rank(&partial[blockIdx.y][threadIdx.x / 32], lane) = sum;
-    cluster.sync();
-  } else {
-    if (lane == 0) partial[0][threadIdx.x / 32] = sum;
-    __syncthreads();
-  }
-  sum = lane < Cluster * warps ? partial[lane / warps][lane % warps] : 0.0f;
+  if (lane == 0) partial[threadIdx.x / 32] = sum;
+  __syncthreads();
+  sum = lane < warps ? partial[lane] : 0.0f;
   sum = warp::reduce_sum(sum);
-  if constexpr (Cluster > 1)
-    cooperative_groups::this_cluster().sync();
-  else
-    __syncthreads();
+  __syncthreads();
   return rsqrtf(sum / float(Hidden) + eps);
 }
 
-template <uint32_t World, uint32_t Hidden, uint32_t Cluster, uint32_t TopK, bool NextNorm>
-__global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Cluster, 1)
-    kernel(const __grid_constant__ Params<World> p) {
+template <uint32_t World, uint32_t Hidden, uint32_t TopK, bool NextNorm>
+__global__ void __launch_bounds__(Hidden / 8) kernel(const __grid_constant__ Params<World> p) {
   using namespace device;
   namespace ptx = device::ptx;
   device::PDLWaitPrimary<true>();
   const auto row = blockIdx.x;
-  const auto tx = blockIdx.y * blockDim.x + threadIdx.x;
+  const auto tx = threadIdx.x;
   const auto epoch = distributed::PushEpoch<World>{p.workspace};
   if (row == p.rows) {
     // Keep every counter in phase when interleaving with generic all-reduces.
     __syncthreads();
-    if (blockIdx.y == 0) epoch.unsafe_flip_range(row, p.counters);
+    epoch.unsafe_flip_range(row, p.counters);
     device::PDLTriggerSecondary<true>();
     return;
   }
@@ -106,7 +94,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     for (uint32_t rank = 0; rank < World; ++rank)
       ptx::st_relaxed_16B(value, epoch.slot_ptr(rank, p.rank), idx);
   }
-  // Fetch epilogue inputs while the peers publish their rank-local payloads.
+  // Fetch epilogue inputs while the peers publish; asm loads stay ahead of the poll.
   Vec post, residual;
   ptx::ld_relaxed_16B(post, p.post_weight, tx);
   ptx::ld_relaxed_16B(residual, p.residual, idx);
@@ -131,7 +119,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     }
     value[j] = cast<bf16x2_t>(sum);
   }
-  const float post_rstd = inv_rms<Hidden, Cluster>(value, p.eps);
+  const float post_rstd = inv_rms<Hidden>(value, p.eps);
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {
     auto v = cast<fp32x2_t>(value[j]);
@@ -144,7 +132,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
   }
   ptx::st_global_16B(value, p.combined, idx);
   if constexpr (NextNorm) {
-    const float rstd = inv_rms<Hidden, Cluster>(value, p.eps);
+    const float rstd = inv_rms<Hidden>(value, p.eps);
     Vec weight;
     weight.load(p.next_weight, tx);
 #pragma unroll
@@ -162,19 +150,17 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     ptx::st_global_16B(zero, epoch.slot_ptr(p.rank, rank), idx);
   // A successor must wait for completion before consuming this plane again.
   device::PDLTriggerSecondary<true>();
-  if constexpr (Cluster > 1)
-    cooperative_groups::this_cluster().sync();
-  else
-    __syncthreads();
-  if (blockIdx.y == 0) epoch.flip();
+  __syncthreads();
+  epoch.flip();
 }
 }  // namespace beam_ar
 
 /// Validate and launch a BF16 all-reduce + sandwich/residual/next norm.
-template <uint32_t World, uint32_t Hidden, uint32_t Cluster, uint32_t TopK>
+template <uint32_t World, uint32_t Hidden, uint32_t TopK>
 struct BeamAllReduceNorm {
   static_assert(World == 2 || World == 4 || World == 8);
-  static_assert(Hidden % (Cluster * 256) == 0 && Hidden <= 8192);
+  // Whole warps per CTA, and at most 32 so inv_rms reduces them in one warp.
+  static_assert(Hidden % 256 == 0 && Hidden <= 8192);
   static void
   run(host::distributed::CommunicatorRef ref,
       tvm::ffi::TensorView input,
@@ -243,10 +229,8 @@ struct BeamAllReduceNorm {
         .rank = push.rank,
         .counters = push.num_blocks,
         .workspace = push.get_workspace<World>(bytes)};
-    auto kernel = next ? beam_ar::kernel<World, Hidden, Cluster, TopK, true>
-                       : beam_ar::kernel<World, Hidden, Cluster, TopK, false>;
-    LaunchKernel(dim3(n + (n < push.num_blocks), Cluster), Hidden / 8 / Cluster, input.device())
-        .enable_pdl(true)(kernel, p);
+    auto kernel = next ? beam_ar::kernel<World, Hidden, TopK, true> : beam_ar::kernel<World, Hidden, TopK, false>;
+    LaunchKernel(dim3(n + (n < push.num_blocks)), Hidden / 8, input.device()).enable_pdl(true)(kernel, p);
   }
 };
 }  // namespace sglang

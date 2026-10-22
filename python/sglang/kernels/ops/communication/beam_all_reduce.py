@@ -1,40 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
 """Beam BF16 all-reduce with FP32 sandwich normalization and rounded residuals."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 
+if TYPE_CHECKING:
+    from sglang.kernels.ops.communication.all_reduce import Communicator
+
 
 @cache_once
-def _module(world_size: int, hidden_size: int, cluster: int = 1, topk: int = 1):
+def _module(world_size: int, hidden_size: int, topk: int):
     return load_jit(
         "beam_all_reduce_norm",
         str(world_size),
         str(hidden_size),
-        str(cluster),
         str(topk),
         cuda_files=["distributed/beam_all_reduce.cuh"],
         cuda_wrappers=[
             (
                 "run",
-                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {cluster}, {topk}>::run",
+                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {topk}>::run",
             )
         ],
+        # Round every multiply and add separately, as the unfused norm does.
         extra_cuda_cflags=["--fmad=false"],
     )
 
 
-def _cluster_size(world_size: int, rows: int, topk: int) -> int:
-    # TP8 benefits from distributing the smallest rows across SMs; at larger
-    # batches a single CTA per row avoids cluster synchronization overhead.
-    if world_size == 8:
-        return 5 if rows <= (16 if topk == 8 else 8) else 1
-    return 5 if world_size == 2 and rows == 1 and topk == 8 else 1
-
-
 def beam_all_reduce_norm(
-    comm, branch, residual, post_weight, next_weight, eps, scales, *, routed_scale=1.0
-):
+    comm: Communicator,
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    next_weight: Optional[torch.Tensor],
+    eps: float,
+    scales: tuple[float, float],
+    *,
+    routed_scale: float = 1.0,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Return `(normalized, combined)` using a caller-owned V2 communicator.
 
     All ranks must call with identical shapes/epilogue and serialize use of the
@@ -52,12 +60,7 @@ def beam_all_reduce_norm(
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual) if next_weight is not None else None
     if branch.shape[0]:
-        _module(
-            comm.world_size,
-            branch.shape[-1],
-            _cluster_size(comm.world_size, branch.shape[0], topk),
-            topk,
-        ).run(
+        _module(comm.world_size, branch.shape[-1], topk).run(
             comm,
             branch,
             residual,
