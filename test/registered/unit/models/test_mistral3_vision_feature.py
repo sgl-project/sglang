@@ -105,21 +105,64 @@ class TestPixtralAdaptorVisionFeature(unittest.TestCase):
                 self.assertEqual(out.shape, (3 * TOKENS, HIDDEN))
 
 
-class TestMistral3WrapperAttrs(unittest.TestCase):
-    def test_attr_set_on_wrapper_survives_eval(self):
-        """Loaders keep what ``model.eval()`` returns (the inner Llava module), so
-        state set on the wrapper must reach it or the runner fails at startup."""
-        inner = torch.nn.Module()
-        # Skip __init__, which builds the full Llava model from an HF config.
-        wrapper = object.__new__(Mistral3ForConditionalGeneration)
-        wrapper.inner = inner
+def _bare_mistral3():
+    # Skip LlavaForConditionalGeneration.__init__, which builds the language and
+    # vision models from an HF config.
+    model = Mistral3ForConditionalGeneration.__new__(Mistral3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    return model
+
+
+class RecordingLoader(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loaded = []
+
+    def load_weights(self, weights):
+        self.loaded.extend(name for name, _ in weights)
+
+
+class TestMistral3ModelSurvivesEval(unittest.TestCase):
+    def test_eval_keeps_the_model_and_its_state(self):
+        """Loaders keep what ``model.eval()`` returns, so it must be the model the
+        loader built, still carrying ``shared_experts_config`` set after construction.
+        """
+        model = _bare_mistral3()
         sentinel = object()
+        model.shared_experts_config = sentinel
 
-        wrapper.shared_experts_config = sentinel
+        loaded = model.eval()
 
-        loaded = wrapper.eval()
-        self.assertIs(loaded, inner)
+        self.assertIs(loaded, model)
         self.assertIs(loaded.shared_experts_config, sentinel)
+
+    def test_v5_checkpoint_names_load_after_eval(self):
+        """Weight updates call ``load_weights`` on the model kept after ``eval()``,
+        so transformers v5 Mistral3 checkpoint names must still be normalized."""
+        model = _bare_mistral3()
+        model.vision_feature_select_strategy = "full"
+        model.language_model = RecordingLoader()
+        model.vision_tower = RecordingLoader()
+        model.multi_modal_projector = torch.nn.Linear(2, 2, bias=False)
+        projector_weight = torch.ones(2, 2)
+
+        model.eval().load_weights(
+            [
+                ("model.language_model.embed_tokens.weight", torch.zeros(1)),
+                ("lm_head.weight", torch.zeros(1)),
+                ("model.vision_tower.patch_conv.weight", torch.zeros(1)),
+                ("model.multi_modal_projector.weight", projector_weight),
+            ]
+        )
+
+        self.assertEqual(
+            model.language_model.loaded,
+            ["model.embed_tokens.weight", "lm_head.weight"],
+        )
+        self.assertEqual(model.vision_tower.loaded, ["patch_conv.weight"])
+        self.assertTrue(
+            torch.equal(model.multi_modal_projector.weight, projector_weight)
+        )
 
 
 if __name__ == "__main__":
