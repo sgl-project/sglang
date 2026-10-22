@@ -15,6 +15,10 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_kda_aiter import (
+    aiter_chunk_kda_fwd,
+    can_use_aiter_chunk_kda,
+)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -1295,6 +1299,37 @@ def chunk_kda(
 ):
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    if can_use_aiter_chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        output_intermediate_states=output_intermediate_states,
+        beta_is_raw=beta_is_raw,
+    ):
+        return aiter_chunk_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+        )
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
