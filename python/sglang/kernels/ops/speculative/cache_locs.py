@@ -25,7 +25,10 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+    from sgl_kernel import (
+        assign_draft_cache_locs_contiguous_cpu,
+        assign_extend_cache_locs_cpu,
+    )
 
 
 def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
@@ -77,6 +80,47 @@ def assign_draft_cache_locs_contiguous(
                     kv_start,
                     topk_offset < topk,
                 )
+
+
+def assign_draft_cache_locs_contiguous_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,  # mutable
+    topk: int,
+    num_cols: int,
+    positions: Optional[torch.Tensor] = None,  # mutable
+    mrope: Optional[torch.Tensor] = None,  # mutable
+):
+    """Copy each request's ``topk * num_cols`` slots from ``seq_lens`` on, and
+    write the draft positions when ``positions`` is given."""
+    if _is_cpu:
+        assert positions is None and mrope is None, "CPU writes no positions"
+        assign_draft_cache_locs_contiguous_cpu(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            out_cache_loc,
+            req_to_token.shape[1],
+            topk,
+            num_cols,
+        )
+        return
+    bs = seq_lens.shape[0]
+    assign_draft_cache_locs_contiguous[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        req_to_token.shape[1],
+        topk,
+        num_cols,
+        positions=positions,
+        mrope=mrope,
+        BS=bs,
+        WRITE_POSITIONS=positions is not None,
+        WRITE_MROPE=mrope is not None,
+    )
 
 
 @triton.jit
@@ -385,131 +429,6 @@ def generate_draft_decode_window_kv_indices(
 
 
 @triton.jit
-def align_evict_mask_to_page_size(
-    seq_lens,
-    evict_mask,
-    page_size: tl.constexpr,
-    num_draft_tokens: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    t_range = tl.arange(0, BLOCK_SIZE)
-
-    bid = tl.program_id(axis=0)
-    seq_len = tl.load(seq_lens + bid)
-    io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(
-        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
-    )
-
-    num_trues = tl.sum(mask_row)
-    num_false = num_draft_tokens - num_trues
-
-    start = (seq_len + num_false - 1) // page_size * page_size - seq_len
-    for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
-        tl.store(evict_mask + bid * num_draft_tokens + i, False)
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def get_src_tgt_cache_loc(
-    seq_lens: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    accept_index: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    draft_token_num: int,
-    page_size: int,
-):
-    src_cache_loc = out_cache_loc[accept_index]
-    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
-    # instead of caching-allocator garbage.
-    tgt_cache_loc = torch.zeros_like(src_cache_loc)
-    extended_len = seq_lens + draft_token_num
-    keep_len = torch.minimum(
-        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
-        extended_len,
-    )
-    to_free_num_slots = extended_len - keep_len
-    return src_cache_loc, tgt_cache_loc, to_free_num_slots
-
-
-@triton.jit
-def get_target_cache_loc(
-    tgt_cache_loc,
-    to_free_slots,
-    num_correct_drafts,
-    to_free_num_slots,
-    out_cache_loc,
-    num_verify_tokens: tl.constexpr,
-    num_verify_tokens_upper: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    bid = tl.program_id(axis=0)
-    offset = tl.arange(0, num_verify_tokens_upper)
-    bs_offset = tl.arange(0, bs_upper)
-
-    # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
-    tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(num_correct_drafts + bid) + 1
-    out_cache_loc_row = tl.load(
-        out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
-    )
-    tl.store(
-        tgt_cache_loc + tgt_cache_loc_start + offset,
-        out_cache_loc_row,
-        mask=offset < copy_len,
-    )
-
-    # write the second part to to_free_num_pages
-    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
-    to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
-    out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
-    to_free_slots_start = tl.sum(to_free_num_slots_all)
-
-    copy_len = to_free_num_slots_cur
-    out_cache_loc_row = tl.load(
-        out_cache_loc + bid * num_verify_tokens + out_cache_loc_start + offset,
-        mask=offset < copy_len,
-    )
-    tl.store(
-        to_free_slots + to_free_slots_start + offset,
-        out_cache_loc_row,
-        mask=offset < copy_len,
-    )
-
-
-@triton.jit
-def filter_finished_cache_loc_kernel(
-    out_cache_loc,
-    tgt_cache_loc,
-    num_correct_drafts,
-    num_accept_tokens_filter,
-    bs_upper: tl.constexpr,
-    num_verify_tokens_upper: tl.constexpr,
-):
-    bid = tl.program_id(0)
-    bs_offset = tl.arange(0, bs_upper)
-
-    num_correct_drafts_all = tl.load(
-        num_correct_drafts + bs_offset, mask=bs_offset < bid
-    )
-    old_start = tl.sum(num_correct_drafts_all) + bid
-
-    num_accept_tokens_filter_all = tl.load(
-        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
-    )
-    new_start = tl.sum(num_accept_tokens_filter_all)
-
-    copy_len = tl.load(num_accept_tokens_filter + bid)
-    copy_offset = tl.arange(0, num_verify_tokens_upper)
-    value = tl.load(
-        tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
-    )
-    tl.store(
-        out_cache_loc + new_start + copy_offset, value, mask=copy_offset < copy_len
-    )
-
-
-@triton.jit
 def rebuild_compact_draft_req_to_token(
     draft_req_to_token,
     target_req_to_token,
@@ -800,3 +719,34 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def fill_front_out_cache_loc_func(
+    num_front: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    front_out_cache_loc: torch.Tensor,  # mutable
+):
+    """Pack the first ``num_front[i]`` slots of request i's window in ``out_cache_loc``."""
+    bs = num_front.numel()
+    window = out_cache_loc.view(bs, -1)
+    rows = torch.arange(bs, device=window.device)
+    starts = torch.zeros_like(num_front)
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            rows,
+            window.int(),
+            starts,
+            num_front,
+            front_out_cache_loc,
+            window.shape[1],
+        )
+        return
+    assign_extend_cache_locs[(bs,)](
+        rows,
+        window,
+        starts,
+        num_front,
+        front_out_cache_loc,
+        window.shape[1],
+        next_power_of_2(bs),
+    )
