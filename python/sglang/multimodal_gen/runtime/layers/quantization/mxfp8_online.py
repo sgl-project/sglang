@@ -14,7 +14,6 @@ from typing import Optional
 
 import torch
 from torch.nn import Module
-from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
 
 from sglang.kernels.ops.diffusion import (
     can_use_mxfp8_swizzled,
@@ -34,6 +33,10 @@ def mxfp8_scaled_mm(
     bias: Optional[torch.Tensor],
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # Imported here: torch builds without the block-scaled scaled_mm API (e.g. the
+    # ROCm 7.2 images) must still load this module to take the fallback path.
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+
     return scaled_mm(
         a,
         weight.t(),
