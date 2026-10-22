@@ -4058,7 +4058,8 @@ class DeepseekV4Model(nn.Module):
                     )
             engram = self.layers[i].engram
             if engram is not None:
-                before_engram = state.residual
+                # No local name holds the pre-Engram residual: it would stay alive
+                # until the next Engram layer.
                 hidden_states = engram(
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
@@ -4071,7 +4072,7 @@ class DeepseekV4Model(nn.Module):
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
-                        before_engram,
+                        state.residual,
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
@@ -4083,6 +4084,7 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
+                del aux
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4353,9 +4355,13 @@ class DeepseekV4Model(nn.Module):
         tail = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
+            # Hand the layer input over without keeping a reference here, so the
+            # layer loop can free it once the first residual replaces it.
+            layer_input = [hidden_states]
+            del hidden_states
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
                 positions,
-                hidden_states,
+                layer_input.pop(),
                 forward_batch,
                 input_ids,
                 input_ids_global,
