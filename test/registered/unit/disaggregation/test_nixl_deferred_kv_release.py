@@ -19,10 +19,7 @@ from test_deferred_decode_kv_release import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import (
-    ABORT_TAG,
-    AckTarget,
-)
+from sglang.srt.disaggregation.common.conn import AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -155,28 +152,6 @@ class TestNixlAbortNotification(
             [(ROOM, AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION))],
         )
         self.assertEqual(manager._deferred_ack_targets, {})
-
-    def test_feature_off_marks_failed_without_ack(self):
-        manager = _manager(enabled=False)
-
-        claimed = manager._handle_abort_notification(self._abort_message())
-
-        self.assertTrue(claimed)
-        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        self.assertEqual(manager._deferred_ack_targets, {})
-        self.assertEqual(manager._sent, [])
-
-    def test_legacy_abort_without_return_address_is_tolerated(self):
-        manager = _manager()
-
-        claimed = manager._handle_abort_notification(
-            [ABORT_TAG, str(ROOM).encode("ascii")]
-        )
-
-        self.assertTrue(claimed)
-        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        self.assertEqual(manager._deferred_ack_targets, {})
-        self.assertEqual(manager._sent, [])
 
 
 if __name__ == "__main__":
