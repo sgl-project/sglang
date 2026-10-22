@@ -219,7 +219,7 @@ class Memory(msgspec.Struct):
     ] = "mooncake"
     enable_linker_mla_dedup: A[
         bool,
-        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+        "Read rank-replicated MLA KV once per TP group (Mooncake or KVCR linker).",
     ] = False
 
     # -------------------------------------------------------------------------
