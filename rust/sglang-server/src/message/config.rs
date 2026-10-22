@@ -106,6 +106,14 @@ pub struct ServerArgs {
     /// `"default"` on the Python side, so it is present in every blob; `None`
     /// only when the blob omits the key.
     pub weight_version: Option<String>,
+    /// HiCache storage backend configured at startup.
+    pub hicache_storage_backend: Option<String>,
+    /// Backend-specific configuration as a JSON string.
+    pub hicache_storage_backend_extra_config: Option<String>,
+    /// Policy for prefetching cached entries from HiCache storage.
+    pub hicache_storage_prefetch_policy: Option<String>,
+    /// Write policy for the hierarchical cache.
+    pub hicache_write_policy: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
@@ -216,6 +224,10 @@ impl ServerArgs {
         revision,
         load_format,
         weight_version,
+        hicache_storage_backend,
+        hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy,
+        hicache_write_policy,
         host,
         port,
         grpc_port,
@@ -264,6 +276,10 @@ impl ServerArgs {
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
+        hicache_storage_backend: Option<String>,
+        hicache_storage_backend_extra_config: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
         host: String,
         port: u16,
         grpc_port: Option<u16>,
@@ -310,6 +326,10 @@ impl ServerArgs {
             revision,
             load_format,
             weight_version,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
             host,
             port,
             grpc_port,
@@ -364,6 +384,10 @@ impl Default for ServerArgs {
             revision: None,
             load_format: None,
             weight_version: None,
+            hicache_storage_backend: None,
+            hicache_storage_backend_extra_config: None,
+            hicache_storage_prefetch_policy: None,
+            hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
