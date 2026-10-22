@@ -187,6 +187,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        shared_memory_group=None,
     ):
         """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
@@ -202,7 +203,10 @@ class HostKVCache(abc.ABC):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.shared_memory_group = shared_memory_group
+        self.allocator = get_allocator_from_storage(
+            allocator_type, shared_memory_group=shared_memory_group
+        )
         self.can_use_write_back_jit = False
 
         self.dtype = dtype
@@ -221,8 +225,9 @@ class HostKVCache(abc.ABC):
         self.end_layer = end_layer
         if not is_dummy:
             self._allocate_host_buffer()
-        self.lock = threading.RLock()
-        self.clear()
+        else:
+            self.lock = threading.RLock()
+            self.clear()
 
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
@@ -238,14 +243,19 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
+        error = None
         if requested_bytes > available_bytes:
-            raise ValueError(
+            error = ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
-        else:
+        if self.shared_memory_group is not None:
+            self.allocator.synchronize_error(error, operation="host memory admission")
+        elif error is not None:
+            raise error
+        if error is None:
             draft_layer_num = self.layer_num - self.target_layer_num
             if draft_layer_num > 0:
                 logger.info(
@@ -268,7 +278,29 @@ class HostKVCache(abc.ABC):
                 )
 
         self.kv_buffer = self.init_kv_buffer()
-        self.fd = getattr(self.allocator, "fd", None)
+        error = None
+        try:
+            self.fd = getattr(self.allocator, "fd", None)
+            # A lock for allocation and state transitions within this rank.
+            self.lock = threading.RLock()
+            self.clear()
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(error, operation="host pool metadata")
+
+    def _finish_shared_initialization(self, error, *, operation: str) -> None:
+        if not getattr(self.allocator, "is_shared", False):
+            if error is not None:
+                raise error
+            return
+        try:
+            self.allocator.synchronize_error(error, operation=operation)
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                logger.exception("Could not release failed shared HiCache pool")
+            raise
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
@@ -280,7 +312,6 @@ class HostKVCache(abc.ABC):
         """
         if getattr(self, "_destroyed", False):
             return
-        self._destroyed = True
         buffers = getattr(self, "kv_buffer", None)
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
             if not isinstance(buffers, (list, tuple)):
@@ -288,7 +319,16 @@ class HostKVCache(abc.ABC):
             for buf in buffers:
                 if buf is not None:
                     _cuda_host_unregister(buf)
+                    if getattr(self.allocator, "is_shared", False):
+                        self.allocator.release(buf)
         self.kv_buffer = None
+        if getattr(self.allocator, "is_shared", False):
+            self._clear_shared_host_views()
+            self.allocator.close()
+        self._destroyed = True
+
+    def _clear_shared_host_views(self) -> None:
+        """Drop subclass views only after all CUDA registrations are removed."""
 
     # Bytes between strided device KV rows; None (the default, and what a pool
     # built without `_init_device_row_stride` keeps) means packed rows.
