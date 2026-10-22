@@ -41,7 +41,7 @@ _BUDGET_VARIANT_CACHE_SIZE = 32
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    """Defers grammar constraints until the reasoning end sequence is complete."""
+    """Defers constraints until a reasoning end or native tool-start sequence."""
 
     def __init__(
         self,
@@ -56,6 +56,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         apply_vocab_mask_fn=None,
         think_starts: Sequence[str] = (),
         decode: Optional[Callable[[List[int]], str]] = None,
+        tool_start_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar = grammar
@@ -65,6 +66,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.think_starts = tuple(think_starts)
         self.decode = decode
         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
+        self.tool_start_ids = tuple(tool_start_ids or ())
+        self._tool_start_matcher = (
+            TokenSequenceMatcher(self.tool_start_ids) if self.tool_start_ids else None
+        )
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
@@ -83,10 +88,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._opening: List[int] = []
         self._opening_text = ""
         self._generated = 0
+        self._matched_tool_start_tokens = 0
+        self._tool_start_match_history: List[int] = []
+        # Unlike </think>, a tool-start marker belongs to the inner grammar.
+        # Track the replay separately from tokens emitted after the boundary.
+        self._tool_start_prefix_len = 0
 
     def maybe_init_reasoning(self, reasoning: bool):
         self._matched_think_end_tokens = 0
         self._thinking_match_history.clear()
+        self._matched_tool_start_tokens = 0
+        self._tool_start_match_history.clear()
+        self._tool_start_prefix_len = 0
         if reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
@@ -154,16 +167,49 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def transfer_state(self, token: int) -> None:
         if self._is_thinking():
             previous_match = self._matched_think_end_tokens
-            self._thinking_match_history.append(previous_match)
             matched = self._think_end_matcher.advance(previous_match, token)
+            tool_match = (
+                self._tool_start_matcher.advance(self._matched_tool_start_tokens, token)
+                if self._tool_start_matcher is not None
+                else 0
+            )
+            implicit_end = (
+                self._tool_start_matcher is not None
+                and tool_match == len(self._tool_start_matcher)
+                and matched != len(self._think_end_matcher)
+            )
+            if implicit_end and not self._accept_tool_start():
+                # A constraint that cannot start with the marker (e.g. a JSON
+                # schema) keeps it as reasoning text.
+                implicit_end = False
+                tool_match = self._tool_start_matcher.prefix_lengths[-1]
+            self._thinking_match_history.append(previous_match)
+            if self._tool_start_matcher is not None:
+                self._tool_start_match_history.append(self._matched_tool_start_tokens)
+            self._matched_tool_start_tokens = tool_match
             if matched == len(self._think_end_matcher):
                 self._matched_think_end_tokens = 0
+                self._matched_tool_start_tokens = 0
+                self.tokens_after_end = 0
+            elif implicit_end:
+                self._matched_think_end_tokens = 0
+                self._matched_tool_start_tokens = 0
+                self._tool_start_prefix_len = (
+                    0 if self.reasoning_in_grammar else len(self.tool_start_ids)
+                )
                 self.tokens_after_end = 0
             else:
                 self.tokens_in_think += previous_match + 1 - matched
                 self._matched_think_end_tokens = matched
         elif self._is_generation():
             self.tokens_after_end += 1
+
+    def _accept_tool_start(self) -> bool:
+        return (
+            self.reasoning_in_grammar
+            or self.grammar is None
+            or self.grammar.try_accept_tokens(list(self.tool_start_ids))
+        )
 
     def rollback_state(self):
         if self._is_thinking():
@@ -173,11 +219,20 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     previous_match + 1 - self._matched_think_end_tokens
                 )
                 self._matched_think_end_tokens = previous_match
+                if self._tool_start_matcher is not None:
+                    self._matched_tool_start_tokens = (
+                        self._tool_start_match_history.pop()
+                    )
         elif self._is_generation():
             if self.tokens_after_end == 0:
                 if self._thinking_match_history:
                     self.tokens_after_end = -1
                     self._matched_think_end_tokens = self._thinking_match_history.pop()
+                    if self._tool_start_matcher is not None:
+                        self._matched_tool_start_tokens = (
+                            self._tool_start_match_history.pop()
+                        )
+                    self._tool_start_prefix_len = 0
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
 
@@ -214,6 +269,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 steps_after = k
             else:
                 steps_after = min(k, max(0, self.tokens_after_end))
+                if self._is_generation() and k > self.tokens_after_end:
+                    # Undo the whole marker replay even when only its last token is
+                    # rolled back; re-accepting that token replays it exactly once.
+                    steps_after += self._tool_start_prefix_len
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
         if self.reasoning_in_grammar:
@@ -324,11 +383,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
             apply_vocab_mask_fn=self.apply_vocab_mask_fn,
             think_starts=self.think_starts,
             decode=self.decode,
+            tool_start_ids=self.tool_start_ids,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
         new_obj._matched_think_end_tokens = self._matched_think_end_tokens
         new_obj._thinking_match_history = list(self._thinking_match_history)
+        new_obj._matched_tool_start_tokens = self._matched_tool_start_tokens
+        new_obj._tool_start_match_history = list(self._tool_start_match_history)
+        new_obj._tool_start_prefix_len = self._tool_start_prefix_len
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
         new_obj.reasoning_in_grammar = self.reasoning_in_grammar
@@ -392,6 +455,21 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self._decode = lambda token_ids: tokenizer.decode(
             token_ids, skip_special_tokens=False, spaces_between_special_tokens=False
         )
+        tool_start_token = getattr(detector, "tool_start_token", None)
+        self.tool_start_ids = None
+        # A token mask cannot see line starts, so a line-anchored marker would end
+        # thinking where the reasoning parser does not.
+        if tool_start_token and not getattr(
+            detector, "tool_start_at_line_start", False
+        ):
+            self.tool_start_ids = tokenizer.encode(
+                tool_start_token, add_special_tokens=False
+            )
+            if not self.tool_start_ids:
+                raise ValueError(
+                    f"tool_start_token '{tool_start_token}' could not be encoded "
+                    "by the tokenizer."
+                )
         self._enable_strict_thinking = enable_strict_thinking
         self._answer_frame = reasoning_parser.detector.get_answer_frame()
         if self._answer_frame is not None:
@@ -454,6 +532,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
             think_starts=self.think_starts,
             decode=self._decode,
+            tool_start_ids=self.tool_start_ids,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj
