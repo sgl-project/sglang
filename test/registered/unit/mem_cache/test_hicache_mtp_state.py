@@ -128,9 +128,6 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
 
 
 def _dsa_draft_worker(monkeypatch, *, nextn_layers, dcp_replicated, dcp_size=4):
-    # The layout check is ROCm-only; CUDA keeps a replicated draft and never
-    # reaches it.
-    monkeypatch.setattr(spec, "_is_hip", True)
     monkeypatch.setattr(
         spec, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=dcp_size)
     )
