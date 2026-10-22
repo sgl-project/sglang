@@ -204,6 +204,7 @@ _npu_all_gather_base_mm = None
 if is_npu():
     try:
         import torch_npu  # noqa: F401
+
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         # arch35 (Ascend 950) MC2 fused ops accumulate at lower GEMM precision
