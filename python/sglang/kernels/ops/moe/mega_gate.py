@@ -17,6 +17,8 @@ def bf16_mega_gate(
     image_token_mask: Optional[torch.Tensor] = None,
     valid_token_mask: Optional[torch.Tensor] = None,
     hash_topk_ids: Optional[torch.Tensor] = None,
+    to_physical_map: Optional[torch.Tensor] = None,
+    logical_count: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import deep_gemm
@@ -52,6 +54,8 @@ def bf16_mega_gate(
             else None
         ),
         unmapped_topk_idx=hash_topk_ids,
+        to_physical_map=to_physical_map,
+        logical_count=logical_count,
         out=(ids, weights),
     )
     return weights, ids

@@ -471,6 +471,12 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         weights = scores.gather(1, ids)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
         weights = weights * kwargs["routed_scaling_factor"]
+        if kwargs["to_physical_map"] is not None:
+            physical_map, count = kwargs["to_physical_map"], kwargs["logical_count"]
+            assert physical_map.dtype == count.dtype == torch.int32
+            token = torch.arange(ids.shape[0])[:, None]
+            replica = (kwargs["ep_rank"] + token * 23333) % count[ids]
+            ids = physical_map[ids, replica]
         if kwargs["mask"] is not None:
             weights = weights.masked_fill(~kwargs["mask"][:, None], 0)
             ids = ids.masked_fill(~kwargs["mask"][:, None], -1)
@@ -606,14 +612,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                             torch.tensor([[0.5 * scale] * 2] * 3 + [[0.0, 0.0]]),
                         )
 
-    def test_mega_gate_maps_eplb_and_records_routed_ids(self):
+    def test_mega_gate_maps_eplb_in_kernel_and_records_from_buffer(self):
         moe = self._mega_gate_moe()
         hidden = torch.ones((4, 256), dtype=torch.bfloat16)
         hidden[2:] = float("nan")
         dispatch_info = ExpertLocationDispatchInfo(
             ep_dispatch_algorithm="static",
             partial_logical_to_rank_dispatch_physical_map=torch.tensor(
-                [9, 8, 7, 6, 5, 4, 3, 2], dtype=torch.int32
+                [9, 8, 7, 6, 5, 4, 3, 2]
             ),
             partial_logical_to_all_physical_map=None,
             partial_logical_to_all_physical_map_num_valid=None,
@@ -643,15 +649,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             routing = mega_gate_runtime.run_mega_gate(
                 moe, hidden, torch.tensor([7, 99, 1000, 1000]), buf
             )
-        self.assertFalse(routing.in_buffer)
+        self.assertTrue(routing.in_buffer)
         torch.testing.assert_close(
-            routing.topk_ids,
+            buf.topk_idx[:4],
             torch.tensor([[9, 8], [2, 3], [-1, -1], [-1, -1]]),
         )
-        self.assertTrue((routing.topk_weights[2:] == 0).all())
+        self.assertTrue((buf.topk_weights[2:4] == 0).all())
         self.assertEqual(len(recorded), 1)
-        torch.testing.assert_close(recorded[0], routing.topk_ids)
-        self.assertTrue((buf.topk_idx == 0).all())
+        torch.testing.assert_close(recorded[0], buf.topk_idx[:4])
         for algorithm in ("lp", "fake"):
             with patch.object(
                 moe.topk,

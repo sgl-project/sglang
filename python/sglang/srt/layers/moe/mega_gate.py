@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple, Optional
 
 import torch
@@ -90,16 +91,27 @@ def should_use_mega_gate(moe, hidden_states: torch.Tensor) -> bool:
     )
 
 
-def _routes_into_buffer(moe, dispatch_info) -> bool:
-    if dispatch_info is not None:
-        return False
-    if (
+def _captures_routed_experts(moe) -> bool:
+    return (
         not moe.is_hash
         and moe.topk.topk_config.allow_routed_experts_capture
         and get_global_experts_capturer() is not None
-    ):
-        return False
-    return get_exec().moe.expert_distribution_recorder_mode is None
+    )
+
+
+@functools.lru_cache
+def _ones(num_experts: int, device: torch.device) -> torch.Tensor:
+    return torch.ones(num_experts, dtype=torch.int32, device=device)
+
+
+def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
+    if info.ep_dispatch_algorithm == "static":
+        rank_map = info.partial_logical_to_rank_dispatch_physical_map
+        return rank_map.to(torch.int32)[:, None], _ones(len(rank_map), rank_map.device)
+    return (
+        info.partial_logical_to_all_physical_map.to(torch.int32),
+        info.partial_logical_to_all_physical_map_num_valid.to(torch.int32),
+    )
 
 
 def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateRouting]:
@@ -129,7 +141,17 @@ def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateR
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
-    in_buffer = buf is not None and _routes_into_buffer(moe, dispatch_info)
+    # The benchmark override writes logical ids, so with EPLB it must run before the remap.
+    in_buffer = (
+        buf is not None
+        and not _captures_routed_experts(moe)
+        and not (dispatch_info is not None and routing_simulation_enabled())
+    )
+    to_physical_map = logical_count = None
+    if in_buffer and dispatch_info is not None:
+        # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
+        # under EPLB the gate must map logical ids in-kernel to stay on this path.
+        to_physical_map, logical_count = _physical_dispatch_maps(dispatch_info)
     weights, ids = bf16_mega_gate(
         hidden_states,
         moe.gate.weight,
@@ -143,6 +165,8 @@ def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateR
         image_token_mask=image,
         valid_token_mask=valid,
         hash_topk_ids=hash_ids,
+        to_physical_map=to_physical_map,
+        logical_count=logical_count,
         out=(
             (buf.topk_idx[:num_tokens], buf.topk_weights[:num_tokens])
             if in_buffer
@@ -164,6 +188,9 @@ def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateR
             ),
         )
     if in_buffer:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=buf.topk_idx[:num_tokens]
+        )
         return MegaGateRouting(None, None, 1.0, True)
 
     if moe.is_hash:
