@@ -1,16 +1,4 @@
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# SPDX-License-Identifier: Apache-2.0
 """Beam attention gate with activation-dtype bias and sigmoid rounding."""
 
 from __future__ import annotations
@@ -64,6 +52,12 @@ def _fake_attention_gate(attention_output, gate, gate_bias, head_dim):
     return torch.empty_like(attention_output, memory_format=torch.contiguous_format)
 
 
+@torch.compiler.disable
+def _eager_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    # Inductor's sigmoid can round FP16 one ULP away from ATen's.
+    return torch.sigmoid(x)
+
+
 @register_custom_op(fake_impl=_fake_attention_gate)
 def fused_attention_gate(
     attention_output: torch.Tensor,
@@ -74,6 +68,8 @@ def fused_attention_gate(
     """`attention_output * sigmoid(gate + gate_bias[head])` for 2-D `[tokens, heads*head_dim]` inputs."""
     if attention_output.shape != gate.shape or attention_output.ndim != 2:
         raise ValueError("attention_output and gate must be matching 2-D tensors")
+    if attention_output.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("attention_output must be fp16, bf16 or fp32")
     attention_output = attention_output.contiguous()
     hidden_dim = attention_output.shape[1]
     if gate_bias.numel() * head_dim != hidden_dim or not gate_bias.is_contiguous():
@@ -110,10 +106,9 @@ class BeamAttentionGateOp(BaseFusedOp):
 
     def forward_torch_compile(self, *args, **kwargs):
         if self._compiled_native is None:
-            # Register and warm the opaque op before tracing its dispatch wrapper.
-            self.forward_triton(*args, **kwargs)
+            # Without emulated casts, Inductor drops eager's intermediate rounding.
             self._compiled_native = torch.compile(
-                self.forward_triton, options={"emulate_precision_casts": True}
+                self.forward_native, options={"emulate_precision_casts": True}
             )
         return self._compiled_native(*args, **kwargs)
 
@@ -125,7 +120,7 @@ class BeamAttentionGateOp(BaseFusedOp):
         head_dim: int,
     ) -> torch.Tensor:
         heads = gate_bias.numel()
-        multiplier = torch.sigmoid(
+        multiplier = _eager_sigmoid(
             gate.reshape(-1, heads, head_dim) + gate_bias[None, :, None]
         )
         return (attention_output.reshape(-1, heads, head_dim) * multiplier).reshape_as(
@@ -139,9 +134,4 @@ class BeamAttentionGateOp(BaseFusedOp):
         gate_bias: torch.Tensor,
         head_dim: int,
     ) -> torch.Tensor:
-        if not attention_output.is_cuda or attention_output.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            return self.forward_native(attention_output, gate, gate_bias, head_dim)
         return fused_attention_gate(attention_output, gate, gate_bias, head_dim)

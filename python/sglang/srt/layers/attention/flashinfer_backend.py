@@ -1471,18 +1471,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
-                ragged_window_left = layer.sliding_window_size
-                # The sliding mask excludes no keys when every uncached
-                # sequence fits the window. Reuse the full attention plan.
-                if (
-                    self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-                    and wrapper_idx == 0
-                    and ragged_window_left >= 0
-                    and forward_batch.extend_seq_lens_cpu
-                    and max(forward_batch.extend_seq_lens_cpu) <= ragged_window_left + 1
-                ):
-                    prefill_wrapper_ragged = self.prefill_wrappers_ragged[1]
-                    ragged_window_left = -1
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
@@ -1492,7 +1480,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
-                    window_left=ragged_window_left,
+                    window_left=layer.sliding_window_size,
                     logits_soft_cap=logits_soft_cap,
                 )
 

@@ -11,12 +11,13 @@ launch is needed — every extra launch costs ~2us on gfx950.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.bf16x3_split import split_fp32_to_bf16x3
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
@@ -31,8 +32,8 @@ _CONFIGS = (
     (32, (16, 32, 512, 8, 4)),
     (_MAX_M, (32, 32, 512, 8, 4)),
 )
-# FP32 weights on CUDA (FP32 router gates) use the FP32 row path only; above
-# 8 rows router_gemm_bf16x3_cublas is faster. Swept for N=256, K=5120 on H200 and B300.
+# FP32 weights on CUDA (FP32 router gates) use the FP32 row path only, up to 8 rows,
+# a conservative cap: for N=256, K=5120 on GB300 it beats bf16x3 through 14 rows.
 _CUDA_FP32_CONFIGS = ((8, (1, 16, 128, 8, 8)),)
 
 
@@ -40,7 +41,7 @@ def _configs(w_dtype: torch.dtype):
     return _CUDA_FP32_CONFIGS if w_dtype == torch.float32 else _CONFIGS
 
 
-def _config(m: int, w_dtype: torch.dtype = torch.bfloat16):
+def _config(m: int, w_dtype: torch.dtype):
     configs = _configs(w_dtype)
     for max_m, cfg in configs:
         if m <= max_m:
@@ -186,61 +187,13 @@ def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@triton.jit
-def _split_fp32_to_bf16x3_kernel(w_ptr, out_ptr, numel, BLOCK: tl.constexpr):
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
-    w = tl.load(w_ptr + offs, mask=mask)
-    hi = w.to(tl.bfloat16)
-    residual = w - hi.to(tl.float32)
-    mid = residual.to(tl.bfloat16)
-    lo = (residual - mid.to(tl.float32)).to(tl.bfloat16)
-    tl.store(out_ptr + offs, hi, mask=mask)
-    tl.store(out_ptr + numel + offs, mid, mask=mask)
-    tl.store(out_ptr + 2 * numel + offs, lo, mask=mask)
-
-
-def split_fp32_to_bf16x3(
-    w: torch.Tensor, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """[N, K] fp32 -> [3N, K] bf16 as (hi, mid, lo) blocks with w == hi + mid + lo.
-
-    Exact for |w| >= 2**-110: each part takes the next 8 significant bits, and the
-    last residual then stays a normal number.
-    """
-    if out is None:
-        out = torch.empty(
-            3 * w.shape[0], w.shape[1], dtype=torch.bfloat16, device=w.device
-        )
-    if w.is_cuda and w.is_contiguous():
-        block = 1024
-        _split_fp32_to_bf16x3_kernel[(triton.cdiv(w.numel(), block),)](
-            w, out, w.numel(), BLOCK=block
-        )
-        return out
-    hi = w.to(torch.bfloat16)
-    residual = w - hi.float()
-    mid = residual.to(torch.bfloat16)
-    lo = (residual - mid.float()).to(torch.bfloat16)
-    return torch.cat([hi, mid, lo], out=out)
-
-
-_split_scratch: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
-
-
 def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """[M, K] bf16 x [N, K] fp32 router logits on BF16 tensor cores.
 
     The fp32 weight is split per call, so in-place weight updates take effect
-    without any refresh. Every bf16 x bf16 product is exact in fp32, but
-    tensor-core accumulation is not IEEE fp32: the error is a few times that of
-    an fp32 SGEMM.
+    without any refresh. Each bf16 x bf16 product is exact within fp32's exponent
+    range, but tensor-core accumulation is not IEEE fp32 summation.
     """
-    n, k = w.shape
-    key = (w.device, n, k)
-    if key not in _split_scratch:
-        _split_scratch[key] = torch.empty(
-            3 * n, k, dtype=torch.bfloat16, device=w.device
-        )
-    w3 = split_fp32_to_bf16x3(w, out=_split_scratch[key])
+    n = w.shape[0]
+    w3 = split_fp32_to_bf16x3(w)
     return torch.mm(x, w3.t(), out_dtype=torch.float32).view(-1, 3, n).sum(dim=1)

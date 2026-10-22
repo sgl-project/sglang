@@ -13,7 +13,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 #include <utility>
 
 namespace sglang {
@@ -85,8 +84,7 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
   const uint32_t tx = threadIdx.x;
   const Weight* w_tile = static_cast<const Weight*>(params.w) + bx * (N_SPLIT * K);
 
-  // FP32 weights may have been updated by the preceding graph node.
-  if constexpr (std::is_same_v<Weight, float>) PDLWaitPrimary<kUsePDL>();
+  // prefetch weight before PDL
   using weight_vec_t = AlignedVector<packed_t<Weight>, kVecSize / 2>;
   weight_vec_t wv[N_SPLIT][kUnroll];
 #pragma unroll
@@ -97,7 +95,7 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
     }
   }
 
-  if constexpr (!std::is_same_v<Weight, float>) PDLWaitPrimary<kUsePDL>();
+  PDLWaitPrimary<kUsePDL>();
 
   vec_t xv[M][kUnroll];
 #pragma unroll
