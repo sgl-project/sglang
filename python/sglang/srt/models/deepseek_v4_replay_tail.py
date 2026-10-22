@@ -4,8 +4,9 @@ Eager prefill steps replay them directly. A prefill-graph shape of at least
 ``SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS`` tokens replays them from one
 eager break, through bridge buffers; smaller shapes keep the tail captured.
 
-Under DP attention every rank replays the largest rank's bucket. MegaMoE agrees
-on it through a host gather, so it needs the prefill graph off.
+Under DP attention every rank replays the largest rank's bucket. In an eager step
+MegaMoE agrees on it through a host gather; the prefill-graph break reads every
+rank's rows from the pre-forward exchange.
 """
 
 from __future__ import annotations
@@ -282,7 +283,6 @@ class DecoderReplayTail:
 
         return (
             num_tokens >= envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS.get()
-            and (get_parallel().attn_dp_size == 1 or get_moe_a2a_backend().is_none())
             and tail.cp_metadata is None
             and not is_unified_kv_triton()
             # Encoder replay's folded rows are not checked against the exact tail.

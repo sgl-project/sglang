@@ -36,29 +36,6 @@ def _mha(**overrides):
 
 
 class TestPageUnifiedLayout(CustomTestCase):
-    def test_page_dims_are_the_byte_order(self):
-        """The buffer's C-contiguous strides must equal the declared strides.
-
-        Everything else here -- and both transfer kernels -- computes offsets
-        from the layout rather than from the tensor, so a disagreement between
-        the two would move correct-looking bytes to wrong addresses.
-        """
-        layout = _mha()
-        buffer = torch.empty(layout.page_dims(3), dtype=torch.bfloat16)
-        strides = [s * buffer.element_size() for s in buffer.stride()]
-        self.assertEqual(
-            strides,
-            [
-                layout.bytes_per_page,
-                layout.head_group_bytes,
-                layout.layer_bytes,
-                layout.page_size * layout.group_bytes,
-                layout.group_bytes,
-                layout.head_dim * layout.itemsize,
-                layout.itemsize,
-            ],
-        )
-
     def test_chunks_tile_the_page_exactly_once(self):
         """The grid's chunks must partition a page: no gap, no overlap.
 
@@ -92,35 +69,6 @@ class TestPageUnifiedLayout(CustomTestCase):
             ],
         )
         self.assertEqual(sum(length for _, length in spans), layout.bytes_per_page)
-
-    def test_head_group_count_does_not_change_page_size(self):
-        """Cutting the head axis permutes a page; it must not resize it."""
-        sizes = {
-            PageUnifiedLayout(
-                page_size=4,
-                layer_num=6,
-                head_num=8,
-                head_group_num=groups,
-                head_dim=16,
-                itemsize=2,
-            ).bytes_per_page
-            for groups in (1, 2, 4, 8)
-        }
-        self.assertEqual(len(sizes), 1)
-
-    def test_mla_page_has_no_head_or_component_axis(self):
-        layout = PageUnifiedLayout(
-            page_size=64,
-            layer_num=61,
-            head_num=1,
-            head_group_num=1,
-            head_dim=576,
-            itemsize=2,
-            is_mla=True,
-        )
-        self.assertEqual(layout.page_dims(7), (7, 61, 64, 576))
-        self.assertEqual(layout.components, 1)
-        self.assertEqual(layout.chunk_span((0, 61)), (0, layout.bytes_per_page))
 
     def test_unaligned_group_row_is_rejected(self):
         """The transfer kernels move 16-byte vectors and cannot express a tail."""

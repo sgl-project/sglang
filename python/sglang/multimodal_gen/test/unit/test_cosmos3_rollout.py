@@ -4,14 +4,21 @@ selection and fused-parameter shard-id plumbing in the weights updater."""
 
 import types
 import unittest
+from contextlib import nullcontext
+from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    cosmos3,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -103,6 +110,42 @@ class TestPrepareRolloutRequestScheduler(unittest.TestCase):
 
         self.assertIs(batch.scheduler, serving)
         torch.testing.assert_close(serving.sigmas, expected)
+
+
+class TestCosmos3ServingStep(unittest.TestCase):
+    def test_serving_request_steps_unipc_without_rollout_kwargs(self):
+        """A serving request runs Cosmos3's denoise loop on the UniPC serving
+        scheduler, whose step() takes no ``transition``: the loop must not pass
+        rollout-only keyword arguments to it."""
+        stage = cosmos3.Cosmos3DenoisingStage.__new__(cosmos3.Cosmos3DenoisingStage)
+        stage.scheduler = _serving_scheduler()
+        stage.transformer = mock.Mock()
+        stage._logged_parallel_config = True
+        stage.log_info = mock.Mock()
+        stage.progress_bar = lambda iterable, **kwargs: iterable
+        stage.use_declared_component = lambda **kwargs: nullcontext()
+        # Zero velocity: every UniPC step leaves the latents unchanged.
+        stage._run_transformer = lambda **kwargs: torch.zeros_like(kwargs["latents"])
+        text = torch.ones(1, 2, dtype=torch.long)
+        batch = Req(
+            sampling_params=SamplingParams(prompt="test", guidance_scale=1.0),
+            latents=torch.ones(1, 1, 1, 1, 1),
+            timesteps=stage.scheduler.timesteps,
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": text,
+                "uncond_text_ids": text,
+                "uncond_text_mask": text,
+                "cond_text_seq_len": 2,
+                "video_shape": (1, 1, 1),
+            },
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=None, enable_cfg_parallel=False
+        )
+        with mock.patch.object(cosmos3, "get_sp_world_size", return_value=1):
+            stage.forward(batch, server_args)
+        torch.testing.assert_close(batch.latents, torch.ones_like(batch.latents))
 
 
 class _FusedParamModule(torch.nn.Module):
