@@ -30,41 +30,18 @@ def _prepare_a4(
     X,
     Q,
     QS,
-    IDS,
     EXPERT,
-    POST,
-    FIRST,
-    M: tl.constexpr,
-    START: tl.constexpr,
+    NEXT,
     NB: tl.constexpr,
     NBB: tl.constexpr,
-    S: tl.constexpr,
-    PER_E: tl.constexpr,
-    BM: tl.constexpr,
-    E: tl.constexpr,
 ):
-    # Program 0: per-expert route counts -> block offsets and the block->expert map; the rank scan and
-    # scatter run per expert in _scatter_a4. Programs 1..4M quantize activation rows.
+    # Program 0: clear the block->expert map and the block allocator for _scatter_a4.
+    # Programs 1..4M quantize activation rows.
     pid = tl.program_id(0)
     if pid == 0:
-        r = tl.arange(0, S)
-        e = tl.arange(0, E)
-        ids = tl.load(IDS + r, r < M * 8, other=-1)
-        hits = (ids[None, :] == START + e[:, None]) & (r[None, :] < M * 8)
-        blocks = tl.cdiv(tl.sum(hits.to(tl.int32), axis=1), BM)
-        first = tl.cumsum(blocks, axis=0) - blocks
         b = tl.arange(0, NBB)
         tl.store(EXPERT + b, -1, b < NB)
-        tl.store(FIRST + e, first)
-        # The later block-map writes may be owned by a different lane than initialization.
-        tl.debug_barrier()
-        eb = tl.arange(0, PER_E)
-        tl.store(
-            EXPERT + first[:, None] + eb[None, :],
-            e[:, None],
-            eb[None, :] < blocks[:, None],
-        )
-        tl.store(POST, tl.sum(blocks, axis=0) * BM)
+        tl.store(NEXT, 0)
     else:
         row = (pid - 1) // 4
         tile = (pid - 1) % 4
@@ -81,25 +58,33 @@ def _prepare_a4(
 def _scatter_a4(
     IDS,
     SORTED,
-    FIRST,
+    EXPERT,
+    NEXT,
     M: tl.constexpr,
     START: tl.constexpr,
     S: tl.constexpr,
     PER_E: tl.constexpr,
     BM: tl.constexpr,
 ):
-    # One program per local expert: rank its routes in token order and fill its blocks (sentinel M*8).
+    # One program per local expert: count its routes, take its blocks from the shared allocator (block order
+    # varies run to run; every block is computed and stored independently, so outputs do not), map them to the
+    # expert and rank its routes in token order into them (sentinel M*8).
     e = tl.program_id(0)
     s = tl.arange(0, S)
     ids = tl.load(IDS + s, s < M * 8, other=-1)
     hit = (ids == START + e) & (s < M * 8)
-    rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
-    nslots = tl.cdiv(tl.sum(hit.to(tl.int32), axis=0), BM) * BM
-    base = tl.load(FIRST + e) * BM
-    c = tl.arange(0, PER_E * BM)
-    tl.store(SORTED + base + c, M * 8, c < nslots)
-    tl.debug_barrier()
-    tl.store(SORTED + base + rank, s, hit)
+    count = tl.sum(hit.to(tl.int32), axis=0)
+    blocks = tl.cdiv(count, BM)
+    if blocks > 0:
+        first = tl.atomic_add(NEXT, blocks)
+        eb = tl.arange(0, PER_E)
+        tl.store(EXPERT + first + eb, e, eb < blocks)
+        rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
+        base = first * BM
+        c = tl.arange(0, PER_E * BM)
+        tl.store(SORTED + base + c, M * 8, c < blocks * BM)
+        tl.debug_barrier()
+        tl.store(SORTED + base + rank, s, hit)
 
 
 @triton.jit
@@ -254,37 +239,21 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start, shuffled=False)
     nb = triton.cdiv(cap, bm)
     sid = torch.empty(cap, device=x.device, dtype=torch.int32)
     eid = torch.empty(nb, device=x.device, dtype=torch.int32)
-    post = torch.empty(1, device=x.device, dtype=torch.int32)
+    nxt = torch.empty(1, device=x.device, dtype=torch.int32)
     q = torch.empty((m, 2048), device=x.device, dtype=torch.uint8)
     qs = torch.empty((m, 128), device=x.device, dtype=torch.uint8)
     inter = torch.empty((rows, 2048), device=x.device, dtype=torch.uint8)
     inter_scale = torch.empty((rows, 128), device=x.device, dtype=torch.uint8)
     y = torch.empty((rows, h), device=x.device, dtype=torch.bfloat16)
-    first = torch.empty(e_local, device=x.device, dtype=torch.int32)
     s_pow2, per_e = (
         triton.next_power_of_2(rows),
         triton.next_power_of_2(triton.cdiv(rows, bm)),
     )
     _prepare_a4[(1 + m * 4,)](
-        x,
-        q,
-        qs,
-        ids,
-        eid,
-        post,
-        first,
-        m,
-        local_start,
-        nb,
-        triton.next_power_of_2(nb),
-        s_pow2,
-        per_e,
-        bm,
-        e_local,
-        num_warps=4,
+        x, q, qs, eid, nxt, nb, triton.next_power_of_2(nb), num_warps=4
     )
     _scatter_a4[(e_local,)](
-        ids, sid, first, m, local_start, s_pow2, per_e, bm, num_warps=4
+        ids, sid, eid, nxt, m, local_start, s_pow2, per_e, bm, num_warps=4
     )
     grid = (4096 // 64, nb)
     options = dict(num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
