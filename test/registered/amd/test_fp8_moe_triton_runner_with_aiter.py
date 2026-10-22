@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
@@ -98,11 +98,12 @@ def _triton_moe(layer, hidden_states, topk_output):
 )
 class TestFp8MoeTritonRunnerWithAiter(CustomTestCase):
     def setUp(self):
-        self.enterContext(
-            get_context().override_server_args(model_path="dummy", device="cuda")
+        # enter_scope rather than enterContext, which is 3.11+.
+        enter_scope(
+            self, get_context().override_server_args(model_path="dummy", device="cuda")
         )
-        self.enterContext(
-            get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON)
+        enter_scope(
+            self, get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON)
         )
 
     def test_the_triton_runner_computes_what_it_computes_without_aiter(self):
