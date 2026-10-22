@@ -84,7 +84,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
         coordinator = MagicMock(
             token_to_kv_pool_allocator=token_allocator,
-            mem_pool_device=SimpleNamespace(layer_num=3),
+            mem_pool_device=SimpleNamespace(layer_num=3, page_size=64),
             req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 16))),
             device="cpu",
             is_dsv4_hisparse=False,
@@ -165,6 +165,8 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
 
     def test_accept_commit_keeps_hot_and_newest_device_slots(self):
         coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.compress_ratio = 1
+        coordinator.is_dsv4_hisparse = False
         coordinator.device_buffer_size = 5
         coordinator.page_size = 8
         coordinator.req_to_device_buffer = torch.tensor(
