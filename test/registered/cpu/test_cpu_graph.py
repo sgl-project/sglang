@@ -6,7 +6,7 @@ python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -44,11 +44,10 @@ class TestCPUGraph(CustomTestCase):
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
-        n_numa_node = len(get_cpu_ids_by_node())
         # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
         # fall back to the original one-rank-per-numa-node default.
         tp_size = 6
-        bind = get_tp_cpu_bind(n_numa_node)
+        bind = get_tp_cpu_bind(tp_size)
         process = popen_launch_server(
             model,
             base_url,
