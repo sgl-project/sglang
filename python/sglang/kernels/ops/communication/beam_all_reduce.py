@@ -34,11 +34,9 @@ def _module(world_size: int, hidden_size: int, cluster: int, topk: int):
 
 
 def _cluster_size(world_size: int, rows: int, topk: int) -> int:
-    # Measured on 8xH200: 5-CTA clusters win at TP8 up to 8 rows (top-k 1) or
-    # 16 rows (top-k 8); one CTA per row wins elsewhere and at TP2/TP4.
-    if world_size == 8:
-        return 5 if rows <= (16 if topk == 8 else 8) else 1
-    return 1
+    # Measured on 8xH200: 5-CTA clusters win at TP8 up to 16 rows for top-k 1 and 8;
+    # one CTA per row wins from 32 rows and at TP2/TP4.
+    return 5 if world_size == 8 and rows <= 16 else 1
 
 
 def beam_all_reduce_norm(
