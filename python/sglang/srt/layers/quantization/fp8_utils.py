@@ -16,6 +16,7 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
 from sglang.kernels.ops.gemm.hopper_fp8_block_gemv import (
     hopper_fp8_block_gemv,
     use_hopper_fp8_block_gemv,
+    use_hopper_fp8_block_gemv_side,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     dequant_group_fp8_to_bf16,
@@ -1470,6 +1471,81 @@ def _use_fp8_block_gemv(
         and use_hopper_fp8_block_gemv(
             input_2d.shape[0], weight.shape[0], weight.shape[1], block_size
         )
+    )
+
+
+def can_use_fused_kda_output_quant(
+    linear: LinearBase,
+    m: int,
+    k: int,
+    input_dtype: torch.dtype,
+) -> bool:
+    if not envs.SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT.get() or not 1 <= m <= 8:
+        return False
+    # Import lazily: fp8.py imports this module while defining Fp8LinearMethod.
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+    quant_method = linear.quant_method
+    if not isinstance(quant_method, Fp8LinearMethod):
+        return False
+    if not (
+        input_dtype == torch.bfloat16
+        and quant_method.block_quant
+        and not quant_method.use_marlin
+        and not quant_method.use_mxfp8
+        and not quant_method.block_fp8_as_mxfp8
+        and not (
+            isinstance(quant_method.quant_config, Fp8Config)
+            and quant_method.quant_config.scale_fmt == "ue8m0"
+        )
+        and quant_method.w8a8_block_fp8_linear
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and tuple(quant_method.weight_block_size) == (128, 128)
+        and linear.bias is None
+    ):
+        return False
+
+    weight = linear.weight
+    weight_scale = linear.weight_scale_inv
+    if weight.ndim != 2:
+        return False
+    n = weight.shape[0]
+    if not (
+        weight.dtype == torch.float8_e4m3fn
+        and weight.is_cuda
+        and weight.device == weight_scale.device
+        and weight.shape[1] == k
+        and weight.is_contiguous()
+        and weight_scale.dtype == torch.float32
+        and weight_scale.shape == ((n + 127) // 128, k // 128)
+        and weight_scale.is_contiguous()
+    ):
+        return False
+    return _fp8_block_gemv_enabled() and use_hopper_fp8_block_gemv(
+        m, n, k, quant_method.weight_block_size
+    )
+
+
+def fp8_block_gemv_with_side(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    side_weight: torch.Tensor,
+    act_scale_ue8m0: bool = False,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not (
+        input_2d.dtype == torch.bfloat16
+        and _use_fp8_block_gemv(input_2d, weight, weight_scale, block_size)
+        and side_weight.device == input_2d.device
+        and use_hopper_fp8_block_gemv_side(side_weight, input_2d.shape[1])
+    ):
+        return None
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d, block_size[1], scale_ue8m0=act_scale_ue8m0
+    )
+    return hopper_fp8_block_gemv(
+        q_input, x_scale, weight, weight_scale, x_bf16=input_2d, side_w=side_weight
     )
 
 

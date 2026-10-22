@@ -162,6 +162,61 @@ class TestPrequantizedBlockFp8Routing(CustomTestCase):
         self.assertFalse(use_hopper_fp8_block_gemv(1, 1536, 4096, [32, 32]))
 
 
+class TestFusedKdaOutputQuantGate(CustomTestCase):
+    @staticmethod
+    def _o_proj(n=2048, k=1024):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        def tensor(shape, dtype):
+            return SimpleNamespace(
+                shape=shape,
+                ndim=len(shape),
+                dtype=dtype,
+                is_cuda=True,
+                device="cuda:0",
+                is_contiguous=lambda: True,
+            )
+
+        method = MagicMock(spec=Fp8LinearMethod)
+        method.block_quant = True
+        method.use_marlin = False
+        method.use_mxfp8 = False
+        method.block_fp8_as_mxfp8 = False
+        method.quant_config = SimpleNamespace()
+        method.w8a8_block_fp8_linear = (
+            fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
+        method.weight_block_size = [128, 128]
+        return SimpleNamespace(
+            quant_method=method,
+            bias=None,
+            weight=tensor((n, k), torch.float8_e4m3fn),
+            weight_scale_inv=tensor((n // 128, k // 128), torch.float32),
+        )
+
+    def test_requires_both_env_gates_and_small_m(self):
+        from sglang.srt.environ import envs
+
+        def gate(kda_env, gemv_env, m):
+            with (
+                envs.SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT.override(kda_env),
+                envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.override(gemv_env),
+                patch.object(
+                    fp8_utils,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_sm90=True),
+                ),
+            ):
+                return fp8_utils.can_use_fused_kda_output_quant(
+                    self._o_proj(), m=m, k=1024, input_dtype=torch.bfloat16
+                )
+
+        self.assertTrue(gate(True, True, 8))
+        self.assertFalse(gate(False, True, 8))
+        self.assertFalse(gate(True, False, 8))
+        self.assertFalse(gate(True, True, 9))
+
+
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
         for _ in range(100):
