@@ -6,43 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1), **DeepSeek V4**, and **MiniMax M3**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. The existing `--enable-hisparse` path uses a private host pool and supports decode-side PD disaggregation. The opt-in V2 path below shares the HiCache host tier with the radix cache on a colocated server.
-
-## DSA with the shared HiCache host tier (V2)
-
-For unpooled DSA models such as DeepSeek-V3.2 on NVIDIA CUDA, V2 shares
-HiCache's host pool while retaining radix caching. Append these options to the
-model's [cookbook deployment](/cookbook/intro):
-
-```bash
---enable-hisparse-v2 \
---enable-hierarchical-cache \
---hicache-ratio 2 \
---hicache-write-policy write_back \
---hicache-mem-layout page_first \
---page-size 64
-```
-
-V2 supports chunked prefill, decode CUDA graphs, and linear EAGLE/MTP with one
-DSA draft model: use `--speculative-eagle-topk 1` and 2-4
-`--speculative-num-draft-tokens`. MTP shares one `device_buffer_size` hot buffer
-across queries and deduplicates their swap misses, using the same hot/scratch
-policy as V1. For `N` draft tokens, scratch holds
-`min(N * top_k, max(1024, N * top_k - device_buffer_size))` slots per request.
-Hot and scratch slots are reserved together before prefill and released when
-the request finishes. Resident KV is read directly from the GPU pool; hot slots
-are populated on demand after HiCache eviction. Target and draft KV share slot
-ownership and the HiCache lifecycle. Adaptive speculation and multi-layer drafts
-are unsupported.
-V2 cannot be combined with `--enable-hisparse`, PD, PP/CP, hybrid SWA, mixed
-prefill/decode batches, sessions, or routed-expert recording.
-
-V2 keeps GPU indexes for Device KV pages and Host KV pages, sharing prefix
-indexes across requests. The default index capacity is `(1 + hicache_ratio)`
-times the Device KV capacity, plus page padding. A custom `expansion_ratio`
-sets the Host-addressed index region and must cover the actual HiCache host pool.
-
-The remaining sections describe `--enable-hisparse`.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1), **DeepSeek V4**, and **MiniMax M3**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
 
 ## Why HiSparse?
 
