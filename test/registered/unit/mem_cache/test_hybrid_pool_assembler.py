@@ -362,7 +362,9 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool = SimpleNamespace(
+            layer_num=1, size=800, rows_are_dcp_collapsed=False
+        )
         draft_kv_pool.host_pool_decls = lambda: (make_kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
