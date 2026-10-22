@@ -1432,15 +1432,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
-            if (
-                obj.bidir_prefix_len is not None
-                and obj.bidir_prefix_len >= 0
-                and self.server_args.attention_backend not in (None, "triton")
-            ):
-                raise ValueError(
-                    "bidir_prefix_len (block-bidirectional attention) is only "
-                    "supported by the triton attention backend."
-                )
+            if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
+                if self.server_args.attention_backend not in (None, "triton"):
+                    raise ValueError(
+                        "bidir_prefix_len (block-bidirectional attention) is only "
+                        "supported by the triton attention backend."
+                    )
+                chunk = self.server_args.chunked_prefill_size
+                if chunk is not None and 0 < chunk < input_token_num:
+                    raise ValueError(
+                        f"bidir_prefix_len prompts are not chunked; the prompt has "
+                        f"{input_token_num} tokens but --chunked-prefill-size is {chunk}."
+                    )
             if (
                 obj.return_sampling_mask
                 and obj.custom_logit_processor

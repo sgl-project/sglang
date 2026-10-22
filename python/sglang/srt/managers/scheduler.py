@@ -1352,6 +1352,9 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        # State blocks of block-bidirectional requests being prefilled;
+        # siblings wait so they can reuse the state instead of recomputing it.
+        self.bidir_states_in_flight: Dict[Any, Req] = {}
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -3986,6 +3989,29 @@ class Scheduler(
 
         return res
 
+    @staticmethod
+    def _bidir_state_key(req: Req):
+        return (
+            req.extra_key,
+            hash(tuple(req.origin_input_ids[: req.bidir_prefix_len])),
+        )
+
+    def _bidir_state_in_flight(self, req: Req) -> bool:
+        """True if another request is still prefilling this request's state block."""
+        if req.bidir_prefix_len <= 0 or not self.bidir_states_in_flight:
+            return False
+        owner = self.bidir_states_in_flight.get(self._bidir_state_key(req))
+        if owner is None:
+            return False
+        if owner.finished():
+            del self.bidir_states_in_flight[self._bidir_state_key(req)]
+            return False
+        return True
+
+    def _note_bidir_state_in_flight(self, req: Req):
+        if req.prefix_len < req.bidir_prefix_len:
+            self.bidir_states_in_flight.setdefault(self._bidir_state_key(req), req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4194,6 +4220,9 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if self._bidir_state_in_flight(req):
+                continue
+
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
@@ -4212,6 +4241,8 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+            if res == AddReqResult.CONTINUE and req.bidir_prefix_len > 0:
+                self._note_bidir_state_in_flight(req)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

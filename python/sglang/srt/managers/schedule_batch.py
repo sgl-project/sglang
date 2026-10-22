@@ -1190,6 +1190,11 @@ class Req(ReqDllmMixin):
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
 
+        if bidir_prefix_len >= 0:
+            # Block-bidirectional KV is only reusable across requests with the
+            # same state boundary; keep them in their own radix tree.
+            extra_key = (extra_key or "") + f"|bidir{bidir_prefix_len}"
+
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
