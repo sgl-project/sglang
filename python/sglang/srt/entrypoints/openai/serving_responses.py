@@ -76,7 +76,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
-    ResponseToolChoiceError,
     custom_tool_description,
     custom_tool_names,
     custom_tool_parameters,
@@ -88,7 +87,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     label_developer_content,
     response_tool_name,
 )
-from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
+from sglang.srt.entrypoints.openai.responses_tools.beam import (
+    BeamToolAdapter,
+    ResponseToolChoiceError,
+)
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _incomplete_tool_call_indices,

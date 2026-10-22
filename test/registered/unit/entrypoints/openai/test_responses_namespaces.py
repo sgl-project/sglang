@@ -13,13 +13,13 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponseTool,
 )
-from sglang.srt.entrypoints.openai.responses_adapters import (
+from sglang.srt.entrypoints.openai.responses_adapters import response_tool_name
+from sglang.srt.entrypoints.openai.responses_tools.beam import (
+    BeamToolAdapter,
     flatten_response_input,
     flatten_response_tools,
     response_tool_choice,
-    response_tool_name,
 )
-from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
 from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
