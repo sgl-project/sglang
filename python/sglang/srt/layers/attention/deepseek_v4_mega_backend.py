@@ -94,7 +94,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             extra_kv=extra_k_cache,
             extra_indices=extra_indices,
             extra_topk_length=extra_topk_lengths,
-            use_legacy=not self.token_to_kv_pool.get_swa_key_layout().is_interleaved,
+            use_legacy=not self._swa_interleaved,
         )
         return data, scale
 
@@ -122,5 +122,6 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             self.softmax_scale,
             attn_sink=attn_sink,
             topk_length=topk_length,
+            use_legacy=not self._swa_interleaved,
         )
         return data, scale
