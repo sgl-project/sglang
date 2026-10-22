@@ -400,12 +400,12 @@ class TestFlux3ImageDiTContract(unittest.TestCase):
         )
         with mock.patch(metadata, return_value=object()):
             with self.assertRaisesRegex(ValueError, "do not also set --quantization"):
-                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "convrot_int8")
 
         with mock.patch(metadata, return_value=None):
             config = resolve_flux3_image_dit_quant_config(
                 "dit.safetensors",
-                "kitchen_int8",
+                "convrot_int8",
                 ignored_layers=["adaln.linear"],
             )
         self.assertIsInstance(config, ConvRotInt8Config)
