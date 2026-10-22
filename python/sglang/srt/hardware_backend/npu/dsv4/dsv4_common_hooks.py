@@ -11,8 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and the
-per-peer-addressed C4 compress state.
+NPU-specific payloads for the independently addressed C128 KV pool.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -64,50 +63,6 @@ def maybe_write_dsv4_extend(
     )
 
 
-def _c4_state_rows(
-    req_to_token_pool,
-    req_pool_idx,
-    seq_len,
-    *,
-    ratio=4,
-    coff=2,
-):
-    """Map logical token positions to this peer's C4 state rows.
-
-    Peers may run different C4 ring sizes, so the indices are derived through
-    each peer's own SWA pages instead of a shared request-bank row formula.
-
-    The transferred set is the compressor's history window, ``coff * ratio``
-    positions (8 for C4). It is the same on both peers because it depends only
-    on the compressor geometry, and it never exceeds the smallest ring (8), so
-    a peer can always hold every transferred position in distinct rows. A
-    wider set would alias two positions onto one ring row and the transfer
-    would copy the newer row into the older position's destination row.
-    """
-    import numpy as np
-
-    seq_len = max(0, int(seq_len))
-    state_len = min(seq_len, ratio * coff)
-    start = seq_len - state_len
-    positions = np.arange(start, seq_len, dtype=np.int64)
-    if positions.size == 0:
-        return np.empty((0,), dtype=np.int32)
-    allocator = getattr(req_to_token_pool, "_dsv4_allocator", None)
-    if allocator is None:
-        return np.empty((0,), dtype=np.int32)
-    token_to_kv_pool = allocator.get_kvcache()
-    pools = getattr(token_to_kv_pool, "compress_state_pools", None) or []
-    pool = next((p for p in pools if p is not None and p.ratio == 4), None)
-    if pool is None:
-        return np.empty((0,), dtype=np.int32)
-    device = req_to_token_pool.req_to_token.device
-    pos = torch.as_tensor(positions, dtype=torch.long, device=device)
-    full = req_to_token_pool.req_to_token[int(req_pool_idx), pos]
-    swa = token_to_kv_pool.translate_loc_from_full_to_swa(full)
-    rows = pool.translate_from_swa_loc_to_state_loc(swa)
-    return rows.to(torch.int32).cpu().numpy()
-
-
 def dsv4_state_payloads(
     req_to_token_pool,
     req_pool_idx: int,
@@ -122,17 +77,14 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows. The component is
-      separate from ``StateType.SWA`` because prefill and decode may use
-      different ring sizes (8 without MTP, 16 with it); each peer maps the same
-      logical token positions through its own SWA pages, so an item stays one
-      state row. A3 keeps the C4 state inside the SWA payload.
+
+    The C4 compress state is explicit-location addressed and transports with the
+    shared ``StateType.SWA`` payload on every arch.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -151,16 +103,7 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
-    if is_npu_arch35():
-
-        def c4_state_rows():
-            return _c4_state_rows(req_to_token_pool, req_pool_idx, seq_len)
-
-        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_rows
-
-    return payloads
+    return {AscendStateType.DSV4_C128: c128_kv_pages}
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
