@@ -3033,8 +3033,16 @@ class DeepseekV4HipRadixBackend(
         return o
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        # Idle metadata may be stale; zero-padded locations target the dummy slot.
+        # Idle metadata may be stale or unset: idle writes the request window's
+        # idle layout, or translates the zero-padded out_cache_loc to the dummy slot.
+        out_cache_loc = forward_batch.out_cache_loc
         window = self.token_to_kv_pool.request_window
+        if forward_batch.forward_mode.is_idle():
+            if window is not None:
+                return window.activate_idle(out_cache_loc.shape[0])
+            return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         if window is not None:
             layout = self.forward_metadata.core_attn_metadata.request_window_layout
             window.activate(layout)
@@ -3043,14 +3051,9 @@ class DeepseekV4HipRadixBackend(
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # the tail's rows are a subset of the extend, so it owns its own store target
             return metadata.late_layer_tail.swa_out_cache_loc
-        out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
-        if (
-            cached is not None
-            and not forward_batch.forward_mode.is_idle()
-            and cached.shape[0] == out_cache_loc.shape[0]
-        ):
+        if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
             return cached
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
