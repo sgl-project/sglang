@@ -1,15 +1,10 @@
-//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. Only
-//! this module knows HTTP, so other protocols can mount the same `AppState`.
-//! `/generate` submits a `Request` then awaits one `Done` (unary) or relays SSE
-//! frames (`data: {json}` … `[DONE]`), byte-compatible with Python
-//! `http_server.generate_request`; `/server_info` reuses it for one control result.
-pub mod app;
-mod common;
+//! API server (axum / tokio). I/O-bound; own pinned multi-thread runtime. The
+//! transport-neutral [`core::CoreHandle`] is the shared entry into the runtime
+//! pipeline; `http` and `grpc` are the wire adapters on top of it. Generation
+//! handlers render semantic core events as unary JSON, SSE, or gRPC frames;
+//! control handlers serialize typed core results such as server metadata.
+pub(crate) mod core;
 mod disaggregation;
-mod frame;
-mod guard;
+pub(crate) mod grpc;
+pub(crate) mod http;
 mod log;
-mod native_api;
-mod openai;
-mod prefetch;
-mod submit;

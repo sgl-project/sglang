@@ -2,8 +2,9 @@
 // hydration time, so keep the cookbook data self-contained.
 //
 // The serving settings in the six base recipes below were benchmarked with the
-// K2 Horizon runtime support in sgl-project/sglang#37654 and the pinned model
-// revisions. Playground overrides remain separate from the verified commands.
+// K2 Horizon runtime support in sgl-project/sglang#37654. The commands pin the
+// current model revisions; benchmark provenance is documented on the page.
+// Playground overrides remain separate from the verified commands.
 
 export const config = {
   modelName: "K2 Horizon",
@@ -18,8 +19,8 @@ export const config = {
     { id: "3.7b", label: "3.7B", subtitle: "Dense" },
     { id: "7b", label: "7B", subtitle: "Dense" },
     { id: "32b", label: "32B", subtitle: "Dense" },
-    { id: "36b", label: "36B", subtitle: "MoE + MoVA" },
-    { id: "375b", label: "375B", subtitle: "MoE" },
+    { id: "36b", label: "MoVA-36B-A4B", subtitle: "MoE + MoVA" },
+    { id: "375b", label: "375B-A23B", subtitle: "MoE" },
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
@@ -36,8 +37,8 @@ export const config = {
     "3.7b|bf16": "IFM/K2-Horizon-3.7B",
     "7b|bf16": "IFM/K2-Horizon-7B",
     "32b|bf16": "IFM/K2-Horizon-32B",
-    "36b|bf16": "IFM/K2-Horizon-36B",
-    "375b|bf16": "IFM/K2-Horizon-375B",
+    "36b|bf16": "IFM/K2-Horizon-MoVA-36B-A4B",
+    "375b|bf16": "IFM/K2-Horizon-375B-A23B",
   },
 
   placeholders: {
@@ -85,7 +86,7 @@ sgl-eval run gsm8k \\
   // The page covers a family, so use the largest checkpoint as the canonical
   // issue-form model while each recipe still resolves its exact HF repository.
   github: {
-    cookbookModel: "IFM/K2-Horizon-375B",
+    cookbookModel: "IFM/K2-Horizon-375B-A23B",
   },
 
   playgroundFeatures: {
@@ -99,18 +100,18 @@ sgl-eval run gsm8k \\
           values: [
             null,
             { value: 1, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 does not fit on one H200 at TP=1." },
+              disableReason: "375B-A23B BF16 does not fit on one H200 at TP=1." },
             { value: 2, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 does not fit on two H200 GPUs." },
+              disableReason: "375B-A23B BF16 does not fit on two H200 GPUs." },
             { value: 4, disable: { variant: ["375b"] },
-              disableReason: "375B BF16 requires TP=8 to fit on an eight-H200 node." },
+              disableReason: "375B-A23B BF16 requires TP=8 to fit on an eight-H200 node." },
             8,
           ],
         },
       ],
     },
 
-    // K2 Horizon 36B and 375B contain sparse MoE feed-forward layers. Keep
+    // K2 Horizon MoVA-36B-A4B and 375B-A23B contain sparse MoE feed-forward layers. Keep
     // expert parallelism disabled on the dense variants.
     moe: {
       ep: {
@@ -119,29 +120,29 @@ sgl-eval run gsm8k \\
           null,
           { value: 1,
             disable: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-            disableReason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+            disableReason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
           { value: 2,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1] },
                 reason: "EP=2 requires an effective TP degree of at least 2." },
             ] },
           { value: 4,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1, 2] },
                 reason: "EP=4 requires an effective TP degree of at least 4." },
             ] },
           { value: 8,
             disable: [
               { when: { variant: ["0.9b", "3.7b", "7b", "32b"] },
-                reason: "Expert parallelism applies only to the sparse 36B and 375B variants." },
+                reason: "Expert parallelism applies only to the sparse MoVA-36B-A4B and 375B-A23B variants." },
               { when: { effTp: [1, 2, 4] },
                 reason: "EP=8 requires an effective TP degree of at least 8." },
               { when: { variant: ["36b"] },
-                reason: "36B has 100 routed experts, which is not divisible by EP=8." },
+                reason: "MoVA-36B-A4B has 100 routed experts, which is not divisible by EP=8." },
             ] },
         ],
       },
@@ -213,7 +214,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 9b9ec1f7e17f62ed218df542687a144116219d84",
+        "--revision 6fbc54f7e4dc9d9cd671351f51498a1958dd2a01",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -228,7 +229,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision c177771836a4c460743c00002c22483f6f18d1eb",
+        "--revision fe504ef19c7efa3120a9352bcfa180aa133946de",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -243,7 +244,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 69ada542b68fe13d767479db2ab9421baff88681",
+        "--revision 85d46bbaf6ecd844a8ef61991f6e492d4faf4179",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -258,7 +259,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision e1fd0277713e4eefcd3416348fd6fedacf7f2392",
+        "--revision eff3d24a3a40360c6fd1a1dd5723ce6329d93484",
         "--tp 2",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -273,7 +274,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 16d20c739c687c08423422d1a2fbba6c529014cd",
+        "--revision e5c131d4d0ae196f5041284a0f9262d713083901",
         "--tp 2",
         "--dtype bfloat16",
         "--json-model-override-args '{\"xllm_source_router_gemm_partitions\":2}'",
@@ -289,7 +290,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 12812264242a14dce44aa7ae27f931ff4584bcbf",
+        "--revision 70d7c58c1f8a2fc523c861c2cf7d2d339d7a8a0c",
         "--tp 8",
         "--dtype bfloat16",
         "--attention-backend fa3",

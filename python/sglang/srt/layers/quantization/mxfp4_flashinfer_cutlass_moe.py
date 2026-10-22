@@ -87,6 +87,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         self.moe_runner_config = moe_runner_config
+        # The fused func reads the layer's MoE placement off the config.
+        if moe_runner_config.layer is None:
+            moe_runner_config.layer = layer
 
         E = layer.num_local_experts
         device = layer.w13_weight.device
@@ -120,6 +123,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling.
@@ -249,10 +255,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
             swiglu_beta=None,
             swiglu_limit=self._swiglu_limit_tensor,
             use_swiglu_step=self._use_swiglu_step,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=None,
         )
         return self.runner.run(dispatch_output, quant_info)
