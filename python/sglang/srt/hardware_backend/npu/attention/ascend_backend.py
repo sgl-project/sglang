@@ -861,33 +861,26 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        graph_context_len = self.max_context_len
+        total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
-            graph_context_len += self.speculative_num_draft_tokens
-        total_context_len = graph_context_len + self.page_size - 1
+            total_context_len += self.speculative_num_draft_tokens
+        graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
-            cycle_size = self.page_size * self.dcp_size
-            max_local_context_len = (
-                graph_context_len // cycle_size * self.page_size
-                + min(
-                    self.page_size,
-                    max(
-                        0,
-                        graph_context_len % cycle_size - self.dcp_rank * self.page_size,
-                    ),
-                )
-            )
             graph_num_pages = max(
-                1, (max_local_context_len + self.page_size - 1) // self.page_size
+                1,
+                (graph_num_pages + self.dcp_size - 1 - self.dcp_rank) // self.dcp_size,
             )
-            self.graph_metadata = {
-                "block_tables": torch.empty(
-                    (max_bs, graph_num_pages), dtype=torch.int32, device=self.device
-                ),
-                "dcp_seq_lens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
-                ),
-            }
+        self.graph_metadata = {
+            "block_tables": torch.empty(
+                (max_bs, graph_num_pages),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        }
+        if self.dense_mla_dcp_target:
+            self.graph_metadata["dcp_seq_lens"] = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            )
             if self.speculative_num_draft_tokens is not None:
                 self.graph_metadata["dcp_spec_seq_lens"] = torch.zeros(
                     max_bs * self.speculative_num_draft_tokens,
@@ -903,15 +896,6 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=torch.bool,
                     device=self.device,
                 )
-        else:
-            graph_num_pages = max(1, total_context_len // self.page_size)
-            self.graph_metadata = {
-                "block_tables": torch.empty(
-                    (max_bs, graph_num_pages),
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-            }
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if self.dsa_dcp_target:
             dcp_page_size = self.page_size * self.dcp_size
