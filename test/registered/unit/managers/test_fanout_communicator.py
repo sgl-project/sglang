@@ -122,6 +122,33 @@ class TestQueueingCall(CustomTestCase):
 
         asyncio.run(scenario())
 
+    def test_late_timed_out_response_cannot_complete_retry(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=1,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+
+            with self.assertRaises(FanOutTimeoutError):
+                await comm(SimpleNamespace(submission_id="submission-1"), timeout=0.01)
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"), timeout=1)
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-1"))
+            await asyncio.sleep(0)
+            self.assertFalse(retry.done())
+
+            response = SimpleNamespace(submission_id="submission-2")
+            comm.handle_recv(response)
+            self.assertEqual(await retry, [response])
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

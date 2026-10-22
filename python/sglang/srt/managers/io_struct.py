@@ -2400,8 +2400,16 @@ class RecoverElasticEPReqOutput(BaseReq, kw_only=True):
     conflict: bool = False
     operation_id: Optional[str] = None
     submission_id: Optional[str] = None
+    responder_rank: Optional[int] = None
     recovery_phase: str = "idle"
     terminal: bool = False
+
+
+class RecoverElasticEPProgressOutput(BaseReq, kw_only=True):
+    operation_id: str
+    submission_id: str
+    responder_rank: int
+    completed_stage: str
 
 
 class ObserveElasticEPMembershipReqInput(BaseReq, kw_only=True):
