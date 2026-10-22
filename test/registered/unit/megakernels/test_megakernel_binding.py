@@ -154,7 +154,6 @@ def forward_batch():
     return SimpleNamespace(
         batch_size=2,
         forward_mode="decode",
-        decode_trtllm_mla_metadata=None,
         out_cache_loc=torch.zeros(2, dtype=torch.int32),
         out_cache_loc_is_physical=True,
     )
@@ -471,12 +470,11 @@ class TestMegakernelBinding(CustomTestCase):
                 ):
                     binding.forward_view(forward_batch())
 
-    def test_capture_keeps_each_metadata_owner_and_honors_the_batch_override(self):
+    def test_capture_keeps_each_metadata_owner(self):
         fixture = hybrid_backend()
         binding = mb.MegakernelBinding(model=torch.nn.Module())
         binding.preparation_view(fixture.runner)
         first_batch = forward_batch()
-        first_mla = fixture.full.forward_decode_metadata
         first_kda = fixture.linear.forward_metadata
         with patch(BACKEND, return_value=fixture.backend):
             binding.seal_capture_view(first_batch, binding.forward_view(first_batch))
@@ -493,13 +491,6 @@ class TestMegakernelBinding(CustomTestCase):
             binding.seal_capture_view(second_batch, binding.forward_view(second_batch))
             binding.assert_live()
 
-            # A batch-owned eager stamp still takes precedence over the backend's
-            # subsequently selected metadata; captured owners remain unchanged.
-            first_batch.decode_trtllm_mla_metadata = first_mla
-            self.assertIs(
-                binding.forward_view(first_batch).hybrid.mla.block_table,
-                first_mla.block_kv_indices,
-            )
             first_kda.mamba_cache_indices = torch.zeros_like(
                 first_kda.mamba_cache_indices
             )

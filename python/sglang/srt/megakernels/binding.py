@@ -587,7 +587,7 @@ class MegakernelBinding:
         sources = self._current_hybrid_sources()
         if backend is not sources.backend:
             raise RuntimeError("megakernel binding: running hybrid backend changed")
-        mla_metadata = self._mla_metadata(sources, forward_batch)
+        mla_metadata = self._mla_metadata(sources)
         kda_metadata: Optional[KdaForwardMetadata] = (
             sources.linear_backend.forward_metadata
         )
@@ -634,16 +634,8 @@ class MegakernelBinding:
             ),
         )
 
-    def _mla_metadata(
-        self, sources: _HybridSources, forward_batch: ForwardBatch
-    ) -> TRTLLMMLADecodeMetadata:
-        # The backend optionally stamps this per-batch owner during eager decode;
-        # graph capture instead selects its metadata on the backend itself.
-        metadata: Optional[TRTLLMMLADecodeMetadata] = getattr(
-            forward_batch, "decode_trtllm_mla_metadata", None
-        )
-        if metadata is None:
-            metadata = sources.full_backend.forward_decode_metadata
+    def _mla_metadata(self, sources: _HybridSources) -> TRTLLMMLADecodeMetadata:
+        metadata = sources.full_backend.forward_decode_metadata
         if metadata is None:
             raise RuntimeError("megakernel binding: MLA decode metadata is unavailable")
         return metadata
@@ -658,7 +650,7 @@ class MegakernelBinding:
         replacement of its tensor fields without confusing that normal selection.
         """
         sources = self._current_hybrid_sources()
-        mla_metadata = self._mla_metadata(sources, forward_batch)
+        mla_metadata = self._mla_metadata(sources)
         kda_metadata = sources.linear_backend.forward_metadata
         return {
             "mla.block_table": lambda: mla_metadata.block_kv_indices,
