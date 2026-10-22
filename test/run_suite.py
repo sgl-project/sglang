@@ -24,8 +24,8 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
-    # "mps": HWBackend.MPS,
-    # "ppu": HWBackend.PPU,
+    "mps": HWBackend.MPS,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
