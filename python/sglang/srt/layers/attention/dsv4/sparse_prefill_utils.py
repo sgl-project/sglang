@@ -72,7 +72,7 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     return dsv4_prefill_backend == "flashmla_sparse_q8"
 
 
-class SparsePrefillWorkspace:
+class SparsePrefillKVBuffer:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
     Every attention call overwrites the rows it reads, except compressed rows

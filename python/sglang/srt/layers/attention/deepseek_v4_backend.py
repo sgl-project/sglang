@@ -75,7 +75,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -1302,7 +1302,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -4198,7 +4198,7 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -4209,7 +4209,7 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 n_compressed + cache.swa_token_ids.shape[0]
             )
             compressed_slice = workspace[:n_compressed]
@@ -4222,7 +4222,7 @@ class DeepseekV4AttnBackend(
             source = (
                 extra_k_cache.data_ptr(),
                 flat_token_ids.data_ptr(),
-                self.sparse_prefill_workspace.generation,
+                self.sparse_prefill_kv_buffer.generation,
                 n_compressed,
             )
             if cache.dequantized_source != source:
@@ -4383,7 +4383,7 @@ class DeepseekV4AttnBackend(
         flat_token_ids = None
 
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
@@ -4398,7 +4398,7 @@ class DeepseekV4AttnBackend(
             )
 
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 n_compressed + cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
