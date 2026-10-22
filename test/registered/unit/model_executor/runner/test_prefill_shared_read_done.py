@@ -129,7 +129,11 @@ class _TargetOnlyPrefillAlgo(CustomSpecAlgo):
 
 class TestPrefillReadDoneCapability(CustomTestCase):
     def test_builtin_allowlist_is_unchanged(self):
-        allowed = {SpeculativeAlgorithm.NONE, SpeculativeAlgorithm.DFLASH}
+        allowed = {
+            SpeculativeAlgorithm.NONE,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        }
         for algorithm in SpeculativeAlgorithm:
             with self.subTest(algorithm=algorithm):
                 runner = _model_runner(spec_algorithm=algorithm)
