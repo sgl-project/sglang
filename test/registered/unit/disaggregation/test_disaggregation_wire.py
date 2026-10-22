@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     should_send_replicated_state,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import _c4_state_rows
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -2075,6 +2076,38 @@ def _make_state_pool(*, ratio, request_scoped, online=False, ring_size=256):
     pool.online = online
     pool.ring_size = ring_size
     return pool
+
+
+class TestDSV4C4StateIndices(unittest.TestCase):
+    def test_ring_size_difference_keeps_item_count(self):
+        req_to_token = torch.arange(4 * 16, dtype=torch.int64).reshape(4, 16)
+        req_pool = SimpleNamespace(req_to_token=req_to_token)
+
+        src_pool = _make_state_pool(ratio=4, request_scoped=False, ring_size=8)
+        src_pool.swa_page_size = 4
+        dst_pool = _make_state_pool(ratio=4, request_scoped=False, ring_size=16)
+        dst_pool.swa_page_size = 4
+
+        src_kv = SimpleNamespace(
+            compress_state_pools=[src_pool],
+            translate_loc_from_full_to_swa=lambda loc: loc,
+        )
+        dst_kv = SimpleNamespace(
+            compress_state_pools=[dst_pool],
+            translate_loc_from_full_to_swa=lambda loc: loc,
+        )
+
+        src = _c4_state_rows(req_pool, src_kv, 2, 13)
+        dst = _c4_state_rows(req_pool, dst_kv, 2, 13)
+
+        # The history window is ring independent: both peers ship 8 rows.
+        self.assertEqual(src.size, 8)
+        self.assertEqual(src.size, dst.size)
+        self.assertFalse(np.array_equal(src, dst))
+        # A wider window would alias two positions onto one ring row, so every
+        # transferred index must stay unique on both peers.
+        self.assertEqual(np.unique(src).size, src.size)
+        self.assertEqual(np.unique(dst).size, dst.size)
 
 
 class TestDSV4RequestStateTransfer(unittest.TestCase):

@@ -1747,6 +1747,20 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
+        # C4 state travels as single rows registered separately from the SWA
+        # payload, so P and D can map the same logical positions through their
+        # own SWA pages when their local ring sizes differ.
+        if hasattr(token_to_kv_pool, "get_c4_state_buf_infos"):
+            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+            if c4_ptrs:
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_C4_STATE,
+                    c4_ptrs,
+                    c4_lens,
+                    c4_item_lens,
+                )
+
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while
