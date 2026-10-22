@@ -1523,6 +1523,12 @@
                     "pages": [
                       "cookbook/autoregressive/Cloudflare/clef"
                     ]
+                  },
+                  {
+                    "group": "Kev",
+                    "pages": [
+                      "cookbook/autoregressive/Kev/kev"
+                    ]
                   }
                 ]
               },
