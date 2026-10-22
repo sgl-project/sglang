@@ -121,8 +121,14 @@ inline void cutlass_prepare_moe_input(
   auto device = SymbolicDevice{};
   auto tokens = SymbolicSize{"tokens"};
   auto topk = SymbolicSize{"topk"};
-  TensorMatcher({tokens, topk}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(topk_ids);
+  TensorMatcher({tokens, topk})
+      .with_strides({-1, -1})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(topk_ids);
   const int64_t num_routes = topk_ids.numel();
+  // Empty PyTorch dimensions can have noncanonical strides; no ID is read.
+  CHECK_HOST(num_routes == 0 || topk_ids.is_contiguous());
   CHECK_HOST(num_routes <= max_index);
   TensorMatcher({num_experts + 1}).with_dtype<int32_t>().with_device(device).verify(expert_offsets);
   TensorMatcher({num_experts, 3})
