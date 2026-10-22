@@ -125,6 +125,8 @@ def preprocess_image(
     sizes = sizes or (image.size,)
     for index, (width, height) in enumerate(sizes):
         last = index == len(sizes) - 1
+        if last and crop == (0, 0, height, width):
+            crop = None
         pixels = resize_rgb(
             pixels,
             height,
