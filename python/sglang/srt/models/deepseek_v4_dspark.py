@@ -485,7 +485,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             num_embeddings_padded=num_padded,
         )
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=vocab_gather
+            start=self._tp_shard.org_vocab_start,
+            width=self._tp_shard.org_vocab_end - self._tp_shard.org_vocab_start,
+            gather=vocab_gather,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
