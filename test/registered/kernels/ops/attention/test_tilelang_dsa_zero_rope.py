@@ -75,14 +75,14 @@ def _torch_sparse_attention(q, kv, indices, scale, d_v):
     "TileLang DSA requires gfx950 or SM89+ for these tests",
 )
 class TestTileLangDSAZeroRope(CustomTestCase):
-    def _assert_matches_torch(self, use_fp8, d_v, d_tail):
+    def _assert_matches_torch(self, use_fp8, d_v, d_tail, *, tokens=17, heads=64):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             FP8_DTYPE,
             tilelang_sparse_fwd,
         )
 
         torch.manual_seed(7)
-        tokens, heads, topk = 17, 64, 2112
+        topk = 2112
         if not is_hip() and not use_fp8 and d_tail:
             # The existing CUDA BF16 tail kernel processes pairs of 128 rows.
             topk = 2304
@@ -92,6 +92,8 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         indices = torch.arange(topk, device="cuda", dtype=torch.int32)
         indices = indices.view(1, 1, topk).expand(tokens, -1, -1).clone()
         indices[..., 2051:] = -1  # padded rows must be masked, not gathered from slot 0
+        # Keep the final logical column valid to catch truncated index tiles.
+        indices[..., -1] = topk - 1
         if use_fp8:
             kv = kv.to(FP8_DTYPE)
         reference_q = q.to(FP8_DTYPE) if use_fp8 else q
@@ -121,6 +123,14 @@ class TestTileLangDSAZeroRope(CustomTestCase):
     def test_fp8_zero_rope_matches_torch(self):
         """Before the fix the FP8 partial kernel asserted d_v == 512 and read four NoPE tiles."""
         self._assert_matches_torch(use_fp8=True, d_v=256, d_tail=0)
+
+    def test_fp8_large_query_virtual_padding_matches_torch(self):
+        if is_hip() or torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("The large-query FP8 tile dispatch requires SM90")
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        self._assert_matches_torch(
+            use_fp8=True, d_v=512, d_tail=0, tokens=4 * sm_count, heads=16
+        )
 
     def test_tail64_layout_unchanged_by_zero_tail_specialization(self):
         """The 512+64 path was rewritten into has_tail/num_main_tiles branches and must still match."""
