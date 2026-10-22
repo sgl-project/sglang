@@ -218,9 +218,7 @@ class TestSleepCommCleanupPP(_SleepWakeTopologyMixin, CustomTestCase):
         released) is a 400 with the PP reason, not a hang or a state change."""
         text_before = _generate_greedy(self, self.base_url)
 
-        response = _post(
-            self.base_url, "/resume_memory_occupation", {"tags": ["comm"]}
-        )
+        response = _post(self.base_url, "/resume_memory_occupation", {"tags": ["comm"]})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("pipeline parallelism", response.text)
 

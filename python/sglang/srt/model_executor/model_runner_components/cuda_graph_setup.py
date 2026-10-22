@@ -451,23 +451,27 @@ def capture_cuda_graphs(
 
 
 # ----------------------------------------------------------------------
-# Sleep-mode comm cleanup (NPU "comm" tag)
+# Sleep-mode comm cleanup graph lifecycle
 #
-# Captured graphs embed HCCL comm buffer addresses, so destroying comms
-# requires destroying the graphs first, and rebuilt comms require graph
-# recapture afterwards. Graph memory is released through the normal free
-# path (torch_memory_saver free included), which is strictly stronger than
-# pausing: physical pages go back to the driver instead of being unmapped.
+# Captured graphs may embed comm buffer addresses, so destroying device
+# communicators requires destroying the graphs first, and rebuilt comms
+# require graph recapture afterwards. Graph memory is released through the
+# normal free path (torch_memory_saver free included), which is strictly
+# stronger than pausing: physical pages go back to the driver instead of
+# being unmapped.
+#
+# These are optional helpers: a platform's sleep-comm backend decides whether
+# and when to call them.
 # ----------------------------------------------------------------------
 
 
 def drop_cuda_graphs_for_sleep(model_runner: ModelRunner) -> None:
     """Destroy the prefill+decode graph runners of one model runner.
 
-    The caller (sleep_comm_manager) must invoke release_shared_graph_pool()
-    once after ALL runners (target + draft) have been dropped, because the
-    graph memory pool is shared. Forward naturally falls back to eager while
-    the runners are None (guarded in _forward_raw).
+    The caller (a platform sleep-comm backend) must invoke
+    release_shared_graph_pool() once after ALL runners (target + draft) have
+    been dropped, because the graph memory pool is shared. Forward naturally
+    falls back to eager while the runners are None (guarded in _forward_raw).
     """
     current_platform.synchronize()
     for attr in ("prefill_cuda_graph_runner", "decode_cuda_graph_runner"):

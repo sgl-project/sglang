@@ -320,11 +320,11 @@ class DeepEPBuffer:
     def invalidate_buffer(cls):
         """Drop the cached DeepEP buffer.
 
-        NPU sleep-mode comm cleanup ("comm" tag) calls this BEFORE the HCCL
-        communicators are destroyed: the buffer holds the comm name of the old
-        communicator, which becomes invalid once destroyed. On NPU the buffer
-        reuses the torch process group's communicator (no persistent nvl/rdma
-        allocations of its own), so dropping the reference is sufficient; the
+        Sleep-mode comm cleanup calls this BEFORE the device communicators are
+        destroyed: the buffer holds the comm name of the old communicator,
+        which becomes invalid once destroyed. On platforms whose buffer reuses
+        the torch process group's communicator (no persistent nvl/rdma
+        allocations of its own), dropping the reference is sufficient; the
         next dispatch lazily recreates the buffer on the rebuilt group via
         get_deepep_buffer().
         """
@@ -395,7 +395,7 @@ class DeepEPConfig(BaseDispatcherConfig):
 class _DeepEPDispatcherImplBase:
     def __init__(
         self,
-        group: GroupCoordinator,
+        group: Union[torch.distributed.ProcessGroup, GroupCoordinator],
         router_topk: int,
         permute_fusion: bool,
         num_experts: int,
@@ -417,17 +417,18 @@ class _DeepEPDispatcherImplBase:
             ) from _deepep_import_error
 
         self.runner_backend = runner_backend
-        # Keep the GroupCoordinator (stable identity), not the raw
-        # ProcessGroup: NPU sleep-mode comm cleanup ("comm" tag) swaps
+        # Prefer the GroupCoordinator (stable identity) over the raw
+        # ProcessGroup: a platform's sleep-mode comm cleanup may swap
         # device_group in place, so a cached raw PG would dangle after wake.
+        # Raw PGs remain accepted for existing/out-of-tree callers.
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 
-        if not isinstance(group, GroupCoordinator):
-            raise TypeError(
-                f"DeepEP dispatcher expects a GroupCoordinator (resolves the "
-                f"live device_group per use), got {type(group).__name__}."
-            )
-        self._group_coordinator = group
+        if isinstance(group, GroupCoordinator):
+            self._group_coordinator = group
+            self._static_group = None
+        else:
+            self._group_coordinator = None
+            self._static_group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.num_experts = num_experts
@@ -458,7 +459,9 @@ class _DeepEPDispatcherImplBase:
     def group(self) -> torch.distributed.ProcessGroup:
         # Resolved per use: after a sleep/wake cycle this is the rebuilt PG,
         # so the DeepEP buffer is lazily recreated on the live communicator.
-        return self._group_coordinator.device_group
+        if self._group_coordinator is not None:
+            return self._group_coordinator.device_group
+        return self._static_group
 
     def dispatch_a(
         self,
@@ -1026,7 +1029,7 @@ class _Stage(Enum):
 class DeepEPDispatcher(BaseDispatcher):
     def __init__(
         self,
-        group: GroupCoordinator,
+        group: Union[torch.distributed.ProcessGroup, GroupCoordinator],
         router_topk: int,
         permute_fusion: bool = False,
         num_experts: int = None,

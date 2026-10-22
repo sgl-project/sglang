@@ -84,10 +84,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.managers.scheduler_components.weight_updater import (
-    _resolve_tags,
-    _validate_tags,
-)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
@@ -101,6 +97,7 @@ from sglang.srt.utils import (
     normalize_serialized_named_tensor_payloads,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.sleep_comm import validate_tags
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -890,7 +887,7 @@ class TokenizerControlMixin:
         # Fail fast in this (HTTP-facing) process: tag errors raised here
         # surface to the caller as an HTTP 400, whereas an exception inside
         # the scheduler would kill the whole server.
-        _validate_tags(_resolve_tags(obj.tags))
+        validate_tags(obj.tags or [])
         results = await self.release_memory_occupation_communicator(obj)
         _raise_on_memory_occupation_error(results)
 
@@ -900,7 +897,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        _validate_tags(_resolve_tags(obj.tags))
+        validate_tags(obj.tags or [])
         results = await self.resume_memory_occupation_communicator(obj)
         _raise_on_memory_occupation_error(results)
 
