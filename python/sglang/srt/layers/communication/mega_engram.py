@@ -18,7 +18,9 @@ from sglang.kernels.ops.communication.all_reduce import Communicator, PullPlane
 from sglang.kernels.ops.communication.mega_engram import (
     NUM_COLS,
     ROW_BYTES,
+    mega_engram_local_bytes,
     mega_engram_lookup,
+    get_owner_magic,
 )
 
 _ALIGN = 1024
@@ -57,14 +59,11 @@ def _owner_magic(world_size: int, column_bounds: Sequence[int]) -> int:
         assert start == expect, (
             f"shard {r} starts at {start}, the kernel assumes {expect}"
         )
-    if by_column:
-        return 0
-    magic = -(-(2**64) // num_rows)
-    error = magic * num_rows - 2**64
-    assert world_size * num_rows * error < 2**64, (
-        f"no exact owner magic for N={num_rows}"
+    return get_owner_magic(
+        world_size=world_size,
+        num_rows=num_rows,
+        by_column=by_column,
     )
-    return magic
 
 
 class MegaEngramWorkspace:
@@ -109,7 +108,11 @@ class MegaEngramWorkspace:
         if world_size > 2:
             assert symm_mem.multicast_ptr, "mega engram needs multicast for R > 2"
             mc_semaphore = symm_mem.multicast_ptr + ws_bytes
-        self.counter = torch.zeros(world_size, dtype=torch.uint64, device=device)
+        self.local = torch.zeros(
+            mega_engram_local_bytes(world_size, self.stride - 1),
+            dtype=torch.uint8,
+            device=device,
+        )
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.comm = Communicator(
@@ -131,16 +134,17 @@ class MegaEngramWorkspace:
         self.sf = local[sf_off : sf_off + sf_bytes]
         dist.barrier(group=group)
 
-    def attach(self, column_bounds: Sequence[int]) -> MegaEngramTable:
+    def attach(self, column_bounds: Sequence[int], no_sort: bool) -> MegaEngramTable:
         """Bind one Engram layer's table: its 25 hash-column boundaries
-        (``EngramConfig.column_bounds``). Only the per-rank layout: this rank
-        holds ``engram.shard_range``'s rows of the table."""
+        (``EngramConfig.column_bounds``) and whether to never read this rank's
+        shard in row order (``mega_engram_lookup``). Only the per-rank layout: this rank holds ``engram.shard_range``'s
+        rows of the table."""
         from sglang.srt.layers.engram import shard_range
 
         bounds = tuple(column_bounds)
         magic = _owner_magic(self.world_size, bounds)
-        row_start, _ = shard_range(bounds[-1], bounds, self.rank, self.world_size)
-        return MegaEngramTable(self, magic, row_start)
+        row_start, row_end = shard_range(bounds[-1], bounds, self.rank, self.world_size)
+        return MegaEngramTable(self, magic, row_start, row_end - row_start, no_sort)
 
 
 _WORKSPACE: Optional[MegaEngramWorkspace] = None
@@ -162,13 +166,25 @@ def get_mega_engram_workspace(
 class MegaEngramTable:
     """One Engram layer's table on a shared ``MegaEngramWorkspace``."""
 
-    def __init__(self, workspace: MegaEngramWorkspace, magic: int, row_start: int):
+    def __init__(
+        self,
+        workspace: MegaEngramWorkspace,
+        magic: int,
+        row_start: int,
+        num_rows: int,
+        no_sort: bool,
+    ):
         self.workspace = workspace
         self.magic = magic
         self.row_start = row_start
+        self.num_rows = num_rows
+        self.no_sort = no_sort
 
     def lookup(
-        self, hash_ids: torch.Tensor, weight_ptr: int, scale_ptr: int
+        self,
+        hash_ids: torch.Tensor,
+        weight_ptr: int,
+        scale_ptr: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Both kernels on ``hash_ids`` ([T, 24] int32, contiguous); ``weight_ptr`` /
         ``scale_ptr`` address this rank's shard. Returns (fp8 [T, 6144], 128x4
@@ -181,11 +197,13 @@ class MegaEngramTable:
             weight_ptr,
             scale_ptr,
             ws.recv,
-            ws.counter,
             ws.out,
             ws.sf,
             self.magic,
             self.row_start,
+            self.num_rows,
+            self.no_sort,
+            ws.local,
         )
         num_tokens = hash_ids.shape[0]
         return (

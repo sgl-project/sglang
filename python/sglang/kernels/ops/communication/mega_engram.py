@@ -41,8 +41,17 @@ def _jit_mega_engram_module(world_size: int) -> Module:
         "mega_engram",
         *args,
         cuda_files=["deepseek_v4/engram/mega.cuh"],
-        cuda_wrappers=[("lookup", f"EngramPush<{args}>::lookup")],
+        cuda_wrappers=[
+            ("lookup", f"MegaEngram<{args}>::lookup"),
+            ("local_bytes", f"MegaEngram<{args}>::local_bytes"),
+        ],
     )
+
+
+def mega_engram_local_bytes(world_size: int, max_ids: int) -> int:
+    """Bytes of the private, zero-filled buffer ``mega_engram_lookup`` takes as
+    ``local`` for receive slots of ``max_ids`` ids."""
+    return _jit_mega_engram_module(world_size).local_bytes(max_ids)
 
 
 def mega_engram_lookup(
@@ -51,11 +60,13 @@ def mega_engram_lookup(
     weight_ptr: int,
     scale_ptr: int,
     recv: torch.Tensor,
-    counter: torch.Tensor,
     out: torch.Tensor,
     sf: torch.Tensor,
     owner_magic: int,
     row_start: int,
+    num_rows: int,
+    no_sort: bool,
+    local: torch.Tensor,
 ) -> None:
     """One Engram lookup: push this rank's ``hash_ids`` ([T, 24] int32,
     contiguous, T may be 0) to their owners, then serve the rows the peers asked
@@ -63,9 +74,11 @@ def mega_engram_lookup(
 
     ``weight_ptr`` / ``scale_ptr`` address this rank's shard ([rows, 256] fp8
     and [rows, 8] e8m0, device or registered host memory) whose first global
-    row is ``row_start``. ``recv`` is [R, 1 + max_ids] uint64, ``counter`` a
-    local [R] uint64 that starts zeroed. Every rank must call this every step,
-    idle or not.
+    row is ``row_start`` and which holds ``num_rows`` rows. A large shard is
+    read in row order unless ``no_sort`` (set it for device shards).
+    ``recv`` is [R, 1 + max_ids] uint64; ``local`` is this rank's private state
+    (``mega_engram_local_bytes`` uint8, zeroed once). Every rank must call this
+    every step, idle or not.
     """
     module = _jit_mega_engram_module(comm.world_size)
     module.lookup(
@@ -74,9 +87,22 @@ def mega_engram_lookup(
         weight_ptr,
         scale_ptr,
         recv,
-        counter,
         out,
         sf,
         owner_magic,
         row_start,
+        num_rows,
+        no_sort,
+        local,
     )
+
+
+def get_owner_magic(*, world_size: int, num_rows: int, by_column: bool) -> int:
+    if by_column:
+        return 0
+    magic = -(-(2**64) // num_rows)
+    error = magic * num_rows - 2**64
+    assert world_size * num_rows * error < 2**64, (
+        f"no exact owner magic for {num_rows = }, {world_size = }"
+    )
+    return magic

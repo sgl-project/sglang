@@ -1100,7 +1100,11 @@ class Engram(nn.Module):
             torch.device("cuda", torch.cuda.current_device()),
             max_tokens=max_tokens,
         )
-        self.mega_table = workspace.attach(self.column_bounds)
+        self.mega_table = workspace.attach(
+            self.column_bounds,
+            # NOTE: device random access doesn't benefit from sort
+            no_sort=embed.host_table is None,
+        )
         logger.info(
             "mega engram on: table %d, R=%d, max %d tokens per rank",
             self.layer_hash_index,
