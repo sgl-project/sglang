@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Sequence, Tuple
 
 import torch
+
+from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
+    alloc_with_host_register,
+)
 
 
 class HostExpertStore:
@@ -27,7 +33,13 @@ class HostExpertStore:
         }
 
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=self.pin)
+        if not self.pin or math.prod(shape) == 0:
+            return torch.empty(shape, dtype=dtype, device="cpu")
+        # HiCache's host allocator pins exactly the tensor's size; torch's pinned allocator
+        # rounds every allocation up to a power of two.
+        return alloc_with_host_register(
+            tuple(shape), dtype, "cpu", True, HostTensorAllocator()
+        )
 
     def page_in(self, layer, loads: Sequence[Tuple[int, int]]) -> None:
         """Copy each ``(expert, slot)`` pair's expert, of every paged tensor, into its slot."""

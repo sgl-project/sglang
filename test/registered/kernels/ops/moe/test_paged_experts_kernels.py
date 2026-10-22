@@ -123,6 +123,27 @@ class TestPagedExpertsKernels(CustomTestCase):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
             self.assertFalse(gpu[1].any())  # untouched
 
+    def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
+        """The host store pins exactly its size (torch's pinned allocator rounds up to a power
+        of two), and the gather kernel reads it through the GPU."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
+        self.assertTrue(host.is_pinned())
+        self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
+        src = torch.tensor([5, 63] + [0] * (K - 2), dtype=torch.int32).cuda()
+        dst = torch.tensor([2, 0] + [0] * (K - 2), dtype=torch.int32).cuda()
+        count = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+        paged_experts_gather(*_gather_args([host], [gpu]), src, dst, count)
+
+        self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
+        self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
+
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
         seen at capture."""
