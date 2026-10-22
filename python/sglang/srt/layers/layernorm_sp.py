@@ -274,12 +274,14 @@ def column_parallel_g_matmul(
                     input_parallel.contiguous(),
                     linear.weight.t().contiguous(),
                     _npu_hccl_comm_name(),
-                    linear.tp_size,
+                    linear.tp_group.world_size,
                 )
                 return mm_out[:num_tokens]
             except Exception:
-                pass  # fall through to the plain all-gather + matmul below.
-        if getattr(linear, "_sp_use_cutlass", False):
+                # CANN MC2 unavailable for this shape/dtype: fall through to the
+                # plain all-gather + matmul below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.gemm.sp_collective_gemm import all_gather_matmul
 
             return all_gather_matmul(
@@ -287,14 +289,15 @@ def column_parallel_g_matmul(
                 linear.weight,
                 get_parallel().tp_group.device_group,
             )[:num_tokens]
-        group_name = get_parallel().tp_group.device_group.group_name
-        _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-            input_parallel.contiguous(),
-            [linear.weight.t()],
-            gather_dim=0,
-            group_name=group_name,
-        )
-        return mm_outputs[0][:num_tokens]
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                input_parallel.contiguous(),
+                [linear.weight.t()],
+                gather_dim=0,
+                group_name=group_name,
+            )
+            return mm_outputs[0][:num_tokens]
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
@@ -327,21 +330,24 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
                     reduce_op="sum",
                 )
             except Exception:
-                pass  # fall through to matmul + plain reduce-scatter below.
-        if getattr(linear, "_sp_use_cutlass", False):
+                # CANN MC2 unavailable for this shape/dtype: fall through to
+                # matmul + plain reduce-scatter below (symm_mem is CUDA-only).
+                pass
+        elif getattr(linear, "_sp_use_cutlass", False):
             from sglang.kernels.ops.gemm.sp_collective_gemm import matmul_reduce_scatter
 
             return matmul_reduce_scatter(
                 x, linear.weight, get_parallel().tp_group.device_group
             )
-        group_name = get_parallel().tp_group.device_group.group_name
-        return torch.ops.symm_mem.fused_matmul_reduce_scatter(
-            x,
-            linear.weight.t(),
-            "sum",
-            scatter_dim=0,
-            group_name=group_name,
-        )
+        else:
+            group_name = get_parallel().tp_group.device_group.group_name
+            return torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                x,
+                linear.weight.t(),
+                "sum",
+                scatter_dim=0,
+                group_name=group_name,
+            )
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)
