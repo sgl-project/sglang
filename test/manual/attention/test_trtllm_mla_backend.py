@@ -230,6 +230,7 @@ class MockModelRunner:
             {
                 "context_len": config["context_len"],
                 "attention_arch": AttentionArch.MLA,
+                "is_dflash_mla_draft": False,
                 "num_attention_heads": config["num_attention_heads"],
                 "kv_lora_rank": config["kv_lora_rank"],
                 "qk_nope_head_dim": config["qk_nope_head_dim"],

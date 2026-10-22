@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -103,6 +104,66 @@ class TestOOTDFlashHooks(CustomTestCase):
                 self.assertRaisesRegex(ValueError, error),
             ):
                 self._resolve_backend(None, platform)
+
+
+class TestDFlashDraftBackendResolution(CustomTestCase):
+    """Backends that serve one attention layout follow the draft's layout."""
+
+    def _resolve(self, draft_backend, *, mla, target_backend="fa3"):
+        args = _make_dflash_args(draft_backend)
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = False
+        config = SimpleNamespace(
+            num_hidden_layers=1,
+            is_causal=True,
+            dflash_config={"attention_mode": "mla" if mla else "gqa"},
+        )
+        with (
+            patch(f"{HOOK_MODULE}.current_platform", platform),
+            patch(
+                f"{HOOK_MODULE}.get_platform",
+                return_value=SimpleNamespace(is_xpu=False, is_hip=False),
+            ),
+            patch(
+                f"{HOOK_MODULE}.attention_backends_of",
+                return_value=(target_backend, target_backend),
+            ),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=config,
+            ),
+        ):
+            _resolve_dflash_draft_attention_backend(args)
+        return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_layout_specific_backends(self):
+        self.assertEqual(self._resolve("tokenspeed_mla", mla=True), "tokenspeed_mla")
+        self.assertEqual(self._resolve("tokenspeed_mla", mla=False), "flashinfer")
+        # A DeepSeek target's tokenspeed_mla must not reach a GQA draft.
+        self.assertEqual(
+            self._resolve(None, mla=False, target_backend="tokenspeed_mla"),
+            "flashinfer",
+        )
+        self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
+        self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
+
+    def test_draft_worker_does_not_inherit_tokenspeed_mla(self):
+        """A GQA DSpark draft inherits its backend in the worker, so an MLA target's
+        tokenspeed_mla must fall back unless the draft names it."""
+        from sglang.srt.speculative import draft_worker_common as common
+
+        target = ("tokenspeed_mla", "tokenspeed_mla")
+        platform = SimpleNamespace(is_xpu=False)
+        for named, expected in ((None, "flashinfer"), ("tokenspeed_mla",) * 2):
+            spec = SimpleNamespace(speculative_draft_attention_backend=named)
+            with (
+                patch.object(common, "get_spec", return_value=spec),
+                patch.object(common, "attention_backends", return_value=target),
+                patch.object(common, "get_platform", return_value=platform),
+                patch.object(common.torch.version, "hip", None),
+            ):
+                result = common.resolve_draft_worker_attention_backend()
+            self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":
