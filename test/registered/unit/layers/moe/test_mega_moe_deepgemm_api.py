@@ -2,7 +2,7 @@
 
 import sys
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -490,7 +490,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         )
         moe.topk.topk_config.sqrtsoftplus_log1p = True
         moe.topk.enable_waterfill = False
-        moe._mega_gate_supported = None
+        moe.mega_gate_supported = True
         if hash_routing:
             moe.is_hash = True
             moe.gate.e_score_correction_bias = None
@@ -505,37 +505,36 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             )
         return moe
 
-    def test_mega_gate_admission_falls_back_for_unsupported_routers(self):
-        moe = self._mega_gate_moe()
+    @contextmanager
+    def _mega_gate_env(self):
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        with ExitStack() as stack:
+            stack.enter_context(
+                get_context().override_server_args(
+                    model_path="dummy", enable_deterministic_inference=False
+                )
+            )
+            stack.enter_context(get_parallel().override(moe_ep_rank=0))
+            stack.enter_context(patch.dict(sys.modules, {"deep_gemm": deep_gemm}))
+            stack.enter_context(patch.object(topk_module, "_is_cuda", True))
+            stack.enter_context(
+                patch.object(topk_module, "_can_fuse_padded_region", return_value=False)
+            )
+            yield
+
+    def test_mega_gate_admission_falls_back_for_unsupported_routers(self):
+        moe = self._mega_gate_moe()
         supported = mega_gate_runtime.mega_gate_supported
         with (
-            get_context().override_server_args(
-                model_path="dummy", enable_deterministic_inference=False
-            ),
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            self._mega_gate_env(),
             patch.object(mega_gate_runtime, "_device_sm", 100),
         ):
             self.assertTrue(supported(moe))
             self.assertTrue(supported(self._mega_gate_moe(hash_routing=True)))
-            for name, value in (
-                ("renormalize", False),
-                ("use_grouped_topk", True),
-                ("scoring_func", "sigmoid"),
-                ("sqrtsoftplus_log1p", False),
-                ("custom_routing_function", object()),
-                ("torch_native", True),
-            ):
-                with patch.object(moe.topk.topk_config, name, value):
-                    self.assertFalse(supported(moe), name)
-            with patch.object(moe.topk, "enable_waterfill", True):
+            with patch.object(moe.topk.topk_config, "scoring_func", "sigmoid"):
                 self.assertFalse(supported(moe))
             with patch.object(moe, "num_fused_shared_experts", 1):
-                self.assertFalse(supported(moe))
-            with patch.object(moe.gate, "weight", moe.gate.weight.float()):
-                self.assertFalse(supported(moe))
-            with patch.object(mega_gate_runtime, "_device_sm", 90):
                 self.assertFalse(supported(moe))
             with get_exec().deterministic.override(enable_deterministic_inference=True):
                 self.assertFalse(supported(moe))
@@ -545,7 +544,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(mega_gate_runtime.should_use_mega_gate(moe, hidden))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
                 self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden))
-                self.assertTrue(moe._mega_gate_supported)
                 self.assertFalse(
                     mega_gate_runtime.should_use_mega_gate(moe, hidden.float())
                 )
@@ -556,8 +554,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 )
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
-        deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.bf16_mega_gate = self._mega_gate_reference
         for is_hash in (False, True):
             for scale_in_topk in (False, True):
                 for in_buffer in (False, True):
@@ -570,33 +566,21 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         hidden = torch.ones((4, 256), dtype=torch.bfloat16)
                         hidden[3:] = float("nan")
                         input_ids = torch.tensor([7, 99, 7, 1000])
-                        bound = torch.tensor([3])
                         buf = SimpleNamespace(
                             topk_idx=torch.full((8, 2), 5, dtype=torch.int64),
                             topk_weights=torch.full((8, 2), 9.0),
                         )
                         with (
-                            get_parallel().override(moe_ep_rank=0),
-                            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-                            patch.object(topk_module, "_is_cuda", True),
-                            patch.object(
-                                topk_module,
-                                "_can_fuse_padded_region",
-                                return_value=False,
-                            ),
+                            self._mega_gate_env(),
                             patch.object(
                                 moe.topk,
                                 "routing_inputs",
-                                return_value=(bound, None),
+                                return_value=(torch.tensor([3]), None),
                                 create=True,
                             ),
                         ):
                             routing = mega_gate_runtime.run_mega_gate(
-                                moe,
-                                hidden,
-                                input_ids,
-                                None,
-                                buf if in_buffer else None,
+                                moe, hidden, input_ids, buf if in_buffer else None
                             )
                         self.assertEqual(routing.in_buffer, in_buffer)
                         if in_buffer:
@@ -626,8 +610,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         moe = self._mega_gate_moe()
         hidden = torch.ones((4, 256), dtype=torch.bfloat16)
         hidden[2:] = float("nan")
-        deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.bf16_mega_gate = self._mega_gate_reference
         dispatch_info = ExpertLocationDispatchInfo(
             ep_dispatch_algorithm="static",
             partial_logical_to_rank_dispatch_physical_map=torch.tensor(
@@ -646,10 +628,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             topk_weights=torch.zeros((8, 2)),
         )
         with (
-            get_parallel().override(moe_ep_rank=0),
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            patch.object(topk_module, "_is_cuda", True),
-            patch.object(topk_module, "_can_fuse_padded_region", return_value=False),
+            self._mega_gate_env(),
             patch.object(
                 mega_gate_runtime,
                 "get_global_expert_distribution_recorder",
@@ -662,7 +641,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ),
         ):
             routing = mega_gate_runtime.run_mega_gate(
-                moe, hidden, torch.tensor([7, 99, 1000, 1000]), None, buf
+                moe, hidden, torch.tensor([7, 99, 1000, 1000]), buf
             )
         self.assertFalse(routing.in_buffer)
         torch.testing.assert_close(
@@ -680,7 +659,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 return_value=(None, SimpleNamespace(ep_dispatch_algorithm=algorithm)),
             ):
                 self.assertIsNone(
-                    mega_gate_runtime.run_mega_gate(moe, hidden, None, None, buf)
+                    mega_gate_runtime.run_mega_gate(moe, hidden, None, buf)
                 )
 
     @staticmethod

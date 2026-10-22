@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate, is_mega_gate_available
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _post_process_topk_ids,
@@ -21,8 +17,8 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
-MEGA_GATE_MAX_ROWS = 2048
-_ROW_MASKS_ATTR = "_mega_gate_row_masks"
+# DeepGEMM bf16_mega_gate scores one token block per launch.
+_MEGA_GATE_MAX_ROWS = 2048
 
 
 class MegaGateRouting(NamedTuple):
@@ -32,30 +28,11 @@ class MegaGateRouting(NamedTuple):
     in_buffer: bool
 
 
-@contextmanager
-def mega_gate_forward_scope(forward_batch):
-    if forward_batch is None or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
-        yield
-        return
-    try:
-        setattr(forward_batch, _ROW_MASKS_ATTR, {})
-    except (AttributeError, TypeError):
-        yield
-        return
-    try:
-        yield
-    finally:
-        try:
-            delattr(forward_batch, _ROW_MASKS_ATTR)
-        except AttributeError:
-            pass
-
-
 def mega_gate_supported(moe) -> bool:
     if (
         _device_sm // 10 != 10
         or not is_mega_gate_available()
-        or getattr(moe.config, "model_type", None) != "deepseek_v41"
+        or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
         or get_exec().deterministic.enable_deterministic_inference
@@ -101,30 +78,20 @@ def mega_gate_supported(moe) -> bool:
     )
 
 
-def mega_gate_rows_ok(moe, num_tokens: int) -> bool:
-    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
-        return False
-    supported = moe._mega_gate_supported
-    if supported is None:
-        supported = moe._mega_gate_supported = mega_gate_supported(moe)
+def should_use_mega_gate(moe, hidden_states: torch.Tensor) -> bool:
     forward = get_forward()
     return (
-        supported
-        and 0 < num_tokens <= MEGA_GATE_MAX_ROWS
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+        and moe.mega_gate_supported
+        and 0 < hidden_states.shape[0] <= _MEGA_GATE_MAX_ROWS
         and not forward.is_extend_in_batch
         and not forward.sp_active
-    )
-
-
-def should_use_mega_gate(moe, hidden_states: torch.Tensor) -> bool:
-    return (
-        mega_gate_rows_ok(moe, hidden_states.shape[0])
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
     )
 
 
-def routes_into_buffer(moe, dispatch_info) -> bool:
+def _routes_into_buffer(moe, dispatch_info) -> bool:
     if dispatch_info is not None:
         return False
     if (
@@ -133,51 +100,10 @@ def routes_into_buffer(moe, dispatch_info) -> bool:
         and get_global_experts_capturer() is not None
     ):
         return False
-    recorder = get_global_expert_distribution_recorder()
-    return (
-        getattr(type(recorder), "on_select_experts", None)
-        is ExpertDistributionRecorder.on_select_experts
-    )
+    return get_exec().moe.expert_distribution_recorder_mode is None
 
 
-def _gate_row_masks(moe, num_tokens, bound, input_ids, forward_batch):
-    use_image = (
-        not moe.is_hash
-        and moe.gate.e_score_correction_bias_vl is not None
-        and input_ids is not None
-    )
-    cache = getattr(forward_batch, _ROW_MASKS_ATTR, None)
-    key = (
-        num_tokens,
-        id(bound) if bound is not None else None,
-        id(input_ids) if use_image else None,
-        moe.config.image_token_id if use_image else None,
-    )
-    if isinstance(cache, dict):
-        hit = cache.get(key)
-        if (
-            hit is not None
-            and hit[0] is bound
-            and hit[1] is (input_ids if use_image else None)
-        ):
-            return hit[2], hit[3]
-    valid = None
-    if bound is not None:
-        valid = (
-            torch.arange(num_tokens, device=moe.gate.weight.device, dtype=torch.int32)
-            < bound.reshape(-1)[:1]
-        )
-    image = None
-    if use_image:
-        image = (input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
-    if isinstance(cache, dict):
-        cache[key] = (bound, input_ids if use_image else None, valid, image)
-    return valid, image
-
-
-def run_mega_gate(
-    moe, hidden_states, input_ids, forward_batch, buf=None
-) -> Optional[MegaGateRouting]:
+def run_mega_gate(moe, hidden_states, input_ids, buf=None) -> Optional[MegaGateRouting]:
     bound, dispatch_info = moe.topk.routing_inputs()
     if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm in (
         "lp",
@@ -187,18 +113,24 @@ def run_mega_gate(
     if moe.is_hash and input_ids is None:
         return None
     num_tokens = hidden_states.shape[0]
-    valid, image = _gate_row_masks(moe, num_tokens, bound, input_ids, forward_batch)
-
-    hash_ids = None
+    valid = None
+    if bound is not None:
+        valid = (
+            torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int32)
+            < bound.reshape(-1)[:1]
+        )
+    image = hash_ids = None
     if moe.is_hash:
         token_ids = input_ids[:num_tokens]
         if valid is not None:
             token_ids = torch.where(valid, token_ids, 0)
         hash_ids = moe.topk.tid2eid[token_ids].to(torch.int64)
+    elif moe.gate.e_score_correction_bias_vl is not None and input_ids is not None:
+        image = (input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
-    in_buffer = buf is not None and routes_into_buffer(moe, dispatch_info)
+    in_buffer = buf is not None and _routes_into_buffer(moe, dispatch_info)
     weights, ids = bf16_mega_gate(
         hidden_states,
         moe.gate.weight,
