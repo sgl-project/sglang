@@ -411,9 +411,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         model and the loader may each request it, in either order. A linear the
         loader already re-laid out for the AITER ASM GEMM no longer holds the
         checkpoint layout, so it keeps that GEMM."""
-        if getattr(layer, "dequantized_bf16", False) or getattr(
-            layer, "use_aiter_asm_fp4_gemm", False
-        ):
+        if layer.dequantized_bf16 or layer.use_aiter_asm_fp4_gemm:
             return
         w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
         layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
@@ -423,7 +421,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # A model may already have densified this linear before the loader pass.
-        if getattr(layer, "dequantized_bf16", False):
+        if layer.dequantized_bf16:
             return
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
@@ -478,6 +476,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
     ):
         self.input_size_per_partition = input_size_per_partition
         layer.dequantized_bf16 = False
+        layer.use_aiter_asm_fp4_gemm = False
 
         output_size_per_partition = sum(output_partition_sizes)
         self.output_size_per_partition = output_size_per_partition
@@ -881,12 +880,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         # (The fused tuple-input paths below are only used by MLA attention
         # projections, which are excluded from quantization for this checkpoint,
         # so a plain-tensor activation is what reaches here.)
-        if getattr(layer, "dequantized_bf16", False):
+        if layer.dequantized_bf16:
             if isinstance(x, tuple):
                 x = x[0]
             return torch.nn.functional.linear(x, layer.weight, bias)
 
-        if getattr(layer, "use_aiter_asm_fp4_gemm", False):
+        if layer.use_aiter_asm_fp4_gemm:
             output_shape = None
             if isinstance(x, tuple):
                 x_q, x_scales = _asm_fp4_prequantized_input(x)
