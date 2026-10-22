@@ -166,6 +166,11 @@ CROSS_ENCODER_ATTENTION_BACKEND = "triton"
 CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
 
 
+@unittest.skip(
+    "XPU store_cache supports only fp16/bf16/uint8 K/V; this fp32 cross-encoder "
+    "fails with 'store_cache only supports k/v dtype in {fp16, bf16, uint8}; got Float'. "
+    "Re-enable once more XPU KV cache dtypes are upstreamed."
+)
 class TestXPUCrossEncoderRerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
