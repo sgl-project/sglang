@@ -665,17 +665,20 @@ def _fp8_wo_a_einsum(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     recipe: Tuple[int, int, int],
-) -> torch.Tensor:
+    out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
     import deep_gemm
 
-    groups, rank = weight.shape[:2]
-    output = torch.empty(
-        o_fp8.shape[0], groups, rank, device=o_fp8.device, dtype=torch.bfloat16
-    )
+    if out is None:
+        groups, rank = weight.shape[:2]
+        out = torch.empty(
+            o_fp8.shape[0], groups, rank, device=o_fp8.device, dtype=torch.bfloat16
+        )
     deep_gemm.fp8_einsum(
-        "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), output, recipe=recipe
+        "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), out, recipe=recipe
     )
-    return output
+    return out
 
 
 def _apply_gguf_grouped_wo_a(
@@ -1395,6 +1398,12 @@ class MQALayer(MqaAttentionBase):
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
         self.mega_wq_b_permuted = False
+        if self.use_mega_attention:
+            self.wo_b.deepgemm_mxfp8_input = (
+                self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            )
+            if self.fuse_wqa_wkv:
+                self.wqkv_a.deepgemm_mxfp8_input = True
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1461,6 +1470,9 @@ class MQALayer(MqaAttentionBase):
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
+    def accepts_deepgemm_mxfp8_input(self) -> bool:
+        return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
+
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
         backend = getattr(method, "mxfp8_dense_backend", None)
@@ -1491,7 +1503,9 @@ class MQALayer(MqaAttentionBase):
             o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
-        return self._mega_core(q, attn_sink, forward_batch, attn_backend)
+        return self._mega_core(
+            q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
+        )
 
     def _mega_core(
         self,
@@ -1499,7 +1513,8 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-    ) -> torch.Tensor:
+        allow_mxfp8_output: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1512,9 +1527,25 @@ class MQALayer(MqaAttentionBase):
             cos_sin_cache=self.mega_cos_sin_cache,
         )
         groups = self.n_local_groups
-        return _fp8_wo_a_einsum(
-            data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
-        )
+        rows = data.shape[0]
+        o_fp8, o_s = data[:, :groups], scale[:, :groups]
+        if (
+            allow_mxfp8_output
+            and self.wo_b.deepgemm_mxfp8_input
+            and mhc.fused_mxfp8_rows(rows)
+        ):
+            y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+                rows, groups * self.o_lora_rank, data.device
+            )
+            _fp8_wo_a_einsum(
+                o_fp8,
+                o_s,
+                *self.mega_wo_a,
+                recipe=(1, 1, 32),
+                out=(y.view(rows, groups, -1), y_sf),
+            )
+            return y, y_sf
+        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32))
 
     def _get_npu_rope_position_cache(
         self,
