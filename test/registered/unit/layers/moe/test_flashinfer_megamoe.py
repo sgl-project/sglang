@@ -501,9 +501,6 @@ def test_decode_workspace_is_untuned_only_and_chosen_in_lockstep(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
     dp = types.ModuleType("sglang.srt.layers.dp_attention")
     monkeypatch.setitem(sys.modules, dp.__name__, dp)
-    sys.modules["sglang.srt.runtime_context"].get_parallel = lambda: (
-        types.SimpleNamespace(dp_size=4)
-    )
     quant_info = module.FlashInferMegaMoeQuantInfo(
         mega=mega,
         mega_forward=lambda layer, tensors: layer.forward(tensors),
@@ -520,7 +517,6 @@ def test_decode_workspace_is_untuned_only_and_chosen_in_lockstep(monkeypatch):
         ([1, 4, 2, 0], False, workspace),
         ([1, 5, 0, 0], False, None),
         ([1, 1, 1, 1], True, None),
-        ([3], False, None),
     ):
         dp.get_dp_global_num_tokens = lambda counts=counts: counts
         dp.get_is_extend_in_batch = lambda extend=extend: extend

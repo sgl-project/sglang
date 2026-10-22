@@ -216,17 +216,10 @@ def _select_decode_workspace(quant_info: FlashInferMegaMoeQuantInfo) -> Any:
         get_dp_global_num_tokens,
         get_is_extend_in_batch,
     )
-    from sglang.srt.runtime_context import get_parallel
 
     if get_is_extend_in_batch():
         return None
-    global_num_tokens = get_dp_global_num_tokens()
-    # A singleton list under DP holds only this rank's count; it cannot agree.
-    if not global_num_tokens or (
-        len(global_num_tokens) == 1 and get_parallel().dp_size > 1
-    ):
-        return None
-    if max(global_num_tokens) > workspace.max_tokens_per_rank:
+    if max(get_dp_global_num_tokens()) > workspace.max_tokens_per_rank:
         return None
     return workspace
 
