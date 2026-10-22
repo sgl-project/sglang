@@ -59,6 +59,158 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
     def setUpClass(cls):
         cls.device = _require_accelerator_device()
 
+    @unittest.skipIf(is_xpu(), "CUDA graph replay required")
+    def test_capacity_tail_is_not_consumed_on_replay(self):
+        """Unused routing capacity never contributes, including a zero used count."""
+        import sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts as temp
+        import sglang.kernels.ops.lora.moe.virtual_experts as stock
+        from sglang.srt.lora.trtllm_lora_temp.specialized_expand import (
+            _moe_lora_expand_add_kernel,
+        )
+
+        block_m, block_n, capacity_blocks = 16, 16, 9
+        routes, width, router_topk = block_m * capacity_blocks, 33, 2
+        sorted_ids = torch.zeros(routes, dtype=torch.int32, device=self.device)
+        expert_ids = torch.full(
+            (capacity_blocks,), -3, dtype=torch.int32, device=self.device
+        )
+        count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        order = torch.arange(routes, dtype=torch.int32, device=self.device)
+        route_values = (torch.arange(routes, device=self.device) % 7).half() / 8
+        scores = torch.full((routes,), 0.5, device=self.device, dtype=torch.float16)
+
+        def publish(blocks):
+            count.fill_(blocks * block_m)
+            sorted_ids.zero_()
+            sorted_ids[: blocks * block_m].copy_(order[: blocks * block_m])
+            expert_ids.fill_(-3)
+            expert_ids[:blocks].fill_(0)
+            if blocks:
+                expert_ids[0] = -1
+
+        variants = (
+            [
+                ("stock-shrink", stock._moe_lora_shrink_splitk_kernel, split_k)
+                for split_k in (1, 2)
+            ]
+            + [
+                ("temp-shrink", temp._moe_lora_shrink_splitk_kernel, split_k)
+                for split_k in (1, 2)
+            ]
+            + [("expand", _moe_lora_expand_add_kernel, add) for add in (False, True)]
+        )
+        for name, kernel, mode in variants:
+            with self.subTest(kernel=name, mode=mode):
+                shrink = name != "expand"
+                contraction = 64 if shrink else 32
+                a = route_values[:, None].expand(routes, contraction).contiguous()
+                # Negative tail IDs address a poisoned leading record if consumed.
+                backing = torch.full(
+                    (4, width, contraction),
+                    float("nan"),
+                    dtype=torch.float16,
+                    device=self.device,
+                )
+                weight = backing[3:]
+                weight.fill_(0.125)
+                additive = not shrink and mode
+                output_rows = routes // router_topk if additive else routes
+                output = torch.empty(
+                    (output_rows, width), dtype=torch.float16, device=self.device
+                )
+                initial = 0.0 if shrink and mode > 1 else 0.75
+                baseline = torch.full_like(output, initial)
+                grid = (capacity_blocks * ((width + block_n - 1) // block_n),)
+
+                def launch():
+                    if shrink:
+                        kernel[(grid[0] * mode,)](
+                            a,
+                            weight,
+                            output,
+                            sorted_ids,
+                            expert_ids,
+                            count,
+                            width,
+                            contraction,
+                            routes,
+                            a.stride(0),
+                            a.stride(1),
+                            weight.stride(0),
+                            weight.stride(1),
+                            weight.stride(2),
+                            output.stride(0),
+                            output.stride(1),
+                            top_k=1,
+                            BLOCK_SIZE_M=block_m,
+                            BLOCK_SIZE_N=block_n,
+                            BLOCK_SIZE_K=32,
+                            GROUP_SIZE_M=4,
+                            SPLIT_K=mode,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+                    else:
+                        kernel[grid](
+                            a,
+                            weight,
+                            output,
+                            scores,
+                            sorted_ids,
+                            expert_ids,
+                            count,
+                            width,
+                            contraction,
+                            routes,
+                            a.stride(0),
+                            a.stride(1),
+                            weight.stride(0),
+                            weight.stride(1),
+                            weight.stride(2),
+                            output.stride(0),
+                            output.stride(1),
+                            router_topk=router_topk,
+                            MUL_ROUTED_WEIGHT=True,
+                            FUSE_SUM_ALL_REDUCE=mode,
+                            BLOCK_SIZE_M=block_m,
+                            BLOCK_SIZE_N=block_n,
+                            BLOCK_SIZE_R=32,
+                            GROUP_SIZE_M=4,
+                            GATED_A_HALF=0,
+                            BROADCAST_A=False,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                publish(capacity_blocks)
+                output.copy_(baseline)
+                launch()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch()
+                for blocks in (0, 3, 5, capacity_blocks, 0, 3):
+                    publish(blocks)
+                    output.copy_(baseline)
+                    graph.replay()
+                    expected = baseline.clone()
+                    active_end = blocks * block_m
+                    projection = route_values * (contraction * 0.125)
+                    if shrink:
+                        expected[block_m:active_end] = projection[
+                            block_m:active_end, None
+                        ]
+                    elif additive:
+                        delta = torch.zeros(routes, device=self.device).half()
+                        delta[block_m:active_end] = projection[block_m:active_end] * 0.5
+                        expected += delta.view(-1, router_topk).sum(1)[:, None]
+                    elif blocks:
+                        expected[:block_m] = 0
+                        expected[block_m:active_end] = (
+                            projection[block_m:active_end, None] * 0.5
+                        )
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
     def test_negative_sentinels_preserved(self):
         """Virtual scratch IDs stay bounded without changing borrowed route metadata."""
         for dtype in (torch.int32, torch.int64):
