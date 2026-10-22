@@ -67,6 +67,9 @@ state layouts and attention TP sizes.
 It does not support speculative decoding, hybrid MLA layouts, other extra state
 components (including QSA), HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
+Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.
+Sharding produces noncontiguous send positions, while CPU-buffer transfers
+require contiguous send slices. The server rejects this combination at startup.
 Unsupported local configurations and peer layouts fail explicitly.
 
 On decode, this mode defaults `--disaggregation-decode-retraction-backup` to
