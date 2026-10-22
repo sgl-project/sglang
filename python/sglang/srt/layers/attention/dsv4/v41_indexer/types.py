@@ -48,11 +48,12 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
     # [columns] int64 index-K pool slot of each flattened-K column, from
-    # scoring.prefill_k_slots; gathered with the metadata, never per layer.
+    # scoring.prefill_k_slots; gathered once with a non-speculative extend's
+    # metadata, per layer otherwise.
     k_slots: torch.Tensor
     # ratio -> scoring.PrefillIndexPlan, filled by the first layer of each ratio and
-    # reused by the rest of the forward; None when the metadata outlives a forward
-    # (captured graphs), so every layer builds its own.
+    # reused by the rest of the forward; None when the metadata has no snapshot, so
+    # every layer builds its own.
     index_plans: Optional[Dict[int, object]]
     # [rows, pages] int32 at the KV page size; the index-K pool pages it with
     # expand_index_page_table.
