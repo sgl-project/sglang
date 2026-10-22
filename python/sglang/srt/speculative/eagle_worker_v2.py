@@ -27,7 +27,6 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -536,7 +535,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TritonAttnBackend,
             TRTLLMMLABackend,
             TRTLLMHAAttnBackend,
-            TokenspeedMLABackend,
             FlashInferAttnBackend,
             QwenSparseAttnBackend,
         ]
@@ -800,7 +798,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_context(
                         ForwardContext(
                             attn_backend=self.draft_attn_backend.attn_backends[i]
-                        )
+                        ),
+                        forward_batch=forward_batch,
                     ),
                     canary_index_ctx,
                 ):
@@ -903,7 +902,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_context(
                     ForwardContext(
                         attn_backend=self.draft_attn_backend.attn_backends[i]
-                    )
+                    ),
+                    forward_batch=forward_batch,
                 ),
                 canary_index_ctx,
             ):
