@@ -408,10 +408,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def dequantize_to_bf16(self, layer: torch.nn.Module) -> None:
         """Switch the linear to a dense BF16 weight and GEMM. Idempotent: the
-        model and the loader may each request it, in either order. A linear the
-        loader already re-laid out for the AITER ASM GEMM no longer holds the
-        checkpoint layout, so it keeps that GEMM."""
-        if layer.dequantized_bf16 or layer.use_aiter_asm_fp4_gemm:
+        model and the loader may each request it, in either order."""
+        if layer.dequantized_bf16:
+            return
+        # The ASM layout (shuffled weight, swizzled scale) no longer decodes as MXFP4.
+        if layer.use_aiter_asm_fp4_gemm:
             return
         w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
         layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)

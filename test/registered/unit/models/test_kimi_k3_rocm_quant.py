@@ -151,8 +151,8 @@ class TestDensifyQuarkMxfp4SharedExperts(CustomTestCase):
                 )
 
     def test_asm_relaid_linear_is_left_alone(self):
-        """A loader pass that already shuffled the weight and swizzled the scale
-        for the AITER ASM GEMM leaves nothing in the checkpoint layout to decode."""
+        """Densify must keep a linear the loader re-laid out for the AITER ASM GEMM
+        on that GEMM, not decode its shuffled weight as checkpoint MXFP4."""
         linear = _quark_mxfp4_linear(256, 256)
         with (
             patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),
