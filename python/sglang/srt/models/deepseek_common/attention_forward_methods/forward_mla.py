@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -372,9 +372,7 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -389,6 +387,9 @@ class DeepseekMLAForwardMixin:
                     topk_indices = maybe_capture_indexer_topk(
                         self.layer_id, prev_topk_indices
                     )
+                # Issued after the indexer so the join stays on the main lane at graph replay.
+                with torch.cuda.stream(self.alt_stream):
+                    q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -942,8 +943,7 @@ class DeepseekMLAForwardMixin:
 
         return (
             self.rotary_emb is not None
-            and self.current_attention_backend
-            in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
+            and self.current_attention_backend in ("trtllm_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
