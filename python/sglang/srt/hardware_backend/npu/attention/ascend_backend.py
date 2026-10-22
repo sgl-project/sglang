@@ -2775,27 +2775,21 @@ class AscendAttnBackend(AttentionBackend):
             **fia_kwargs,
         )
         attn_output = attn_output[:, :, :num_heads, :].reshape(
-            num_tokens, num_heads, self.kv_lora_rank
+            num_tokens, num_heads * self.kv_lora_rank
         )
         if not return_softmax_lse:
-            return attn_output.view(num_tokens, num_heads * self.kv_lora_rank)
+            return attn_output
 
         softmax_lse = softmax_lse.transpose(1, 2)[:, :, :num_heads, :].reshape(
-            num_tokens, num_heads, 1
+            num_tokens, num_heads
         )
-        if local_seq_lens is not None and local_seq_lens.numel():
-            rows_per_length = num_tokens // local_seq_lens.numel()
-            valid = (
-                (local_seq_lens > 0).repeat_interleave(rows_per_length).view(-1, 1, 1)
-            )
+        if local_seq_lens is not None:
+            valid = (local_seq_lens > 0).view(num_tokens, 1)
             attn_output = torch.where(valid, attn_output, torch.zeros_like(attn_output))
             softmax_lse = torch.where(
                 valid, softmax_lse, torch.full_like(softmax_lse, float("-inf"))
             )
-        return (
-            attn_output.view(num_tokens, num_heads * self.kv_lora_rank),
-            softmax_lse.squeeze(-1).to(torch.float32).contiguous(),
-        )
+        return attn_output, softmax_lse
 
     def forward_mtp(
         self,
