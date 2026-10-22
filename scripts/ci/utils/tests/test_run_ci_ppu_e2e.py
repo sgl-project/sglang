@@ -1,9 +1,8 @@
-"""Hardware-free contracts for label-selected PPU E2E execution."""
+"""Hardware-free contracts for command-selected PPU E2E execution."""
 
 import copy
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -19,11 +18,14 @@ sys.path.insert(0, str(ROOT / "scripts/ci/ppu"))
 import pr_e2e_report as report
 import pr_e2e_worker as worker
 import select_pr_e2e as selector
+from test_run_ci_ppu_commands import MemoryGitHub
 
 
-class FakeGitHub:
+class FakeGitHub(MemoryGitHub):
     def __init__(self, pr, events=None, permission="write"):
-        self.pr = pr
+        super().__init__(pr)
+        tokens = sorted({label["name"] for label in pr["labels"]} & selector.TOKENS)
+        self.selected_request = self.accept(tokens) if tokens else None
         self.history = (
             events
             if events is not None
@@ -61,6 +63,11 @@ def pull_request(labels):
     }
 
 
+def selection_state(labels):
+    api = FakeGitHub(pull_request(labels))
+    return {**selector.snapshot(api.pr), "request": api.selected_request}
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
@@ -85,7 +92,7 @@ class E2ESelectionTest(unittest.TestCase):
 
     def plan(self, labels=("run-ci", "test-bf16")):
         return selector.make_plan(
-            self.catalog, selector.snapshot(pull_request(labels)), "c" * 40, "42", "1"
+            self.catalog, selection_state(labels), "c" * 40, "42", "1"
         )
 
     def selected(self, *labels):
@@ -266,8 +273,8 @@ class E2ESelectionTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 selector.load_catalog(path)
 
-    def test_active_label_provenance_and_permissions(self):
-        pr = pull_request(["run-ci", "test-bf16"])
+    def test_run_ci_label_provenance_and_permissions(self):
+        pr = pull_request(["run-ci"])
         state = selector.snapshot(pr)
         for permission in ("write", "maintain", "admin"):
             self.assertEqual(
@@ -285,15 +292,13 @@ class E2ESelectionTest(unittest.TestCase):
         api = FakeGitHub(pr)
         api.history[-1]["actor"]["type"] = "Bot"
         self.assertTrue(selector.label_authorization(api, state))
-        api.history += [
-            {"id": 10, "event": "unlabeled", "label": {"name": "test-bf16"}}
-        ]
+        api.history += [{"id": 10, "event": "unlabeled", "label": {"name": "run-ci"}}]
         self.assertTrue(selector.label_authorization(api, state))
         api.history += [
             {
                 "id": 11,
                 "event": "labeled",
-                "label": {"name": "test-bf16"},
+                "label": {"name": "run-ci"},
                 "actor": {"login": "maintainer", "type": "User"},
             }
         ]
@@ -323,10 +328,92 @@ class E2ESelectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             selector.check_live(unauthorized, api)
 
+    def test_new_command_does_not_interrupt_pinned_workers_but_supersedes_gate(self):
+        api = FakeGitHub(pull_request(["run-ci", "test-bf16"]))
+        plan = self.plan()
+        latest = api.accept(("test-qwen",), 20)
+        selector.check_live(plan, api)
+        with self.assertRaisesRegex(ValueError, "superseded"):
+            selector.check_live(plan, api, require_latest=True)
+        current = selector.make_plan(
+            self.catalog,
+            {**selector.snapshot(api.pr), "request": latest},
+            "c" * 40,
+            "42",
+            "1",
+        )
+        self.assertNotEqual(plan["plan_hash"], current["plan_hash"])
+        with self.assertRaises(ValueError):
+            selector.check_cpu(current, "true", selector.cpu_identity(plan))
+        api.notes[0]["body"] = "/clear-ppu-e2e"
+        with self.assertRaises(ValueError):
+            selector.check_live(plan, api)
+
+    def test_frozen_event_rerun_uses_live_authorization_and_fresh_cpu_identity(self):
+        api = FakeGitHub(pull_request(["run-ci", "test-bf16"]))
+        self.assert_plan_outputs(
+            api, pull_request([]), requested="true", authorized="true"
+        )
+
+    def test_baseline_and_clear_preserve_existing_bot_run_ci_behavior(self):
+        api = FakeGitHub(pull_request(["run-ci"]))
+        api.history[0]["actor"]["type"] = "Bot"
+        for clear in (False, True):
+            if clear:
+                api.selected_request = api.accept((), 20)
+            with self.subTest(clear=clear):
+                plan = self.assert_plan_outputs(
+                    api, api.pr, requested="false", authorized="true"
+                )
+                with mock.patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+                    selector.check_live(plan, api, require_latest=True)
+
+    def test_coverage_labels_alone_never_select_e2e(self):
+        api = FakeGitHub(pull_request(["run-ci"]))
+        api.pr["labels"].append({"name": "test-qwen"})
+        self.assert_plan_outputs(api, api.pr, requested="false", authorized="true")
+
+    def assert_plan_outputs(self, api, original, **expected):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            event = directory / "event.json"
+            plan_path = directory / "selection.json"
+            output = directory / "outputs"
+            write_json(event, {"pull_request": original})
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_EVENT_PATH": str(event),
+                    "GITHUB_OUTPUT": str(output),
+                    "GITHUB_STEP_SUMMARY": "",
+                    "GITHUB_RUN_ATTEMPT": "2",
+                },
+            ), mock.patch.object(
+                selector, "GitHub", return_value=api
+            ), mock.patch.object(
+                sys, "argv", ["selector", "plan", "--plan", str(plan_path)]
+            ), self.assertRaises(
+                SystemExit
+            ) as caught:
+                selector.main()
+            self.assertFalse(caught.exception.code)
+            outputs = dict(
+                line.split("=", 1) for line in output.read_text().splitlines()
+            )
+            for name, value in expected.items():
+                self.assertEqual(outputs[name], value)
+            plan = selector.read_json(plan_path)
+            self.assertEqual(plan["attempt"], "2")
+            with mock.patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+                selector.check_cpu(plan, "true", selector.cpu_identity(plan))
+            return plan
+
     def test_stale_event_writes_failed_selection_plan(self):
         live = pull_request(["run-ci", "test-bf16"])
         stale = copy.deepcopy(live)
-        stale["head"]["sha"] = "old"
+        stale["head"]["sha"] = "old-head"
+        stale["base"]["sha"] = "old-base"
         with tempfile.TemporaryDirectory() as temporary:
             event, output = (
                 Path(temporary) / "event.json",
@@ -349,7 +436,10 @@ class E2ESelectionTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     selector.main()
             self.assertTrue(caught.exception.code)
-            self.assertIn("stale", " ".join(selector.read_json(output)["errors"]))
+            plan = selector.read_json(output)
+            self.assertIn("stale", " ".join(plan["errors"]))
+            self.assertEqual(plan["head_sha"], "old-head")
+            self.assertEqual(plan["base_sha"], "old-base")
 
 
 class E2EEvidenceTest(unittest.TestCase):
@@ -722,7 +812,7 @@ class E2EEvidenceTest(unittest.TestCase):
     def test_outer_gate_never_accepts_skipped_full_ci_for_selected_work(self):
         plan = selector.make_plan(
             self.catalog,
-            selector.snapshot(pull_request(["test-bf16", "run-ci"])),
+            selection_state(["test-bf16", "run-ci"]),
             "c" * 40,
             "42",
             "1",
@@ -845,7 +935,7 @@ class E2EWorkflowTest(unittest.TestCase):
     def workflow(self, name):
         return yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
 
-    def test_exact_label_allowlists_and_distinct_ignored_check_name(self):
+    def test_only_run_ci_grants_are_relevant_label_events(self):
         ci = self.workflow("ci.yaml")
         expressions = [
             ci["concurrency"]["group"],
@@ -854,9 +944,9 @@ class E2EWorkflowTest(unittest.TestCase):
             ci["jobs"]["e2e-gate"]["if"],
         ]
         for expression in expressions:
-            lists = re.findall(r"fromJSON\('([^']+)'\)", expression)
-            self.assertEqual(len(lists), 1)
-            self.assertEqual(set(json.loads(lists[0])), selector.RELEVANT_LABELS)
+            self.assertIn("github.event.label.name == 'run-ci'", expression)
+            for token in selector.TOKENS:
+                self.assertNotIn(token, expression)
         gate = ci["jobs"]["e2e-gate"]
         self.assertIn("PPU E2E Ignored Event", gate["name"])
         self.assertIn("always()", gate["if"])
@@ -878,9 +968,9 @@ class E2EWorkflowTest(unittest.TestCase):
             ("pull_request", "labeled", "test-unknown", False),
         ]
         cases += [
-            ("pull_request", action, label, True)
+            ("pull_request", action, label, action == "labeled" and label == "run-ci")
             for action in ("labeled", "unlabeled")
-            for label in selector.RELEVANT_LABELS
+            for label in selector.TOKENS | {"run-ci"}
         ]
         events = [
             {"event_name": event, "event": {"action": action, "label": {"name": label}}}

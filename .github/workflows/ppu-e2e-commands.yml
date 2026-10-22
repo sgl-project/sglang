@@ -1,0 +1,67 @@
+name: PPU E2E Commands
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: [CI Pipeline]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  resolve:
+    if: >-
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' &&
+      (contains(github.event.comment.body, '/run-ppu-e2e') ||
+      contains(github.event.comment.body, '/clear-ppu-e2e'))) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pr: ${{ steps.resolve.outputs.pr }}
+    steps:
+      # Neither privileged event may execute PR-controlled code or artifacts.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve current PR from trusted GitHub metadata
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/ppu/pr_e2e_commands.py resolve
+
+  schedule:
+    needs: resolve
+    if: needs.resolve.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ppu-e2e-commands-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Persist latest command and queue full CI rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+        run: python3 scripts/ci/ppu/pr_e2e_commands.py reconcile

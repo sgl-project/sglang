@@ -7,23 +7,21 @@ import json
 import os
 import re
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+from pr_e2e_commands import (
+    FAMILIES,
+    FORMATS,
+    MODIFIERS,
+    SELECTORS,
+    TOKENS,
+    GitHub,
+    resolve_request,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 CATALOG = ROOT / "scripts/ci/ppu/pr_e2e_catalog.json"
-FAMILIES = {"qwen", "deepseek", "glm", "kimi", "minimax"}
-FORMATS = {
-    "test-w4a8": {"w4a8-int8"},
-    "test-w8a8": {"w8a8-int8"},
-    "test-bf16": {"bf16"},
-    "test-fp8": {"fp8", "fp8-channelwise"},
-    "test-mxfp4": {"mxfp4-fp8"},
-}
-SELECTORS = {"test-" + family for family in FAMILIES} | set(FORMATS) | {"test-all"}
-MODIFIERS = {"test-accuracy-full", "test-perf", "test-multinode", "test-pd"}
-LABELS = SELECTORS | MODIFIERS | {"test-functional"}
-RELEVANT_LABELS = LABELS | {"run-ci"}
+RELEVANT_LABELS = {"run-ci"}
 ENVIRONMENT = {
     "SGLANG_DEFAULT_THINKING": {"0", "1"},
     "SGLANG_DSV4_REASONING_EFFORT": {"high"},
@@ -183,8 +181,8 @@ def phase(entry):
     return "default"
 
 
-def select(catalog, labels):
-    labels = set(labels) & LABELS
+def select(catalog, tokens):
+    labels = set(tokens) & TOKENS
     selectors = labels & SELECTORS
     errors = []
     if labels & MODIFIERS and not selectors:
@@ -238,34 +236,6 @@ def select(catalog, labels):
     return sorted(selected.values(), key=lambda e: e["id"]), sorted(errors)
 
 
-class GitHub:
-    def __init__(self):
-        self.repository = os.environ["GITHUB_REPOSITORY"]
-        self.base = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-        self.token = os.environ["GH_TOKEN"]
-
-    def get(self, path):
-        request = urllib.request.Request(
-            self.base + "/repos/" + self.repository + "/" + path,
-            headers={
-                "Authorization": "Bearer " + self.token,
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
-
-    def events(self, number):
-        result = []
-        for page in range(1, 101):
-            batch = self.get(f"issues/{number}/events?per_page=100&page={page}")
-            result.extend(batch)
-            if len(batch) < 100:
-                return result
-        raise ValueError("Label history exceeds the bounded pagination limit")
-
-
 def snapshot(pr):
     return {
         "pr": pr["number"],
@@ -278,7 +248,7 @@ def snapshot(pr):
 
 
 def label_authorization(api, state):
-    if not set(state["labels"]) & LABELS:
+    if "run-ci" not in state["labels"]:
         return []
     active = {}
     for event in sorted(api.events(state["pr"]), key=lambda e: e["id"]):
@@ -309,10 +279,12 @@ def label_authorization(api, state):
 
 
 def make_plan(catalog, state, tested_sha, run_id, attempt, root=ROOT):
-    entries, errors = select(catalog, state["labels"])
+    request = state.get("request")
+    entries, errors = select(catalog, request["selectors"] if request else [])
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         **state,
+        "request": request,
         "tested_sha": tested_sha,
         "run_id": str(run_id),
         "attempt": str(attempt),
@@ -338,7 +310,15 @@ def validate_plan(plan, root=ROOT):
         load_catalog(root / "scripts/ci/ppu/pr_e2e_catalog.json", root),
         {
             k: plan[k]
-            for k in ("pr", "head_sha", "base_sha", "labels", "draft", "state")
+            for k in (
+                "pr",
+                "head_sha",
+                "base_sha",
+                "labels",
+                "draft",
+                "state",
+                "request",
+            )
         },
         plan["tested_sha"],
         plan["run_id"],
@@ -356,14 +336,20 @@ def validate_plan(plan, root=ROOT):
             raise ValueError(f"Stale selection identity: {key}; use Re-run all jobs")
 
 
-def check_live(plan, api, require_authorized=True):
+def check_live(plan, api, require_authorized=True, require_latest=False):
     validate_plan(plan)
     current = snapshot(api.get(f"pulls/{plan['pr']}"))
     if current != {key: plan[key] for key in current}:
         raise ValueError(
-            "PR revision, draft state, or selected labels changed; this plan is stale"
+            "PR revision, draft state, or run-ci authorization changed; this plan is stale"
         )
-    errors = label_authorization(api, current)
+    if plan["request"] is not None:
+        resolve_request(api, plan["pr"], plan["request"])
+    if require_latest and resolve_request(api, plan["pr"]) != plan["request"]:
+        raise ValueError(
+            "E2E request superseded; the latest command is queued for a full rerun"
+        )
+    errors = label_authorization(api, current) if plan["entries"] else []
     if errors:
         raise ValueError("; ".join(errors))
     if require_authorized and (
@@ -405,14 +391,14 @@ def main():
         choices=["validate", "preview", "plan", "check", "matrix", "entry", "cpu"],
     )
     parser.add_argument("--plan", default="selection.json")
-    parser.add_argument("--labels", nargs="*", default=[])
+    parser.add_argument("--selectors", nargs="*", default=[])
     parser.add_argument("--allow-unauthorized", action="store_true")
     args = parser.parse_args()
     if args.mode == "validate":
         print(f"Validated {len(load_catalog()['entries'])} E2E entries")
         return
     if args.mode == "preview":
-        entries, errors = select(load_catalog(), args.labels)
+        entries, errors = select(load_catalog(), args.selectors)
         print(
             json.dumps(
                 {"selected": [e["id"] for e in entries], "errors": errors}, indent=2
@@ -425,27 +411,43 @@ def main():
         event = read_json(os.environ["GITHUB_EVENT_PATH"])
         api = GitHub()
         state = snapshot(api.get(f"pulls/{event['pull_request']['number']}"))
+        errors = []
+        try:
+            state["request"] = resolve_request(api, state["pr"])
+        except Exception as error:
+            state["request"] = None
+            errors.append(f"Command authorization failed: {error}")
+        original = snapshot(event["pull_request"])
         plan = make_plan(
             load_catalog(),
-            state,
+            {**state, **{key: original[key] for key in ("pr", "head_sha", "base_sha")}},
             os.environ["GITHUB_SHA"],
             os.environ["GITHUB_RUN_ID"],
             os.environ["GITHUB_RUN_ATTEMPT"],
         )
-        # Older events do not get to authorize newer label sets or revisions.
-        if snapshot(event["pull_request"]) != state:
-            plan["errors"].append(
-                "Event payload is stale; trigger a fresh relevant PR event."
+        # Reruns intentionally refresh command/label state, never the tested revision.
+        if any(original[key] != state[key] for key in ("pr", "head_sha", "base_sha")):
+            errors.append(
+                "Event revision is stale; trigger a fresh PR synchronize event."
             )
-        plan["errors"].extend(label_authorization(api, state))
+        if state["request"] and state["request"]["selectors"]:
+            errors.extend(label_authorization(api, state))
+        plan["errors"].extend(errors)
         plan = seal(plan)
         Path(args.plan).write_text(json.dumps(plan, indent=2) + "\n")
-        output("requested", str(bool(set(state["labels"]) & LABELS)).lower())
+        request = state["request"]
+        output("requested", str(bool(request and request["selectors"])).lower())
+        ready = not state["draft"] and state["state"] == "open"
+        output("ready", str(ready).lower())
+        output(
+            "authorized",
+            str(not plan["errors"] and ready and "run-ci" in state["labels"]).lower(),
+        )
         output("plan_hash", plan["plan_hash"])
-        output("identity", f"{plan['run_id']}:{plan['attempt']}:{plan['tested_sha']}")
         summary = [
             "## PPU E2E selection",
-            f"Labels: {', '.join(state['labels']) or '(none)'}",
+            f"Command: {request['comment_id'] if request else '(none)'}",
+            f"Selectors: {', '.join(request['selectors']) if request else '(none)'}",
             f"Selected executions: {len(plan['entries'])}",
             "Default: Answer + Accuracy smoke. Format/model selectors use union semantics.",
         ]

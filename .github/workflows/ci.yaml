@@ -15,25 +15,27 @@ permissions:
   actions: read
 
 concurrency:
-  # Review-only runs must not cancel CPU/hardware jobs they do not schedule.
-  # Ignored review and unrelated-label events use a per-run suffix so they
-  # cannot cancel active PR CI.
+  # Metadata events never preempt active CI. A run-ci grant queues in the PR
+  # group; other label events and reviews are isolated and do not run PPU work.
   group: >-
     ci-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{
     ((github.event_name == 'pull_request_review' &&
     (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
     (github.event_name == 'pull_request' &&
     (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-    !contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))) && github.run_id || 'active' }}
-  cancel-in-progress: true
+    !(github.event.action == 'labeled' && github.event.label.name == 'run-ci'))) && github.run_id || 'active' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.run_attempt == 1 }}
 
 jobs:
   # Stage 1: 密钥扫描预检（组织级 reusable workflow）
   precheck:
     name: Pre-check
     if: >-
-      github.event_name != 'pull_request_review' ||
-      (github.event.review.state == 'approved' && github.event.review.user.type != 'Bot')
+      (github.event_name == 'pull_request' &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci'))) ||
+      (github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' && github.event.review.user.type != 'Bot')
     uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
 
   # Stage 2: 注册完整性校验与 AI 评审并行
@@ -67,10 +69,12 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci'))
     runs-on: ubuntu-latest
     outputs:
       requested: ${{ steps.select.outputs.requested }}
+      ready: ${{ steps.select.outputs.ready }}
+      authorized: ${{ steps.select.outputs.authorized }}
       plan_hash: ${{ steps.select.outputs.plan_hash }}
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +96,7 @@ jobs:
   cpu-precheck:
     name: CPU Shortlist
     needs: [precheck, e2e-selection]
-    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    if: github.event_name == 'pull_request' && needs.e2e-selection.outputs.ready == 'true'
     uses: ./.github/workflows/pr-test-ppu.yml
     with:
       cpu_only: true
@@ -123,8 +127,8 @@ jobs:
     name: Full CI
     needs: [registration-validation, cpu-precheck, e2e-selection]
     if: >-
-      github.event_name == 'pull_request' && !github.event.pull_request.draft &&
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      github.event_name == 'pull_request' &&
+      needs.e2e-selection.outputs.authorized == 'true'
     uses: ./.github/workflows/pr-test-ppu.yml
     with:
       cpu_precheck_result: ${{ needs.cpu-precheck.result }}
@@ -139,13 +143,13 @@ jobs:
     name: >-
       ${{ github.event_name == 'pull_request' &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name)) &&
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')) &&
       'PPU E2E Gate' || 'PPU E2E Ignored Event' }}
     needs: [precheck, e2e-selection, cpu-precheck, ci]
     if: >-
       always() && github.event_name == 'pull_request' &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      contains(fromJSON('["run-ci","test-qwen","test-deepseek","test-glm","test-kimi","test-minimax","test-w4a8","test-w8a8","test-bf16","test-fp8","test-mxfp4","test-all","test-accuracy-full","test-perf","test-multinode","test-pd","test-functional"]'), github.event.label.name))
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

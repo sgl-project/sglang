@@ -307,7 +307,7 @@ def main():
     plan = read_json(args.plan)
     validate_plan(plan)
     if args.mode == "outer":
-        check_live(plan, GitHub(), bool(plan["entries"]))
+        check_live(plan, GitHub(), bool(plan["entries"]), require_latest=True)
         needs = json.loads(os.environ["NEEDS_JSON"])
         require(needs["e2e-selection"]["result"] == "success", "Selection failed")
         if plan["entries"]:

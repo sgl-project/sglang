@@ -53,7 +53,7 @@ on:
         type: string
         default: ''
       e2e_requested:
-        description: 'Force CPU prerequisites for an explicit label-selected E2E request.'
+        description: 'Force CPU prerequisites for a persistent command-selected E2E request.'
         required: false
         type: boolean
         default: false
@@ -74,8 +74,10 @@ on:
         value: ${{ jobs.e2e.outputs.evidence_ok }}
 
 concurrency:
-  group: pr-test-ppu-${{ inputs.cpu_only && 'cpu' || 'full' }}-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # The outer pipeline owns PR cancellation; reusable callers must not preempt
+  # one another when a command requests a later full rerun.
+  group: pr-test-ppu-${{ inputs.cpu_only && 'cpu' || 'full' }}-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -139,7 +141,7 @@ jobs:
           predicate-quantifier: every
           filters: |
             ppu_ci:
-              - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+              - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
               - '!**/*.[mM][dD]'
               - '!**/*.[mM][dD][xX]'
               - '!**/*.[rR][sS][tT]'
@@ -148,7 +150,7 @@ jobs:
             # One positive union per group; exemptions bind to each changed file.
             # paths-filter v3 expands renames into old-path deletions/new additions.
             cpu:
-              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
               - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
               - '!test/{srt/models/diffusion,registered/diffusion}/**'
               - '!**/*.[mM][dD]'
@@ -156,7 +158,7 @@ jobs:
               - '!**/*.[rR][sS][tT]'
               - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
             ppu_single:
-              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-test-ppu-e2e.yml,pr-test-ppu-e2e-entry.yml,ppu-e2e-commands.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
               - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
               - '!test/{srt/models/diffusion,registered/diffusion}/**'
               - '!test/registered/ppu/{test_ppu_constraints.py,test_ppu_environment_fingerprint_unit.py,accuracy_eval/test_ppu_accuracy_eval_unit.py,pd_perf_eval/test_ppu_pd_perf_eval_unit.py,pr/test_cpu_eval.py}'

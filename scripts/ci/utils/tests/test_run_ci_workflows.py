@@ -35,14 +35,16 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             ["registration-validation", "cpu-precheck", "e2e-selection"],
         )
         self.assertIn(
-            "contains(github.event.pull_request.labels.*.name, 'run-ci')",
-            workflow,
+            "needs.e2e-selection.outputs.authorized == 'true'", jobs["ci"]["if"]
         )
+        self.assertNotIn("github.event.pull_request.labels", jobs["ci"]["if"])
         self.assertIn("github.event.action != 'unlabeled'", jobs["e2e-selection"]["if"])
-        self.assertIn("contains(fromJSON(", jobs["e2e-selection"]["if"])
+        self.assertIn(
+            "github.event.label.name == 'run-ci'", jobs["e2e-selection"]["if"]
+        )
         self.assertNotIn("require_run_ci_label: false", workflow)
         self.assertIn("github.event.action == 'labeled'", workflow)
-        self.assertIn("!github.event.pull_request.draft", jobs["ci"]["if"])
+        self.assertIn("needs.e2e-selection.outputs.ready", jobs["cpu-precheck"]["if"])
         self.assertEqual(
             jobs["e2e-gate"]["needs"],
             ["precheck", "e2e-selection", "cpu-precheck", "ci"],
@@ -50,7 +52,7 @@ class RunCiWorkflowContractTest(unittest.TestCase):
 
     def test_review_events_cannot_cancel_pr_execution(self):
         concurrency = yaml.safe_load(self.read_workflow("ci.yaml"))["concurrency"]
-        self.assertTrue(concurrency["cancel-in-progress"])
+        self.assertIn("github.run_attempt == 1", concurrency["cancel-in-progress"])
         script = r"""
             const {template, github} = JSON.parse(process.argv[1]);
             const group = template.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expr) =>
@@ -127,7 +129,7 @@ class RunCiWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("secrets", cpu)
         self.assertEqual(
             cpu["if"].strip(),
-            "github.event_name == 'pull_request' && !github.event.pull_request.draft",
+            "github.event_name == 'pull_request' && needs.e2e-selection.outputs.ready == 'true'",
         )
         self.assertEqual(
             jobs["ci"]["with"],
@@ -420,6 +422,8 @@ class PpuPathSelectionTest(unittest.TestCase):
                     ".github/workflows/pr-test-ppu.yml",
                     ".github/workflows/pr-test-ppu-e2e.yml",
                     ".github/workflows/pr-test-ppu-e2e-entry.yml",
+                    ".github/workflows/ppu-e2e-commands.yml",
+                    "scripts/ci/ppu/pr_e2e_commands.py",
                     ".github/workflows/pr-gate.yml",
                     ".github/workflows/labeler.yml",
                     ".github/labeler.yml",
