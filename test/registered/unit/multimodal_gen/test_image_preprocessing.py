@@ -10,7 +10,9 @@ from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import QwenImageEditPlusPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 from sglang.srt.environ import envs
@@ -34,9 +36,13 @@ class TestImagePreprocessing(CustomTestCase):
                 with self.subTest(shape=shape, mode=mode):
                     source = image.convert(mode)
                     with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(True):
-                        expected = preprocess_image(source, device=torch.device("cuda"), sizes=sizes, crop=crop)
+                        expected = preprocess_image(
+                            source, device=torch.device("cuda"), sizes=sizes, crop=crop
+                        )
                     with envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(False):
-                        actual = preprocess_image(source, device=torch.device("cuda"), sizes=sizes, crop=crop)
+                        actual = preprocess_image(
+                            source, device=torch.device("cuda"), sizes=sizes, crop=crop
+                        )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     self.assertEqual(actual.stride(), expected.stride())
 
@@ -47,12 +53,22 @@ class TestImagePreprocessing(CustomTestCase):
         qwen = QwenImageEditPlusPipelineConfig()
         qwen_processor = VaeImageProcessor(vae_scale_factor=8)
         for height, width in ((1024, 1024), (1081, 1921), (731, 517), (2160, 3840)):
-            image = Image.fromarray(rng.integers(0, 256, (height, width, 3), dtype=np.uint8))
+            image = Image.fromarray(
+                rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+            )
             with self.subTest(height=height, width=width):
-                source = processor._resize_to_target_area(image) if width * height > 1024**2 else image
+                source = (
+                    processor._resize_to_target_area(image)
+                    if width * height > 1024**2
+                    else image
+                )
                 out_w, out_h = source.width // 16 * 16, source.height // 16 * 16
-                expected = processor.preprocess(source, height=out_h, width=out_w, resize_mode="crop").cuda()
-                actual, size = flux.preprocess_condition_image(image, width, height, processor)
+                expected = processor.preprocess(
+                    source, height=out_h, width=out_w, resize_mode="crop"
+                ).cuda()
+                actual, size = flux.preprocess_condition_image(
+                    image, width, height, processor
+                )
                 self.assertEqual(size, (out_w, out_h))
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 self.assertEqual(actual.stride(), expected.stride())
