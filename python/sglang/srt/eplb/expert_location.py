@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.eplb.stage_domain import EPLBStageDomain
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -44,6 +45,18 @@ def _prefer_same_node_experts() -> bool:
     return (
         get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
     )
+
+
+def _num_ep_ranks_per_node(ep_size: int) -> int:
+    if get_parallel().pp_size == 1:
+        return ep_size // get_parallel().nnodes
+    domain = EPLBStageDomain.from_runtime()
+    if domain.ep_size != ep_size:
+        raise RuntimeError(
+            "Expert dispatch domain and metadata disagree on EP size: "
+            f"domain={domain.ep_size}, metadata={ep_size}"
+        )
+    return domain.ep_size // domain.num_nodes
 
 
 def _compute_elastic_expert_layout(
@@ -179,6 +192,7 @@ class ExpertLocationMetadata:
         logical_count: torch.Tensor,
         *,
         use_flat_topology: bool = False,
+        stage_domain: Optional[EPLBStageDomain] = None,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -194,7 +208,16 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = 1 if use_flat_topology else get_parallel().nnodes
+        if use_flat_topology:
+            num_nodes = 1
+        else:
+            stage_domain = stage_domain or EPLBStageDomain.from_runtime()
+            if stage_domain.ep_size != common["ep_size"]:
+                raise RuntimeError(
+                    "EPLB layout domain and metadata disagree on EP size: "
+                    f"domain={stage_domain.ep_size}, metadata={common['ep_size']}"
+                )
+            num_nodes = stage_domain.num_nodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -562,9 +585,7 @@ def _compute_logical_to_all_physical_map(
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (
-            get_parallel().ep_size // get_parallel().nnodes
-            if prefer_same_node
-            else None
+            _num_ep_ranks_per_node(ep_size) if prefer_same_node else None
         )
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
@@ -624,9 +645,7 @@ def compute_logical_to_rank_dispatch_physical_map(
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
     prefer_same_node = _prefer_same_node_experts()
-    num_gpus_per_node = (
-        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
-    )
+    num_gpus_per_node = _num_ep_ranks_per_node(ep_size) if prefer_same_node else None
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node
         if num_gpus_per_node is not None
