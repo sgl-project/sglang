@@ -90,19 +90,13 @@ def _a2a_staging_buffer(
         _UNCACHED_STAGING
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or (device.type != "cpu" and device.type not in _A2A_DEVICE_TYPES)
+        or device.type not in _A2A_DEVICE_TYPES
+        or torch.get_device_module(device).is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    if device.type == "cpu":
-        # CPU has no accelerator stream capture or device index.
-        device_index = 0
-    else:
-        device_module = torch.get_device_module(device)
-        if device_module.is_current_stream_capturing():
-            return torch.empty(shape, dtype=dtype, device=device)
-        device_index = device.index
-        if device_index is None:
-            device_index = device_module.current_device()
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.get_device_module(device).current_device()
     key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
