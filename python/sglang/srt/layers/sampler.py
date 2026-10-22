@@ -960,10 +960,8 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
         if return_filtered_probs:
-            # Keep filtered float32 weights in token order.
-            filtered_probs = torch.zeros_like(probs_sort).scatter_(
-                1, probs_idx, probs_sort
-            )
+            # Reuse the softmax buffer; preserve the logits dtype and vocab order.
+            filtered_probs = probs.scatter_(1, probs_idx, probs_sort)
 
         if sampling_seed is None:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
