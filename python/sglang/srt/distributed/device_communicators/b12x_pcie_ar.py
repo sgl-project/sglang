@@ -45,7 +45,7 @@ and costs 46% decode throughput on the 2+2 split.
 
 import inspect
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import torch
@@ -226,9 +226,7 @@ class B12xPCIeCommunicator:
         if envs.SGLANG_B12X_PCIE_DMA.get():
             self._init_dma(group, device)
 
-    def _resolve_oneshot_cap(
-        self, *, group: ProcessGroup, device: torch.device
-    ) -> int:
+    def _resolve_oneshot_cap(self, *, group: ProcessGroup, device: torch.device) -> int:
         """Largest message the one-shot path may take, in bytes.
 
         See the module docstring for why this is deployment-specific. A cap of 0 leaves
@@ -260,7 +258,9 @@ class B12xPCIeCommunicator:
                     fn=lambda t: dist.all_reduce(t, group=group), buf=buf, group=group
                 )
                 b12x_us = _time_all_reduce(
-                    fn=lambda t: self._oneshot.all_reduce(t, **(self._channels.kwargs() or {})),
+                    fn=lambda t: self._oneshot.all_reduce(
+                        t, **(self._channels.kwargs() or {})
+                    ),
                     buf=buf,
                     group=group,
                 )
