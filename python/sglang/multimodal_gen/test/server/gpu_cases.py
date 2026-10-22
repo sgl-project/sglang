@@ -1663,43 +1663,40 @@ if current_platform.is_hip():
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
+# scheduling estimates use full-process H100 CI medians, rounded up to 10s
 STANDALONE_FILE_EST_TIMES = {
     "bcg-diffusion": {
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
-        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
+        "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
-        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
-        # Raise if CI reports a higher measured time.
-        "../single_test_file/test_disagg_server.py": 600.0,
-        "../single_test_file/test_ar_models.py": 600.0,
+        "../single_test_file/test_disagg_server.py": 780.0,
+        "../single_test_file/test_ar_models.py": 120.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
-        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
-        "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
+        "../single_test_file/test_ipc_a2a_multi_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
-        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
-        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
-        # padded for cold-cache CI.
-        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 40.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 30.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 100.0,
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 70.0,
         # zimage server startup dominates; six short requests after warmup
-        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        "../single_test_file/test_dp_serving_2_gpu.py": 60.0,
         # one capture plus three replays on a 32K-element exchange
-        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
-        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
         # no model load; two small all-to-alls
-        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
-        "../unit/test_async_output_save.py": 30.0,
-        "../unit/test_kandinsky6_sequence_parallel.py": 150.0,
-        "../unit/test_kandinsky6_sr_sequence_parallel.py": 150.0,
-        "../unit/test_qwen_image21_distributed.py": 90.0,
+        "../unit/test_async_output_save.py": 20.0,
+        "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }
 
