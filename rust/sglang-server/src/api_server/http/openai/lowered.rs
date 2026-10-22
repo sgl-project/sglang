@@ -336,20 +336,28 @@ mod tests {
         answering_app_state_with, answering_app_state_with_item, body_json, chunk, post_json,
     };
     use super::*;
-    use crate::message::response::ResponseItem;
+    use crate::message::response::{ChunkExtras, ResponseItem};
     use crate::utils::error::Error;
 
     /// A word-level tokenizer; the mocked core ignores the prompt ids.
-    fn tokenizer() -> Tokenizer {
-        static TOKENIZER: std::sync::OnceLock<Tokenizer> = std::sync::OnceLock::new();
-        let load = || {
-            let path = std::env::temp_dir().join(format!("lowered-{}.json", std::process::id()));
-            let model = json!({"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"});
+    /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
+    fn tokenizer_path() -> &'static str {
+        static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("lowered-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let vocab = json!({"[UNK]": 0, "!": 1, "#": 2, "Ã©": 3});
+            let model = json!({"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"});
             let config = json!({"model": model, "pre_tokenizer": {"type": "Whitespace"}});
+            let path = dir.join("tokenizer.json");
             std::fs::write(&path, config.to_string()).unwrap();
-            Tokenizer::from_file(path.to_str().unwrap()).unwrap()
-        };
-        TOKENIZER.get_or_init(load).clone()
+            path.to_string_lossy().into_owned()
+        })
+    }
+
+    /// The mocked core ignores the prompt ids.
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_file(tokenizer_path()).unwrap()
     }
 
     async fn chat(body: Value) -> Value {
@@ -501,12 +509,42 @@ mod tests {
         );
     }
 
-    /// Logprobs are served by the processor, which reports `reasoning_tokens`.
+    /// Logprobs are served by the processor: a partial character's `bytes`
+    /// are its byte-level token's, as on Python, not the replacement text's.
     #[tokio::test]
     async fn processor_serves_logprobs() {
-        let messages = json!([{"role": "user", "content": "17*23?"}]);
-        let body = json!({"model": "model", "messages": messages, "logprobs": true});
-        assert!(chat(body).await["usage"].get("reasoning_tokens").is_some());
+        let args = ServerArgs {
+            tokenizer_path: tokenizer_path().into(),
+            ..Default::default()
+        };
+        let app = lowered_state_with(args, |rid| {
+            let mut item = chunk(rid, "\u{FFFD}", true);
+            let ResponseItem::Done(output) = &mut item else {
+                unreachable!()
+            };
+            output.extras = Some(Box::new(ChunkExtras {
+                out_lp_val: vec![-0.25],
+                out_lp_idx: vec![3],
+                out_lp_txt: vec!["\u{FFFD}".into()],
+                out_top_val: vec![-0.25, -2.0],
+                out_top_idx: vec![3, 1],
+                out_top_lens: vec![2],
+                out_top_txt: vec!["\u{FFFD}".into(), "!".into()],
+                ..Default::default()
+            }));
+            item
+        });
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let body =
+            json!({"model": "model", "messages": messages, "logprobs": true, "top_logprobs": 2});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let token = &value["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(token["token"], "\u{FFFD}");
+        assert_eq!(token["logprob"], -0.25);
+        assert_eq!(token["bytes"], json!([0xC3, 0xA9]));
+        assert_eq!(token["top_logprobs"][1]["token"], "!");
+        assert_eq!(token["top_logprobs"][1]["bytes"], json!([b'!']));
+        assert!(value["usage"].get("reasoning_tokens").is_some());
     }
 
     /// A request the processor does not reproduce reaches the typed handler.
