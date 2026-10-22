@@ -308,6 +308,10 @@ add_mount_if_exists "libmnl" "libmnl.so*"
 echo "Mount args: $MOUNT_ARGS"
 
 echo "Launching container: ci_sglang"
+# MOONCAKE_DISABLE_HIP_DMABUF=1: Mooncake >= v0.3.14 registers GPU KV buffers
+# for RDMA through a dma-buf export. With a full-GPU KV pool (Qwen3-8B at TP1)
+# both PD servers then fail their next stream creation with hipErrorOutOfMemory
+# at scheduler start; plain ibv_reg_mr (the pre-v0.3.14 behavior) works here.
 docker run -dt --user root \
   --device=/dev/kfd \
   --device=/dev/dri \
@@ -336,6 +340,7 @@ docker run -dt --user root \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
+  -e MOONCAKE_DISABLE_HIP_DMABUF="${MOONCAKE_DISABLE_HIP_DMABUF:-1}" \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
