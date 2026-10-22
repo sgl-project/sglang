@@ -399,7 +399,15 @@ class TestPrefillSparseIndexer(CustomTestCase):
         part = select_sparse(sub, rows_of(case.data, idx), case.k_cache)
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
-            self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+            # A full-table pick the tail dropped at its own selection floor is a
+            # rounding swap, as in the dense comparison above.
+            scores = case.dense[rows - tail + r]
+            b_floor = scores[list(b)].min()
+            swaps = sum(
+                bool(scores[p] <= b_floor + b_floor.abs() * FLOOR_TOLERANCE)
+                for p in a - b
+            )
+            self.assertGreaterEqual(len(a & b) + swaps, MIN_TAIL_OVERLAP * len(a), r)
 
     @torch.inference_mode()
     def test_row_pair_ids_schedule_the_same_logits_as_per_request_ids(self):
