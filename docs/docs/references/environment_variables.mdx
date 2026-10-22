@@ -358,7 +358,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank token capacity of an extra, smaller FlashInfer MegaMOE workspace for decode-only forwards of ModelOpt NVFP4 MoE layers. <code>0</code> disables it; other values must be below the main capacity. A forward uses it only when no DP rank extends and every EP rank's batch fits; otherwise it uses the main workspace. Unused while MegaMoE startup autotuning runs, since the tuned capacity profiles already serve small batches.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank token capacity of an extra, smaller FlashInfer MegaMOE workspace for decode-only forwards of ModelOpt NVFP4 MoE layers. Either <code>0</code> (off) or <code>0 &lt; capacity &lt; main capacity</code>, where the main capacity is <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code> or its derived value; any other value fails when the first MegaMOE layer is built. A forward uses it only when no DP rank extends and every EP rank's batch fits; otherwise it uses the main workspace. Unused (logged once) while MegaMoE startup autotuning runs, since the tuned capacity profiles already serve small batches; it takes effect with <code>--disable-flashinfer-autotune</code> or <code>--flashinfer-autotune-skip-ops flashinfer_megamoe</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
@@ -777,8 +777,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BEAM_DECODE_GEMV</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run single-token Beam MoE decode through a fused GEMV on SM103 (GB300) for BF16 experts with MoE TP4 and EP1, where Beam fuses the expert sum into its all-reduce. Requires <code>SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1</code> and the Triton MoE runner; other setups keep the Triton path and log that the switch is unused.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run single-token Beam MoE decode through a fused GEMV on SM103 (GB300) for BF16 experts with MoE TP4 and EP1, where Beam fuses the expert sum into its all-reduce (Triton MoE runner). Requires <code>SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1</code>. Unsupported setups and forwards keep their normal MoE path. Only a failed static check (device, BF16 experts, MoE TP/EP or expert shape) logs that the switch is unused.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>
 </table>
