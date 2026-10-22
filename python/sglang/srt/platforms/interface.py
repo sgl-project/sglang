@@ -209,6 +209,30 @@ class SRTPlatform(DeviceMixin):
         return False
 
     # ------------------------------------------------------------------
+    # Distributed
+    # ------------------------------------------------------------------
+
+    def get_group_coordinator_device(self, local_rank: int) -> torch.device:
+        """Return the device a ``GroupCoordinator`` binds to on this rank.
+
+        Consulted only for out-of-tree platforms; in-tree devices are resolved
+        in ``parallel_state``. The default is CPU, which is what an unknown
+        device got before this hook existed.
+        """
+        import torch
+
+        return torch.device("cpu")
+
+    def use_pynccl_by_default(self) -> bool:
+        """Whether model-parallel groups create a PyNccl communicator when the
+        caller does not choose.
+
+        Consulted only for out-of-tree platforms. The default keeps the
+        previous behavior; a platform without NCCL should return False.
+        """
+        return True
+
+    # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
