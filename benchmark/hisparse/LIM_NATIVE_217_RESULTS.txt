@@ -1,5 +1,8 @@
 217 / GLM-5.2-W4A8 / 新原生 LIM 验证
 
+历史记录：以下固定为2026-10-21的runtime611760f1和工作负载。
+2026-10-22文章对照、启动修复后的runtime8961cc36、三组profiling与独立计时，见LIM_ARTICLE_217_PROFILE.txt；两轮数据不能混用。
+
 本报告只使用 2026-10-21 新标准 kernel wheel 的模型实测，不引用历史外部 aclnn probe 的性能作为本轮结果。
 SGLang runtime: 611760f18007a63781f42c666fe9a296e96b6fa8
 Kernel implementation: b5a45667efb377b0312108c01bbd0a730c1f9e78

@@ -1,5 +1,8 @@
 新原生 LIM / SGLang / GLM-5.2-W4A8 / 217 decode profile
 
+历史记录：以下固定为2026-10-21的单份8K/batch1 trace。
+2026-10-22文章对照的三组10-step/16-rank采集见LIM_ARTICLE_217_PROFILE.txt；不要将两轮跨度或任务占比混用。
+
 SGLang runtime611760f1，kernel实现b5a45667，标准库ff93127d...；8K输入、实际并发1、graph batch16。生成16 token后采集6个decode step，共78层×6=468个完整copy/SFA分组。
 这是单份graph-on trace及源码顺序归因，没有graph-off mapping trace。profile请求与所有性能计时分离。
 Rank0原始trace SHA256: bc1a8741f1378ba750b78b88371f77ceb7fe60cd85996eba2d40e0d258cb0259；文件114213313字节。

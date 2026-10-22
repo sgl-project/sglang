@@ -1,0 +1,220 @@
+217 / GLM-5.2 W4A8 / LIM 文章对照与实测，2026-10-22
+
+本轮按用户提供的《decode KVcache 低时延卸载技术实践》重新采集三组对照；
+输入为固定 token-ID retrieval 提示，输出512 token、ignore_eos，不是 SWE-bench。
+现有实现是原生 LIM 管理元数据 + 独立 copy + 独立 SFA。CopySFA、SharedCopy、
+C8、MTP 尚未接入本轮实现，不能把文章中的性能或精度无损结论直接移用。
+
+版本与配置
+基线 runtime: 611760f18007a63781f42c666fe9a296e96b6fa8
+LIM runtime: 8961cc3689aa9ba4f476ee133f29fb43eb5dc51c
+社区 main 基点: 4b83f215f498bc0371587bfae4a9470f24e77737；本轮固定版本，不在测量中换 main。
+kernel 实现 b5a45667efb377b0312108c01bbd0a730c1f9e78，发布分支头6d830514。
+标准 sgl-kernel-npu wheel SHA256: 7606b7493725ffe70cd5eb70ac1b52b46ef4223efb3e41fa91252dd15cb0a22b
+加载的正常库 SHA256: ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8
+16 Ascend A3 die，TP16/EP16，DeepEP auto，W4A8权重，主KV和index KV均BF16。
+ctx66048，max-running-requests16，page128，chunked-prefill4096，mem-fraction-static0.82，
+radix禁用，graph capture batch16，seed42，MTP关闭。K=2048，C=4096。
+K 是每次索引选取的 TopK 数；C 是每请求每层主KV的HBM resident token容量。
+基线实际token pool204800；LIM长大batch实际index pool859136（请求1048576后被clamp）。
+精度专用LIM实例将实际index pool设204800，以对齐基线容量；内核与策略不变。
+三组正式profile均采10个完整decode图、16 rank全部验证；计时来自另行运行的无profiler请求。
+
+独立性能：每组两轮，不丢弃慢轮，不宣称最大吞吐
+| 场景 | 轮次 | 满batch decode TPS | 有效TPOT ms | SSE间隔中位 ms | 整批耗时含prefill s | 整批output TPS | HBM峰值中位 MiB | 最坏芯片 MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 全HBM 16K/B12 | 1 | 219.404 | 54.694 | 54.655 | 117.430 | 52.321 | 59961.0 | 60159 |
+| 全HBM 16K/B12 | 2 | 217.802 | 55.096 | 55.057 | 116.226 | 52.863 | 59961.0 | 60159 |
+| 全HBM 64K/B3 | 1 | 59.157 | 50.712 | 50.680 | 126.518 | 12.141 | 59961.0 | 60159 |
+| 全HBM 64K/B3 | 2 | 59.074 | 50.784 | 50.728 | 126.403 | 12.152 | 59961.0 | 60159 |
+| LIM 64K/B12 | 1 | 73.450 | 163.377 | 163.482 | 672.310 | 9.139 | 59993.5 | 60521 |
+| LIM 64K/B12 | 2 | 74.167 | 161.796 | 161.717 | 656.930 | 9.353 | 59993.5 | 60522 |
+同64K输入的这两个可容纳配置，LIM把实际并发3提升至12，decode TPS中位数 59.116→73.809，变化+24.85%；
+有效TPOT 50.748→162.587 ms，变化+220.38%。收益须结合单请求SLO判断。
+该对比是固定内存预算下不同可容纳batch的系统收益，不是同batch算子加速比。
+有效TPOT=1000×实际batch/decode TPS；SSE间隔受客户端调度影响，两个值分别保存。
+窗口在所有请求至少输出10 token后开始、首请求结束前截止，排除prefill和drain。未使用ITL/3。
+整批耗时包括prefill与首填充，独立列出，不能由decode TPS推断TTFT或完整请求收益。
+LIM第一轮prefill与本任务CPU trace分析重叠，整批耗时仅作诊断；第二轮整批无此重叠。
+无上述CPU重叠的整批对比：全HBM output TPS中位12.146，LIM第二轮9.353，变化-23.00%。
+该整批结果与稳定decode收益分别判断；LIM只有一轮整批无CPU重叠，不足以建立整请求性能分布。
+所有六个decode计时窗口均无本任务CPU分析/测试重叠，NPU占用扫描均覆盖窗口且无外部模型干扰。
+HBM为整个设备采样水位，包含预分配index池/graph，不等于实际token KV净大小；LIM还使用很大DRAM。
+理论上12×64000 token、78层BF16主KV本身约64.27GiB/rank，尚未计权重/index/graph；
+C4096的17个resident行主KV约5.827GiB/rank，另计selected/tail等workspace，省出的预算被用于扩大index pool。
+基线与LIM均固定graph16，没有搜索更适合B3的graph4或最优饱和batch，不把B3称为硬件最大并发。
+
+正式profiling：rank0，每图含LM head等捕获内容，不能称作纯78层耗时或端到端ITL
+| 场景 | 实际batch | 16-rank完整图 | rank0图跨度中位 ms | rank间中位数范围 ms | LI/LIM累计 ms/step | copy累计 ms/step | SFA累计 ms/step |
+|---|---:|---|---:|---|---:|---:|---:|
+| baseline-64k-b3-r2 | 3 | 16×10 | 51.270 | 51.270–51.279 | 1.524 | 0.000 | 7.306 |
+| baseline-16k-b12-r2 | 12 | 16×10 | 54.125 | 54.076–54.129 | 1.665 | 0.000 | 7.392 |
+| lim-64k-b12-c4096-nativegraph | 12 | 16×10 | 148.175 | 147.476–148.175 | 12.459 | 39.197 | 6.797 |
+原始native rank0有810次SFA，含采集起点之前的30次不完整图。解析器只对10个完整图
+计算kernel/copy表：780 SFA、210 LIM、3900 copy，4932个partial/outside任务另存，避免分母错配。
+
+Kernel table：rank0，累计NPU任务时间占比>=1%；HCCL包含等待，累计占比不是关键路径占比
+| kernel | 调用数/10step | 累计 ms | 累计任务占比 | 物理stream |
+|---|---:|---:|---:|---|
+| reduce_scatterAicpuKernel | 750 | 766.297 | 32.53% | [73] |
+| unidex_copy_21 | 3900 | 391.967 | 16.64% | [75] |
+| allgatherAicpuKernel | 760 | 191.470 | 8.13% | [73] |
+| fused_lightning_indexer_manage_0 | 210 | 124.592 | 5.29% | [75] |
+| aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3 | 4110 | 85.831 | 3.64% | [75] |
+| aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul | 1500 | 73.202 | 3.11% | [75] |
+| SparseFlashAttention | 780 | 67.969 | 2.89% | [75] |
+| aclnnInplaceCopy_ViewCopyAiCore_ViewCopy | 3330 | 61.469 | 2.61% | [75] |
+| aclnnAdd_AddAiCore_Add | 7030 | 46.497 | 1.97% | [75] |
+| MoeLowLatencyCombineV2 | 750 | 44.145 | 1.87% | [75] |
+| aclnnInplaceZero_ZerosLikeAiCore_ZerosLike | 2560 | 42.366 | 1.80% | [75] |
+| aclnnBitwiseAndTensor_LogicalAndAiCore_LogicalAnd | 11210 | 40.101 | 1.70% | [75] |
+| aclnnArange_ArangeAiCore_Range | 3900 | 35.893 | 1.52% | [75] |
+| aclnnInplaceCopy_SliceAiCore_Slice | 3120 | 33.993 | 1.44% | [75] |
+| MoeLowLatencyDispatchV2 | 750 | 33.813 | 1.44% | [75] |
+| aclnnInplaceCopy_CastAiCore_Cast | 12130 | 24.054 | 1.02% | [75] |
+
+Overlap-opportunity table：累计口径与区间交集分开报告，按来源归因，无假设的加速倍数
+| 区段 | 累计 ms/step | 对应累计任务占比 | 已测重叠/限制 | 后续方向 |
+|---|---:|---:|---|---|
+| 五类copy | 39.197 | 16.64% | 与SFA同stream75；全部10步交集0 ms | CopySFA或经事件约束的tile流水；先做同输入对照 |
+| LIM | 12.459 | 5.29% | 每步21次，当前在SFA之前完成 | owner计划复用；减少计划后的mask/offset/contiguous |
+| SFA | 6.797 | 2.89% | 每步78次；约6.80ms不能掩盖任意多copy | 区分纯attention代价与融合后tile等待 |
+| HCCL spans | 97.914 | 41.57% | stream73，有等待且可与计算并行，非可直接回收的时延 | 结合依赖和rank偏斜分析，不能累计相减 |
+
+copy方向由当前BF16源码调用顺序与780个完整5-copy/SFA分组共同确认，CANN名称本身不编码方向。
+| 方向 | 累计 ms/step | 单次时长中位 us |
+|---|---:|---:|
+| new-token D2H | 0.755 | 9.800 |
+| miss DRAM-to-resident H2D | 23.704 | 267.905 |
+| resident-to-selected D2D | 12.670 | 162.323 |
+| short-row H2D (masked on long rows) | 0.963 | 12.340 |
+| visible-tail H2D | 1.105 | 13.990 |
+不能用copy时长推导命中率或传输字节，也没有已测CopySFA hiding百分比。
+
+Fuse-pattern table：只列源码确定且对应累计任务占比>=1%的候选；不把候选写成已实现能力
+| 来源/现有顺序 | 证据累计占比 | 可修改处 | 正确性/容量边界 |
+|---|---:|---|---|
+| lim.py:materialize，miss H2D→resident-selected D2D；attention.py再独立SFA | copy16.64% + SFA2.89% | 先去selected中转，再做CopySFA | cold fill C、steady miss、全batch fallback、BF161152B行tile与UB预算 |
+| lim.py:select/materialize/append_tail；manager.py新token回写 | LIM5.29%、ViewCopy2.61%、zero1.80%、arange1.52%等全图证据 | 复用owner设备计划；copy内直接消费有效count；去冗余zero/contiguous | 这些Torch kernel全图计数含其他调用，不能全部归为LIM或承诺全部节省 |
+| 78层独立copy，21个LI owner，57层共享选中索引 | copy16.64% | SharedCopy跨4层聚合事务，HBM仍分层 | 4份KV payload，字节量不会自动减少4倍；布局、NUMA和workspace要验证 |
+这是单份graph-on源码映射分析；没有另采graph-off mapping trace。源码路径均相对SGLang仓库：
+python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/{lim,manager,attention}.py。
+
+已修正并验证的代码
+42bc2268：host callback reporter沿用调用线程ACL context；初始化失败会唤醒调用方并传递异常，
+ready等待有超时，registry按device/context区分。修复原有SetDevice507033后主线程无限等ready的问题。
+8961cc36：原生LIM图没有ACL host callback，不再无条件启动legacy reporter；原有legacy路径保留。
+两个CPU回归、修复前负例、真实16设备ACL callback均验证，16 rank原生图成功启动与重放。
+未将启动修复单独归因成decode加速。标准native kernel二进制本轮未修改。
+验证工具另修：chunked prefill中间采样会被丢弃。旧helper在64K输入记录79次而HTTP只输出64，
+现跳过15次discarded call，再保存raw call15..78，逻辑step0..63；保存前不force，之后逐项核对HTTP历史。
+旧无效采集保留rejected-precision-v1，不进入KL比较；新CPU测试重建processor实例验证计数仍连续。
+
+精度：完整词表原始logits，CPU float64 KL(p_ref || p_candidate)，4个边界输入×64位置，真实batch1
+输入长度63999/64000/64127/64128；所有四份capture共1024个.pt，原始词表logits在force之前保存。
+参考延续来自LIM自由greedy采样，基线及repeat强制同一token历史；这是对这些延续上的条件分布比较。
+| reference→candidate | mean KL | p99 KL | max KL | KL>0.01比例 | top1一致率 |
+|---|---:|---:|---:|---:|---:|
+| lim-long-free-v2→lim-long-repeat-v2 | 0.00000000 | 0.00000000 | 0.00000000 | 0.00% | 100.00% |
+| baseline-long-a-v2→baseline-long-b-v2 | 0.00000000 | 0.00000000 | 0.00000000 | 0.00% | 100.00% |
+| baseline-long-a-v2→lim-long-free-v2 | 0.03829318 | 0.88100517 | 1.43516800 | 30.86% | 95.31% |
+本轮两种模式各自重复均bitwise一致、KL=0，而跨模式mean KL=0.03829318，不能称精度无损。
+占用审计：LIM free/repeat精度窗口分别有3/10个scan观察到其他容器AFS任务；这些精度采集不满足独占条件。
+原始数据、失败isolation标志和precision-isolation-limits.json均保留；不把它们当计时或质量无损证明。
+三组profile及六个独立性能窗口仍执行严格独占检查，全部通过；未放宽这些性能采纳条件。
+定位信息：4个prefill位置KL全0；4个first-decode位置mean KL=1.41e-07；
+4个prefix页变化位置mean KL=1.28e-07；全部252个decode位置mean KL=0.03890100。
+差异主要出现在后续decode，不能据此直接认定为页边界bug或全部归因于TopK策略；还需同策略LI参考及逐层selected-set/SFA定位。
+同模式重复用于估计执行波动；未设置事后accuracy pass阈值。256个位置不足以证明
+总体精度无损，更不能覆盖C8、MTP、长代码任务或不同batch。页边界上的差异需结合选中集合及SFA oracle定位。
+
+对照文章需要修正/补齐的语义与内存
+1. 原生LIM当前long path在稳定prefix选K，再追加最多128个visible tail token；文章描述full visible TopK。
+   两者一般不等价，当前attention可能到2176 token。C还参与prefix>=C的long/short路径切换，
+   所以跨C比较必须同时标注选择策略；C不是TopK数量。topk-policy-oracle给出额外128项的构造反例，
+   均匀attention下输出可为0.0588235而globalTopK为0；它证明函数可能不同，不是模型质量下降频率。
+   正确对齐需修改native候选域、尾部常驻映射和SFA索引契约，不能只把prefix_lens改成seq_len。
+2. 当前miss plan底层workspace每行32768项，但materialize实际切片/扫描[:C]，本轮C4096，
+   不是每层都扫描32768。Q1稳态最多K个query miss；cold firstfill可达C。应让copy直接读device count，
+   省重复mask/offset及未激活short-copy发射，不能用CPU.item()换成每层同步。PAD fastpath输出可旧，必须valid row守卫。
+3. A3 index KV的compact布局现被arch35条件挡住：21次LI调用不等于只分配21层index KV。
+   若从78层压到21层，按本次859136+128padding token×128dim×BF16计算，理论省11.677GiB/rank。
+   17个resident行×78层×(12288-4096)×1152B约11.654GiB/rank，接近把C4K升C12K的增量。
+   这是静态预算线索，尚未实现/验证；必须同时改分配、layer→slot映射与pool sizing，主KV仍是78层。
+4. 当前host buffer按maxreq×maxctx×78层保留，约96223.70MiB/rank；16 rank约1.47TiB。
+   需要按已接纳tokens的分页host池、分组注册和NUMA布局；GVA/SHMEM直接可访问不代表搬运免费。
+   新token先D2H再从host读tail的往返可改成设备tail ring+整页dump，后续MTP须有256tail及回滚生命周期测试。
+5. 文章C8 fused_li_manage_c8契约、656B packed row、CopySFA、SharedCopy不能套用当前19-tensor BF16算子。
+   C8需scale/layout独立oracle，BF16是1152B/row；SharedCopy减少事务，不会把四层payload字节数除4。
+
+本轮独立last-owner计数诊断完整结果：
+{
+  "diagnostic_only": true,
+  "scope": "Last IndexShare owner only, rank 0, actual batch 1, Q1",
+  "case": "boundary-64000",
+  "input_tokens": 64000,
+  "last_owner_layer_ids": [
+    74
+  ],
+  "first_fill": {
+    "sampling_step": 1,
+    "raw_sampling_call": 16,
+    "last_owner_layer_id": 74,
+    "active_owner_count": 21,
+    "K": 2048,
+    "C": 4096,
+    "prefix_topk_misses": 2048,
+    "copy_count": 4096,
+    "valid_topk_sources": 2048,
+    "index_k_buffer_shape": [
+      78,
+      1601,
+      128,
+      1,
+      128
+    ],
+    "index_k_buffer_bytes": 4092002304,
+    "managed_hbm_budget_bytes": 6716165392,
+    "host_kv_budget_bytes": 100897864704,
+    "framework_acl_reporter_count": 0
+  },
+  "steady_samples": 126,
+  "steady_mean_prefix_topk_misses": 289.8095238095238,
+  "steady_prefix_topk_hit_fraction": 0.8584914434523809,
+  "limits": "Excludes full-tail tokens and padding; cannot estimate 21-owner average or SWE-bench cache locality."
+}
+仅rank0/batch1最后一个IndexShare owner；不能当作21 owner平均命中率，更不能从copy持续时间反推。
+
+补充验证优先级
+- P0：globalTopK与现prefixTopK+tail的selected-set/SFA oracle；ties、K/C±1、128页边界、请求复用/PAD。
+- P0：小模型或逐层捕获定位KL，区分选择策略差异与slot错配；比较prefill位置、首decode、后续跨页。
+- P1：21 owner的设备侧miss直方图，cold与steady分开；C2K/4K/8K/12K、输入8K/16K/32K/64K、
+      输出128/512/2048、实际batch1/3/4/8/12/16的SLO及HBM/DRAM预算扫描，LRU与random实测。
+- P1：同输入同cache状态split vs CopySFA，miss0/1023/1024/1025、cold C、fallback整batch、跨层workspace生命周期。
+- P1：基线graph按真实batch调优、吞吐饱和点、TTFT/TPOT/P95及整请求完成时间，真实code-agent/长上下文质量集。
+- P2：SharedCopy BS(4D)布局及4层数据完整性、NUMA/注册开销；MTP3回滚/accept、256tail；C8 scale/packing。
+
+失败/排除记录
+早期baseline0.90内存比例启动仅剩0.26GiB，warmup额外62MiB OOM，未作为任何收益数据。
+C12288配置实际index pool被clamp至193792，不够12×64K，未发该工作负载，不将其描述成已实测OOM。
+基线独立计时第一次启动时前一个模型HBM尚未全部释放，触发TP memory-balance guard；等16设备水位恢复后重启，未采纳失败启动数据。
+callback启动失败及chunked helper无效采集均留档；只采纳通过完整请求、图计数、占用与历史校验的数据。
+
+证据与复现
+采集/解析/精度命令及配置注意事项见 LIM_ARTICLE_PROFILE_GUIDE.txt。
+远端完整原始48份rank profiler树：
+/home/y00970600/personal/hisparse-lim-article-profile-217-20261022/results/profiles/
+compact证据包含3份完整rank0 ascend_pt树（含PROF_*、ASCEND_PROFILER_OUTPUT），其余rank原始文件留217，
+16-rank摘要和每trace SHA一同归档；独立raw-logits包包含全部1024个有效原始.pt。
+lim-article-glm52-217-evidence-20261022.tar.gz：236645330 bytes；SHA256 32a658d84b0d4fec6081d0153ba7f96c6e3a46d59625c5dc5e5973be850c1aac
+lim-article-glm52-217-raw-logits-20261022.tar.gz：319377831 bytes；SHA256 478b46f4dcf9aef710448d1e8d282041c6cf82b204fee1ab6fa39a7a7576e1ed
+本机复核两包SHA256、945个compact清单文件和1024个原始logits文件；
+再用Windows CPU float64独立重算3组KL，与217各数值的最大绝对差均<=1e-10，详见local-evidence-verification.json。
+article-compact-file-manifest.json、raw-logits-sha256.json逐文件校验，原始输入/输出HTTP、步骤索引、
+监控原始JSONL、状态与失败日志、两份runtime改动及patch、wheel/lib哈希均保留。
+本轮容器与模型进程均由任务标签及PID归属检查后停止，未批量结束其他任务。
+历史 LIM_NATIVE_217_RESULTS/PROFILE.txt 固定2026-10-21/611760f1及旧工作负载；本报告是另一轮，数字不能混用。
+
+来源：用户附件temp.txt用于文章描述；vLLM PR17392用于LIM→CopySFA公开接入背景，
+https://github.com/vllm-project/vllm-ascend/pull/17392
+ACL线程context说明：https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/API/runtimeapi/aclpythondevg_01_0074.html

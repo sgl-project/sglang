@@ -43,8 +43,11 @@ ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8.
 No external LIM probe or custom vendor library is loaded in these checks.
 Checkpoint-backed GLM-5.2-W4A8 A/B is complete for this native port. See
 LIM_NATIVE_217_RESULTS.txt for all timings, matched HBM windows, task scores
-and eight full-vocabulary KL comparisons. Runtime source is 611760f1; later
-branch changes add diagnostics and documentation without changing SRT.
+and eight full-vocabulary KL comparisons from 2026-10-21, pinned to runtime
+611760f1. On 2026-10-22, commits 42bc2268 and 8961cc36 fix ACL reporter
+startup/context handling and skip the unused reporter for native LIM graphs.
+The dated three-control profile/timing results for that runtime are in
+LIM_ARTICLE_217_PROFILE.txt; do not mix these two workloads or runtimes.
 
 Current native-port TPOT (ms), with one excluded warmup and three measured
 rounds per case, and no individual-round outlier removal:
