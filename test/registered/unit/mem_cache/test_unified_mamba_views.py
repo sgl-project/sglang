@@ -44,6 +44,7 @@ def _make_pool(
     temporal_dtype,
     want_slots=8,
     device="cpu",
+    grow_direction="down",
 ):
     """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
@@ -56,7 +57,7 @@ def _make_pool(
     mamba_spec = MambaSubPoolSpec(
         name="mamba",
         layer_num=mamba_layer_num,
-        grow_direction="down",
+        grow_direction=grow_direction,
         conv_state_shapes=tuple(tuple(s) for s in conv_state_shapes),
         conv_dtype=conv_dtype,
         temporal_state_shape=tuple(temporal_state_shape),
@@ -69,7 +70,7 @@ def _make_pool(
         head_num=1,
         head_dim=8,
         store_dtype=torch.bfloat16,
-        grow_direction="up",
+        grow_direction="down" if grow_direction == "up" else "up",
     )
     entry_mamba = mamba_spec.entry_bytes()
     entry_full = full_spec.entry_bytes()
@@ -249,8 +250,8 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
     def _build_kda_views(heads_per_rank: int = 12):
         """Real K3 KDA envelope views on CPU for one attn-TP shard; 2 slots
         suffice, the per-slot geometry is slot-count independent."""
-        from sglang.srt.mem_cache.layout.page_major import (
-            build_page_major_mamba_views,
+        from sglang.srt.mem_cache.layout.token_major import (
+            build_mamba_entry_views,
             mamba_entry_bytes,
         )
 
@@ -258,9 +259,7 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
         entry_bytes = mamba_entry_bytes(**geom)
         max_slots = 2
         raw = torch.empty(max_slots * entry_bytes, dtype=torch.uint8, device="cpu")
-        _, temporal_view = build_page_major_mamba_views(
-            raw, max_slots=max_slots, **geom
-        )
+        _, temporal_view = build_mamba_entry_views(raw, max_slots=max_slots, **geom)
         return geom, entry_bytes, temporal_view
 
     def test_k3_tp8_envelope_view_matches_recurrent_kda_contract(self):

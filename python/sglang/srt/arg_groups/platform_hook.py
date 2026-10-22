@@ -20,11 +20,13 @@ from sglang.srt.utils.common import is_host_cpu_arm64
 logger = logging.getLogger(__name__)
 
 
-def handle_hardware_runtime_validation():
-    # This is intentionally independent of `server_args.device`: setting
-    # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
-    # the environment cannot honor that request. With the flag unset,
-    # use_mlx() remains lazy and does not import MLX.
+def handle_hardware_runtime_validation(server_args: Any):
+    # `server_args` is accepted, not read: every resolution-hook step takes
+    # it, uniformly, so `run_hook` never has to special-case an arity. The
+    # check below is intentionally independent of `server_args.device`:
+    # setting SGLANG_USE_MLX opts into the MLX backend and must fail
+    # immediately if the environment cannot honor that request. With the
+    # flag unset, use_mlx() remains lazy and does not import MLX.
     use_mlx()
 
 
@@ -34,20 +36,6 @@ def handle_npu_backends(server_args: Any):
         from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
         set_default_server_args(server_args)
-
-        current = cfg.cuda_graph_config.prefill.tc_compiler
-        if current is not None and current != "eager":
-            logger.warning(
-                "At this moment Ascend platform only support prefill graph compilation with "
-                "cuda_graph_config[prefill].tc_compiler='eager'."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_npu_backends",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
-                ),
-            )
 
 
 def handle_mps_backends(server_args: Any):
@@ -125,6 +113,19 @@ def handle_symm_mem_device_support(server_args: Any):
 def handle_xpu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "xpu":
+        if cfg.sampling_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                sampling_backend="intel_xpu",
+            )
+        # Enable the fused qknorm + rope by default as the fused q/k-norm + RoPE kernel is a pure win here.
+        if cfg.enable_fused_qk_norm_rope is None:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                enable_fused_qk_norm_rope=True,
+            )
         # Decode graph is opt-in on XPU: unless the user explicitly set
         # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
         # disabled so the default startup doesn't require graph capture.

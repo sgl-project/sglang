@@ -124,6 +124,7 @@ class BenchArgs:
     base_url: str = ""
     local_tokenizer_path: str = ""
     skip_warmup: bool = False
+    skip_token_capacity_check: bool = False
     show_report: bool = False
     profile: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
@@ -148,6 +149,7 @@ class BenchArgs:
     cache_hit_rate: float = 0.0
     backend: str = "sglang"
     fake_prefill: bool = False
+    flush_hicache_storage: bool = False
     server_args_for_metrics: Optional[List[str]] = None
     lora_name: Optional[List[str]] = None
     lora_request_distribution: str = "uniform"
@@ -207,6 +209,11 @@ class BenchArgs:
             ),
         )
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--skip-token-capacity-check",
+            action="store_true",
+            help="Skip the raw-token capacity check; keep max-running-requests checks.",
+        )
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument(
@@ -254,6 +261,7 @@ class BenchArgs:
                 "generated-shared-prefix",
                 "sharegpt",
                 "custom",
+                "longbench_v2",
             ],
             help="Name of the dataset to benchmark on. sharegpt/custom replay "
             "recorded text prompts (custom reads --dataset-path JSONL); their "
@@ -342,6 +350,13 @@ class BenchArgs:
             "to benchmark pure decode performance without a real prefill node.",
         )
         parser.add_argument(
+            "--flush-hicache-storage",
+            action="store_true",
+            default=BenchArgs.flush_hicache_storage,
+            help="Also clear the hierarchical cache's storage tier before each case; "
+            "/flush_cache resets the radix tree and the host tier only.",
+        )
+        parser.add_argument(
             "--server-args-for-metrics",
             type=str,
             nargs="*",
@@ -385,7 +400,7 @@ class BenchArgs:
             action="store_true",
             help=(
                 "Allow --batch-size to exceed the server's "
-                "effective_max_running_requests_per_dp * dp_size. The surplus "
+                "effective_max_running_requests_per_dp * num_dp_ranks. The surplus "
                 "requests are queued by the scheduler and promoted as slots "
                 "free, so the batch is served as multiple sequential batches "
                 "at the running-batch cap. Useful for stabilizing throughput "
@@ -617,12 +632,17 @@ def run_one_case(
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
+    flush_hicache_storage: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
         _flush_cache_with_retry(url, "/flush_cache")
+        # /flush_cache resets the radix tree and the host tier; a storage tier
+        # persists across it and would serve the same prompts on the next case.
+        if flush_hicache_storage:
+            _flush_cache_with_retry(url, "/hicache/storage-backend/clear")
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -638,6 +658,7 @@ def run_one_case(
             "random-ids",
             "mmmu",
             "generated-shared-prefix",
+            "longbench_v2",
         ) + REPLAY_TEXT_DATASETS
         if dataset_name not in supported_datasets:
             raise ValueError(
@@ -684,6 +705,21 @@ def run_one_case(
         elif dataset_name == "mmmu":
             input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
             image_data = [req.image_data for req in input_requests]
+        elif dataset_name == "longbench_v2":
+            # Real long documents, so the requested ISL is a TRUNCATION rather
+            # than one short message tiled up to length. Truncate to exactly
+            # input_len (instead of averaging, as the replay datasets do) so the
+            # shape under test matches the tiled `random` arm token for token
+            # and the only variable left is how the prompts route.
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            input_ids = [ids[:input_len] for ids in input_ids if len(ids) >= input_len]
+            if len(input_ids) < batch_size:
+                raise ValueError(
+                    f"longbench_v2 yielded only {len(input_ids)} prompts of >= "
+                    f"{input_len} tokens for batch size {batch_size}"
+                )
+            input_ids = input_ids[:batch_size]
+            image_data = None
         elif dataset_name in REPLAY_TEXT_DATASETS:
             if len(input_requests) < batch_size:
                 raise ValueError(
@@ -1215,7 +1251,10 @@ def run_benchmark_internal(
 
         internal_states = server_info.get("internal_states", [])
         internal_state = internal_states[0] if internal_states else {}
-        dp_size = internal_state.get("dp_size", None) or 1
+        # Replicas times attention-DP groups, as in `num_dp_ranks_of`.
+        num_dp_ranks = (internal_state.get("dp_size", None) or 1) * (
+            internal_state.get("attn_dp_size", None) or 1
+        )
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state.get(
@@ -1229,6 +1268,9 @@ def run_benchmark_internal(
             skip_token_capacity_threshold += state.get("memory_usage", {}).get(
                 "token_capacity", 1000000000
             )
+
+        if bench_args.skip_token_capacity_check:
+            skip_token_capacity_threshold = float("inf")
 
         # Router /get_server_info responses carry "router_manager"; worker
         # responses never do, so its presence confirms a router by design.
@@ -1244,10 +1286,12 @@ def run_benchmark_internal(
             assert max_running_requests_per_dp > 0, (
                 f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
             )
-            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+            skip_max_running_requests_threshold = (
+                max_running_requests_per_dp * num_dp_ranks
+            )
 
         print(f"{max_running_requests_per_dp=}")
-        print(f"{dp_size=}")
+        print(f"{num_dp_ranks=}")
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 
@@ -1334,6 +1378,7 @@ def run_benchmark_internal(
                 backend=bench_args.backend,
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
+                flush_hicache_storage=bench_args.flush_hicache_storage,
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1380,6 +1425,7 @@ def run_benchmark_internal(
                     backend=bench_args.backend,
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
+                    flush_hicache_storage=bench_args.flush_hicache_storage,
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1437,6 +1483,7 @@ def run_benchmark_internal(
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
+                            flush_hicache_storage=bench_args.flush_hicache_storage,
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,

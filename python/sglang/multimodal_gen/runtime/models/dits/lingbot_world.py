@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -12,6 +13,16 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func as _lingbot_fa_varlen,
+)
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift,
+    try_fused_fp32_layernorm_bf16,
+    try_fused_scaled_residual_bf16,
+)
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -196,7 +207,57 @@ class LingBotWorldCamConditioner(nn.Module):
         if scale_shift is None:
             scale_shift = self.compute_scale_shift(c2ws_plucker_emb)
         cam_scale, cam_shift = scale_shift
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and hidden_states.is_contiguous()
+            and cam_scale.is_contiguous()
+            and cam_shift.is_contiguous()
+            and cam_scale.shape == cam_shift.shape == hidden_states.shape
+        ):
+            channels = hidden_states.shape[-1]
+            x = hidden_states.view(-1, 1, channels)
+            scale = cam_scale.view(-1, channels)
+            shift = cam_shift.view(-1, channels)
+            if can_use_modulate_scale_shift_cuda(x, scale, shift):
+                # This existing CUDA kernel preserves every storage-dtype
+                # rounding boundary and already owns its runtime fallback.
+                return modulate_scale_shift(x, scale, shift).view_as(hidden_states)
         return (1.0 + cam_scale) * hidden_states + cam_shift
+
+
+_LINGBOT_SP_STRATEGIES = (
+    "ulysses",
+    "kvgather_replicated",
+    "kvgather_sharded",
+    "ring",
+)
+
+
+def lingbot_sp_strategy() -> str:
+    """Which sequence-parallel exchange the causal attention uses.
+
+    `ulysses` splits the cache by head, so history never crosses ranks. The
+    other three split by token or not at all, and each pays for that
+    differently -- see the docstrings on the branches in `forward`.
+    """
+    value = os.environ.get("SGLANG_LINGBOT_SP_STRATEGY", "ulysses").strip().lower()
+    if value not in _LINGBOT_SP_STRATEGIES:
+        raise ValueError(
+            f"SGLANG_LINGBOT_SP_STRATEGY must be one of {_LINGBOT_SP_STRATEGIES}, got {value!r}"
+        )
+    return value
+
+
+def _lingbot_merge_lse(o1, l1, o2, l2):
+    """Online-softmax merge of two partial attention results."""
+    merged = torch.logaddexp(l1, l2)
+    out = o1 * (l1 - merged).exp().unsqueeze(-1) + o2 * (l2 - merged).exp().unsqueeze(
+        -1
+    )
+    return out, merged
 
 
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
@@ -208,6 +269,20 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 f"num_heads ({self.num_heads}) must be divisible by ulysses_degree ({ulysses_world_size})."
             )
         self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        # kv-gather and ring keep every head on every rank and shard the
+        # queries instead, so they need a full-width attention impl.
+        self.full_head_attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends=(
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
+                AttentionBackendEnum.TORCH_SDPA,
+            ),
+        )
         self.ulysses_attn = LocalAttention(
             num_heads=self.ulysses_num_heads,
             head_size=self.head_dim,
@@ -278,6 +353,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 cache_start,
             )
 
+        strategy = lingbot_sp_strategy() if sequence_shard_enabled else "ulysses"
+
         if sequence_shard_enabled:
             seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
             if seq_splits is None:
@@ -286,7 +363,9 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
-            # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
+
+        if sequence_shard_enabled and strategy == "ulysses":
+            # Trade sequence for heads. Packed so this is one collective, not three.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
                 _usp_input_all_to_all(qkv, head_dim=2)
@@ -294,6 +373,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
+        elif sequence_shard_enabled and strategy == "kvgather_replicated":
+            # Queries stay sharded with every head; only the NEW chunk's K/V is
+            # gathered. History is already identical on every rank because each
+            # step appended the same gathered chunk, so it is never re-synced.
+            kv = torch.cat([roped_key, v], dim=-1)
+            kv = sequence_model_parallel_all_gather(kv, dim=1)
+            roped_key, v = kv.chunk(2, dim=-1)
 
         if (
             not sequence_shard_enabled
@@ -302,15 +388,23 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         ):
             return self.attn(roped_query, roped_key, v)
 
-        cache_head_start = (
-            get_tp_rank() * roped_key.shape[2]
-            if sequence_shard_enabled
-            else self.head_start
-        )
+        if sequence_shard_enabled and strategy == "ulysses":
+            cache_head_start = get_tp_rank() * roped_key.shape[2]
+        elif sequence_shard_enabled:
+            # every non-ulysses strategy keeps all heads resident
+            cache_head_start = 0
+        else:
+            cache_head_start = self.head_start
+        # A token-sharded window stores this rank's slice only, so the chunk
+        # start must be counted in local rows, not global ones.
+        cache_chunk_start = current_start
+        if sequence_shard_enabled and strategy in ("kvgather_sharded", "ring"):
+            cache_chunk_start = current_start // get_sp_world_size()
+
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
-            current_chunk_start=current_start,
+            current_chunk_start=cache_chunk_start,
             cache_head_start=cache_head_start,
             recent_window_tokens=(
                 None
@@ -321,20 +415,89 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if update_cache_only:
             return v
-        attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
-        x = attn_impl(
-            roped_query,
-            cache_view.k,
-            cache_view.v,
-        )
-        if sequence_shard_enabled:
+        if not sequence_shard_enabled:
+            x = self.attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "ulysses":
+            x = self.ulysses_attn(roped_query, cache_view.k, cache_view.v)
             assert seq_splits is not None
             x = (
                 _usp_output_all_to_all(x, head_dim=2)
                 if uniform_seq_splits
                 else _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
             )
+        elif strategy == "kvgather_replicated":
+            # Output is already this rank's row shard; no second collective.
+            x = self.full_head_attn(roped_query, cache_view.k, cache_view.v)
+        elif strategy == "kvgather_sharded":
+            # The window itself is split by token, so it must be reassembled
+            # every step -- O(window) instead of O(chunk).
+            full_k = sequence_model_parallel_all_gather(cache_view.k, dim=1)
+            full_v = sequence_model_parallel_all_gather(cache_view.v, dim=1)
+            x = self.full_head_attn(roped_query, full_k, full_v)
+        elif strategy == "ring":
+            x = self._ring_attend(roped_query, cache_view.k, cache_view.v)
+        else:
+            raise ValueError(f"unhandled LingBot SP strategy: {strategy}")
         return x
+
+    def _ring_attend(self, q, k, v):
+        """P2P-rotate a token-sharded window, merging each hop's partial result.
+
+        The transfer for the next hop is issued before this hop's attention so
+        the two overlap; unlike a blocking all-gather, no step waits on the
+        whole window before it can start computing.
+        """
+        sp_group = get_sp_group()
+        pg = sp_group.device_group
+        ws = get_sp_world_size()
+        rank = get_sp_parallel_rank()
+        nxt = torch.distributed.get_global_rank(pg, (rank + 1) % ws)
+        prv = torch.distributed.get_global_rank(pg, (rank - 1) % ws)
+
+        bufs = [torch.stack((k, v)), None]
+        bufs[1] = torch.empty_like(bufs[0])
+        cur = 0
+        out_acc = lse_acc = None
+        for step in range(ws):
+            nxt_buf = 1 - cur
+            pending = None
+            if step < ws - 1:
+                pending = torch.distributed.batch_isend_irecv(
+                    [
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, bufs[cur], nxt, group=pg
+                        ),
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, bufs[nxt_buf], prv, group=pg
+                        ),
+                    ]
+                )
+            result = _lingbot_fa_varlen(
+                q=q,
+                k=bufs[cur][0],
+                v=bufs[cur][1],
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=bufs[cur][0].shape[1],
+                softmax_scale=self.head_dim**-0.5,
+                causal=False,
+                return_softmax_lse=True,
+                ver=3,
+            )
+            out, lse = result[0], result[1]
+            if lse.shape[-1] == q.shape[1]:
+                lse = lse.transpose(1, 2)
+            out_acc, lse_acc = (
+                (out, lse)
+                if out_acc is None
+                else _lingbot_merge_lse(out_acc, lse_acc, out, lse)
+            )
+            if pending is not None:
+                for op in pending:
+                    op.wait()
+            cur = nxt_buf
+        return out_acc.to(q.dtype)
 
 
 class LingBotWorldTransformerBlock(nn.Module):
@@ -679,16 +842,9 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         width_local: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_start = rank * local_len
-        token_indices = torch.arange(
-            token_start, token_start + local_len, device=device, dtype=torch.long
+        return self.rotary_emb.forward_3d_sequence_shard(
+            local_len, rank, frame_stride_local, width_local, device
         )
-        t_idx = token_indices // frame_stride_local
-        rem = token_indices % frame_stride_local
-        h_idx = rem // width_local
-        w_idx = rem % width_local
-        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-        return self.rotary_emb.forward_uncached(positions)
 
     def forward(
         self,
@@ -788,13 +944,16 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep,
-                encoder_hidden_states,
-                encoder_hidden_states_image,
-                timestep_seq_len=ts_seq_len,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+            timestep_seq_len=ts_seq_len,
         )
         timestep_proj = (
             timestep_proj.unflatten(2, (6, -1))
@@ -909,6 +1068,165 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
+        self._norm1_modulation_gate = BitExactFusionGate(
+            "LingBot norm1 modulation", per_signature=True
+        )
+        self._cross_norm_gate = BitExactFusionGate(
+            "LingBot cross-attention FP32 norm", per_signature=True
+        )
+        self._self_residual_gate = BitExactFusionGate(
+            "LingBot self-attention residual", per_signature=True
+        )
+
+    def _fp32_norm(
+        self,
+        hidden_states: torch.Tensor,
+        scale: torch.Tensor | None = None,
+        shift: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        modulate = scale is not None
+        norm = self.norm1 if modulate else self.self_attn_residual_norm.norm
+        gate = self._norm1_modulation_gate if modulate else self._cross_norm_gate
+        batch, tokens, channels = hidden_states.shape
+        frames = scale.shape[1] if modulate else 1
+
+        def reference():
+            if not modulate:
+                return norm(hidden_states)
+            return (
+                (
+                    norm(hidden_states.float()).unflatten(1, (frames, tokens // frames))
+                    * (1 + scale)
+                    + shift
+                )
+                .flatten(1, 2)
+                .to(hidden_states.dtype)
+            )
+
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            # The FP32 Welford order is validated against Hopper's native
+            # LayerNorm. A matching first input on B200 does not establish
+            # equivalence for later inputs or graph replays.
+            and current_platform.is_hopper()
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not gate.disabled
+            and frames > 0
+            and tokens % frames == 0
+            and (
+                norm.weight is None and norm.bias is None
+                if modulate
+                else norm.weight is not None and norm.bias is not None
+            )
+        ):
+            sig = (hidden_states.device, hidden_states.shape, frames, norm.eps)
+            verified = gate.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    if modulate:
+                        affine_scale = scale.reshape(
+                            batch * frames, channels
+                        ).contiguous()
+                        affine_shift = shift.reshape(
+                            batch * frames, channels
+                        ).contiguous()
+                    else:
+                        affine_scale = (
+                            norm._cached_fp32_param(
+                                "_weight_fp32_cache", norm.weight, hidden_states.device
+                            )
+                            .view(1, channels)
+                            .expand(batch, -1)
+                        )
+                        affine_shift = (
+                            norm._cached_fp32_param(
+                                "_bias_fp32_cache", norm.bias, hidden_states.device
+                            )
+                            .view(1, channels)
+                            .expand(batch, -1)
+                        )
+                    out = try_fused_fp32_layernorm_bf16(
+                        hidden_states.view(batch * frames, tokens // frames, channels),
+                        affine_scale,
+                        affine_shift,
+                        norm.eps,
+                        affine=not modulate,
+                    )
+                    if out is not None:
+                        out = out.view_as(hidden_states)
+                        if verified:
+                            return out
+                        return gate.accept_or_fallback(
+                            out,
+                            reference(),
+                            sig=sig,
+                            equal=lambda a, b: torch.equal(
+                                a.view(torch.int16), b.view(torch.int16)
+                            ),
+                            logger=logger,
+                        )
+                except Exception as exc:
+                    gate.on_exception(exc, logger=logger)
+        return reference()
+
+    def _self_attn_residual(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+        gate_msa: torch.Tensor,
+    ) -> torch.Tensor:
+        def reference():
+            zero = hidden_states.new_zeros((1,))
+            return self.self_attn_residual_norm(
+                hidden_states, attn_output, gate_msa, zero, zero
+            )[1]
+
+        gate = self._self_residual_gate
+        if (
+            hidden_states.is_cuda
+            and torch.version.hip is None
+            and hidden_states.dtype == attn_output.dtype == torch.bfloat16
+            and gate_msa.dtype == torch.float32
+            and hidden_states.shape[-1] % 256 == 0
+            and hidden_states.shape[-1] <= 8192
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not gate.disabled
+        ):
+            sig = (
+                hidden_states.device,
+                hidden_states.shape,
+                hidden_states.stride(),
+                attn_output.stride(),
+                gate_msa.shape,
+                gate_msa.stride(),
+            )
+            verified = gate.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    out = try_fused_scaled_residual_bf16(
+                        hidden_states, attn_output.contiguous(), gate_msa
+                    )
+                    if out is None:
+                        return reference()
+                    if verified:
+                        return out
+                    return gate.accept_or_fallback(
+                        out,
+                        reference(),
+                        sig=sig,
+                        equal=lambda a, b: torch.equal(
+                            a.view(torch.int16), b.view(torch.int16)
+                        ),
+                        logger=logger,
+                    )
+                except Exception as exc:
+                    gate.on_exception(exc, logger=logger)
+        return reference()
 
     def _can_fuse_qkv_projection(self) -> bool:
         if self._fused_qkv_weight is not None:
@@ -961,42 +1279,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
         return query, key, value
-
-    def _cross_attn_with_cache(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        crossattn_cache: CrossAttentionKVCache | None,
-    ) -> torch.Tensor:
-        attn2 = self.attn2
-        q, _ = attn2.to_q(hidden_states)
-        if attn2.tp_rmsnorm:
-            q = tensor_parallel_rms_norm(q, attn2.norm_q)
-        else:
-            q = attn2.norm_q(q)
-        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-        if crossattn_cache is not None and crossattn_cache.is_init:
-            k = crossattn_cache.k
-            v = crossattn_cache.v
-        else:
-            k, _ = attn2.to_k(encoder_hidden_states)
-            if attn2.tp_rmsnorm:
-                k = tensor_parallel_rms_norm(k, attn2.norm_k)
-            else:
-                k = attn2.norm_k(k)
-            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            v, _ = attn2.to_v(encoder_hidden_states)
-            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            if crossattn_cache is not None:
-                crossattn_cache.store(k, v)
-
-        hidden_states = attn2.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
-        hidden_states, _ = attn2.to_out(hidden_states)
-        return hidden_states
 
     def _cam_conditioner_scale_shift(
         self,
@@ -1057,24 +1339,12 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
-        num_frames = temb.shape[1]
-        seqlen_per_frame = hidden_states.shape[1] // num_frames
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
             6, dim=2
         )
-        norm_hidden_states = (
-            (
-                self.norm1(hidden_states.float()).unflatten(
-                    dim=1, sizes=(num_frames, seqlen_per_frame)
-                )
-                * (1 + scale_msa)
-                + shift_msa
-            )
-            .flatten(1, 2)
-            .to(orig_dtype)
-        )
+        norm_hidden_states = self._fp32_norm(hidden_states, scale_msa, shift_msa)
         query, key, value = self._project_qkv(norm_hidden_states)
         if self.tp_rmsnorm:
             query = tensor_parallel_rms_norm(query, self.norm_q)
@@ -1103,12 +1373,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        residual_zero = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, residual_zero, residual_zero
-        )
+        # Camera conditioning changes the residual before cross-attention LN;
+        # the normalized output of the earlier fused residual+LN was discarded.
+        hidden_states = self._self_attn_residual(hidden_states, attn_output, gate_msa)
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype),
             c2ws_plucker_emb,
@@ -1118,9 +1385,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
                 else self._cam_conditioner_scale_shift(c2ws_plucker_emb)
             ),
         )
-        norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
-            orig_dtype
-        )
+        norm_hidden_states = self._fp32_norm(hidden_states).to(orig_dtype)
 
         attn_output = self._cross_attn_with_cache(
             norm_hidden_states, encoder_hidden_states, crossattn_cache
@@ -1558,13 +1823,16 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 device=hidden_states.device,
             )
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self._prepare_condition_embeddings(
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_image=encoder_hidden_states_image,
-                crossattn_cache=crossattn_cache,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self._prepare_condition_embeddings(
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+            crossattn_cache=crossattn_cache,
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape

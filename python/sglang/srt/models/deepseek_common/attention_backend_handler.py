@@ -156,10 +156,6 @@ def handle_attention_flashmla(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "flashmla")
 
 
-def handle_attention_cutlass_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
-
-
 def handle_attention_fa4(attn, forward_batch):
     # FA4 absorbed MLA feeds q_nope through the qv argument, which
     # flash_attn.cute only implements on SM100/SM110 (not SM120); keep the
@@ -185,12 +181,6 @@ def handle_attention_trtllm_mla(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
-def handle_attention_tokenspeed_mla(attn, forward_batch):
-    # tokenspeed_mla shares the trtllm_mla dispatch pattern: pure prefill goes
-    # via MHA chunked KV (TRT-LLM ragged), spec decode / decode goes via MLA.
-    return handle_attention_trtllm_mla(attn, forward_batch)
-
-
 def handle_attention_aiter(attn, forward_batch):
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
@@ -200,6 +190,8 @@ def handle_attention_aiter(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
@@ -268,10 +260,8 @@ AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
 AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
-AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
-AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)
 AttentionBackendRegistry.register(

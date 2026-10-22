@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 import torch
 
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
-from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -36,11 +35,6 @@ def _vec(val: float = 1.0) -> torch.Tensor:
     return torch.full((HIDDEN_DIM,), val, dtype=torch.float32)
 
 
-def _vec2d(val: float = 1.0) -> torch.Tensor:
-    """Create a [1, HIDDEN_DIM] tensor."""
-    return torch.full((1, HIDDEN_DIM), val, dtype=torch.float32)
-
-
 # ========================================================================
 # PositionalEmbeds
 # ========================================================================
@@ -53,69 +47,9 @@ class TestPositionalEmbeds(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_from_list_of_1d_tensors(self):
-        pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 5])
-        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
-        self.assertAlmostEqual(pe.embeds[0, 0].item(), 1.0)
-        self.assertAlmostEqual(pe.embeds[1, 0].item(), 2.0)
-
-    def test_from_list_of_2d_tensors(self):
-        pe = PositionalEmbeds(embeds=[_vec2d(3), _vec2d(4)], positions=[1, 2])
-        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
-
-    def test_from_pre_stacked_tensor(self):
-        stacked = torch.zeros(3, HIDDEN_DIM)
-        pe = PositionalEmbeds(embeds=stacked, positions=[0, 1, 2])
-        self.assertIs(pe.embeds, stacked)
-
     def test_length_mismatch_raises(self):
         with self.assertRaises(ValueError):
             PositionalEmbeds(embeds=[_vec()], positions=[0, 1])
-
-    def test_empty(self):
-        pe = PositionalEmbeds(embeds=torch.zeros(0, HIDDEN_DIM), positions=[])
-        self.assertEqual(pe.embeds.shape[0], 0)
-
-
-# ========================================================================
-# convert_embeds_to_tensors
-# ========================================================================
-
-
-class TestConvertEmbedsToTensors(CustomTestCase):
-    def setUp(self):
-        # The code under test reads its config from the bags.
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
-
-    def test_none_returns_none(self):
-        self.assertIsNone(convert_embeds_to_tensors(None))
-
-    def test_empty_list(self):
-        self.assertEqual(convert_embeds_to_tensors([]), [])
-
-    def test_single_input(self):
-        """[num_replacements][hidden_size] -> [[tensor, ...]]"""
-        result = convert_embeds_to_tensors([[1.0, 2.0], [3.0, 4.0]])
-        self.assertEqual(len(result), 1)  # wrapped in outer list
-        self.assertEqual(len(result[0]), 2)  # two replacement vectors
-        self.assertTrue(torch.is_tensor(result[0][0]))
-        self.assertEqual(result[0][0].tolist(), [1.0, 2.0])
-        self.assertEqual(result[0][0].dtype, torch.float32)
-        self.assertEqual(result[0][0].dim(), 1)  # each vector is 1-D
-
-    def test_batch_input(self):
-        """[num_inputs][num_replacements][hidden_size] -> [[tensor, ...], ...]"""
-        result = convert_embeds_to_tensors(
-            [
-                [[1.0, 2.0]],
-                [[3.0, 4.0], [5.0, 6.0]],
-            ]
-        )
-        self.assertEqual(len(result), 2)
-        self.assertEqual(len(result[0]), 1)
-        self.assertEqual(len(result[1]), 2)
 
 
 # ========================================================================
@@ -535,6 +469,59 @@ class TestBuildTokenIdInputs(CustomTestCase):
         self.assertIn(0, pe.positions)
         self.assertIn(4, pe.positions)
         self.assertEqual(pe.embeds.shape[0], 2)
+
+
+# ========================================================================
+# Score mixin: _build_token_id_inputs stacked path
+# ========================================================================
+
+
+def _stacked(n_rows: int, val: float = 1.0) -> torch.Tensor:
+    return torch.full((n_rows, HIDDEN_DIM), val, dtype=torch.float32)
+
+
+class TestBuildTokenIdInputsStacked(CustomTestCase):
+    def setUp(self):
+        self.mixin = _FakeMixin()
+
+    def test_single_item_stacked_none_slot(self):
+        stacked = _stacked(2, 5.0)
+        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked, None],
+        )
+        self.assertEqual(input_ids, [[50, 10, 20, 50], [50, 10, 30, 40]])
+        self.assertEqual(len(pe_overrides), 2)
+        self.assertIs(pe_overrides[0].embeds, stacked)
+        self.assertEqual(pe_overrides[0].positions, [0, 3])
+        self.assertIsNone(pe_overrides[1])
+
+    def test_multi_item_stacked_used_as_is(self):
+        # One fused sequence; placeholders: query pos 0, item[0] pos 4
+        # (query_len 2 + delim 1 + idx 1). item[1] has no placeholder.
+        stacked = _stacked(2, 9.0)
+        _, input_ids, pe_overrides, delim = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=True,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked],
+        )
+        self.assertEqual(
+            input_ids, [[50, 10, DELIM_TOKEN, 20, 50, DELIM_TOKEN, 30, 40, DELIM_TOKEN]]
+        )
+        self.assertEqual(len(pe_overrides), 1)
+        self.assertEqual(pe_overrides[0].positions, [0, 4])
+        self.assertIs(pe_overrides[0].embeds, stacked)
 
 
 # ========================================================================
