@@ -3154,15 +3154,18 @@ class KVCacheConfigurator:
         else:
             max_stage_mamba_layers = len(all_mamba_layers)
         pp_layer_scale = max_stage_mamba_layers / max(len(all_mamba_layers), 1)
-        # A fused draft state block widens every state slot: price the entry
-        # the unified factory carves out (host + draft + pad), not the host's.
-        fused_state_entry = self.fused_entry_bytes("mamba")
-        per_req = (
-            config.mamba2_cache_params.mamba_cache_per_req
-            if fused_state_entry is None
-            else fused_state_entry
+        stage_per_req = int(
+            config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
         )
-        stage_per_req = int(per_req * pp_layer_scale)
+        # A fused draft state block widens every slot the unified factory carves
+        # (host + draft + pad). The slot count, and the request cap it implies,
+        # comes from the host's state as on the default pool; the widened slots
+        # are charged in full, out of the KV share. The fused entry is built
+        # from this rank's own layers already, so it takes no stage scale.
+        fused_state_entry = self.fused_entry_bytes("mamba")
+        stage_slot_bytes = (
+            stage_per_req if fused_state_entry is None else fused_state_entry
+        )
 
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
@@ -3309,7 +3312,8 @@ class KVCacheConfigurator:
 
         # +1 accounts for each pool's padding slot.
         mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
+            (get_schedule().max_mamba_cache_size + 1)
+            * (stage_slot_bytes + extra_per_slot)
             + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
