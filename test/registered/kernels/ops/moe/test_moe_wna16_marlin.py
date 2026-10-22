@@ -1,5 +1,6 @@
 import itertools
 import sys
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1121,7 +1122,21 @@ def _check_marlin_inactive_routes(
             activated = torch.nn.functional.silu(gate) * up
             projected = torch.einsum("mti,mthi->mth", activated, w2_ref[ids])
             reference = (projected.float() * weights[:, :, None]).sum(1).to(x.dtype)
-            with patch.object(zero_copy_context, "get_moe_output", return_value=output):
+            projections = []
+
+            def checked_marlin_gemm(*args, **kwargs):
+                # Ordinary built-in alignment certifies both projections.
+                assert kwargs.get("expert_ids_are_sorted", False)
+                projections.append(kwargs["mul_topk_weights"])
+                return moe_wna16_marlin_gemm(*args, **kwargs)
+
+            with (
+                patch.object(zero_copy_context, "get_moe_output", return_value=output),
+                patch(
+                    "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe.moe_wna16_marlin_gemm",
+                    checked_marlin_gemm,
+                ),
+            ):
                 for _ in range(3):
                     run()
                 torch.cuda.synchronize()
@@ -1142,25 +1157,25 @@ def _check_marlin_inactive_routes(
                     if hook_weights:
                         weights, ids = hook_weights
                         assert torch.count_nonzero(weights[ids < 0]) == 0
+            if runner_kind == "fused":
+                assert projections == [False, True] * 4
 
 
-def test_moe_wna16_marlin_inactive_output_ownership():
-    """An allocated output zeros inactive rows; caller-owned rows stay untouched."""
+@pytest.mark.parametrize("has_inactive_prefix_count", [False, True])
+def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
+    """Inactive-output policy honors sorted/EP routing and ignores unused tails."""
     torch.manual_seed(57)
-    m, e, k, n, topk, block_m = 1, 8, 256, 256, 2, 8
-    _, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
+    m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
+    w_ref, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
         e, n, k, scalar_types.uint4b8
     )
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    ids = torch.full((m, topk), -1, device="cuda", dtype=torch.int32)
     routing_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
-    sorted_ids, expert_ids, num_post = moe_align_block_size(ids, block_m, e)
     workspace = torch.zeros(
         torch.cuda.get_device_properties(x.device).multi_processor_count * 4,
         device="cuda",
         dtype=torch.int32,
     )
-    caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
     original_empty = torch.empty
 
     def poisoned_empty(*args, **kwargs):
@@ -1169,36 +1184,128 @@ def test_moe_wna16_marlin_inactive_output_ownership():
             tensor.fill_(float("nan"))
         return tensor
 
-    for output in (None, caller_output):
-        with patch.object(torch, "empty", side_effect=poisoned_empty):
-            result = _run_single_gemm(
-                moe_wna16_marlin_gemm,
-                x,
-                output,
-                qweight,
-                scales,
-                zeros,
-                g_idx,
-                permutation,
-                workspace,
-                sorted_ids,
-                expert_ids,
-                num_post,
-                routing_weights,
-                scalar_types.uint4b8,
-                block_m,
-                topk,
-                m,
-                n,
-                k,
-                False,
-                True,
-                True,
-            )
-        expected = (
-            torch.zeros_like(result) if output is None else torch.full_like(result, 3.0)
+    cases = (
+        ("inactive-default", (-1, -1, -1), False, False, False),
+        ("inactive-sorted", (-1, -1, -1), True, False, False),
+        ("empty-sorted", (-1, -1, -1), True, False, False),
+        ("mixed-default", (-1, 0, 1), False, False, False),
+        ("mixed-sorted", (0, -1, 1), True, False, False),
+        ("mixed-scattered", (-1, 0, 1), False, True, False),
+        ("inactive-ep", (-1, -1, -1), False, False, True),
+        ("mixed-ep", (-1, 0, 1), False, True, True),
+        ("valid-default", (0, 1, 2), False, False, False),
+        ("valid-sorted", (0, 1, 2), True, False, False),
+    )
+    for case, route_ids, sorted_proof, scatter, is_ep in cases:
+        if has_inactive_prefix_count and not sorted_proof:
+            continue
+        ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+        sorted_ids, expert_ids, num_post = moe_align_block_size(
+            ids,
+            block_m,
+            e,
+            return_inactive_prefix_count=has_inactive_prefix_count,
         )
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        if scatter:
+            # Keep the matching token blocks, but move the inactive block to
+            # the middle so a first-ID shortcut without proof would be unsafe.
+            order = torch.tensor([1, 0, 2], device="cuda")
+            sorted_ids = sorted_ids.view(topk, block_m)[order].reshape(-1)
+            expert_ids = expert_ids[order]
+        elif case == "empty-sorted":
+            sorted_ids, expert_ids = sorted_ids[:0], expert_ids[:0]
+            num_post.zero_()
+        if case != "empty-sorted":
+            used_blocks = 1 if max(route_ids) < 0 else topk
+            if not scatter and route_ids[0] < 0:
+                # An empty inactive block guards against skipping only one;
+                # real routes stay unique, as the alignment producer guarantees.
+                empty_block = torch.full_like(sorted_ids[:block_m], topk)
+                sorted_ids = torch.cat(
+                    (empty_block, sorted_ids[: used_blocks * block_m])
+                )
+                expert_ids = torch.cat((expert_ids[:1], expert_ids[:used_blocks]))
+                num_post[0].add_(block_m)
+                if has_inactive_prefix_count:
+                    num_post[1].add_(1)
+                used_blocks += 1
+            # Only the published prefix is ordered. A binary search or scan
+            # over allocated capacity would miscount these extra negative IDs.
+            dirty_ids = torch.tensor(
+                [0, -1, e - 1, -1], device="cuda", dtype=torch.int32
+            )
+            expert_ids = torch.cat((expert_ids[:used_blocks], dirty_ids))
+            sorted_ids = torch.cat(
+                (
+                    sorted_ids[: used_blocks * block_m],
+                    torch.full((4 * block_m,), topk, device="cuda", dtype=torch.int32),
+                )
+            )
+
+        if not has_inactive_prefix_count and case == "valid-sorted":
+            # An allocated second word is not a producer certificate. The
+            # legacy path must ignore it and discover its own prefix.
+            num_post = torch.cat((num_post, torch.full_like(num_post, 0x3FFFFFFF)))
+
+        def gemm(*args, **kwargs):
+            kwargs["is_ep"] = is_ep
+            if has_inactive_prefix_count:
+                kwargs["has_inactive_prefix_count"] = True
+            if sorted_proof:
+                kwargs["expert_ids_are_sorted"] = True
+            return moe_wna16_marlin_gemm(*args, **kwargs)
+
+        # Omit the policy on default calls to guard caller-owned inactive rows.
+        for zero_inactive_output in (False, True):
+            project = (
+                partial(gemm, zero_inactive_output=True)
+                if zero_inactive_output
+                else gemm
+            )
+            caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
+            for output in (None, caller_output):
+                with patch.object(torch, "empty", side_effect=poisoned_empty):
+                    result = _run_single_gemm(
+                        project,
+                        x,
+                        output,
+                        qweight,
+                        scales,
+                        zeros,
+                        g_idx,
+                        permutation,
+                        workspace,
+                        sorted_ids,
+                        expert_ids,
+                        num_post,
+                        routing_weights,
+                        scalar_types.uint4b8,
+                        block_m,
+                        topk,
+                        m,
+                        n,
+                        k,
+                        False,
+                        True,
+                        True,
+                    )
+                expected = (
+                    torch.zeros_like(result)
+                    if output is None
+                    else torch.full_like(result, 3.0)
+                )
+                if zero_inactive_output and case != "empty-sorted":
+                    expected[ids.reshape(-1) < 0] = 0
+                for slot, expert in enumerate(route_ids):
+                    if expert >= 0:
+                        expected[slot] = (x[0].float() @ w_ref[expert].float().T).to(
+                            expected.dtype
+                        )
+                torch.testing.assert_close(result, expected, rtol=0.03, atol=0.02)
+                inactive = ids.reshape(-1) < 0
+                torch.testing.assert_close(
+                    result[inactive], expected[inactive], rtol=0, atol=0
+                )
 
 
 def test_marlin_lora_direct_inactive_routes():
@@ -1266,13 +1373,22 @@ def test_marlin_lora_direct_inactive_routes():
     assert torch.count_nonzero(down_output[ids < 0]) == 0
 
 
+@pytest.mark.parametrize("use_expert_map", [False, True])
+@pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
-def test_muse_marlin_inactive_routes(fused_norm):
-    """Muse maps global routes once and masks inactive weights before either norm tail."""
+@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+def test_muse_marlin_inactive_routes(
+    fused_norm, hidden, intermediate, weight_first, use_expert_map
+):
+    """Muse finalization excludes undefined inactive projection rows and weights."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+    from sglang.srt.layers.muse_spark.muse_spark_layers import (
+        MuseSpark1xRMSNorm,
+        MuseSpark1xRMSNormWithInputScale,
+    )
 
     torch.manual_seed(67)
-    rows, local_experts, hidden, intermediate, topk = 4, 2, 256, 256, 2
+    rows, local_experts, topk = 4, 2, 2
     dtype = torch.bfloat16
     layer = MuseSpark1xFp4Experts.__new__(MuseSpark1xFp4Experts)
     torch.nn.Module.__init__(layer)
@@ -1281,8 +1397,12 @@ def test_muse_marlin_inactive_routes(fused_norm):
     layer.params_dtype = dtype
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = local_experts
-    layer.global_num_experts = 4
-    layer._expert_map = torch.tensor([-1, -1, 0, 1], device="cuda", dtype=torch.int32)
+    layer.global_num_experts = 4 if use_expert_map else local_experts
+    layer._expert_map = (
+        torch.tensor([-1, -1, 0, 1], device="cuda", dtype=torch.int32)
+        if use_expert_map
+        else None
+    )
     references = []
     for prefix, n, k in (
         ("w13", 2 * intermediate, hidden),
@@ -1310,19 +1430,53 @@ def test_muse_marlin_inactive_routes(fused_norm):
     local_ids = torch.tensor(
         [[0, 1], [1, -1], [-1, 0], [-1, -1]], device="cuda", dtype=torch.int32
     )
+    if not use_expert_map:
+        ids = local_ids.clone()
     weights = torch.tensor(
         [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
     )
     weights[local_ids < 0] = float("nan")
-    norm = torch.nn.RMSNorm(hidden, eps=1e-6, device="cuda", dtype=dtype)
+    weights[-1, 0] = float("inf")
+    input_weights = weights.clone()
+    norm_class = (
+        MuseSpark1xRMSNormWithInputScale if weight_first else MuseSpark1xRMSNorm
+    )
+    norm = norm_class(hidden, eps=1e-6).to(device="cuda", dtype=dtype)
+    norm.weight.data.copy_(torch.linspace(0.5, 1.5, hidden, device="cuda", dtype=dtype))
     layer._post_expert_norm = norm
     layer._post_expert_norm_weight = norm.weight.detach() if fused_norm else None
     layer._post_expert_norm_eps = norm.eps
-    layer._post_expert_norm_weight_first = False
+    layer._post_expert_norm_weight_first = weight_first
 
-    expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
+    projection_buffers = []
+
+    def record_projection_buffer(a, c, *args, **kwargs):
+        assert kwargs["is_ep"] is use_expert_map
+        assert kwargs["has_inactive_prefix_count"] is (not use_expert_map)
+        count = args[10]
+        assert count.shape == ((1,) if use_expert_map else (2,))
+        assert count.dtype == torch.int32 and count.is_contiguous()
+        if not use_expert_map:
+            assert count.data_ptr() % 8 == 0
+        projection_buffers.append(c)
+        c.fill_(float("nan"))
+        c[local_ids.reshape(-1) < 0, 0] = float("inf")
+        return moe_wna16_marlin_gemm(a, c, *args, **kwargs)
+
+    with patch(
+        "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
+        side_effect=record_projection_buffer,
+    ):
+        expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
+        actual = layer._forward_marlin(x, weights, ids, norm)
+    for gate_up_buffer, down_buffer in zip(
+        projection_buffers[::2], projection_buffers[1::2]
+    ):
+        assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
+        assert down_buffer.untyped_storage().nbytes() == (
+            rows * topk * max(2 * intermediate, hidden) * x.element_size()
+        )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
-    assert torch.count_nonzero(expert_output[local_ids < 0]) == 0
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)
     w13_ref, w2_ref = references
     for row in range(rows):
@@ -1334,16 +1488,20 @@ def test_muse_marlin_inactive_routes(fused_norm):
             gate, up = gate_up.chunk(2)
             activated = torch.nn.functional.silu(gate) * up
             expected_experts[row, route] = activated @ w2_ref[expert].T
-    torch.testing.assert_close(expert_output, expected_experts, rtol=0.05, atol=0.25)
+    torch.testing.assert_close(
+        expert_output[local_ids >= 0],
+        expected_experts[local_ids >= 0],
+        rtol=0.05,
+        atol=0.25,
+    )
     safe_weights = weights.masked_fill(local_ids < 0, 0.0)
     expected = (
         (norm(expected_experts).float() * safe_weights[..., None]).sum(1).to(dtype)
     )
-    actual = layer._forward_marlin(x, weights, ids, norm)
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.25)
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[-1]) == 0
-    assert torch.isnan(weights[local_ids < 0]).all()
+    torch.testing.assert_close(weights, input_weights, rtol=0, atol=0, equal_nan=True)
 
 
 if __name__ == "__main__":
