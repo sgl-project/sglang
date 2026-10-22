@@ -117,6 +117,10 @@ def _build_server_args(
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
+        hicache_storage_backend=get_memory().hicache_storage_backend,
+        hicache_storage_backend_extra_config=get_memory().hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy=get_memory().hicache_storage_prefetch_policy,
+        hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
         # The shared field is also populated for legacy SMG mode; only forward

@@ -77,9 +77,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     def __init__(self):
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
-        from flashinfer.kda import recurrent_kda
+        from flashinfer import kda
 
-        self._recurrent_kda = recurrent_kda
+        self._recurrent_kda = kda.recurrent_kda
+        # Older FlashInfer installations retain the eager BCG break.
+        self.prefill_graph_wrapper_cls = getattr(
+            kda, "RecurrentKDAPrefillWrapper", None
+        )
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
