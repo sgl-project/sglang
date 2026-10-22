@@ -127,6 +127,18 @@ class AscendOpsDispatcher(BaseDispatcher):
         self._mc2_state: Optional[_MC2State] = None
         self._pad_buffers: dict[tuple, tuple] = {}
         self._alltoall_state: Optional[dict[str, Any]] = None
+        self._allgather_state: Optional[dict[str, Any]] = None
+        if self.ascend_ops_config.prefill == "allgather":
+            if not (
+                parallel.tp_size == parallel.moe_ep_size == parallel.attn_dp_size
+                and parallel.attn_tp_size == 1
+                and self.num_local_experts * self.ep_size == self.num_experts
+                and not moe_runner_config.num_fused_shared_experts
+            ):
+                raise ValueError(
+                    "NPU AllGather currently requires TP=EP=Attention DP, "
+                    "contiguous expert placement and no fused shared experts"
+                )
         self._init_routing = NPUMoEInitRouting_v2(quant_mode=-1)
         self._finalize_routing = NPUFinalizeRouting(drop_pad_mode=2)
 
@@ -179,7 +191,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _dispatch_prefill_allgather(self, hidden_states, topk_weights, topk_ids):
         self._dispatch_path = "prefill_allgather"
         self._dispatch_group = self.tp_group
-        raise NotImplementedError("Ascend Ops prefill allgather dispatch is pending")
+        return self._dispatch_allgather(hidden_states, topk_weights, topk_ids)
 
     def _dispatch_prefill_alltoallv(self, hidden_states, topk_weights, topk_ids):
         self._dispatch_path = "prefill_alltoallv"
@@ -216,7 +228,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     # Combine path boundaries --------------------------------------------------
 
     def _combine_prefill_allgather(self, combine_input):
-        raise NotImplementedError("Ascend Ops prefill allgather combine is pending")
+        return self._combine_allgather(combine_input.hidden_states)
 
     def _combine_prefill_alltoallv(self, combine_input):
         return self._combine_alltoallv(combine_input.hidden_states)
@@ -421,6 +433,125 @@ class AscendOpsDispatcher(BaseDispatcher):
                 name = self.ep_group.get_hccl_comm_name(self.ep_rank)
             self._ep_comm_name = name
         return self._ep_comm_name
+
+    # Prefill allgather --------------------------------------------------------
+
+    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids):
+        if self._dispatch_output is not None:
+            raise RuntimeError("NPU dispatch called before the previous combine")
+        group = self._dispatch_group
+        input_dtype = hidden_states.dtype
+        quant_mode = self._routing_quant_mode()
+        if quant_mode not in (-1, 1):
+            raise NotImplementedError("NPU AllGather supports BF16 and INT8 routing")
+        # Ranks may have different row counts, including zero; use tensor sizes.
+        world_size = dist.get_world_size(group)
+        local_size = torch.tensor(
+            [hidden_states.shape[0]], dtype=torch.int32, device=hidden_states.device
+        )
+        sizes = torch.empty(world_size, dtype=torch.int32, device=hidden_states.device)
+        dist.all_gather_into_tensor(sizes, local_size, group=group)
+        row_sizes = sizes.tolist()
+        max_rows = max(row_sizes)
+        if max_rows == 0:
+            raise RuntimeError("NPU prefill requires at least one global token")
+
+        def gather_rows(tensor):
+            padded = tensor.new_zeros((max_rows, *tensor.shape[1:]))
+            padded[: tensor.shape[0]].copy_(tensor)
+            gathered = tensor.new_empty((world_size * max_rows, *tensor.shape[1:]))
+            dist.all_gather_into_tensor(gathered, padded, group=group)
+            return torch.cat(
+                [
+                    gathered[rank * max_rows : rank * max_rows + rows]
+                    for rank, rows in enumerate(row_sizes)
+                ],
+                dim=0,
+            )
+
+        # Gather before quantization. For INT8 routing, init_routing quantizes
+        # the grouped rows and returns their per-token scales.
+        hidden_states = gather_rows(hidden_states)
+        topk_weights = gather_rows(topk_weights.float())
+        topk_ids = gather_rows(topk_ids.to(torch.int32))
+        local_ids = topk_ids - self.ep_rank * self.num_local_experts
+        is_local = (local_ids >= 0) & (local_ids < self.num_local_experts)
+        topk_weights = topk_weights.masked_fill(~is_local, 0)
+        # Operator constraint: npu_moe_init_routing_v2 needs a non-negative
+        # out-of-range expert ID for dropped routes. Do not use -1: it can
+        # corrupt valid expert counts even when the routing weight is zero.
+        # num_local_experts is just beyond the valid local expert ID range.
+        local_ids = local_ids.masked_fill(~is_local, self.num_local_experts)
+        x, row_idx, expert_tokens, scales = self._init_routing_tokens(
+            hidden_states, local_ids, self.num_local_experts, quant_mode
+        )
+        # Trim unused routing capacity before expert computation.
+        num_routed_rows = int(expert_tokens.sum().item())
+        x = x[:num_routed_rows]
+        if scales is not None:
+            scales = scales[:num_routed_rows]
+        # Give every dropped route an in-bounds zero row, filled at combine.
+        row_idx = row_idx.masked_fill(~is_local.reshape(-1), num_routed_rows)
+        self._allgather_state = {
+            "group": group,
+            "row_sizes": row_sizes,
+            "input_dtype": input_dtype,
+            "num_routed_rows": num_routed_rows,
+        }
+        self._dispatch_output = AscendOpsDispatchOutput(
+            hidden_states=x,
+            hidden_states_scale=scales,
+            topk_weights=topk_weights,
+            topk_ids=local_ids,
+            expanded_row_idx=row_idx,
+            expert_tokens=expert_tokens,
+            group_list_type=1,
+            prefill_mode="allgather",
+        )
+        return self._dispatch_output
+
+    def _combine_allgather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        state = self._allgather_state
+        if state is None:
+            raise RuntimeError("NPU AllGather combine called before dispatch")
+        dispatched = self._dispatch_output
+        sizes = state["row_sizes"]
+        group = state["group"]
+        num_routed_rows = state["num_routed_rows"]
+        valid_output = hidden_states[:num_routed_rows]
+        # Operator constraint: finalize mode 2 requires the full
+        # [global_tokens * top_k, hidden] shape, not just the valid expert rows.
+        # Dropped routes must read an explicit zero row: 0 * NaN is still NaN,
+        # so zero weights cannot make uninitialized GEMM rows safe to read.
+        expert_output = torch.zeros(
+            (dispatched.topk_ids.numel(), self.hidden_size),
+            dtype=torch.float32,
+            device=valid_output.device,
+        )
+        expert_output[:num_routed_rows].copy_(valid_output)
+        # Keep weighted expert sums in FP32 across ranks. Rounding each
+        # rank's partial output to BF16 before ReduceScatter loses precision.
+        contributions = self._finalize_routing._finalize_routing(
+            expert_output,
+            topk_weights=dispatched.topk_weights,
+            expanded_row_idx=dispatched.expanded_row_idx,
+            topk_ids=dispatched.topk_ids,
+        )
+        # Restore equal-sized chunks in source-rank order for ReduceScatter.
+        max_rows = max(sizes)
+        padded = contributions.new_zeros((len(sizes) * max_rows, self.hidden_size))
+        offset = 0
+        for rank, rows in enumerate(sizes):
+            padded[rank * max_rows : rank * max_rows + rows].copy_(
+                contributions[offset : offset + rows]
+            )
+            offset += rows
+        output = contributions.new_empty((max_rows, self.hidden_size))
+        dist.reduce_scatter_tensor(output, padded, group=group)
+        output = output[: sizes[dist.get_rank(group)]].to(state["input_dtype"])
+        self._dispatch_output = None
+        self._allgather_state = None
+        return output
 
     # Prefill alltoallv --------------------------------------------------------
 
