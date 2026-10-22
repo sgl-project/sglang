@@ -350,6 +350,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        if getattr(hf_config, "valen_head", None) is not None:
+            image_kwargs = hf_config.valen_media_kwargs.get("images_kwargs", {})
+            if "size" in image_kwargs:
+                _processor.image_processor.size = dict(image_kwargs["size"])
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",

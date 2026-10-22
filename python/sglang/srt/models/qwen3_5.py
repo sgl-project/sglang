@@ -103,6 +103,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.valen_head import ValenMixerHead, ValenPooler
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -2397,7 +2398,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
-        if config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+        if getattr(config, "valen_head", None) is not None:
+            self.pooler = ValenPooler(
+                ValenMixerHead(config.text_config.hidden_size, config.valen_head)
+            )
+        elif config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             model = get_model()
             joint_head_config = load_joint_head_config(model.model_path, model.revision)
             if joint_head_config is not None:
@@ -2465,6 +2470,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         bare_backbone = False
         for name, loaded_weight in weights:
+            if isinstance(self.pooler, ValenPooler):
+                if name.startswith("head."):
+                    target = "pooler." + name
+                    if target not in params_dict:
+                        raise ValueError(f"Unknown Valen head parameter: {name}")
+                    default_weight_loader(params_dict[target], loaded_weight)
+                    loaded_params.add(target)
+                    continue
+                if name.startswith("backbone."):
+                    name = "model." + name.removeprefix("backbone.")
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -2544,6 +2559,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
+        if isinstance(self.pooler, ValenPooler):
+            expected = {
+                f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
+            }
+            if expected - loaded_params:
+                raise ValueError(
+                    f"Missing Valen head weights: {sorted(expected - loaded_params)}"
+                )
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
             loaded_params.add("lm_head.weight")

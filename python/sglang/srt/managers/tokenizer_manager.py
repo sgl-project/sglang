@@ -1452,8 +1452,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
-        if self.model_config.joint_head_config is None:
+        """Native decision heads require the spans of a decision layout."""
+        is_valen = getattr(self.model_config, "valen_head_config", None) is not None
+        if self.model_config.joint_head_config is None and not is_valen:
             return
         if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
             # Health checks only need a response, which is an empty embedding.
@@ -1477,7 +1478,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"The prompt has {len(input_ids)} tokens, but this server scores "
                 f"at most {limit} in one prefill"
             )
-        parse_decision_layout(obj.decision_layout, len(input_ids))
+        if is_valen:
+            from sglang.srt.layers.valen_head import parse_valen_layout
+
+            parse_valen_layout(obj.decision_layout, len(input_ids))
+        else:
+            parse_decision_layout(obj.decision_layout, len(input_ids))
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

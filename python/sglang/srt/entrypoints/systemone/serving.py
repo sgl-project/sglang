@@ -44,6 +44,11 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneScoreAnswer,
     SystemOneUsage,
 )
+from sglang.srt.entrypoints.systemone.valen import (
+    encode_valen,
+    valen_messages,
+    valen_options,
+)
 from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.runtime_context import get_schedule
@@ -76,8 +81,13 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        if self.joint_head_config is not None:
+        if self.joint_head_config is not None or self.valen_head_config is not None:
             return self._validate_joint_schema_request(request)
+        if any(
+            q.type == "score" and len(q.criteria) > 10
+            for q in request.questions.values()
+        ):
+            return "Generative decision models support at most 10 score levels"
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -87,7 +97,7 @@ class SystemOneServing(OpenAIServingDecisions):
     def _validate_joint_schema_request(
         self, request: SystemOneRequest
     ) -> Optional[str]:
-        """A Clef checkpoint renders its own prompt, without the chat template."""
+        """Native decision heads use the prompt format they were trained with."""
         route = self.route
         if self.tokenizer_manager.tokenizer is None:
             return f"{route} requires the server tokenizer"
@@ -115,7 +125,7 @@ class SystemOneServing(OpenAIServingDecisions):
         Tuple[SystemOneRequest, List[QuestionView]],
     ]:
         views = [_view(question) for question in request.questions.values()]
-        if self.joint_head_config is not None:
+        if self.joint_head_config is not None or self.valen_head_config is not None:
             return self._joint_schema_request(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
@@ -134,6 +144,11 @@ class SystemOneServing(OpenAIServingDecisions):
         for question_id, view in zip(request.questions, views):
             if view.kind == "score":
                 _check_legend(question_id, view)
+        if self.valen_head_config is not None:
+            _, images = valen_messages(request, self.tokenizer_manager.tokenizer)
+            if images and self.tokenizer_manager.mm_processor is None:
+                raise ValueError("Valen images require multimodal input")
+            return EmbeddingReqInput(image_data=images or None)
         return EmbeddingReqInput(
             image_data=[
                 ImageData(url=image.url, detail=image.detail or "auto")
@@ -160,6 +175,26 @@ class SystemOneServing(OpenAIServingDecisions):
             adapted_request.image_data, image_token_counts = await self._read_images(
                 adapted_request.image_data
             )
+        if self.valen_head_config is not None:
+            messages, _ = valen_messages(request, tokenizer_manager.tokenizer)
+            input_ids, layout = encode_valen(
+                tokenizer_manager.tokenizer,
+                request,
+                messages,
+                max_length=min(
+                    tokenizer_manager.model_config.hf_config.valen_max_length,
+                    max_joint_prompt_tokens(
+                        context_len=tokenizer_manager.context_len,
+                        num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+                        max_req_input_len=tokenizer_manager.max_req_input_len,
+                        max_prefill_tokens=get_schedule().max_prefill_tokens,
+                    ),
+                ),
+                image_token_counts=image_token_counts,
+            )
+            adapted_request.input_ids = input_ids
+            adapted_request.decision_layout = layout
+            return
         input_ids, layout = encode_joint_schema(
             tokenizer_manager.tokenizer,
             request,
@@ -197,8 +232,13 @@ class SystemOneServing(OpenAIServingDecisions):
             adapted_request, raw_request
         ).__anext__()
         logits = ret["embedding"]
+        options = (
+            valen_options
+            if self.valen_head_config is not None
+            else joint_schema_options
+        )
         names = [
-            [name for name, _ in joint_schema_options(question)]
+            [name for name, _ in options(question)]
             for question in request.questions.values()
         ]
         if len(logits) != sum(map(len, names)):
@@ -339,7 +379,7 @@ class SystemOneServing(OpenAIServingDecisions):
         raw_request: Request,
     ) -> ORJSONResponse:
         request, views = processed
-        if self.joint_head_config is not None:
+        if self.joint_head_config is not None or self.valen_head_config is not None:
             return await self._answer_joint_schema(
                 adapted_request, request, views, raw_request
             )

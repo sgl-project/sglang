@@ -242,7 +242,7 @@ What to expect from this route:
 - A `noul` answer is the probability of yes. A `choice` answer has the most probable option and a `score` answer the probability-weighted mean level, each with `probabilities` and `confidence`, and a score answer echoes its levels in `legend`.
 - `confidence` follows the formulas TypeSafe publishes for its adapter. It is a statistic of the returned probabilities, which are renormalized over the answer labels and ignore probability outside them. It is not calibrated, it can read 0 for a score split between distant levels, and thresholds tuned on another provider may not transfer.
 - For a model scored with answer-label tokens, each answer also carries `x_label_mass`, the full-vocabulary probability of its labels, which `/v1/decisions` returns as `label_mass`. The Python SDK drops fields it does not define, so read it from `result.raw_http_response.json()`. Decision checkpoints and joint schema checkpoints omit it, because their readout or head scores only the answers.
-- A choice takes 1 to 255 options and a score 1 to 10 levels. Option names that are blank, contain control or line break characters, or repeat another name after trimming and case folding are refused, and so are blank or null levels, as on `/v1/decisions`.
+- A choice takes 1 to 255 options. Generative models support 1 to 10 score levels; native decision heads support up to 255. Valen requires at least 2 score levels. Option names that are blank, contain control or line break characters, or repeat another name after trimming and case folding are refused, and so are blank or null levels, as on `/v1/decisions`.
 - For general generation models that score answer labels, options beyond 26 get two-letter labels (`AA`, `AB`, and so on), each checked to be one token for the served tokenizer. These labels include common words and have unequal priors, so answers can depend on option order. Supporting more than 26 options also requires a Hugging Face tokenizer that reports its added tokens and a compatible chat-template boundary, as the Qwen models have with `</think>`. Without those properties, these models are limited to 26 options. Clef's joint schema head scores the options directly and does not use letter labels.
 - `instructions` are optional. For general generation models, a choice or score question without them drops its question line; Clef uses the question id as its instructions. A `noul` question is answered from its `true` and `false` descriptions, and one with neither descriptions nor instructions, such as the SDK's bare `Noul()`, is refused.
 - Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `images` is accepted as an SGLang extension. Clef rejects nonempty `chat_template_kwargs` because it uses the prompt its head was trained with; other models check this field against their own template rules.
@@ -251,6 +251,67 @@ What to expect from this route:
 - `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, or once for a joint schema checkpoint, and `usage.output_tokens` is 0.
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.
 - The SDKs time out after 10 seconds and retry, so raise their timeout for requests with many questions over a long state. A request whose client gives up still finishes its encoding and part of its prefill, so each retry repeats at least the encoding.
+
+## Valen checkpoints
+
+[Valen-2B](https://huggingface.co/Valen-Team/Valen-2B) uses a Qwen3.5 backbone and a trained FP32 Mixer head. SGLang runs all questions in one causal prefill and scores their candidates directly. The checkpoint must use `qwen_execution="shared_state"` and `head_type="mixer"`.
+
+On Linux with an NVIDIA CUDA GPU, launch one tensor-parallel and one pipeline-parallel rank:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path Valen-Team/Valen-2B \
+  --tp-size 1 --pp-size 1 \
+  --context-length 32768 --max-prefill-tokens 32768 \
+  --host 127.0.0.1 --port 30000
+```
+
+Native loading does not require `--trust-remote-code`. The server selects the checkpoint's backbone compute dtype and preserves the head in FP32. It enables embedding mode and disables radix caching, chunked prefill, and CUDA graphs because the head reads every prompt token. This checkpoint serves `/v1/systemone`; generation and ordinary embedding requests are rejected.
+
+```python Example
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/systemone",
+    json={
+        "model": "Valen-Team/Valen-2B",
+        "state": "I was charged twice. Please refund the duplicate payment.",
+        "questions": {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team should handle this request?",
+                "criteria": {"billing": "Payments and refunds", "support": "Technical support"},
+            },
+            "urgent": {"type": "noul", "instructions": "Does this require emergency assistance?"},
+        },
+    },
+    timeout=60,
+)
+response.raise_for_status()
+print(response.json()["answers"])
+```
+
+Every question requires nonempty string `instructions`. Choice criteria and score levels require nonempty string descriptions. Candidate order is preserved. A `noul` question uses Valen's trained true/false descriptions; omit its `criteria`. Nonempty `chat_template_kwargs` and tokenizer control tokens in input text are rejected. Prompts are never truncated: their expanded length must fit both `valen_max_length` and the server's prefill limits.
+
+For images, use the top-level `images` list with a text state, or pass a native message state:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        {"type": "text", "text": "Use this image to answer the questions."}
+      ]
+    }
+  ]
+}
+```
+
+Set this object as `state` alongside `model` and `questions`. Messages support `user`, `assistant`, and `system` roles. Images use the checkpoint's trained resize limits. Video and audio content blocks are currently unsupported and return an error. Responses contain candidate probabilities, the usual System One confidence fields, and zero output tokens; they omit `x_label_mass`.
+
+To compare native serving with the checkpoint's Transformers implementation on your GPU, run `test/manual/valen_reference.py` with `--model-path` pointing to a downloaded checkpoint and `--output-dir` pointing to a new results directory. It records token counts, probability differences, sequential latency, and concurrent throughput.
 
 ## Build decisions without `/v1/decisions`
 

@@ -548,6 +548,12 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        self.valen_head_config = None
+        if self.hf_config.architectures == ["ValenQwenForDecisionMaking"]:
+            self.valen_head_config = self.hf_config.valen_head
+            # Reuse Qwen3.5's native multimodal and hybrid-attention runtime.
+            self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+            self.hf_config.model_type = "qwen3_5"
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
@@ -562,7 +568,9 @@ class ModelConfig:
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
         self.joint_head_config = None
-        if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+        if self.valen_head_config is None and self.hf_config.architectures == [
+            "Qwen3_5ForConditionalGeneration"
+        ]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
@@ -788,6 +796,8 @@ class ModelConfig:
         )
         self.use_engram = bool(getattr(self.hf_config, "engram_layer_ids", ()))
         self._derive_multimodal_cuda_graph_support(enable_multimodal)
+        if self.valen_head_config is not None and dtype == "auto":
+            dtype = self.hf_config.valen_backbone_autocast_dtype or "float32"
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes

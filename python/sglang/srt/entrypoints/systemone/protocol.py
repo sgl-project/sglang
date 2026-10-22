@@ -28,8 +28,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 # The documented maximum. Options beyond 26 get two-letter labels, checked per request.
 MAX_CHOICE_OPTIONS = 255
-# Levels are labeled 0 to 9, so at most 10.
-MAX_SCORE_LEVELS = 10
+# Native decision heads score up to 255 levels; generative models validate a
+# smaller label budget in the serving handler.
+MAX_SCORE_LEVELS = 255
 
 
 class _Question(BaseModel):
