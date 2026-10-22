@@ -70,6 +70,8 @@ failing_models = {
     "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
     "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
     "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",  # GSM8K ~0.31 < 0.46 on every ROCm lane
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",  # GSM8K ~0.16 < 0.69 on every ROCm lane
 }
 
 
