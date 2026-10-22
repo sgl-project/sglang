@@ -654,7 +654,7 @@ class DataParallelController:
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
-                    self.context, zmq.PUSH, host=bind_host
+                    self.context, zmq.PUSH, host=bind_host, restrict_peers=True
                 )
                 worker_ports.append(worker_port)
                 self.workers[slot] = worker_socket

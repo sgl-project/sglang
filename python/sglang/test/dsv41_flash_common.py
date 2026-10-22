@@ -2,7 +2,13 @@
 
 Each server configuration lives in its own file under
 ``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
-configurations partition independently across GB300 runners.
+configurations partition independently across GB300 runners. All use default
+decoder bounded replay and explicitly enabled breakable prefill graphs.
+
+They run on two GB300 GPUs (TP2) with the engram tables in host memory
+(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE). The two engram tables are ~189 GiB in FP8
+(2 x ~384M rows x 264 B), so at TP2 offloading them frees ~94 GiB per GPU and the
+remaining weights (~143 GiB/GPU) leave room for KV cache, graphs and DSPARK.
 """
 
 import requests
@@ -18,7 +24,7 @@ from sglang.test.test_utils import (
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 # Tensor-parallel attention and expert-parallel MoE, without DP attention.
-TP4_EP4_ARGS = ["--attn-dp-size", "1", "--ep-size", "4"]
+TP2_EP2_ARGS = ["--attn-dp-size", "1", "--ep-size", "2"]
 
 
 class DSV41FlashAccuracyMixin(GSM8KMixin):
@@ -36,10 +42,20 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmmu_pro_load_preset_from_model_id = MODEL
 
     mem_fraction_static = "0.8"
-    max_running_requests = "64"
-    graph_args = []
+    max_running_requests = "32"
+    graph_args = [
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--cuda-graph-max-bs-prefill",
+        "8192",
+        "--cuda-graph-max-seq-len-prefill",
+        "16384",
+        "--chunked-prefill-size",
+        "8192",
+    ]
     parallel_args = []
-    server_env = {}
+    # Keep the engram tables in host memory so DSV4.1-Flash fits on two GB300s.
+    server_env = {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1"}
 
     @classmethod
     def setUpClass(cls):
@@ -52,7 +68,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "2",
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",

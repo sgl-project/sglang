@@ -1,7 +1,10 @@
-"""DEPRECATED: superseded by ``sglang.kernels.ops.quantization.per_token_group_quant`` (the
-default CUDA path). No sglang runtime code may call this kernel; it is kept
-only as the perf baseline for the per_token_group_quant benchmarks and its own
-bit-parity tests, and will be deleted once those move to torch references.
+"""JIT port of ``sgl_per_token_group_quant_8bit_v2``.
+
+``sglang.kernels.ops.quantization.per_token_group_quant`` is the default CUDA
+path. This kernel still serves the row-major UE8M0 layout stored as fp32
+power-of-two scales, which per_token_group_quant does not produce (see
+``fp8_kernel._run_per_token_group_quant_8bit_kernel``), and is the perf baseline
+for the per_token_group_quant benchmarks.
 """
 
 from __future__ import annotations

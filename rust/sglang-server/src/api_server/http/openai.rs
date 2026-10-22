@@ -16,6 +16,7 @@ mod template;
 mod template_builtins;
 mod template_legacy;
 mod template_loader;
+mod tokenize;
 mod tools;
 
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
@@ -35,6 +36,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(tokenize::routes())
 }
 
 /// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
