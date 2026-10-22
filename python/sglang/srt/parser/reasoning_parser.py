@@ -1124,8 +1124,7 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
 
 
 class _LlamaNemotronDetector(Nemotron3Detector):
-    """Thinking follows the system prompt, so enable_thinking never forces
-    reasoning; detection rests on the model opening <think> itself."""
+    """Thinking follows the system prompt, so enable_thinking never forces reasoning."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
