@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -308,6 +309,71 @@ def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional
         return json.load(f)
 
 
+# The values the Kev reference reads for head.pt fields that older checkpoints
+# did not write.
+_POINTER_HEAD_DEFAULTS = {
+    "base_revision": None,
+    "head_dim": 256,
+    "option_isolation": False,
+    "special_embeddings": False,
+    "weights_dtype": "fp32",
+    "temperature": 1.0,
+}
+
+
+@lru_cache
+def load_pointer_head(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """head.pt of a Kev checkpoint, whose pointer head answers /v1/systemone
+    decisions from the backbone's hidden states."""
+    path = cached_file(
+        model_path,
+        "head.pt",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if path is None:
+        return None
+    meta = {
+        **_POINTER_HEAD_DEFAULTS,
+        **torch.load(path, map_location="cpu", weights_only=True),
+    }
+    # Both change the prompt or the attention mask the head was trained with.
+    for name in ("option_isolation", "special_embeddings"):
+        if meta[name]:
+            raise ValueError(f"head.pt {name} is not supported")
+    return meta
+
+
+@lru_cache
+def load_pointer_adapter(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """head.pt of a Kev LoRA checkpoint with its merge scale. Such a checkpoint has
+    no model config and is served as the base backbone its head.pt pins, with the
+    adapter merged into the base weights at load."""
+    meta = load_pointer_head(model_path, revision)
+    if meta is None:
+        return None
+    path = cached_file(
+        model_path,
+        "adapter_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if path is None:
+        return None
+    # Kev applies an adapter trained on a BF16 backbone unmerged, which a merge
+    # into the base weights does not reproduce.
+    if meta["weights_dtype"] != "fp32":
+        raise ValueError(
+            f"{model_path} is a Kev adapter trained on a {meta['weights_dtype']} "
+            "backbone, which SGLang does not serve. Serve its full weight release."
+        )
+    with open(path) as f:
+        adapter = json.load(f)
+    return {**meta, "lora_scale": adapter["lora_alpha"] / adapter["r"]}
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
@@ -548,6 +614,13 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        self.pointer_head = None
+        base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
+        if base is not None:
+            # A Kev LoRA checkpoint, whose base weights load with its adapter merged.
+            self.pointer_head = load_pointer_adapter(self.model_path, revision)
+            self.model_path, self.revision = base
+            revision = self.revision
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
@@ -564,6 +637,11 @@ class ModelConfig:
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
+        if self.hf_config.architectures == ["Qwen3_5TextModel"]:
+            self.pointer_head = load_pointer_head(self.model_path, revision)
+            if self.pointer_head is not None:
+                # A Kev backbone without an LM head, served by the text-only class.
+                self.hf_config.architectures = ["Qwen3_5ForCausalLM"]
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )

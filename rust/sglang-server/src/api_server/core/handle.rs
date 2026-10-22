@@ -354,7 +354,7 @@ impl CoreHandle {
         })
     }
 
-    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
+    pub(super) async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),

@@ -41,7 +41,6 @@ from sglang.srt.entrypoints.openai.responses_adapters import encode_reasoning_st
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
-    _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -1714,16 +1713,6 @@ class ChatToolChoiceConversionTestCase(CustomTestCase):
             fn({"type": "function", "name": "get_weather"}),
             {"type": "function", "function": {"name": "get_weather"}},
         )
-
-
-class ShouldEmitNormalTextTestCase(CustomTestCase):
-    def test_whitespace_suppressed_only_while_a_tool_is_open(self):
-        emit = _should_emit_normal_text_as_message
-        self.assertFalse(emit("", any_tool_call_in_progress=False))
-        # whitespace between tool blocks is an inter-call separator, not content
-        self.assertFalse(emit("\n", any_tool_call_in_progress=True))
-        self.assertTrue(emit("\n", any_tool_call_in_progress=False))
-        self.assertTrue(emit("hello", any_tool_call_in_progress=True))
 
 
 class EnginePassthroughTestCase(CustomTestCase):
