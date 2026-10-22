@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
