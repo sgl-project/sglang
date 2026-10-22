@@ -25,11 +25,22 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_shuffle_weighted_sum_module(
     dtype: torch.dtype,
+    output_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     index_dtype: torch.dtype,
     topk: int,
     cast_weights_to_input_dtype: bool = False,
-) -> Module:
+) -> Module | None:
+    if (
+        dtype not in (torch.float16, torch.bfloat16)
+        or output_dtype != dtype
+        or weight_dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or index_dtype not in (torch.int32, torch.int64)
+        or is_hip_runtime()
+        or is_musa_runtime()
+        or is_sail_runtime()
+    ):
+        return None
     args = make_cpp_args(
         dtype, weight_dtype, index_dtype, topk, 128, cast_weights_to_input_dtype
     )
@@ -141,27 +152,24 @@ def shuffle_weighted_sum(
     if (
         inputs.is_cuda
         and inputs.dtype in (torch.float16, torch.bfloat16)
-        and output.dtype == inputs.dtype
-        and weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and permutation.dtype in (torch.int32, torch.int64)
         and inputs.ndim == output.ndim == weights.ndim == 2
         and output.numel() != 0
-        and not is_hip_runtime()
-        and not is_musa_runtime()
-        and not is_sail_runtime()
     ):
-        _jit_shuffle_weighted_sum_module(
+        module = _jit_shuffle_weighted_sum_module(
             inputs.dtype,
+            output.dtype,
             weights.dtype,
             permutation.dtype,
             weights.shape[1],
             cast_weights_to_input_dtype,
-        ).reduce(inputs, output, permutation, weights)
-    else:
-        _shuffle_weighted_sum_triton(
-            inputs,
-            output,
-            permutation,
-            weights,
-            cast_weights_to_input_dtype=cast_weights_to_input_dtype,
         )
+        if module is not None:
+            module.reduce(inputs, output, permutation, weights)
+            return
+    _shuffle_weighted_sum_triton(
+        inputs,
+        output,
+        permutation,
+        weights,
+        cast_weights_to_input_dtype=cast_weights_to_input_dtype,
+    )
