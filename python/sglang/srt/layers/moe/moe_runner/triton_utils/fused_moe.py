@@ -53,6 +53,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_fuse_clamp_activation_quant = get_bool_env_var("SGLANG_OPT_MOE_ACT_QUANT_FUSION")
 
 
 if _is_cuda:
@@ -698,7 +699,56 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    if not fuse_swiglu_interleaved:
+    fuse_clamp_activation_quant = (
+        _fuse_clamp_activation_quant
+        and _is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and use_fp8_w8a8
+        and block_shape is not None
+        and list(block_shape) == [128, 128]
+        and activation == "silu"
+        and is_gated
+        and swiglu_limit == 10
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and a2_scale is None
+        and not filter_expert
+        and not hooks
+        and not fuse_swiglu_interleaved
+        and E == 289
+        and N == 1024
+        and topk == 9
+        and num_tokens >= 1024
+    )
+    if fuse_clamp_activation_quant:
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
+
+        # Up-GEMM has already produced either route-major or TMA expert-sorted
+        # rows. Preserve that order; unused padding rows never reach combine.
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        a2_scale = torch.empty(
+            (total_tokens, N // 256), device=hidden_states.device, dtype=torch.float32
+        )
+        silu_and_mul_contig_post_quant(
+            intermediate_cache1.view(-1, N),
+            intermediate_cache2,
+            a2_scale,
+            128,
+            swiglu_limit=swiglu_limit,
+            round_to_bf16=True,
+            rows_per_cta=4,
+        )
+        logger.warning_once(
+            "GLM clamp activation + FP8 quant fusion enabled (TMA=%s).",
+            down_moe_use_tma,
+        )
+    elif not fuse_swiglu_interleaved:
         intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
             device=hidden_states.device,
@@ -716,8 +766,9 @@ def _fused_moe_kernel_sequence(
     )
 
     # Activation function with multiplication
-    if fuse_swiglu_interleaved:
-        # silu(gate) * up was already applied by the up-GEMM epilogue.
+    if fuse_swiglu_interleaved or fuse_clamp_activation_quant:
+        # Activation was applied by either the GEMM epilogue or the fused
+        # clamp/activation/quantization kernel above.
         pass
     elif activation == "silu_rounded" and is_gated:
         if _is_cuda:
