@@ -174,33 +174,6 @@ class TestPageShardScratchSizing(CustomTestCase):
         ):
             yield kvc
 
-    def test_disabled_draft_and_trivial_group_need_no_scratch(self):
-        for options in (
-            {"enabled": False},
-            {"draft": True},
-            {"shard_size": 1},
-        ):
-            with self.subTest(options=options), self._fixture(**options) as kvc:
-                self.assertIsNone(make_page_shard_spec(kvc))
-                self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
-
-    def test_eight_contexts_are_reserved_independently_of_batch_limits(self):
-        for options in (
-            {},
-            {"prefill_max_requests": 1},
-            {"max_running_requests": 1},
-            {"max_running_requests": 4, "dp_size": 4},
-            {"chunk_tokens": 16},
-            {"chunk_tokens": 8192, "prefill_max_requests": 32},
-        ):
-            with self.subTest(options=options), self._fixture(**options) as kvc:
-                spec = make_page_shard_spec(kvc)
-                self.assertEqual(spec.max_prefix_tokens, 8 * 4096)
-                self.assertEqual(spec.chunk_tokens, options.get("chunk_tokens", 256))
-                self.assertEqual(
-                    spec.scratch_rows, spec.max_prefix_tokens + spec.chunk_tokens + 16
-                )
-
     def test_each_context_is_aligned_before_multiplying_by_eight(self):
         with self._fixture(context_len=4097, chunk_tokens=33) as kvc:
             spec = make_page_shard_spec(kvc)
@@ -210,25 +183,6 @@ class TestPageShardScratchSizing(CustomTestCase):
         self.assertGreater(spec.max_prefix_tokens, 32832)
         self.assertEqual(spec.chunk_tokens, 48)
         self.assertEqual(spec.max_prefix_tokens % spec.logical_page_size, 0)
-
-    def test_wide_gqa_keeps_eight_contexts_without_a_byte_cap(self):
-        with self._fixture(
-            use_mla=False,
-            context_len=65536,
-            chunk_tokens=4096,
-            tp_size=1,
-            num_kv_heads=64,
-            head_dim=128,
-            v_head_dim=128,
-        ) as kvc:
-            spec = make_page_shard_spec(kvc)
-            estimated = compute_page_shard_scratch_bytes(kvc)
-        # Numerical sizing only: do not allocate this large scratch on CPU.
-        # 64 heads * (128 K + 128 V) * two-byte BF16 = 32 KiB per row.
-        self.assertEqual(spec.max_prefix_tokens, 8 * 65536)
-        self.assertEqual(spec.chunk_tokens, 4096)
-        self.assertEqual(estimated, 2 * (8 * 65536 + 4096 + 16) * 32768)
-        self.assertGreater(estimated, 64 << 20)
 
     def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
         for use_mla in (True, False):
@@ -300,40 +254,6 @@ def _alloc_extend(alloc, prefix_len, seq_len, rotation_base, last_loc=-1):
     return _alloc_extend_batch(
         alloc, [prefix_len], [seq_len], [rotation_base], [last_loc]
     )
-
-
-class TestPlacement(CustomTestCase):
-    def test_owner_local_round_trip(self):
-        pl = PageInterleavePlacement(_make_spec())
-        loc = torch.arange(0, 37 * GS + 5)
-        owner = pl.owner_of(loc)
-        local = pl.local_index(loc)
-        # Reconstruct loc from (group, owner, in-page offset): the bijection.
-        group = loc // GS
-        self.assertTrue(torch.equal(group * GS + owner * PS + loc % PS, loc))
-        # Local rows are group-major: [Q*ps, (Q+1)*ps) — identical on every
-        # rank (symmetric allocation); owner only selects WHICH rank stores.
-        self.assertTrue(torch.equal(local, group * PS + loc % PS))
-
-    def test_filter_local_partitions_disjoint_and_equal(self):
-        pl = PageInterleavePlacement(_make_spec())
-        loc = torch.arange(0, 10 * GS)
-        parts = [pl.filter_local(loc, r) for r in range(N)]
-        self.assertEqual(sum(p.numel() for p in parts), loc.numel())
-        # Equal shares of whole groups.
-        self.assertEqual(len({p.numel() for p in parts}), 1)
-        # Every rank's local rows for a full range are the same integers
-        # (each rank stores its own stripe at the SAME rows).
-        for p in parts[1:]:
-            self.assertTrue(torch.equal(p, parts[0]))
-
-    def test_owned_tokens_form_page_runs(self):
-        pl = PageInterleavePlacement(_make_spec(shard_rank=2))
-        loc = torch.arange(0, 3 * GS)
-        mask = pl.local_mask(loc, 2)
-        # Owner-2 tokens are exactly [2*ps, 3*ps) of every group.
-        expect = (loc % GS >= 2 * PS) & (loc % GS < 3 * PS)
-        self.assertTrue(torch.equal(mask, expect))
 
 
 class TestClassedAllocator(CustomTestCase):

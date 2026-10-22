@@ -192,8 +192,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                         "SGLANG_DISAGG_STAGING_POOL_SIZE_MB"
                     )
             unsupported = []
-            if attn_dp_enabled_of(view):
-                unsupported.append(f"attention DP (--attn-dp-size {view.attn_dp_size})")
             if view.ep_size > 1:
                 unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
             if view.moe_a2a_backend != "none":
@@ -202,8 +200,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
             if view.pp_size > 1:
                 unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
-            if view.dp_size > 1:
-                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if (
+                attn_dp_enabled_of(view)
+                and view.enable_dp_attention_local_control_broadcast
+            ):
+                unsupported.append("DP attention local control broadcast")
             if view.dcp_size > 1:
                 unsupported.append(
                     f"decode context parallelism (--dcp-size {view.dcp_size})"

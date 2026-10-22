@@ -19,8 +19,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import errno
 import logging
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -64,6 +66,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
@@ -2562,6 +2565,115 @@ def _wait_weights_ready():
     )
 
 
+class _ReusePortMultiprocess(Multiprocess):
+    """Give each uvicorn worker a private SO_REUSEPORT listener.
+
+    uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
+    fresh listener is handed out on every read and the parent's copy is closed
+    once the child holds it; the lifecycle (health checks, restarts, SIGTTIN)
+    stays uvicorn's own. Requires uvicorn >= 0.51, whose Process builds its
+    own Server.
+    """
+
+    def __init__(self, config: uvicorn.Config):
+        self._handed_out: List[socket.socket] = []
+        self._reserved_socket: Optional[socket.socket] = _reserve_reuseport_socket(
+            config
+        )
+        self._socket_family = self._reserved_socket.family
+        self._socket_address = self._reserved_socket.getsockname()
+        super().__init__(config, sockets=[])
+
+    @property
+    def sockets(self) -> List[socket.socket]:
+        self._close_handed_out()
+        sock = self._reserved_socket
+        self._reserved_socket = None
+        if sock is None:
+            sock = _bind_reuseport_socket(
+                self.config, self._socket_family, self._socket_address
+            )
+        self._handed_out.append(sock)
+        return [sock]
+
+    @sockets.setter
+    def sockets(self, value: List[socket.socket]) -> None:
+        if value:
+            raise ValueError("_ReusePortMultiprocess binds its own listeners")
+
+    def _close_handed_out(self) -> None:
+        # Each spawn site starts its Process before the next read, so every
+        # listener handed out so far is already held by its child.
+        for sock in self._handed_out:
+            sock.close()
+        self._handed_out.clear()
+
+    def init_processes(self) -> None:
+        try:
+            super().init_processes()
+        except BaseException:
+            self.terminate_all()
+            self.join_all()
+            raise
+        finally:
+            self._close_handed_out()
+
+    def restart_all(self) -> None:
+        try:
+            super().restart_all()
+        finally:
+            self._close_handed_out()
+
+    def keep_subprocess_alive(self) -> None:
+        try:
+            super().keep_subprocess_alive()
+        finally:
+            self._close_handed_out()
+
+    def handle_ttin(self) -> None:
+        try:
+            super().handle_ttin()
+        finally:
+            self._close_handed_out()
+
+
+def _bind_reuseport_socket(config: uvicorn.Config, family, address) -> socket.socket:
+    sock = socket.socket(family=family)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind(address)
+    sock.listen(config.backlog)
+    sock.set_inheritable(True)
+    return sock
+
+
+def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
+    try:
+        family = socket.AF_INET6 if ":" in config.host else socket.AF_INET
+        address = socket.getaddrinfo(config.host, config.port, family)[0][4]
+        if config.port == 0:
+            sock = _bind_reuseport_socket(config, family, address)
+            config.port = sock.getsockname()[1]
+            return sock
+        name = f"\0sglang-reuseport-{os.geteuid()}-{config.port}"
+        with socket.socket(socket.AF_UNIX) as reservation:
+            while True:
+                try:
+                    reservation.bind(name)
+                    break
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    time.sleep(0.01)
+            with socket.socket(family=family) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(address)
+            return _bind_reuseport_socket(config, family, address)
+    except OSError as error:
+        logger.error(error)
+        raise SystemExit(1) from error
+
+
 def _run_granian_server(
     host,
     port,
@@ -2858,22 +2970,32 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
-                    envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
-                    host=get_serving().host,
-                    port=get_serving().port,
-                    root_path=get_serving().fastapi_root_path,
-                    log_level=get_observability().log_level_http
+                app_path = envs.SGLANG_HTTP_SERVER_APP_PATH.get()
+                uvicorn_options = {
+                    "host": get_serving().host,
+                    "port": get_serving().port,
+                    "root_path": get_serving().fastapi_root_path,
+                    "log_level": get_observability().log_level_http
                     or get_observability().log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
-                    loop="uvloop",
-                    workers=get_serving().tokenizer_worker_num,
-                    ssl_keyfile=get_serving().ssl_keyfile,
-                    ssl_certfile=get_serving().ssl_certfile,
-                    ssl_ca_certs=get_serving().ssl_ca_certs,
-                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
-                )
+                    "timeout_keep_alive": envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    "timeout_worker_healthcheck": envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                    "loop": "uvloop",
+                    "workers": get_serving().tokenizer_worker_num,
+                    "ssl_keyfile": get_serving().ssl_keyfile,
+                    "ssl_certfile": get_serving().ssl_certfile,
+                    "ssl_ca_certs": get_serving().ssl_ca_certs,
+                    "ssl_keyfile_password": get_serving().ssl_keyfile_password,
+                }
+                if get_serving().enable_http_worker_reuseport:
+                    config = uvicorn.Config(app_path, **uvicorn_options)
+                    supervisor = _ReusePortMultiprocess(config)
+                    logger.info(
+                        f"Uvicorn running on {config.host}:{config.port} "
+                        f"with {config.workers} SO_REUSEPORT workers"
+                    )
+                    supervisor.run()
+                else:
+                    uvicorn.run(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
