@@ -161,6 +161,7 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
