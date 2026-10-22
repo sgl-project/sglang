@@ -376,7 +376,35 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 enable_es=(mxfp8, mxfp8),
             )
 
-        reference = run(inputs.nan_to_num(), ids.clamp_min(0), weights.nan_to_num())
+        from sgl_kernel import prepare_moe_input as legacy_prepare_moe_input
+
+        valid_inputs = inputs.nan_to_num()
+        valid_ids = ids.clamp_min(0)
+        valid_weights = torch.full_like(weights, 1 / ids.size(1))
+        # Both producers define every map entry when all routes are valid.
+        # Keep the same native entry and GEMM arguments so only map production
+        # changes; compare raw output bits rather than a numerical tolerance.
+        with patch.object(
+            cutlass_moe, "cutlass_prepare_moe_input", legacy_prepare_moe_input
+        ):
+            legacy_valid = run(valid_inputs, valid_ids, valid_weights)
+            legacy_repeat = run(valid_inputs, valid_ids, valid_weights)
+        torch.testing.assert_close(
+            legacy_valid.view(torch.int16),
+            legacy_repeat.view(torch.int16),
+            rtol=0,
+            atol=0,
+            msg="Legacy native provider is nondeterministic; exact producer parity is unresolved",
+        )
+        actual_valid = run(valid_inputs, valid_ids, valid_weights)
+        torch.testing.assert_close(
+            actual_valid.view(torch.int16),
+            legacy_valid.view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
+
+        reference = run(valid_inputs, valid_ids, weights.nan_to_num())
         prepare = cutlass_moe.cutlass_prepare_moe_input
 
         def checked_prepare(*args):
