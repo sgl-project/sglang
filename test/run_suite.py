@@ -92,6 +92,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-unit-1-gpu-h100",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
+        "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
@@ -132,14 +133,9 @@ PER_COMMIT_SUITES = {
         # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
         "stage-b-e2e-mps",
     ],
-    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
-    # the runner preflight until the PPU SRT platform and AOT kernels land.
-    # Declaring a name here before a workflow dispatches it would let a test
-    # register, validate, and count as covered while never running, so each PPU
-    # suite name arrives with the job that runs it. Until then PPU is in
-    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
-    # rejects any register_ppu_ci() outright.
-    HWBackend.PPU: [],
+    HWBackend.PPU: [
+        "stage-a-test-1-gpu-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
