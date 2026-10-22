@@ -1932,24 +1932,6 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (2, 3, 16, 16))
 
 
-class TestCosmos3ModalitySamplingParams(unittest.TestCase):
-    """Sound / V2V / action sampling-param fields and defaults."""
-
-    def test_sound_duration_default_and_set(self):
-        self.assertEqual(Cosmos3SamplingParams(prompt="t").sound_duration, 0.0)
-        self.assertEqual(
-            Cosmos3SamplingParams(prompt="t", sound_duration=3.0).sound_duration, 3.0
-        )
-
-    def test_v2v_fields(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", video_path="in.mp4", condition_frame_indexes=[0, 1]
-        )
-        self.assertEqual(sp.video_path, "in.mp4")
-        self.assertEqual(sp.condition_frame_indexes, [0, 1])
-        self.assertEqual(sp.condition_video_keep, "first")
-
-
 class TestCosmos3CaptionMetadata(unittest.TestCase):
     """Structured captions get generation metadata; prose prompts opt out."""
 

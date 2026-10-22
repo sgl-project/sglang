@@ -94,6 +94,7 @@ class Flux3ImageSamplingParams(SamplingParams):
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
     ) -> None:
+        self._explicit_fields = {"width", "height"}
         # Warmup copies the request's steps as the full-workload target before
         # any adjustment; ``None`` (server default) has to be resolved here.
         for key in (

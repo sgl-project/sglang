@@ -50,10 +50,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    pub(super) request: CreateChatCompletionRequest,
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -1254,6 +1254,7 @@ mod tests {
                     .unwrap();
             let state = Arc::new(super::super::AppState {
                 core,
+                generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
             });
