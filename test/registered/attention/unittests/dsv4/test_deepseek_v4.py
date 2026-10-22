@@ -550,6 +550,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     forward_mode=ForwardMode.EXTEND,
                     _original_forward_mode=None,
                     tbo_parent_token_range=None,
+                    mixed_num_prefill_tokens=None,
                     positions=torch.zeros(num_qo_tokens + (4 if padded else 0)),
                 )
                 backend = self._make_prefill_backend()
@@ -582,7 +583,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, mixed_num_prefill_tokens=None
+        )
         backend = self._make_prefill_backend(hisparse_coordinator=object())
 
         shared_read_ends = backend.resolve_prefill_shared_read_ends(batch)

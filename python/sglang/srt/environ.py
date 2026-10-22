@@ -742,6 +742,11 @@ class Envs:
     # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
     # copy kernel, so as not to disturb persistent kernels.
     SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
+    # --enable-mixed-chunk + speculative decoding: running requests draft and verify
+    # inside the prefill step's target forward (verify-merged mixed step) instead of
+    # a 1-token decode. DSPARK only, without DP attention or PP; unsupported setups
+    # warn and fall back (see verify_merged_mixed_enabled).
+    SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
