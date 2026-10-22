@@ -29,7 +29,9 @@ from sglang.srt.layers.dcp.layout import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
+    dcp_local_prefix_rows,
     dcp_owned_prefix_positions,
+    localize_dcp_indices,
     plan_dcp_extend_gather,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -183,6 +185,59 @@ class TestDcpOwnedPrefixPositions(CustomTestCase):
                             expected,
                             (prefix_lens, dcp_size, interleave, rank),
                         )
+
+
+class TestDcpLocalPrefixRows(CustomTestCase):
+    """The planner's read of this rank's prefix rows must land on the rows the
+    pool's write put them in (``localize_dcp_indices``). Selection is by
+    position and mapping by slot, so an off-by-one reads real KV of the wrong
+    position: right shapes, fluent output that stops following the prompt.
+
+    Each rank's pool is written through the write mapping, slots come from
+    widened allocator pages handed out in shuffled order, and every row read
+    must carry the tag of the position it was planned for."""
+
+    def test_every_rank_reads_back_what_the_write_stored(self):
+        g = torch.Generator().manual_seed(0)
+        for prefix_lens, _ in CASES:
+            for dcp_size in DCP_SIZES:
+                for interleave in INTERLEAVES:
+                    page = dcp_size * interleave
+                    pages = [-(-p // page) for p in prefix_lens]
+                    order = torch.randperm(sum(pages), generator=g)
+                    slots, used = [], 0
+                    for prefix_len, n in zip(prefix_lens, pages):
+                        pos = torch.arange(prefix_len)
+                        table = order[used : used + n]
+                        slots.append(table[pos // page] * page + pos % page)
+                        used += n
+                    slots = torch.cat(slots)
+                    # Tag = offset into the concatenated prefixes, + 1 so a row
+                    # that was never written (NaN) or a zero cannot pass.
+                    tags = torch.arange(1, slots.numel() + 1, dtype=torch.float64)
+                    for rank in range(dcp_size):
+                        with self.subTest(
+                            prefix_lens=prefix_lens,
+                            dcp_size=dcp_size,
+                            interleave=interleave,
+                            rank=rank,
+                        ):
+                            pool = torch.full(
+                                (sum(pages) * interleave,),
+                                float("nan"),
+                                dtype=torch.float64,
+                            )
+                            loc = localize_dcp_indices(
+                                slots, dcp_size, rank, interleave
+                            )
+                            pool[loc[loc >= 0]] = tags[loc >= 0]
+                            rows = dcp_local_prefix_rows(
+                                slots, prefix_lens, dcp_size, rank, interleave
+                            )
+                            owned = dcp_owned_prefix_positions(
+                                prefix_lens, dcp_size, rank, interleave
+                            )
+                            self.assertTrue(torch.equal(pool[rows], tags[owned]))
 
 
 class TestDcpExtendGathersKv(CustomTestCase):

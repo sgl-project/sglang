@@ -25,8 +25,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     update_kv_lens_and_indices,
 )
 from sglang.srt.layers.dcp.layout import (
-    dcp_local_row,
-    dcp_owned_prefix_positions,
+    dcp_local_prefix_rows,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -119,12 +118,12 @@ def prepare_decode_context_parallel_metadata(
         # NPU pools shard in page_size runs (the translator's rank-local write),
         # not round-robin, so this rank's prefix rows are not the stride below.
         # A rank-local NPU pool is never a translating one: rows are physical.
-        interleave = get_attn_backend().page_size
-        owned = dcp_owned_prefix_positions(
-            extend_prefix_lens_cpu, parallel.dcp_size, parallel.dcp_rank, interleave
-        ).to(dcp_prefix_kv_indices.device)
-        dcp_local_prefix_kv_indices = dcp_local_row(
-            dcp_prefix_kv_indices[owned], parallel.dcp_size, interleave
+        dcp_local_prefix_kv_indices = dcp_local_prefix_rows(
+            dcp_prefix_kv_indices,
+            extend_prefix_lens_cpu,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            get_attn_backend().page_size,
         )
         # NPU gathers into its own reused buffers and never reads this one,
         # which is context-sized: 1.15 GB per extend forward at a 1M prefix.

@@ -3629,8 +3629,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         create_chunked_prefix_cache_kv_indices_fn,
     ):
         if _is_npu:
-            # NPU keeps the query-gather extend (#37787) unless the DSA
-            # KV-gather path claims this batch; the NPU module owns that call.
+            # NPU decode and short-tail extends gather the query (#37787) and
+            # read rank-local metadata off the attention backend. A DSA extend
+            # whose prefix is cheaper to move than its queries gathers the KV
+            # instead, which needs this; its presence is what selects that path.
+            # The gathered-KV operator path is bf16/fp16 only; any other KV
+            # dtype keeps the query gather rather than raising there.
+            if not self.use_dsa or kv_cache_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                return None
+            prefix_sum = sum(int(p) for p in extend_prefix_lens_cpu)
             parallel = get_parallel()
             if not dcp_extend_kv_gather_wants_metadata(
                 use_dsa=self.use_dsa,
