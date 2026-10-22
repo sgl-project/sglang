@@ -11,8 +11,20 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_moe_align_module(dtype: torch.dtype, pad_expert_ids: bool) -> Module:
-    args = make_cpp_args(dtype, pad_expert_ids)
+def _jit_moe_align_module(
+    dtype: torch.dtype,
+    write_inactive_prefix_count: bool = False,
+    map_invalid_experts_to_sentinel: bool = False,
+    pad_expert_ids: bool = False,
+) -> Module:
+    if map_invalid_experts_to_sentinel and dtype not in (torch.int32, torch.int64):
+        raise ValueError("Checked alignment requires int32 or int64 expert IDs")
+    args = make_cpp_args(
+        dtype,
+        write_inactive_prefix_count,
+        map_invalid_experts_to_sentinel,
+        pad_expert_ids,
+    )
     return load_jit(
         "moe_align_block_size",
         *args,
@@ -33,10 +45,23 @@ def moe_align_block_size(
     cumsum_buffer: torch.Tensor,
     pad_sorted_token_ids: bool = False,
     *,
+    write_inactive_prefix_count: bool = False,
+    map_invalid_experts_to_sentinel: bool = False,
     pad_expert_ids: bool = False,
 ) -> None:
-    """Align routes; optionally define unused expert-map capacity as -1."""
-    module = _jit_moe_align_module(topk_ids.dtype, pad_expert_ids)
+    """Align +1-offset buckets, optionally publishing a padded-token/block pair.
+
+    ``write_inactive_prefix_count`` requires an aligned int32[2] count output.
+    ``pad_expert_ids`` fills unused expert-map capacity with -1.
+    IDs must be in ``[-1, num_experts - 2]`` unless
+    ``map_invalid_experts_to_sentinel`` maps other signed IDs into bucket zero.
+    """
+    module = _jit_moe_align_module(
+        topk_ids.dtype,
+        write_inactive_prefix_count,
+        map_invalid_experts_to_sentinel,
+        pad_expert_ids,
+    )
     module.moe_align_block_size(
         topk_ids,
         num_experts,

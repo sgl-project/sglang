@@ -307,6 +307,9 @@ def _align_block_size_jit(
     block_size: int,
     num_experts: int,
     scratch=None,
+    *,
+    return_inactive_prefix_count: bool = False,
+    map_invalid_experts_to_sentinel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
 
@@ -316,6 +319,8 @@ def _align_block_size_jit(
 
     ``scratch(numel)`` returns the int32 scratch buffer (default: a fresh
     allocation); a caller under CUDA graphs passes a persistent buffer.
+    IDs must be certified in [-1, num_experts) unless
+    ``map_invalid_experts_to_sentinel`` maps other signed IDs to bucket zero.
     """
     assert num_experts <= 8191, (
         f"_align_block_size_jit supports at most 8191 experts "
@@ -324,13 +329,21 @@ def _align_block_size_jit(
 
     device = topk_ids.device
     flat_topk_ids = topk_ids.reshape(-1)
-    if flat_topk_ids.dtype == torch.int64:
+    if not map_invalid_experts_to_sentinel and flat_topk_ids.dtype == torch.int64:
         flat_topk_ids = flat_topk_ids.to(torch.int32)
     num_total_tokens = flat_topk_ids.numel()
 
     if num_total_tokens == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
-        return empty, empty, torch.zeros(1, dtype=torch.int32, device=device)
+        return (
+            empty,
+            empty,
+            torch.zeros(
+                2 if return_inactive_prefix_count else 1,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
 
     # JIT kernel uses +1 offset convention: -1 -> bucket 0 (sentinel),
     # expert i -> bucket i+1. So pass num_experts + 1 as the bucket count.
@@ -370,7 +383,9 @@ def _align_block_size_jit(
     off += max_num_tokens_padded
     expert_ids = buf[off : off + max_num_m_blocks]
     off += max_num_m_blocks_padded
-    num_tokens_post_padded = buf[off : off + 1]
+    # The already padded count segment has room for the optional pair:
+    # [total padded tokens, leading negative-expert blocks].
+    num_tokens_post_padded = buf[off : off + (2 if return_inactive_prefix_count else 1)]
     off += num_post_pad_size
     cumsum_buffer = buf[off : off + jit_num_experts + 1]
 
@@ -383,6 +398,8 @@ def _align_block_size_jit(
         num_tokens_post_padded,
         cumsum_buffer,
         True,  # pad_sorted_token_ids
+        write_inactive_prefix_count=return_inactive_prefix_count,
+        map_invalid_experts_to_sentinel=map_invalid_experts_to_sentinel,
     )
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded
