@@ -475,7 +475,8 @@ class AiterAttnBackend(AttentionBackend):
         # FMHA serves it directly.
         self.use_mla_flydsl_fp8_prefill = False
         self.require_mla_flydsl_fp8_prefill = (
-            self.use_mla and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED.get()
+            self.use_mla
+            and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED.get()
         )
         self.use_mla_flydsl_fused_kv_proj = (
             self.use_mla and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get()
