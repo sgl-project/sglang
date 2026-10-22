@@ -1012,6 +1012,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             io_results = [0 if state == 1 else -1 for state in exist_result]
             missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
             if missing_idx:
+                start_time = time.perf_counter()
                 put_results = self._put_batch_zero_copy_impl(
                     [all_key_strs[i] for i in missing_idx],
                     [all_ptrs[i] for i in missing_idx],
@@ -1020,12 +1021,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         all_group_ids if all_group_ids else None, missing_idx
                     ),
                 )
+                end_time = time.perf_counter()
+                if self.enable_storage_metrics:
+                    self._record_v2_io_metrics(
+                        num_pages=self._count_v2_missing_pages(prepared, missing_idx),
+                        num_bytes=self._sum_v2_io_bytes(
+                            [all_sizes[i] for i in missing_idx]
+                        ),
+                        elapsed=end_time - start_time,
+                        is_set=True,
+                    )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
         else:
+            start_time = time.perf_counter()
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes
             )
+            end_time = time.perf_counter()
+            if self.enable_storage_metrics:
+                self._record_v2_io_metrics(
+                    num_pages=sum(
+                        (end - start) // key_multiplier
+                        for _, key_multiplier, start, end in prepared
+                    ),
+                    num_bytes=self._sum_v2_io_bytes(all_sizes),
+                    elapsed=end_time - start_time,
+                    is_set=False,
+                )
 
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
@@ -1035,6 +1058,43 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier=key_multiplier,
             )
         return results
+
+    @staticmethod
+    def _sum_v2_io_bytes(sizes: List[Any]) -> int:
+        # Entries are either per-object byte counts or, after multi-buffer
+        # packing, per-object lists of element sizes; set-path placeholders
+        # for already-existing objects are scalar zeros.
+        total = 0
+        for size in sizes:
+            if isinstance(size, Sequence):
+                total += sum(size)
+            else:
+                total += size
+        return total
+
+    @staticmethod
+    def _count_v2_missing_pages(prepared, missing_idx) -> int:
+        # A page counts as written iff any of its component objects was put;
+        # all components of a missing page are put together.
+        missing = set(missing_idx)
+        return sum(
+            sum(1 for i in range(start, end) if i in missing) // key_multiplier
+            for _, key_multiplier, start, end in prepared
+        )
+
+    def _record_v2_io_metrics(
+        self, num_pages: int, num_bytes: int, elapsed: float, is_set: bool
+    ):
+        # Same units as the v1 path: pages per batch and GB/s of bytes moved.
+        if elapsed <= 0 or num_bytes <= 0:
+            return
+        bandwidth_gbps = num_bytes / elapsed / (1 << 30)
+        if is_set:
+            self.backup_pgs.append(num_pages)
+            self.backup_bandwidth.append(bandwidth_gbps)
+        else:
+            self.prefetch_pgs.append(num_pages)
+            self.prefetch_bandwidth.append(bandwidth_gbps)
 
     def _build_pool_buffer_meta(
         self,
