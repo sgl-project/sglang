@@ -237,7 +237,9 @@ class BailingMoE(nn.Module):
         self.tp_size = get_parallel().tp_size
 
         self.top_k = config.num_experts_per_tok
-        self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
+        # The reference modeling always renormalizes the top-k weights, and the
+        # Ling-2.5/2.6 configs carry no norm_topk_prob key.
+        self.norm_expert_prob = getattr(config, "norm_topk_prob", True)
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.num_shared_experts = getattr(config, "num_shared_experts", 0)
