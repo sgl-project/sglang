@@ -233,6 +233,22 @@ def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     return spec in ("inkling", "kimi_k3", "dsv41")
 
 
+def spec_prompt_reads_default_thinking_env(spec: Optional[str]) -> bool:
+    """Whether the encoder for ``spec`` builds the prompt's thinking mode from
+    the request's ``thinking`` chat-template kwarg, falling back to
+    SGLANG_DEFAULT_THINKING when the kwarg is absent.
+
+    Only the DeepSeek native encoders do this (see
+    ``serving_chat._apply_jinja_template``). The response-parsing side must
+    resolve the same default for these specs, or the prompt and the reasoning
+    parser disagree about whether a thinking block is being generated: with
+    SGLANG_DEFAULT_THINKING=1 and no request-level toggle, the prompt opens a
+    thinking block while the parser runs with force_reasoning=False and the
+    chain-of-thought leaks into ``content``.
+    """
+    return spec in ("dsv4", "dsv41", "dsv32")
+
+
 def encode_simple_chat(
     *,
     tokenizer: Any,

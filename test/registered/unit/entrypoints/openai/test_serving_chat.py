@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -1252,6 +1253,68 @@ class ServingChatTestCase(CustomTestCase):
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertFalse(kwargs["thinking"])
+
+    def test_dsv41_reasoning_mirrors_default_thinking_env(self):
+        # With SGLANG_DEFAULT_THINKING=1 and no request-level toggle, the
+        # dsv41 encoder opens a thinking block in the prompt; the reasoning
+        # parser must be forced too, or the chain-of-thought leaks into
+        # `content` (prompt side and parse side disagreeing about the default
+        # thinking state).
+        self.chat.chat_encoding_spec = "dsv41"
+        self.chat.reasoning_parser = "deepseek-v41"
+
+        plain = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        explicit_on = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        explicit_off = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False},
+        )
+
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertTrue(self.chat._get_reasoning_from_request(plain))
+            # An explicit request toggle wins over the env default.
+            self.assertTrue(self.chat._get_reasoning_from_request(explicit_on))
+            self.assertFalse(self.chat._get_reasoning_from_request(explicit_off))
+
+        with envs.SGLANG_DEFAULT_THINKING.override(False):
+            self.assertFalse(self.chat._get_reasoning_from_request(plain))
+            self.assertTrue(self.chat._get_reasoning_from_request(explicit_on))
+            self.assertFalse(self.chat._get_reasoning_from_request(explicit_off))
+
+        # Env unset: the default is off, matching the CHAT-mode prompt.
+        envs.SGLANG_DEFAULT_THINKING.clear()
+        self.assertFalse(self.chat._get_reasoning_from_request(plain))
+
+    def test_jinja_explicit_reasoning_ignores_default_thinking_env(self):
+        # Jinja-template prompts never apply SGLANG_DEFAULT_THINKING (only
+        # the template's own default does), so the read side must keep
+        # ignoring the env for explicit-thinking parsers on that path.
+        self.chat.chat_encoding_spec = None
+        self.chat.reasoning_parser = "deepseek-v3"
+        self.chat._reasoning_detector = ReasoningParser(
+            model_type="deepseek-v3"
+        ).detector
+
+        plain = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertFalse(self.chat._get_reasoning_from_request(plain))
+
+        explicit_on = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(explicit_on))
 
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
