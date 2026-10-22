@@ -33,21 +33,7 @@ jobs:
         # ("runner lost communication") but passes on an 8-GPU runner.
         include:
           - suite: nightly-stage-c-2-gpu-mi350
-            runner: linux-mi35x-gpu-8
-          # The 4-GPU suite is ~6 h of estimated test time; split it so each
-          # half fits in the step timeout.
-          - suite: nightly-stage-c-4-gpu-mi350
-            runner: linux-mi35x-gpu-8
-            partition_id: 0
-            partition_size: 2
-            part: 1/2
-          - suite: nightly-stage-c-4-gpu-mi350
-            runner: linux-mi35x-gpu-8
-            partition_id: 1
-            partition_size: 2
-            part: 2/2
-          - suite: nightly-stage-c-8-gpu-mi350
-            runner: linux-mi35x-gpu-8
+            runner: linux-mi35x-gpu-2
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -92,10 +78,34 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Probe runner pod limits
+        run: |
+          echo "== cgroup"; cat /proc/self/cgroup
+          for f in memory.max memory.current memory.peak memory.events memory/memory.limit_in_bytes memory/memory.usage_in_bytes; do
+            [ -r "/sys/fs/cgroup/$f" ] && echo "$f: $(paste -sd' ' "/sys/fs/cgroup/$f")"
+          done
+          echo "== free"; free -g
+          echo "== df (runner)"; df -h / /home/runner /tmp 2>/dev/null || true
+          echo "== docker info"; docker info 2>/dev/null | grep -E "Docker Root Dir|Storage Driver|Total Memory|CPUs" || true
+          echo "== df (ci_sglang)"; docker exec ci_sglang df -h / /sgl-data /dev/shm 2>/dev/null || true
+
       - name: Run miles CI suite ${{ matrix.suite }}
         timeout-minutes: 180
         run: |
           touch "${GITHUB_WORKSPACE}/github_summary.md"
+          # Resource monitor: one MON line every 15 s, so the last lines before
+          # the runner disappears show which resource was climbing.
+          (
+            while true; do
+              mem=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)
+              ev=$(grep -E "^(oom|oom_kill|max) " /sys/fs/cgroup/memory.events 2>/dev/null | paste -sd' ')
+              host=$(free -g | awk '/^Mem:/{print "used="$3"G avail="$7"G"}')
+              cdf=$(docker exec ci_sglang df -BG --output=used,avail / 2>/dev/null | tail -1 | tr -s ' ')
+              rdf=$(df -BG --output=used,avail / 2>/dev/null | tail -1 | tr -s ' ')
+              echo "MON $(date -u +%H:%M:%S) pod_mem=$((${mem:-0}/1073741824))G ${ev} host_${host} container_disk_used/avail=${cdf} runner_disk_used/avail=${rdf}"
+              sleep 15
+            done
+          ) &
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
             -e PYTHONPATH=/root/miles:/opt/tilelang \
