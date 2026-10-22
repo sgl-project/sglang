@@ -146,7 +146,7 @@ class DenseBlocksBackend:
 
     def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
         selected, blocks = _publish_prefill_blocks(
@@ -167,7 +167,7 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
         assert published is not None
@@ -189,6 +189,7 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
                 picked.append(
@@ -224,6 +225,7 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
                 idx = topk_among_blocks(

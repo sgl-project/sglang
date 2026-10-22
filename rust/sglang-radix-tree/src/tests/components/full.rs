@@ -496,13 +496,13 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
     // asynchronously under write_back; matching can split it before the ack.
     let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
     let published_a = match action {
-        Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
             new_child_node_id,
         }) => {
-            assert_eq!((ack_id, old_node_id, new_child_node_id), (Some(a), a, a));
+            assert_eq!((ack_id, old_node_id, new_child_node_id), (a, a, a));
             assert_eq!(new_node_id, tc.arena.node(prefix_idx).id);
             vec![new_node_id, new_child_node_id]
         }
@@ -2499,7 +2499,6 @@ fn evict_device_pushes_value_and_decrements_size() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 3);
@@ -2533,7 +2532,6 @@ fn evict_device_on_valueless_node_is_noop() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 0);
@@ -2569,7 +2567,6 @@ fn evict_device_pushes_a_present_but_empty_value() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 0);
@@ -2601,7 +2598,6 @@ fn evict_host_pushes_host_value_and_tombstones() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed, 0);
@@ -2637,7 +2633,6 @@ fn evict_host_on_node_without_host_value_is_noop() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed, 0);
@@ -2672,7 +2667,6 @@ fn evict_host_pushes_a_present_but_empty_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(host_freed, 0);
@@ -2713,7 +2707,6 @@ fn evict_host_accumulates_into_shared_host_frees() {
         a,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Host,
     );
     let freed_b = FullComponent.evict_component(
@@ -2721,7 +2714,6 @@ fn evict_host_accumulates_into_shared_host_frees() {
         b,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed_a, (0, 2));
@@ -2757,7 +2749,6 @@ fn evict_device_leaves_host_value_untouched() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 1);
@@ -2792,7 +2783,6 @@ fn evict_all_frees_both_layers() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::All,
     );
     assert_eq!(freed, 3);
@@ -2840,7 +2830,6 @@ fn evict_device_accumulates_into_shared_device_frees() {
         a,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     FullComponent.evict_component(
@@ -2848,7 +2837,6 @@ fn evict_device_accumulates_into_shared_device_frees() {
         b,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     let pushed = &device_frees[&FULL];
@@ -2881,7 +2869,6 @@ fn evict_device_pushed_entry_aliases_the_node_value() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
     // The pushed entry shares storage with the node's value (Python appends cd.value).
@@ -2904,7 +2891,6 @@ fn evict_panics_on_missing_node() {
         NodeIdx_(999),
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
 }
@@ -2933,7 +2919,6 @@ fn evict_panics_when_size_would_underflow() {
         node,
         &mut device_frees,
         &mut host_frees,
-        &mut Vec::new(),
         EvictLayer::Device,
     );
 }

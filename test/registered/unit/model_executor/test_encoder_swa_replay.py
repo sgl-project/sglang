@@ -52,9 +52,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# The fake request window's zero row: past every slot the fixtures use.
-_ZERO_ROW = 64 * 2 * SWA_WINDOW
-
 _ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 MAX_CTX = 1024
 
@@ -148,7 +145,7 @@ def _backend(fx):
     backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
     backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
     backend.token_to_kv_pool = SimpleNamespace(
-        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW, zero_row=_ZERO_ROW)
+        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
     )
     backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
     backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
@@ -308,7 +305,6 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         expected = window_layout(
             req,
             tail.positions,
-            zero_row=_ZERO_ROW,
             capacity=2 * SWA_WINDOW,
             floor=floor,
             num_groups=3,

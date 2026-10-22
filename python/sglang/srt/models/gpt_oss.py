@@ -252,7 +252,6 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.router = TinyGemmLinear(
             config.hidden_size,

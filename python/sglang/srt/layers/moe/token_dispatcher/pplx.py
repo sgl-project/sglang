@@ -198,7 +198,6 @@ class _PplxDispatcherImpl:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        runner_backend=None,
     ):
         if not use_pplx:
             raise ImportError(
@@ -209,7 +208,6 @@ class _PplxDispatcherImpl:
                 "backend."
             )
 
-        self.runner_backend = runner_backend
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -433,7 +431,6 @@ class PplxDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        runner_backend=None,
     ):
         super().__init__()
 
@@ -445,7 +442,6 @@ class PplxDispatcher(BaseDispatcher):
             )
 
         self._low_latency_dispatcher = _PplxDispatcherImpl(
-            runner_backend=runner_backend,
             group=group,
             router_topk=router_topk,
             permute_fusion=permute_fusion,

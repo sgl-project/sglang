@@ -4,11 +4,6 @@ Each server configuration lives in its own file under
 ``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
 configurations partition independently across GB300 runners. All use default
 decoder bounded replay and explicitly enabled breakable prefill graphs.
-
-They run on two GB300 GPUs (TP2) with the engram tables in host memory
-(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE). The two engram tables are ~189 GiB in FP8
-(2 x ~384M rows x 264 B), so at TP2 offloading them frees ~94 GiB per GPU and the
-remaining weights (~143 GiB/GPU) leave room for KV cache, graphs and DSPARK.
 """
 
 import requests
@@ -24,7 +19,7 @@ from sglang.test.test_utils import (
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 # Tensor-parallel attention and expert-parallel MoE, without DP attention.
-TP2_EP2_ARGS = ["--attn-dp-size", "1", "--ep-size", "2"]
+TP4_EP4_ARGS = ["--attn-dp-size", "1", "--ep-size", "4"]
 
 
 class DSV41FlashAccuracyMixin(GSM8KMixin):
@@ -54,8 +49,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
         "8192",
     ]
     parallel_args = []
-    # Keep the engram tables in host memory so DSV4.1-Flash fits on two GB300s.
-    server_env = {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1"}
+    server_env = {}
 
     @classmethod
     def setUpClass(cls):
@@ -68,7 +62,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",

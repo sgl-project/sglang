@@ -14,6 +14,7 @@ import torch
 
 from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
@@ -306,16 +307,25 @@ def _run_mega_routed(
         topk_output = moe.topk(
             hidden_states,
             router_logits,
+            num_token_non_padded=(
+                forward_batch.num_token_non_padded
+                if forward_batch is not None
+                else None
+            ),
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+                if moe.experts.uses_expert_location
+                else None
+            ),
             **topk_kwargs,
         )
         x_in = hidden_states
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
-        num_token_non_padded, _ = moe.topk.routing_inputs()
-        if num_token_non_padded is not None:
+        if forward_batch is not None and forward_batch.num_token_non_padded is not None:
             _fill_padded_rows(
                 topk_ids,
-                num_token_non_padded,
+                forward_batch.num_token_non_padded,
                 experts,
             )
     else:

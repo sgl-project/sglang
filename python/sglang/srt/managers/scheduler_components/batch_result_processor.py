@@ -772,8 +772,6 @@ class SchedulerBatchResultProcessor:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
-        self.metrics_reporter.snapshot_spec_decode_metrics(batch, result)
-
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         stride = _get_speculative_output_stride(result)
@@ -1402,7 +1400,6 @@ class SchedulerBatchResultProcessor:
                 and lookahead == 1
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
             ):
                 req.mamba_lazy_checkpoint = False
 
@@ -1590,9 +1587,9 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
+            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
                 other_idx
-            ] and mamba_lazy_spec_in_window(
+            ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1677,8 +1674,9 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        pool = batch.req_to_token_pool
-        if not req.kv.mamba_ping_pong_empty[other_idx]:
+        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
+        if other_val != -1:
+            pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )

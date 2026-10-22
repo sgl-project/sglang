@@ -30,7 +30,6 @@ from sglang.srt.layers.layer_boundary.ops import (
 )
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
 from sglang.srt.models import qwen4_exp
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,16 +56,14 @@ def _step(stage, variant):
     return stage.plan.paths[variant].entry.prepare.keywords["step"]
 
 
-def _build_layers(parallel):
+def _build_layers(parallel, linear_group):
     """A linear-attention layer, then a sparse-attention layer."""
     config = SimpleNamespace(
         model_type="qwen4_exp_text", num_hidden_layers=2, ple_layer_ids=[]
     )
     with (
         fixture.planning(parallel),
-        get_parallel().override(
-            enable_cp_tp_group_sharing=parallel.enable_cp_tp_group_sharing
-        ),
+        patch.object(qwen4_exp, "linear_attn_parallel_group", lambda: linear_group),
         layer_stack(),
     ):
         linear = qwen4_exp._build_qwen4_exp_stages(
@@ -85,7 +82,7 @@ class TestTokenOrderAttention(CustomTestCase):
             enable_prefill_cp=True,
             enable_cp_tp_group_sharing=True,
         )
-        self.linear, self.sparse = _build_layers(parallel)
+        self.linear, self.sparse = _build_layers(parallel, "tp")
 
     def test_linear_attention_reads_the_whole_sequence_in_token_order(self):
         attn, ffn = self.linear
@@ -124,7 +121,7 @@ class TestTokenOrderAttention(CustomTestCase):
 
     def test_without_sharing_linear_attention_binds_like_attention(self):
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
-        linear, sparse = _build_layers(parallel)
+        linear, sparse = _build_layers(parallel, "attn_tp")
 
         def steps(stage):
             entry = stage.plan.paths[ORDINARY].entry

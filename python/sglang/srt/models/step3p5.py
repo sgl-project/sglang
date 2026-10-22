@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -161,10 +162,6 @@ class Step3p5MoEMLP(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
         )
-        self.topk.bind_runner_backend(
-            self.experts.runner_backend,
-            routing_method_type=self.experts.routing_method_type,
-        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -255,6 +252,10 @@ class Step3p5MoEMLP(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

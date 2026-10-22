@@ -4,11 +4,9 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    MOONLIGHT_16B_A3B_MODEL_PATH,
-)
 from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
+    DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
     IMAGES_EXAMPLE_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
@@ -28,6 +26,7 @@ from sglang.test.test_utils import (
 register_npu_ci(
     est_time=400,
     suite="base-b-test-4-npu-a3",
+    disabled="Temporarily disable this test case due to DTS2026091464350",
 )
 register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
 
@@ -77,12 +76,11 @@ class TestDPAttentionMixedChunk(
 ):
     # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    # Moonlight bf16 GSM8K baseline is ~0.837.
-    gsm8k_accuracy_thres = 0.83
+    gsm8k_accuracy_thres = 0.34
 
     @classmethod
     def setUpClass(cls):
-        cls.model = MOONLIGHT_16B_A3B_MODEL_PATH
+        cls.model = DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -115,7 +113,7 @@ class TestDPRetract(
 ):
     @classmethod
     def setUpClass(cls):
-        cls.model = MOONLIGHT_16B_A3B_MODEL_PATH
+        cls.model = DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

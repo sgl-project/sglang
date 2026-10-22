@@ -27,9 +27,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
-        self.manager.model_config = SimpleNamespace(
-            joint_head_config=None, pointer_head=None
-        )
+        self.manager.model_config = SimpleNamespace(joint_head_config=None)
 
     def _validate(
         self,
@@ -53,6 +51,7 @@ class TestSamplingMaskValidation(CustomTestCase):
                 return logits
 
         for processor in (
+            None,
             DisallowedTokensLogitsProcessor.to_str(),
             BoundMask.to_str(),
         ):

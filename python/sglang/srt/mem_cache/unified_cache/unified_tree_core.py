@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    UpdatePendingBackupOnNodeSplit,
+    ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -690,7 +690,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         start,
                         end,
                         None if value is None else len(value),
-                        len(node.children),
                     )
                 )
                 start = end
@@ -811,7 +810,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             params.get_lock_uuid(component_type),
             result.device_frees,
             result.host_frees,
-            cache_actions=result.cache_actions,
         )
         return result
 
@@ -835,7 +833,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             params.get_lock_uuid(ComponentType.SWA),
             result.device_frees,
             result.host_frees,
-            cache_actions=result.cache_actions,
         )
 
         # Drop strictly-lower-priority locks co-located on the node, skipping
@@ -1272,7 +1269,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Fire-and-forget actions safe to batch until the next barrier."""
         return isinstance(
             action,
-            (FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit),
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
         )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
@@ -1481,13 +1478,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        # Buffer-mode dependencies are tracked by the cache, without an ack here.
+        # A split of a backuped node tells the cache to fix its publish list.
         action: Optional[CacheAction | ComponentAction] = None
-        ack_id = child.write_through_pending_id
-        if ack_id is not None:
+        if child.write_through_pending_id is not None:
+            ack_id = child.write_through_pending_id
             new_node.write_through_pending_id = ack_id
-        if ack_id is not None or self.is_host_memory_buffer_only:
-            action = UpdatePendingBackupOnNodeSplit(
+            action = ReplaceWriteThroughOnNodeSplit(
                 ack_id=ack_id,
                 old_node_id=child.id,
                 new_node_id=new_node.id,
@@ -1532,7 +1528,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
             BASE_COMPONENT_TYPE
-        ].reclaimable_value_len(new_node)
+        ].reclaimable_tokens(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1553,7 +1549,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
-        n = self.components_by_type[ct].reclaimable_value_len(node)
+        n = self.components_by_type[ct].reclaimable_tokens(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -1655,10 +1651,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._begin_tracking_unbacked_tokens()
         try:
             step = component.evict_device_next_node(
-                updated_tracker,
-                result.device_frees,
-                result.host_frees,
-                cache_actions=result.cache_actions,
+                updated_tracker, result.device_frees, result.host_frees
             )
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
@@ -1681,9 +1674,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             or result.mamba_backup_node_id is not None
             or result.swa_backup_node_id is not None
             or bool(result.tracker)
-            or bool(result.cache_actions)
-            or any(result.device_frees.values())
-            or any(result.host_frees.values())
         )
         return result
 
@@ -1744,7 +1734,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker=result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
-                cache_actions=result.cache_actions,
             )
             self._cascade_evict(
                 node,
@@ -1752,7 +1741,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
-                cache_actions=result.cache_actions,
             )
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
@@ -1788,7 +1776,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result.tracker,
                     device_frees=result.device_frees,
                     host_frees=result.host_frees,
-                    cache_actions=result.cache_actions,
                 )
                 return result
             self._demote(
@@ -1796,7 +1783,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.tracker,
                 device_frees=result.device_frees,
                 host_frees=result.host_frees,
-                cache_actions=result.cache_actions,
             )
             return result
         finally:
@@ -1842,7 +1828,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.tracker,
                 result.device_frees,
                 result.host_frees,
-                cache_actions=result.cache_actions,
             )
             self._remove_leaf_from_parent(desc)
         self._delete_unbacked_device_leaf(
@@ -1850,7 +1835,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             result.tracker,
             device_frees=result.device_frees,
             host_frees=result.host_frees,
-            cache_actions=result.cache_actions,
         )
         result.is_dropped = True
         return result
@@ -1862,7 +1846,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
@@ -1875,7 +1858,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker=tracker,
                 device_frees=device_frees,
                 host_frees=host_frees,
-                cache_actions=cache_actions,
             )
         self.evictable_device_leaves.discard(node)
         self.evictable_host_leaves.discard(node)
@@ -1886,26 +1868,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
         self._release_all_component_layers(
-            node,
-            StorageMedium.GPU,
-            tracker,
-            device_frees,
-            host_frees,
-            cache_actions=cache_actions,
+            node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
         parent = node.parent
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
         self._iteratively_delete_tombstone_leaf(
-            node,
-            tracker,
-            device_frees=device_frees,
-            host_frees=host_frees,
-            cache_actions=cache_actions,
+            node, tracker, device_frees=device_frees, host_frees=host_frees
         )
 
     def drive_host_eviction(
@@ -1927,14 +1899,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result.tracker,
                     result.device_frees,
                     result.host_frees,
-                    cache_actions=result.cache_actions,
                 )
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,
                 result.device_frees,
                 result.host_frees,
-                cache_actions=result.cache_actions,
             )
         return result
 
@@ -1943,13 +1913,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
-            self.node_by_id(tail_node_id),
-            device_frees,
-            host_frees,
-            cache_actions=cache_actions,
+            self.node_by_id(tail_node_id), device_frees, host_frees
         )
 
     def _reclaim_full_host_duplicates(
@@ -1958,7 +1924,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Reclaim Full host duplicates until num_tokens are freed; pass 1
         spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
@@ -1978,7 +1943,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if not self._can_reclaim_full_host_duplicate(node):
                     continue
                 self._release_full_host_duplicate(
-                    node, tracker, device_frees, host_frees, cache_actions=cache_actions
+                    node, tracker, device_frees, host_frees
                 )
                 swept_ids.append(node.id)  # released -> no longer a duplicate
         # Sweep after the walk: the dict must not be mutated mid-iteration.
@@ -2004,7 +1969,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
@@ -2017,7 +1981,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
-            cache_actions=cache_actions,
         )
         self.write_back_duplicate_reclaim_digest = (
             self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
@@ -2029,7 +1992,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Atomically evict all components on a host leaf.
 
@@ -2045,14 +2007,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 tracker=None,
                 device_frees=device_frees,
                 host_frees=host_frees,
-                cache_actions=cache_actions,
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
-        self._iteratively_delete_tombstone_leaf(
-            node, tracker, device_frees, host_frees, cache_actions=cache_actions
-        )
+        self._iteratively_delete_tombstone_leaf(node, tracker, device_frees, host_frees)
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Release a node's device KV once its host copy exists; the node stays in the
@@ -2063,7 +2022,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             result.tracker,
             result.device_frees,
             result.host_frees,
-            cache_actions=result.cache_actions,
         )
         return result
 
@@ -2073,7 +2031,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert not node.evicted and node.backuped
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
@@ -2084,15 +2041,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
-            cache_actions=cache_actions,
         )
         self._cascade_evict(
-            node,
-            trigger,
-            tracker,
-            device_frees=device_frees,
-            host_frees=host_frees,
-            cache_actions=cache_actions,
+            node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
         self.kv_events.record_remove(node, medium=StorageMedium.GPU)
 
@@ -2109,7 +2060,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
@@ -2128,7 +2078,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     tracker=tracker,
                     device_frees=device_frees,
                     host_frees=host_frees,
-                    cache_actions=cache_actions,
                 )
                 if comp.component_type == BASE_COMPONENT_TYPE:
                     base_evicted = True
@@ -2206,17 +2155,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         comp: TreeComponent,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
         had_host_copy = node.component_data[comp.component_type].host_value is not None
         device_freed, host_freed = comp.evict_component(
-            node,
-            target=target,
-            device_frees=device_frees,
-            host_frees=host_frees,
-            cache_actions=cache_actions,
+            node, target=target, device_frees=device_frees, host_frees=host_frees
         )
         if tracker is not None:
             if EvictLayer.DEVICE in target:
@@ -2249,7 +2193,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ):
         """Walk up from *deleted_node* and cascade-delete childless ancestors.
 
@@ -2259,11 +2202,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
           - neither              → evict all remaining data, delete, continue up
         """
         self._iteratively_delete_tombstone_ancestors(
-            deleted_node.parent,
-            tracker,
-            device_frees,
-            host_frees,
-            cache_actions=cache_actions,
+            deleted_node.parent, tracker, device_frees, host_frees
         )
 
     def _iteratively_delete_tombstone_ancestors(
@@ -2272,7 +2211,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Delete childless tombstone ancestors until a live or locked node is reached."""
         ct = BASE_COMPONENT_TYPE
@@ -2299,7 +2237,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         tracker=tracker,
                         device_frees=device_frees,
                         host_frees=host_frees,
-                        cache_actions=cache_actions,
                     )
 
             if has_host:
@@ -2316,7 +2253,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         tracker=tracker,
                         device_frees=device_frees,
                         host_frees=host_frees,
-                        cache_actions=cache_actions,
                     )
 
             self.evictable_host_leaves.discard(cur)
@@ -2950,7 +2886,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
-        ledger = self.components_by_type[component_type].reclaimable_value_len(node)
+        ledger = self.components_by_type[component_type].reclaimable_tokens(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += ledger
         else:
@@ -2965,15 +2901,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[component_type]
         if node is self.root_node or cd.value is None:
             return
-        sizes = (
-            self.component_protected_size_
-            if cd.lock_ref > 0
-            else self.component_evictable_size_
-        )
-        updated = sizes[component_type] + delta
-        if updated < 0:
-            raise ValueError(f"component size cannot be negative: {updated}")
-        sizes[component_type] = updated
+        if cd.lock_ref > 0:
+            self.component_protected_size_[component_type] += delta
+        else:
+            self.component_evictable_size_[component_type] += delta
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -3194,7 +3125,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 cd = n.component_data[ct]
                 if cd.value is not None:
-                    toks = self.components_by_type[ct].reclaimable_value_len(n)
+                    toks = self.components_by_type[ct].reclaimable_tokens(n)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:

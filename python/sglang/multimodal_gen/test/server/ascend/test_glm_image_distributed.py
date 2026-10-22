@@ -30,17 +30,7 @@ _PERFORMANCE_TOLERANCE = 0.25
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     try:
-        pgid = os.getpgid(proc.pid)
-        # Coverage collection can only flush a traced subprocess on a graceful
-        # stop (SIGKILL skips atexit). Give the cluster a SIGTERM head start
-        # when coverage is active, then always escalate to SIGKILL.
-        if os.environ.get("COVERAGE_PROCESS_START"):
-            os.killpg(pgid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                pass
-        os.killpg(pgid, signal.SIGKILL)
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
 

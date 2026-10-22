@@ -70,6 +70,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",
+    "tokenspeed_mla",
     "ascend",
     "intel_xpu",
 ]

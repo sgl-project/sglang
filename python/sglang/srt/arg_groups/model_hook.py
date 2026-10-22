@@ -305,21 +305,15 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
-
-                    if not (
-                        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-                        and supports_prefill_cp_bcg(server_args)
-                    ):
-                        declare_resolution(
-                            server_args,
-                            "_handle_model_specific_adjustments",
-                            cuda_graph_config=with_phase(
-                                cfg.cuda_graph_config,
-                                Phase.PREFILL,
-                                backend=Backend.DISABLED,
-                            ),
-                        )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     attn_tp_size = derive_attn_tp_size(
@@ -984,21 +978,12 @@ def handle_model_capability_adjustments(server_args: Any):
     # A Clef checkpoint's joint schema head reads the final hidden state of
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool. A
-    # Kev checkpoint's pointer head reads two positions of each question's
-    # prompt and is served the same way.
+    # also puts the FA backend on its raw K/V path, which skips the KV pool.
     if model_config.joint_head_config is not None:
-        name, head = "Clef", "joint schema head"
-        tp_reason = ", since the joint schema head reads full LM head rows"
-    elif model_config.pointer_head is not None:
-        name, head, tp_reason = "Kev", "pointer head", ""
-    else:
-        name = None
-    if name is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
-                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
-                f"{tp_reason}"
+                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
+                "since the joint schema head reads full LM head rows"
             )
         for key, value in (
             ("is_embedding", True),
@@ -1017,7 +1002,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 ),
             )
         logger.info(
-            f"{name} {head} detected: serving /v1/systemone decisions in "
+            "Clef joint schema head detected: serving /v1/systemone decisions in "
             "embedding mode without radix cache, chunked prefill, or CUDA graphs."
         )
 

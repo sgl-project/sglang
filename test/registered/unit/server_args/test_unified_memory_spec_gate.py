@@ -93,6 +93,7 @@ _VERIFY_BACKENDS = (
     "triton",
     "trtllm_mla",
     "cutedsl_mla",
+    "tokenspeed_mla",
     "flashmla",
     "flashinfer",
     "fa3",

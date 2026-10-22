@@ -15,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -96,8 +97,12 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        backend = self.runner_backend
-        is_humming = backend is not None and backend.is_humming()
+        is_humming = (
+            get_moe_runner_backend().is_humming()
+            or get_moe_runner_backend().is_auto()
+            and quant_config is not None
+            and quant_config.get_name() == "humming"
+        )
         if get_moe_a2a_backend().is_deepep_v2():
             self.deprecate_flag = True
         elif is_humming:
@@ -116,16 +121,14 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
-            backend is not None
-            and backend.is_flashinfer_cutedsl()
+            get_moe_runner_backend().is_flashinfer_cutedsl()
             and quant_config is not None
             and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and backend is not None
-            and backend.is_deep_gemm()
+            and get_moe_runner_backend().is_deep_gemm()
             and quant_config is not None
             and quant_config.get_name() == "mxfp4"
         ):
@@ -135,8 +138,7 @@ class DeepEPMoE(FusedMoE):
         elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
-            and backend is not None
-            and backend.is_deep_gemm()
+            and get_moe_runner_backend().is_deep_gemm()
             and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip

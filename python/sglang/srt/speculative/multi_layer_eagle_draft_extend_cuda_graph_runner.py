@@ -451,9 +451,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             attn_backend.init_forward_metadata_in_graph(forward_batch)
             return self._run_step_body(forward_batch, num_tokens, bs)
 
-        with forward_context(
-            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
-        ):
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)
@@ -1028,9 +1026,7 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
             forward_batch = r.get_forward_batch(bs)
             forward_batch = r._postprocess_forward_batch(forward_batch, bs)
             attn_backend = self.draft_extend_attn_backend_list[r.step]
-            with forward_context(
-                ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
-            ):
+            with forward_context(ForwardContext(attn_backend=attn_backend)):
                 attn_backend.init_forward_metadata_out_graph(
                     forward_batch, in_capture=True
                 )
@@ -1041,10 +1037,7 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
             outs = []
             for i, (r, forward_batch, num_tokens, attn_backend) in enumerate(items):
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
-                with forward_context(
-                    ForwardContext(attn_backend=attn_backend),
-                    forward_batch=forward_batch,
-                ):
+                with forward_context(ForwardContext(attn_backend=attn_backend)):
                     ret = r._run_step_body(forward_batch, num_tokens, bs)
                 outs.append(ret)
                 if i < n - 1:

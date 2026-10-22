@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -55,9 +54,6 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
-    get_waiting_storage_span: (
-        Callable[[CacheRequestHandle], tuple[int, int] | None] | None
-    ) = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -88,19 +84,9 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
-                matched = req.num_matched_prefix_tokens
-                uncached = max(0, req.seqlen - matched)
-                if self.get_waiting_storage_span is not None:
-                    span = self.get_waiting_storage_span(req.cache_request_handle)
-                    if span is not None:
-                        storage_tokens = max(
-                            0, min(span[1], req.seqlen) - max(span[0], matched)
-                        )
-                        uncached -= storage_tokens
+                num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
-                # The historical hit rate already includes admitted storage hits.
-                uncached = int(req.seqlen * cache_miss_rate)
-            num_tokens += uncached
+                num_tokens += int(req.seqlen * cache_miss_rate)
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - cr.prefix_len)

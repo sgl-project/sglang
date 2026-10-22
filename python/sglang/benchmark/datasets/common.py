@@ -76,15 +76,11 @@ def get_available_tokens(tokenizer):
     )
 
 
-def gen_prompt_ids(tokenizer, token_num):
-    """Generate random token ids of specified length using tokenizer vocabulary."""
-    all_available_tokens = get_available_tokens(tokenizer)
-    return random.choices(all_available_tokens, k=token_num)
-
-
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    return tokenizer.decode(gen_prompt_ids(tokenizer, token_num))
+    all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
 
 
 @lru_cache(maxsize=1)

@@ -64,8 +64,7 @@ MINIMAX_M27_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M2.7",
         tp_size=8,
-        # MI300: mean 0.9216 over 10x full GSM8K (exact CI config); 0.93 never passes.
-        accuracy_threshold=0.91,
+        accuracy_threshold=0.93,
         timeout=3600,
         variant="TP8+EP8",
         other_args=[

@@ -194,16 +194,13 @@ export const KimiK26Deployment = () => {
       cmd += ' \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla';
     }
 
-    const usesCutedslMla = hardware === 'b300' || hardware === 'gb300';
+    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
 
-    if (usesCutedslMla) {
-      cmd += ' \\\n  --attention-backend cutedsl_mla';
-      if (speculative === 'enabled') {
-        cmd += ' \\\n  --speculative-attention-mode decode';
-      }
+    if (usesTokenspeedMla) {
+      cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
-    if (isAMD || usesCutedslMla) {
+    if (isAMD || usesTokenspeedMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 

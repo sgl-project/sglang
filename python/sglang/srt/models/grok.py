@@ -161,7 +161,6 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
@@ -940,23 +939,13 @@ old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
 
 
 def _prepare_presharded_weights(
-    self,
-    model_name_or_path: str,
-    revision: Optional[str],
-    fall_back_to_pt: bool,
-    allow_patterns_overrides: Optional[list[str]] = None,
+    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
 
-    if get_parallel().tp_size == 1 or allow_patterns_overrides is not None:
-        return old_prepare_weights(
-            self,
-            model_name_or_path,
-            revision,
-            fall_back_to_pt,
-            allow_patterns_overrides,
-        )
+    if get_parallel().tp_size == 1:
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf

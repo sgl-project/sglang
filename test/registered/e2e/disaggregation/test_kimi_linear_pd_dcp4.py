@@ -30,7 +30,7 @@ NIAH_KEY = "739391"
 
 COMMON_ARGS = [
     "--attention-backend",
-    "cutedsl_mla",
+    "tokenspeed_mla",
     "--kv-cache-dtype",
     "fp8_e4m3",
     "--dtype",

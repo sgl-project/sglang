@@ -78,12 +78,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         decision = torch.tensor(
             int(can_run_graph and seed_ready),
             dtype=torch.int32,
-            device="cpu",
+            device=self.device,
         )
         torch.distributed.all_reduce(
             decision,
             op=torch.distributed.ReduceOp.MIN,
-            group=get_parallel().tp_group.cpu_group,
+            group=get_parallel().tp_group.device_group,
         )
         return bool(decision.item())
 

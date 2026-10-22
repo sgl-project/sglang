@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.layers.attention import trtllm_mla_backend as backend_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
@@ -165,6 +166,10 @@ class _DCPMetadataTests:
 
 class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
     backend_cls = TRTLLMMLABackend
+
+
+class TestTokenspeedMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
+    backend_cls = TokenspeedMLABackend
 
 
 class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):

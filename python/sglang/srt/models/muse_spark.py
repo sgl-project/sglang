@@ -91,7 +91,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
 from sglang.srt.utils.common import get_device_capability, is_cuda
@@ -111,13 +111,9 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
         super().__init__(config, **kwargs)
         self.use_fp32_output = True
 
-    def _compute_lm_head(
-        self, hidden_states, lm_head, embedding_bias=None, *, out=None
-    ):
+    def _compute_lm_head(self, hidden_states, lm_head, embedding_bias=None):
         if not hasattr(lm_head, "weight"):
-            return super()._compute_lm_head(
-                hidden_states, lm_head, embedding_bias, out=out
-            )
+            return super()._compute_lm_head(hidden_states, lm_head, embedding_bias)
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
         if use_intel_amx_backend(lm_head):
             # ParallelLMHead swaps in PackWeightMethod on CPU+AMX, which repacks
@@ -130,16 +126,10 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 True,
             ).to(output_dtype)
         else:
-            if out is not None and out.shape != (
-                hidden_states.shape[0],
-                lm_head.weight.shape[0],
-            ):
-                out = None
             logits = torch.mm(
                 hidden_states.to(lm_head.weight.dtype),
                 lm_head.weight.T,
                 out_dtype=output_dtype,
-                out=out,
             )
         if embedding_bias is not None:
             logits = logits + embedding_bias
@@ -363,10 +353,6 @@ class MuseSpark1xAttention(nn.Module):
     def _fused_kv_store(
         self, forward_batch: ForwardBatch
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        # Unified pools interleave layers in each token row. Reuse the prefill
-        # path, whose attention-backend cache writer supports these strides.
-        if get_memory().enable_unified_memory:
-            return None
         backend = get_attn_backend()
         pool = get_token_to_kv_pool()
         if not (

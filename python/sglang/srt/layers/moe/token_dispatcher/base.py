@@ -329,7 +329,6 @@ class BaseDispatcher(ABC):
 
     def __init__(self):
         self.quant_config: dict = {}
-        self.runner_backend = None
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

@@ -66,7 +66,6 @@ def construct_variable_block_sizes(
     dit_seq_shape: tuple[int, int, int],
     num_tiles: tuple[int, int, int],
     device: torch.device,
-    tile_size: tuple[int, int, int] = VSA_TILE_SIZE,
 ) -> torch.LongTensor:
     """
     Compute the number of valid (non‑padded) tokens inside every
@@ -79,7 +78,7 @@ def construct_variable_block_sizes(
     """
     # unpack
     t, h, w = dit_seq_shape
-    ts_t, ts_h, ts_w = tile_size
+    ts_t, ts_h, ts_w = VSA_TILE_SIZE
     n_t, n_h, n_w = num_tiles
 
     def _sizes(dim_len: int, tile: int, n_tiles: int) -> torch.LongTensor:

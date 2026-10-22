@@ -511,10 +511,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
-        with forward_context(
-            ForwardContext(attn_backend=self.draft_attn_backend),
-            forward_batch=forward_batch,
-        ):
+        with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
