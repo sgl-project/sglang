@@ -128,7 +128,7 @@ inline void cutlass_prepare_moe_input(
       .verify(topk_ids);
   const int64_t num_routes = topk_ids.numel();
   // Empty PyTorch dimensions can have noncanonical strides; no ID is read.
-  CHECK_HOST(num_routes == 0 || topk_ids.is_contiguous());
+  RuntimeCheck(num_routes == 0 || topk_ids.is_contiguous(), "topk_ids must be contiguous when nonempty");
   CHECK_HOST(num_routes <= max_index);
   TensorMatcher({num_experts + 1}).with_dtype<int32_t>().with_device(device).verify(expert_offsets);
   TensorMatcher({num_experts, 3})
