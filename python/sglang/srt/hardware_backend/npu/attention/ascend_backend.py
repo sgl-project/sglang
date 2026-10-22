@@ -543,9 +543,7 @@ class AscendAttnBackend(AttentionBackend):
             ).to(torch.int32)
         else:
             if block_tables is None:
-                max_len = (
-                    int(local_kv_lens.max().item()) if local_kv_lens.numel() else 0
-                )
+                max_len = local_kv_lens.max().item() if local_kv_lens.numel() else 0
                 num_pages = max(1, (max_len + self.page_size - 1) // self.page_size)
                 block_tables = torch.empty(
                     (req_pool_indices.numel(), num_pages),
@@ -613,7 +611,7 @@ class AscendAttnBackend(AttentionBackend):
             # Derive FIA's Host lengths from the CPU mirror without a device readback.
             effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
             if forward_batch.forward_mode.is_target_verify():
-                query_len = int(forward_batch.spec_info.draft_token_num)
+                query_len = forward_batch.spec_info.draft_token_num
                 spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is not None and spec_algorithm.is_dflash_family():
                     # Active Host lengths already include verify tokens; Ascend's
@@ -627,7 +625,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
             ):
-                effective_seq_lens_cpu = effective_seq_lens_cpu + int(
+                effective_seq_lens_cpu = effective_seq_lens_cpu + (
                     self.speculative_step_id + 1
                 )
             # Size the table from FIA's Host bound, which can lead device lengths.
@@ -711,7 +709,7 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch.forward_mode.is_decode_or_idle()
                     and forward_batch.spec_info is not None
                 ):
-                    effective_seq_lens = effective_seq_lens + int(
+                    effective_seq_lens = effective_seq_lens + (
                         self.speculative_step_id + 1
                     )
             metadata.seq_lens = get_dcp_lens(
@@ -1193,10 +1191,10 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens.copy_(local_seq_lens)
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
             if in_capture:
-                metadata.seq_lens_cpu_list = local_seq_lens.cpu().int().tolist()
+                metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
 
             if forward_mode.is_target_verify():
-                query_len = int(self.speculative_num_draft_tokens)
+                query_len = self.speculative_num_draft_tokens
                 metadata.dcp_spec_seq_lens.copy_(
                     get_dcp_chain_spec_lens(
                         effective_seq_lens,
@@ -1877,7 +1875,7 @@ class AscendAttnBackend(AttentionBackend):
                 interleave_size=self.page_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        return kv_cached, k_rope_cached
+        return kv_cached, k_rope_cached.flatten(0, 1)
 
     def forward_extend(
         self,
@@ -2378,7 +2376,6 @@ class AscendAttnBackend(AttentionBackend):
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                 kv_cached, k_rope_cached = self._load_mla_prefix_cache(layer)
-                k_rope_cached = k_rope_cached.reshape(-1, 1, self.qk_rope_head_dim)
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
@@ -2470,7 +2467,6 @@ class AscendAttnBackend(AttentionBackend):
 
                 # 2nd, load history kvcache(kv_a and k_pe) and calculate k_nope
                 kv_cached, k_rope_cached = self._load_mla_prefix_cache(layer)
-                k_rope_cached = k_rope_cached.reshape(-1, 1, self.qk_rope_head_dim)
 
                 assert layer.kv_b_proj is not None
                 kv = layer.kv_b_proj(kv_cached)[0].view(
@@ -2824,7 +2820,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify():
             # Keep the full query shape, including graph padding rows.
             num_tokens = q.shape[0]
-            query_len = int(forward_batch.spec_info.draft_token_num)
+            query_len = forward_batch.spec_info.draft_token_num
             batch_size = num_tokens // query_len
             num_heads = layer.tp_q_head_num
             if num_tokens == 0:
@@ -2841,12 +2837,9 @@ class AscendAttnBackend(AttentionBackend):
                     :batch_size
                 ]
             else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int[:batch_size]
-                    .cpu()
-                    .int()
-                    .tolist()
-                )
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int[
+                    :batch_size
+                ].tolist()
             attn_mask = self.forward_metadata.dcp_mtp_attn_mask[:batch_size]
 
             c_kv, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -3510,7 +3503,7 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
+        return_softmax_lse = kwargs.pop("return_softmax_lse", False)
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
