@@ -1187,7 +1187,22 @@ class KimiK3MoE(nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
+            if (
+                self._sbo_shared_overlap
+                and self._shared_experts_tp1
+                and not fine_grained_overlap
+            ):
+                # A replicated output is read only by the tail add below, and
+                # the next layer's side-stream work waits for the forward
+                # stream before it runs, so the block can keep the lifetime of
+                # the stream that produced it. Marking it on the forward stream
+                # instead holds the block until this layer's routed kernel
+                # finishes; a rank whose forward stream lags then grows the
+                # symmetric pool while the others reuse the block, and the
+                # window registration ends up running on some ranks only.
+                shared_output.record_stream(self.alt_stream)
+            else:
+                shared_output.record_stream(current_stream)
             if self._shared_experts_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
