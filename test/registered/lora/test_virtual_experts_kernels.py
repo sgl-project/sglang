@@ -211,6 +211,106 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                         )
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(is_xpu(), "CUDA staged virtual-expert helpers required")
+    def test_empty_virtual_calls_preserve_stage_results(self):
+        """Empty route sets preserve add outputs and the staged shrink return contract."""
+        import sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts as temp
+        import sglang.kernels.ops.lora.moe.virtual_experts as stock
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config,
+        )
+
+        hidden, width, rank = 32, 16, 16
+        a = torch.empty((1, 2, rank, hidden), device=self.device, dtype=torch.float16)
+        b = torch.empty((1, 2, width, rank), device=self.device, dtype=torch.float16)
+        with patch.object(
+            fused_moe_triton_config,
+            "try_get_optimal_moe_config",
+            side_effect=AssertionError(
+                "empty routes must return before tuning or routing"
+            ),
+        ):
+            for tokens, topk in ((0, 2), (3, 0)):
+                with self.subTest(tokens=tokens, topk=topk):
+                    backing = torch.full(
+                        (3, 2, width), 0.75, device=self.device, dtype=torch.float16
+                    )
+                    saved = backing.clone()
+                    output = backing[:tokens, :topk]
+                    cache_marker = object()
+                    cache = {"untouched": cache_marker}
+                    kwargs = dict(
+                        output=output,
+                        hidden_states=torch.empty(
+                            (tokens, hidden), device=self.device, dtype=a.dtype
+                        ),
+                        lora_a=a,
+                        lora_b=b,
+                        topk_ids=torch.empty(
+                            (tokens, topk), device=self.device, dtype=torch.int32
+                        ),
+                        topk_weights=torch.empty(
+                            (tokens, topk), device=self.device, dtype=torch.float32
+                        ),
+                        token_lora_mapping=torch.empty(
+                            tokens, device=self.device, dtype=torch.int32
+                        ),
+                        mul_routed_weight=True,
+                        experts_shared_outer_loras_a=False,
+                        experts_shared_outer_loras_b=False,
+                        routing_cache=cache,
+                    )
+                    self.assertIsNone(stock.merged_experts_fused_moe_lora_add(**kwargs))
+                    for stage in ("routing", "all", "shrink", "expand"):
+                        for provide_buffer in (False, True):
+                            with self.subTest(
+                                stage=stage, provide_buffer=provide_buffer
+                            ):
+                                buffer = (
+                                    torch.empty(
+                                        (tokens, topk, rank),
+                                        device=self.device,
+                                        dtype=a.dtype,
+                                    )
+                                    if provide_buffer
+                                    else None
+                                )
+                                call_kwargs = dict(
+                                    kwargs, stage=stage, intermediate_buffer=buffer
+                                )
+                                if stage == "expand" and buffer is None:
+                                    with self.assertRaisesRegex(
+                                        AssertionError, "requires intermediate_buffer"
+                                    ):
+                                        temp.merged_experts_fused_moe_lora_add(
+                                            **call_kwargs
+                                        )
+                                    continue
+                                result = temp.merged_experts_fused_moe_lora_add(
+                                    **call_kwargs
+                                )
+                                if stage == "shrink":
+                                    self.assertEqual(result.shape, (tokens, topk, rank))
+                                    self.assertEqual(result.dtype, a.dtype)
+                                    self.assertEqual(result.device, a.device)
+                                    if buffer is not None:
+                                        self.assertIs(result, buffer)
+                                else:
+                                    self.assertIsNone(result)
+                    if tokens:
+                        reduced = backing[:, 0]
+                        self.assertIsNone(
+                            temp.merged_experts_fused_moe_lora_add(
+                                **dict(kwargs, output=reduced, fuse_sum_all_reduce=True)
+                            )
+                        )
+                    with self.assertRaisesRegex(AssertionError, "invalid stage"):
+                        temp.merged_experts_fused_moe_lora_add(
+                            **dict(kwargs, stage="invalid")
+                        )
+                    self.assertEqual(cache, {"untouched": cache_marker})
+                    torch.testing.assert_close(backing, saved, rtol=0, atol=0)
+
     def test_negative_sentinels_preserved(self):
         """Virtual scratch IDs stay bounded without changing borrowed route metadata."""
         for dtype in (torch.int32, torch.int64):

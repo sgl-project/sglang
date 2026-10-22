@@ -567,11 +567,15 @@ def _merged_experts_fused_moe_lora_add_impl(
         assert lora_b.shape[2] > 0 and lora_b.shape[2] % 2 == 0
         assert output.shape[-1] == lora_b.shape[2]
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    num_routes = topk_ids.numel()
+    input_top_k = 1 if hidden_states.shape[0] == num_routes else topk_ids.shape[1]
     if adapter_enabled is not None:
         assert adapter_enabled.shape == (max_loras,)
         assert adapter_enabled.device == topk_ids.device
         assert adapter_enabled.dtype == torch.int32
+
+    if num_routes == 0:
+        return
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
         # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]

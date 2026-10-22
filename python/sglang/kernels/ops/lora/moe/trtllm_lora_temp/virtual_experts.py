@@ -488,7 +488,8 @@ def _merged_experts_fused_moe_lora_add_impl(
     # dim 1) while lora_b is per-expert, so take the max for the true global count.
     per_expert_dim = max(lora_a.shape[1], lora_b.shape[1])
     ep_local = local_num_experts is not None and local_num_experts < per_expert_dim
-    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    num_routes = topk_ids.numel()
+    input_top_k = 1 if hidden_states.shape[0] == num_routes else topk_ids.shape[1]
     if adapter_enabled is not None:
         assert adapter_enabled.shape == (max_loras,)
         assert adapter_enabled.dtype == torch.int32
@@ -698,6 +699,19 @@ def _merged_experts_fused_moe_lora_add_impl(
         assert intermediate_buffer is not None
         assert intermediate_buffer.ndim == 2
         assert intermediate_buffer.shape[0] == token_lora_mapping.shape[0]
+    if num_routes == 0:
+        if stage == "shrink":
+            if intermediate_buffer is not None:
+                return intermediate_buffer
+            return hidden_states.new_empty(
+                (token_lora_mapping.shape[0], topk_ids.shape[1], max_lora_rank)
+            )
+        if stage == "expand":
+            assert intermediate_buffer is not None, (
+                "stage='expand' requires intermediate_buffer"
+            )
+        return None
+
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
