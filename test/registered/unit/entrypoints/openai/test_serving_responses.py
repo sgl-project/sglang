@@ -43,7 +43,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
     _should_emit_normal_text_as_message,
 )
-from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -1466,9 +1466,7 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
-            instance.parse_non_stream_result.return_value = StreamingParseResult(
-                normal_text="trailing text", calls=[fake_call]
-            )
+            instance.parse_non_stream.return_value = ("trailing text", [fake_call])
             output_items = serving._make_response_output_items(
                 self._function_tool_request(),
                 "raw model output with <tool_call>",
@@ -1500,8 +1498,9 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
-            instance.parse_non_stream_result.return_value = StreamingParseResult(
-                normal_text="I'll check the weather.", calls=[fake_call]
+            instance.parse_non_stream.return_value = (
+                "I'll check the weather.",
+                [fake_call],
             )
             output_items = serving._make_response_output_items(
                 self._function_tool_request(),
@@ -1513,40 +1512,6 @@ class OutputItemsTestCase(CustomTestCase):
         types = [type(item).__name__ for item in output_items]
         self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
         self.assertEqual(output_items[0].phase, "commentary")
-
-    def test_beam_preserves_text_tool_text_order(self):
-        serving = self.serving
-        serving.reasoning_parser = "beam"
-        serving.tool_call_parser = "beam"
-        tokenizer = serving.tokenizer_manager.tokenizer
-        tokenizer.response_template = None
-        tokenizer.init_kwargs = {}
-        request = self._function_tool_request()
-        request._response_parser_prefix = "<|start|>assistant"
-        raw = (
-            "<|channel|>analysis<|message|>Check weather.<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>Before.<|end|>"
-            "<|start|>assistant to=get_weather<|channel|>analysis"
-            ' <|constrain|>xml<|message|><rfl:parameter name="city">'
-            "\nParis\n</rfl:parameter><|end|>"
-            "<|start|>assistant<|channel|>final<|message|>After.<|return|>"
-        )
-
-        items = serving._make_response_output_items(
-            request, raw, tokenizer, require_reasoning=True
-        )
-
-        self.assertEqual(
-            [item.type for item in items],
-            ["reasoning", "message", "function_call", "message"],
-        )
-        self.assertEqual(items[0].content[0].text, "Check weather.")
-        self.assertEqual(items[1].content[0].text, "Before.")
-        self.assertEqual(items[1].phase, "commentary")
-        self.assertEqual(items[2].name, "get_weather")
-        self.assertEqual(orjson.loads(items[2].arguments), {"city": "Paris"})
-        self.assertEqual(items[3].content[0].text, "After.")
-        self.assertEqual(items[3].phase, "final_answer")
 
     def test_required_tool_choice_parses_json_array_without_native_parser(self):
         serving = self.serving

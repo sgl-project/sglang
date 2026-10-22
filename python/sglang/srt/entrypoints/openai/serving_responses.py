@@ -1144,13 +1144,23 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             if required_json and content:
                 content, calls = self._parse_required_tool_json(content)
-            parts, incomplete_calls = [content, *calls], set()
+            incomplete_calls = set()
         else:
-            reasoning_content, parts, incomplete_calls = self._parse_text_output(
-                request, final_output, chat_tools, require_reasoning=require_reasoning
+            reasoning_content, content, calls, incomplete_calls = (
+                self._parse_text_output(
+                    request,
+                    final_output,
+                    chat_tools,
+                    require_reasoning=require_reasoning,
+                )
             )
         return self._output_items(
-            request, reasoning_content, parts, incomplete_calls, output_logprobs
+            request,
+            reasoning_content,
+            content,
+            calls,
+            incomplete_calls,
+            output_logprobs,
         )
 
     def _parse_text_output(
@@ -1160,9 +1170,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools: list[Tool],
         *,
         require_reasoning: bool,
-    ) -> tuple[Optional[str], list[str | ToolCallItem], set[int]]:
-        """The reasoning, then text and calls in output order, and the indices
-        of calls the output cut off."""
+    ) -> tuple[Optional[str], Any, list[ToolCallItem], set[int]]:
+        """The reasoning, content and calls, and the indices of calls the
+        output cut off."""
         tool_parsing = self._tool_parsing_active(request, chat_tools)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
@@ -1188,7 +1198,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         calls: list[ToolCallItem] = []
         parsed_via_native = False
         detector_owns_format = False
-        ordered_parts = None
         incomplete_calls = set()
         if content and self.tool_call_parser and tool_parsing:
             parser = FunctionCallParser(
@@ -1206,11 +1215,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
                 try:
-                    parsed = parser.parse_non_stream_result(
+                    content, calls = parser.parse_non_stream(
                         content, preserve_incomplete=True
                     )
-                    content, calls = parsed.normal_text, parsed.calls
-                    ordered_parts = parsed.ordered_parts
                     incomplete_calls = _incomplete_tool_call_indices(parser)
                     parsed_via_native = bool(calls)
                 except Exception as e:
@@ -1224,18 +1231,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             and not detector_owns_format
         ):
             content, calls = self._parse_required_tool_json(content)
-        parts = ordered_parts if ordered_parts is not None else [content, *calls]
-        return reasoning_content, parts, incomplete_calls
+        return reasoning_content, content, calls, incomplete_calls
 
     def _output_items(
         self,
         request: ResponsesRequest,
         reasoning_content: Optional[str],
-        parts: list[str | ToolCallItem],
+        content: Any,
+        calls: list[ToolCallItem],
         incomplete_calls: set[int],
         output_logprobs: Optional[list],
     ) -> list:
-        """Output items for the reasoning, then each text and call part."""
+        """Output items for the reasoning, the content and the calls."""
         output_items = []
         if reasoning_content:
             output_items.append(
@@ -1246,36 +1253,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     status="completed",
                 )
             )
-        custom_names = custom_tool_names(request.tools)
-        remaining_calls = sum(not isinstance(part, str) for part in parts)
-        for part in parts:
-            if not isinstance(part, str):
-                item = self._make_tool_call_item(
-                    part.name, part.parameters, custom_names, request._tool_state.names
-                )
-                if (
-                    isinstance(item, ResponseFunctionToolCall)
-                    and part.tool_index in incomplete_calls
-                ):
-                    item.status = "incomplete"
-                output_items.append(item)
-                remaining_calls -= 1
-                continue
-            if not part:
-                continue
-            # Region parsers may split adjacent text into several events.
-            if output_items and isinstance(output_items[-1], ResponseOutputMessage):
-                output_items[-1].content[0].text += part
-                continue
+        if content:
             output_text = ResponseOutputText(
-                text=part,
+                text=content,
                 annotations=[],
                 type="output_text",
                 # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
-                phase="commentary" if remaining_calls else "final_answer",
+                phase="commentary" if calls else "final_answer",
                 id=f"msg_{random_uuid()}",
                 content=[output_text],
                 role="assistant",
@@ -1283,8 +1270,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
-            # Preserve the existing all-generated-token logprobs payload once.
-            output_logprobs = None
+        custom_names = custom_tool_names(request.tools)
+        for call in calls:
+            item = self._make_tool_call_item(
+                call.name, call.parameters, custom_names, request._tool_state.names
+            )
+            if (
+                isinstance(item, ResponseFunctionToolCall)
+                and call.tool_index in incomplete_calls
+            ):
+                item.status = "incomplete"
+            output_items.append(item)
         return output_items
 
     @staticmethod
@@ -2400,7 +2396,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item(*, phase="final_answer"):
+        def _close_message_item():
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -2413,7 +2409,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
-                phase=phase,
+                phase="final_answer",
             )
             events = [
                 openai_responses_types.ResponseTextDoneEvent(
@@ -2654,27 +2650,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not delta and not flush and not token_calls:
                     continue
 
-                ordered_parts = None
-                if token_stream is not None:
+                if isinstance(tool_parser, JsonArrayParser):
+                    sp = tool_parser.parse_streaming_increment(delta, chat_tools)
+                    normal_text, tool_calls = sp.normal_text or "", sp.calls
+                    if flush:
+                        end = tool_parser.finish(chat_tools)
+                        normal_text += end.normal_text
+                        tool_calls = list(tool_calls) + end.calls
+                elif token_stream is not None:
                     normal_text, tool_calls = delta, token_calls
                 elif tool_parser is not None and not self._answer_started(
                     reasoning_parser_obj
                 ):
-                    if isinstance(tool_parser, JsonArrayParser):
-                        parsed = tool_parser.parse_streaming_increment(
-                            delta, chat_tools
-                        )
-                        end = tool_parser.finish(chat_tools) if flush else None
-                    else:
-                        parsed = tool_parser.parse_stream_chunk_result(delta)
-                        end = tool_parser.parse_stream_end_result() if flush else None
-                    normal_text, tool_calls = parsed.normal_text, list(parsed.calls)
-                    ordered_parts = parsed.ordered_parts
-                    if end is not None:
-                        normal_text += end.normal_text
-                        tool_calls.extend(end.calls)
-                        if ordered_parts is not None:
-                            ordered_parts = [*ordered_parts, *(end.ordered_parts or [])]
+                    normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
+                    if flush:
+                        end_text, end_calls = tool_parser.parse_stream_end()
+                        normal_text = (normal_text or "") + end_text
+                        tool_calls = list(tool_calls) + end_calls
                 else:
                     normal_text, tool_calls = delta, []
 
@@ -2685,8 +2677,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_reasoning_item():
                                 yield ev
                         if message_state["open"]:
-                            for ev in _close_message_item(phase="commentary"):
+                            for ev in _close_message_item():
                                 yield ev
+
+                    if calls:
+                        for item in emitted_items:
+                            if isinstance(item, ResponseOutputMessage):
+                                item.phase = "commentary"
 
                     for call in calls:
                         tool_index = call.tool_index
@@ -2827,17 +2824,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             delta=normal_text,
                             logprobs=[],
                         )
-
-                if ordered_parts is not None:
-                    for part in ordered_parts:
-                        if isinstance(part, str):
-                            normal_text = part
-                            for ev in _emit_normal_text():
-                                yield ev
-                        else:
-                            for ev in _emit_tool_calls([part]):
-                                yield ev
-                    continue
 
                 # The parser's (text, calls) tuple is unordered, but positions
                 # are recoverable: continuing arguments precede this delta's

@@ -442,7 +442,6 @@ class ResponseTemplateStreamAdapter:
         on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
         on_tool_dropped: Callable[[], None] | None = None,
-        on_text: Callable[[str], None] | None = None,
     ) -> str:
         """Route tool regions to the callbacks and return the passthrough text.
 
@@ -463,13 +462,9 @@ class ResponseTemplateStreamAdapter:
             etype = event["type"]
             if field == _PASSTHROUGH_FIELD and etype == "region_chunk":
                 normal_parts.append(event["text"])
-                if on_text is not None:
-                    on_text(event["text"])
             elif field == _CONTENT_FIELD and etype == "region_open":
                 # The answer's opener stays text, like the answer after it.
                 normal_parts.append(self._generated_text(event))
-                if on_text is not None:
-                    on_text(normal_parts[-1])
             elif field != _TOOL_FIELD or etype == "region_chunk":
                 continue
             elif etype == "region_open":
@@ -865,24 +860,18 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         adapter = self._new_adapter()
         tool_indices = self._get_tool_indices(tools)
         calls: list[ToolCallItem] = []
-        ordered_parts: list[str | ToolCallItem] = []
 
         def on_close(value: Any) -> bool:
             items = self._to_tool_call_items(value, tool_indices, len(calls))
             if not items:
                 return False
             calls.extend(items)
-            ordered_parts.extend(items)
             return True
 
         normal_text = adapter.route_tool_events(
-            adapter.parse(text, tools),
-            on_tool_close=on_close,
-            on_text=ordered_parts.append,
+            adapter.parse(text, tools), on_tool_close=on_close
         )
-        return ToolStreamingParseResult(
-            normal_text=normal_text, calls=calls, ordered_parts=ordered_parts
-        )
+        return ToolStreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -899,13 +888,11 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             self._tool_indices = self._get_tool_indices(tools)
         tool_indices = self._tool_indices
         pending_calls: list[ToolCallItem] = []
-        ordered_parts: list[str | ToolCallItem] = []
 
         def on_open(name: str) -> bool:
             if name not in tool_indices and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return False
             self._emit_tool_name(name, pending_calls)
-            ordered_parts.append(pending_calls[-1])
             return True
 
         def on_close(value: Any) -> bool:
@@ -916,7 +903,6 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
                 return False
             for item in items:
                 self._emit_tool_call(item, pending_calls)
-                ordered_parts.append(pending_calls[-1])
             return True
 
         normal_text = self._adapter.route_tool_events(
@@ -924,11 +910,8 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             on_tool_open=on_open,
             on_tool_close=on_close,
             on_tool_dropped=self._drop_streamed_tool_call,
-            on_text=ordered_parts.append,
         )
-        return ToolStreamingParseResult(
-            normal_text=normal_text, calls=pending_calls, ordered_parts=ordered_parts
-        )
+        return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
     def supports_structural_tag(self) -> bool:
         return False

@@ -15,7 +15,7 @@ from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -180,59 +180,45 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str, *, preserve_incomplete: bool = False
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
         Args:
             full_text: The complete text to parse
+            preserve_incomplete: Keep a call that a response-template parser
+                recognized but the text cut off, as streaming does
 
         Returns:
             A tuple containing:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        result = self.parse_non_stream_result(full_text)
-        return result.normal_text, result.calls
-
-    def parse_non_stream_result(
-        self, full_text: str, *, preserve_incomplete: bool = False
-    ) -> StreamingParseResult:
-        """Parse full output with optional ordering and retained cutoff calls.
-
-        Responses opts into the streaming lifecycle for template parsers so
-        recognized but unfinished calls survive. Tuple callers keep the legacy
-        full-parse behavior.
-        """
         if not self.tools:
-            return StreamingParseResult(normal_text=full_text)
+            return full_text, []
         if preserve_incomplete and isinstance(
             self.detector, ResponseTemplateToolDetector
         ):
-            parsed = self.parse_stream_chunk_result(full_text)
-            end = self.parse_stream_end_result()
-            calls = {}
-            parts = []
-            for part in [*parsed.ordered_parts, *end.ordered_parts]:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif part.tool_index not in calls:
-                    calls[part.tool_index] = part.model_copy()
-                    parts.append(calls[part.tool_index])
+            normal_text, streamed = self.parse_stream_chunk(full_text)
+            end_text, end_calls = self.parse_stream_end()
+            calls: dict[int, ToolCallItem] = {}
+            for call in [*streamed, *end_calls]:
+                if call.tool_index not in calls:
+                    calls[call.tool_index] = call.model_copy()
                 else:
-                    call = calls[part.tool_index]
-                    call.name = part.name or call.name
-                    call.parameters += part.parameters
-            return StreamingParseResult(
-                normal_text=parsed.normal_text + end.normal_text,
-                calls=list(calls.values()),
-                ordered_parts=parts,
-            )
+                    merged = calls[call.tool_index]
+                    merged.name = call.name or merged.name
+                    merged.parameters += call.parameters
+            return normal_text + end_text, list(calls.values())
         has_tool_call = self.detector.has_tool_call(full_text)
-        result = self.detector.detect_and_parse(full_text, self.tools)
-        if result.calls or has_tool_call:
-            return result
-        return StreamingParseResult(normal_text=full_text)
+        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        tool_call_list = parsed_result.calls
+        if tool_call_list or has_tool_call:
+            return parsed_result.normal_text, tool_call_list
+        else:
+            return full_text, []
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
@@ -246,14 +232,19 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        result = self.parse_stream_chunk_result(chunk_text)
-        return result.normal_text, result.calls
-
-    def parse_stream_chunk_result(self, chunk_text: str) -> StreamingParseResult:
-        """Parse a chunk without discarding optional text/tool ordering."""
         if not self.tools:
-            return StreamingParseResult(normal_text=chunk_text)
-        return self.detector.parse_streaming_increment(chunk_text, self.tools)
+            return chunk_text, []
+        final_normal_text = ""
+        final_calls = []
+
+        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        if sp_result.normal_text:
+            final_normal_text = sp_result.normal_text
+        if sp_result.calls:
+            final_calls.extend(sp_result.calls)
+            final_normal_text = sp_result.normal_text
+
+        return final_normal_text, final_calls
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -261,14 +252,10 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        result = self.parse_stream_end_result()
-        return result.normal_text, result.calls
-
-    def parse_stream_end_result(self) -> StreamingParseResult:
-        """Flush the parser, retaining optional text/tool ordering."""
         if not self.tools:
-            return StreamingParseResult()
-        return self.detector.finish(self.tools)
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     @property
     def supports_abort_flush(self) -> bool:

@@ -78,11 +78,8 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertEqual(calls, [])
 
         parser = FunctionCallParser([_tool()], "beam", prefix=PREFIX)
-        result = parser.parse_non_stream_result(text, preserve_incomplete=True)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, "")
-        self.assertEqual(result.ordered_parts, result.calls)
+        _, calls = parser.parse_non_stream(text, preserve_incomplete=True)
+        self.assertEqual([(call.name, call.parameters) for call in calls], [("get_weather", "")])
         self.assertEqual(parser.detector.incomplete_tool_call_indices, {0})
 
     def test_reasoning_and_final_content(self):

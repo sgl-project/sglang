@@ -276,7 +276,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     [i["status"] for i in full["output"]],
                 )
 
-    def test_beam_text_tool_text_matches_full_response_across_chunks(self):
+    def test_beam_output_matches_full_response_across_chunks(self):
         serving = make_serving()
         serving.reasoning_parser = "beam"
         serving.tool_call_parser = "beam"
@@ -300,14 +300,22 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             ],
         )
         request._response_parser_prefix = "<|start|>assistant"
-        raw = (
-            "<|channel|>analysis<|message|>Check weather.<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>Before.<|end|>"
-            "<|start|>assistant to=get_weather<|channel|>analysis"
-            ' <|constrain|>xml<|message|><rfl:parameter name="city">'
-            "Paris</rfl:parameter><|end|>"
-            "<|start|>assistant<|channel|>final<|message|>After.<|return|>"
+        reasoning = "<|channel|>analysis<|message|>Check weather.<|end|><|start|>assistant"
+        call = (
+            " to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+            '<rfl:parameter name="city">\n{}\n</rfl:parameter>'
         )
+        outputs = {
+            reasoning
+            + call.format("Paris")
+            + "<|end|><|start|>assistant"
+            + call.format("Rome")
+            + "<|call|>": ["reasoning", "function_call", "function_call"],
+            reasoning + "<|channel|>final<|message|>Sunny.<|return|>": [
+                "reasoning",
+                "message",
+            ],
+        }
 
         def semantic(items):
             return [
@@ -321,53 +329,53 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                 for item in items
             ]
 
-        full = serving._make_response_output_items(
-            request, raw, tokenizer, require_reasoning=True
-        )
-        self.assertEqual(
-            [i.type for i in full], ["reasoning", "message", "function_call", "message"]
-        )
-        expected = semantic([i.model_dump() for i in full])
-        # A single engine chunk, character-wise output, and every two-way split
-        # exercise both complete regions and partial control/XML delimiters.
-        boundaries = [[len(raw)], list(range(1, len(raw) + 1))]
-        boundaries.extend([split, len(raw)] for split in range(1, len(raw)))
-        for ends in boundaries:
-            with self.subTest(ends=ends if len(ends) == 2 else len(ends)):
-                events = StreamFixture(serving, request, require_reasoning=True).run(
-                    [
-                        engine_chunk(raw[:end], end, finish=end == len(raw))
-                        for end in ends
+        for raw, kinds in outputs.items():
+            full = serving._make_response_output_items(
+                request, raw, tokenizer, require_reasoning=True
+            )
+            self.assertEqual([i.type for i in full], kinds)
+            expected = semantic([i.model_dump() for i in full])
+            # A single engine chunk, character-wise output, and every two-way
+            # split exercise both complete regions and partial control/XML
+            # delimiters.
+            boundaries = [[len(raw)], list(range(1, len(raw) + 1))]
+            boundaries.extend([split, len(raw)] for split in range(1, len(raw)))
+            for ends in boundaries:
+                with self.subTest(raw=raw, ends=ends if len(ends) == 2 else len(ends)):
+                    events = StreamFixture(serving, request, require_reasoning=True).run(
+                        [
+                            engine_chunk(raw[:end], end, finish=end == len(raw))
+                            for end in ends
+                        ]
+                    )
+                    payloads = event_payloads(events)
+                    output = find_completed_event(events)["response"]["output"]
+                    self.assertEqual(semantic(output), expected)
+                    done = [
+                        p["item"]
+                        for p in payloads
+                        if p["type"] == "response.output_item.done"
                     ]
-                )
-                payloads = event_payloads(events)
-                output = find_completed_event(events)["response"]["output"]
-                self.assertEqual(semantic(output), expected)
-                done = [
-                    p["item"]
-                    for p in payloads
-                    if p["type"] == "response.output_item.done"
-                ]
-                self.assertEqual(semantic(done), expected)
-                self.assertEqual(
-                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
-                )
-                for index, item in enumerate(output):
-                    deltas = [p for p in payloads if p.get("output_index") == index]
-                    if item["type"] == "message":
-                        text = "".join(
-                            p["delta"]
-                            for p in deltas
-                            if p["type"] == "response.output_text.delta"
-                        )
-                        self.assertEqual(text, item["content"][0]["text"])
-                    elif item["type"] == "function_call":
-                        args = "".join(
-                            p["delta"]
-                            for p in deltas
-                            if p["type"] == "response.function_call_arguments.delta"
-                        )
-                        self.assertEqual(args, item["arguments"])
+                    self.assertEqual(semantic(done), expected)
+                    self.assertEqual(
+                        [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                    )
+                    for index, item in enumerate(output):
+                        deltas = [p for p in payloads if p.get("output_index") == index]
+                        if item["type"] == "message":
+                            text = "".join(
+                                p["delta"]
+                                for p in deltas
+                                if p["type"] == "response.output_text.delta"
+                            )
+                            self.assertEqual(text, item["content"][0]["text"])
+                        elif item["type"] == "function_call":
+                            args = "".join(
+                                p["delta"]
+                                for p in deltas
+                                if p["type"] == "response.function_call_arguments.delta"
+                            )
+                            self.assertEqual(args, item["arguments"])
 
     def test_reasoning_content_part_lifecycle_matches_terminal_output(self):
         for finish_reason, status, suffix in (
@@ -827,14 +835,20 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             engine_chunk(" " * 14, 14, finish=True),
         ]
 
+        script_iter = iter(scripted)
+
+        def fake_parse_stream_chunk(delta):
+            sp = next(script_iter)
+            return sp.normal_text, sp.calls
+
         with patch(
             "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             parser_cls.return_value.detector.supports_structural_tag.return_value = True
-            parser_cls.return_value.parse_stream_chunk_result.side_effect = scripted
-            parser_cls.return_value.parse_stream_end_result.return_value = (
-                StreamingParseResult()
+            parser_cls.return_value.parse_stream_chunk.side_effect = (
+                fake_parse_stream_chunk
             )
+            parser_cls.return_value.parse_stream_end.return_value = ("", [])
             fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 
