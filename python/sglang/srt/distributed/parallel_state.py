@@ -252,21 +252,15 @@ def reg_all_to_all_single(
 
 
 @dataclass
-class _DeviceGroupRebuildSpec:
-    """Resolved parameters needed to rebuild a GroupCoordinator's device_group.
+class _DeviceGroupSnapshot:
+    """Resolved parameters for rebuilding a GroupCoordinator's device_group.
 
-    Snapshotted at the END of GroupCoordinator.__init__, i.e. after every
-    constructor transformation (rank_offset shift, use_local_synchronization
-    derivation, backend resolution), so restore replays final values instead
-    of re-deriving them. Used by NPU sleep-mode comm cleanup
-    (release_memory_occupation/resume_memory_occupation with the "comm" tag).
+    Snapshotted at the END of ``__init__``, after every constructor
+    transformation, so a rebuild replays final values instead of re-deriving.
     """
 
-    # FULL post-shift subgroup list, not just this rank's own subgroup:
-    # torch.distributed.new_group requires every rank in the world to enter
-    # with the same group list in the same order (group names come from a
-    # process-level counter, so replaying only own subgroups would collide
-    # store prefixes across disjoint subgroups).
+    # Full post-shift subgroup list: new_group must be entered by every world
+    # rank with the same list, in the same order.
     group_ranks: List[List[int]]
     backend: str  # resolved torch_distributed_backend (e.g. "hccl")
     group_name: str  # resolved group_name (defaults to "anonymous")
@@ -591,18 +585,16 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
-        # Snapshot for sleep-mode comm cleanup (NPU "comm" tag). Captured here,
-        # after all constructor transformations, so restore replays final
-        # values. Mooncake-backend groups and elastic-EP joiner groups
-        # (recovered_rank / rank_offset > 0) are excluded from comm cleanup.
+        # Snapshot for sleep-mode comm cleanup; Mooncake and elastic-EP joiner
+        # groups cannot be replayed by the process-level new_group counter.
         if (
             "mooncake" in str(torch_distributed_backend)
             or recovered_rank
             or rank_offset > 0
         ):
-            self._rebuild_spec: Optional[_DeviceGroupRebuildSpec] = None
+            self._device_group_snapshot: Optional[_DeviceGroupSnapshot] = None
         else:
-            self._rebuild_spec = _DeviceGroupRebuildSpec(
+            self._device_group_snapshot = _DeviceGroupSnapshot(
                 group_ranks=[list(ranks) for ranks in group_ranks],
                 backend=str(torch_distributed_backend),
                 group_name=group_name,
@@ -611,7 +603,6 @@ class GroupCoordinator:
                 timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
                 pg_options=get_torch_distributed_pg_options(group_name),
             )
-        self._released_comm_attrs: List[str] = []
 
     def __repr__(self):
         return (
@@ -2155,66 +2146,37 @@ class GroupCoordinator:
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
-    # ------------------------------------------------------------------
-    # Sleep-mode comm cleanup (NPU "comm" tag)
-    # ------------------------------------------------------------------
+    # Device group lifecycle (used by platform sleep-mode comm cleanup).
 
-    def release_device_comm(self) -> bool:
-        """Destroy device-side communication resources, keeping cpu_group.
+    @property
+    def can_rebuild_device_group(self) -> bool:
+        """Whether this group carries a replayable device group snapshot."""
+        return self._device_group_snapshot is not None
 
-        cpu_group and mq_broadcaster are intentionally retained: they are a
-        pure CPU/shared-memory control plane holding no device memory, and the
-        cross-rank barriers used by the sleep/wake orchestration run on them.
-        Communicators bound to cpu_group (pynccl/mscclpp/ca/qr/symm_mem) are
-        CUDA/HIP paths that never coexist with NPU comm cleanup, so they are
-        left untouched as well.
+    @property
+    def rebuild_group_ranks(self) -> Optional[List[List[int]]]:
+        """The full subgroup list a rebuild will replay, or None."""
+        if self._device_group_snapshot is None:
+            return None
+        return self._device_group_snapshot.group_ranks
 
-        Idempotent: returns False when there is nothing to release (e.g. the
-        group is excluded from comm cleanup or already released).
+    def destroy_device_group(self) -> bool:
+        """Destroy only the device group; cpu_group/mq_broadcaster are retained
+        as the cross-rank control plane. Idempotent: False when nothing to do.
         """
-        if self._rebuild_spec is None:
-            logger.info(
-                f"Group {self.unique_name}: skipped in comm cleanup "
-                "(mooncake or elastic-EP group)."
-            )
+        if self._device_group_snapshot is None or self.device_group is None:
             return False
-        if self.device_group is None:
-            return False
-        # Communicators referencing device_group must go first.
-        for attr in (
-            "pcie_ipc_comm",
-            "npu_communicator",
-            "hpu_communicator",
-            "xpu_communicator",
-        ):
-            comm = getattr(self, attr, None)
-            if comm is None:
-                continue
-            destroy_fn = getattr(comm, "destroy", None)
-            close_fn = getattr(comm, "close", None)
-            if callable(destroy_fn):
-                destroy_fn()
-            elif callable(close_fn):
-                close_fn()
-            setattr(self, attr, None)
-            self._released_comm_attrs.append(attr)
         torch.distributed.destroy_process_group(self.device_group)
         self.device_group = None
         return True
 
-    def restore_device_comm(self) -> bool:
-        """Rebuild device_group from the snapshot and recreate the
-        communicators that existed before release_device_comm().
-
-        Idempotent: returns False when the device group is already present.
-        """
-        if self._rebuild_spec is None or self.device_group is not None:
+    def rebuild_device_group(self) -> bool:
+        """Replay the snapshot to rebuild device_group. Idempotent."""
+        if self._device_group_snapshot is None or self.device_group is not None:
             return False
-        spec = self._rebuild_spec
-        # Replay the FULL subgroup list exactly like __init__ does: every
-        # world rank must enter new_group for every subgroup in the same
-        # order (non-members get NON_GROUP_MEMBER), otherwise group names
-        # (from a process-level counter) collide across disjoint subgroups.
+        spec = self._device_group_snapshot
+        # Replay every subgroup, exactly like __init__: group names come from a
+        # process-level counter, so the order must match across ranks.
         for ranks in spec.group_ranks:
             device_group = torch.distributed.new_group(
                 ranks,
@@ -2230,45 +2192,7 @@ class GroupCoordinator:
             f"Group {self.unique_name}: rank {self.rank} not found in "
             f"rebuild group_ranks={spec.group_ranks}"
         )
-        for attr in self._released_comm_attrs:
-            self._rebuild_device_comm(attr)
-        self._released_comm_attrs = []
         return True
-
-    def _rebuild_device_comm(self, attr: str) -> None:
-        """Recreate one device-group-bound communicator destroyed by
-        release_device_comm(). Only reached for communicators that actually
-        existed before release (recorded in _released_comm_attrs)."""
-        if attr == "npu_communicator":
-            from sglang.srt.distributed.device_communicators.npu_communicator import (
-                NpuCommunicator,
-            )
-
-            self.npu_communicator = NpuCommunicator(group=self.device_group)
-        elif attr == "hpu_communicator":
-            from sglang.srt.distributed.device_communicators.hpu_communicator import (
-                HpuCommunicator,
-            )
-
-            self.hpu_communicator = HpuCommunicator(group=self.device_group)
-        elif attr == "xpu_communicator":
-            from sglang.srt.distributed.device_communicators.xpu_communicator import (
-                XpuCommunicator,
-            )
-
-            self.xpu_communicator = XpuCommunicator(group=self.device_group)
-        elif attr == "pcie_ipc_comm":
-            from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
-                PcieIpcCommunicator,
-            )
-
-            self.pcie_ipc_comm = PcieIpcCommunicator(
-                group=self.device_group,
-                device=self.device,
-                cpu_group=self.cpu_group,
-            )
-        else:
-            raise ValueError(f"Unknown device communicator attribute: {attr}")
 
 
 def _group_coordinator_device(local_rank: int) -> torch.device:
@@ -2290,6 +2214,16 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
 
 
 _WORLD: Optional[GroupCoordinator] = None
+
+
+def get_all_groups() -> List[GroupCoordinator]:
+    """All still-alive registered GroupCoordinators, unsorted."""
+    groups = []
+    for ref in _groups.values():
+        group = ref()
+        if group is not None:
+            groups.append(group)
+    return groups
 
 
 def get_world_group() -> GroupCoordinator:

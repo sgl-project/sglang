@@ -1,15 +1,8 @@
 """NPU CI test for sleep-mode comm cleanup with EAGLE3 speculative decoding.
 
-Spec decoding keeps extra CUDA graphs OUTSIDE the target model runner: the
-inner EagleDraftWorker's own draft-decode / draft-extend graph runners. A
-sleep must drop those too (they embed HCCL comm buffer addresses), and the
-wake must recapture them on the rebuilt communicators — otherwise the first
-post-wake draft replay hits a destroyed comm and hangs or corrupts output.
-
-Verification is end-to-end: greedy spec-decoded output must be bit-identical
-before and after both a full sleep/wake and a comm-only sleep/wake (spec
-decoding is lossless, so any stale-graph or stale-comm symptom shows up as
-a hang (request timeout) or a text diff).
+Spec decoding keeps extra graphs on the inner EagleDraftWorker, which the sleep
+must drop and the wake must recapture. Greedy spec-decoded output must be
+bit-identical across full and comm-only sleep/wake cycles.
 
 Usage:
 python3 -m unittest test_sleep_comm_cleanup_eagle

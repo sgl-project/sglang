@@ -252,9 +252,8 @@ class NemotronHMoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
-        # Scalar rank/size come from the GroupCoordinator (identity-stable):
-        # caching the raw device_group PG would dangle after NPU sleep-mode
-        # comm cleanup swaps it in place.
+        # Scalars come from the GroupCoordinator: caching the raw PG would
+        # dangle after comm cleanup swaps it in place.
         ep_coordinator = get_parallel().moe_ep_group
         self.ep_rank = ep_coordinator.rank_in_group
         self.ep_size = ep_coordinator.world_size

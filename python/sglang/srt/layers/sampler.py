@@ -116,10 +116,8 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        # Cache the GroupCoordinator (stable identity), not the raw
-        # ProcessGroup: NPU sleep-mode comm cleanup ("comm" tag) swaps
-        # device_group in place, so a cached raw PG would dangle after wake.
-        # The tp_sync_group/cp_sync_group properties resolve the live PG.
+        # Cache the GroupCoordinator, not the raw PG: comm cleanup swaps
+        # device_group in place. The properties below resolve the live PG.
         self._tp_sync_pg_source = get_parallel().tp_group
         self._cp_sync_pg_source = None
         if is_dp_attention_enabled():
@@ -142,15 +140,14 @@ class Sampler(nn.Module):
 
     @property
     def tp_sync_group(self):
-        # Resolved per use: after a sleep/wake cycle this is the rebuilt PG.
+        # Resolved per use, so it is the rebuilt PG after a sleep/wake cycle.
         if self._tp_sync_pg_source is None:
             return None
         return self._tp_sync_pg_source.device_group
 
     @tp_sync_group.setter
     def tp_sync_group(self, value):
-        # Tests clear the sync group with None; a live PG must come from the
-        # coordinator, so only None is assignable here.
+        # Only None (used by tests to clear it) is assignable.
         if value is not None:
             raise AttributeError(
                 "tp_sync_group is resolved from _tp_sync_pg_source; "

@@ -166,8 +166,7 @@ def _get_deepep_comm_group(a2a_backend):
         return get_parallel().tp_group
 
     if a2a_backend.is_deepep():
-        # DeepEPDispatcher keeps the GroupCoordinator (identity-stable across
-        # NPU sleep-mode comm cleanup) and resolves device_group per use.
+        # DeepEPDispatcher resolves device_group per use.
         return get_parallel().moe_ep_group if _is_npu else get_parallel().tp_group
 
     if _is_npu:

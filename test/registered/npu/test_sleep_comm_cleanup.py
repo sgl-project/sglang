@@ -1,28 +1,8 @@
-"""NPU CI test for sleep-mode comm cleanup (the ``comm`` memory-occupation tag).
+"""NPU CI test for sleep-mode comm cleanup (the ``comm`` tag).
 
-Launches tp=2 servers with the memory saver enabled and drives the
-/release_memory_occupation and /resume_memory_occupation endpoints:
-
-  * ``comm``-only sleep must free HCCL communicator device buffers
-    (destroy_process_group -> hcclCommDestroy) and the matching wake must
-    rebuild the communicators and recapture the graphs so inference keeps
-    working;
-  * a full (tag-less) sleep includes ``comm`` on NPU; greedy output must be
-    bit-identical before and after the cycle (weights CPU backup + recaptured
-    graphs + rebuilt comms);
-  * legacy clients resuming with the pre-comm triple
-    [weights, kv_cache, cuda_graph] still get a complete wake (comm is
-    auto-included);
-  * invalid resumes (unreleased tag, missing still-offloaded dependencies)
-    are rejected with HTTP 400 while the server stays alive;
-  * repeated sleep/wake cycles return device memory to the baseline band
-    (no leak, graphs really recaptured — an eager fallback would leave
-    memory well below baseline);
-  * with graphs disabled, the comm-only delta isolates pure HCCL buffers.
-
-Not covered here (see PR description for the manual checklist): DeepEP/MoE
-dispatcher buffer rebuild, MindSpore gate, adaptive-spec and dflash/dspark
-hook idempotency, cross-rank recapture-failure vote.
+Drives /release_memory_occupation and /resume_memory_occupation on tp=2
+servers: comm-only and full sleep/wake, legacy resume, invalid resumes (400)
+and repeated cycles (no leak, graphs really recaptured).
 
 Usage:
 python3 -m unittest test_sleep_comm_cleanup.TestSleepCommCleanup
@@ -55,18 +35,13 @@ if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
 
 _MIB = 1 << 20
-# A comm-only sleep destroys every device-side HCCL communicator of the
-# server. Each communicator holds HCCL_BUFFSIZE (default ~200MB) of device
-# buffers and even a dense tp=2 server owns several of them (tp, world, ...),
-# so per-card usage must drop well above this floor.
+# Each HCCL communicator holds ~200MB of device buffers, so a comm-only sleep
+# must free well above this floor.
 COMM_RELEASE_MIN_DELTA_MB = 100
-# A tag-less sleep additionally pauses weights + kv_cache, so the drop is far
-# larger; keep a conservative floor.
+# A tag-less sleep also pauses weights + kv_cache; keep a conservative floor.
 FULL_RELEASE_MIN_DELTA_MB = 500
-# After a successful wake the device usage must return near the pre-sleep
-# baseline: recaptured graphs + restored weights re-occupy their memory. If
-# recapture silently failed (eager fallback) usage would stay well below the
-# band; a leak would push it above.
+# After wake, usage should return near the pre-sleep baseline: far below means
+# recapture silently fell back to eager, far above means a leak.
 WAKE_BASELINE_TOL_MB = 400
 
 _GREEDY_PROMPT = "Where is the capital of France?"
@@ -79,8 +54,7 @@ def _device_used_mb():
 
 
 def _post(base_url, endpoint, payload=None):
-    # Timeout matters: a regression that kills or wedges the scheduler must
-    # fail the test fast instead of hanging the CI job forever.
+    # Timeout so a wedged scheduler fails fast instead of hanging CI.
     return requests.post(f"{base_url}{endpoint}", json=payload or {}, timeout=300)
 
 
@@ -113,9 +87,7 @@ class TestSleepCommCleanup(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # Graph capture stays enabled on purpose: the comm tag implies graph
-        # destruction on sleep and recapture on wake, which this test
-        # exercises end to end.
+        # Graph capture stays enabled: the comm tag implies drop + recapture.
         cls.process = popen_launch_server(
             QWEN3_0_6B_WEIGHTS_PATH,
             cls.base_url,
@@ -131,10 +103,8 @@ class TestSleepCommCleanup(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--enable-memory-saver",
-                # Required for test_2: without the CPU backup a full sleep
-                # DISCARDS the weights and a wake cannot produce correct
-                # output (that is the documented RL flow: reload weights
-                # after wake). With the backup, weights survive the cycle.
+                # Required: without the CPU backup a full sleep discards the
+                # weights and wake cannot produce correct output.
                 "--enable-weights-cpu-backup",
                 "--disable-radix-cache",
             ],
@@ -145,10 +115,9 @@ class TestSleepCommCleanup(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_1_comm_only_sleep_wake(self):
-        """comm tag: communicators are destroyed on sleep and rebuilt on wake
-        (with graph recapture), and inference is correct again. The memory
-        delta here intentionally includes dropped graph memory; the pure
-        HCCL share is isolated in TestSleepCommCleanupNoGraph."""
+        """comm tag: comms are destroyed on sleep, rebuilt on wake, and
+        inference is correct again. The delta also includes dropped graphs; the
+        pure HCCL share is isolated in TestSleepCommCleanupNoGraph."""
         _assert_generate_works(self, self.base_url)
 
         used_before_mb = _device_used_mb()
