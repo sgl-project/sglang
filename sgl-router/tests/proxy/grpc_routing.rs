@@ -791,7 +791,7 @@ mod native {
         reorg: bool,
         proxy: Proxy,
     ) -> Arc<AppContext> {
-        super::router_ctx_with_ranks(workers, reorg, proxy, 2)
+        router_ctx_with_ranks(workers, reorg, proxy, 2)
     }
 
     async fn serve_grpc(ctx: Arc<AppContext>) -> SglangServiceClient<Channel> {
@@ -1070,10 +1070,20 @@ mod native {
             conflict: sgl_router::config::ConflictPolicy::Allow,
         };
         let mut client = serve_grpc(ctx).await;
-        let request = serde_json::from_value::<proto::GenerateRequest>(json!({
-            "text": "hello world", "sampling_params": {"temperature": 0.5}
-        }))
-        .unwrap();
+        let request = proto::GenerateRequest {
+            text: Some(proto::StringOrList {
+                value: Some(proto::string_or_list::Value::One("hello world".into())),
+            }),
+            sampling_params: Some(proto::SamplingParamsOrList {
+                value: Some(proto::sampling_params_or_list::Value::One(
+                    proto::SamplingParams {
+                        temperature: Some(0.5),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
         collect(client.generate(request).await).await.unwrap();
         let sent = serde_json::to_value(seen.last().await).unwrap();
         assert_eq!(sent["input_ids"], json!(expected));

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The engine's native gRPC interface (`sglang.runtime.v1.SglangService`),
+//! Native `api.v1.Generate` and the existing `runtime.v1.SglangService`,
 //! served so a gRPC client can point at the router or at an engine. Each served
 //! RPC is routed like its HTTP route and forwarded to the same RPC on an engine.
 
