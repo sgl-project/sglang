@@ -2064,8 +2064,10 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             cache_request_handle=req_id,
             prefix_len=live.device_prefix_len,
             last_node=live.last_device_node,
+            storage_prefetch_last_match_len=None,
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        self.assertEqual(req.storage_prefetch_last_match_len, live.device_prefix_len)
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
