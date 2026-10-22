@@ -519,22 +519,23 @@ class AscendAttnBackend(AttentionBackend):
         block_tables: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP."""
+        parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
                 kv_lens_cpu,
                 self.speculative_num_draft_tokens,
-                self.dcp_size,
-                self.dcp_rank,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
                 interleave_size=self.page_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
-                self.dcp_size,
-                self.dcp_rank,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
                 interleave_size=self.page_size,
             ).int()
-        page_stride = self.page_size * self.dcp_size
+        page_stride = self.page_size * parallel.attn_dcp_size
         if block_tables is None:
             if self.use_dsa:
                 max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
