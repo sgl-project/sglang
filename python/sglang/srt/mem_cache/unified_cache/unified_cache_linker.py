@@ -237,7 +237,6 @@ class ExternalCacheHitMarker(NamedTuple):
 
 @dataclass
 class _ExternalCachePrefetch:
-    request: CacheRequestHandle
     key: RadixKey
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
@@ -419,7 +418,6 @@ class UnifiedCacheLinkerWrapper:
             return
         end = start + pages * page
         state = _ExternalCachePrefetch(
-            request,
             key[:end],
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
@@ -521,13 +519,6 @@ class UnifiedCacheLinkerWrapper:
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
-            try:
-                publish = (
-                    publish and not state.future.cancelled() and state.future.result()
-                )
-            except Exception:
-                logger.warning("Mooncake prefetch failed", exc_info=True)
-                publish = False
         end = len(state.key)
         try:
             if not publish:
@@ -563,8 +554,8 @@ class UnifiedCacheLinkerWrapper:
                     component_evicted_seqlens=evicted,
                 )
             )
-            self.cache.prefetch_loaded_tokens_by_reqid[state.request] = len(full)
-            self.cache.prefetch_loaded_storage_start_by_reqid[state.request] = start
+            self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
+            self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
@@ -817,6 +808,9 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._clear_state()
+
+    def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
@@ -824,9 +818,6 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
-        self._release_pending_offloads()
-
-    def _release_pending_offloads(self) -> None:
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False
@@ -848,10 +839,4 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
-        for request in list(self.prefetches):
-            self._finish_prefetch(request, publish=False)
-        self.hit_markers.clear()
-        self.prefetch_attempts.clear()
-        self.inflight_load_rids.clear()
-        self.private_load_indices.clear()
-        self._release_pending_offloads()
+        self._clear_state()
