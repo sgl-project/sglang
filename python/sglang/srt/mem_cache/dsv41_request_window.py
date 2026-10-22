@@ -32,6 +32,9 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_pos: torch.Tensor
     history_loc: torch.Tensor
     history_valid: torch.Tensor
+    # Window row each history slot copies from (zero_row when invalid); every
+    # layer reads the same rows, so the layout computes them once.
+    history_src: torch.Tensor
     commit_mask: torch.Tensor
     size: int
     # Rows address the ring itself (indices / write_loc are ring rows); no workspace.
@@ -64,6 +67,7 @@ class WindowLayout(msgspec.Struct, frozen=True):
         self.history_pos.copy_(other.history_pos)
         self.history_loc.copy_(other.history_loc)
         self.history_valid.copy_(other.history_valid)
+        self.history_src.copy_(other.history_src)
         self.commit_mask.copy_(other.commit_mask)
 
 
@@ -88,6 +92,7 @@ def window_layout(
     req,
     pos,
     *,
+    zero_row: int,
     window: int = 128,
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
@@ -139,6 +144,9 @@ def window_layout(
         history_valid &= history_pos >= g_floor.repeat_interleave(window)
     history_req = g_req.repeat_interleave(window)
     history_loc = torch.arange(history_rows, device=device)
+    history_src = torch.where(
+        history_valid, history_req * capacity + history_pos % capacity, zero_row
+    )
 
     commit_mask = (group_last - offset) < capacity
     if padded_rows is not None and padded_rows > n:
@@ -171,6 +179,7 @@ def window_layout(
         history_pos,
         history_loc,
         history_valid,
+        history_src,
         commit_mask,
         history_rows + n,
     )
@@ -217,6 +226,7 @@ def direct_window_layout(
         empty,
         empty,
         no_rows,
+        empty,
         no_rows,
         0,
         direct=True,
@@ -265,9 +275,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
-        self._rows = None
-        self._rows_layout = None
-        self._rows_layer = -1
+        self._idle_layout = None
         self._tags_layout = None
         self._tags_layer = -1
 
@@ -301,7 +309,7 @@ class RequestWindow:
             return
         self.layout = layout
         self.prepared = None
-        if layout.direct:
+        if _is_hip and layout.direct:
             return
         if self.workspace is None:
             self._ensure_workspace(layout.size)
@@ -312,6 +320,24 @@ class RequestWindow:
                 f"for a layout of {layout.size}"
             )
 
+    def activate_idle(self, num_rows: int) -> torch.Tensor:
+        """Activate a layout for an idle forward, whose attention metadata is
+        stale or unset. Its rows write the workspace past an empty history, and
+        an idle forward never commits them."""
+        layout = self._idle_layout
+        if layout is None or layout.pos.numel() != num_rows:
+            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
+            self._idle_layout = layout
+        self.activate(layout)
+        return layout.write_loc
+
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
@@ -321,28 +347,8 @@ class RequestWindow:
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
 
-    def _history_src(self, layout):
-        return torch.where(
-            layout.history_valid,
-            self.row_loc(layout.history_req, layout.history_pos),
-            self.zero_row,
-        )
-
-    def _history_rows(self, layer):
-        """History source ring rows of the active layout.
-
-        They are the same for every layer, so they are built once per forward --
-        at its first layer or when another layout (the late-layer tail) takes
-        over. A captured graph records the build there and replays it."""
-        layout = self.layout
-        if self._rows_layout is not layout or layer <= self._rows_layer:
-            self._rows = self._history_src(layout)
-            self._rows_layout = layout
-        self._rows_layer = layer
-        return self._rows
-
     def buffer(self, layer):
-        if self.layout is not None and self.layout.direct:
+        if _is_hip and self.layout is not None and self.layout.direct:
             return self.state.kv_buffer[layer]
         # The runner's capture scope includes eager warmups before CUDA capture
         # starts, so the phase is part of the key: leaving the scope revalidates.
@@ -352,7 +358,7 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_rows(layer) if _is_hip else self._history_src(layout)
+            src = layout.history_src
             # Signal-only: skip building the predicate when detection is off.
             if not in_capture and resolve_level() >= InvariantCheckLevel.WARN:
                 expect(
@@ -374,7 +380,7 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
-        if layout.direct:
+        if _is_hip and layout.direct:
             # The store already wrote the ring. Every layer gets the same rows, so
             # one tag update at the forward's first layer covers all of them.
             if self._tags_layout is not layout or layer <= self._tags_layer:

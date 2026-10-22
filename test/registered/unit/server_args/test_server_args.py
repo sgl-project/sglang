@@ -710,6 +710,43 @@ class TestImageProcessorBackend(CustomTestCase):
             handle_deprecated_args(server_args)
 
 
+class TestTokenspeedMlaAlias(CustomTestCase):
+    def test_maps_to_cutedsl_with_fp8_kv(self):
+        server_args = ServerArgs(model_path="dummy", attention_backend="tokenspeed_mla")
+
+        with self.assertLogs(serving_hook.logger, level="WARNING"):
+            handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(resolution_result(server_args, "kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "prefill"
+        )
+
+    def test_speculative_verify_moves_to_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            decode_attention_backend="tokenspeed_mla",
+            prefill_attention_backend="tokenspeed_mla",
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="EAGLE3",
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "decode_attention_backend"), "cutedsl_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "prefill_attention_backend"), "trtllm_mla"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "speculative_attention_mode"), "decode"
+        )
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
@@ -2191,6 +2228,13 @@ class TestSSLArgs(unittest.TestCase):
             self._validate_ssl(enable_ssl_refresh=True)
         self.assertIn("--enable-ssl-refresh", str(context.exception))
         self.assertIn("--ssl-certfile", str(context.exception))
+
+    def test_http_worker_reuseport_requires_multiple_uvicorn_workers(self):
+        for kwargs in ({}, {"tokenizer_worker_num": 2, "enable_http2": True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError) as context:
+                self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
+            self.assertIn("--enable-http-worker-reuseport", str(context.exception))
+        self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
 
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):

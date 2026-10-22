@@ -12,10 +12,11 @@ from sglang.srt.mem_cache.dsv41_request_window import (
     direct_window_layout,
     window_layout,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 PAGE, LAYOUT, WINDOW = 16, KVLayout.V4, 128
 
@@ -54,7 +55,7 @@ def gather(buf, indices):
     return out, valid
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(is_hip(), "the in-place request window is HIP-only")
 class TestRequestWindowDirect(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
@@ -123,7 +124,12 @@ class TestRequestWindowDirect(CustomTestCase):
         ]
 
         old_layout = window_layout(
-            req, pos, capacity=ref.capacity, floor=floor, num_groups=len(order)
+            req,
+            pos,
+            zero_row=ref.zero_row,
+            capacity=ref.capacity,
+            floor=floor,
+            num_groups=len(order),
         )
         direct = direct_window_layout(req, pos, capacity=new.capacity, floor=floor)
         self.assertTrue(direct.direct)

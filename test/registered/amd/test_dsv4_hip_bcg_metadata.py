@@ -932,7 +932,7 @@ class TestEncoderReplayRequestWindowHip(CustomTestCase):
     ):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.token_to_kv_pool = SimpleNamespace(
-            request_window=SimpleNamespace(capacity=256)
+            request_window=SimpleNamespace(capacity=256, zero_row=0)
         )
         backend.encoder_replay = encoder_replay
         backend.encoder_row_floor = encoder_row_floor

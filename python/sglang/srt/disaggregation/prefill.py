@@ -1734,7 +1734,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self._release_aborted_request(req)
+        # The request is requeued, not aborted: keep its multimodal inputs (the
+        # re-prefill embeds its image tokens again) and its streaming session.
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)
