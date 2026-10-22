@@ -26,6 +26,7 @@ from sglang.srt.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -1353,7 +1354,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
 
         target_model = self._target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+        # Other embeddings (e.g. Gemma's scaled nn.Embedding) are replicated and
+        # run no collective, so the draft keeps calling the module itself.
+        if not isinstance(embed_module, VocabParallelEmbedding):
+            return
+        if embed_module.num_added_embeddings:
+            raise ValueError(
+                "DFLASH with dp attention does not support target embeddings "
+                "with added-vocabulary rows."
+            )
         tp_group = (
             get_parallel().attn_tp_group
             if embed_module.use_attn_tp_group
