@@ -191,6 +191,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     materialize_image_gpu,
 )
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     get_device,
     get_exec,
     get_forward,
@@ -3573,7 +3574,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             else nullcontext()
         )
         with (
-            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            get_forward().scoped(
+                mlp_reduce_scatter=mlp_reduce_scatter,
+                # the MLP runs on the rows gathered from every attention-DP rank
+                lora_batch_layout=(
+                    LoRABatchLayout.TP_GLOBAL
+                    if _use_tp_moe_gather
+                    else get_forward().lora_batch_layout
+                ),
+            ),
             gathered_rows,
         ):
             return_moe_output = (
@@ -3858,7 +3867,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         fb = state.forward_batch
         global_hidden = state.pop("global_hidden")
         global_ids = fb._tbo_global_input_ids
-        with get_forward().scoped(mlp_reduce_scatter=True):
+        with get_forward().scoped(
+            mlp_reduce_scatter=True, lora_batch_layout=LoRABatchLayout.TP_GLOBAL
+        ):
             state.global_expert_out = self.mlp(
                 global_hidden,
                 fb,
