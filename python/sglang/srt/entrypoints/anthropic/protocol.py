@@ -287,8 +287,8 @@ class AnthropicThinkingParam(BaseModel):
     def _validate_thinking_shape(self):
         # Cross-field rules mirror the SDK's three discriminated variants.
         if self.type == "enabled":
-            # budget_tokens is optional: the backend has no hard-cap knob to
-            # honor it, and DeepSeek-style clients omit it.
+            # Deliberate deviation from the Anthropic API, which rejects
+            # type="enabled" without budget_tokens (see class docstring).
             if self.budget_tokens is not None and self.budget_tokens < 1024:
                 raise ValueError(
                     "thinking.budget_tokens must be >= 1024 (got {})".format(
