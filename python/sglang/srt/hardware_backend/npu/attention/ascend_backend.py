@@ -803,11 +803,16 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-        if self.enable_sparsity_driven_kv_offload:
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and self.sparse_kv_manager.indexer_impl != "lim"
+        ):
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
             )
 
+            # Native LIM and its device copy kernels do not launch ACL host
+            # callbacks. Avoid a polling reporter thread for this graph path.
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
