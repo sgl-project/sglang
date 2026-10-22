@@ -188,8 +188,14 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    render_chat(formatter, body, &request, chat_template_kwargs.as_ref())
-        .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
+    render_chat(
+        formatter,
+        body,
+        &request,
+        chat_template_kwargs.as_ref(),
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
 async fn detokenize(

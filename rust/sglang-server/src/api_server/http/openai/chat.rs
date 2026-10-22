@@ -166,13 +166,15 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
+    // What `reasoning_effort` and `reasoning` imply for thinking, as the renderer reads them.
+    let requested_thinking = sglang_processor::requested_thinking(&body);
     let (request, rendered) =
         match prepare_chat_request(&state, body, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
 
-    let sampling = match chat_sampling(
+    let mut sampling = match chat_sampling(
         &request,
         SamplingDefaults::CHAT,
         parser.as_deref(),
@@ -186,6 +188,13 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, message, false);
         }
     };
+
+    // `_patch_reasoning_skip_special_tokens`: K3's channel markers are special tokens.
+    if reasoning_parser.as_deref() == Some("kimi_k3")
+        || matches!(state.chat_formatter, Some(ChatFormatter::KimiK3))
+    {
+        sampling.skip_special_tokens = false;
+    }
 
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
@@ -219,7 +228,13 @@ async fn chat_completions(
             chat_template_kwargs
                 .as_ref()
                 .and_then(|kwargs| kwargs.get("thinking"))
-                != Some(&Value::Bool(false)),
+                .cloned()
+                .or(requested_thinking.map(Value::Bool))
+                .or_else(|| {
+                    let defaults = &state.server_args.default_chat_template_kwargs;
+                    defaults.get("thinking").cloned()
+                })
+                != Some(Value::Bool(false)),
         ),
         parser => starts_in_reasoning(parser, rendered.prompt.as_str()).then_some(true),
     };
@@ -320,7 +335,14 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let rendered = render_chat(&formatter, body, &request, kwargs).map_err(|error| {
+    let rendered = render_chat(
+        &formatter,
+        body,
+        &request,
+        kwargs,
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -934,6 +956,7 @@ mod tests {
             body,
             &request,
             None,
+            &Default::default(),
         )
         .unwrap()
     }
@@ -1201,19 +1224,21 @@ mod tests {
             super::super::ChatFormatter::KimiK3,
             "Hello!",
         );
-        let response = super::super::test_utils::post_json(
-            super::routes().with_state(state),
-            "/v1/chat/completions",
-            serde_json::json!({
-                "model": "model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "chat_template_kwargs": {"thinking": false}
-            }),
-        )
-        .await;
-        let value = super::super::test_utils::body_json(response).await;
-        assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
-        assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
+        let messages = serde_json::json!([{"role": "user", "content": "Hi"}]);
+        for body in [
+            serde_json::json!({"model": "model", "messages": messages, "chat_template_kwargs": {"thinking": false}}),
+            serde_json::json!({"model": "model", "messages": messages, "reasoning_effort": "none"}),
+        ] {
+            let response = super::super::test_utils::post_json(
+                super::routes().with_state(state.clone()),
+                "/v1/chat/completions",
+                body,
+            )
+            .await;
+            let value = super::super::test_utils::body_json(response).await;
+            assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
+            assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
+        }
     }
 
     #[tokio::test]
@@ -1391,6 +1416,7 @@ mod tests {
                 };
                 let prompt = generate.chat_prompt.as_ref().unwrap();
                 assert!(prompt.prompt.as_str().contains("lookup"));
+                assert!(!generate.sampling_params.skip_special_tokens);
                 assert!(
                     generate
                         .sampling_params
