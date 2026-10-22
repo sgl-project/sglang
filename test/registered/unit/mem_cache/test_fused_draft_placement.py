@@ -713,24 +713,39 @@ class TestFusedDraftDecision(CustomTestCase):
         attn_dp_size=1,
         dcp_size=1,
         hicache=False,
+        hicache_storage=None,
         retraction_backup=None,
         draft_parallel_layout=None,
         mla_draft=False,
         mla_host=False,
         draft_window=False,
+        host="swa",
+        nextn=False,
+        host_head_dim=64,
     ):
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         cfg.draft_parallel_layout = draft_parallel_layout
-        cfg.is_hybrid_swa = True
-        cfg.mambaish_config = None
+        # "swa", "mamba", or the three-sub-pool "swa+mamba".
+        cfg.is_hybrid_swa = "swa" in host
+        cfg.mambaish_config = (
+            SimpleNamespace(full_attention_layer_ids=[1]) if "mamba" in host else None
+        )
+        cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.use_mla_backend = mla_host
         cfg.is_draft_worker = False
         cfg.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
         cfg.model_config = SimpleNamespace(
-            is_multi_layer_eagle=False, sliding_window_size=None
+            is_multi_layer_eagle=False,
+            sliding_window_size=None,
+            get_num_kv_heads=lambda tp, dcp=1: 4,
+            head_dim=host_head_dim,
+            v_head_dim=host_head_dim,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
         cfg.spec_aux_config = SimpleNamespace(
@@ -742,7 +757,8 @@ class TestFusedDraftDecision(CustomTestCase):
                 is_deepseek_v4_arch=False,
                 swa_attention_layer_ids=[0],
                 sliding_window_size=None,
-                num_nextn_predict_layers=None,
+                num_nextn_predict_layers=1 if nextn else None,
+                hf_config=SimpleNamespace(architectures=["DraftForCausalLM"]),
                 get_num_kv_heads=lambda tp: max(1, 4 // tp),
                 get_swa_num_kv_heads=lambda tp: max(1, 4 // tp),
                 head_dim=64,
@@ -756,7 +772,9 @@ class TestFusedDraftDecision(CustomTestCase):
             ),
         )
         memory = SimpleNamespace(
-            enable_unified_memory=True, enable_hierarchical_cache=hicache
+            enable_unified_memory=True,
+            enable_hierarchical_cache=hicache,
+            hicache_storage_backend=hicache_storage,
         )
         spec = SimpleNamespace(
             speculative_num_steps=1,
@@ -770,6 +788,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_dp_size=attn_dp_size,
             ),
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(hpa, "get_memory", return_value=memory),
             patch.object(
                 kvc,
                 "get_disagg",
@@ -925,13 +944,62 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertIsNone(declined.placement, algorithm)
             self.assertIn("--dcp-size 2", declined.declined)
 
-    def test_hierarchical_cache_keeps_the_private_pool(self):
-        """HiCache builds the draft's host pool off its own device pool, which
-        a fused draft does not have; DSPARK + HiCache keeps working on the
-        private pool."""
-        declined = self._decide(algorithm="DSPARK", hicache=True)
+    def test_hierarchical_cache_fuses_where_page_envelopes_carry_the_rows(self):
+        """A two-pool hybrid-SWA host's L2 page envelopes copy whole pages,
+        draft parts included. A storage backend past L2 is not shown to keep
+        them, and page-envelope host pools exist for MHA hosts only."""
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            decision = self._decide(algorithm=algorithm, hicache=True)
+            self.assertIsNotNone(decision.placement, algorithm)
+        # Window draft layers ride in the swa sub-pool's envelopes.
+        self.assertIsNotNone(self._decide(hicache=True, draft_window=True).placement)
+        for storage in ("mori", "file"):
+            declined = self._decide(
+                algorithm="DSPARK", hicache=True, hicache_storage=storage
+            )
+            self.assertIsNone(declined.placement, storage)
+            self.assertIn("L2-only storage", declined.declined)
+        self.assertIsNone(self._decide(hicache=True, mla_host=True).placement)
+        # A DFLASH draft keeps full-attention layers only under HiCache.
+        declined = self._decide(algorithm="DFLASH", hicache=True, draft_window=True)
         self.assertIsNone(declined.placement)
-        self.assertIn("--enable-hierarchical-cache", declined.declined)
+        self.assertIn("full-attention-only draft", declined.declined)
+
+    def test_hierarchical_cache_packs_a_nextn_head_on_a_mamba_host(self):
+        """A Mamba host's host pool copies rows layer by layer; a NEXTN head
+        in the target's row shape packs after the target's layers, whatever
+        the storage backend."""
+        for storage in (None, "mooncake"):
+            decision = self._decide(
+                host="mamba", nextn=True, hicache=True, hicache_storage=storage
+            )
+            self.assertIsNotNone(decision.placement, storage)
+        # An MLA head packs into an MLA host's latent rows.
+        decision = self._decide(
+            host="mamba", nextn=True, hicache=True, mla_draft=True, mla_host=True
+        )
+        self.assertIsInstance(decision.placement.region("full"), LatentDraftRegion)
+        # Without HiCache, nothing has to pack.
+        self.assertIsNotNone(self._decide(host="mamba", host_head_dim=128).placement)
+
+    def test_hierarchical_cache_declines_a_draft_that_does_not_pack(self):
+        cases = (
+            dict(host="mamba", algorithm="DFLASH"),
+            dict(host="mamba", algorithm="DSPARK"),
+            dict(host="mamba", algorithm="EAGLE3", nextn=True),
+            # Rows unlike the target's.
+            dict(host="mamba", nextn=True, host_head_dim=128),
+            # Dense rows on an MLA host.
+            dict(host="mamba", nextn=True, mla_host=True),
+            # The three-sub-pool host copies its full and swa rows per layer.
+            dict(host="swa+mamba", nextn=True),
+        )
+        for case in cases:
+            declined = self._decide(hicache=True, **case)
+            self.assertIsNone(declined.placement, case)
+            self.assertIn(
+                "packs a draft's only for a NEXTN head", declined.declined, case
+            )
 
     def test_host_pool_retraction_keeps_the_private_pool(self):
         """Host-pool decode retraction builds the draft's host pool off its

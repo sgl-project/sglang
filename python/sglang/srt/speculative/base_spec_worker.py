@@ -15,6 +15,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
@@ -36,20 +37,18 @@ class HiCacheDraftPlan:
     device_pools: tuple[object, ...] = ()
 
 
-def _can_pack_hicache_mtp(
+def can_pack_hicache_mtp(
     spec_algorithm: SpeculativeAlgorithm,
-    draft_runners: tuple[ModelRunner, ...],
+    draft_model_configs: tuple[ModelConfig, ...],
 ) -> bool:
     is_nextn_mtp = (
         spec_algorithm.is_eagle()
         and not spec_algorithm.is_eagle3()
-        and all(
-            runner.model_config.num_nextn_predict_layers for runner in draft_runners
-        )
+        and all(config.num_nextn_predict_layers for config in draft_model_configs)
     )
     is_dspark_dsv4 = (
         spec_algorithm.is_dspark()
-        and draft_runners[0].model_config.hf_config.architectures[0]
+        and draft_model_configs[0].hf_config.architectures[0]
         == "DeepseekV4ForCausalLMDSpark"
     )
     return is_nextn_mtp or is_dspark_dsv4
@@ -267,6 +266,9 @@ class BaseSpecWorker(ABC):
         pass
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
+
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         target_model_runner.mtp_draft_mamba_pools = ()
@@ -282,25 +284,33 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        from sglang.srt.mem_cache.unified_draft_pool import (
-            fused_draft_host_allocator,
+        packable = can_pack_hicache_mtp(
+            spec_algorithm, tuple(runner.model_config for runner in draft_runners)
         )
-
         if any(fused_draft_host_allocator(pool) is not None for pool in draft_pools):
-            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-                validate_fused_hicache_draft,
-            )
+            # A fused draft's rows live in the target's entries. The boot gate
+            # admitted HiCache only where its host pools keep them: whole page
+            # envelopes on a hybrid-SWA host, or a NEXTN head's layers packed
+            # after the target's below.
+            if isinstance(target_model_runner.token_to_kv_pool, BaseSWAKVPool):
+                from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                    validate_fused_hicache_draft,
+                )
 
-            validate_fused_hicache_draft(
-                target_config=target_model_runner.kv_cache_configurator,
-                draft_device_pools=draft_pools,
+                validate_fused_hicache_draft(
+                    target_config=target_model_runner.kv_cache_configurator,
+                    draft_device_pools=draft_pools,
+                )
+                # The target's page envelopes already carry every draft layer.
+                # Packing or adding a sidecar would back up the same bytes twice.
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
+                )
+            assert packable, (
+                "a fused draft whose layers do not pack after the target's "
+                "would lose its rows on a HiCache reload"
             )
-            # The target's page envelopes already carry every draft layer.
-            # Packing or adding a sidecar would back up the same bytes twice.
-            return HiCacheDraftPlan(
-                mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
-            )
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        if packable:
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = getattr(
                 target_model_runner.req_to_token_pool, "mamba_pool", None

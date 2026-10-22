@@ -675,15 +675,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "the draft's host pool off the draft's own device pool, which a fused "
         "EAGLE draft does not have."
     )
-    assert not (
-        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
-        and cfg.enable_hierarchical_cache
-    ), (
-        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
-        "--enable-hierarchical-cache: HiCache keeps the draft on a private "
-        "pool, and would pack an MTP head's KV into the target's "
-        "page-envelope host pool, which refuses per-layer draft loads."
-    )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured

@@ -111,9 +111,21 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
+        # HiCache's per-layer copies read these when the draft's layers pack
+        # after the target's in its host pool.
+        self._init_data_ptrs_and_strides()
 
     def _clear_buffers(self):
         pass  # lifetime owned by UnifiedKVPool
+
+    @property
+    def host_transfer_translate(self):
+        """Virtual -> physical ids for HiCache's copies of these rows, as the
+        host sub-pool's own: the full side translates through its v2p; an swa
+        side, like the target's, is handed swa-physical ids already."""
+        if self._host_sub_pool_name != "full":
+            return None
+        return self.host_allocator.full_attn_allocator.translate_kv_loc
 
     def get_kv_size_bytes(self):
         return 0, 0  # fused into the host entries; UnifiedKVPool logs the total
@@ -193,6 +205,12 @@ class UnifiedDraftMLAKVPool(MLATokenToKVPool):
 
     def _clear_buffers(self):
         pass  # lifetime owned by UnifiedKVPool
+
+    @property
+    def host_transfer_translate(self):
+        """Virtual -> physical ids for HiCache's copies of these rows, through
+        the full sub-pool's v2p as for the host's own rows."""
+        return self.host_allocator.full_attn_allocator.translate_kv_loc
 
     def get_kv_size_bytes(self):
         return 0  # fused into the host entries; UnifiedKVPool logs the total

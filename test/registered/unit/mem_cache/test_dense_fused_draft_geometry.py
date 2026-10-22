@@ -18,6 +18,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    _validate_packed_draft_pools,
+    check_packed_kv_rows,
+)
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -27,6 +32,8 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftMambaPool,
@@ -40,6 +47,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
+    UnifiedMLATokenToKVPool,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -577,18 +585,23 @@ def _latent_region(lane_num=2):
     )
 
 
-def _unified_mamba_allocator(pool, page_size):
+class _FakeKV:
+    def attach_allocator(self, allocator):
+        self.allocator = allocator
+
+
+def _unified_mamba_allocator(pool, page_size, full_kv_pool=None):
+    """The host's allocator; it wires HiCache's id translate into ``full_kv_pool``."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
-    class _FakeKV:
-        def attach_allocator(self, allocator):
-            self.allocator = allocator
-
     return UnifiedMambaTokenToKVPoolAllocator(
         unified_buffer=pool,
-        kvcache=SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV()),
+        kvcache=SimpleNamespace(
+            full_kv_pool=_FakeKV() if full_kv_pool is None else full_kv_pool,
+            mamba_pool=_FakeKV(),
+        ),
         device=_DEV,
         page_size=page_size,
         need_sort=False,
@@ -864,6 +877,190 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         nz = raw.nonzero()
         self.assertGreater(nz.numel(), 0)
         self.assertTrue(bool((nz >= lo).all() and (nz < 7 * swa_entry).all()))
+
+
+def _copy_rows(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+    for src, dst in zip(src_layers, dst_layers, strict=True):
+        dst[dst_indices] = src[src_indices]
+
+
+class TestFusedDraftThroughHiCache(unittest.TestCase):
+    """A Mamba host's HiCache host pool copies rows layer by layer; a fused
+    draft's rows ride along as layers packed after the target's, read through
+    the draft pool's own pointer tables at the host's physical ids."""
+
+    PS = 2
+    PAGES = 8
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _pools(self, mla: bool):
+        if mla:
+            full = _mla_host_spec(_latent_region(lane_num=1))
+        else:
+            full = _host_spec(
+                DenseDraftRegion(lane_num=1, head_num=2, head_dim=4, store_dtype=_DTYPE)
+            )
+        mamba = _mamba_filler_spec()
+        pool = UnifiedKVPool(
+            total_bytes=self.PAGES * self.PS * full.entry_bytes()
+            + 4 * mamba.entry_bytes(),
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=_placement(full.draft_region),
+        )
+        if mla:
+            target = UnifiedMLATokenToKVPool(
+                unified_buffer=pool,
+                sub_pool_name="full",
+                page_size=self.PS,
+                kv_cache_dtype=_DTYPE,
+            )
+        else:
+            target = UnifiedMHATokenToKVPool(
+                unified_buffer=pool, sub_pool_name="full", page_size=self.PS
+            )
+        alloc = _unified_mamba_allocator(pool, self.PS, full_kv_pool=target)
+        draft = (UnifiedDraftMLAKVPool if mla else UnifiedDraftKVPool)(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=alloc,
+            layer_lanes={0: 0},
+            page_size=self.PS,
+        )
+        return pool, alloc, target, draft
+
+    def test_draft_ids_resolve_like_the_hosts(self):
+        """The engine resolves a packed draft layer's ids through the draft
+        pool: a virtual id read as physical lands in another request's rows."""
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                _, alloc, target, draft = self._pools(mla)
+                virtual = alloc.alloc(2 * self.PS)
+                resolved = [
+                    L2TransferEngine._resolve_device_indices(
+                        L2Transfer(SimpleNamespace(), pool, virtual, virtual)
+                    )
+                    for pool in (target, draft)
+                ]
+                self.assertFalse(torch.equal(resolved[0], virtual))
+                torch.testing.assert_close(resolved[1], resolved[0])
+
+    def test_an_swa_side_takes_swa_physical_ids_as_given(self):
+        """The target's swa pool is handed swa-physical ids, and so is a
+        draft's swa side: a full-side translate would remap them again."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=_DTYPE
+        )
+        swa = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=4,
+            store_dtype=_DTYPE,
+            grow_direction="up",
+            draft_region=region,
+        )
+        full = _host_spec()
+        pool = UnifiedKVPool(
+            total_bytes=self.PAGES * self.PS * (full.entry_bytes() + swa.entry_bytes()),
+            sub_pool_specs=[full, swa],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"swa": [1]}, regions={"swa": region}
+            ),
+        )
+        draft = UnifiedDraftKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="swa",
+            host_allocator=object(),
+            layer_lanes={0: 0},
+            page_size=self.PS,
+        )
+        self.assertIsNone(draft.host_transfer_translate)
+
+    def test_draft_rows_reload_with_the_target(self):
+        """Back a request's rows up through the host pool, wipe the device
+        buffer, load them back at another request's slots: the draft's rows
+        must arrive with the target's."""
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                self._round_trip(mla)
+
+    def _round_trip(self, mla: bool):
+        pool, alloc, target, draft = self._pools(mla)
+        _validate_packed_draft_pools(
+            target_decls=target.host_pool_decls(), draft_pools=(draft,)
+        )
+        host_kwargs = dict(
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=self.PS,
+            layout="layer_first",
+            pin_memory=False,
+            device_capacity_tokens=target.size,
+            start_layer=target.start_layer,
+            end_layer=target.end_layer,
+            draft_buffer_infos=(draft.get_device_pool_infos()[0].buffer_info,),
+        )
+        if mla:
+            check_packed_kv_rows(kv_pool=target, drafts=(draft,), use_mla=True)
+            host_cls, module = MLATokenToKVPoolHost, "mla"
+            host_kwargs.update(
+                target_layer_num=target.layer_num,
+                override_kv_cache_dim=target.kv_cache_dim,
+            )
+            buffers = [*target.kv_buffer, *draft.kv_buffer]
+        else:
+            host_cls, module = MHATokenToKVPoolHost, "mha"
+            buffers = [
+                *target.k_buffer,
+                *target.v_buffer,
+                *draft.k_buffer,
+                *draft.v_buffer,
+            ]
+        host = host_cls(target.get_device_pool_infos()[0].buffer_info, **host_kwargs)
+        self.addCleanup(host.destroy)
+        self.assertEqual(host.layer_num, target.layer_num + 1)
+
+        translate = alloc.full_attn_allocator.translate_kv_loc
+        src = translate(alloc.alloc(2 * self.PS))
+        dst = translate(alloc.alloc(2 * self.PS))
+        for value, buffer in enumerate(buffers, 1):
+            raw = buffer.view(torch.uint8)
+            raw.copy_(
+                (torch.arange(raw.numel()).reshape(raw.shape) * 7 + value)
+                .remainder(251)
+                .to(torch.uint8)
+            )
+        expected = [buffer[src].clone() for buffer in buffers]
+        host_indices = host.alloc(len(src))
+        with patch(
+            f"sglang.srt.mem_cache.pool_host.{module}.transfer_kv_direct",
+            side_effect=_copy_rows,
+            create=True,
+        ):
+            host.backup_from_device_all_layer(target, host_indices, src, "direct")
+            pool._raw.zero_()
+            for layer in range(host.layer_num):
+                is_draft = layer >= target.layer_num
+                host.load_to_device_per_layer(
+                    draft if is_draft else target,
+                    host_indices,
+                    dst,
+                    layer,
+                    "direct",
+                    is_draft=is_draft,
+                )
+        for buffer, rows in zip(buffers, expected, strict=True):
+            torch.testing.assert_close(buffer[dst], rows)
 
 
 if __name__ == "__main__":

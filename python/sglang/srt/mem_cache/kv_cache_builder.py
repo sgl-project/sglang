@@ -134,9 +134,9 @@ def maybe_register_hicache_draft(
             draft_device_pools=draft_plan.device_pools, tree_cache=tree_cache
         )
         logger.info(
-            "HiCache fused draft KV uses the target FULL page envelopes "
+            "HiCache fused draft KV uses the target's page envelopes "
             "(%d draft layers); no draft host sidecar is allocated.",
-            draft_plan.device_pools[0].layer_num,
+            sum(pool.layer_num for pool in draft_plan.device_pools),
         )
         return
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
