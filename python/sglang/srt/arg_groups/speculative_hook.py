@@ -436,6 +436,57 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_ubtree(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.ubtree_components.config import (
+        parse_ubtree_config,
+        resolve_verify_width,
+        validate_runtime_config,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError("UBTREE requires --speculative-draft-model-path")
+    if attn_dp_enabled_of(cfg):
+        raise ValueError("UBTREE does not support DP attention")
+    target_archs = model_config_of(server_args).hf_config.architectures
+    if "BailingMoeV3ForCausalLM" not in target_archs:
+        raise ValueError("UBTREE currently supports Ling3 BailingMoeV3 targets")
+
+    draft = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+    tree = parse_ubtree_config(draft)
+    width = resolve_verify_width(tree, cfg.speculative_num_draft_tokens)
+    if cfg.speculative_dflash_block_size not in (None, tree.block_size):
+        raise ValueError("UBTREE draft block size does not match the checkpoint")
+    # The backend uses topk>1 to enable direct-parent tree metadata. UBTree's
+    # actual irregular topology is carried by UBTreeVerifyInput, not topk.
+    declare_resolution(
+        server_args,
+        "_handle_ubtree",
+        speculative_dflash_block_size=tree.block_size,
+        speculative_num_draft_tokens=width,
+        speculative_num_steps=tree.depth_count,
+        speculative_eagle_topk=2,
+        max_running_requests=(
+            1 if cfg.max_running_requests is None else cfg.max_running_requests
+        ),
+        enable_mixed_chunk=False,
+    )
+    _resolve_dflash_draft_attention_backend(server_args)
+    validate_runtime_config(cfg, tuple(attention_backends_of(cfg)))
+    if cfg.enable_unified_memory:
+        raise ValueError("UBTREE does not yet support unified memory")
+    if envs.SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK.get() and set(
+        attention_backends_of(cfg)
+    ) != {"fa3"}:
+        raise ValueError("UBTree tree-only visibility requires FA3 target attention")
+
+
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 

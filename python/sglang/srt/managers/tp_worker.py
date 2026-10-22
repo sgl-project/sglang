@@ -563,6 +563,15 @@ class TpModelWorker(BaseTpWorker):
             kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
+        if self.model_runner.spec_algorithm.is_ubtree():
+            # V2 keeps two verify allocations in flight. The request-to-token
+            # row already includes one tree width; reserve the other at admission.
+            headroom = max(
+                get_spec().speculative_num_steps,
+                get_spec().speculative_num_draft_tokens,
+            )
+            max_req_len = max(1, max_req_len - headroom)
+            max_req_input_len = max(1, min(max_req_input_len, max_req_len - 5))
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (

@@ -37,6 +37,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    UBTREE = auto()
     UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -117,6 +118,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_ubtree(self) -> bool:
+        return self == SpeculativeAlgorithm.UBTREE
+
     def is_uno(self) -> bool:
         return self == SpeculativeAlgorithm.UNO
 
@@ -124,7 +128,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self.is_dflash() or self.is_dspark() or self.is_ubtree()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -142,7 +146,7 @@ class SpeculativeAlgorithm(Enum):
         """
         # DSPARK's draft KV inject runs after the target prefill, but on write
         # locations it computes before the target forward.
-        return self.is_none() or self.is_dflash_family()
+        return self.is_none() or (self.is_dflash_family() and not self.is_ubtree())
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -169,7 +173,25 @@ class SpeculativeAlgorithm(Enum):
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
-        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or (self.is_dflash_family() and not self.is_ubtree())
+        )
+
+    def can_run_cuda_graph(self, forward_batch, *, is_draft_worker: bool) -> bool:
+        # UBTree owns its segmented draft graph; the ordinary draft decode
+        # runner does not refresh its changing attention metadata.
+        return not (self.is_ubtree() and is_draft_worker)
+
+    def create_cuda_graph_verify_input(
+        self, *, custom_mask, num_tokens_per_req: int, is_draft_worker: bool
+    ):
+        if not self.is_ubtree() or is_draft_worker:
+            return None
+        from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
+
+        return create_ubtree_verify_input(custom_mask, num_tokens_per_req)
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -243,6 +265,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_ubtree,
             _handle_uno,
         )
 
@@ -252,7 +275,9 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_ubtree():
+            _handle_ubtree(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
@@ -308,6 +333,11 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        if self.is_ubtree():
+            from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
+
+            return UBTreeWorkerV2
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it

@@ -1484,6 +1484,8 @@ class Envs:
     # replay only stages the dynamic tree mask into a stable backend buffer.
     SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Use compact tree-only visibility with UBTree's FA3 target verification.
+    SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
