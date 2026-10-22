@@ -372,9 +372,7 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -389,6 +387,9 @@ class DeepseekMLAForwardMixin:
                     topk_indices = maybe_capture_indexer_topk(
                         self.layer_id, prev_topk_indices
                     )
+                # Issued after the indexer so the join stays on the main lane at graph replay.
+                with torch.cuda.stream(self.alt_stream):
+                    q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)

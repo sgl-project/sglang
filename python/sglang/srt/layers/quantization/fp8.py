@@ -831,6 +831,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if use_deepgemm_runner and self.weight_block_size == [32, 32]:
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                # UE8M0 DeepGEMM casts these fp32 scales in the kernel, which
+                # holds only for powers of two; the linear keeps others on Triton.
+                layer.weight_scale_inv.power_of_two = bool(
+                    (torch.frexp(weight_scale)[0] == 0.5).all().item()
+                )
         if hasattr(layer, "_block_fp8_bf16_weight"):
             layer._block_fp8_bf16_weight = None
             layer._derived_weight_cache_error = None
@@ -3413,6 +3422,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            fp8_activations=(
+                self.is_fp4_expert and getattr(layer, "fp8_activations", False)
+            ),
             fused_moe_kwargs=fused_moe_kwargs,
         )
 
