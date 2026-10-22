@@ -58,9 +58,12 @@ def _publish(role, session_id, port):
             transporter_mod, "remote_instance_transfer_engine_enabled", lambda: True
         ),
         patch.object(
+            transporter_mod, "register_weight_memory", lambda model, engine: None
+        ),
+        patch.object(
             transporter_mod,
-            "register_memory_region",
-            lambda model, engine: {f"{role}.weight": (1, 4, 2)},
+            "describe_weight_locations",
+            lambda model: {f"{role}.weight": (1, 4, 2)},
         ),
     ):
         transporter = RemoteInstanceWeightTransporter(

@@ -99,7 +99,7 @@ class TestRemoteInstanceTransferEngineRole(CustomTestCase):
                         "_initialize_model",
                         return_value=torch.nn.Linear(1, 1),
                     ),
-                    patch.object(loader_mod, "register_memory_region"),
+                    patch.object(loader_mod, "register_weight_memory"),
                     patch.object(
                         loader_mod,
                         "get_remote_instance_transfer_engine_info_per_rank",

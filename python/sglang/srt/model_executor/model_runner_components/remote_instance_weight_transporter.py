@@ -10,7 +10,8 @@ from sglang.srt.distributed.parallel_state import RankParallelismConfig
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    register_memory_region,
+    describe_weight_locations,
+    register_weight_memory,
 )
 from sglang.srt.runtime_context import (
     get_model,
@@ -32,7 +33,8 @@ class RemoteInstanceWeightTransporter:
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""
-    weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+    # name -> (address, numel, element size), once this runner registered with or loaded through a transfer engine
+    weight_locations: Optional[dict[str, tuple[int, int, int]]] = None
     parallelism_config: Optional[RankParallelismConfig] = None
     _nixl_manager: Optional[Any] = None
 
@@ -77,10 +79,11 @@ class RemoteInstanceWeightTransporter:
             and get_model().remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.engine is not None
-            and self.weight_info is None
+            and self.weight_locations is None
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
-            self.weight_info = register_memory_region(self.model, self.engine)
+            register_weight_memory(self.model, self.engine)
+            self.weight_locations = describe_weight_locations(self.model)
             self._register_to_engine_info_bootstrap(role)
 
         # The P2P weight-update client needs each rank's parallelism layout to
@@ -157,7 +160,7 @@ class RemoteInstanceWeightTransporter:
             "tp_rank": self.tp_rank,
             "transfer_engine_info": {
                 "session_id": self.session_id,
-                "weights_info_dict": self.weight_info,
+                "weights_info_dict": self.weight_locations,
             },
         }
 

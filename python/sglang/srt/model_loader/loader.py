@@ -45,8 +45,9 @@ from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    describe_weight_locations,
     get_remote_instance_transfer_engine_info_per_rank,
-    register_memory_region,
+    register_weight_memory,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -3294,8 +3295,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "TransferEngine registering memory regions (this may take a few seconds)..."
             )
             # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+            register_weight_memory(
                 model, load_config.remote_instance_weight_loader_transfer_engine
+            )
+            self.remote_instance_transfer_engine_weight_info = (
+                describe_weight_locations(model)
             )
             logger.info(
                 "TransferEngine memory regions have been successfully registered."

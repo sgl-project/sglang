@@ -1320,7 +1320,7 @@ class ModelRunner:
         current_platform.post_load_model(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
-            self.remote_instance_weight_transporter.weight_info = (
+            self.remote_instance_weight_transporter.weight_locations = (
                 loaded.remote_instance_weight_info
             )
 
