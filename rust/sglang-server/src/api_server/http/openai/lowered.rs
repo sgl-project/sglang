@@ -259,7 +259,8 @@ pub(super) async fn chat(
         .map(|call| (call, timing.clone()))
         .collect();
     let incremental = state.server_args.incremental_streaming_output;
-    let mut frames = Box::pin(generation_event_stream(calls, incremental, is_batch));
+    let frames = generation_event_stream(calls, incremental, is_batch).map(python_abort_frame);
+    let mut frames = Box::pin(frames);
     // An error before the first frame answers the whole request, as on Python.
     let mut first = Vec::new();
     while first.is_empty() && !responder.done() {
@@ -291,6 +292,34 @@ pub(super) async fn chat(
         )
             .into_response(),
     )
+}
+
+/// The core streams every failure as an error frame; Python's `/generate`
+/// streams only a `ValueError` (400) so, and a status-coded abort as a frame
+/// whose `finish_reason` carries the status, which its chat layer answers
+/// with an error event under that status.
+fn python_abort_frame(data: String) -> String {
+    if !data.starts_with(r#"{"error":"#) {
+        return data;
+    }
+    let Ok(frame) = serde_json::from_str::<Value>(&data) else {
+        return data;
+    };
+    let code = frame["error"]["code"].as_u64().unwrap_or(400);
+    if code == 400 {
+        return data;
+    }
+    let finish_reason = serde_json::json!({
+        "type": "abort",
+        "message": frame["error"]["message"],
+        "status_code": code,
+    });
+    serde_json::json!({
+        "text": "",
+        "index": frame["index"],
+        "meta_info": {"finish_reason": finish_reason},
+    })
+    .to_string()
 }
 
 /// A failed unary choice, as Python's chat layer answers its abort.
@@ -435,6 +464,34 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A status-coded abort in a stream is Python's error event under that
+    /// status, then the stream's end, not a 400 `BadRequestError`.
+    #[tokio::test]
+    async fn streamed_abort_keeps_its_status() {
+        let app = lowered_state(|_| ResponseItem::Error(Error::QueueFull));
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let body = json!({"model": "model", "messages": messages, "stream": true});
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let error: Value = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .find_map(|data| {
+                serde_json::from_str::<Value>(data)
+                    .ok()?
+                    .get("error")
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no error event: {text}"));
+        assert_eq!(error["type"], "SERVICE_UNAVAILABLE");
+        assert_eq!(error["code"], 503);
+        assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
     }
 
     /// The router's override headers reach the request, as they reach
