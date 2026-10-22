@@ -1,9 +1,10 @@
 """Temporary prefill shim for the Ascend Ops dispatcher.
 
-The real prefill (TP allgather / alltoallv) path is implemented separately.
-Until it lands, this subclass runs prefill batches through the decode DS v2 EP
-dispatch/combine path so the model can be served end to end.  Delete this
-module once the prefill path is in.
+The real prefill (TP allgather / alltoallv) path now lives in
+``AscendOpsDispatcher``. This subclass keeps the DS v2 EP dispatch/combine as an
+A/B control for the prefill batch, so both can be exercised from the same build
+via ``SGLANG_ASCEND_OPS_MOCK_PREFILL``. Delete this module once the real path is
+verified end to end.
 """
 
 from __future__ import annotations

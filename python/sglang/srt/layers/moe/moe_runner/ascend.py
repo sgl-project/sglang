@@ -455,8 +455,8 @@ def post_permute_ascend_to_ascend_ops(
         AscendOpsCombineInput,
     )
 
-    # The DS v2 combine op weights and sums the top-k routes itself, so only
-    # the expert output is passed on.
+    # The combine path (DS v2 op or finalize routing) weights and sums the top-k
+    # routes itself, so only the expert output is passed on.
     return AscendOpsCombineInput(hidden_states=runner_output.hidden_states)
 
 

@@ -106,6 +106,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_num=num_experts,
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
+                row_idx_type=0,
                 active_expert_range=[0, num_experts],
                 quant_mode=self.quant_mode,
             )
