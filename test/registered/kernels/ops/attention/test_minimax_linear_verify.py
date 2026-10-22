@@ -1,6 +1,4 @@
-"""MiniMax-M3 EAGLE verify on CUDA: each draft row must see exactly the prefix up to its own token,
-eagerly and when a graph captured on 1-token dummies replays at the end of the context.
-"""
+"""MiniMax-M3 EAGLE verify: each draft row sees exactly its causal prefix."""
 
 import sys
 from types import SimpleNamespace
@@ -113,8 +111,6 @@ _LAYER = SimpleNamespace(
 
 
 class _Case:
-    """bs requests with given prefixes, their prefix KV, and ndt draft tokens each."""
-
     def __init__(self, prefixes, with_value, seed=0):
         torch.manual_seed(seed)
         self.with_value = with_value
@@ -286,12 +282,12 @@ def test_graph_replay_at_longer_context(with_value):
     torch.cuda.synchronize()
     # No row may read past the context-length bound the score buffer was sized for.
     assert int(backend._linear_verify_meta.seq_lens.max()) == MAX_CONTEXT
-    # Compared to tolerance: the captured and the reference score buffers differ in width.
     inside = [
         r
         for r in range(case.bs * NDT)
         if int(case.prefix[r // NDT]) + r % NDT + 1 <= MAX_CONTEXT
     ]
+    # The captured and reference score buffers differ in width; compare to tolerance.
     _assert_same(out, case.reference(), exact=False, rows=inside)
 
 
