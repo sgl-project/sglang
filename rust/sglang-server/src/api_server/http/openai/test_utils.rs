@@ -106,9 +106,11 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 }
 
 pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
+    let server_args = server_args();
     Arc::new(super::AppState {
         core,
-        server_args: server_args(),
+        generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        server_args,
         chat_formatter: None,
     })
 }
@@ -157,9 +159,11 @@ fn answering_app_state() -> Arc<super::AppState> {
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
         },
     );
+    let server_args = server_args();
     Arc::new(super::AppState {
         core,
-        server_args: server_args(),
+        generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        server_args,
         chat_formatter: Some(super::ChatFormatter::Legacy(Box::new(
             super::template::LegacyFormatter {
                 spec: super::template::builtin_template("chatml").unwrap(),
