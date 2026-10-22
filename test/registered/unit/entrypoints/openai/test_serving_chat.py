@@ -5249,6 +5249,24 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving.apply_reasoning_enabled(request, True)
         self.assertEqual(request.reasoning_effort, "low")
 
+    def test_llama_nemotron_anthropic_thinking_is_accepted(self):
+        """Bug regression: llama_nemotron exposes no reasoning toggle, so
+        Anthropic thinking enabled (and 4.7 "adaptive") raised and surfaced as
+        400 from /v1/messages. Thinking rides the caller's system prompt, so
+        both modes must pass through without rewriting the request."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "llama_nemotron"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default=None)
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        for enabled in (True, False):
+            serving.apply_reasoning_enabled(request, enabled)
+            self.assertIsNone(request.reasoning_effort)
+            self.assertIsNone(request.chat_template_kwargs)
+
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
