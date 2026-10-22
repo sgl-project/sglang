@@ -72,12 +72,13 @@ def test_gqa_verify_splitkv(bs, window, kv_heads):
 
 
 @pytest.mark.parametrize("bs", [1, 8, 48])
-def test_gqa_verify_splitkv_2kv(bs):
+@pytest.mark.parametrize("kv_heads", [2, 4])
+def test_gqa_verify_splitkv_2kv(bs, kv_heads):
     from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
         gqa_verify_splitkv_2kv,
     )
 
-    q, kc, vc, seq, table, kd, vd = _paged_inputs(bs, seed=100 + bs)
+    q, kc, vc, seq, table, kd, vd = _paged_inputs(bs, kv_heads=kv_heads, seed=100 + bs)
     out = torch.empty_like(q)
     gqa_verify_splitkv_2kv(q, kc, vc, out, seq, table, SCALE, kd, vd)
     torch.testing.assert_close(
