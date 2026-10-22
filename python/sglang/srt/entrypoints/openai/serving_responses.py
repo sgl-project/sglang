@@ -72,7 +72,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
-    ResponsesStreamEvent,
     Tool,
     UsageInfo,
 )
@@ -171,10 +170,6 @@ def _should_emit_normal_text_as_message(
 
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
-_OUTPUT_ITEM_EVENTS = (
-    openai_responses_types.ResponseOutputItemAddedEvent,
-    openai_responses_types.ResponseOutputItemDoneEvent,
-)
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -2091,45 +2086,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     async def responses_stream_generator_non_harmony(
         self,
-        request,
-        sampling_params,
-        result_generator,
-        model_name,
-        tokenizer,
-        request_metadata,
-        created_time=None,
-        *,
-        require_reasoning,
-        tool_adapter=None,
-    ):
-        events = self._responses_stream_events_non_harmony(
-            request,
-            sampling_params,
-            result_generator,
-            model_name,
-            tokenizer,
-            request_metadata,
-            created_time,
-            require_reasoning=require_reasoning,
-            tool_adapter=tool_adapter,
-        )
-        sequence_number = 0
-        async for event in events:
-            payload = event.model_dump()
-            if isinstance(event, _OUTPUT_ITEM_EVENTS) and isinstance(
-                event.item, ResponseOutputMessage
-            ):
-                payload["item"] = event.item.model_dump()
-            if tool_adapter is not None:
-                payload = tool_adapter.event(payload)
-                if payload is None:
-                    continue
-            payload["sequence_number"] = sequence_number
-            sequence_number += 1
-            yield f"event: {payload['type']}\ndata: {orjson.dumps(payload).decode()}\n\n"
-
-    async def _responses_stream_events_non_harmony(
-        self,
         request: ResponsesRequest,
         sampling_params: Any,
         result_generator: AsyncIterator[Any],
@@ -2140,8 +2096,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         tool_adapter=None,
-    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
-        pending: list[ResponsesStreamEvent] = []
+    ) -> AsyncGenerator[str, None]:
+        pending: list[dict] = []
         can_call_tools = (
             bool(self._response_tools_to_chat_tools(request))
             and request.effective_tool_choice() != "none"
@@ -2157,19 +2113,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             require_reasoning=require_reasoning,
             tool_adapter=tool_adapter,
         ):
+            if not event:
+                continue
             if not can_call_tools:
                 yield event
                 continue
-            event_type = event.type
-            item_type = (
-                event.item.type if isinstance(event, _OUTPUT_ITEM_EVENTS) else None
-            )
+            payload = orjson.loads(event.split("data: ", 1)[1])
+            event_type = payload["type"]
+            item_type = payload.get("item", {}).get("type")
             opens_item = event_type == "response.output_item.added"
             if pending or (opens_item and item_type == "message"):
-                pending.append(event)
+                pending.append(payload)
                 tool_follows = opens_item and item_type in (
                     "function_call",
                     "custom_tool_call",
+                    "shell_call",
                 )
                 terminal = event_type in (
                     "response.completed",
@@ -2179,11 +2137,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if tool_follows or terminal:
                     phase = "commentary" if tool_follows else "final_answer"
                     for buffered in pending:
-                        if isinstance(buffered, _OUTPUT_ITEM_EVENTS) and isinstance(
-                            buffered.item, ResponseOutputMessage
-                        ):
-                            buffered.item.phase = phase
-                        yield buffered
+                        if buffered.get("item", {}).get("type") == "message":
+                            buffered["item"]["phase"] = phase
+                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
                     pending.clear()
             else:
                 yield event
@@ -2200,10 +2156,32 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         tool_adapter=None,
-    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
-        """Parse engine chunks into typed reasoning, tool-call, and text events."""
+    ) -> AsyncGenerator[str, None]:
+        """Stream a /v1/responses response as typed OpenAI SSE events for
+        non-harmony models. Each engine chunk is run through the reasoning
+        and function-call parsers; leftover text becomes
+        ``response.output_text.delta``.
+        """
 
         created_time = created_time or int(time.time())
+        sequence_number = 0
+
+        def _send_event(event):
+            nonlocal sequence_number
+            if hasattr(event, "sequence_number"):
+                event.sequence_number = sequence_number
+            event_type = getattr(event, "type", "unknown")
+            payload = event.model_dump()
+            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
+                payload["item"] = event.item.model_dump()
+            if tool_adapter is not None:
+                # An event the adapter suppresses takes no sequence number.
+                payload = tool_adapter.event(payload)
+                if payload is None:
+                    return ""
+                event_type = payload["type"]
+            sequence_number += 1
+            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
         initial_response = ResponsesResponse.from_request(
             request,
@@ -2215,7 +2193,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=None,
         )
         for event_type in ("response.created", "response.in_progress"):
-            yield ResponsesLifecycleEvent(type=event_type, response=initial_response)
+            yield _send_event(
+                ResponsesLifecycleEvent(type=event_type, response=initial_response)
+            )
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
@@ -2331,56 +2311,66 @@ class OpenAIServingResponses(OpenAIServingChat):
             events: list = []
             if wants_summary:
                 events.append(
-                    openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
-                        type="response.reasoning_summary_text.done",
-                        item_id=reasoning_state["item_id"],
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        summary_index=0,
-                        text=text,
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                            type="response.reasoning_summary_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            text=text,
+                        )
                     )
                 )
                 events.append(
-                    openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
-                        type="response.reasoning_summary_part.done",
-                        item_id=reasoning_state["item_id"],
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        summary_index=0,
-                        part=ResponseReasoningSummaryDonePart(
-                            type="summary_text", text=text
-                        ),
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                            type="response.reasoning_summary_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            part=ResponseReasoningSummaryDonePart(
+                                type="summary_text", text=text
+                            ),
+                        )
                     )
                 )
             else:
                 events.append(
-                    openai_responses_types.ResponseReasoningTextDoneEvent(
-                        type="response.reasoning_text.done",
-                        item_id=reasoning_state["item_id"],
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        content_index=0,
-                        text=text,
+                    _send_event(
+                        openai_responses_types.ResponseReasoningTextDoneEvent(
+                            type="response.reasoning_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            text=text,
+                        )
                     )
                 )
                 events.append(
-                    openai_responses_types.ResponseContentPartDoneEvent(
-                        type="response.content_part.done",
-                        item_id=reasoning_state["item_id"],
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        content_index=0,
-                        part=ResponseReasoningTextDonePart(
-                            type="reasoning_text", text=text
-                        ),
+                    _send_event(
+                        openai_responses_types.ResponseContentPartDoneEvent(
+                            type="response.content_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            part=ResponseReasoningTextDonePart(
+                                type="reasoning_text", text=text
+                            ),
+                        )
                     )
                 )
             events += [
-                openai_responses_types.ResponseOutputItemDoneEvent(
-                    type="response.output_item.done",
-                    sequence_number=-1,
-                    output_index=reasoning_state["output_index"],
-                    item=completed_item,
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        item=completed_item,
+                    )
                 ),
             ]
             emitted_items.append(completed_item)
@@ -2412,28 +2402,34 @@ class OpenAIServingResponses(OpenAIServingChat):
                 phase="final_answer",
             )
             events = [
-                openai_responses_types.ResponseTextDoneEvent(
-                    type="response.output_text.done",
-                    sequence_number=-1,
-                    output_index=message_state["output_index"],
-                    content_index=0,
-                    text=text,
-                    logprobs=[],
-                    item_id=message_state["item_id"],
+                _send_event(
+                    openai_responses_types.ResponseTextDoneEvent(
+                        type="response.output_text.done",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        content_index=0,
+                        text=text,
+                        logprobs=[],
+                        item_id=message_state["item_id"],
+                    )
                 ),
-                openai_responses_types.ResponseContentPartDoneEvent(
-                    type="response.content_part.done",
-                    sequence_number=-1,
-                    item_id=message_state["item_id"],
-                    output_index=message_state["output_index"],
-                    content_index=0,
-                    part=text_content,
+                _send_event(
+                    openai_responses_types.ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        sequence_number=-1,
+                        item_id=message_state["item_id"],
+                        output_index=message_state["output_index"],
+                        content_index=0,
+                        part=text_content,
+                    )
                 ),
-                openai_responses_types.ResponseOutputItemDoneEvent(
-                    type="response.output_item.done",
-                    sequence_number=-1,
-                    output_index=message_state["output_index"],
-                    item=completed_item,
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        item=completed_item,
+                    )
                 ),
             ]
             emitted_items.append(completed_item)
@@ -2456,12 +2452,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if remainder:
                     state["payload"] = payload
                     events.append(
-                        openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
-                            type="response.custom_tool_call_input.delta",
-                            sequence_number=-1,
-                            item_id=state["item_id"],
-                            output_index=state["output_index"],
-                            delta=remainder,
+                        _send_event(
+                            openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                type="response.custom_tool_call_input.delta",
+                                sequence_number=-1,
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                delta=remainder,
+                            )
                         )
                     )
                 completed_item = ResponseCustomToolCall(
@@ -2472,12 +2470,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     input=payload,
                 )
                 events.append(
-                    openai_responses_types.ResponseCustomToolCallInputDoneEvent(
-                        type="response.custom_tool_call_input.done",
-                        sequence_number=-1,
-                        item_id=state["item_id"],
-                        output_index=state["output_index"],
-                        input=payload,
+                    _send_event(
+                        openai_responses_types.ResponseCustomToolCallInputDoneEvent(
+                            type="response.custom_tool_call_input.done",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            input=payload,
+                        )
                     )
                 )
             else:
@@ -2495,21 +2495,27 @@ class OpenAIServingResponses(OpenAIServingChat):
                     status=item_status,
                 )
                 events.append(
-                    openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
-                        type="response.function_call_arguments.done",
-                        sequence_number=-1,
-                        item_id=state["item_id"],
-                        output_index=state["output_index"],
-                        arguments=arguments,
-                        **response_tool_name(state["name"], request._tool_state.names),
+                    _send_event(
+                        openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                            type="response.function_call_arguments.done",
+                            sequence_number=-1,
+                            item_id=state["item_id"],
+                            output_index=state["output_index"],
+                            arguments=arguments,
+                            **response_tool_name(
+                                state["name"], request._tool_state.names
+                            ),
+                        )
                     )
                 )
             events.append(
-                openai_responses_types.ResponseOutputItemDoneEvent(
-                    type="response.output_item.done",
-                    sequence_number=-1,
-                    output_index=state["output_index"],
-                    item=completed_item,
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=state["output_index"],
+                        item=completed_item,
+                    )
                 )
             )
             emitted_items.append(completed_item)
@@ -2590,61 +2596,71 @@ class OpenAIServingResponses(OpenAIServingChat):
                             yield ev
                     if not reasoning_state["open"]:
                         item_id = _open_reasoning_item()
-                        yield openai_responses_types.ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=reasoning_state["output_index"],
-                            item=ResponseReasoningItem(
-                                id=item_id,
-                                type="reasoning",
-                                summary=[],
-                                content=[],
-                                status="in_progress",
-                            ),
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=reasoning_state["output_index"],
+                                item=ResponseReasoningItem(
+                                    id=item_id,
+                                    type="reasoning",
+                                    summary=[],
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
                         )
                         # Clients that opt into ``reasoning.summary`` render
                         # off the ``reasoning_summary_text.*`` event stream,
                         # so mirror the trace into a summary part.
                         if wants_summary:
-                            yield openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
-                                type="response.reasoning_summary_part.added",
-                                item_id=item_id,
-                                output_index=reasoning_state["output_index"],
-                                summary_index=0,
-                                part=ResponseReasoningSummaryAddedPart(
-                                    type="summary_text", text=""
-                                ),
-                                sequence_number=-1,
+                            yield _send_event(
+                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                    type="response.reasoning_summary_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    summary_index=0,
+                                    part=ResponseReasoningSummaryAddedPart(
+                                        type="summary_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
                             )
                         else:
-                            yield openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
-                                item_id=item_id,
-                                output_index=reasoning_state["output_index"],
-                                content_index=0,
-                                part=ResponseReasoningTextAddedPart(
-                                    type="reasoning_text", text=""
-                                ),
-                                sequence_number=-1,
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    content_index=0,
+                                    part=ResponseReasoningTextAddedPart(
+                                        type="reasoning_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
                             )
                     reasoning_state["text"] += reasoning_chunk
                     if wants_summary:
-                        yield openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
-                            type="response.reasoning_summary_text.delta",
-                            item_id=reasoning_state["item_id"],
-                            output_index=reasoning_state["output_index"],
-                            summary_index=0,
-                            delta=reasoning_chunk,
-                            sequence_number=-1,
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                                type="response.reasoning_summary_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                summary_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
                         )
                     else:
-                        yield openai_responses_types.ResponseReasoningTextDeltaEvent(
-                            type="response.reasoning_text.delta",
-                            item_id=reasoning_state["item_id"],
-                            output_index=reasoning_state["output_index"],
-                            content_index=0,
-                            delta=reasoning_chunk,
-                            sequence_number=-1,
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                type="response.reasoning_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                content_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
                         )
 
                 if not delta and not flush and not token_calls:
@@ -2737,11 +2753,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     id=state["item_id"],
                                     status="in_progress",
                                 )
-                            yield openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=state["output_index"],
-                                item=added_item,
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=state["output_index"],
+                                    item=added_item,
+                                )
                             )
                         if call.parameters:
                             state["arguments"] += call.parameters
@@ -2757,20 +2775,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ) > len(state["payload"]):
                                     delta = decoded[len(state["payload"]) :]
                                     state["payload"] = decoded
-                                    yield openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
-                                        type="response.custom_tool_call_input.delta",
+                                    yield _send_event(
+                                        openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                            type="response.custom_tool_call_input.delta",
+                                            sequence_number=-1,
+                                            item_id=state["item_id"],
+                                            output_index=state["output_index"],
+                                            delta=delta,
+                                        )
+                                    )
+                            else:
+                                yield _send_event(
+                                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                        type="response.function_call_arguments.delta",
                                         sequence_number=-1,
                                         item_id=state["item_id"],
                                         output_index=state["output_index"],
-                                        delta=delta,
+                                        delta=call.parameters,
                                     )
-                            else:
-                                yield openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                    type="response.function_call_arguments.delta",
-                                    sequence_number=-1,
-                                    item_id=state["item_id"],
-                                    output_index=state["output_index"],
-                                    delta=call.parameters,
                                 )
 
                 def _emit_normal_text():
@@ -2788,41 +2810,47 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 yield ev
                         if not message_state["open"]:
                             item_id = _open_message_item()
-                            yield openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item=ResponseOutputMessage(
-                                    id=item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
-                                    status="in_progress",
-                                    phase="final_answer",
-                                ),
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=message_state["output_index"],
+                                    item=ResponseOutputMessage(
+                                        id=item_id,
+                                        type="message",
+                                        role="assistant",
+                                        content=[],
+                                        status="in_progress",
+                                        phase="final_answer",
+                                    ),
+                                )
                             )
-                            yield openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item_id=message_state["item_id"],
-                                content_index=0,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    sequence_number=-1,
+                                    output_index=message_state["output_index"],
+                                    item_id=message_state["item_id"],
+                                    content_index=0,
+                                    part=openai_responses_types.ResponseOutputText(
+                                        type="output_text",
+                                        text="",
+                                        annotations=[],
+                                        logprobs=None,
+                                    ),
+                                )
                             )
                         message_state["text"] += normal_text
-                        yield openai_responses_types.ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=0,
-                            output_index=message_state["output_index"],
-                            item_id=message_state["item_id"],
-                            delta=normal_text,
-                            logprobs=[],
+                        yield _send_event(
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
+                                sequence_number=-1,
+                                content_index=0,
+                                output_index=message_state["output_index"],
+                                item_id=message_state["item_id"],
+                                delta=normal_text,
+                                logprobs=[],
+                            )
                         )
 
                 # The parser's (text, calls) tuple is unordered, but positions
@@ -2856,7 +2884,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 usage=None,
             )
             failed.error = {"code": "server_error", "message": str(e)}
-            yield ResponsesLifecycleEvent(type="response.failed", response=failed)
+            yield _send_event(
+                ResponsesLifecycleEvent(type="response.failed", response=failed)
+            )
             return
 
         for ev in _close_reasoning_item():
@@ -2906,8 +2936,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         for item in final_response.output
                     ]
 
-        yield ResponsesLifecycleEvent(
-            type=f"response.{final_response.status}", response=final_response
+        yield _send_event(
+            ResponsesLifecycleEvent(
+                type=f"response.{final_response.status}", response=final_response
+            )
         )
 
     async def _generate_with_builtin_tools(

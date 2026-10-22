@@ -47,7 +47,6 @@ from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutput
 from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
-    ResponseStreamEvent,
     ResponseTextConfig,
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
@@ -2383,9 +2382,6 @@ class ResponsesLifecycleEvent(BaseModel):
     ]
     response: ResponsesResponse
     sequence_number: int = -1
-
-
-ResponsesStreamEvent: TypeAlias = Union[ResponseStreamEvent, ResponsesLifecycleEvent]
 
 
 class RequestResponseMetadata(BaseModel):
