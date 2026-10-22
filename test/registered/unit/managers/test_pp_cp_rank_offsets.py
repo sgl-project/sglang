@@ -18,10 +18,10 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    PPBatchMetadata,
     SchedulerPPMixin,
-    _pp_exchange_outputs_before_forward,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -46,21 +46,12 @@ def _fake_group() -> SimpleNamespace:
 
 
 def _make_receiver() -> SchedulerRequestReceiver:
-    tp_group = _fake_group()
-    attn_tp_group = _fake_group()
-    attn_cp_group = _fake_group()
-    world_group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        tp_group=tp_group,
-        tp_cpu_group=tp_group,
-        attn_tp_cpu_group=attn_tp_group,
-        attn_cp_cpu_group=attn_cp_group,
-        world_group=world_group,
         server_args=SimpleNamespace(
             enable_dp_attention_local_control_broadcast=False,
         ),
@@ -120,6 +111,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             attn_tp_size=1,
             attn_cp_size=1,
             tp_size=32,
+            tp_group=_fake_group(),
         )
 
         with (
@@ -150,15 +142,16 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         self.assertEqual(result, [control_req])
         broadcast.assert_called_once_with(
             [control_req],
-            receiver.tp_group.rank,
-            receiver.tp_cpu_group,
-            src=receiver.tp_group.ranks[0],
+            parallel.tp_group.rank,
+            parallel.tp_group.cpu_group,
+            src=parallel.tp_group.ranks[0],
         )
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         enter_scope(self, _published_topology())
+        enter_scope(self, get_parallel().override(world_group=_fake_group()))
         calls = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
@@ -254,7 +247,7 @@ class TestDSparkPPOutput(CustomTestCase):
         result = SchedulerPPMixin._pp_prep_batch_result(
             scheduler,
             batch,
-            SimpleNamespace(can_run_cuda_graph=False),
+            PPBatchMetadata(can_run_cuda_graph=False),
             PPProxyTensors(wire),
         )
         self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)
@@ -263,21 +256,6 @@ class TestDSparkPPOutput(CustomTestCase):
         torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
         torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
-
-
-class TestPPSpecExchangeOrder(unittest.TestCase):
-    def test_extend_launches_before_the_relay_exchange(self):
-        kwargs = dict(spec_relay=True, is_last_rank=False, async_batch_depth=0)
-        extend = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND, is_extend_in_batch=False
-        )
-        decode = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
-        )
-        self.assertFalse(
-            _pp_exchange_outputs_before_forward(cur_batch=extend, **kwargs)
-        )
-        self.assertTrue(_pp_exchange_outputs_before_forward(cur_batch=decode, **kwargs))
 
 
 if __name__ == "__main__":

@@ -160,6 +160,14 @@ fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
 }
 
 #[test]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+fn get_or_fill_uuid_rejects_mamba() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [node] = chain::<1>(&mut tc);
+    mamba_component().get_or_fill_uuid(&mut tc, node, /* host = */ false);
+}
+
+#[test]
 fn node_has_component_data_reads_each_layer() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
@@ -373,6 +381,7 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
         &holder_params,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
 
@@ -732,6 +741,7 @@ fn evict_component_device_frees_and_tombstones_the_slot() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!((freed, host_freed), (1, 0));
@@ -756,6 +766,7 @@ fn evict_component_device_moves_a_host_backed_node_into_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(tc.arena.node(a).has_host_value(MAMBA));
@@ -775,6 +786,7 @@ fn evict_component_host_frees_and_leaves_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!((freed, host_freed), (0, 1));
@@ -796,6 +808,7 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::All,
     );
     assert_eq!((freed, host_freed), (1, 1));
@@ -1287,6 +1300,7 @@ fn host_eviction_tombstones_internal_host_values() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert!(!tc.arena.node(a).has_host_value(MAMBA));
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
@@ -1326,6 +1340,7 @@ fn host_eviction_takes_a_host_leaf_atomically() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     // The atomic host-leaf eviction frees both components and the node.
     assert_eq!(tracker[&MAMBA], 1);
@@ -1350,6 +1365,7 @@ fn host_drive_panics_on_an_lru_member_without_a_mamba_host_value() {
         &mut tracker,
         &mut HashMap::new(),
         &mut HashMap::new(),
+        &mut Vec::new(),
     );
 }
 
@@ -1376,6 +1392,7 @@ fn swa_triggered_cascade_takes_the_mamba_slot() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(!tc.arena.node(a).has_device_value(MAMBA));
@@ -1407,6 +1424,7 @@ fn mamba_triggered_cascade_spares_the_higher_tiers() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     // FULL (2) and SWA (1) both outrank the mamba trigger (0).
@@ -2394,7 +2412,7 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
     assert_eq!(result.best_match_node_id, a);
     assert_eq!(result.last_device_node_id, a);
-    assert_eq!(result.device_indices.numel(), 3);
+    assert_eq!(result.device_prefix_len, 3);
     assert_eq!(result.host_hit_length, 0);
     assert_eq!(result.full_kv_hit_length, 7);
     assert_eq!(result.mamba_branching_seqlen, Some(6));
@@ -2406,7 +2424,7 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
     ));
     assert!(!insert_result.mamba_exist);
     let second = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
-    assert_eq!(second.device_indices.numel(), 6);
+    assert_eq!(second.device_prefix_len, 6);
     assert_eq!(second.mamba_branching_seqlen, None);
 }
 

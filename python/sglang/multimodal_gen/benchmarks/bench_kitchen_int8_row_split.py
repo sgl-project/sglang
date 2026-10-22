@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Measure the SM120 Kitchen INT8 default against the explicit 8192-row policy."""
+"""Measure the Kitchen INT8 default against the explicit 8192-row policy."""
 
 import argparse
 import json
@@ -51,9 +51,8 @@ def main():
     records = []
     reference = None
     with torch.inference_mode():
-        for override in (True, False, False, True):
-            kitchen_int8._ROW_SPLIT_OVERRIDDEN = override
-            kitchen_int8._MAX_ROWS_PER_CALL = 8192
+        for limit in (8192, 0, 0, 8192):
+            kitchen_int8._MAX_ROWS_PER_CALL = limit
             kitchen_int8._MIN_SPLIT_OUTPUT = 8192
             for _ in range(5):
                 output = method.apply(layer, inputs, bias)
@@ -71,7 +70,7 @@ def main():
                 samples.append(start.elapsed_time(end))
             records.append(
                 {
-                    "arm": "8192" if override else "default",
+                    "arm": "8192" if limit else "default",
                     "ms": samples,
                     "median_ms": statistics.median(samples),
                 }

@@ -1,76 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hardware defaults and explicit overrides for Kitchen INT8 row splitting."""
+"""Unsplit default and explicit row limits for the Kitchen INT8 backend."""
+
+import importlib.util
 
 import pytest
-import torch
 
 from sglang.multimodal_gen.runtime.layers.quantization import (
     convrot_int8_comfy_kitchen as kitchen_int8,
 )
 
 
-@pytest.mark.parametrize(
-    "capability,device,dtype,rows,width,expected",
-    [
-        ((12, 0), "cuda:0", torch.bfloat16, 32700, 16128, None),
-        ((12, 0), "cuda:1", torch.bfloat16, 8193, 24832, None),
-        ((12, 0), "cuda:0", torch.bfloat16, 14850, 28672, 8192),
-        ((8, 9), "cuda:0", torch.bfloat16, 32700, 16128, 8192),
-        ((9, 0), "cuda:0", torch.bfloat16, 32700, 16128, 8192),
-        ((12, 0), "cuda:0", torch.float16, 32700, 16128, 8192),
-        ((12, 0), "cuda:0", torch.float32, 32700, 16128, 8192),
-        ((12, 0), "cpu", torch.bfloat16, 32700, 16128, 8192),
-        ((12, 0), "cuda:0", torch.bfloat16, 8192, 16128, None),
-        ((8, 9), "cuda:0", torch.bfloat16, 32700, 5376, None),
-    ],
-)
-def test_row_split_hardware_default(
-    monkeypatch, capability, device, dtype, rows, width, expected
-):
-    monkeypatch.setattr(kitchen_int8, "_ROW_SPLIT_OVERRIDDEN", False)
-    monkeypatch.setattr(kitchen_int8, "_MAX_ROWS_PER_CALL", 8192)
-    monkeypatch.setattr(kitchen_int8, "_MIN_SPLIT_OUTPUT", 8192)
-    kitchen_int8._is_sm120.cache_clear()
-    devices = []
-
-    def get_capability(device_id):
-        devices.append(device_id)
-        return capability
-
-    monkeypatch.setattr(
-        kitchen_int8.current_platform, "get_device_capability", get_capability
+@pytest.mark.parametrize("limit", [None, "0", "4096", "8192"])
+@pytest.mark.parametrize("min_output", [None, "8192", "16384"])
+def test_row_split_environment_policy(monkeypatch, limit, min_output):
+    for name, value in (
+        ("SGLANG_KITCHEN_INT8_MAX_ROWS", limit),
+        ("SGLANG_KITCHEN_INT8_MIN_SPLIT_N", min_output),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    # Execute the import-time policy without replacing classes used by other tests.
+    spec = importlib.util.spec_from_file_location(
+        "_kitchen_int8_policy_test", kitchen_int8.__file__
     )
-    try:
-        assert (
-            kitchen_int8._row_split(rows, width, 5376, torch.device(device), dtype)
-            == expected
-        )
-        if devices:
-            assert devices == [torch.device(device).index]
-    finally:
-        kitchen_int8._is_sm120.cache_clear()
-
-
-@pytest.mark.parametrize("limit,expected", [(0, None), (8192, 8192), (4096, 4096)])
-def test_row_split_explicit_override(monkeypatch, limit, expected):
-    monkeypatch.setattr(kitchen_int8, "_ROW_SPLIT_OVERRIDDEN", True)
-    monkeypatch.setattr(kitchen_int8, "_MAX_ROWS_PER_CALL", limit)
-    monkeypatch.setattr(kitchen_int8, "_MIN_SPLIT_OUTPUT", 8192)
-    assert (
-        kitchen_int8._row_split(
-            32700, 16128, 5376, torch.device("cuda:0"), torch.bfloat16
-        )
-        == expected
-    )
-
-
-def test_row_split_preserves_large_reduction_policy(monkeypatch):
-    monkeypatch.setattr(kitchen_int8, "_ROW_SPLIT_OVERRIDDEN", False)
-    monkeypatch.setattr(kitchen_int8, "_MAX_ROWS_PER_CALL", 8192)
-    monkeypatch.setattr(kitchen_int8, "_MIN_SPLIT_OUTPUT", 8192)
-    assert (
-        kitchen_int8._row_split(
-            12288, 21504, 28672, torch.device("cuda:0"), torch.bfloat16
-        )
-        == 8192
-    )
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    max_rows = int(limit or "0")
+    min_width = int(min_output or "8192")
+    for rows in (4095, 4096, 4097, 8192, 8193, 32700):
+        for width in (5376, 8191, 8192, 16128, 16384):
+            expected = (
+                max_rows
+                if max_rows > 0 and rows > max_rows and width >= min_width
+                else None
+            )
+            assert policy._row_split(rows, width) == expected
