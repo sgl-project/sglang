@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -15,6 +16,12 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
+from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type, supports_prefill_cp_bcg
+from sglang.srt.layers.cp.bcg.bcg import (
+    PrefillCPBCGInput,
+    filter_prefill_cp_bcg_capture_num_tokens,
+)
+from sglang.srt.layers.cp.bcg.dsv4_bcg import DSV4CPBCGInput
 from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
@@ -33,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -57,6 +65,103 @@ class _FakeCPGroup:
     def all_gather_into_tensor(self, output, input_tensor):
         del input_tensor
         torch.cat(self.all_rank_tensors, dim=0, out=output)
+
+
+@contextmanager
+def _bcg_config(
+    *, strategy="interleave", backend="dsv4", cp=8, tp=8, pp=1, enabled=True
+):
+    cfg = SimpleNamespace(
+        enable_prefill_cp=enabled, pp_size=pp, tp_size=tp, cp_strategy=strategy
+    )
+    resolved = SimpleNamespace(attn_cp_size=cp)
+    module = "sglang.srt.layers.cp.bcg"
+    with (
+        patch(module + ".resolving_view", return_value=cfg),
+        patch(module + ".resolved_view", return_value=resolved),
+        patch(module + ".attention_backends_of", return_value=(backend, backend)),
+        patch(module + ".bcg.resolving_view", return_value=cfg),
+        patch(module + ".bcg.resolved_view", return_value=resolved),
+        patch(module + ".bcg.attention_backends_of", return_value=(backend, backend)),
+    ):
+        yield cfg
+
+
+class TestCPBCGConfiguration(CustomTestCase):
+    def test_interleave_backend_selects_the_matching_adapter(self):
+        self.assertIs(
+            get_cp_bcg_input_type(
+                ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSV4
+            ),
+            DSV4CPBCGInput,
+        )
+        self.assertIs(
+            get_cp_bcg_input_type(
+                ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSA
+            ),
+            InterleaveCPBCGInput,
+        )
+        self.assertIs(
+            get_cp_bcg_input_type(
+                ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA
+            ),
+            ZigzagCPBCGInput,
+        )
+        self.assertTrue(DSV4CPBCGInput.supports_max_context_size)
+        self.assertFalse(InterleaveCPBCGInput.supports_max_context_size)
+
+    def test_runtime_factory_selects_dsv4_without_glm_replay_restrictions(self):
+        init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
+        try:
+            with (
+                _bcg_config(cp=4, tp=4) as cfg,
+                get_parallel().override(attn_cp_size=4, attn_cp_rank=0),
+            ):
+                runner = SimpleNamespace(
+                    device="cpu",
+                    max_num_tokens=16,
+                    model_runner=SimpleNamespace(
+                        server_args=cfg,
+                        model_config=SimpleNamespace(hidden_size=1),
+                        dtype=torch.float32,
+                    ),
+                )
+                adapter = PrefillCPBCGInput.create(runner)
+            self.assertIsInstance(adapter, DSV4CPBCGInput)
+            self.assertTrue(adapter.allows_replay(2, 12, [4, 8], True))
+            glm = InterleaveCPBCGInput(
+                input_embeds=torch.empty(0),
+                positions=torch.empty(0),
+                bucket_local_tokens={16: 4},
+            )
+            self.assertFalse(glm.allows_replay(2, 12, [4, 8], True))
+        finally:
+            init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_dsv41_interleave_enables_cp_bcg_and_filters_small_buckets(self):
+        with _bcg_config() as cfg:
+            self.assertTrue(supports_prefill_cp_bcg(cfg))
+            self.assertTrue(supports_prefill_cp_bcg(cfg))
+            self.assertEqual(
+                filter_prefill_cp_bcg_capture_num_tokens([1, 2, 4, 8, 16], cfg),
+                [8, 16],
+            )
+
+    def test_unsupported_cp_bcg_configurations_stay_disabled(self):
+        cases = (
+            dict(strategy="zigzag"),
+            dict(backend="fa3"),
+            dict(cp=4),
+            dict(pp=2),
+            dict(enabled=False),
+        )
+        for case in cases:
+            with self.subTest(case=case), _bcg_config(**case) as cfg:
+                self.assertFalse(supports_prefill_cp_bcg(cfg))
+
+    def test_trtllm_zigzag_support_is_preserved(self):
+        with _bcg_config(strategy="zigzag", backend="trtllm_mha") as cfg:
+            self.assertTrue(supports_prefill_cp_bcg(cfg))
 
 
 class TestCPStrategyUnit(CustomTestCase):
@@ -122,6 +227,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def _make_runner(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(model=SimpleNamespace(vision=None))
         runner._is_full_backend = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
@@ -185,6 +291,60 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 self.assertTrue(runner.can_run_graph(batch))
         batch.extend_prefix_lens_cpu = [0, 1, 0]
         self.assertFalse(runner.can_run_graph(batch))
+
+    def test_dsv41_capture_prepares_cp_before_attention_metadata(self):
+        class MetadataChecked(Exception):
+            pass
+
+        init_cp_strategy(enable_prefill_cp=True, cp_size=8, cp_strategy="interleave")
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=torch.arange(16),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([8, 8]),
+            out_cache_loc=torch.arange(16),
+            seq_lens_sum=16,
+            positions=torch.arange(16),
+            seq_lens_cpu=torch.tensor([8, 8]),
+            extend_seq_lens_cpu=[8, 8],
+            extend_num_tokens=16,
+            max_seq_len_override=51200,
+        )
+        runner = self._make_runner()
+        runner.device = "cpu"
+        runner.max_num_tokens = 16
+        runner.model_runner = SimpleNamespace(
+            model=SimpleNamespace(
+                get_input_embeddings=lambda: lambda ids: ids[:, None].float()
+            ),
+            model_config=SimpleNamespace(hidden_size=1),
+            dtype=torch.float32,
+        )
+        runner.capture_prepare = lambda size: (batch, None)
+
+        def check_metadata(forward_batch, shape_key):
+            self.assertIsNotNone(forward_batch.attn_cp_metadata)
+            self.assertEqual(forward_batch.attn_cp_metadata.total_seq_lens, 16)
+            self.assertEqual(
+                len(forward_batch.attn_cp_metadata.per_rank_actual_token), 8
+            )
+            self.assertIsNotNone(forward_batch.cp_positions)
+            self.assertIsNotNone(forward_batch.cp_input_ids)
+            self.assertEqual(forward_batch.max_seq_len_override, 51200)
+            raise MetadataChecked
+
+        runner._init_forward_metadata_for_capture = check_metadata
+        with (
+            _bcg_config() as cfg,
+            get_parallel().override(
+                attn_cp_rank=0, attn_cp_size=8, enable_cp_tp_group_sharing=True
+            ),
+        ):
+            runner.enable_cp_bcg_capture = supports_prefill_cp_bcg(cfg)
+            runner.prefill_cp_bcg_input = DSV4CPBCGInput.create(runner)
+            with self.assertRaises(MetadataChecked):
+                runner.capture_one_shape(16)
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()

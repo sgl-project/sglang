@@ -22,11 +22,13 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     resolved_view,
     resolving_view,
 )
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy_kind,
 )
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
@@ -36,6 +38,10 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -86,13 +92,19 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
+    supports_max_context_size = False
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
         if cls is PrefillCPBCGInput:
             from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type
 
-            return get_cp_bcg_input_type(get_cp_strategy_kind()).create(runner)
+            backend, _ = attention_backends_of(
+                resolved_view(runner.model_runner.server_args)
+            )
+            return get_cp_bcg_input_type(
+                get_cp_strategy_kind(), CPAttentionBackendKind.from_string(backend)
+            ).create(runner)
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -114,6 +126,9 @@ class PrefillCPBCGInput:
     def model_positions(self, forward_batch):
         # No override: retain the runner's existing model/mRoPE selection.
         return None
+
+    def model_input_ids(self, forward_batch):
+        return forward_batch.input_ids
 
     @staticmethod
     def supports(server_args: ServerArgs) -> bool:
@@ -328,11 +343,22 @@ def execute_prefill_cp_bcg(
             hidden_states, hidden_states_before_norm = hidden_states
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        logits_inputs = CPLogitsInputs(forward_batch.input_ids, forward_batch)
+        if isinstance(model, CPBoundedTailLogits):
+            logits_inputs = model.prepare_cp_logits_inputs(
+                forward_batch.input_ids, forward_batch
+            )
+
+        output = model.logits_processor(
+            logits_inputs.input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_inputs.logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if logits_inputs.hidden_states_token_indices is not None:
+            output.hidden_states_token_indices = (
+                logits_inputs.hidden_states_token_indices
+            )
+        return output

@@ -127,6 +127,11 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+    LanguageModelInputPreparation,
+)
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -2419,7 +2424,8 @@ class MQALayer(MqaAttentionBase):
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
                 and (
-                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                    is_cp_active(forward_batch)
+                    or not getattr(attn_backend, "low_ratio_prefill_graph", False)
                     or in_replay_tail_graph()
                 )
             ):
@@ -3869,11 +3875,16 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4473,7 +4484,14 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
+class DeepseekV4ForCausalLM(
+    nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
+):
     supports_cuda_vmm_feature_transport = True
 
     @classmethod
@@ -4524,15 +4542,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -4736,6 +4750,25 @@ class DeepseekV4ForCausalLM(nn.Module):
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
+
+    def prepare_cp_logits_inputs(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> CPLogitsInputs:
+        if not (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return CPLogitsInputs(input_ids, forward_batch)
+
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        if tail is None:
+            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        return CPLogitsInputs(tail.rows(input_ids), logits_metadata, tail.token_indices)
 
     def prepare_language_model_inputs(
         self,

@@ -23,12 +23,20 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
     (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSA),
+    (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSV4),
 }
 
 
-def get_cp_bcg_input_type(strategy: ContextParallelStrategyKind):
+def get_cp_bcg_input_type(
+    strategy: ContextParallelStrategyKind,
+    attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.DSA,
+):
     # Keep runtime adapters lazy: config resolution also queries CP BCG support.
     if strategy == ContextParallelStrategyKind.INTERLEAVE:
+        if attention_backend == CPAttentionBackendKind.DSV4:
+            from sglang.srt.layers.cp.bcg.dsv4_bcg import DSV4CPBCGInput
+
+            return DSV4CPBCGInput
         from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 
         return InterleaveCPBCGInput
@@ -61,4 +69,4 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         return False
     if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
         return False
-    return get_cp_bcg_input_type(combination[0]).supports(server_args)
+    return get_cp_bcg_input_type(*combination).supports(server_args)
