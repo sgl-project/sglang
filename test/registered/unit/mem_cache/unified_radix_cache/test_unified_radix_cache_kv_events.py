@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
+from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
@@ -54,6 +55,29 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         removed = self._removed_events(cache, StorageMedium.GPU)
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0].block_hashes, stored_hashes)
+
+    def test_mm_routing_spans_match_across_tree_cores(self):
+        """The Python and Rust tree cores report the same routing-label spans."""
+        label = "9e3779b97f4a7c15"
+        pads = [11_000_000_001, 12_000_000_002, 13_000_000_003, 14_000_000_004]
+        self.addCleanup(setattr, events, "MM_ROUTING_LABELS", events.MM_ROUTING_LABELS)
+        for backend in ("python", "rust"):
+            with self.subTest(tree_core_backend=backend):
+                events.MM_ROUTING_LABELS = events.MmRoutingLabels()
+                cache, allocator, _ = build_fixture(
+                    self.cfg, enable_kv_cache_events=True, tree_core_backend=backend
+                )
+                cache.take_events()
+                events.MM_ROUTING_LABELS.register(pads, label)
+                self._insert(cache, allocator, [1, 2] + pads)
+                spans = [
+                    block_spans
+                    for event in self._stored_events(cache, StorageMedium.GPU)
+                    for block_spans in (
+                        event.mm_routing_spans or [[]] * len(event.block_hashes)
+                    )
+                ]
+                self.assertEqual(spans, [[], [(0, 2, label)], [(0, 2, label)]])
 
     def test_cache_salt_is_included_in_store_and_remove_events(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

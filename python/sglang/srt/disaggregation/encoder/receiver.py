@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
+from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
@@ -1076,6 +1077,10 @@ class WaitingMMRequestBase(ABC):
             _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
+        )
+        attach_mm_routing_labels(
+            getattr(mm_inputs, "mm_items", None),
+            getattr(self.recv_req, "mm_routing_labels", None),
         )
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
