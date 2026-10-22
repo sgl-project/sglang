@@ -202,7 +202,7 @@ def init_mla_ptpc_state(self_attn: nn.Module) -> None:
 def fuse_mla_gate_ptpc(x: torch.Tensor, gate: torch.Tensor):
     """x * sigmoid(gate) as (fp8, per-token scale), or the BF16 product when the
     fused kernel does not cover the shape."""
-    from sglang.kernels.ops.attention import mla_output_gate_fp8_quant_hip
+    from sglang.kernels.ops.elementwise import mla_output_gate_fp8_quant_hip
 
     if mla_output_gate_fp8_quant_hip.covered(x, gate):
         return mla_output_gate_fp8_quant_hip.kimi_k3_mla_output_gate_fp8_quant(x, gate)
