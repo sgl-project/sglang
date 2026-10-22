@@ -56,6 +56,12 @@ _JSON_TYPE_NAMES = {
 }
 
 
+def _json_valued(field: ResponseTemplateField) -> bool:
+    """Whether the field's tool-call arguments are decoded from JSON, where a string is explicit."""
+    value_parser = field.content_args.get("value_parser") or {}
+    return field.content == "json" or value_parser.get("name") == "json"
+
+
 def _coerce(raw: str, types: tuple[str, ...]) -> Any:
     if "string" in types and set(types) != {"string"}:
         # Any text is a valid string, so only text that is exactly the JSON of another declared type is cast.
@@ -491,9 +497,7 @@ class ResponseParser:
         try:
             value = process_field(self._body, field, self._captures, self._json_keys(field))
             if self._tool_params:
-                value_parser = field.content_args.get("value_parser") or {}
-                json_values = field.content == "json" or value_parser.get("name") == "json"
-                value = self._coerce_tool_calls(value, json_values=json_values)
+                value = self._coerce_tool_calls(value, json_values=_json_valued(field))
             if field.join is not None and not isinstance(value, str):
                 raise ValueError(
                     f"Field '{field.name}': 'join' requires each match to parse to a string, "

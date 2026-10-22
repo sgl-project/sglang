@@ -41,7 +41,10 @@ from sglang.srt.function_call.response_template_structural_tag import (
     typed_parameters,
 )
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
-from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
+from sglang.srt.parser.chat_parsing.response_parser import (
+    ResponseParser,
+    _json_valued,
+)
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
     ResponseTemplateField,
@@ -481,12 +484,15 @@ class ResponseTemplateStreamAdapter:
         if not isinstance(value, list):
             logger.warning("response_template: malformed tool call value: %r", value)
             return []
+        json_values = _json_valued(self._template.fields[_TOOL_FIELD])
         members = []
         for member in value:
             try:
                 scope = {**self._open_tool_captures, **member}
                 call = _apply_transform(self._each_transform, scope)
-                members.append(self._parser._coerce_tool_calls(call))
+                members.append(
+                    self._parser._coerce_tool_calls(call, json_values=json_values)
+                )
             except (KeyError, TypeError, ValueError):
                 logger.warning(
                     "response_template: malformed tool call value: %r", member

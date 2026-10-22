@@ -790,13 +790,25 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
     def test_transform_each_tool_region_emits_all_calls(self):
         """Each member is transformed with the opener's captures, and its
-        arguments are cast to the tool schema."""
+        arguments are cast to the tool schema. A JSON string stays a string
+        where the schema allows one."""
         template = TRANSFORM_EACH_RESPONSE_TEMPLATE
-        tools = [_tool(), _tool("get_forecast")]
+        lookup = Tool(
+            type="function",
+            function=Function(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": ["string", "integer"]}},
+                },
+            ),
+        )
+        tools = [_tool(), _tool("get_forecast"), lookup]
         opener = "<calls id=1>"
         text = (
             opener + '[{"name":"get_weather","arguments":{"location":"Paris"}},'
-            '{"name":"get_forecast","arguments":{"days":"3"}}]</calls>'
+            '{"name":"get_forecast","arguments":{"days":"3"}},'
+            '{"name":"lookup","arguments":{"code":"123"}}]</calls>'
         )
         detector = ResponseTemplateToolDetector(
             response_template=template,
@@ -811,6 +823,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             [
                 ("get_weather", {"location": "Paris"}),
                 ("get_forecast", {"days": 3}),
+                ("lookup", {"code": "123"}),
             ],
         )
 
@@ -829,6 +842,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             [
                 ("get_weather", {"location": "Paris"}),
                 ("get_forecast", {"days": 3}),
+                ("lookup", {"code": "123"}),
             ],
         )
 
