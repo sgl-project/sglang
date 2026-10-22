@@ -13,7 +13,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.attention.mla_output_gate import covered as _gate_covered
+from sglang.kernels.ops.elementwise.mla_output_gate import covered as _gate_covered
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
