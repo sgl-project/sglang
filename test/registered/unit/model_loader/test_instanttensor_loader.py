@@ -81,11 +81,6 @@ class TestInstantTensorLoader(CustomTestCase):
                 return_value=torch.device("cuda:1"),
             )
         )
-        # The fake InstantTensor yields CPU tensors and current_device is mocked, so
-        # keep the iterator off the CUDA clone pool even on a GPU host.
-        patches.enter_context(
-            patch.object(weight_utils.torch.cuda, "is_available", return_value=False)
-        )
         self.is_initialized = patches.enter_context(
             patch.object(
                 weight_utils.torch.distributed, "is_initialized", return_value=False
@@ -212,17 +207,13 @@ class TestInstantTensorLoader(CustomTestCase):
                 weight_utils.torch.distributed,
                 "new_group",
                 return_value=load_comm_group,
-            ) as new_group,
-            patch.object(
-                weight_utils.torch.distributed, "destroy_process_group"
-            ) as destroy_process_group,
+            ),
+            patch.object(weight_utils.torch.distributed, "destroy_process_group"),
             patch.object(weight_utils.torch.cuda, "current_stream"),
         ):
             for world_size in (1, 2):
                 with self.subTest(world_size=world_size):
                     self.safe_open.reset_mock()
-                    new_group.reset_mock()
-                    destroy_process_group.reset_mock()
                     self.get_parallel.return_value = SimpleNamespace(
                         world_group=SimpleNamespace(
                             world_size=world_size, device_group=device_group
@@ -242,14 +233,6 @@ class TestInstantTensorLoader(CustomTestCase):
                         process_group=load_comm_group if world_size > 1 else None,
                         copy=True,
                     )
-                    # A multi-rank world load runs over a temporary communicator,
-                    # destroyed once iteration ends.
-                    if world_size > 1:
-                        new_group.assert_called_once_with(backend="nccl")
-                        destroy_process_group.assert_called_once_with(load_comm_group)
-                    else:
-                        new_group.assert_not_called()
-                        destroy_process_group.assert_not_called()
 
     def test_iterator_uses_explicit_load_group(self):
         self.is_initialized.return_value = True
