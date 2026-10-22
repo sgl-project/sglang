@@ -34,8 +34,8 @@ def _module(world_size: int, hidden_size: int, cluster: int, topk: int):
 
 
 def _cluster_size(world_size: int, rows: int) -> int:
-    # Measured on 8xH200: 5-CTA clusters win at TP8 up to 16 rows for top-k 1 and 8;
-    # one CTA per row wins from 32 rows and at TP2/TP4.
+    # Measured on 8xH200: 5-CTA clusters are faster at TP8 up to 16 rows; one CTA
+    # per row is faster at TP2 and TP4.
     return 5 if world_size == 8 and rows <= 16 else 1
 
 
