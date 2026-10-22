@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.fused_a_gemm import (
+    fp8_small_m_eligible,
+    fp8_small_m_linear,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -565,6 +569,8 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+        # Set once the block-FP8 weights are final (process_weights_after_loading_block_quant).
+        self.small_m_w8a16 = False
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -941,6 +947,12 @@ class Fp8LinearMethod(LinearMethodBase):
             if scale_reordered is not layer.weight_scale_inv.data:
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
+
+        self.small_m_w8a16 = fp8_small_m_eligible(
+            layer=layer,
+            weight_block_size=self.weight_block_size,
+            block_fp8_as_mxfp8=self.block_fp8_as_mxfp8,
+        )
 
     def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
         """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
@@ -1408,6 +1420,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            if self.small_m_w8a16 and not isinstance(x, tuple):
+                small_m_out = fp8_small_m_linear(layer, x)
+                if small_m_out is not None:
+                    return small_m_out
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (
