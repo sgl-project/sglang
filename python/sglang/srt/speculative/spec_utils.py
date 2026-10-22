@@ -734,15 +734,20 @@ def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
     Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
-    ``attn_tp_group`` is still the target's.
+    sync) runs on the target's attention-TP group. With prefill CP and no
+    attention DP it uses full TP as ordinary attention TP, matching the borrowed
+    target LM head. Other draft work keeps the target's TP placement.
+    Enter it from outside any draft scope.
     """
     if not owns_attention:
         return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
+    parallel = get_parallel()
+    group = (
+        parallel.tp_group
+        if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1
+        else parallel.attn_tp_group
     )
+    return patch_tensor_parallel_group(group, owns_attention=True)
 
 
 def spec_stage_span(name: str):
