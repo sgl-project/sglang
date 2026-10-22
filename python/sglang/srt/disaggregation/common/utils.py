@@ -32,7 +32,7 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
-    # Completion event for source KV writes; wait before the transfer reads them.
+    # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
 
 
