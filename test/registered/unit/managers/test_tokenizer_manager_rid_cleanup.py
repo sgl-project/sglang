@@ -261,6 +261,42 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
+    async def test_cumulative_stream_backlog_preserves_customized_info(self):
+        """Cumulative streaming returns only the last queued output.
+
+        A customized_info key that arrived on an earlier queued output must
+        still reach the client through the accumulated state.
+        """
+        self.tm.incremental_streaming_output = False
+        key = "request_score"
+        hidden_key = "hidden_metric"
+        stream = self.tm._wait_one_response(self.state.obj)
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
+        self.state.out_list.extend(
+            [
+                {"output_ids": [1], "meta_info": first_meta_info},
+                {
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                },
+            ]
+        )
+        self.state.finished = True
+        self.state.event.set()
+
+        out = await anext(stream)
+
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
     async def test_cancelling_pending_wait_removes_event_waiter(self):
         stream = self.tm._wait_one_response(self.state.obj)
         pending = asyncio.create_task(anext(stream))
@@ -1190,6 +1226,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)
@@ -1348,6 +1385,49 @@ class TestLoRARequestLifecycle(CustomTestCase):
     def test_second_parallel_warmup_failure_releases_all_references(self):
         """A failed warmup must return references even after earlier warmups finish."""
         asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
+
+
+class TestPriorityRange(CustomTestCase):
+    """Request priorities reach the radix cache as signed 64-bit integers, so an
+    out-of-range value is rejected before dispatch instead of failing inside
+    the scheduler, and the boundary values themselves pass through unchanged."""
+
+    INT64_MIN = -(1 << 63)
+    INT64_MAX = (1 << 63) - 1
+
+    def test_int64_boundaries_are_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_priority_scheduling = True
+        tm.default_priority_value = 0
+        for priority in (self.INT64_MIN, self.INT64_MAX):
+            with self.subTest(priority=priority):
+                obj = GenerateReqInput(input_ids=[1], priority=priority)
+                tm._set_default_priority(obj)
+                self.assertEqual(obj.priority, priority)
+
+    def test_out_of_range_priority_is_rejected_before_dispatch(self):
+        for enabled in (False, True):
+            for priority in (self.INT64_MIN - 1, self.INT64_MAX + 1):
+                for source in ("body", "default"):
+                    if source == "default" and not enabled:
+                        continue
+                    with self.subTest(
+                        enabled=enabled, priority=priority, source=source
+                    ):
+                        tm = _make_tm_for_generate(self)
+                        del tm._set_default_priority  # the real one is under test
+                        tm.enable_priority_scheduling = enabled
+                        tm.default_priority_value = (
+                            priority if source == "default" else 0
+                        )
+                        tm._init_req_state = Mock()
+                        obj = GenerateReqInput(
+                            input_ids=[1],
+                            priority=priority if source == "body" else None,
+                        )
+                        with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+                            asyncio.run(tm.generate_request(obj).__anext__())
+                        tm._init_req_state.assert_not_called()
 
 
 if __name__ == "__main__":

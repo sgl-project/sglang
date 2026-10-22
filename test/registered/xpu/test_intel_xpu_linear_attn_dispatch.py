@@ -6,10 +6,16 @@ behavior from the platform-agnostic linear-attn dispatch tests.
 """
 
 import unittest
-from unittest.mock import patch, sentinel
+from types import SimpleNamespace
+from unittest.mock import Mock, patch, sentinel
+
+import torch
 
 from sglang.srt.layers.attention.linear import gdn_backend
-from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
+    GDNKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels import gdn_xpu
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -94,6 +100,35 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
                         activation="silu",
                         cache_indices=sentinel.cache_indices,
                     )
+
+    def test_prefill_conv_uses_selected_kernel_and_optional_block_table(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend._causal_conv1d_fn = Mock(side_effect=lambda x, *args, **kwargs: x)
+        x = torch.zeros(3, 4)
+        state = torch.zeros(1, 4, 2)
+        weight = torch.zeros(4, 3)
+        layer = SimpleNamespace(conv_weights=weight, bias=None, activation="silu")
+        batch = SimpleNamespace(
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+            extend_seq_lens_cpu=[3],
+        )
+        starts = torch.tensor([0, 3], dtype=torch.int32)
+        indices = torch.tensor([0], dtype=torch.int32)
+        for block_table in (None, torch.tensor([[0, 0]], dtype=torch.int32)):
+            with self.subTest(block_table=block_table):
+                backend.forward_metadata = SimpleNamespace(
+                    query_start_loc=starts, conv_block_table=block_table
+                )
+                backend._causal_conv1d_fn.reset_mock()
+                torch.testing.assert_close(
+                    backend._convolve_prefill(layer, batch, x, state, indices), x
+                )
+                kwargs = backend._causal_conv1d_fn.call_args.kwargs
+                self.assertEqual("block_table" in kwargs, block_table is not None)
+                if block_table is not None:
+                    self.assertIs(kwargs["block_table"], block_table)
+                self.assertIs(kwargs["conv_states"], state)
+                self.assertIs(kwargs["cache_indices"], indices)
 
 
 class TestIntelXpuKDADispatch(CustomTestCase):

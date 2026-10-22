@@ -24,9 +24,14 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.observability.forward_pass_metrics import (
+        FpmTiming,
+        ScheduledRequestMetrics,
+    )
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -73,7 +78,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -144,9 +149,9 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
-    fpm_start_event: Optional[torch.cuda.Event] = None
-    fpm_end_event: Optional[torch.cuda.Event] = None
+    # Forward pass metrics (FPM)
+    fpm_timing: Optional[FpmTiming] = None
+    fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
@@ -390,8 +395,9 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
+    fpm_timing: Optional[FpmTiming] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):

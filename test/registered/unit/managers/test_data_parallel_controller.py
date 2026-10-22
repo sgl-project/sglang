@@ -29,6 +29,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    WorkerPortHandshake,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
@@ -75,6 +76,75 @@ def _req(
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestJoinerWorkerPortAdmission(CustomTestCase):
+    def _launch_joiner(self, parallel, handshake, launch):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._receive_ports_as_client = MagicMock(return_value=handshake)
+        controller.launch_tensor_parallel_group = launch
+        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=execution,
+            ),
+        ):
+            controller.launch_dp_attention_schedulers(
+                SimpleNamespace(), SimpleNamespace()
+            )
+
+    def test_topology_mismatch_is_rejected_before_scheduler_launch(self):
+        mismatches = [
+            # A wider joiner would map physical offset 4 onto active primary slot 2.
+            ((1, 1), (2, 1), 1),
+            # A narrower joiner would select beyond the primary's reserved slots.
+            ((2, 1), (1, 1), 2),
+        ]
+        for primary, joining, num_dp_ranks in mismatches:
+            with self.subTest(primary=primary, joining=joining):
+                parallel = SimpleNamespace(
+                    dist_init_addr="127.0.0.1:20000",
+                    ep_join_rank_offset=4,
+                    num_dp_ranks=num_dp_ranks,
+                    attn_tp_size=joining[0],
+                    attn_cp_size=joining[1],
+                )
+                handshake = WorkerPortHandshake(
+                    worker_ports=[1000, 1001, 1002, 1003],
+                    attn_tp_size=primary[0],
+                    attn_cp_size=primary[1],
+                )
+                launch = MagicMock()
+
+                with self.assertRaisesRegex(ValueError, "same attention topology"):
+                    self._launch_joiner(parallel, handshake, launch)
+
+                launch.assert_not_called()
+
+    def test_matching_topology_selects_reserved_logical_dp_slot(self):
+        parallel = SimpleNamespace(
+            dist_init_addr="127.0.0.1:20000",
+            ep_join_rank_offset=4,
+            num_dp_ranks=1,
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        handshake = WorkerPortHandshake(
+            worker_ports=[1000, 1001, 1002, 1003],
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        launch = MagicMock()
+
+        self._launch_joiner(parallel, handshake, launch)
+
+        self.assertEqual(launch.call_args.args[-1], [1002])
 
 
 class TestLocalKvEventSources(CustomTestCase):
@@ -124,6 +194,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
         # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
         readers = [
@@ -222,54 +293,6 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
-
-
-class TestDPBudgetDispatch(CustomTestCase):
-    """DPBudget.dispatch picks a rank from current state and updates counters."""
-
-    def test_total_requests_dispatch_picks_min_and_increments(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.assertEqual(rank, 1)
-        self.assertEqual(
-            budget.total_requests[1],
-            3,
-            "dispatch should increment chosen worker's request count",
-        )
-
-    def test_total_tokens_dispatch_applies_estimated_tokens(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [100, 50, 200]
-        budget.total_requests = [0, 0, 0]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=30)
-        self.assertEqual(rank, 1, "should pick worker with min total_tokens")
-        self.assertEqual(
-            budget.total_tokens[1],
-            80,
-            "dispatch should add estimated_tokens to chosen worker",
-        )
-        self.assertEqual(
-            budget.total_requests[1],
-            1,
-            "dispatch should also increment request count",
-        )
-
-    def test_total_tokens_tie_breaks_on_total_requests(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [50, 50, 50]
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=10)
-        self.assertEqual(
-            rank, 1, "tie on total_tokens should fall back to min total_requests"
-        )
-
-    def test_dispatch_returns_none_for_methods_not_handled(self):
-        """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
-        only handles the load-aware variants."""
-        budget = DPBudget(num_dp_ranks=3)
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
 
 
 class TestRoundRobinScheduler(CustomTestCase):

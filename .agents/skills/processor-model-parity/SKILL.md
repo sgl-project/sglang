@@ -13,7 +13,20 @@ the implementation, and SGLang code exists only where the two differ.
 
 Scope: the request -> prompt -> token ids path, plus the checks that let hosts
 serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
-Multimodal preprocessing is not covered here.
+Multimodal preprocessing is not covered here: `render_request` fails on media
+content parts, so hosts send those chats to the engine. The fixture generator
+serves every checkpoint text-only, so a media case records that rejection.
+
+## Done means
+
+- **All text should work**: every text chat the engine accepts renders and
+  tokenizes in the processor (sgl-router's `AllText`). Only what SGLang rejects or
+  the processor cannot reproduce goes to the engine; list it in the PR.
+- **Chat and completions go through the engine's `/generate`**, with the router
+  rendering, tokenizing and parsing (`lower_chat`, `lower_completion`); the
+  engine's OpenAI route is only the `Unsupported` fallback. That needs the
+  cookbook's `--reasoning-parser` and `--tool-call-parser` ported. Verify the route
+  against a live engine.
 
 The worked example is DeepSeek-V4-Flash-0731: `src/render/models/deepseek_v4.rs`
 plus `tests/fixtures/parity/deepseek-v4-flash-0731.json`. Paths below are relative
@@ -39,10 +52,14 @@ renders the model:
   give the model a dedicated `ChatFormatter` variant and `render_request` arm, like
   DeepSeek-V4. If `selection.rs` already wires the model to a Dynamo
   `PromptFormatter`, replace that branch.
-- **Python calls `apply_chat_template`** (Jinja, spec `None`): the first such model
-  adds one generic arm that adapts the body into `OAIChatLikeRequest`, in its own
-  PR. sgl-router's `ChatRequest` in
-  `experimental/sgl-router/src/tokenizer/chat_formatter.rs` is a working adapter.
+- **Python calls `apply_chat_template`** (Jinja, spec `None`): give the model a
+  variant holding Dynamo's Jinja `PromptFormatter`, picked in
+  `ChatFormatter::from_tokenizer_config` from the template text (as
+  `parser/template_detection.py` picks it, where it has a detector), and build the
+  template context that `_process_messages` and `_apply_jinja_template` build, like
+  GLM-5.3 (`models/glm53.rs`) and Qwen3.8 (`models/qwen38.rs`). Dynamo's formatter
+  rewrites shapes its load-time probes find the template rejects (a later system
+  turn, for one); SGLang raises on them, so check those before rendering.
 
 ## Method
 
@@ -92,11 +109,16 @@ renders the model:
 ## Checklist (DeepSeek-V4 case that covers each)
 
 - **Message dump**: roles lowercased; unknown and null fields dropped; `user`
-  reduced to role and content; null content becomes `""`. (`ignored_fields`, `tool_results`)
+  reduced to role and content; null content becomes `""`; history tool calls keep
+  only `ToolCall`'s fields. (`ignored_fields`, `tool_results`; GLM-5.3's `tool_call_extra_fields`)
 - **Content parts**: which part types survive and the join separator. (`parts`)
 - **Tools**: all request tools or only those `tool_choice` allows; field order
-  and defaults of `Function.model_dump`; message-level tools; empty lists.
-  (`tools`, `tools_none`, `tools_named`, `message_tools`, `empty_message_tools`)
+  and defaults of `Function.model_dump`; message-level tools; empty lists; schema
+  types `_validate_request` rewrites (`varchar` becomes `string`). (`tools`,
+  `tools_none`, `tools_named`, `message_tools`, `empty_message_tools`; GLM-5.3's
+  `tool_schema_type_aliases`)
+- **Template kwargs**: check reserved names (`apply_chat_template`'s own arguments)
+  after the server's defaults merge in. (GLM-5.3's `kwargs_tokenize`, `default_tokenize`)
 - **Pydantic coercion**: typed request fields are coerced before rendering. For
   example, `strict: 1` and `defer_loading: "false"` become booleans, and
   `strict: null` is rejected. Probe the pydantic model in Python to get its exact
@@ -117,7 +139,7 @@ renders the model:
   split (it is for DeepSeek-V4). Run each check where Python runs it: a final
   assistant turn's tool calls are discarded, so object checks on their arguments
   belong after the split. Hosts reach the model through `render_prompt` too, so
-  check the renderer's continuation handling (`sglang-renderer` `render()`) as well.
+  check their continuation handling as well.
   (`final_assistant`, `continuation_parts`, `continuation_bos`, `continuation_only`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
@@ -136,18 +158,23 @@ renders the model:
 - **Known gaps**: when a mismatch is inside Dynamo and out of the processor's
   reach, fix it upstream and mark the case `known_gap` with the reason. The test
   reports the case without failing, and fails once it matches so the marker gets
-  removed. (`tool_float_values`: Dynamo's `deepseek::common::to_json`)
+  removed. Check a newer Dynamo release first. (`tool_float_values`: Dynamo's `deepseek::common::to_json`)
 
 ## Generating fixtures
 
 `tests/scripts/generate_parity.py` loads the pinned snapshot and resolves the
-spec and per-checkpoint state with SGLang's own resolvers. It then renders every
-case through the real `OpenAIServingChat._apply_jinja_template` and writes:
+spec and per-checkpoint state with SGLang's own resolvers. It then validates every
+case with `OpenAIServingChat._validate_request`, which rewrites tool schemas, and
+renders it through the real `_process_messages`, under the case's
+`default_chat_template_kwargs` (the server's `--default-chat-template-kwargs`), and
+writes:
 - `prompt`, `token_count` and `token_sha256` for each case, or `error` when
-  Python raises (`name`, `request` and `known_gap` are kept as written). An
-  `AttributeError` aborts instead: the stub server lacks something, so extend it;
+  Python raises (`name`, `request`, `default_chat_template_kwargs` and `known_gap`
+  are kept as written). An `AttributeError` aborts instead: the stub server lacks
+  something, so extend it;
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
-  resolved overrides such as the effort profile) and `bos_token_id`.
+  resolved overrides such as the effort profile), `bos_token_id`, and for a Jinja
+  checkpoint its `chat_template`, so the test renders offline.
 
 ```sh
 cd rust/sglang-processor
@@ -158,8 +185,10 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
   example `_dsv41_default_reasoning_effort`.
-- **Tokenizes through `apply_chat_template(tokenize=True)`:** the recorder sees no
-  text. Record the template's text output instead.
+
+A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
+recorded by the template's text output. Its `render_request` returns the
+segments the checkpoint encodes, and `tests/parity.rs` encodes them one by one.
 
 Pin `revision` to a commit hash and regenerate only on purpose.
 
@@ -195,12 +224,20 @@ OpenAI layer:
   `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
   output for it, and the response Python builds from that output. Launch the
-  engine with the model's cookbook flags, including its parsers.
+  engine with the model's cookbook flags, including its parsers. Without the
+  weights, mark cases `synthetic` and write the engine output by hand, as GLM-5.3's
+  fixture does.
 
 ## Pitfalls
 
 - Dynamo version bumps change rendering silently: rerun every fixture after bumping
   `dynamo-renderer` or `dynamo-tokenizers`.
+- `/generate` accepts only the API's sampling fields (`proto/sglang/api/v1/sampling.proto`).
+  A field Python sets in-process, such as glm47's `ebnf_full_assistant`, cannot be
+  sent, so such requests stay on the engine's route. Fixtures don't show this; a
+  live engine does.
+- Python mutates the request before rendering (`_validate_request` rewrites tool
+  schemas), so fixture generators drive the server's own entry points.
 - Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`,
   `SGLANG_DSV41_REASONING_EFFORT`) are read per request, as in Python. The
   generator pins them and `tests/parity.rs` clears them, so fixtures do not
