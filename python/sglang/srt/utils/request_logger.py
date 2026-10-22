@@ -55,9 +55,9 @@ class RequestLogger:
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
 
-        self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
-            self._compute_metadata()
-        )
+        self.metadata: Tuple[
+            Optional[int], Optional[Set[str]], Optional[Set[str]], Optional[Set[str]]
+        ] = self._compute_metadata()
         self.targets = self._setup_targets()
 
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
@@ -95,12 +95,14 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        max_length, skip_names, _ = self.metadata
+        max_length, skip_names, _, skip_value_fields = self.metadata
         headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(
+                    obj, max_length, skip_names, skip_value_fields=skip_value_fields
+                ),
             }
             if headers:
                 log_data["headers"] = headers
@@ -108,7 +110,7 @@ class RequestLogger:
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
+                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names, skip_value_fields=skip_value_fields)}{headers_str}"
             )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
@@ -135,7 +137,7 @@ class RequestLogger:
         request: Optional[fastapi.Request] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
-        max_length, _, _ = self.metadata
+        max_length, _, _, skip_value_fields = self.metadata
         max_length = max_length if max_length is not None else 2048
         headers = _extract_whitelisted_headers(request)
 
@@ -146,7 +148,11 @@ class RequestLogger:
 
         if self.log_requests_format == "json":
             log_data = {
-                "obj": _transform_data_for_logging(obj_to_log, max_length=max_length),
+                "obj": _transform_data_for_logging(
+                    obj_to_log,
+                    max_length=max_length,
+                    skip_value_fields=skip_value_fields,
+                ),
             }
             if headers:
                 log_data["headers"] = headers
@@ -154,7 +160,7 @@ class RequestLogger:
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
+                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length, skip_value_fields=skip_value_fields)}{headers_str}"
             )
 
     def log_finished_request(
@@ -170,33 +176,46 @@ class RequestLogger:
         if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 
-        max_length, skip_names, out_skip_names = self.metadata
+        max_length, skip_names, out_skip_names, skip_value_fields = self.metadata
         headers = _extract_whitelisted_headers(request)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(
+                    obj, max_length, skip_names, skip_value_fields=skip_value_fields
+                ),
             }
             if headers:
                 log_data["headers"] = headers
             log_data["out"] = _transform_data_for_logging(
-                out, max_length, out_skip_names
+                out, max_length, out_skip_names, skip_value_fields=skip_value_fields
             )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
-                obj, max_length, skip_names=skip_names
+                obj,
+                max_length,
+                skip_names=skip_names,
+                skip_value_fields=skip_value_fields,
             )
-            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            out_value = _dataclass_to_string_truncated(
+                out,
+                max_length,
+                skip_names=out_skip_names,
+                skip_value_fields=skip_value_fields,
+            )
             headers_str = f", headers={headers}" if headers else ""
-            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
+            self._log(f"Finish: obj={obj_str}{headers_str}, out={out_value}")
 
     def _compute_metadata(
         self,
-    ) -> Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]]:
+    ) -> Tuple[
+        Optional[int], Optional[Set[str]], Optional[Set[str]], Optional[Set[str]]
+    ]:
         max_length: Optional[int] = None
         skip_names: Optional[Set[str]] = None
         out_skip_names: Optional[Set[str]] = None
+        skip_value_fields: Optional[Set[str]] = None
         if self.log_requests:
             if self.log_requests_level == 0:
                 max_length = 1 << 30
@@ -231,7 +250,9 @@ class RequestLogger:
                 raise ValueError(
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
-        return max_length, skip_names, out_skip_names
+
+            skip_value_fields = set(envs.SGLANG_LOG_REQUEST_SKIP_FIELDS.get()) or None
+        return max_length, skip_names, out_skip_names, skip_value_fields
 
     def _log(self, msg: str) -> None:
         for target in self.targets:
@@ -240,10 +261,15 @@ class RequestLogger:
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
-    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
+    data: Any,
+    max_length: int = 2048,
+    skip_names: Optional[Set[str]] = None,
+    skip_value_fields: Optional[Set[str]] = None,
 ) -> str:
     if skip_names is None:
         skip_names = set()
+    if skip_value_fields is None:
+        skip_value_fields = set()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -262,38 +288,50 @@ def _dataclass_to_string_truncated(
             return str(redact_watermark_secrets(data))
     elif isinstance(data, dict):
         data = redact_watermark_secrets(data)
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {_dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
+        parts = []
+        for k, v in data.items():
+            if k in skip_names:
+                continue
+            if k in skip_value_fields:
+                rendered = "None" if v is None else "'<skipped>'"
+                parts.append(f"'{k}': {rendered}")
+            else:
+                parts.append(
+                    f"'{k}': {_dataclass_to_string_truncated(v, max_length, skip_value_fields=skip_value_fields)}"
+                )
+        return "{" + ", ".join(parts) + "}"
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         values = redact_watermark_secrets(
             {f.name: getattr(data, f.name) for f in fields}
         )
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(values[f.name], max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
-        )
+        parts = []
+        for f in fields:
+            if f.name in skip_names:
+                continue
+            val = values[f.name]
+            if f.name in skip_value_fields:
+                rendered = "None" if val is None else "'<skipped>'"
+                parts.append(f"{f.name}={rendered}")
+            else:
+                parts.append(
+                    f"{f.name}={_dataclass_to_string_truncated(val, max_length, skip_value_fields=skip_value_fields)}"
+                )
+        return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
         return str(data)
 
 
 def _transform_data_for_logging(
-    data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
+    data: Any,
+    max_length: int = 2048,
+    skip_names: Optional[Set[str]] = None,
+    skip_value_fields: Optional[Set[str]] = None,
 ) -> Any:
     if skip_names is None:
         skip_names = set()
+    if skip_value_fields is None:
+        skip_value_fields = set()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -303,24 +341,42 @@ def _transform_data_for_logging(
         if len(data) > max_length:
             half_length = max_length // 2
             return list(data[:half_length]) + ["..."] + list(data[-half_length:])
-        return [_transform_data_for_logging(v, max_length) for v in data]
+        return [
+            _transform_data_for_logging(
+                v, max_length, skip_value_fields=skip_value_fields
+            )
+            for v in data
+        ]
     elif isinstance(data, dict):
         data = redact_watermark_secrets(data)
-        return {
-            k: _transform_data_for_logging(v, max_length)
-            for k, v in data.items()
-            if k not in skip_names
-        }
+        result = {}
+        for k, v in data.items():
+            if k in skip_names:
+                continue
+            if k in skip_value_fields:
+                result[k] = None if v is None else "<skipped>"
+            else:
+                result[k] = _transform_data_for_logging(
+                    v, max_length, skip_value_fields=skip_value_fields
+                )
+        return result
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         values = redact_watermark_secrets(
             {f.name: getattr(data, f.name) for f in fields}
         )
-        return {
-            f.name: _transform_data_for_logging(values[f.name], max_length)
-            for f in fields
-            if f.name not in skip_names
-        }
+        result = {}
+        for f in fields:
+            if f.name in skip_names:
+                continue
+            val = values[f.name]
+            if f.name in skip_value_fields:
+                result[f.name] = None if val is None else "<skipped>"
+            else:
+                result[f.name] = _transform_data_for_logging(
+                    val, max_length, skip_value_fields=skip_value_fields
+                )
+        return result
     elif isinstance(data, (int, float, bool, type(None))):
         return data
     else:
