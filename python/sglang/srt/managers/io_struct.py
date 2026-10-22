@@ -2175,23 +2175,32 @@ class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # Optional tags to identify the memory region, which is primarily used for RL.
+    # Supported: `weights`, `kv_cache`, `cuda_graph`, `comm`.
+    # `comm` is NPU-only: it destroys device-side HCCL communicators and implies
+    # CUDA graph destruction + recapture on resume (captured graphs embed comm
+    # buffer addresses), even when `cuda_graph` is not in tags.
     tags: Optional[List[str]] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    # Client-caused rejection (e.g. invalid tags) reported without killing the
+    # scheduler; the tokenizer layer raises it so HTTP callers get a 400.
+    error: Optional[str] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # Optional tags to identify the memory region, which is primarily used for RL.
+    # Supported: `weights`, `kv_cache`, `cuda_graph`, `comm`.
+    # If `comm` was passed to release, resume must also include `comm`.
     tags: Optional[List[str]] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    # Client-caused rejection (e.g. invalid tags or resuming a tag that was
+    # never released) reported without killing the scheduler; the tokenizer
+    # layer raises it so HTTP callers get a 400.
+    error: Optional[str] = None
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
