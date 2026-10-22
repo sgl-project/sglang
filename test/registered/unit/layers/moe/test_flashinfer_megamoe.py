@@ -502,9 +502,7 @@ def test_decode_workspace_is_untuned_only_and_chosen_in_lockstep(monkeypatch):
     dp = types.ModuleType("sglang.srt.layers.dp_attention")
     monkeypatch.setitem(sys.modules, dp.__name__, dp)
     quant_info = module.FlashInferMegaMoeQuantInfo(
-        mega=mega,
-        mega_forward=lambda layer, tensors: layer.forward(tensors),
-        mega_decode_workspace=workspace,
+        mega=mega, mega_decode_workspace=workspace
     )
     dispatch_output = types.SimpleNamespace(
         hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
