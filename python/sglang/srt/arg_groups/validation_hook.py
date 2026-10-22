@@ -24,14 +24,27 @@ from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import is_cuda, torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
+from sglang.srt.watermarking.synthid.config import validate_synthid_watermark
 
 logger = logging.getLogger(__name__)
 
 
 def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
+    validate_synthid_watermark(
+        view=cfg,
+        key_file=cfg.synthid_watermark_key_file,
+        ngram_len=cfg.synthid_watermark_ngram_len,
+        top_k=cfg.synthid_watermark_top_k,
+        context_history_size=cfg.synthid_watermark_context_history_size,
+        rl_on_policy_target=cfg.rl_on_policy_target,
+        speculative_algorithm=cfg.speculative_algorithm,
+        cuda_is_available=is_cuda,
+    )
+    if cfg.watermark_algorithm == "synthid":
+        return
     if cfg.watermark_config is not None and not cfg.enable_watermark:
         raise ValueError("--watermark-config requires --enable-watermark")
 

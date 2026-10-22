@@ -38,6 +38,8 @@ class EagleVerifyInput(SpecInput):
     # The iteration's plan when the draft planned the verify window
     # (`prepared_out_cache_loc`); verify and draft extend take it.
     kv_loc_plan: Optional[KVLocPlan] = None
+    # Sparse q token ids for SynthID Algorithm 5, shape (bs, num_steps, top_k).
+    draft_prob_token_ids: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -63,7 +65,11 @@ class EagleVerifyInput(SpecInput):
 
     @classmethod
     def create_idle_input(
-        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+        cls,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+        device: str,
     ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),
@@ -162,9 +168,12 @@ class EagleDraftInput(SpecInput):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # Draft proposal q from draft-extend, only set under rejection sampling:
-    # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
+    # Draft proposal q from draft-extend, only set under rejection sampling.
+    # Dense: (b, vocab) / (b, num_steps, vocab).
+    # Sparse SynthID: (b, top_k) / (b, num_steps, top_k).
     draft_probs: torch.Tensor = None
+    # Token ids matching the sparse draft_probs representation.
+    draft_prob_token_ids: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
@@ -218,7 +227,16 @@ class EagleDraftInput(SpecInput):
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
         vocab_size: int = 0,
+        synthid_config=None,
     ):
+        use_sparse_draft_probs = (
+            get_spec().speculative_use_rejection_sampling and synthid_config is not None
+        )
+        draft_prob_width = (
+            min(synthid_config.top_k, vocab_size)
+            if use_sparse_draft_probs
+            else vocab_size
+        )
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=(
@@ -229,8 +247,21 @@ class EagleDraftInput(SpecInput):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
-                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                torch.empty(
+                    (0, draft_prob_width),
+                    device=device,
+                    dtype=torch.float32,
+                )
                 if get_spec().speculative_use_rejection_sampling
+                else None
+            ),
+            draft_prob_token_ids=(
+                torch.empty(
+                    (0, draft_prob_width),
+                    device=device,
+                    dtype=torch.int64,
+                )
+                if use_sparse_draft_probs
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
@@ -249,6 +280,8 @@ class EagleDraftInput(SpecInput):
         self.topk_index = self.topk_index[new_indices]
         if self.draft_probs is not None:
             self.draft_probs = self.draft_probs[new_indices]
+        if self.draft_prob_token_ids is not None:
+            self.draft_prob_token_ids = self.draft_prob_token_ids[new_indices]
         if self.hidden_states is not None:
             self.hidden_states = self.hidden_states[new_indices]
         self.bonus_tokens = self.bonus_tokens[new_indices]
@@ -288,6 +321,7 @@ class EagleDraftInput(SpecInput):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
+            self.draft_prob_token_ids = spec_info.draft_prob_token_ids
             self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
@@ -311,7 +345,28 @@ class EagleDraftInput(SpecInput):
         else:
             self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
+            if (self.draft_prob_token_ids is None) != (
+                spec_info.draft_prob_token_ids is None
+            ):
+                from sglang.srt.sampling.watermarking.proposal_relay import (
+                    merge_proposals,
+                )
+
+                self.draft_probs, self.draft_prob_token_ids = merge_proposals(
+                    self.draft_probs,
+                    self.draft_prob_token_ids,
+                    spec_info.draft_probs,
+                    spec_info.draft_prob_token_ids,
+                )
+                return
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
+        if (
+            self.draft_prob_token_ids is not None
+            and spec_info.draft_prob_token_ids is not None
+        ):
+            self.draft_prob_token_ids = torch.cat(
+                [self.draft_prob_token_ids, spec_info.draft_prob_token_ids]
+            )
 
 
 @dataclass

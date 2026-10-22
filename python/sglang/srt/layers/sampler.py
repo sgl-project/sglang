@@ -24,6 +24,12 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.core import WatermarkState
+from sglang.srt.sampling.watermarking.synthid_request import (
+    forward_mixed,
+    is_enabled,
+    is_mixed,
+)
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -35,6 +41,8 @@ from sglang.srt.utils.common import (
     is_xpu,
 )
 from sglang.utils import LazyImport
+from sglang.srt.watermarking.synthid.sampling import forward_synthid
+from sglang.srt.watermarking.synthid.setup import init_synthid_watermark
 
 if is_cuda():
     from sgl_kernel import (
@@ -135,6 +143,34 @@ class Sampler(nn.Module):
         self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
 
         self.output_logprob_processor = OutputLogprobProcessor()
+        self.synthid_watermark = None
+        self.use_ordinary_synthid_sampling = False
+        self.use_fused_synthid_sampling = False
+        self.watermark_state: Optional[WatermarkState] = None
+
+    def invalidate_watermark_on_cache_flush(self) -> None:
+        if (
+            get_exec().kernel.synthid_watermark_key_file is not None
+            and self.synthid_watermark is None
+        ):
+            raise RuntimeError("SynthID watermarking is configured but not initialized.")
+        if self.synthid_watermark is not None:
+            self.synthid_watermark.invalidate_on_cache_flush()
+        if self.watermark_state is not None:
+            self.watermark_state.lengths.zero_()
+            self.watermark_state.write_positions.zero_()
+            self.watermark_state.num_watermarked_contexts.zero_()
+
+    def init_synthid_watermark(self, req_to_token_pool, device) -> None:
+        (
+            self.synthid_watermark,
+            self.use_ordinary_synthid_sampling,
+            self.use_fused_synthid_sampling,
+        ) = init_synthid_watermark(
+            num_slots=req_to_token_pool.req_to_token.shape[0],
+            device=device,
+            tp_sync_group=self.tp_sync_group,
+        )
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -181,6 +217,22 @@ class Sampler(nn.Module):
 
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
+
+        if self.synthid_watermark is not None and is_enabled(sampling_info.synthid_state):
+            if is_mixed(sampling_info.synthid_state) and not sampling_info.is_all_greedy:
+                return forward_mixed(
+                    sampler=self,
+                    logits_output=logits_output,
+                    sampling_info=sampling_info,
+                    return_logprob=return_logprob,
+                    top_logprobs_nums=top_logprobs_nums,
+                    token_ids_logprobs=token_ids_logprobs,
+                    positions=positions,
+                )
+            return forward_synthid(
+                self, logits_output, sampling_info, return_logprob,
+                top_logprobs_nums, token_ids_logprobs, positions,
+            )
 
         # Preprocess logits (custom processors and NaN handling)
         _trace_e2e_sampler("preprocess_enter")
@@ -365,6 +417,8 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         positions: torch.Tensor,
         simple_sampling_case: bool,
+        *,
+        synthid_applied: bool = False,
     ) -> Tuple[torch.Tensor, Optional[_SamplingMaskCapture]]:
         """Sample from probability distribution (after softmax).
 
@@ -385,6 +439,7 @@ class Sampler(nn.Module):
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
+                synthid_applied=synthid_applied,
             )
             if return_sampling_mask:
                 capture_probs = select_capture_rows(probs)
@@ -713,9 +768,10 @@ class Sampler(nn.Module):
         return batch_next_token_ids, logprobs
 
     def _sync_token_ids_across_tp(
-        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo,
+        *, force_sync: bool = False,
     ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars or force_sync:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
@@ -782,6 +838,32 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def top_k_top_p_min_p_filter_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+    *,
+    max_top_k: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return filtered weights and their token-ID permutation."""
+    if max_top_k is not None and max_top_k < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(probs_sort.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    if need_min_p_sampling:
+        threshold = probs_sort[:, 0] * min_ps
+        probs_sort[probs_sort < threshold.view(-1, 1)] = 0.0
+    return probs_sort, probs_idx
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -810,29 +892,21 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     # exact. The seeded path keeps the full sort because the order of tied
     # probabilities may depend on k, which is a batch-wide value, and
     # deterministic inference must not depend on the batch composition.
-    if (
+    partial_sort = (
         max_top_k is not None
         and max_top_k < probs.shape[-1]
         and sampling_seed is None
         and not return_filtered_probs
-    ):
-        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
-    else:
-        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
+    )
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
         assert sampling_seed is None, (
             "With sampling seed, multinomial_with_seed will provide wrong results"
         )
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = top_k_top_p_min_p_filter_probs_torch(
+        probs, top_ks, top_ps, min_ps, need_min_p_sampling,
+        max_top_k=max_top_k if partial_sort else None,
+    )
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -932,7 +1006,8 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
 @torch.compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
-    logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
+    logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor,
+    *, synthid_applied: bool = False,
 ) -> torch.Tensor:
     """
     Samples n elements from an input tensor `inputs` of shape (n, m) using
@@ -966,7 +1041,11 @@ def multinomial_with_seed(
     # keep everything in in-place operations to avoid unnecessary memory allocations.
     # clamp both ends: x == 1 gives gumbel +inf (NaN at -inf logprobs); the cap is
     # the hash spacing so that bucket matches its neighbor instead of dominating
-    x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0**-32)).neg_()
+    if synthid_applied:
+        x.clamp_(max=1.0 - 2**-53)
+        x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()
+    else:
+        x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0**-32)).neg_()
     x.log_().neg_()  # -log(-log(x)) == gumbel noise
 
     # add gumbel noise to logprobs
@@ -979,6 +1058,8 @@ def sampling_from_probs_torch(
     probs: torch.Tensor,
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
+    *,
+    synthid_applied: bool = False,
 ):
     """A sampling implementation with native pytorch operations, without
     top-k, top-p, or min-p filtering.
@@ -998,7 +1079,7 @@ def sampling_from_probs_torch(
     else:
         # Deterministic sampling: convert probs to logprobs and use gumbel trick
         sampled_index = multinomial_with_seed(
-            torch.log(probs), sampling_seed, positions
+            torch.log(probs), sampling_seed, positions, synthid_applied=synthid_applied
         )
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids

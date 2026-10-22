@@ -1431,6 +1431,7 @@ class Envs:
     # Logits and log-probability processing
     # ===================================================================
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    SGLANG_RETURN_WATERMARKED_LOGPROB = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)

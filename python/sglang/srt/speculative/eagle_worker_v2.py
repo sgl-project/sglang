@@ -29,9 +29,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
+from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -67,6 +65,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.watermarking.synthid_request import is_enabled, is_mixed
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -107,7 +106,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -130,6 +128,11 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
     log_info_on_rank0,
+)
+from sglang.srt.watermarking.synthid.speculative import (
+    apply_synthid_to_draft_logits,
+    ensure_sparse_algo5_draft_probs,
+    sample_synthid_draft_logits,
 )
 
 _is_cpu = is_cpu()
@@ -218,6 +221,67 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _apply_synthid_to_draft_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info,
+        prior_draft_tokens: Optional[torch.Tensor] = None,
+    ):
+        return apply_synthid_to_draft_logits(
+            processor=self.target_worker.model_runner.sampler.synthid_watermark,
+            logits=logits,
+            sampling_info=sampling_info,
+            prior_draft_tokens=prior_draft_tokens,
+        )
+
+    def _sample_draft_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info,
+        synthid_sparse_output=None,
+        fused_draft_sample=None,
+        positions=None,
+    ):
+        if (
+            is_enabled(sampling_info.synthid_state)
+            or synthid_sparse_output is not None
+            or fused_draft_sample is not None
+        ):
+            use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+            return sample_synthid_draft_logits(
+                logits=logits,
+                sampling_info=sampling_info,
+                sparse_output=synthid_sparse_output,
+                fused_draft_sample=fused_draft_sample,
+                use_rejection_sampling=use_rejection_sampling,
+                topk=self.topk if not use_rejection_sampling else 1,
+            )
+        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        if use_rejection_sampling:
+            draft_probs, topk_p, topk_index = sample_draft_proposal(
+                logits, sampling_info.temperatures, sampling_info.top_ks
+            )
+            return draft_probs, None, topk_p, topk_index
+        probs = renorm_draft_probs(logits, sampling_info, False)
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        return None, None, topk_p, topk_index
+
+    def _ensure_sparse_algo5_draft_probs(
+        self,
+        draft_probs: Optional[torch.Tensor],
+        draft_prob_token_ids: Optional[torch.Tensor],
+        sampling_info,
+    ):
+        if not is_enabled(sampling_info.synthid_state) or is_mixed(
+            sampling_info.synthid_state
+        ):
+            return draft_probs, draft_prob_token_ids
+        return ensure_sparse_algo5_draft_probs(
+            processor=self.target_worker.model_runner.sampler.synthid_watermark,
+            draft_probs=draft_probs,
+            draft_prob_token_ids=draft_prob_token_ids,
+        )
 
     def alloc_memory_pool(
         self,
@@ -455,6 +519,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
+        self.cuda_graph_runner_watermark_off = None
+        self.cuda_graph_runner_watermark_mixed = None
         self.cuda_graph_runner_for_draft_extend = None
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
@@ -484,6 +550,40 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
             ](self)
+            if (
+                self.target_worker.model_runner.sampler.synthid_watermark is not None
+                and not get_exec().features.watermark_enforce_all
+            ):
+                cpu_rng = torch.get_rng_state()
+                cuda_rng = torch.cuda.get_rng_state_all()
+                # Both policies share attention buffers already captured by ON.
+                self.cuda_graph_runner_watermark_off = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](
+                    self,
+                    synthid_enabled=False,
+                    initialize_attention_state=False,
+                )
+                if (
+                    self.target_worker.device == "cuda"
+                    and not _is_hip
+                    and self.cuda_graph_runner.synthid_graph_supported
+                    and self.cuda_graph_runner.max_bs >= 2
+                ):
+                    self.cuda_graph_runner_watermark_mixed = (
+                        Device2DraftCudaGraphRunner[self.target_worker.device](
+                            self,
+                            synthid_mixed=True,
+                            initialize_attention_state=False,
+                        )
+                    )
+                    self.target_worker.model_runner.sampler.synthid_watermark.capture_mixed_target_graphs(
+                        capture_bs=self.cuda_graph_runner_watermark_mixed.capture_bs,
+                        rows_per_request=self.speculative_num_draft_tokens,
+                        vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+                    )
+                torch.set_rng_state(cpu_rng)
+                torch.cuda.set_rng_state_all(cuda_rng)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -618,11 +718,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
+        graph_runner = self.cuda_graph_runner
+        if is_mixed(batch.sampling_info.synthid_state):
+            graph_runner = self.cuda_graph_runner_watermark_mixed or graph_runner
+        elif not is_enabled(batch.sampling_info.synthid_state):
+            graph_runner = self.cuda_graph_runner_watermark_off or graph_runner
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
-            self.cuda_graph_runner,
+            graph_runner,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -650,16 +755,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
-                )
+                (
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    draft_probs,
+                    draft_prob_token_ids,
+                ) = graph_runner.execute(forward_batch)
+                # Verification reads these after target forward, which may reuse
+                # the draft graph pool. Detach both sparse values and IDs.
                 if draft_probs is not None:
-                    # draft_probs is the one graph output read after the target
-                    # forward rather than by it, and it points into the graph's
-                    # private memory pool. The pool recycles that block in the
-                    # meantime -- in practice the DSA top-k mask lands there and
-                    # eagle_sample sees -inf. Copy out at the boundary.
                     draft_probs = draft_probs.clone()
+                if draft_prob_token_ids is not None:
+                    draft_prob_token_ids = draft_prob_token_ids.clone()
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -669,10 +777,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+                (
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    draft_probs,
+                    draft_prob_token_ids,
+                ) = self.draft_forward(forward_batch)
 
+        draft_probs, draft_prob_token_ids = self._ensure_sparse_algo5_draft_probs(
+            draft_probs,
+            draft_prob_token_ids,
+            batch.sampling_info,
+        )
         verify_input = build_eagle_verify_input(
             batch,
             draft_input,
@@ -680,6 +797,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             draft_probs,
+            draft_prob_token_ids,
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
@@ -733,8 +851,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             get_spec().speculative_use_rejection_sampling
             and not forward_batch.sampling_info.is_all_greedy
         )
+        synthid_enabled = is_enabled(forward_batch.sampling_info.synthid_state)
         if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_prob_token_ids_list = [spec_info.draft_prob_token_ids]
+        synthid_chain_tokens = (
+            [topk_index]
+            if synthid_enabled
+            else None
+        )
 
         topk1_chain_fits = (
             self.topk == 1
@@ -749,6 +874,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and (_is_cuda or _is_hip)
             and self.hot_token_id is None
             and not needs_draft_probs
+            and not synthid_enabled
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -812,13 +938,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if needs_draft_probs:
+                if synthid_enabled:
+                    sparse_output, fused_sample = self._apply_synthid_to_draft_logits(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        prior_draft_tokens=torch.cat(synthid_chain_tokens, dim=1),
+                    )
+                    probs, token_ids, topk_p, topk_index = self._sample_draft_logits(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        sparse_output,
+                        fused_sample,
+                        positions=forward_batch.positions,
+                    )
+                    if needs_draft_probs:
+                        if (
+                            token_ids is None
+                            and not forward_batch.sampling_info.synthid_force_dense_draft_probs
+                        ):
+                            probs, token_ids = self._ensure_sparse_algo5_draft_probs(
+                                probs, token_ids, forward_batch.sampling_info
+                            )
+                        draft_probs_list.append(probs)
+                        draft_prob_token_ids_list.append(token_ids)
+                    forward_batch.positions.add_(1)
+                elif needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
                     )
                     draft_probs_list.append(probs)
+                    draft_prob_token_ids_list.append(None)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
                     if _is_cuda or _is_hip:
@@ -852,10 +1003,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
+                if synthid_chain_tokens is not None:
+                    synthid_chain_tokens.append(topk_index)
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
+        )
+        draft_prob_token_ids = (
+            torch.stack(draft_prob_token_ids_list, dim=1)
+            if needs_draft_probs
+            and all(value is not None for value in draft_prob_token_ids_list)
+            else None
         )
 
         # Organize the results
@@ -863,20 +1022,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             bs = draft_tokens_topk1.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+            return (
+                parent_list,
+                top_scores_index,
+                draft_tokens_topk1,
+                draft_probs,
+                draft_prob_token_ids,
+            )
 
         if topk1_chain_fits:
             bs = token_list[0].shape[0]
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens, draft_probs
+            return (
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                draft_probs,
+                draft_prob_token_ids,
+            )
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            draft_probs,
+            draft_prob_token_ids,
+        )
 
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
@@ -1024,20 +1201,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
 
         # Assemble the next-iter draft spec_info from the extend output.
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
+        (
+            synthid_sparse_output,
+            fused_draft_sample,
+        ) = self._apply_synthid_to_draft_logits(
             logits_output.next_token_logits,
             batch.sampling_info,
-            use_rejection_sampling,
         )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
-        else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        (
+            draft_probs,
+            draft_prob_token_ids,
+            topk_p,
+            topk_index,
+        ) = self._sample_draft_logits(
+            logits_output.next_token_logits,
+            batch.sampling_info,
+            synthid_sparse_output,
+            fused_draft_sample,
+            positions=batch.seq_lens,
+        )
+        draft_probs, draft_prob_token_ids = self._ensure_sparse_algo5_draft_probs(
+            draft_probs,
+            draft_prob_token_ids,
+            batch.sampling_info,
+        )
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=draft_probs,
+            draft_prob_token_ids=draft_prob_token_ids,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1194,7 +1386,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ]
         # Selected-row top-k remains worker-owned for both graph and eager
         # paths; the graph runner only moves the row selection before lm_head.
-        if get_spec().speculative_use_rejection_sampling:
+        ret_draft_prob_token_ids = None
+        if is_enabled(batch.sampling_info.synthid_state):
+            sparse_output, fused_sample = self._apply_synthid_to_draft_logits(
+                draft_logits_output.next_token_logits, batch.sampling_info
+            )
+            (
+                ret_draft_probs,
+                ret_draft_prob_token_ids,
+                ret_topk_p,
+                ret_topk_index,
+            ) = self._sample_draft_logits(
+                draft_logits_output.next_token_logits,
+                batch.sampling_info,
+                sparse_output,
+                fused_sample,
+            )
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
@@ -1213,14 +1421,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
+            ret_draft_prob_token_ids = None
         else:
-            probs = renorm_draft_probs(
+            (
+                ret_draft_probs,
+                ret_draft_prob_token_ids,
+                ret_topk_p,
+                ret_topk_index,
+            ) = self._sample_draft_logits(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
+                positions=batch.seq_lens,
             )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
+        (
+            ret_draft_probs,
+            ret_draft_prob_token_ids,
+        ) = self._ensure_sparse_algo5_draft_probs(
+            ret_draft_probs,
+            ret_draft_prob_token_ids,
+            batch.sampling_info,
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1236,6 +1456,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if get_spec().speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
+            next_draft_input.draft_prob_token_ids = ret_draft_prob_token_ids
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
         next_draft_input.cuda_graph_compatible = not (
@@ -1401,6 +1622,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
+                    synthid_config=(
+                        self.target_worker.model_runner.sampler.synthid_watermark.config
+                        if self.target_worker.model_runner.sampler.synthid_watermark
+                        is not None
+                        else None
+                    ),
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input
@@ -1432,6 +1659,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+                and (
+                    self.target_worker.model_runner.sampler.synthid_watermark is None
+                    or not get_spec().speculative_use_rejection_sampling
+                )
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:

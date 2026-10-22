@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -526,8 +525,9 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    synthid_processor=None,
     *,
-    watermark_state: Optional[WatermarkState] = None,
+    watermark_state=None,
     watermark_full_mask: bool = True,
 ):
     """
@@ -589,11 +589,11 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    watermark_context_hashes = None
-    watermark_selected = None
+    watermark_context_hashes = watermark_selected = None
     if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if synthid_processor is not None:
+            raise RuntimeError("A verify batch cannot apply two watermark algorithms")
         if batch.return_logprob:
-            # compute_spec_logprobs reads logits_output after verify.
             next_token_logits = next_token_logits.clone()
         if next_token_logits.is_cuda:
             watermark_context_hashes, watermark_selected = (
@@ -628,8 +628,30 @@ def eagle_sample(
                     draft_token_num=verify_input.draft_token_num,
                 )
             )
-
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    synthid_applied = synthid_processor is not None
+    synthid_sparse_output = None
+    synthid_sparse_probs = None
+    synthid_sparse_token_ids = None
+    if synthid_applied:
+        from sglang.srt.watermarking.synthid.speculative import apply_synthid_to_target
+
+        (
+            synthid_sparse_output,
+            synthid_sparse_probs,
+            synthid_sparse_token_ids,
+            original_logits,
+        ) = apply_synthid_to_target(
+            processor=synthid_processor,
+            logits=next_token_logits,
+            sampling_info=sampling_info,
+            candidates=candidates,
+            tree_topk=verify_input.tree_topk,
+            return_logprob=batch.return_logprob,
+        )
+        if original_logits is not None:
+            logits_output.next_token_logits_before_watermark = original_logits
+
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
@@ -640,14 +662,19 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    use_greedy_verification = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+    )
+    if use_greedy_verification:
+        target_predict = (
+            synthid_sparse_output.argmax_token_ids(torch.int64)
+            if synthid_sparse_output is not None
+            else torch.argmax(next_token_logits, dim=-1)
+        )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
@@ -702,15 +729,6 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_parallel().tp_group
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
@@ -718,48 +736,131 @@ def eagle_sample(
                 sampling_fn = partial(sampling_fn, block_verification=True)
         else:
             sampling_fn = tree_speculative_sampling_target_only
-
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
-
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+        if synthid_applied:
+            from sglang.kernels.ops.sampling.synthid.triton import (
+                chain_synthid_speculative_sampling_triton,
+                sample_synthid_zero_step_triton,
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+
+        use_sparse_target_rejection = (
+            use_rejection_sampling
+            and synthid_sparse_probs is not None
+            and synthid_sparse_probs.shape[-1] <= 1024
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+        )
+
+        if use_sparse_target_rejection:
+            target_probs = synthid_sparse_probs.reshape(
+                bs,
+                verify_input.draft_token_num,
+                -1,
+            )
+            target_token_ids = synthid_sparse_token_ids.reshape(
+                bs,
+                verify_input.draft_token_num,
+                -1,
+            )
+        else:
+            if synthid_sparse_probs is not None:
+                next_token_logits.zero_()
+                next_token_logits.scatter_(
+                    1,
+                    synthid_sparse_token_ids,
+                    synthid_sparse_probs,
+                )
+                target_probs = next_token_logits
+            elif synthid_applied:
+                target_probs = torch.softmax(
+                    next_token_logits, dim=-1
+                )  # (bs * num_draft_tokens, vocab_size)
+            else:
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures, verify_input.draft_token_num, dim=0
+                )
+                target_probs = sampling_softmax(
+                    next_token_logits, temperatures=expanded_temperature
+                )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            if sampling_info.need_top_k_sampling and not synthid_applied:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling and not synthid_applied:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
+        draft_prob_token_ids = verify_input.draft_prob_token_ids
+        if (
+            synthid_applied
+            and use_rejection_sampling
+            and draft_probs is None
+            and verify_input.draft_token_num == 1
+        ):
+            if use_sparse_target_rejection:
+                draft_probs = target_probs.new_empty((bs, 0, target_probs.shape[-1]))
+                draft_prob_token_ids = target_token_ids.new_empty(
+                    (bs, 0, target_token_ids.shape[-1])
+                )
+            else:
+                draft_probs = torch.zeros_like(target_probs)
+        if (
+            use_rejection_sampling
+            and not use_sparse_target_rejection
+            and draft_prob_token_ids is not None
+        ):
+            dense_draft_probs = torch.zeros(
+                (*draft_probs.shape[:-1], target_probs.shape[-1]),
+                dtype=draft_probs.dtype,
+                device=draft_probs.device,
+            )
+            dense_draft_probs.scatter_(
+                -1,
+                draft_prob_token_ids,
+                draft_probs,
+            )
+            draft_probs = dense_draft_probs
+            draft_prob_token_ids = None
+        # Defense-in-depth behind the spec_hook startup allowlist: validate the
+        # actual kernel inputs (catches draft_probs plumbing regressions or a
+        # startup guard bypassed by a worker subclass) before the Triton kernel.
         if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            draft_probs is None
+            or (
+                not use_sparse_target_rejection
+                and draft_probs.shape[-1] != target_probs.shape[-1]
+            )
+            or (
+                use_sparse_target_rejection
+                and (
+                    draft_prob_token_ids is None
+                    or draft_prob_token_ids.shape != draft_probs.shape
+                )
+            )
         ):
             raise ValueError(
                 "Rejection sampling requires a target-vocab draft proposal "
                 "distribution; the current speculative algorithm/draft worker "
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
-
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
             seq_lens=batch.seq_lens,
@@ -767,35 +868,57 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
-        del (
-            expanded_temperature,
-            target_probs,
-            draft_probs,
-            coins,
-            coins_for_final_sampling,
-        )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
+        if use_sparse_target_rejection:
+            chain_synthid_speculative_sampling_triton(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                target_tokens=target_token_ids,
+                draft_probs=draft_probs,
+                draft_tokens=draft_prob_token_ids,
+            )
+        elif synthid_applied and use_rejection_sampling and candidates.shape[1] == 1:
+            sample_synthid_zero_step_triton(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                retrieve_index=verify_input.retrieve_index,
+                target_probs=target_probs,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+            )
+        else:
+            sampling_kwargs = dict(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
+            sampling_fn(**sampling_kwargs)
+        del target_probs, draft_probs, coins, coins_for_final_sampling
+        if not synthid_applied:
+            del expanded_temperature
+
+    # Sampling results must be rank-consistent. Non-greedy verification already
+    # required this; SynthID also makes one greedy mismatch permanently diverge
+    # the per-request watermark state.
+    if not use_greedy_verification or synthid_applied:
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
@@ -845,6 +968,12 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     accept_lens = num_correct_drafts + 1
+    if synthid_applied:
+        synthid_processor.commit(
+            sampling_info.synthid_state,
+            predict[accept_index.to(torch.int64).clamp_min(0)],
+            accept_lens,
+        )
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,

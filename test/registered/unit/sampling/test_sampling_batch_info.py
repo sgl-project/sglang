@@ -744,6 +744,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+        self.assertIsNone(info.synthid_state)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
