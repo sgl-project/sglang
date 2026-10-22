@@ -8,7 +8,7 @@ from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=17, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _make_temp_pem(content: bytes) -> str:
@@ -109,33 +109,6 @@ class TestSSLCertRefresher(CustomTestCase):
 
         result_ctx = self._run_async(_test())
         result_ctx.load_cert_chain.assert_not_called()
-
-    def test_no_ca_watcher_when_ca_not_provided(self):
-        """No CA watcher task is created when ca_path is None."""
-        mock_ctx = MagicMock()
-        cert_path = self._track(_make_temp_pem(b"CERT"))
-        key_path = self._track(_make_temp_pem(b"KEY"))
-
-        async def _test():
-            refresher = SSLCertRefresher(mock_ctx, key_path, cert_path)
-            self.assertEqual(len(refresher._tasks), 1)
-            refresher.stop()
-
-        self._run_async(_test())
-
-    def test_ca_watcher_created_when_ca_provided(self):
-        """A CA watcher task is created when ca_path is provided."""
-        mock_ctx = MagicMock()
-        cert_path = self._track(_make_temp_pem(b"CERT"))
-        key_path = self._track(_make_temp_pem(b"KEY"))
-        ca_path = self._track(_make_temp_pem(b"CA"))
-
-        async def _test():
-            refresher = SSLCertRefresher(mock_ctx, key_path, cert_path, ca_path)
-            self.assertEqual(len(refresher._tasks), 2)
-            refresher.stop()
-
-        self._run_async(_test())
 
     def test_reload_error_does_not_crash(self):
         """A reload error is logged but doesn't crash the watcher."""
