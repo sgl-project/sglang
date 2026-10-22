@@ -1177,6 +1177,48 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+@functools.cache
+def _precompile_bf16_mla(
+    num_heads: int,
+    dim: int,
+    tail_dim: int,
+    topk: int,
+    sm_scale: float,
+    block_I: int,
+    threads: int,
+) -> None:
+    """Populate the JIT cache for every split reachable by _pick_inner_iter.
+
+    Query length is dynamic, but the partial kernel's inner_iter and the
+    combine kernel's group count are compile-time parameters. Preparing them
+    on the first forward lets server warmup cover later query lengths too.
+    """
+    ni = topk // block_I
+    inner_iter = ni
+    while inner_iter >= 1:
+        # Match the selector's halving sequence, including non-power-of-two ni.
+        if ni % inner_iter == 0:
+            sparse_mla_fwd_decode_partial(
+                num_heads,
+                dim,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=block_I,
+                inner_iter=inner_iter,
+                threads=threads,
+            )
+            sparse_mla_fwd_decode_combine(
+                num_heads,
+                dim,
+                (ni // inner_iter) * block_I,
+                head_per_block=4,
+                block_I=block_I,
+                threads=threads,
+            )
+        inner_iter //= 2
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1220,6 +1262,15 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+            _precompile_bf16_mla(
+                num_heads=num_heads,
+                dim=d_v,
+                tail_dim=tail_dim,
+                topk=topk,
+                sm_scale=sm_scale,
+                block_I=block_I,
+                threads=threads,
+            )
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
