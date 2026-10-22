@@ -209,6 +209,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     lora_info,
 ) -> StandardCombineInput:
     from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+        _prewarm_per_expert_lora_routes,
         merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -346,7 +347,24 @@ def fused_experts_experimental_sgl_marlin_lora(
         )
         # Allocate and prewarm on main; side streams launch kernels only.
         gate_up_delta = hidden_states.new_empty((M, topk, 2 * N))
-        if not direct_decode:
+        paired_routing = (
+            factored_shared_outer
+            and not direct_decode
+            and _prewarm_per_expert_lora_routes(
+                hidden_states,
+                lora_info.down_lora_a_weights,
+                lora_info.gate_up_lora_b_weights,
+                topk_ids,
+                lora_info.token_lora_mapping,
+                routing_cache,
+                shrink_lora_b=lora_info.down_lora_b_weights,
+                adapter_enabled=lora_info.adapter_enabled,
+                include_inactive_routes=True,
+                local_expert_offset=0,
+                local_num_experts=E,
+            )
+        )
+        if not direct_decode and not paired_routing:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
                 hidden_states=hidden_states,
@@ -406,7 +424,7 @@ def fused_experts_experimental_sgl_marlin_lora(
             )
         )
         # Prewarm down routing and allocate its intermediate on main.
-        if not direct_decode:
+        if not direct_decode and not paired_routing:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
                 hidden_states=hidden_states,

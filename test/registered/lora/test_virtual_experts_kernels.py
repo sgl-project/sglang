@@ -211,6 +211,264 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                         )
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(is_xpu(), "CUDA paired routing and graph replay required")
+    def test_paired_routing_matches_staged_routes_and_replays(self):
+        """Both per-expert stages share raw routes, including distinct tuned blocks."""
+        import weakref
+
+        import sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts as temp
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config,
+        )
+
+        slots, experts, rank, hidden, width, topk = 3, 3, 8, 65, 33, 2
+        # Strided payload metadata must not force flatten/copy during routing.
+        a = torch.empty(
+            (slots, experts, rank, hidden * 2), device=self.device, dtype=torch.float16
+        )[..., ::2]
+        b = torch.empty(
+            (slots, experts, width * 2, rank), device=self.device, dtype=a.dtype
+        )[:, :, ::2, :]
+        shared_a = torch.empty(
+            (slots, 1, rank, hidden), device=self.device, dtype=a.dtype
+        )
+        shared_b = torch.empty(
+            (slots, 1, hidden, rank), device=self.device, dtype=a.dtype
+        )
+
+        def config(w1_shape, w2_shape, stage_topk, dtype, tokens):
+            # Gate B and down shared B deliberately select different blocks.
+            return {
+                "BLOCK_SIZE_M": 32 if w2_shape[1] == width else 64,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 16,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
+
+        for tokens in (6, 512):
+            with (
+                self.subTest(tokens=tokens),
+                patch.object(
+                    fused_moe_triton_config,
+                    "try_get_optimal_moe_config",
+                    side_effect=config,
+                ),
+                patch.object(
+                    temp.lora_envs.SGLANG_OPT_LORA_SHRINK_TUNE,
+                    "get",
+                    return_value=False,
+                ),
+                patch.object(
+                    temp.lora_envs.SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE,
+                    "get",
+                    return_value=True,
+                ),
+            ):
+                x = torch.empty((tokens, hidden), device=self.device, dtype=a.dtype)
+                ids = torch.arange(tokens * topk, device=self.device).view(tokens, topk)
+                ids.remainder_(experts)
+                mapping = torch.arange(tokens, device=self.device).remainder_(slots)
+                enabled = torch.ones(slots * 2, device=self.device, dtype=torch.int32)[
+                    ::2
+                ]
+                weights = torch.ones((tokens, topk), device=self.device)
+                output = torch.empty(
+                    (tokens, topk, width), device=self.device, dtype=a.dtype
+                )
+
+                def prepare(cache):
+                    self.assertTrue(
+                        temp._prewarm_per_expert_lora_routes(
+                            x,
+                            a,
+                            b,
+                            ids,
+                            mapping,
+                            cache,
+                            shrink_lora_b=shared_b,
+                            adapter_enabled=enabled,
+                            include_inactive_routes=True,
+                            local_num_experts=experts,
+                        )
+                    )
+
+                def check(cache):
+                    valid_slot = (mapping >= 0) & (mapping < slots)
+                    safe_slot = mapping.clamp(0, slots - 1)
+                    mask = valid_slot & (enabled[safe_slot] != 0)
+                    expected = torch.where(
+                        mask[:, None] & (ids >= 0) & (ids < experts),
+                        ids + mapping[:, None] * experts,
+                        -1,
+                    ).flatten()
+                    for key, (
+                        sorted_ids,
+                        expert_ids,
+                        count,
+                        token_mask,
+                    ) in cache.items():
+                        block = key[2]
+                        used = int(count[0].item())
+                        self.assertLessEqual(used, sorted_ids.numel())
+                        route = sorted_ids[:used].long()
+                        expert = expert_ids[: used // block].repeat_interleave(block)
+                        real = route < ids.numel()
+                        route, expert = route[real], expert[real]
+                        self.assertEqual(route.numel(), ids.numel())
+                        self.assertEqual(route.unique().numel(), ids.numel())
+                        actual = torch.empty_like(expected)
+                        actual[route] = expert.to(actual.dtype)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        torch.testing.assert_close(token_mask, mask, rtol=0, atol=0)
+
+                raw_refs = []
+                remap = temp._fused_virtual_topk_ids
+
+                def observe_raw(*args, **kwargs):
+                    result = remap(*args, **kwargs)
+                    raw_refs.append(weakref.ref(result[0]))
+                    return result
+
+                cache = {}
+                with patch.object(
+                    temp, "_fused_virtual_topk_ids", side_effect=observe_raw
+                ):
+                    prepare(cache)
+                self.assertEqual(len(raw_refs), 1)
+                self.assertIsNone(raw_refs[0]())
+                expected_blocks = {32, 64 if tokens >= 512 else 16}
+                self.assertEqual({key[2] for key in cache}, expected_blocks)
+                tables = list(cache.values())
+                self.assertIs(tables[0][3], tables[1][3])
+                check(cache)
+
+                # The unchanged public staged route path is an independent cache oracle.
+                reference = {}
+                common = dict(
+                    output=output,
+                    hidden_states=x,
+                    topk_ids=ids,
+                    topk_weights=weights,
+                    token_lora_mapping=mapping,
+                    routing_cache=reference,
+                    stage="routing",
+                    include_inactive_routes=True,
+                    adapter_enabled=enabled,
+                    local_num_experts=experts,
+                )
+                temp.merged_experts_fused_moe_lora_add(
+                    **common,
+                    lora_a=shared_a,
+                    lora_b=b,
+                    mul_routed_weight=False,
+                    experts_shared_outer_loras_a=True,
+                    experts_shared_outer_loras_b=False,
+                    prewarm_a_routing=False,
+                )
+                temp.merged_experts_fused_moe_lora_add(
+                    **common,
+                    lora_a=a,
+                    lora_b=shared_b,
+                    mul_routed_weight=True,
+                    experts_shared_outer_loras_a=False,
+                    experts_shared_outer_loras_b=True,
+                    prewarm_b_routing=False,
+                )
+                self.assertEqual(set(cache), set(reference))
+                check(reference)
+
+                # Enabled identity and inactive-route mode retain their distinct keys.
+                other_enabled = enabled.clone().zero_()
+                self.assertTrue(
+                    temp._prewarm_per_expert_lora_routes(
+                        x,
+                        a,
+                        b,
+                        ids,
+                        mapping,
+                        cache,
+                        shrink_lora_b=shared_b,
+                        adapter_enabled=other_enabled,
+                        include_inactive_routes=True,
+                    )
+                )
+                self.assertTrue(
+                    temp._prewarm_per_expert_lora_routes(
+                        x,
+                        a,
+                        b,
+                        ids,
+                        mapping,
+                        cache,
+                        shrink_lora_b=shared_b,
+                        adapter_enabled=enabled,
+                        include_inactive_routes=False,
+                    )
+                )
+                self.assertEqual(len(cache), 6)
+                for key, value in cache.items():
+                    if key[4] == id(other_enabled):
+                        self.assertFalse(bool(value[3].any()))
+                # Global-ID EP keeps the existing staged/merged provider path.
+                untouched = {}
+                self.assertFalse(
+                    temp._prewarm_per_expert_lora_routes(
+                        x,
+                        a,
+                        b,
+                        ids,
+                        mapping,
+                        untouched,
+                        shrink_lora_b=shared_b,
+                        local_num_experts=experts - 1,
+                    )
+                )
+                self.assertEqual(untouched, {})
+                self.assertTrue(
+                    temp._prewarm_per_expert_lora_routes(
+                        x[:0],
+                        a,
+                        b,
+                        ids[:0],
+                        mapping[:0],
+                        untouched,
+                        shrink_lora_b=shared_b,
+                        adapter_enabled=enabled,
+                    )
+                )
+                self.assertEqual(untouched, {})
+
+                if tokens != 6:
+                    continue
+                # Graph replays mutate borrowed contents, not identities or cache keys.
+                initial_ids, initial_mapping = ids.clone(), mapping.clone()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    replay_cache = {}
+                    prepare(replay_cache)
+                for state in ("partial", "disabled", "missing", "zero", "recovery"):
+                    ids.copy_(initial_ids)
+                    mapping.copy_(initial_mapping)
+                    enabled.fill_(1)
+                    if state == "partial":
+                        ids[0, 0] = -2
+                        ids[1, 1] = experts
+                    elif state == "disabled":
+                        enabled.zero_()
+                    elif state == "missing":
+                        mapping[0] = -1
+                        mapping[1] = slots + 1
+                    elif state == "zero":
+                        ids.fill_(-1)
+                    saved_ids, saved_mapping = ids.clone(), mapping.clone()
+                    graph.replay()
+                    check(replay_cache)
+                    torch.testing.assert_close(ids, saved_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(mapping, saved_mapping, rtol=0, atol=0)
+
     @unittest.skipIf(is_xpu(), "CUDA staged virtual-expert helpers required")
     def test_empty_virtual_calls_preserve_stage_results(self):
         """Empty route sets preserve add outputs and the staged shrink return contract."""
