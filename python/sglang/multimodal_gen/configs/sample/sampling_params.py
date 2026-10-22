@@ -1411,7 +1411,7 @@ class SamplingParams:
             "--true-cfg-scale",
             type=float,
             dest="true_cfg_scale",
-            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image, FLUX.1)",
         )
         add_argument(
             "--guidance-rescale",

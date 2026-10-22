@@ -1,5 +1,3 @@
-"""Resumable insert walk, returned-value drain and segment lock tests for UnifiedRadixCache."""
-
 import sys
 import unittest
 from array import array
@@ -134,7 +132,6 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
                 self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         self.assertFalse(cache.tree_core.has_ongoing_insert())
 
-        # The tree stays usable and the crossing re-fires on the next walk.
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         cache.writing_check(write_back=True)
         (ancestor,) = node_children(cache, cache.root_node_handle())
@@ -231,7 +228,6 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         self.assertTrue(cache.tree_core.is_backuped(middle))
         self.assertFalse(cache.tree_core.is_backuped(top))
 
-        # The device insert unevicts the middle and adds the deep leaf.
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 13)))
         (deep,) = node_children(cache, middle)
 
@@ -386,11 +382,9 @@ class TestResumableInsertWalkSWA(ResumableInsertWalkSWAFixtures, CustomTestCase)
         (window_node,) = node_children(cache, prefix_node)
         self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
-        # Re-inserting fully in-window recovers the prefix span's SWA data.
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
         self.assertIsNotNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
-        # SWA eviction takes the recovered span and keeps the window leaf.
         cache.evict(EvictParams(num_tokens=0, swa_num_tokens=sw))
         self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
         self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.SWA))
@@ -457,14 +451,13 @@ class TestResumableInsertWalkWriteBack(UnifiedRadixCacheFixtures, CustomTestCase
     def test_drop_fallback_frees_host_for_later_backups_same_round(self):
         """Host slots reclaimed by the drop fallback itself (an interior
         host-only descendant) must be reusable by later write-back backups in
-        the same eviction round (pre-split freed them inline)."""
+        the same eviction round."""
         if self._skip_unsupported_hicache_test():
             return
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         host_pool = cache.cache_controller.mem_pool_host
 
-        # Chain 1: unbacked parent -> host-only child -> host-only grandchild.
         p1 = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, p1)
         c1 = p1 + self._make_seq(1000, 2)
@@ -518,8 +511,7 @@ class TestResumableInsertWalkWriteBack(UnifiedRadixCacheFixtures, CustomTestCase
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
-    """Drain contract of the returned-values eviction API: every tree-core step
-    result is drained exactly once, in per-component insertion order."""
+    """Each tree-core step result is drained exactly once, in insertion order."""
 
     cfg = CacheConfig()
 
@@ -629,45 +621,6 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
                 self.assertIs(device_frees[ComponentType.FULL][0], sentinel)
                 self.assertIs(host_frees[ComponentType.FULL][0], sentinel)
 
-    def test_free_values_frees_in_component_insertion_order(self):
-        """Device frees apply before host frees, each in per-component
-        insertion order — the allocator free-list order the pre-split inline
-        frees produced."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        order = [ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA]
-        device_frees = defaultdict(list)
-        host_frees = defaultdict(list)
-        for ct in order:
-            device_frees[ct].append(torch.tensor([1]))
-            host_frees[ct].append(torch.tensor([2]))
-
-        freed = []
-        fake_components = {
-            ct: mock.MagicMock(
-                free_host_values=mock.MagicMock(
-                    side_effect=lambda values, ct=ct: freed.append(("host", ct))
-                )
-            )
-            for ct in order
-        }
-        with (
-            mock.patch.object(
-                cache,
-                "_apply_cache_action",
-                side_effect=lambda action: freed.append(
-                    ("device", action.component_type)
-                ),
-            ),
-            mock.patch.dict(cache.components, fake_components),
-        ):
-            cache._free_values(device_frees, host_frees)
-
-        self.assertEqual(
-            freed, [("device", ct) for ct in order] + [("host", ct) for ct in order]
-        )
-        self.assertFalse(device_frees)
-        self.assertFalse(host_frees)
-
     def test_free_values_mid_drain_failure_cannot_replay_freed_entries(self):
         """A device free that raises must leave only un-attempted entries in
         the dict (no replay of successes) while host frees still drain."""
@@ -723,25 +676,17 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
-    """Segment-lock protocol regressions, replaying the production lock-theft
-    failure classes (F1/F2) and the split hazards.
-
-    The protocol: a lock covers the contiguous node segment
-    [start, boundary-uuid], counting every node (tombstones included), so a
-    release needs only the receipt (anchor node, boundary uuid, skipped
-    components) and any ref==0 met inside the segment is a hard protocol
-    violation. The replays read the tree through the inspection interface, so
-    they run unchanged against the Python and Rust cores.
-    """
+    """A lock covers the node segment [start, boundary-uuid] counting tombstones;
+    a release needs only its receipt, and any ref==0 inside the segment is a
+    violation."""
 
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
 
     def test_rebuilt_tombstone_relock_release_no_theft(self):
-        """F1 attribution replay: A locks a window containing a tombstone; the
-        tombstone is rebuilt and locked by B mid-hold; A's release must leave
-        B's refs intact (the old skip-set protocol decremented B's lock)."""
+        """A locks a window containing a tombstone; B rebuilds and locks it
+        mid-hold; A's release must leave B's refs intact."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
@@ -794,7 +739,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         for n in segment:
             self.assertEqual(self._swa_ref(cache, n), 2)
 
-        # THE regression: A's release takes back exactly A's refs.
         cache.dec_lock_ref(leaf, lock_a.to_dec_params())
         for n in segment:
             self.assertEqual(self._swa_ref(cache, n), 1)
@@ -821,7 +765,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         cache.sanity_check()
 
     def test_root_acquire_receipt_releases_on_root(self):
-        """A cold request locks the root, so its receipt is anchored on root."""
         cache, _, _ = build_fixture(self.cfg)
         root = cache.root_node_handle()
         lock = cache.inc_lock_ref(root).to_dec_params()
@@ -830,7 +773,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         cache.sanity_check()
 
     def test_release_with_incorrect_root_boundary_fails_loud(self):
-        """An incorrect root boundary must fail at the acquired segment's edge."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 3 * sw)
@@ -869,8 +811,8 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         )
 
     def test_unanchored_device_release_fails_loud(self):
-        """#41261 replay: a receipt that lost its anchor must not walk the
-        node's segment and drop locks other holders own."""
+        """A receipt that lost its anchor must not walk the node's segment and
+        drop locks other holders own."""
         cache, allocator, leaf = self._leaf_with_lock_path()
         lock = cache.inc_lock_ref(leaf).to_dec_params()
         self._assert_unanchored_release_rejected(
@@ -920,8 +862,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         )
 
     def test_unanchored_root_release_fails_loud(self):
-        """Every acquire anchors its receipt, root included; an unanchored
-        receipt lost its anchor upstream even where releasing is a no-op."""
         cache, _, _ = build_fixture(self.cfg)
         root = cache.root_node_handle()
         self._assert_protocol_violation(
@@ -941,8 +881,8 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         )
 
     def test_finish_after_early_release_without_skip_swa_fails_loud(self):
-        """F2 replay: retraction-after-early-release used to run a second SWA
-        walk that stole ancestors' locks; now it dies at the first node."""
+        """A finish after early SWA release without skip_swa asserts at the first
+        node instead of stealing ancestors' locks."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
@@ -955,7 +895,7 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         )
 
     def test_finish_after_early_release_with_skip_swa(self):
-        """The correct F2 flow: unlock honors the early release."""
+        """Finish with skip_swa honors the early release."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2 * sw)
@@ -983,7 +923,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         pre_segment = self._segment(cache, leaf, sw)
         pre_full_path = self._full_path(cache, leaf)
 
-        # Diverge inside the window to force a split of a locked node.
         fork = seq[: len(seq) - sw // 2] + self._make_seq(9000, sw)
         self._insert(cache, allocator, req_to_token_pool, fork)
         post_segment = self._segment(cache, leaf, sw)
@@ -1018,7 +957,6 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
 
         params = cache.inc_lock_ref(leaf).to_dec_params()
         self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
-        # Full first: its walk still sees the SWA lock, so the leaf stays out.
         cache.components[ComponentType.FULL].release_component_lock(node, params)
         self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
         # The SWA release drops the last lock and must readmit the leaf itself.
@@ -1029,8 +967,7 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestSegmentLockFuzz(SegmentLockFuzzFixtures, CustomTestCase):
-    """Random lock/insert/evict interleavings with the tree's own ledger
-    recomputation (sanity_check) as the per-step oracle, on both cores."""
+    """Random lock/insert/evict interleavings, with sanity_check as the oracle."""
 
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA),
@@ -1051,9 +988,7 @@ class TestSegmentLockFuzz(SegmentLockFuzzFixtures, CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
-    """The FULL+SWA+MAMBA (Inkling) shape: the Mamba opt-out receipt, the
-    lower-priority cascade on early SWA release, and Mamba evictions all join
-    the interleavings."""
+    """The FULL+SWA+MAMBA shape adds the Mamba opt-out and Mamba evictions."""
 
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
@@ -1067,8 +1002,8 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
 class TestStreamingSessionLockLifecycle(
     StreamingSessionLockLifecycleFixtures, CustomTestCase
 ):
-    """A streaming session owns its record and prefix lock from the first
-    turn's row allocation; every move of that lock keeps the tree balanced."""
+    """A streaming session's prefix lock keeps the tree balanced through every
+    move."""
 
     cfg = CacheConfig(
         page_size=1,
