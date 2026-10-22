@@ -15,7 +15,6 @@ from typing import Optional, Tuple, Union
 import flash_mla
 import torch
 from flash_mla import fused_norm_rope_attn_rope_cast as _mega
-from flash_mla._loader import get_ops
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
@@ -87,144 +86,59 @@ def flash_mla_with_kvcache(
     *,
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Paged MLA decode. A ``FlashMLASchedMeta`` selects the scheduler-object
-    API (sparse, or dense bf16); tensor metadata from
-    ``get_mla_metadata(cache_seqlens, ...)`` selects the legacy-only tensor API
-    (V3.2 sparse, dense bf16, or dense fp8 when ``q`` is fp8)."""
+    """Paged MLA decode. ``tile_scheduler_metadata`` is a ``FlashMLASchedMeta``,
+    or the schedule tensors from ``get_mla_metadata(cache_seqlens, ...)`` with
+    ``num_splits``, which ride on a fresh ``FlashMLASchedMeta`` (legacy only:
+    V3.2 sparse, dense bf16, or dense fp8 when ``q`` is fp8)."""
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
-        return flash_mla.flash_mla_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=head_dim_v,
-            tile_scheduler_metadata=tile_scheduler_metadata,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            is_fp8_kvcache=is_fp8_kvcache,
-            indices=indices,
-            attn_sink=attn_sink,
-            extra_k_cache=extra_k_cache,
-            extra_indices_in_kvcache=extra_indices_in_kvcache,
-            topk_length=topk_length,
-            extra_topk_length=extra_topk_length,
-            use_legacy=use_legacy,
-            kv_format=kv_format,
+        sched_meta = tile_scheduler_metadata
+    else:
+        assert use_legacy, (
+            "tensor scheduling metadata exists only for the legacy kernels"
         )
-    return _flash_mla_with_kvcache_tensor_meta(
-        q=q,
-        k_cache=k_cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        head_dim_v=head_dim_v,
-        tile_scheduler_metadata=tile_scheduler_metadata,
-        num_splits=num_splits,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        descale_q=descale_q,
-        descale_k=descale_k,
-        is_fp8_kvcache=is_fp8_kvcache,
-        indices=indices,
-        kv_format=kv_format,
-        use_legacy=use_legacy,
-        unsupported=(
-            attn_sink,
-            extra_k_cache,
-            extra_indices_in_kvcache,
-            topk_length,
-            extra_topk_length,
-        ),
-    )
-
-
-def _flash_mla_with_kvcache_tensor_meta(
-    *,
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    block_table: Optional[torch.Tensor],
-    cache_seqlens: Optional[torch.Tensor],
-    head_dim_v: int,
-    tile_scheduler_metadata: torch.Tensor,
-    num_splits: Optional[torch.Tensor],
-    softmax_scale: float,
-    causal: bool,
-    descale_q: Optional[torch.Tensor],
-    descale_k: Optional[torch.Tensor],
-    is_fp8_kvcache: bool,
-    indices: Optional[torch.Tensor],
-    kv_format: Optional[str],
-    use_legacy: bool,
-    unsupported: Tuple[Optional[torch.Tensor], ...],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert use_legacy, "tensor scheduling metadata exists only for the legacy kernels"
-    assert num_splits is not None
-    assert block_table is not None
-    assert cache_seqlens is not None
-    assert all(x is None for x in unsupported), (
-        "attn_sink, extra caches and topk lengths need FlashMLASchedMeta"
-    )
-    assert (descale_q is None) == (descale_k is None), (
-        "descale_q and descale_k should be both None or both not None"
-    )
-    ops = get_ops(use_legacy=True)
-    if indices is not None:
-        assert not causal, "causal must be False if sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
-        if (
+        assert num_splits is not None
+        assert block_table is not None and cache_seqlens is not None
+        assert all(
+            x is None for x in (attn_sink, extra_k_cache, extra_indices_in_kvcache)
+        ), "attn_sink and extra caches need FlashMLASchedMeta"
+        assert (descale_q is None) == (descale_k is None), (
+            "descale_q and descale_k should be both None or both not None"
+        )
+        sched_meta = FlashMLASchedMeta(
+            tile_scheduler_metadata=tile_scheduler_metadata, num_splits=num_splits
+        )
+        if indices is None:
+            is_fp8_kvcache = q.element_size() == 1
+        elif (
             kv_format is None
             and q.shape[-1] == 512
             and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
         ):
             kv_format = "V32_NO_ROPE"
-        out, lse, _, _ = ops.sparse_decode_fwd(
-            q,
-            k_cache,
-            indices,
-            None,
-            None,
-            tile_scheduler_metadata,
-            num_splits,
-            None,
-            None,
-            None,
-            head_dim_v,
-            softmax_scale,
-            kv_format,
-        )
-        return out, lse
-    assert kv_format is None, "kv_format only applies to sparse attention"
-    if q.element_size() == 1:
-        out, lse = ops.fwd_kvcache_mla_fp8(
-            q,
-            k_cache,
-            head_dim_v,
-            cache_seqlens,
-            block_table,
-            softmax_scale,
-            causal,
-            tile_scheduler_metadata,
-            num_splits,
-            descale_q,
-            descale_k,
-        )
-        return out, lse
-    assert not is_fp8_kvcache, "dense fp8 decoding takes an fp8 q"
-    assert descale_q is None, "descale_q / descale_k apply to dense fp8 decoding only"
-    out, lse, _, _ = ops.dense_decode_fwd(
-        q,
-        k_cache,
-        head_dim_v,
-        cache_seqlens,
-        block_table,
-        softmax_scale,
-        causal,
-        tile_scheduler_metadata,
-        num_splits,
+    return flash_mla.flash_mla_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        head_dim_v=head_dim_v,
+        tile_scheduler_metadata=sched_meta,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        is_fp8_kvcache=is_fp8_kvcache,
+        indices=indices,
+        attn_sink=attn_sink,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices_in_kvcache,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        use_legacy=use_legacy,
+        kv_format=kv_format,
+        descale_q=descale_q,
+        descale_k=descale_k,
     )
-    return out, lse
 
 
 def flash_mla_sparse_fwd(
