@@ -57,6 +57,11 @@ def _build_server_args(
     running on a silently-defaulted knob."""
     from sglang.srt.rust_extensions import load_rust_extension
 
+    if get_serving().parser_match_mode == "strict":
+        raise ValueError(
+            "--parser-match-mode strict is not supported by the Rust server; "
+            "its parsers match markers as text."
+        )
     ext = extension or load_rust_extension("sglang.srt.rust_extensions._server")
 
     sa = resolving_view(scheduler.server_args)

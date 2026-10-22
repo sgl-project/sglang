@@ -18,10 +18,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -828,6 +828,135 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(len(items), 2)
         self.assertTrue(all(i["name"] for i in items))
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
+
+
+class GlmOutputIdsTestCase(CustomTestCase):
+    MARKERS = (
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+        "<arg_key>",
+        "</arg_key>",
+        "<arg_value>",
+        "</arg_value>",
+    )
+    # A part that is a marker is its control token; any other part is spelled.
+    PARTS = (
+        ["Emit <tool_call> later.", "</think>", "Calling.", "<tool_call>"]
+        + ["get_weather", "<arg_key>", "city", "</arg_key>", "<arg_value>"]
+        + ["a</arg_value>b", "</arg_value>", "</tool_call>"]
+    )
+    EXPECTED = ("Emit <tool_call> later.", "Calling.", [{"city": "a</arg_value>b"}])
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _serving(self):
+        """glm45 + glm47 over a byte-level tokenizer with the GLM markers added,
+        and the output ids of PARTS."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        def byte_level_tokenizer(*added_tokens):
+            alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+            backend = Tokenizer(models.BPE({c: i for i, c in enumerate(alphabet)}, []))
+            backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            backend.decoder = decoders.ByteLevel()
+            backend.add_tokens(list(added_tokens))
+            return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+        tokenizer = byte_level_tokenizer(*self.MARKERS)
+        plain = byte_level_tokenizer()
+        ids = []
+        for part in self.PARTS:
+            ids += (
+                [tokenizer.convert_tokens_to_ids(part)]
+                if part in self.MARKERS
+                else plain.encode(part)
+            )
+        serving = make_serving()
+        serving.tokenizer_manager.tokenizer = tokenizer
+        serving.reasoning_parser = "glm45"
+        serving.tool_call_parser = "glm47"
+        serving.template_manager.force_reasoning = True
+        return serving, tokenizer, ids
+
+    def _request(self, stream):
+        return ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=stream,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+
+    def test_glm_parsers_get_the_output_ids(self):
+        serving, tokenizer, ids = self._serving()
+        reasoning, message, call = serving._make_response_output_items(
+            self._request(stream=False),
+            tokenizer.decode(ids),
+            tokenizer,
+            require_reasoning=True,
+            output_ids=ids,
+        )
+        self.assertEqual(
+            (
+                reasoning.content[0].text,
+                message.content[0].text,
+                [json.loads(call.arguments)],
+            ),
+            self.EXPECTED,
+        )
+
+        for incremental in (True, False):
+            with self.subTest(incremental=incremental):
+                enter_override(
+                    self,
+                    get_context().override_server_args(
+                        incremental_streaming_output=incremental
+                    ),
+                )
+                chunks = []
+                for i in range(len(ids)):
+                    text = tokenizer.decode(ids[: i + 1])
+                    chunk = engine_chunk(
+                        text[len(tokenizer.decode(ids[:i])) :] if incremental else text,
+                        i + 1,
+                        finish=i == len(ids) - 1,
+                    )
+                    chunk["output_ids"] = (
+                        ids[i : i + 1] if incremental else ids[: i + 1]
+                    )
+                    chunks.append(chunk)
+                payloads = event_payloads(
+                    StreamFixture(
+                        serving, self._request(stream=True), require_reasoning=True
+                    ).run(chunks)
+                )
+                streamed = [
+                    "".join(p["delta"] for p in payloads if p["type"] == event)
+                    for event in (
+                        "response.reasoning_text.delta",
+                        "response.output_text.delta",
+                        "response.function_call_arguments.delta",
+                    )
+                ]
+                self.assertEqual(
+                    (streamed[0], streamed[1], [json.loads(streamed[2])]),
+                    self.EXPECTED,
+                )
 
 
 if __name__ == "__main__":

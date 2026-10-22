@@ -91,6 +91,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.control_token_stream import ParserMatchError
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -655,6 +656,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     require_reasoning=require_reasoning,
                 )
                 return result
+            except ParserMatchError as e:
+                return self.create_error_response(
+                    str(e), err_type="InternalServerError", status_code=500
+                )
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
@@ -1122,6 +1127,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and self.tool_call_parser
                     and request.tool_choice != "none"
                 ),
+                match_mode=self.parser_match_mode,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(
                 final_output, output_ids=output_ids
@@ -1149,6 +1155,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                match_mode=self.parser_match_mode,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -1165,6 +1172,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                     parsed_via_native = bool(call_info_list)
+                except ParserMatchError:
+                    raise
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 
@@ -2110,6 +2119,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                match_mode=self.parser_match_mode,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:
@@ -2124,6 +2134,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=isinstance(tool_parser, FunctionCallParser),
+                match_mode=self.parser_match_mode,
             )
 
         current_output_index = -1
@@ -2414,15 +2425,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                         delta = text[stream_offset:]
                         stream_offset = len(text)
                     # Every chunk's ids, even one whose text is still held back.
+                    output_ids_total = meta.get("completion_tokens")
                     if reasoning_parser_obj is not None:
                         reasoning_parser_obj.observe_stream_output_ids(
-                            chunk.get("output_ids"), cumulative=not incremental
+                            chunk.get("output_ids"),
+                            cumulative=not incremental,
+                            total=output_ids_total,
                         )
                     elif tool_parser is not None and not isinstance(
                         tool_parser, JsonArrayParser
                     ):
                         tool_parser.observe_stream_output_ids(
-                            chunk.get("output_ids"), cumulative=not incremental
+                            chunk.get("output_ids"),
+                            cumulative=not incremental,
+                            total=output_ids_total,
                         )
                     if not delta and finish_reason is None:
                         continue

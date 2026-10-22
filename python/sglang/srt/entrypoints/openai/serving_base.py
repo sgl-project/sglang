@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.parser.control_token_stream import ParserMatchError
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
@@ -119,6 +120,13 @@ class OpenAIServingBase(ABC):
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+        except ParserMatchError as e:
+            logger.error("Output parsing error: %s", e)
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=500,
             )
         except ValueError as e:
             return self.create_error_response(

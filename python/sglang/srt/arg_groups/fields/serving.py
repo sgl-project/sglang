@@ -219,6 +219,20 @@ class Serving(msgspec.Struct):
         "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
     ] = False
     tool_call_parser: Optional[str] = None
+    parser_match_mode: A[
+        str,
+        Arg(
+            help="How the reasoning and tool-call parsers recognize markers such as "
+            "</think> and <tool_call>. 'auto' matches the control tokens by output "
+            "token id when the parser and tokenizer support it, else as text. "
+            "'strict' requires id matching: the server fails to start when a "
+            "configured parser cannot match by id, and a response whose text "
+            "and output ids disagree returns an error. 'text' always matches "
+            "the text. Only the glm45 reasoning and glm47 tool-call parsers "
+            "match by id.",
+            choices=["auto", "strict", "text"],
+        ),
+    ] = "auto"
     tool_server: A[
         Optional[str],
         "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",

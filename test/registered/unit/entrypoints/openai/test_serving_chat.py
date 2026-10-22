@@ -42,6 +42,7 @@ from sglang.srt.entrypoints.openai.serving_inkling import InklingChatEncodingAda
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.control_token_stream import ParserMatchError
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -4145,10 +4146,47 @@ class ServingChatTestCase(CustomTestCase):
             return chunks
         return [c for c in self._parse_chunks(chunks) if "sglext" in c]
 
-    def test_glm_parsers_get_the_output_ids(self):
-        """Chat responses pass the output ids to the glm45 reasoning parser and
-        the ids of the content to the glm47 tool-call parser, so tags GLM
-        spells with ordinary tokens stay text in reasoning and in arguments."""
+    _GLM_MARKERS = (
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+        "<arg_key>",
+        "</arg_key>",
+        "<arg_value>",
+        "</arg_value>",
+    )
+    _GLM_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    # Parts, then the reasoning, content and call arguments they parse to; a
+    # part that is a marker is its control token, any other part is spelled.
+    _GLM_CHOICES = [
+        (
+            ["Emit <tool_call> later.", "</think>", "Calling.", "<tool_call>"]
+            + ["get_weather", "<arg_key>", "city", "</arg_key>", "<arg_value>"]
+            + ["a</arg_value>b", "</arg_value>", "</tool_call>"],
+            ("Emit <tool_call> later.", "Calling.", [{"city": "a</arg_value>b"}]),
+        ),
+        (
+            ["Quote </think>.", "</think>", "Use <tool_call> tags."],
+            ("Quote </think>.", "Use <tool_call> tags.", []),
+        ),
+    ]
+
+    def _use_glm_parsers(self):
+        """Serve glm45 + glm47 over a byte-level tokenizer with the GLM markers
+        added, so each marker is a control token or a spelling; returns the
+        tokenizer and the output ids of each of _GLM_CHOICES."""
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers
         from transformers import PreTrainedTokenizerFast
 
@@ -4160,60 +4198,111 @@ class ServingChatTestCase(CustomTestCase):
             backend.add_tokens(list(added_tokens))
             return PreTrainedTokenizerFast(tokenizer_object=backend)
 
-        markers = ["<think>", "</think>", "<tool_call>", "</tool_call>"]
-        markers += ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"]
-        tokenizer = byte_level_tokenizer(*markers)
+        tokenizer = byte_level_tokenizer(*self._GLM_MARKERS)
         plain = byte_level_tokenizer()
-        ids = []
-        for part in [
-            "Emit <tool_call> later.",
-            "</think>",
-            "Calling.",
-            "<tool_call>",
-            "get_weather",
-            "<arg_key>",
-            "city",
-            "</arg_key>",
-            "<arg_value>",
-            "a</arg_value>b",
-            "</arg_value>",
-            "</tool_call>",
-        ]:
-            ids += (
-                [tokenizer.convert_tokens_to_ids(part)]
-                if part in markers
-                else plain.encode(part)
-            )
+        ids_by_choice = []
+        for parts, _ in self._GLM_CHOICES:
+            ids = []
+            for part in parts:
+                ids += (
+                    [tokenizer.convert_tokens_to_ids(part)]
+                    if part in self._GLM_MARKERS
+                    else plain.encode(part)
+                )
+            ids_by_choice.append(ids)
         self.tm.tokenizer = tokenizer
         self.chat.reasoning_parser = "glm45"
         self.chat.tool_call_parser = "glm47"
         self.template_manager.force_reasoning = True
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                },
-            }
-        ]
-        reasoning, content = "Emit <tool_call> later.", "Calling."
-        arguments = {"city": "a</arg_value>b"}
+        return tokenizer, ids_by_choice
 
-        ret = self._output_ids_ret(ids)
-        ret[0]["text"] = tokenizer.decode(ids)
+    def _glm_stream(self, tokenizer, ids_by_choice, *, incremental, garble=None):
+        """Engine chunks of one token each, choices interleaved; ``garble``
+        rewrites the text of the token at that index of choice 0."""
+
+        async def generate():
+            sent = [""] * len(ids_by_choice)
+            for i in range(max(map(len, ids_by_choice))):
+                for index, ids in enumerate(ids_by_choice):
+                    if i >= len(ids):
+                        continue
+                    text = tokenizer.decode(ids[: i + 1])
+                    delta = text[len(tokenizer.decode(ids[:i])) :]
+                    if index == 0 and i == garble:
+                        delta = "~" * len(delta)
+                    sent[index] += delta
+                    yield {
+                        "text": delta if incremental else sent[index],
+                        "output_ids": ids[i : i + 1] if incremental else ids[: i + 1],
+                        "meta_info": {
+                            "id": "chatcmpl-glm-ids",
+                            "prompt_tokens": 3,
+                            "completion_tokens": i + 1,
+                            "cached_tokens": 0,
+                            "finish_reason": (
+                                {"type": "stop", "matched": None}
+                                if i == len(ids) - 1
+                                else None
+                            ),
+                        },
+                        "index": index,
+                    }
+
+        return generate()
+
+    def _streamed_choices(self, chunks):
+        """(reasoning, content, call arguments) of each streamed choice."""
+        parts = {}
+        for chunk in self._parse_chunks(chunks):
+            for choice in chunk["choices"]:
+                delta = choice["delta"]
+                reasoning, content, arguments = parts.setdefault(
+                    choice["index"], ["", "", ""]
+                )
+                parts[choice["index"]] = [
+                    reasoning + (delta.get("reasoning_content") or ""),
+                    content + (delta.get("content") or ""),
+                    arguments
+                    + "".join(
+                        call["function"].get("arguments") or ""
+                        for call in delta.get("tool_calls") or []
+                    ),
+                ]
+        return [
+            (r, c, [json.loads(a)] if a else [])
+            for _, (r, c, a) in sorted(parts.items())
+        ]
+
+    def test_glm_parsers_get_the_output_ids(self):
+        """Every choice's reasoning parser gets its own output ids and its
+        tool-call parser the ids of its content, so tags GLM spells with
+        ordinary tokens stay text in reasoning, content and arguments."""
+        tokenizer, ids_by_choice = self._use_glm_parsers()
+        expected = [parsed for _, parsed in self._GLM_CHOICES]
+
+        ret = self._output_ids_ret(*ids_by_choice)
+        for item, ids in zip(ret, ids_by_choice):
+            item["text"] = tokenizer.decode(ids)
         request = ChatCompletionRequest(
-            model="x", messages=[{"role": "user", "content": "Hi?"}], tools=tools
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=self._GLM_TOOLS,
+            n=2,
         )
-        message = self.chat._build_chat_response(request, ret, 123).choices[0].message
+        choices = self.chat._build_chat_response(request, ret, 123).choices
         self.assertEqual(
-            (message.reasoning_content, message.content), (reasoning, content)
-        )
-        self.assertEqual(
-            [json.loads(c.function.arguments) for c in message.tool_calls], [arguments]
+            [
+                (
+                    c.message.reasoning_content,
+                    c.message.content,
+                    [
+                        json.loads(t.function.arguments)
+                        for t in c.message.tool_calls or []
+                    ],
+                )
+                for c in choices
+            ],
+            expected,
         )
 
         for incremental in (True, False):
@@ -4224,60 +4313,146 @@ class ServingChatTestCase(CustomTestCase):
                         incremental_streaming_output=incremental
                     ),
                 )
-
-                async def generate():
-                    for i in range(len(ids)):
-                        text = tokenizer.decode(ids[: i + 1])
-                        yield {
-                            "text": (
-                                text[len(tokenizer.decode(ids[:i])) :]
-                                if incremental
-                                else text
-                            ),
-                            "output_ids": (
-                                ids[i : i + 1] if incremental else ids[: i + 1]
-                            ),
-                            "meta_info": {
-                                "id": "chatcmpl-glm-ids",
-                                "prompt_tokens": 3,
-                                "completion_tokens": i + 1,
-                                "cached_tokens": 0,
-                                "finish_reason": (
-                                    {"type": "stop", "matched": None}
-                                    if i == len(ids) - 1
-                                    else None
-                                ),
-                            },
-                            "index": 0,
-                        }
-
-                self.tm.generate_request.return_value = generate()
+                self.tm.generate_request.return_value = self._glm_stream(
+                    tokenizer, ids_by_choice, incremental=incremental
+                )
                 stream_request = ChatCompletionRequest(
                     model="x",
                     messages=[{"role": "user", "content": "Hi?"}],
-                    tools=tools,
+                    tools=self._GLM_TOOLS,
                     stream=True,
+                    n=2,
                 )
-                deltas = [
-                    chunk["choices"][0]["delta"]
-                    for chunk in self._parse_chunks(
+                self.assertEqual(
+                    self._streamed_choices(
                         self._run_chat_stream(Mock(), stream_request)
-                    )
-                    if chunk["choices"]
-                ]
+                    ),
+                    expected,
+                )
+
+    def test_anthropic_messages_get_the_output_ids(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+
+        tokenizer, (ids, _) = self._use_glm_parsers()
+        reasoning, content, arguments = self._GLM_CHOICES[0][1]
+        serving = AnthropicServing(self.chat)
+
+        def anthropic_request(stream):
+            return AnthropicMessagesRequest.model_validate(
+                {
+                    "model": "x",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "Hi?"}],
+                    "tools": [
+                        {
+                            "name": "get_weather",
+                            "input_schema": self._GLM_TOOLS[0]["function"][
+                                "parameters"
+                            ],
+                        }
+                    ],
+                    "stream": stream,
+                }
+            )
+
+        request = anthropic_request(stream=False)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        ret = self._output_ids_ret(ids)[0]
+        ret["text"] = tokenizer.decode(ids)
+
+        async def generate():
+            yield ret
+
+        self.tm.generate_request.return_value = generate()
+        with patch.object(
+            self.chat,
+            "_convert_to_internal_request",
+            return_value=(Mock(), chat_request),
+        ):
+            response = asyncio.run(
+                serving._handle_non_streaming(chat_request, request, Mock())
+            )
+        blocks = json.loads(response.body)["content"]
+        self.assertEqual(
+            [b.get("thinking") or b.get("text") or b.get("input") for b in blocks],
+            [reasoning, content] + arguments,
+        )
+
+        for incremental in (True, False):
+            with self.subTest(incremental=incremental):
+                enter_override(
+                    self,
+                    get_context().override_server_args(
+                        incremental_streaming_output=incremental
+                    ),
+                )
+                self.tm.generate_request.return_value = self._glm_stream(
+                    tokenizer, [ids], incremental=incremental
+                )
+                request = anthropic_request(stream=True)
+
+                async def collect():
+                    deltas = []
+                    async for sse in serving._generate_anthropic_stream(
+                        Mock(),
+                        serving._convert_to_chat_completion_request(request),
+                        request,
+                        Mock(),
+                    ):
+                        for line in sse.splitlines():
+                            if line.startswith("data: "):
+                                event = json.loads(line[6:])
+                                if event["type"] == "content_block_delta":
+                                    deltas.append(event["delta"])
+                    return deltas
+
+                deltas = asyncio.run(collect())
                 self.assertEqual(
-                    "".join(d.get("reasoning_content") or "" for d in deltas),
-                    reasoning,
+                    [
+                        "".join(d.get(key) or "" for d in deltas)
+                        for key in ("thinking", "text", "partial_json")
+                    ],
+                    [reasoning, content, json.dumps(arguments[0])],
                 )
-                self.assertEqual(
-                    "".join(d.get("content") or "" for d in deltas), content
-                )
-                streamed_arguments = "".join(
-                    call["function"].get("arguments") or ""
-                    for d in deltas
-                    for call in d.get("tool_calls") or []
-                )
-                self.assertEqual(json.loads(streamed_arguments), arguments)
+
+    def test_strict_parser_match_reports_disagreeing_text(self):
+        """In strict mode a configured parser that cannot match by id stops
+        the server, and text that disagrees with its ids fails the response
+        instead of being parsed as text."""
+        tokenizer, ids_by_choice = self._use_glm_parsers()
+        enter_override(
+            self, get_context().override_server_args(parser_match_mode="strict")
+        )
+        with self.assertRaises(ParserMatchError):
+            OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.tm.server_args.tool_call_parser = "glm47"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.force_reasoning = True
+
+        ret = self._output_ids_ret(ids_by_choice[0])
+        ret[0]["text"] = tokenizer.decode(ids_by_choice[0]).replace(
+            "Calling", "Kalling"
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=self._GLM_TOOLS,
+        )
+        response = self.chat._build_chat_response(request, ret, 123)
+        self.assertEqual(response.status_code, 500)
+
+        self.tm.generate_request.return_value = self._glm_stream(
+            tokenizer, ids_by_choice[:1], incremental=False, garble=30
+        )
+        stream_request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}], stream=True
+        )
+        chunks = self._parse_chunks(self._run_chat_stream(Mock(), stream_request))
+        self.assertEqual(chunks[-1]["error"]["code"], 500)
+        self.assertIn("output token id", chunks[-1]["error"]["message"])
+        self.assertNotIn("~", json.dumps(chunks[:-1]))
 
     def test_streaming_output_ids_incremental_accumulates_deltas(self):
         sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)

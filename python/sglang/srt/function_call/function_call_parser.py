@@ -59,6 +59,11 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.control_token_stream import (
+    OutputIdsCursor,
+    ParserMatchError,
+    ParserMatchMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,18 +123,29 @@ class FunctionCallParser:
     }
 
     def __init__(
-        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        match_mode: ParserMatchMode = "auto",
     ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
-            if tokenizer is not None:
-                sig = inspect.signature(detector_class)
-                if "tokenizer" in sig.parameters:
-                    kwargs["tokenizer"] = tokenizer
+            sig = inspect.signature(detector_class)
+            if tokenizer is not None and "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
+            if "match_mode" in sig.parameters:
+                kwargs["match_mode"] = match_mode
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        if match_mode == "strict" and not detector.wants_output_ids:
+            raise ParserMatchError(
+                f"parser_match_mode=strict: tool call parser {tool_call_parser!r} "
+                "does not match markers by output token id"
+            )
 
         if isinstance(detector, Glm47MoeDetector):
             detector.use_full_assistant_constraint = not any(
@@ -141,7 +157,7 @@ class FunctionCallParser:
         self.detector = self._required_tool_parser or detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
-        self._stream_output_ids_seen = 0
+        self._cursor = OutputIdsCursor()
 
     def owns_tool_format(self) -> bool:
         return (
@@ -168,21 +184,33 @@ class FunctionCallParser:
     def observe_output_ids(self, output_ids: Optional[List[int]]) -> None:
         """Take the token ids that decode to the text parsed next: all of it
         before ``parse_non_stream`` or ``has_tool_call``, a chunk's before
-        ``parse_stream_chunk``."""
-        if output_ids is not None and self.detector.wants_output_ids:
-            self.detector.observe_output_ids(output_ids)
+        ``parse_stream_chunk``. None means they are unknown."""
+        self.observe_stream_output_ids(output_ids, cumulative=False)
 
     def observe_stream_output_ids(
-        self, output_ids: Optional[List[int]], *, cumulative: bool
+        self,
+        output_ids: Optional[List[int]],
+        *,
+        cumulative: bool,
+        total: Optional[int] = None,
     ) -> None:
         """``observe_output_ids`` for a stream chunk whose ids are every id so
-        far when ``cumulative`` is set."""
-        if output_ids is None:
+        far when ``cumulative`` is set; ``total`` is the generated token count
+        after the chunk, when known."""
+        if not self.detector.wants_output_ids:
             return
-        if cumulative:
-            output_ids = output_ids[self._stream_output_ids_seen :]
-        self._stream_output_ids_seen += len(output_ids)
-        self.observe_output_ids(output_ids)
+        if output_ids is None:
+            if self._cursor.started:
+                self.detector.invalidate_output_ids("a stream chunk has no output ids")
+            return
+        try:
+            new_ids = self._cursor.advance(
+                output_ids, cumulative=cumulative, total=total
+            )
+        except ParserMatchError as e:
+            self.detector.invalidate_output_ids(str(e))
+            return
+        self.detector.observe_output_ids(new_ids)
 
     def parse_non_stream(
         self, full_text: str, output_ids: Optional[List[int]] = None
@@ -201,7 +229,8 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
-        self.observe_output_ids(output_ids)
+        if output_ids is not None:
+            self.observe_output_ids(output_ids)
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls

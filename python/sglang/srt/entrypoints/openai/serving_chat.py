@@ -101,6 +101,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.control_token_stream import ParserMatchError
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -288,6 +289,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
         )
+        self.parser_match_mode = get_serving().parser_match_mode
+        if self.parser_match_mode == "strict":
+            self._check_strict_parser_match()
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -516,6 +520,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if self._encoding_adapter is None:
             return None
         return self._encoding_adapter.output
+
+    def _check_strict_parser_match(self) -> None:
+        """Fail at startup when a configured parser cannot match by output token id."""
+        tokenizer = self.tokenizer_manager.tokenizer
+        if self.reasoning_parser:
+            ReasoningParser(
+                model_type=self.reasoning_parser,
+                tokenizer=tokenizer,
+                match_mode="strict",
+            )
+        if self.tool_call_parser:
+            FunctionCallParser(
+                [], self.tool_call_parser, tokenizer=tokenizer, match_mode="strict"
+            )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -966,9 +984,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.reasoning_parser and request.separate_reasoning:
                 tool_output_ids = reasoning_parser_dict[index].take_content_output_ids()
                 cumulative = False
+                output_ids_total = None
             else:
                 tool_output_ids = content.get("output_ids")
                 cumulative = not get_serving().incremental_streaming_output
+                output_ids_total = content["meta_info"].get("completion_tokens")
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -981,6 +1001,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
                 output_ids=tool_output_ids,
                 cumulative_output_ids=cumulative,
+                output_ids_total=output_ids_total,
             ):
                 if chunk:
                     yield chunk
@@ -2328,6 +2349,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        except ParserMatchError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
+            yield f"data: {error}\n\n"
         except ValueError as e:
             if not stream_started:
                 raise
@@ -2469,6 +2497,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
+                        match_mode=self.parser_match_mode,
                     )
                     reasoning_text, text = parser.parse_non_stream(
                         text, output_ids=content_output_ids
@@ -2692,6 +2721,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                match_mode=self.parser_match_mode,
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
@@ -2733,6 +2763,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except ParserMatchError:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
@@ -2842,11 +2874,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=self._tool_call_parsing_active(request),
+                match_mode=self.parser_match_mode,
             )
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_parser.observe_stream_output_ids(
             content.get("output_ids"),
             cumulative=not get_serving().incremental_streaming_output,
+            total=content["meta_info"].get("completion_tokens"),
         )
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
         if finish_reason_type is not None and finish_reason_type != "abort":
@@ -3130,12 +3164,14 @@ class OpenAIServingChat(OpenAIServingBase):
         flush: bool = False,
         output_ids: list[int] | None = None,
         cumulative_output_ids: bool = False,
+        output_ids_total: int | None = None,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
         held back waiting for a marker that can no longer arrive. ``output_ids``
         decode to ``delta``; every id so far when ``cumulative_output_ids`` is set.
+        ``output_ids_total`` is the generated token count after this chunk.
         """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
@@ -3155,6 +3191,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_choice=request.tool_choice,
+                        match_mode=self.parser_match_mode,
                     )
                     use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
@@ -3166,6 +3203,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    match_mode=self.parser_match_mode,
                 )
 
         parser = parser_dict[index]
@@ -3176,7 +3214,7 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             parser.observe_stream_output_ids(
-                output_ids, cumulative=cumulative_output_ids
+                output_ids, cumulative=cumulative_output_ids, total=output_ids_total
             )
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

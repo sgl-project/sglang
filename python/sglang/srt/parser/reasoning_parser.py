@@ -37,7 +37,12 @@ from sglang.srt.function_call.muse_glimmer_format import (
     partial_marker_len,
 )
 from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
-from sglang.srt.parser.control_token_stream import ControlTokenStream
+from sglang.srt.parser.control_token_stream import (
+    ControlTokenStream,
+    OutputIdsCursor,
+    ParserMatchError,
+    ParserMatchMode,
+)
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -135,6 +140,11 @@ class BaseReasoningFormatDetector:
         if self._control is not None:
             self._control.feed(token_ids)
 
+    def invalidate_output_ids(self, reason: str) -> None:
+        """The observed ids no longer describe the text parsed next."""
+        if self._control is not None:
+            self._control.invalidate(reason)
+
     def output_ids_of(self, text: str) -> Optional[List[int]]:
         """The observed output ids that decode to ``text``, the end of the text
         parsed so far, or None when unknown."""
@@ -142,16 +152,33 @@ class BaseReasoningFormatDetector:
             return None
         return self._control.ids_from(text)
 
-    def _marker_view(self, text: str) -> str:
-        """The string searched for markers in ``text``, the end of the text
-        parsed so far; equal in length, so its indices slice ``text``."""
+    def _find_marker(self, marker: str, text: str, start: int = 0) -> int:
+        """Index of the first ``marker`` at or after ``start`` in ``text``, the
+        end of the text parsed so far, or -1."""
         if self._control is None:
-            return text
-        return self._control.view(text)
+            return text.find(marker, start)
+        span = self._control.find(marker, text, start)
+        return -1 if span is None else span.start
+
+    def _find_think_start(self, text: str) -> int:
+        label = self.think_start_self_label
+        idx = self._find_marker(self.think_start_token, text)
+        while idx != -1 and not text.startswith(
+            label, idx + len(self.think_start_token)
+        ):
+            idx = self._find_marker(self.think_start_token, text, idx + 1)
+        return idx
+
+    def _starts_with_think_start(self, text: str) -> bool:
+        if self._control is not None and not self._control.match_at(
+            self.think_start_token, text, 0
+        ):
+            return False
+        return text.startswith(self.think_start_token + self.think_start_self_label)
 
     def _think_end_index(self, text: str) -> int:
         """Index in ``text`` of the think_end_token that ends reasoning, or -1."""
-        return self._marker_view(text).find(self.think_end_token)
+        return self._find_marker(self.think_end_token, text)
 
     def _defers_tool_start(self) -> bool:
         """Whether streaming holds a tool_start_token seen inside reasoning until
@@ -175,15 +202,14 @@ class BaseReasoningFormatDetector:
         buffer whose leading newline was already emitted as reasoning."""
         if not self.tool_start_token:
             return -1
-        view = self._marker_view(text)
-        idx = view.find(self.tool_start_token)
+        idx = self._find_marker(self.tool_start_token, text)
         while idx != -1:
             prev = text[idx - 1] if idx > 0 else preceded_by
             # Nothing precedes the token at the absolute start of generation;
             # that counts as line start too.
             if not self.tool_start_at_line_start or prev in ("", "\n"):
                 return idx
-            idx = view.find(self.tool_start_token, idx + 1)
+            idx = self._find_marker(self.tool_start_token, text, idx + 1)
         return -1
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
@@ -199,7 +225,7 @@ class BaseReasoningFormatDetector:
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = (
-            self._in_reasoning or self.think_start_token in self._marker_view(text)
+            self._in_reasoning or self._find_marker(self.think_start_token, text) != -1
         )
 
         if not in_reasoning:
@@ -208,7 +234,7 @@ class BaseReasoningFormatDetector:
         # The text is considered to be in a reasoning block.
         think_start_text = self.think_start_token + self.think_start_self_label
         processed_text = text
-        while self._marker_view(processed_text).startswith(think_start_text):
+        while self._starts_with_think_start(processed_text):
             processed_text = processed_text[len(think_start_text) :]
 
         end_idx = self._think_end_index(processed_text)
@@ -277,11 +303,14 @@ class BaseReasoningFormatDetector:
 
         # Strip `<think>` token if present
         start_idx = (
-            -1
-            if self.stripped_think_start
-            else self._marker_view(current_text).find(think_start_text)
+            -1 if self.stripped_think_start else self._find_think_start(current_text)
         )
-        if start_idx != -1:
+        if start_idx > 0 and self._control is not None and self._control.active:
+            # Splicing it out would leave a buffer that no longer ends the parsed
+            # text, where ids cannot locate markers; detect_and_parse keeps it too.
+            self.stripped_think_start = True
+            self._in_reasoning = True
+        elif start_idx != -1:
             current_text = (
                 current_text[:start_idx]
                 + current_text[start_idx + len(think_start_text) :]
@@ -361,9 +390,8 @@ class BaseReasoningFormatDetector:
         return StreamingParseResult()
 
     def _strip_leading_think_start(self, text: str) -> str:
-        think_start_text = self.think_start_token + self.think_start_self_label
-        if self._marker_view(text).startswith(think_start_text):
-            return text[len(think_start_text) :]
+        if self._starts_with_think_start(text):
+            return text[len(self.think_start_token + self.think_start_self_label) :]
         return text
 
     @staticmethod
@@ -1009,6 +1037,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
         previous_content: str = "",
         reasoning_default: str = "enable_thinking",
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        match_mode: ParserMatchMode = "auto",
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -1031,7 +1060,9 @@ class Glm45Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
         )
         self._control = ControlTokenStream.create(
-            tokenizer, (self.think_start_token, self.think_end_token, "<tool_call>")
+            tokenizer,
+            (self.think_start_token, self.think_end_token, "<tool_call>"),
+            match_mode=match_mode,
         )
 
     def _defers_tool_start(self) -> bool:
@@ -2401,6 +2432,7 @@ class ReasoningParser:
         request: ChatCompletionRequest = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
+        match_mode: ParserMatchMode = "auto",
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -2478,8 +2510,16 @@ class ReasoningParser:
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
 
+        if "match_mode" in inspect.signature(detector_class).parameters:
+            kwargs["match_mode"] = match_mode
+
         self.detector = detector_class(**kwargs)
-        self._stream_output_ids_seen = 0
+        if match_mode == "strict" and not self.detector.wants_output_ids:
+            raise ParserMatchError(
+                f"parser_match_mode=strict: reasoning parser {model_type!r} "
+                "does not match markers by output token id"
+            )
+        self._cursor = OutputIdsCursor()
         self._observed_output_ids: List[int] = []
         # Index in the observed ids where the normal text starts; -1 when unknown.
         self._content_ids_start: Optional[int] = None
@@ -2518,16 +2558,29 @@ class ReasoningParser:
         return ret.reasoning_text, ret.normal_text
 
     def observe_stream_output_ids(
-        self, output_ids: Optional[List[int]], *, cumulative: bool
+        self,
+        output_ids: Optional[List[int]],
+        *,
+        cumulative: bool,
+        total: Optional[int] = None,
     ) -> None:
         """Pass a stream chunk's output ids to the detector before its text:
-        only the new ids, or every id so far when ``cumulative`` is set."""
-        if output_ids is None:
+        only the new ids, or every id so far when ``cumulative`` is set.
+        ``total`` is the generated token count after the chunk, when known."""
+        if not self.detector.wants_output_ids:
             return
-        if cumulative:
-            output_ids = output_ids[self._stream_output_ids_seen :]
-        self._stream_output_ids_seen += len(output_ids)
-        self._observe_output_ids(output_ids)
+        if output_ids is None:
+            if self._cursor.started:
+                self.detector.invalidate_output_ids("a stream chunk has no output ids")
+            return
+        try:
+            new_ids = self._cursor.advance(
+                output_ids, cumulative=cumulative, total=total
+            )
+        except ParserMatchError as e:
+            self.detector.invalidate_output_ids(str(e))
+            return
+        self._observe_output_ids(new_ids)
 
     def take_content_output_ids(self) -> Optional[List[int]]:
         """The observed output ids of the normal text not taken yet, for a

@@ -38,6 +38,11 @@ from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.parser.control_token_stream import (
+    ControlTokenStream,
+    MarkerSpan,
+    ParserMatchError,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -4100,6 +4105,148 @@ class TestGlmControlTokenIds(unittest.TestCase):
             ("x", "y"),
         )
         self.assertIsNone(reasoning_parser.take_content_output_ids())
+
+    def _reasoning_parser(self, match_mode="auto", stream_reasoning=True):
+        return ReasoningParser(
+            "glm45",
+            stream_reasoning=stream_reasoning,
+            force_reasoning=True,
+            tokenizer=self.tokenizer,
+            match_mode=match_mode,
+        )
+
+    def test_special_token_markers_are_refused(self):
+        """The decoder skips special tokens, so a special marker such as
+        <|assistant|> never gets a position; matching it by id used to defuse
+        the control token itself."""
+        self.assertIsNone(ControlTokenStream.create(self.tokenizer, ["<|assistant|>"]))
+        with self.assertRaisesRegex(ParserMatchError, "special"):
+            ControlTokenStream.create(
+                self.tokenizer, ["</think>", "<|assistant|>"], match_mode="strict"
+            )
+
+    def test_marker_lookups_take_only_the_end_of_the_parsed_text(self):
+        """Lookups return the span of the control token, and refuse any string
+        but the end of the parsed text instead of matching it as text."""
+        stream = ControlTokenStream.create(self.tokenizer, ["</think>"])
+        ids = self._ids(["a", _Spelled("</think>"), "b", "</think>", "c"])
+        stream.feed(ids)
+        text = self.tokenizer.decode(ids)
+        stream.consume(text)
+        self.assertEqual(stream.find("</think>", text), MarkerSpan("</think>", 10, 18))
+        self.assertIsNone(stream.match_at("</think>", text, 1))
+        self.assertEqual(
+            stream.find("</think>", text[10:]), MarkerSpan("</think>", 0, 8)
+        )
+        for lookup in (
+            lambda: stream.find("</think>", "x</think>c"),
+            lambda: stream.match_at("</think>", text[:18], 10),
+            lambda: stream.view(text[:18]),
+        ):
+            with self.assertRaises(ParserMatchError):
+                lookup()
+
+    def test_empty_output_ids_are_not_missing_ids(self):
+        """No ids at all means the text has no source; an empty list is a
+        source that wrote no markers."""
+        ids = self._ids(["a", "</think>", "b"])
+        text = self.tokenizer.decode(ids)
+        self.assertEqual(
+            self._reasoning_parser().parse_non_stream(text, output_ids=None),
+            ("a", "b"),
+        )
+        self.assertEqual(
+            self._reasoning_parser().parse_non_stream(text, output_ids=[]),
+            ("a</think>b", ""),
+        )
+        for output_ids in (None, []):
+            with self.subTest(output_ids=output_ids):
+                with self.assertRaises(ParserMatchError):
+                    self._reasoning_parser("strict").parse_non_stream(
+                        text, output_ids=output_ids
+                    )
+
+    def test_strict_mode_fails_where_auto_matches_as_text(self):
+        ids = self._ids(["a", "</think>", "b"])
+        with self.assertRaises(ParserMatchError):
+            self._reasoning_parser("strict").parse_non_stream(
+                "x</think>y", output_ids=ids
+            )
+        stream_parser = self._reasoning_parser("strict")
+        stream_parser.observe_stream_output_ids(ids, cumulative=False, total=len(ids))
+        with self.assertRaises(ParserMatchError):
+            stream_parser.parse_stream_chunk("ab")
+        tool_parser = FunctionCallParser(
+            self.TOOLS, "glm47", tokenizer=self.tokenizer, match_mode="strict"
+        )
+        call = self._ids(
+            self.CALL + ["<arg_value>", "x", "</arg_value>", "</tool_call>"]
+        )
+        with self.assertRaises(ParserMatchError):
+            tool_parser.parse_non_stream(
+                self.tokenizer.decode(call).replace("x", "y"), output_ids=call
+            )
+        for build in (
+            lambda: ReasoningParser(
+                "qwen3", tokenizer=self.tokenizer, match_mode="strict"
+            ),
+            lambda: ReasoningParser("glm45", match_mode="strict"),
+            lambda: FunctionCallParser(
+                self.TOOLS, "qwen25", tokenizer=self.tokenizer, match_mode="strict"
+            ),
+        ):
+            with self.assertRaises(ParserMatchError):
+                build()
+
+    def test_text_mode_ignores_output_ids(self):
+        ids = self._ids(["a ", _Spelled("</think>"), "b", "</think>", "c"])
+        reasoning_parser = self._reasoning_parser("text")
+        self.assertFalse(reasoning_parser.detector.wants_output_ids)
+        self.assertEqual(
+            reasoning_parser.parse_non_stream(
+                self.tokenizer.decode(ids), output_ids=ids
+            ),
+            ("a ", "b</think>c"),
+        )
+
+    def test_stream_output_ids_must_continue(self):
+        """A chunk whose ids repeat, skip or rewrite earlier ones cannot be
+        aligned with its text; strict mode reports it instead of guessing."""
+        ids = self._ids(["Plan", "</think>", "Done", "."])
+        broken = {
+            "incremental repeat": [(ids[:2], 2), (ids[:2], 2)],
+            "incremental gap": [(ids[:2], 2), (ids[3:], 4)],
+            "cumulative shrink": [(ids[:3], 3), (ids[:2], 4)],
+            "cumulative rewrite": [(ids[:2], 2), (ids[:1] + [0] + ids[2:3], 3)],
+        }
+        for name, chunks in broken.items():
+            with self.subTest(name):
+                parser = self._reasoning_parser("strict")
+                with self.assertRaises(ParserMatchError):
+                    for chunk_ids, total in chunks:
+                        parser.observe_stream_output_ids(
+                            chunk_ids,
+                            cumulative=name.startswith("cumulative"),
+                            total=total,
+                        )
+        # Cumulative ids share storage with the request and can run ahead of
+        # the token count read earlier; that is not a gap.
+        parser = self._reasoning_parser("strict")
+        parser.observe_stream_output_ids(ids[:2], cumulative=True, total=1)
+        parser.observe_stream_output_ids(ids, cumulative=True, total=3)
+        self.assertEqual(
+            parser.parse_stream_chunk(self.tokenizer.decode(ids)), ("Plan", "Done.")
+        )
+
+    def test_think_start_after_text_keeps_matching_by_id(self):
+        """A <think> token after other text in one chunk was spliced out of the
+        buffer, after which markers silently matched as text."""
+        ids = self._ids(
+            ["a", "<think>", "b", _Spelled("</think>"), "c", "</think>", "d"]
+        )
+        expected = ("a<think>b</think>c", "d", [])
+        self.assertEqual(self._parse(ids), expected)
+        self.assertEqual(self._parse(ids, step=len(ids)), expected)
 
 
 class TestLing3Detector(unittest.TestCase):

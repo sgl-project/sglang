@@ -187,6 +187,7 @@ class TestIQuestQ1Detector(CustomTestCase):
 class TestIQuestQ1NonStreamingServingPath(CustomTestCase):
     class _Serving:
         tool_call_parser = "iquest_q1"
+        parser_match_mode = "auto"
         tokenizer_manager = SimpleNamespace(tokenizer=None)
 
         @staticmethod

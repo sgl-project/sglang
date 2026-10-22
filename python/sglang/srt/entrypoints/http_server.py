@@ -1718,6 +1718,7 @@ async def parse_function_call_request(
         tools=obj.tools,
         tool_call_parser=obj.tool_call_parser,
         tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        match_mode="text",
     )
 
     # 2) Call the non-stream parsing method (non-stream)
@@ -1746,6 +1747,7 @@ async def separate_reasoning_request(
         model_type=obj.reasoning_parser,
         request=request,
         tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        match_mode="text",
     )
 
     # 2) Call the non-stream parsing method (non-stream)

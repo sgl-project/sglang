@@ -20,7 +20,11 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import safe_literal_eval
-from sglang.srt.parser.control_token_stream import ControlTokenStream
+from sglang.srt.parser.control_token_stream import (
+    ControlTokenStream,
+    ParserMatchError,
+    ParserMatchMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +35,17 @@ def _group(match: re.Match, text: str, group: int) -> Optional[str]:
     return None if start == -1 else text[start:end]
 
 
-def _remove_markers(text: str, view: str, marker: str) -> str:
-    """``text.replace(marker, "")`` for the markers found in ``view``."""
-    parts = []
-    last = 0
-    idx = view.find(marker)
-    while idx != -1:
-        parts.append(text[last:idx])
-        last = idx + len(marker)
-        idx = view.find(marker, last)
-    parts.append(text[last:])
-    return "".join(parts)
+def _skip_arg_separator(text: str, pos: int, end: int) -> int:
+    """End of the run of whitespace and literal backslash-n at ``pos`` in
+    ``text[:end]``, as ``func_arg_regex`` skips between a key and its value."""
+    while pos < end:
+        if text[pos].isspace():
+            pos += 1
+        elif text.startswith("\\n", pos) and pos + 2 <= end:
+            pos += 2
+        else:
+            break
+    return pos
 
 
 @lru_cache(maxsize=1)
@@ -333,15 +337,15 @@ class Glm47MoeDetector(BaseFormatDetector):
     output, as detect_and_parse does.
     """
 
-    def __init__(self, tokenizer: Optional[PreTrainedTokenizerBase] = None):
+    def __init__(
+        self,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        match_mode: ParserMatchMode = "auto",
+    ):
         super().__init__()
         self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
-        self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
-        )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
@@ -366,6 +370,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 "<arg_value>",
                 "</arg_value>",
             ),
+            match_mode=match_mode,
         )
 
     def _reset_streaming_state(self) -> None:
@@ -388,7 +393,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         if self._control is not None:
             self._control.bind(text)
-        return self.bot_token in self._marker_view(text)
+        return self._find_marker(self.bot_token, text) != -1
 
     def _matches_ids(self) -> bool:
         return self._control is not None and self._control.active
@@ -398,6 +403,46 @@ class Glm47MoeDetector(BaseFormatDetector):
             (_group(m, args, 1), _group(m, args, 2))
             for m in self.func_arg_regex.finditer(args_view)
         ]
+
+    def _marker_in(self, marker: str, text: str, start: int, end: int) -> int:
+        idx = self._find_marker(marker, text, start)
+        return idx if idx != -1 and idx + len(marker) <= end else -1
+
+    def _call_spans(self, text: str) -> List[Tuple[int, int]]:
+        """Each bot_token through the first eot_token after it."""
+        spans = []
+        start = self._find_marker(self.bot_token, text)
+        while start != -1:
+            end = self._find_marker(self.eot_token, text, start + len(self.bot_token))
+            if end == -1:
+                break
+            end += len(self.eot_token)
+            spans.append((start, end))
+            start = self._find_marker(self.bot_token, text, end)
+        return spans
+
+    def _span_arg_pairs(self, text: str, start: int, end: int) -> List[Tuple[str, str]]:
+        """The pairs ``func_arg_regex`` finds in ``text[start:end]``, with
+        only markers that pass ``_find_marker`` delimiting them."""
+        pairs = []
+        while True:
+            key = self._marker_in("<arg_key>", text, start, end)
+            if key == -1:
+                return pairs
+            start = key + 1
+            key_end = self._marker_in("</arg_key>", text, key + 9, end)
+            while key_end != -1:
+                value = _skip_arg_separator(text, key_end + 10, end)
+                value_end = -1
+                if self._marker_in("<arg_value>", text, value, value + 11) == value:
+                    value_end = self._marker_in("</arg_value>", text, value + 11, end)
+                if value_end != -1:
+                    pairs.append(
+                        (text[key + 9 : key_end], text[value + 11 : value_end])
+                    )
+                    start = value_end + 12
+                    break
+                key_end = self._marker_in("</arg_key>", text, key_end + 1, end)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -409,21 +454,19 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         if self._control is not None:
             self._control.bind(text)
-        view = self._marker_view(text)
-        if self.bot_token not in view:
+        if self._find_marker(self.bot_token, text) == -1:
             return StreamingParseResult(normal_text=text, calls=[])
 
         # Extract all normal text (before, between, and after tool calls)
         normal_text_parts = []
         last_end = 0
 
-        # Find all tool call matches
-        matches = list(re.finditer(self.func_call_regex, view, re.DOTALL))
-        for match in matches:
+        call_spans = self._call_spans(text)
+        for call_start, call_end in call_spans:
             # Add text before this tool call
-            if match.start() > last_end:
-                normal_text_parts.append(text[last_end : match.start()])
-            last_end = match.end()
+            if call_start > last_end:
+                normal_text_parts.append(text[last_end:call_start])
+            last_end = call_end
 
         # Add any remaining text after the last tool call
         if last_end < len(text):
@@ -435,19 +478,16 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Parse tool calls
         calls = []
         try:
-            for match in matches:
-                match_result = text[match.start() : match.end()]
-                match_view = view[match.start() : match.end()]
-                # Get function name
-                func_detail = self.func_detail_regex.search(match_view)
-                if func_detail is None:
-                    continue
-                func_name = _group(func_detail, match_result, 1) or ""
-                func_args = _group(func_detail, match_result, 2) or ""
+            for call_start, call_end in call_spans:
+                body_start = call_start + len(self.bot_token)
+                body_end = call_end - len(self.eot_token)
+                args_start = self._marker_in("<arg_key>", text, body_start, body_end)
+                if args_start == -1:
+                    args_start = body_end
+                func_name = text[body_start:args_start]
                 arguments = {}
-                if func_args:
-                    args_view = _group(func_detail, match_view, 2)
-                    pairs = self._arg_pairs(func_args, args_view)
+                if args_start < body_end:
+                    pairs = self._span_arg_pairs(text, args_start, body_end)
                     # Parse arguments using shared method
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
@@ -455,6 +495,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                 match_result = {"name": func_name, "parameters": arguments}
                 calls.extend(self.parse_base_json(match_result, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except ParserMatchError:
+            raise
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
             # return the normal text if parsing fails
@@ -827,11 +869,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
         view = self._marker_view(current_text)
+        first_bot_token_idx = self._find_marker(self.bot_token, current_text)
 
-        # Check if we have a tool call
-        has_tool_call = self.bot_token in view
-
-        if not has_tool_call:
+        if first_bot_token_idx == -1:
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
@@ -844,10 +884,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                 # Must return the entire buffer (current_text), not just new_text,
                 # because buffer may contain previously accumulated characters like '<'
                 # that turned out not to be part of a tool call
-                output_text = current_text
+                output_text = self._remove_eot_markers(current_text)
                 self._buffer = ""
-                if self.eot_token in view:
-                    output_text = _remove_markers(output_text, view, self.eot_token)
                 return StreamingParseResult(normal_text=output_text)
             else:
                 # Could be start of tool call, keep buffering
@@ -855,7 +893,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Extract any text before the first bot_token and return it as normal_text
         normal_text = ""
-        first_bot_token_idx = view.find(self.bot_token)
         if first_bot_token_idx > 0:
             normal_text = current_text[:first_bot_token_idx]
             current_text = current_text[first_bot_token_idx:]
@@ -949,11 +986,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                     calls.extend(finalize_calls)
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+        except ParserMatchError:
+            raise
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _remove_eot_markers(self, text: str) -> str:
+        parts = []
+        last = 0
+        idx = self._find_marker(self.eot_token, text)
+        while idx != -1:
+            parts.append(text[last:idx])
+            last = idx + len(self.eot_token)
+            idx = self._find_marker(self.eot_token, text, last)
+        parts.append(text[last:])
+        return "".join(parts)
 
     def _skip_undeclared_tool(
         self, match: re.Match, text: str, is_tool_end: str, normal_text: str
