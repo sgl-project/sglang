@@ -2697,7 +2697,6 @@ class AscendAttnBackend(AttentionBackend):
         attn_mask: Optional[torch.Tensor] = None,
         actual_seq_lengths=None,
         return_softmax_lse: bool = False,
-        local_seq_lens: Optional[torch.Tensor] = None,
     ):
         """Run MLA FIA and normalize output/LSE to token-major DCP tensors."""
         num_heads = layer.tp_q_head_num
@@ -2764,12 +2763,6 @@ class AscendAttnBackend(AttentionBackend):
         softmax_lse = softmax_lse.transpose(1, 2)[:, :, :num_heads, :].reshape(
             num_tokens, num_heads
         )
-        if local_seq_lens is not None:
-            valid = (local_seq_lens > 0).view(num_tokens, 1)
-            attn_output = torch.where(valid, attn_output, torch.zeros_like(attn_output))
-            softmax_lse = torch.where(
-                valid, softmax_lse, torch.full_like(softmax_lse, float("-inf"))
-            )
         return attn_output, softmax_lse
 
     def forward_mtp(
@@ -2868,9 +2861,6 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
                 attn_mask=attn_mask,
                 return_softmax_lse=True,
-                local_seq_lens=self.forward_metadata.dcp_spec_seq_lens[
-                    : batch_size * query_len
-                ],
             )
 
             return attn_output, softmax_lse
@@ -3812,9 +3802,6 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     return_softmax_lse=return_softmax_lse,
-                    local_seq_lens=(
-                        self.forward_metadata.seq_lens if return_softmax_lse else None
-                    ),
                 )
             else:
                 if return_softmax_lse:
