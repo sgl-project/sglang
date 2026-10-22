@@ -766,15 +766,13 @@ def init_staging_buffers(
     a chunk can never be too large for the buffer.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-    from sglang.srt.environ import envs
 
     full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
     size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
     gpu_id = kv_args.gpu_id
-    host_mem = envs.SGLANG_DISAGG_STAGING_HOST_MEM.get()
-    device = "cpu" if host_mem else f"{_bare_device_type(device_type)}:{gpu_id}"
+    device = f"{_bare_device_type(device_type)}:{gpu_id}"
 
-    custom_mem_pool = None if host_mem else _get_custom_mem_pool(device)[0]
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []
     for _ in range(count):
@@ -796,10 +794,9 @@ def init_staging_allocator(register_fn, kv_args, *, device_type: str):
     pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
     pool_size_bytes = pool_size_mb * 1024 * 1024
     gpu_id = kv_args.gpu_id
-    host_mem = envs.SGLANG_DISAGG_STAGING_HOST_MEM.get()
-    device = "cpu" if host_mem else f"{_bare_device_type(device_type)}:{gpu_id}"
+    device = f"{_bare_device_type(device_type)}:{gpu_id}"
 
-    custom_mem_pool = None if host_mem else _get_custom_mem_pool(device)[0]
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
     register_fn(allocator.get_base_ptr(), allocator.get_total_size())
     return allocator
