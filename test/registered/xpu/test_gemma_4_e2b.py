@@ -239,7 +239,15 @@ class TestGemma4E2BMTPXPU(TestGemma4E2BXPU):
         self.assertGreater(state["startup_time"]["cuda_graph"]["draft_decode"], 0)
 
 
-# Full-model, text-only, and MTP launches, including recurrent XPU drafts.
+class TestGemma4E2BOneStepMTPXPU(TestGemma4E2BMTPXPU):
+    """A one-step frozen draft still needs a captured assistant seed forward."""
+
+    server_args = list(TestGemma4E2BMTPXPU.server_args)
+    server_args[server_args.index("--speculative-num-steps") + 1] = "1"
+    server_args[server_args.index("--speculative-num-draft-tokens") + 1] = "2"
+
+
+# Full-model, text-only, and one-/multi-step MTP launches.
 register_xpu_ci(
     est_time=600,
     suite="nightly-xpu-kernel-main-1-gpu",
