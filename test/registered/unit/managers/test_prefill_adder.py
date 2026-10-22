@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.prefill_budget import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -60,6 +60,12 @@ class _RecordingDelayer:
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        # The publish above is process-wide. Without this cleanup the tp_size=1
+        # configuration stays live for every later test in the same pytest
+        # process and cross-checks their scoped `get_parallel().override()`
+        # (for example a CP test that sets attn_cp_size > 1), which then fails
+        # `tp_size == attn_tp_size * attn_dp_size * attn_cp_size`.
+        self.addCleanup(reset_context)
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
 
