@@ -505,6 +505,7 @@ class TestTopKRoutingInputs(CustomTestCase):
                                 hidden, logits, num_token_non_padded=torch.tensor(real)
                             )
                         with (
+                            get_parallel().override(tp_group=None),
                             patch.dict(sys.modules, {"flashinfer.fused_moe": provider}),
                             patch.object(
                                 flashinfer_trtllm,
@@ -678,7 +679,11 @@ class TestTopKRoutingInputs(CustomTestCase):
                 self.assertEqual(result.top_k, 2)
                 self.assertTrue(bool((returned[2][real:] == -1).all()))
                 self.assertEqual(result.expert_weights.dtype, torch.float32)
-                self.assertTrue(bool(torch.isfinite(result.expert_weights).all()))
+                self.assertTrue(
+                    bool(torch.isfinite(result.expert_weights[:real]).all())
+                )
+                # Dropped permutation entries exclude these still-poisoned scores.
+                self.assertTrue(bool(torch.isnan(result.expert_weights[real:]).all()))
                 torch.testing.assert_close(
                     result.expert_weights[:real].sum(-1), torch.full((real,), 2.5)
                 )
