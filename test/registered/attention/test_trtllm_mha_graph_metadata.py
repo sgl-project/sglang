@@ -195,6 +195,66 @@ def test_xqa_verify_mask_forwarding(
     assert len(calls) == min(splits, q.shape[0] // width)
 
 
+@pytest.mark.parametrize("is_swa", [False, True])
+def test_encoder_only_verify_reads_the_layer_page_table(
+    make_xqa_backend, monkeypatch, is_swa
+):
+    backend = make_xqa_backend(2, is_xqa=False)
+    full_pages = torch.tensor([[10], [11]], dtype=torch.int32)
+    swa_pages = torch.tensor([[1], [2]], dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(
+        is_ragged_verify=False,
+        max_seq_len_q=1,
+        cache_seqlens_int32=torch.tensor([3, 3], dtype=torch.int32),
+        encoder_cache_seqlens=torch.tensor([3, 3], dtype=torch.int32),
+        encoder_page_table=full_pages,
+        encoder_swa_page_table=swa_pages,
+    )
+    swa_pool = SimpleNamespace()
+    kind = IdSpaceKind.SLIDING_WINDOW if is_swa else IdSpaceKind.FULL
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(kind, None, {0: 0})]
+    )
+    backend._swa_kv_pool = swa_pool
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    )
+    backend._should_use_fused_fp8_path = lambda *a: False
+    backend._reshape_paged_kv_cache = lambda *a: (None, None)
+    backend._get_bmm_scales = lambda *a: (1.0, 1.0)
+    backend._get_layer_page_table = lambda *a: None
+    block_tables = []
+
+    def decode(**kwargs):
+        block_tables.append(kwargs["block_tables"])
+        return torch.zeros_like(kwargs["query"])
+
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode)
+        ),
+        raising=False,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=4,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.ENCODER_ONLY,
+    )
+    fb = SimpleNamespace(
+        out_cache_loc=None, forward_mode=ForwardMode.TARGET_VERIFY, batch_size=2
+    )
+    q = torch.zeros(2, 2, 4, dtype=torch.bfloat16)
+    backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+
+    (table,) = block_tables
+    assert table is (swa_pages if is_swa else full_pages)
+
+
 @pytest.mark.parametrize(
     "is_xqa,mode,expected_q_dtype",
     [

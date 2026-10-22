@@ -37,7 +37,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.swa import is_swa_draft_only, is_swa_req_ring
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
@@ -60,6 +60,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip, is_npu
@@ -191,9 +192,15 @@ def maybe_register_hicache_draft(
         raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        attach_draft_swa_host_pool,
         build_hicache_draft_sidecars,
     )
 
+    if is_swa_draft_only(tree_cache.token_to_kv_pool_allocator):
+        attach_draft_swa_host_pool(
+            cache=tree_cache, draft_kv_pool=draft_plan.device_pools[0]
+        )
+        return
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
@@ -385,8 +392,16 @@ def build_kv_cache(
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
+    bundles_draft_kv = get_spec().speculative_draft_kv_bundling
     if is_hybrid_swa:
         sliding_window_size = tp_worker.sliding_window_size
+    elif bundles_draft_kv:
+        # The target has no SWA layers, so the SWA pool holds only the draft's window.
+        is_hybrid_swa = True
+        sliding_window_size = (
+            tp_worker.model_runner.kv_cache_configurator.draft_kv_window
+        )
+    if is_hybrid_swa:
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
@@ -466,6 +481,7 @@ def build_kv_cache(
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_checkpoint_windows=bundles_draft_kv,
         swa_gates_prefix_match=swa_gates_prefix_match,
         draft_swa_window=draft_swa_window,
         mtp_draft_device_pools=mtp_draft_device_pools,

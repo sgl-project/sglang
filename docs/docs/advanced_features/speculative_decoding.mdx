@@ -601,6 +601,8 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
 ```
 
+On a hybrid SSM target (Mamba, GDN or other linear-attention layers) without sliding-window layers, a DFlash or DSpark draft whose layers all use sliding-window attention can keep its KV only where a cached prefix can resume: the window before each cached Mamba checkpoint. Set `--speculative-draft-kv-bundling`. Each checkpoint and its draft window are then cached, moved to and from the HiCache host tier, and evicted together, and the draft pool is sized from the Mamba slots instead of holding one draft slot per target token, which leaves the rest to the target KV cache. It does not support PD disaggregation, DCP, KV cache sharding, HiCache storage backends or buffer mode, LMCache, FlexKV, HiSparse or unified memory yet.
+
 **Send a request:**
 
 ```python Example

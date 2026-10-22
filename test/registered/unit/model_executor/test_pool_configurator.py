@@ -91,6 +91,8 @@ def _make_model_runner(
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
     swa_qk_rope_head_dim=32,
+    max_mamba_cache_size=None,
+    mamba_radix_cache_strategy="auto",
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -151,6 +153,8 @@ def _make_model_runner(
         speculative_algorithm=speculative_algorithm,
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
+        max_mamba_cache_size=max_mamba_cache_size,
+        mamba_radix_cache_strategy=mamba_radix_cache_strategy,
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
@@ -184,11 +188,14 @@ def _make_model_runner(
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
+    mr.bundles_draft_kv = False
+    mr.draft_kv_window = None
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_cell_size_per_token=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -2122,6 +2129,187 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                             (kv_bytes + 68) / ratio,
                         )
                     self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+
+
+class TestDraftKVBundlePoolConfigurator(CustomTestCase):
+    WINDOW = 60  # rounds up to 64 tokens at page size 16
+    PAGE = 16
+    DRAFT_CELL = 48
+    MAMBA_SLOTS = 40
+    SLOTS_PER_REQUEST = 3
+
+    def _run(self, available_bytes=100_000_000, swa_eviction_interval=4, **kwargs):
+        kwargs = {
+            "disable_overlap_schedule": True,
+            "chunked_prefill_size": 32,
+            **kwargs,
+        }
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            page_size=self.PAGE,
+            speculative_algorithm="DFLASH",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=8,
+            max_mamba_cache_size=self.MAMBA_SLOTS,
+            **kwargs,
+        )
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 5
+        mr.dflash_draft_cell_size_per_token = self.DRAFT_CELL
+        mr.bundles_draft_kv = True
+        mr.draft_kv_window = self.WINDOW
+        mr._calculate_mamba_ratio.return_value = self.SLOTS_PER_REQUEST
+        with mock_cpu_env(swa_eviction_interval=swa_eviction_interval):
+            from sglang.srt.model_executor.pool_configurator import (
+                compute_swa_request_cap,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, self.PAGE)
+            cap = compute_swa_request_cap(
+                page_size=self.PAGE,
+                window=self.WINDOW,
+                attn_dp_size=1,
+                max_running_requests=cfg._running,
+            )
+            cap_one = compute_swa_request_cap(
+                page_size=self.PAGE,
+                window=self.WINDOW,
+                attn_dp_size=1,
+                max_running_requests=1,
+            )
+        return mr, config, cap, cap_one
+
+    def _ceil_page(self, tokens):
+        return -(-tokens // self.PAGE) * self.PAGE
+
+    def _assert_budget_used(self, mr, config, available):
+        target_cell = _full_per_token(mr) * 4
+        used = (
+            config.max_total_num_tokens * target_cell
+            + config.swa_max_total_num_tokens * self.DRAFT_CELL
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(
+            used, available - self.PAGE * (target_cell + self.DRAFT_CELL)
+        )
+
+    def test_idle_tree_bounds_a_lightly_loaded_pool(self):
+        # An overlapped extra-buffer request holds its state and two tracking slots.
+        _, config, cap, cap_one = self._run(
+            swa_eviction_interval=1,
+            max_running_requests=2,
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_overlap_schedule=False,
+            chunked_prefill_size=16,
+        )
+        self.assertLessEqual(cap, 3 * 2 * 64)
+        self.assertLessEqual(cap_one, 3 * 64)
+        self.assertEqual(config.swa_max_total_num_tokens, self.MAMBA_SLOTS * 64)
+
+    def test_one_request_with_a_prefill_chunk_can_need_the_most(self):
+        _, config, cap, cap_one = self._run(
+            swa_eviction_interval=1,
+            max_running_requests=2,
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_overlap_schedule=False,
+            chunked_prefill_size=256,
+        )
+        extra = cap_one - 3 * 64
+        self.assertGreater(extra, max(0, cap - 3 * 2 * 64))
+        self.assertEqual(
+            config.swa_max_total_num_tokens,
+            self._ceil_page(self.MAMBA_SLOTS * 64 + extra),
+        )
+
+    def test_running_requests_add_what_their_slots_do_not_hold(self):
+        mr, config, cap, cap_one = self._run(
+            swa_eviction_interval=128, max_running_requests=8
+        )
+        extra = cap - 8 * 64
+        self.assertGreater(extra, max(0, cap_one - 64))
+        self.assertEqual(
+            config.swa_max_total_num_tokens,
+            self._ceil_page(self.MAMBA_SLOTS * 64 + extra),
+        )
+        self.assertEqual(config.full_max_total_num_tokens, config.max_total_num_tokens)
+        self._assert_budget_used(mr, config, 100_000_000)
+
+    def test_windows_beyond_the_budget_fall_back_to_one_slot_per_token(self):
+        mr, config, _, _ = self._run(available_bytes=100_000, max_running_requests=2)
+        self.assertGreater(config.swa_max_total_num_tokens, 0)
+        self.assertLessEqual(
+            config.swa_max_total_num_tokens, config.max_total_num_tokens
+        )
+        self._assert_budget_used(mr, config, 100_000)
+
+
+class TestDraftKVBundlingChecks(CustomTestCase):
+    def _bundle_window(self, layer_types, **server_args):
+        from sglang.srt.speculative.dflash_utils import draft_kv_bundle_window
+
+        _publish_config(self, **server_args)
+        return draft_kv_bundle_window(
+            SimpleNamespace(layer_types=layer_types, sliding_window=2048)
+        )
+
+    def test_window_is_what_the_draft_reads(self):
+        sliding = ["sliding_attention"] * 5
+        self.assertEqual(
+            self._bundle_window(sliding, speculative_algorithm="DSPARK"), 2047
+        )
+        self.assertEqual(
+            self._bundle_window(
+                sliding,
+                speculative_algorithm="DFLASH",
+                speculative_draft_window_size=1024,
+            ),
+            1024,
+        )
+        self.assertEqual(
+            self._bundle_window(
+                sliding,
+                speculative_algorithm="DFLASH",
+                speculative_draft_window_size=4096,
+            ),
+            2047,
+        )
+        with self.assertRaisesRegex(ValueError, "all sliding-window"):
+            self._bundle_window(
+                ["sliding_attention", "full_attention"],
+                speculative_algorithm="DFLASH",
+            )
+
+    def test_unsupported_settings_are_rejected(self):
+        from sglang.srt.arg_groups.speculative_hook import _validate_draft_kv_bundling
+
+        supported = dict(
+            speculative_algorithm="DFLASH",
+            device="cuda",
+            enable_unified_memory=False,
+            enable_hisparse=False,
+            enable_int8_mamba_checkpoint=False,
+            disaggregation_mode="null",
+            dcp_size=1,
+        )
+        _validate_draft_kv_bundling(SimpleNamespace(**supported))
+        for change, message in (
+            (dict(speculative_algorithm="EAGLE"), "DFLASH or DSPARK"),
+            (dict(device="cpu"), "CUDA"),
+            (dict(disaggregation_mode="decode"), "PD disaggregation"),
+            (dict(enable_unified_memory=True), "--enable-unified-memory"),
+            (
+                dict(enable_int8_mamba_checkpoint=True),
+                "--enable-int8-mamba-checkpoint",
+            ),
+        ):
+            with self.subTest(**change), self.assertRaisesRegex(ValueError, message):
+                _validate_draft_kv_bundling(SimpleNamespace(**{**supported, **change}))
 
 
 if __name__ == "__main__":

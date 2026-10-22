@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import (
     free_kv_row_segments,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    MHATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import get_device
@@ -845,6 +849,52 @@ class TestSWAPageRepsFree(CustomTestCase):
                 touched = -(num_tokens // -ps) * ps
                 self.assertTrue(torch.all(mapping[indices[:touched]] == 0))
                 self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
+
+
+class TestDraftOnlySWASide(CustomTestCase):
+    def test_draft_pool_holds_the_swa_side_of_a_target_without_swa_layers(self):
+        device = get_device()
+        pool_args = dict(
+            page_size=1, dtype=torch.bfloat16, head_num=8, head_dim=128, device=device
+        )
+        target = MHATokenToKVPool(
+            size=64, layer_num=2, enable_memory_saver=False, **pool_args
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=64,
+            size_swa=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device=device,
+            kvcache=target,
+            need_sort=False,
+            target_swa=False,
+        )
+        draft = SWAKVPool(
+            size=64,
+            size_swa=16,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[],
+            **pool_args,
+        )
+        draft.register_mapping(allocator.full_to_swa_index_mapping)
+        self.assertIs(allocator.get_kvcache(), target)
+
+        locs = allocator.alloc(4)
+        swa_locs = allocator.translate_loc_from_full_to_swa(locs)
+        self.assertTrue(
+            torch.equal(swa_locs, draft.translate_loc_from_full_to_swa(locs))
+        )
+        k = torch.randn(4, 8, 128, dtype=torch.bfloat16, device=device)
+        draft.set_kv_buffer(
+            SimpleNamespace(layer_id=0),
+            KVWriteLoc(locs, swa_loc=swa_locs, physical=True),
+            k,
+            k,
+        )
+        self.assertTrue(torch.equal(draft.swa_kv_pool.get_key_buffer(0)[swa_locs], k))
+        allocator.free_swa(locs)
+        self.assertEqual(allocator.swa_available_size(), 16)
 
 
 if __name__ == "__main__":
