@@ -1,5 +1,7 @@
 """Complete routing maps and grouped-GEMM shapes for CUTLASS MoE."""
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
