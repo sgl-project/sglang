@@ -815,8 +815,8 @@ jobs:
           echo "Coverage dir: ${COV_ROOT}"
           echo "Source dir: ${COVSTUB}"
 
-          # Coverage data may be absent when all test jobs were skipped
-          # (e.g. by the changes filter). Skip map building in that case.
+          # Coverage data may be absent when no test targets were enumerated
+          # (run_tests_with_coverage.sh never ran). Skip map building then.
           if [ ! -d "${COV_ROOT}" ]; then
             echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
             exit 0
