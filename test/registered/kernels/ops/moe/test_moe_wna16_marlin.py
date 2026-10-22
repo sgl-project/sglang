@@ -1069,6 +1069,7 @@ def _check_marlin_inactive_routes(
                         max_lora_rank=rank,
                         has_active_lora=True,
                         experts_shared_outer_loras=True,
+                        adapter_enabled=torch.ones(1, device="cuda", dtype=torch.int32),
                         gate_up_lora_a_weights=x.new_zeros((1, 1, 2 * rank, hidden)),
                         gate_up_lora_b_weights=x.new_zeros(
                             (1, experts, 2 * intermediate, rank)
@@ -1091,9 +1092,11 @@ def _check_marlin_inactive_routes(
                     if runner_kind != "fused":
                         dispatch = StandardDispatchOutput(x, None, routing)
                         if runner_kind == "stock_lora":
-                            return core.run_from_dispatch(
+                            result = core.run_from_dispatch(
                                 dispatch, quant_info, config, hooks
                             ).hidden_states
+                            assert hook_weights[0] is routing.topk_weights
+                            return result
                         return fused_experts_experimental_sgl_marlin_lora(
                             dispatch, quant_info, config, lora_info
                         ).hidden_states
@@ -1122,20 +1125,23 @@ def _check_marlin_inactive_routes(
             activated = torch.nn.functional.silu(gate) * up
             projected = torch.einsum("mti,mthi->mth", activated, w2_ref[ids])
             reference = (projected.float() * weights[:, :, None]).sum(1).to(x.dtype)
+            caller_module = {
+                "fused": "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe",
+                "stock_lora": "sglang.srt.lora.lora_moe_runner_marlin",
+                "factored_lora": "sglang.srt.lora.marlin_lora_temp.moe_runner",
+            }[runner_kind]
             projections = []
 
             def checked_marlin_gemm(*args, **kwargs):
-                # Ordinary built-in alignment certifies both projections.
+                # Built-in alignment certifies both projections, including padded
+                # graph rows; dropping either certificate restores the table scan.
                 assert kwargs.get("expert_ids_are_sorted", False)
                 projections.append(kwargs["mul_topk_weights"])
                 return moe_wna16_marlin_gemm(*args, **kwargs)
 
             with (
                 patch.object(zero_copy_context, "get_moe_output", return_value=output),
-                patch(
-                    "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe.moe_wna16_marlin_gemm",
-                    checked_marlin_gemm,
-                ),
+                patch(f"{caller_module}.moe_wna16_marlin_gemm", checked_marlin_gemm),
             ):
                 for _ in range(3):
                     run()
@@ -1156,9 +1162,8 @@ def _check_marlin_inactive_routes(
                     assert torch.count_nonzero(actual[count:]) == 0
                     if hook_weights:
                         weights, ids = hook_weights
-                        assert torch.count_nonzero(weights[ids < 0]) == 0
-            if runner_kind == "fused":
-                assert projections == [False, True] * 4
+                        assert torch.isnan(weights[ids < 0]).all()
+            assert projections == [False, True] * 4
 
 
 @pytest.mark.parametrize("has_inactive_prefix_count", [False, True])
@@ -1371,6 +1376,117 @@ def test_marlin_lora_direct_inactive_routes():
     torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
     assert torch.count_nonzero(gate_output[ids < 0]) == 0
     assert torch.count_nonzero(down_output[ids < 0]) == 0
+
+    # A dense oracle for both real adapter slots keeps the selected projection
+    # independent of the kernels' inactive-address and payload masks.
+    finite_shared = torch.stack((shared, shared * 2))
+    finite_gate_b = torch.cat((gate_b, gate_b * 1.5))
+    finite_down_a = torch.cat((down_a, down_a * -0.75))
+    finite_activation = torch.randn_like(activation)
+    dense_gate = (
+        torch.einsum(
+            "smhr,sehir->smehi",
+            finite_shared.view(2, rows, 2, rank).float(),
+            finite_gate_b.view(2, experts, 2, intermediate, rank).float(),
+        )
+        .flatten(-2)
+        .to(gate_output.dtype)
+    )
+    dense_down = torch.einsum(
+        "mti,seri->smter",
+        finite_activation.view(rows, topk, intermediate).float(),
+        finite_down_a.float(),
+    ).to(down_output.dtype)
+    slot_shared = finite_shared.clone()
+    slot_gate_b = finite_gate_b.clone()
+    slot_down_a = finite_down_a.clone()
+    route_ids = torch.arange(topk, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    route_index = torch.arange(topk, device="cuda")
+    states = (
+        ("valid", (0, 1, 0), (1, 1)),
+        ("disabled", (0, 1, 0), (1, 0)),
+        ("missing-or-out-of-range", (0, -1, 2), (1, 1)),
+        ("zero", (0, 1, 0), (1, 1)),
+        ("recovery", (0, 1, 0), (1, 1)),
+    )
+    for enabled_dtype in (torch.bool, torch.int32, torch.int64):
+        # The optional metadata accepts a strided one-dimensional view.
+        enabled = torch.ones(4, device="cuda", dtype=enabled_dtype)[::2]
+
+        def project_enabled():
+            direct_decode_gate_expand(
+                slot_shared,
+                slot_gate_b,
+                ids,
+                slots,
+                gate_output,
+                adapter_enabled=enabled,
+            )
+            direct_decode_down_shrink(
+                activation,
+                slot_down_a,
+                ids,
+                slots,
+                down_output,
+                adapter_enabled=enabled,
+            )
+
+        ids.copy_(route_ids)
+        slots.copy_(torch.tensor(states[0][1], device="cuda", dtype=slots.dtype))
+        activation.copy_(finite_activation)
+        project_enabled()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            project_enabled()
+        for state, mapping, flags in states:
+            ids.copy_(route_ids)
+            slots.copy_(torch.tensor(mapping, device="cuda", dtype=slots.dtype))
+            enabled.copy_(torch.tensor(flags, device="cuda", dtype=enabled_dtype))
+            slot_shared.copy_(finite_shared)
+            slot_gate_b.copy_(finite_gate_b)
+            slot_down_a.copy_(finite_down_a)
+            activation.copy_(finite_activation)
+            if state == "disabled":
+                slot_shared[1].fill_(float("nan"))
+                slot_gate_b[1].fill_(float("nan"))
+                slot_down_a[1].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1].fill_(float("nan"))
+            elif state == "missing-or-out-of-range":
+                slot_shared[:, 1:].fill_(float("nan"))
+                activation.view(rows, topk, intermediate)[1:].fill_(float("nan"))
+            elif state == "zero":
+                ids.fill_(-1)
+                slot_shared.fill_(float("nan"))
+                slot_gate_b.fill_(float("nan"))
+                slot_down_a.fill_(float("nan"))
+                activation.fill_(float("nan"))
+            gate_output.fill_(float("nan"))
+            down_output.fill_(float("nan"))
+            graph.replay()
+            expected_gate.zero_()
+            expected_down.zero_()
+            active_rows = []
+            if state != "zero":
+                for token, slot in enumerate(mapping):
+                    if 0 <= slot < len(flags) and flags[slot]:
+                        active_rows.append(token)
+                        expected_gate[token] = dense_gate[slot, token, route_index]
+                        expected_down[token] = dense_down[
+                            slot, token, route_index, route_index
+                        ]
+            torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
+            torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
+            assert torch.isfinite(gate_output).all()
+            assert torch.isfinite(down_output).all()
+            inactive_rows = [token for token in range(rows) if token not in active_rows]
+            assert torch.count_nonzero(gate_output[inactive_rows]) == 0
+            assert torch.count_nonzero(down_output[inactive_rows]) == 0
+            if active_rows:
+                # Slot zero is a loaded adapter and must remain a real projection.
+                assert 0 in active_rows
+                assert torch.count_nonzero(expected_gate[0]) > 0
+                assert torch.count_nonzero(expected_down[0]) > 0
 
 
 @pytest.mark.parametrize("use_expert_map", [False, True])
