@@ -1694,11 +1694,13 @@ class PrefillAdder:
             return False
 
         # Preempt running requests. Release allocated resources for immediate usage.
-        preemptible_reqs = set(preemptible_reqs)
+        # The set is for membership only: its iteration order follows object ids,
+        # which can differ across TP ranks.
+        preemptible_set = set(preemptible_reqs)
         keep_indices = []
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
-            if running_req in preemptible_reqs:
+            if running_req in preemptible_set:
                 self.memory_budget.total_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )
@@ -1709,5 +1711,7 @@ class PrefillAdder:
             else:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)
-        self.preempt_list.extend(preemptible_reqs)
+        # Requeue in the reverse of the selection order (preferred priority, then oldest
+        # first), so the new wait_queue_entry_time stamps keep the victims' order.
+        self.preempt_list.extend(reversed(preemptible_reqs))
         return True

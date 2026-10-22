@@ -683,6 +683,45 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertFalse(success_by_capacity_check)
 
+    def test_preempt_list_order_independent_of_req_hashes(self):
+        """Several victims are requeued in waiting-queue order on every TP rank:
+        Req hashes by object id, so set order could differ between ranks."""
+        # (rid, importance, wait_queue_entry_time); all five must go to fit new_req.
+        params = [
+            ("c", 0, 2.0),
+            ("a", 1, 0.0),
+            ("e", 0, 4.0),
+            ("b", 1, 1.0),
+            ("d", 0, 3.0),
+        ]
+        for low_first in (False, True):
+            self.scheduling_order(schedule_low_priority_values_first=low_first)
+            sign = -1 if low_first else 1
+            for hashes in ([1, 2, 3, 4, 5], [5, 4, 3, 2, 1]):
+                with self.subTest(low_first=low_first, hashes=hashes):
+                    running_reqs = []
+                    for (rid, importance, wait_time), h in zip(params, hashes):
+                        req = self.create_mock_req(
+                            rid,
+                            sign * importance,
+                            max_new_tokens=10,
+                            wait_time=wait_time,
+                        )
+                        req.__hash__.return_value = h
+                        running_reqs.append(req)
+                    adder = self.create_adder(self.create_running_batch(running_reqs))
+                    self.mock_token_allocator.full_available_size.return_value = 50
+                    self.mock_token_allocator.available_size.return_value = 50
+
+                    new_req = self.create_mock_req(
+                        "new", priority=sign * 2, max_new_tokens=50
+                    )
+                    self.assertTrue(adder.preempt_to_schedule(new_req))
+                    # More important first, then the earliest queued.
+                    self.assertEqual(
+                        [r.rid for r in adder.preempt_list], ["a", "b", "c", "d", "e"]
+                    )
+
     def test_preempt_skip_already_preempted_request(self):
         params = [
             ("req_prio_0", 0, 50),
