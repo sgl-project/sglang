@@ -186,6 +186,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._engine_paused = False
         self._pause_started_at = None
         self._pause_intervals = deque()
+        self._pending_abort_pause = False 2a1b01d15d ([Fix] scheduler: Never schedule a late request after an abort-mode pause with multiple tokenizer workers)
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
