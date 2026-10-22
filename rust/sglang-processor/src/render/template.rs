@@ -20,19 +20,25 @@ pub struct TemplateArgs {
 }
 
 impl TemplateArgs {
-    /// The server `defaults`, under the request's effort and the thinking toggle
-    /// it implies, under the request's own `chat_template_kwargs`.
+    /// The server `defaults`, under the thinking toggle the request's effort
+    /// implies, under the request's own `chat_template_kwargs`. Its effort moves
+    /// onto the request's (`_convert_to_internal_request`), unless a default names one.
     pub fn new(body: &Value, defaults: &HashMap<String, Value>) -> Self {
         let mut kwargs = defaults.clone();
-        if let Some(effort) = requested_effort(body) {
-            kwargs.insert("reasoning_effort".into(), effort.clone());
-        }
         if let Some(thinking) = requested_thinking(body) {
             kwargs.insert("thinking".into(), thinking.into());
             kwargs.insert("enable_thinking".into(), thinking.into());
         }
-        if let Some(own) = body["chat_template_kwargs"].as_object() {
-            kwargs.extend(own.clone());
+        let mut own = body["chat_template_kwargs"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let effort = own
+            .remove("reasoning_effort")
+            .or_else(|| requested_effort(body).cloned());
+        kwargs.extend(own);
+        if let Some(effort) = effort {
+            kwargs.entry("reasoning_effort".into()).or_insert(effort);
         }
         Self {
             kwargs,
@@ -82,7 +88,11 @@ fn last_assistant_message(
     }
     let mut messages = serde_json::to_value(&request.messages).ok()?;
     let list = messages.as_array_mut()?;
-    let content = list.last()?["content"].as_str()?.to_owned();
+    // `_process_messages` first sets a null content to "".
+    let content = match &list.last()?["content"] {
+        Value::Null => String::new(),
+        content => content.as_str()?.to_owned(),
+    };
     let prefix = if continuing {
         list.pop();
         content
@@ -153,10 +163,24 @@ mod tests {
             render(&formatter, body, &none),
             ("<user>Hi<user>Hel<assistant>".into(), String::new())
         );
+
+        // A null content is "" first, so the turn is still asked as a user's.
+        let call =
+            json!({"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let messages = json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call]}
+        ]);
+        let body = json!({"model": "m", "messages": messages});
+        assert_eq!(
+            render(&formatter, body, &none).0,
+            "<user>Hi<user><assistant>"
+        );
     }
 
     /// The request's effort reaches the template with the thinking toggle it
-    /// implies, beneath the request's own `chat_template_kwargs`.
+    /// implies, beneath the request's own `chat_template_kwargs`; a server
+    /// default effort wins over the request's, as on Python.
     #[test]
     fn template_sees_the_requested_effort() {
         let formatter = jinja("{{ reasoning_effort }}|{{ thinking }}|{{ enable_thinking }}");
@@ -171,6 +195,10 @@ mod tests {
             "chat_template_kwargs": {"enable_thinking": false}
         });
         assert_eq!(render(&formatter, body, &none).0, "high|True|False");
+
+        let body = json!({"model": "m", "messages": messages, "reasoning_effort": "high"});
+        let defaults = HashMap::from([("reasoning_effort".into(), json!("low"))]);
+        assert_eq!(render(&formatter, body, &defaults).0, "low|True|True");
     }
 
     /// `reasoning_effort` sets both thinking toggles beneath the request's own
