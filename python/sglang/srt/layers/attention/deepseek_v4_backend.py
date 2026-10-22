@@ -2758,6 +2758,7 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        self.sparse_prefill_kv_buffer.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -4209,34 +4210,28 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_kv_buffer.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+            # Layers sharing a kv_source reuse its dequant: no later layer writes
+            # that cache, and graph replay keeps the layer order.
+            workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
+                n_compressed + cache.swa_token_ids.shape[0],
+                head_source=(
+                    extra_k_cache.data_ptr(),
+                    flat_token_ids.data_ptr(),
+                    n_compressed,
+                ),
             )
-            compressed_slice = workspace[:n_compressed]
+            if not compressed_filled:
+                compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            # Ratio-1/2 layers read their kv_source layer's cache, which no later
-            # layer of this forward writes, so its rows are dequantized once. A
-            # captured graph replays the same layer order, so it may skip too.
-            source = (
-                extra_k_cache.data_ptr(),
-                flat_token_ids.data_ptr(),
-                self.sparse_prefill_kv_buffer.generation,
-                n_compressed,
+            dequantize_k_cache_paged_dsv4(
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-            if cache.dequantized_source != source:
-                dequantize_k_cache_paged_dsv4(
-                    extra_k_cache,
-                    flat_token_ids,
-                    page_size=extra_page_size,
-                    out=compressed_slice,
-                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
-                )
-                cache.dequantized_source = source
-        else:
-            # The SWA rows below overwrite the workspace head.
-            cache.dequantized_source = None
         dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
