@@ -39,14 +39,17 @@ def _silu_mul_add_delta_kernel(
         route = row % ROUTER_TOPK
         route_live = tl.load(topk_ids_ptr + token * stride_im + route * stride_ik) >= 0
         slot = tl.load(token_lora_mapping_ptr + token * stride_tm).to(tl.int64)
-        enabled = (
-            tl.load(
-                adapter_enabled_ptr + slot * stride_ae,
-                mask=(slot >= 0) & (slot < NUM_SLOTS),
-                other=0,
+        if NUM_SLOTS == 1:
+            enabled = (slot == 0) & (tl.load(adapter_enabled_ptr) != 0)
+        else:
+            enabled = (
+                tl.load(
+                    adapter_enabled_ptr + slot * stride_ae,
+                    mask=(slot >= 0) & (slot < NUM_SLOTS),
+                    other=0,
+                )
+                != 0
             )
-            != 0
-        )
     cols = block * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
     if HAS_ROUTING:
