@@ -32,19 +32,10 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # The nightly pipeline runs the full GSM8K set to avoid sampling variance; the
     # PR pipeline only runs the mixin smoke request.
     gsm8k_num_examples = 1319
-<<<<<<< HEAD
     # evalscope is the harness the 0.83 Moonlight bf16 baseline was calibrated
     # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
     gsm8k_backend = "evalscope"
-=======
-    # sgl_eval vs evalscope on the same model: evalscope runs gsm8k 4-shot and
-    # samples at temperature 1.0, sgl_eval runs it 0-shot with greedy decoding.
-    # The 0.83 evalscope baseline therefore reads 0.809-0.823 here (1319 questions).
-    gsm8k_accuracy_thres = 0.79
-    gsm8k_backend = "sgl_eval"
-    gsm8k_max_tokens = 4096
->>>>>>> 7c8b2b1e25 ([Doc] [NPU] tests: Correct the evalscope harness description in GSM8K comments)
 
     @classmethod
     def setUpClass(cls):

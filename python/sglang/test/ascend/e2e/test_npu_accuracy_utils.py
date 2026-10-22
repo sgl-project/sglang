@@ -161,8 +161,10 @@ def run_evalscope(
 
     logger.info(f"Generated evalscope script: {script_path}")
 
+    # Resolve the install script relative to this file so it works from any
+    # deployment path (e.g. /sgl-workspace/sglang in CI images).
     install_cmd = (
-        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+        f"/bin/bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_evalscope.sh')}"
     )
     subprocess.run(install_cmd, shell=True, check=True)
 
