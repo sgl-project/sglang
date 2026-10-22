@@ -926,6 +926,25 @@ class ServingChatTestCase(CustomTestCase):
                     ("Plan", '{"a": 1}', []),
                 )
 
+    def test_tool_markup_inside_json_answer_is_answer_data(self):
+        """Tool markup inside a JSON answer must stay in the answer, never become a
+        call, whether the opener arrives split or together with the JSON."""
+        self._use_delimited_response_template("beam")
+        payload = json.dumps({"note": '<call:get_weather>{"city": "Paris"}</call>'})
+        output = self._stopped_on_token("<think>Plan</think><answer>" + payload, 2)
+        fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
+        for stream, incremental in ((False, False), (True, False), (True, True)):
+            with self.subTest(stream=stream, incremental=incremental):
+                served = self._served(output, stream, incremental=incremental, **fields)
+                self.assertEqual(served, ("Plan", payload, []))
+        adapted, request = self._convert_rendered_as(
+            "<assistant>", stream=True, **fields
+        )
+        self.assertEqual(
+            self._chat_outcome(adapted, request, output),
+            ([], "Plan", payload, ["stop"]),
+        )
+
     def _served(self, output, stream, *, incremental=True, **fields):
         output = copy.deepcopy(output)
         adapted, request = self._convert_rendered_as(

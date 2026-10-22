@@ -1215,6 +1215,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
     ) -> list:
+        tool_parsing = self._tool_parsing_active(request, chat_tools)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1226,12 +1227,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
-                tool_call_parser_active=bool(
-                    self.tool_call_parser
-                    and self._tool_parsing_active(request, chat_tools)
-                ),
+                tool_call_parser_active=bool(self.tool_call_parser and tool_parsing),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            tool_parsing = tool_parsing and not self._answer_started(reasoning_parser)
         else:
             reasoning_content = None
             content = final_output
@@ -1254,11 +1253,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         detector_owns_format = False
         ordered_parts = None
         incomplete_calls = set()
-        if (
-            content
-            and self.tool_call_parser
-            and self._tool_parsing_active(request, chat_tools)
-        ):
+        if content and self.tool_call_parser and tool_parsing:
             parser = FunctionCallParser(
                 chat_tools,
                 self.tool_call_parser,
@@ -1286,7 +1281,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if (
             content
-            and self._tool_parsing_active(request, chat_tools)
+            and tool_parsing
             and is_required
             and not parsed_via_native
             and not detector_owns_format
@@ -2725,7 +2720,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ordered_parts = None
                 if token_stream is not None:
                     normal_text, tool_calls = delta, token_calls
-                elif tool_parser is not None:
+                elif tool_parser is not None and not self._answer_started(
+                    reasoning_parser_obj
+                ):
                     if isinstance(tool_parser, JsonArrayParser):
                         parsed = tool_parser.parse_streaming_increment(
                             delta, chat_tools

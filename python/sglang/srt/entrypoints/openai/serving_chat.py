@@ -998,7 +998,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
         # Handle tool calls
-        if self._tool_call_parsing_active(request):
+        if self._tool_call_parsing_active(request) and not self._answer_started(
+            reasoning_parser_dict.get(index)
+        ):
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -1082,6 +1084,15 @@ class OpenAIServingChat(OpenAIServingBase):
             and self._effective_tools(request)
             and self.tool_call_parser
             and not request._response_parser_json_response_format
+        )
+
+    @staticmethod
+    def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
+        """Whether the output opened a JSON answer framed by the template's
+        grammar, after which no text is a call."""
+        return reasoning_parser is not None and (
+            isinstance(reasoning_parser.detector, ResponseTemplateReasoningDetector)
+            and reasoning_parser.detector.answer_started
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -2865,6 +2876,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle reasoning content
             reasoning_text = None
             tool_calls = None
+            answer_started = False
             if encoding_output is not None:
                 reasoning_text, text, tool_calls, finish_reason = (
                     encoding_output.parse_chat_response(
@@ -2888,6 +2900,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    answer_started = self._answer_started(parser)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -2898,7 +2911,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             effective_tools = self._effective_tools(request)
-            if encoding_output is None and self._tool_call_parsing_active(request):
+            if (
+                encoding_output is None
+                and self._tool_call_parsing_active(request)
+                and not answer_started
+            ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,

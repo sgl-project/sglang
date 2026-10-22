@@ -1124,6 +1124,38 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         self.assertEqual(message["type"], "message")
         self.assertEqual(message["content"][0]["text"], '{"a": 1}')
 
+    def test_tool_markup_inside_json_answer_is_answer_data(self):
+        """Tool markup inside a JSON answer must stay in the answer, never become a
+        call, whether the opener arrives split or together with the JSON."""
+        payload = orjson.dumps({"note": self._CALL.split("</think>")[1]}).decode()
+        text = "<think>Check the forecast.</think><answer>" + payload
+        whole = self._output(text, matched=2)
+        cut = text.index("<answer>") + len("<ans")
+        first = {
+            **whole,
+            "text": text[:cut],
+            "meta_info": {**whole["meta_info"], "finish_reason": None},
+        }
+        split = [first, {**whole, "text": text[cut:]}]
+        fields = {**self._BEAM, "text": {"format": {"type": "json_object"}}}
+        for stream, output in ((False, whole), (True, whole), (True, split)):
+            with self.subTest(stream=stream, split=output is split):
+                if output is split:
+                    make_serving()
+                    enter_override(
+                        self,
+                        get_context().override_server_args(
+                            incremental_streaming_output=True
+                        ),
+                    )
+                response = self._respond(stream, output=output, **fields)
+
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
 
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):

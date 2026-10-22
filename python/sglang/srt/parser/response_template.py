@@ -573,6 +573,9 @@ class ResponseTemplateReasoningDetector:
         self._tools = tools
         self._constrained = constrained
         self._adapter = self._new_adapter()
+        # Whether the parsed output opened the answer that a JSON-answer grammar
+        # admits instead of calls, so that none of its text is a call.
+        self.answer_started = False
 
     def _new_adapter(self) -> ResponseTemplateStreamAdapter:
         return ResponseTemplateStreamAdapter(
@@ -632,12 +635,14 @@ class ResponseTemplateReasoningDetector:
         result = adapter.route_reasoning_events(
             adapter.parse(text, self._tools), stream_reasoning=True
         )
+        self._record_answer(adapter)
         if self._force_nonempty_content and not result.normal_text:
             result.normal_text, result.reasoning_text = result.reasoning_text, ""
         return result
 
     def parse_streaming_increment(self, new_text: str) -> _ReasoningResult:
         events = self._adapter.feed(new_text, self._tools)
+        self._record_answer(self._adapter)
         if self._force_nonempty_content:
             self._track_open_reasoning(events)
         return self._adapter.route_reasoning_events(
@@ -646,6 +651,7 @@ class ResponseTemplateReasoningDetector:
 
     def finish(self) -> _ReasoningResult:
         events = self._adapter.finalize(self._tools)
+        self._record_answer(self._adapter)
         result = self._adapter.route_reasoning_events(
             events, stream_reasoning=self.stream_reasoning
         )
@@ -657,6 +663,12 @@ class ResponseTemplateReasoningDetector:
                 result.normal_text += unclosed_reasoning
                 result.reasoning_text = ""
         return result
+
+    def _record_answer(self, adapter: ResponseTemplateStreamAdapter) -> None:
+        # The parse turns verbatim at the answer opener, outside any call.
+        self.answer_started = (
+            self._grammar_start == GRAMMAR_AT_ANSWER and adapter._verbatim
+        )
 
     def _track_open_reasoning(self, events: list[dict]) -> str | None:
         """Accumulate open thinking text; return the text of a region `events` close."""
