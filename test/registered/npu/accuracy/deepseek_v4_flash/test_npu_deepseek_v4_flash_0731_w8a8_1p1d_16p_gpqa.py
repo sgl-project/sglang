@@ -249,7 +249,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             gsp_num_groups=3,
             gsp_prompts_per_group=8,
             seed=100,
-            warmup_requests=8,
+            warmup_requests=16,
             repeat_rate=0.9,
             cache_report=True,
             min_host_hit_rate_pct=0
