@@ -467,6 +467,9 @@ class OpenAIServingChat(OpenAIServingBase):
             return chat_encoding.spec_supports_inline_system(self.chat_encoding_spec)
         if self.template_manager.chat_template_name is not None:
             return False
+        python_template = self.template_manager.python_chat_template
+        if python_template is not None:
+            return python_template.supports_inline_system
         tokenizer = self.tokenizer_manager.tokenizer
         return tokenizer is not None and detect_inline_system_support(
             tokenizer.chat_template
