@@ -1397,11 +1397,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         local_w = embed_module.weight.data
+        # Gather the equal padded vocabulary rows; the valid tail can differ by rank.
+        num_org = embed_module.shard_indices.num_org_elements_padded
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
 
-        # Gather the equal padded vocabulary rows; the valid tail can differ by rank.
-        shard_t = local_w[: embed_module.shard_indices.num_org_elements_padded]
-        shard_t = shard_t.contiguous()
+        shard_t = local_w[:num_org].contiguous()
         parts = [torch.empty_like(shard_t) for _ in range(embed_module.tp_size)]
         dist.all_gather(parts, shard_t, group=tp_group.device_group)
         self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
