@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
