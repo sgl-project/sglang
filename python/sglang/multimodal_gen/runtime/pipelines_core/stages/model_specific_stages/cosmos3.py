@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels import get_kernel
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -257,8 +258,7 @@ def _preprocess_video_frames_gpu(
     frames: Iterator[np.ndarray], height: int, width: int
 ) -> list[torch.Tensor]:
     """Resize/crop/normalize batches of up to eight RGB frames on CUDA."""
-    from sglang.kernels.ops.mm.process.lanczos import lanczos_resize
-
+    lanczos_resize = get_kernel("mm.lanczos_resize")
     processed = []
     while batch := list(islice(frames, 8)):
         pixels = torch.from_numpy(np.stack(batch)).pin_memory().cuda(non_blocking=True)
@@ -511,7 +511,10 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             # to noise.
             num_source_frames = max(cond_indexes) * 4 + 1
             num_target_frames = batch.num_frames
-            force_cpu = envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+            force_cpu = (
+                not current_platform.is_cuda()
+                or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+            )
             with closing(
                 _iter_video_frames_pyav(video_path, num_source_frames, keep)
             ) as frames:
