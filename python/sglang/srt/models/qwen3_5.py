@@ -15,7 +15,6 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -127,6 +126,7 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
+    maybe_enable_silu_fp4_quant_fusion,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -208,33 +208,6 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
-
-
-def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
-    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
-
-    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
-    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
-    linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
-    """
-    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
-        return
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
-
-    if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
-    ):
-        return
-    try:
-        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
-    except ImportError:
-        return
-    mlp._enable_silu_fp4_quant_fusion = True
-    mlp.down_proj._accepts_prequantized_fp4 = True
-    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
@@ -1170,7 +1143,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            maybe_enable_silu_fp4_quant_fusion(self.mlp)
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
