@@ -345,6 +345,12 @@ class DiffusionTestCase:
     run_models_api_check: bool = True
     expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
+    # Audio-driven video: a second generation with `alt_audio_path` must move the
+    # audio-conditioned region and leave the static one alone. Needs no GT.
+    run_audio_sensitivity_check: bool = False
+    alt_audio_path: str | None = None
+    # Image-conditioned only: frame 0 must still resemble the conditioning image.
+    run_reference_fidelity_check: bool = False
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
@@ -368,6 +374,16 @@ class DiffusionTestCase:
             and self.sampling_params.realtime_num_chunks is not None
         ):
             raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
+        if self.run_audio_sensitivity_check and not self.alt_audio_path:
+            raise ValueError(
+                f"{self.id}: run_audio_sensitivity_check needs alt_audio_path, a "
+                "second clip of the same duration so the frame count is unchanged"
+            )
+        if self.run_reference_fidelity_check and not self.sampling_params.image_path:
+            raise ValueError(
+                f"{self.id}: run_reference_fidelity_check compares frame 0 against "
+                "sampling_params.image_path, which is unset"
+            )
 
         # A consistency golden records one path, and these were recorded on the
         # reference one, so the case asks for it by name instead of inheriting
@@ -740,6 +756,33 @@ MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
     output_size="512x512",
     extras={"num_inference_steps": 8, "seed": 0},
+)
+
+# Wan2.2's own S2V examples, pinned by commit; the S2V stage fetches http(s)
+# itself. Both clips decode to ~5.01 s, so each run gets the same 77 frames.
+S2V_INPUT_ASSET_BASE = (
+    "https://raw.githubusercontent.com/Wan-Video/Wan2.2/"
+    "1ea34ff48f87168174e12956e200b1d908b1c5ff/examples"
+)
+S2V_AUDIO_PATH = f"{S2V_INPUT_ASSET_BASE}/talk.wav"
+S2V_ALT_AUDIO_PATH = f"{S2V_INPUT_ASSET_BASE}/Five%20Hundred%20Miles.MP3"
+
+WAN_S2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A young woman with long blonde hair sings on a city street, close-up, "
+        "soft daylight."
+    ),
+    image_path=f"{S2V_INPUT_ASSET_BASE}/pose.png",
+    # 81 lands on 77 output frames after temporal compression, which is what the
+    # region boxes and bounds in consistency_thresholds were measured on.
+    num_frames=81,
+    output_format="mp4",
+    expect_audio_output=True,
+    extras={
+        "audio_path": S2V_AUDIO_PATH,
+        "num_inference_steps": 4,
+        "seed": 42,
+    },
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
