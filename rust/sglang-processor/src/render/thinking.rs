@@ -91,6 +91,11 @@ impl ThinkingTemplates {
         }
     }
 
+    /// The policy of a request without tools.
+    pub(super) fn default_policy(&self) -> ThinkingPolicy {
+        self.default
+    }
+
     pub(super) fn for_request(self, tools_enabled: bool) -> ThinkingPolicy {
         if tools_enabled {
             self.tool_use.unwrap_or(self.default)

@@ -332,6 +332,45 @@ mod tests {
         super::super::routes().with_state(state)
     }
 
+    /// A Jinja template's own thinking default (here Qwen3's `enable_thinking`,
+    /// on unless the request turns it off) decides whether the reply starts in
+    /// reasoning, as `template_detection` does.
+    #[tokio::test]
+    async fn jinja_template_thinking_default_separates_reasoning() {
+        let dir = std::env::temp_dir().join(format!("lowered-qwen3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+            {% endfor %}<|im_start|>assistant\n\
+            {% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}";
+        std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        let (formatter, error) =
+            sglang_processor::select_chat_formatter(&sglang_processor::ChatFormatterOptions {
+                tokenizer_path: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            });
+        std::fs::remove_dir_all(&dir).unwrap();
+        let formatter = formatter.unwrap_or_else(|| panic!("{error:?}"));
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("qwen3".into()),
+            ..Default::default()
+        };
+        let state = answering_app_state_with(
+            Arc::new(args),
+            formatter,
+            Some(tokenizer()),
+            "17*23</think>391",
+        );
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "17*23?"}]});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "17*23", "{value}");
+        assert_eq!(message["content"], "391");
+    }
+
     /// An `n` past the batch cap is a 400 before the prompt is copied, not a
     /// capacity-overflow panic.
     #[tokio::test]
