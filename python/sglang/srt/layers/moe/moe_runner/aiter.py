@@ -68,6 +68,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
+    # Quantize the activations of MXFP4 experts to MXFP8 at any token count
+    fp8_activations: bool = False
     fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
@@ -256,7 +258,11 @@ class AiterRunnerCore(MoeRunnerCore):
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
-        if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
+        if (
+            _SMALLM_MOE_ON
+            and quant_info.w13_weight.element_size() == 1
+            and not quant_info.fp8_activations
+        ):
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
 
             try:
@@ -290,6 +296,18 @@ class AiterRunnerCore(MoeRunnerCore):
                         return AiterRunnerOutput(hidden_states=out)
             except _smallm.SmallMMoeUnavailable:
                 pass
+
+        if (
+            quant_info.fp8_activations
+            and is_gfx95
+            and runner_input.hidden_states.dtype == torch.bfloat16
+        ):
+            from aiter import dtypes
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            # aiter's A8W4 kernels take interleaved gate/up rows only
+            if extra.get("gate_mode") == GateMode.INTERLEAVE.value:
+                extra.setdefault("quant_dtype_a", dtypes.fp8)
 
         activation = extra.pop("activation", None) if is_gfx95 else None
         if activation is None:
