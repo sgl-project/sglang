@@ -96,7 +96,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             quant_info.global_num_experts if quant_info.expert_map is not None else E
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, align_num_experts
+            topk_ids,
+            block_size_m,
+            align_num_experts,
+            return_inactive_prefix_count=quant_info.expert_map is None,
         )
 
         # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
@@ -142,6 +145,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             mul_topk_weights=False,
             is_ep=quant_info.expert_map is not None,
             expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type1,
             size_m=M,
             size_n=2 * N,
@@ -191,6 +195,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             zero_inactive_output=True,
             is_ep=quant_info.expert_map is not None,
             expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type2,
             size_m=M * topk,
             size_n=K,

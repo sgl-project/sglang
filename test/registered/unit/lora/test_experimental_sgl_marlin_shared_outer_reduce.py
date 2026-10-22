@@ -158,6 +158,147 @@ def test_gate_delta_activation_skips_unwritten_routes_and_adapters(
         )
 
 
+@pytest.mark.skipif(not _CUDA_BF16_AVAILABLE, reason="CUDA BF16 required")
+@pytest.mark.parametrize("shared_b", [False, True])
+def test_private_delta_projection_writes_inactive_routes_on_replay(shared_b):
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.moe_runner.triton_utils import override_config
+    from sglang.srt.lora.marlin_lora_temp.activation import silu_and_mul_add_delta
+
+    device, dtype = "cuda", torch.bfloat16
+    m, k, e, slots, h, n, r = 6, 2, 2, 3, 32, 32, 8
+    ids = torch.tensor([[0, 1]] * m, device=device, dtype=torch.int32)
+    mapping = torch.tensor([0, 1, 2, 0, 1, 2], device=device, dtype=torch.int32)
+    enabled = torch.ones(slots * 2, device=device, dtype=torch.int32)[::2]
+    x = torch.zeros((m, h), device=device, dtype=dtype)
+    x[:, 0] = 0.125
+    a = torch.zeros((slots, 1, r, h), device=device, dtype=dtype)
+    b = torch.zeros((slots, 1 if shared_b else e, 2 * n, r), device=device, dtype=dtype)
+    for slot in range(slots):
+        a[slot, 0, 0, 0] = slot + 2
+        b[slot, :, :n, 0], b[slot, :, n:, 0] = slot + 3, slot + 5
+    weights = torch.ones((m, k), device=device)
+    delta = torch.empty((m, k, 2 * n), device=device, dtype=dtype)
+    base = torch.full_like(delta, 0.5)
+    activated = torch.empty((m * k, n), device=device, dtype=dtype)
+    config = dict(
+        BLOCK_SIZE_M=16,
+        BLOCK_SIZE_N=32,
+        BLOCK_SIZE_K=32,
+        GROUP_SIZE_M=1,
+        num_warps=4,
+        num_stages=2,
+    )
+    kwargs = dict(
+        output=delta,
+        hidden_states=x,
+        lora_a=a,
+        lora_b=b,
+        topk_ids=ids,
+        topk_weights=weights,
+        token_lora_mapping=mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=True,
+        experts_shared_outer_loras_b=shared_b,
+        adapter_enabled=enabled,
+        include_inactive_routes=True,
+    )
+
+    def run():
+        cache = {}
+        merged_experts_fused_moe_lora_add(
+            **kwargs,
+            routing_cache=cache,
+            stage="routing",
+        )
+        merged_experts_fused_moe_lora_add(
+            **kwargs,
+            routing_cache=cache,
+            fuse_add_to_output=False,
+        )
+        silu_and_mul_add_delta(base.view(-1, 2 * n), delta.view(-1, 2 * n), activated)
+
+    with override_config(config):
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for state in ("valid", "mixed", "disabled", "all-inactive", "recovered"):
+            ids.copy_(torch.tensor([[0, 1]] * m, device=device, dtype=ids.dtype))
+            mapping.copy_(
+                torch.tensor([0, 1, 2, 0, 1, 2], device=device, dtype=mapping.dtype)
+            )
+            enabled.fill_(1)
+            if state == "mixed":
+                ids[0, 0], mapping[1], mapping[2], enabled[1] = -1, -1, slots, 0
+            elif state == "disabled":
+                enabled.zero_()
+            elif state == "all-inactive":
+                ids.fill_(-1)
+            live_route = ids >= 0
+            safe_slots = mapping.clamp(0, slots - 1).long()
+            live_adapter = (
+                (mapping >= 0) & (mapping < slots) & (enabled[safe_slots] != 0)
+            )
+            live = live_route & live_adapter[:, None]
+            weights.fill_(1)
+            weights.masked_fill_(~live_route, float("nan"))
+            # Poison both unwritten destinations and inputs that a disabled
+            # producer must not read, rather than relying on zero parameters.
+            x.zero_()
+            x[:, 0] = 0.125
+            x[~live_adapter] = float("nan")
+            delta.fill_(float("nan"))
+            base.fill_(0.5)
+            base.masked_fill_(~live_route.unsqueeze(-1), 0)
+            graph.replay()
+            expected = torch.zeros_like(delta)
+            for row in range(m):
+                for route in range(k):
+                    if bool(live[row, route]):
+                        slot = int(mapping[row])
+                        expert = 0 if shared_b else int(ids[row, route])
+                        expected[row, route] = (
+                            x[row].float() @ a[slot, 0].float().T
+                        ).to(dtype).float() @ b[slot, expert].float().T
+            torch.testing.assert_close(delta, expected, rtol=0, atol=0)
+            gate = base[..., :n].float() + expected[..., :n].float()
+            up = base[..., n:].float() + expected[..., n:].float()
+            torch.testing.assert_close(
+                activated.view(m, k, n),
+                (torch.nn.functional.silu(gate) * up).to(dtype),
+                rtol=_RTOL,
+                atol=_ATOL,
+            )
+            if state == "mixed":
+                added = torch.full_like(delta, 0.5)
+                merged_experts_fused_moe_lora_add(
+                    **{**kwargs, "output": added},
+                    fuse_add_to_output=True,
+                )
+                torch.testing.assert_close(
+                    added, (expected.float() + 0.5).to(dtype), rtol=0, atol=0
+                )
+        # Routing contains no destination identity. Each actual overwrite must
+        # initialize its own omitted rows even when metadata is reused.
+        cache = {}
+        merged_experts_fused_moe_lora_add(
+            **kwargs,
+            routing_cache=cache,
+            stage="routing",
+        )
+        second_output = torch.full_like(delta, float("nan"))
+        merged_experts_fused_moe_lora_add(
+            **{**kwargs, "output": second_output},
+            routing_cache=cache,
+            fuse_add_to_output=False,
+        )
+        torch.testing.assert_close(second_output, expected, rtol=0, atol=0)
+
+
 def _reference_reduce(
     routed_base: torch.Tensor,
     routed_rank: torch.Tensor,
@@ -297,6 +438,8 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
     )
     output = torch.empty((num_tokens, hidden_width), device=device, dtype=dtype)
     rank_output = torch.empty((num_tokens, rank), device=device, dtype=dtype)
+    zero_owned_rank = torch.empty_like(routed_rank)
+    zero_owned_output = torch.empty_like(rank_output)
     topk_ids = torch.zeros((num_tokens, topk), device=device, dtype=torch.int32)
     clean_base = routed_base.clone()
     clean_rank = routed_rank.clone()
@@ -354,6 +497,24 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
     with torch.cuda.graph(graph):
         invoke()
 
+    def invoke_zero_owned_rank():
+        weighted_topk_rank_sum(
+            zero_owned_rank,
+            topk_weights,
+            zero_owned_output,
+            routed_scaling_factor,
+            block_m=1 if num_tokens == 1 else 2,
+            topk_ids=topk_ids,
+            inactive_ranks_are_zero=True,
+        )
+
+    zero_owned_rank.copy_(routed_rank)
+    invoke_zero_owned_rank()
+    torch.cuda.synchronize()
+    zero_owned_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(zero_owned_graph):
+        invoke_zero_owned_rank()
+
     for replay, route_state in enumerate(("valid", "mixed", "idle", "valid")):
         # In-place mutation: replay must follow pointers, not capture-time values.
         routed_base.copy_(clean_base).mul_(0.75).add_(0.002 * (replay + 1))
@@ -376,6 +537,8 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
         rank_output.fill_(float("nan"))
 
         graph.replay()
+        zero_owned_rank.copy_(routed_rank).masked_fill_(inactive.unsqueeze(-1), 0)
+        zero_owned_graph.replay()
         torch.cuda.synchronize()
 
         expected = _reference_reduce(
@@ -397,6 +560,7 @@ def test_fused_base_shared_lora_reduce_cuda_graph_parity(
             .to(dtype)
         )
         torch.testing.assert_close(rank_output, expected_rank, rtol=_RTOL, atol=_ATOL)
+        torch.testing.assert_close(zero_owned_output, rank_output, rtol=0, atol=0)
         assert bool(torch.isfinite(output).all())
         assert bool(torch.isfinite(rank_output).all())
         if route_state == "mixed":

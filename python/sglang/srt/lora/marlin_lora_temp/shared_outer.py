@@ -32,6 +32,7 @@ def _weighted_topk_rank_sum_kernel(
     stride_or,
     TOPK: tl.constexpr,
     HAS_TOPK_IDS: tl.constexpr,
+    INACTIVE_RANKS_ARE_ZERO: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
@@ -52,12 +53,15 @@ def _weighted_topk_rank_sum_kernel(
                 other=-1,
             )
             route_mask = route_mask & (route >= 0)
+        rank_load_mask = mask & route_mask[:, None]
+        if INACTIVE_RANKS_ARE_ZERO:
+            rank_load_mask = mask
         routed_rank = tl.load(
             routed_rank_ptr
             + token[:, None] * stride_rm
             + k * stride_rk
             + rank[None, :] * stride_rr,
-            mask=mask & route_mask[:, None],
+            mask=rank_load_mask,
             other=0.0,
         ).to(tl.float32)
         weight = tl.load(
@@ -82,15 +86,24 @@ def weighted_topk_rank_sum(
     routed_scaling_factor: float,
     *,
     topk_ids: torch.Tensor | None = None,
+    inactive_ranks_are_zero: bool = False,
     block_m: int,
 ) -> None:
-    """Compute ``output[m] = scale * sum_k(gamma[m,k] * rank[m,k])``."""
+    """Compute ``output[m] = scale * sum_k(gamma[m,k] * rank[m,k])``.
+
+    ``inactive_ranks_are_zero`` certifies that the rank producer writes literal
+    zero for every dropped route. Scores remain masked by the original IDs, so
+    undefined inactive weights are never consumed. The default also masks rank
+    loads and admits poisoned private payloads.
+    """
 
     assert routed_rank.ndim == 3
     assert topk_weights.shape == routed_rank.shape[:2]
     assert output.shape == (routed_rank.shape[0], routed_rank.shape[2])
     assert routed_rank.is_contiguous() and topk_weights.is_contiguous()
     assert output.is_contiguous()
+    if inactive_ranks_are_zero:
+        assert topk_ids is not None
     if routed_rank.shape[0] == 0:
         return
 
@@ -123,6 +136,7 @@ def weighted_topk_rank_sum(
         output.stride(1),
         TOPK=routed_rank.shape[1],
         HAS_TOPK_IDS=topk_ids is not None,
+        INACTIVE_RANKS_ARE_ZERO=inactive_ranks_are_zero,
         BLOCK_M=block_m,
         BLOCK_R=block_rank,
         num_warps=1,

@@ -57,7 +57,8 @@ template <
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
     const bool kExpertIdsAreSorted,      // sorted block expert IDs
-    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -323,7 +324,8 @@ template <
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
     const bool kExpertIdsAreSorted,      // sorted block expert IDs
-    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -406,11 +408,32 @@ __global__ void Marlin(
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
 
-  int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
+  int num_tokens_past_padded;
+  int inactive_prefix_blocks = 0;
+  if constexpr (kHasInactivePrefixCount) {
+    // One aligned transaction publishes both quantities without a dependent head-ID load.
+    const int2 counts = __ldg(reinterpret_cast<const int2*>(num_tokens_past_padded_ptr));
+    num_tokens_past_padded = counts.x;
+    inactive_prefix_blocks = counts.y;
+  } else {
+    num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  }
   int parallel = num_tokens_past_padded / moe_block_size;
   if (parallel == 0) return;
   int num_invalid_blocks = 0;
-  if constexpr (kExpertIdsAreSorted) {
+  if constexpr (kHasInactivePrefixCount) {
+    if (inactive_prefix_blocks > 0) {
+      if constexpr (kZeroInactiveOutput) {
+        zero_inactive_output_rows<true, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, inactive_prefix_blocks, prob_m * top_k, prob_n / 8);
+      }
+      parallel -= inactive_prefix_blocks;
+      if (parallel == 0) return;
+      expert_ids_ptr += inactive_prefix_blocks;
+      sorted_token_ids_ptr += inactive_prefix_blocks * moe_block_size;
+    }
+  } else if constexpr (kExpertIdsAreSorted) {
     if (expert_ids_ptr[0] < 0) {
       // Only the used prefix is sorted; allocated tail entries are undefined.
       int first = 0;

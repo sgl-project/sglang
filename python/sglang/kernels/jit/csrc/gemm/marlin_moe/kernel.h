@@ -36,7 +36,8 @@ template <
     const bool kIsEP,                    // expert parallelism
     const bool kHasBias,                 // has per-expert bias
     const bool kExpertIdsAreSorted,      // sorted block expert IDs
-    const bool kZeroInactiveOutput       // zero rows in inactive routing blocks
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
