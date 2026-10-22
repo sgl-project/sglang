@@ -148,7 +148,9 @@ jobs:
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: nightly-mmlu-npu-a3
-      runner_config: linux-aarch64-a3-2-
+      # TEMP EXPERIMENT: use the full-test runner pool to check whether the
+      # MMLU 503 is runner-pool specific. Revert to linux-aarch64-a3-2- after.
+      runner_config: linux-aarch64-a3-2
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '40'
       timeout_per_file: '3600'

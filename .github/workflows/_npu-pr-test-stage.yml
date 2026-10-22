@@ -230,30 +230,16 @@ jobs:
             pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
             pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
 
-            # sgl_eval fetches the MMLU archive with its own httpx client: it
-            # ignores HF_ENDPOINT, has no progress output and no retries, so a
-            # blocked or slow mirror looks like a hang. Stage the pinned archive
-            # here through HF_ENDPOINT instead; the tests read it from
-            # SGLANG_EVAL_ARCHIVE_DIR, re-check the sha256 sgl_eval expects, and
-            # fall back to sgl_eval's own download when it is missing or stale.
-            #
-            # Large files come from Xet storage by default and the mirror does not
-            # serve it (401 from cas-server.xethub.hf.co), so force the classic
-            # HTTP path; plain curl is the last resort.
-            SGLANG_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
-            mkdir -p "${SGLANG_EVAL_ARCHIVE_DIR}"
-            export HF_HUB_DISABLE_XET=1
-            if hf download cais/mmlu --repo-type dataset --include data.tar \
-                 --local-dir "${SGLANG_EVAL_ARCHIVE_DIR}" \
-               || curl -fL --retry 5 --retry-delay 5 --connect-timeout 10 \
-                    -o "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar" \
-                    "${HF_ENDPOINT}/datasets/cais/mmlu/resolve/main/data.tar"; then
-              ls -lh "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
-              sha256sum "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
-            else
-              echo "::warning::MMLU archive prefetch failed; sgl_eval will download it itself"
-            fi
-            echo "SGLANG_EVAL_ARCHIVE_DIR=${SGLANG_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
+            # TEMP EXPERIMENT: the archive prefetch is disabled on purpose so
+            # sgl_eval has to download MMLU itself, isolating runner-pool
+            # network reachability. Probe both endpoints for the log.
+            for probe_url in \
+              "https://huggingface.co/datasets/cais/mmlu/resolve/main/data.tar" \
+              "${HF_ENDPOINT}/datasets/cais/mmlu/resolve/main/data.tar"; do
+              echo -n "[hf-probe] ${probe_url} -> "
+              curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' \
+                --max-time 30 -r 0-1024 -L "${probe_url}" || echo "curl failed"
+            done
 
             hf download MMMU/MMMU --repo-type dataset
           fi
