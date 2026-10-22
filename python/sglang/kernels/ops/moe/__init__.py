@@ -289,3 +289,12 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
