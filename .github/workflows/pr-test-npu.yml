@@ -244,7 +244,7 @@ jobs:
           if-no-files-found: warn
 
   base-b-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -261,7 +261,7 @@ jobs:
     secrets: inherit
 
   base-b-test-2-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -278,7 +278,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -296,7 +296,7 @@ jobs:
     secrets: inherit
 
   base-b-test-8-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
@@ -313,7 +313,7 @@ jobs:
     secrets: inherit
 
   base-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov, recommend-tests-from-coverage]
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
