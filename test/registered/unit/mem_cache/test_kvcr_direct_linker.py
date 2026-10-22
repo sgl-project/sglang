@@ -168,6 +168,7 @@ class TestKVCRDirectLinker(CustomTestCase):
                 module + ".resolve_hybrid_device_pool_group", return_value=self.group
             ),
             patch(module + ".torch.cuda.Event", side_effect=Event),
+            patch(module + ".freeze_gc"),
         ]
         for p in self.patches:
             p.start()

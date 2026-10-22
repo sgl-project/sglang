@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import get_memory, get_model, get_parallel, get_stream
+from sglang.srt.utils import freeze_gc
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._request_scopes = {}
         self._lookup_claims = {}
         self._released_scopes = set()
+        self._gc_frozen = False
         self._fatal = None
         self._closed = False
         self._runtime = None
@@ -466,6 +468,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter.finish(counter_index)
         return landed
 
+    def _freeze_gc_once(self):
+        if self._gc_frozen:
+            return
+        # Keep the mature model graph out of GC scans triggered by transfer metadata.
+        freeze_gc("KVCR direct linker")
+        self._gc_frozen = True
+
     def start_layer_wise_loading(self):
         if self._closed:
             raise RuntimeError("KVCR linker is closed")
@@ -474,6 +483,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         # Synchronous load/start/reset calls keep this queue visible to the scheduler.
         if not self._queued:
             return -1
+        self._freeze_gc_once()
         ready = torch.cuda.Event()
         ready.record()
         return self._call(self._start, ready)
@@ -508,6 +518,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         keys = self.layout.encoded_keys(transfers, allow_partial=True)
         if not keys:
             return False
+        self._freeze_gc_once()
         transfers = tuple(
             replace(
                 transfer,
