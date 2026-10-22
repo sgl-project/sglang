@@ -1,0 +1,9 @@
+{
+  "extra": {
+    "label": "run-ci-extra",
+    "workflows": [
+      ".github/workflows/pr-test-extra.yml",
+      ".github/workflows/pr-test-amd-extra.yml"
+    ]
+  }
+}

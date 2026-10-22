@@ -23,6 +23,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 |------|------|
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
 | `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
+| `scripts/ci/opt_in_ci_tiers.json` | Opt-in CI tiers: tier name → `run-ci-<tier>` label + the workflows that gate on it |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
@@ -390,25 +391,24 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Command | Effect |
 |---------|--------|
 | `/tag-run-ci-label` | Adds `run-ci` label to PR |
-| `/tag-run-ci-label extra` | Adds both `run-ci` and `run-ci-extra` labels |
+| `/tag-run-ci-label <tier> [<tier> ...]` | Also adds each tier's `run-ci-<tier>` label (e.g. `extra`); unknown tiers are rejected |
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
 | `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
-| `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
+| `/tag-and-rerun-ci <tier> [<tier> ...]` | Adds `run-ci` and the tier labels + reruns failed |
 | `/run-full-ci` | Short form of `/tag-and-rerun-ci extra` (baseline + extra). Alias: `/rerun-full-ci` |
-| `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
+| `/run-<tier>-ci` | Adds `run-ci` and the tier label + reruns **only** that tier's workflows (green ones included), leaving baseline runs alone. E.g. `/run-extra-ci`. Alias: `/rerun-<tier>-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 | `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
-### Label-gated workflow dispatch (pr-test, pr-test-extra)
+### Opt-in CI tiers (pr-test-extra and friends)
 
-`pr-test.yml` and `pr-test-extra.yml` both listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). The `check-changes.if` gate has two clauses:
+An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for `/tag-run-ci-label <tier>`, `/tag-and-rerun-ci <tier>` and `/run-<tier>-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
 
-1. **For `labeled` events**: the just-added label must be one of the gating labels (`run-ci` for pr-test, `run-ci` or `run-ci-extra` for pr-test-extra) — otherwise every unrelated label addition would dispatch a full CI run.
-2. **All events**: the PR must currently carry the required labels.
+1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** The gate live-fetches labels, so a missing label fails the gate job (red run) and a rerun after labeling passes.
+2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).
+3. **Every workflow that gates on the label is listed in the tier**, so `/run-<tier>-ci` re-runs all of them.
 
-This is what lets `/tag-run-ci-label` (and the `extra` variant) trigger a fresh CI run without an extra push.
-
-**Caveat — skipped runs cannot be un-skipped by `run.rerun()`:** GitHub's rerun API reuses the original event payload, so rerunning a `pull_request`-event run that was skipped because of missing labels will skip again (label set in the frozen payload doesn't update). The only way to recover a label-skipped run is to add the missing label, which fires a fresh `labeled` event with the current label set. `handle_rerun_failed_ci` in the slash handler is for rerunning failed/non-label-skipped runs; it cannot revive label-skipped ones.
+Tier names `cpu`, `failed` and `full` are reserved: they would collide with `/run-cpu-ci`, `/rerun-failed-ci` and `/run-full-ci`.
