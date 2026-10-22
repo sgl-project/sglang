@@ -79,6 +79,14 @@ def duplicate_prefix_tail_to_draft_branches(
     """
     if topk <= 1:
         return
+    if token_to_kv_pool.rows_are_dcp_collapsed:
+        # This copy addresses slots raw; collapsed rows are owner-only at
+        # loc // dcp_size, so it would place the tail page in rows the draft
+        # never reads.
+        raise NotImplementedError(
+            "duplicate_prefix_tail_to_draft_branches does not support an MLA "
+            "draft under DCP; run with --speculative-eagle-topk 1."
+        )
     bs = rows.shape[0]
     page_off = torch.arange(page_size, device=rows.device, dtype=torch.int64)
     branches = torch.arange(1, topk, device=rows.device, dtype=torch.int64).view(
