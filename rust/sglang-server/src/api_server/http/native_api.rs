@@ -398,6 +398,18 @@ pub(super) fn generation_event_stream(
     incremental: bool,
     with_index: bool,
 ) -> impl futures::Stream<Item = String> {
+    generation_event_stream_with(calls, incremental, with_index, |error, index| {
+        json_string(&error.stream_error(index))
+    })
+}
+
+/// [`generation_event_stream`], writing a failed call's frame with `error_frame`.
+pub(super) fn generation_event_stream_with(
+    calls: Vec<(CoreCall, RequestTiming)>,
+    incremental: bool,
+    with_index: bool,
+    error_frame: impl Fn(&CoreError, Option<u32>) -> String,
+) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         use futures::StreamExt;
 
@@ -462,7 +474,7 @@ pub(super) fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                yield json_string(&error.stream_error(idx(i)));
+                yield error_frame(&error, idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
