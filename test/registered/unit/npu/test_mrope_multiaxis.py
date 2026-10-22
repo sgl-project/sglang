@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 if importlib.util.find_spec("torch_npu") is not None:
     import torch_npu  # noqa: F401 - register the NPU device backend
 
-register_npu_ci(est_time=5, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=5, suite="base-b-test-1-npu-a3")
 
 
 def reference_rotation(value, cache, positions):

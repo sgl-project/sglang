@@ -76,7 +76,7 @@ python -m sglang.launch_server \
   --dtype bfloat16 --host 127.0.0.1 --port 30000
 ```
 
-You can then send an image request using the [multimodal chat example](/docs/hardware-platforms/ascend-npus/getting-started/quick_start#multimodal-chat-completions), with `model` set to `jpeg-study`. To disable device JPEG decoding, set `SGLANG_ENABLE_NPU_IMAGE_DECODE=0` and restart the service. Unsetting the variable also restores the default behavior.
+You can then send an image request using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. To disable device JPEG decoding, set `SGLANG_ENABLE_NPU_IMAGE_DECODE=0` and restart the service. Unsetting the variable also restores the default behavior.
 
 ### Supported inputs and behavior
 
