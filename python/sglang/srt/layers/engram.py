@@ -627,6 +627,21 @@ def _hip_runtime() -> ctypes.CDLL:
     return lib
 
 
+@functools.cache
+def _sorted_host_reads(device: int) -> bool:
+    """Whether host-table rows are read in address order. Without ATS (no
+    NVLink-C2C) the GPU maps pinned host memory in its own page tables, and
+    random rows of a table far larger than its translation reach miss on nearly
+    every row; with ATS the host page tables serve the reads and order costs."""
+    if _is_hip:
+        return False
+    from cuda.bindings import driver
+
+    attr = driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+    err, uses_host_page_tables = driver.cuDeviceGetAttribute(attr, device)
+    return err == driver.CUresult.CUDA_SUCCESS and uses_host_page_tables == 0
+
+
 def _registered_device_ptr(host_ptr: int) -> int:
     """
     Address kernels must use for registered host memory.
@@ -813,6 +828,7 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self._sort_host_reads = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -847,6 +863,7 @@ class EngramEmbedding(nn.Module):
         self.scale = nn.Parameter(scale, requires_grad=False)
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
+        self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
 
     @property
     def _shared(self) -> bool:
@@ -888,6 +905,7 @@ class EngramEmbedding(nn.Module):
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
+                sort_ids=self._sort_host_reads,
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -949,6 +967,7 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
+            sort_ids=self._sort_host_reads,
         )
         return out
 
