@@ -1753,43 +1753,28 @@ class TestSWAPoolFloor(CustomTestCase):
             ),
         )
 
-    def test_dsv4_dense_draft_detected_by_draft_architecture(self):
+    def test_dsv4_dense_draft_cost_follows_the_draft_architecture(self):
+        """A dense draft beside a DSV4 target costs its own KV bytes and must not
+        fall back to the (T+1)/T reserve when that size did not resolve; a DSV4-shaped
+        or absent draft costs nothing extra either way."""
         from sglang.srt.model_executor.pool_configurator import (
             _dense_draft_cell_size_on_dsv4,
         )
 
         with mock_cpu_env(), get_parallel().override(attn_dcp_size=1):
-            for draft_arch, expected in (
-                ("Qwen3DSparkModel", 10240),
-                ("DeepseekV4ForCausalLMDSpark", 0),
-                (None, 0),
+            for draft_arch, cell_size, expected in (
+                ("Qwen3DSparkModel", 10240, 10240),
+                ("Qwen3DSparkModel", None, RuntimeError),
+                ("DeepseekV4ForCausalLMDSpark", None, 0),
+                (None, None, 0),
             ):
-                with self.subTest(draft_arch=draft_arch):
-                    self.assertEqual(
-                        _dense_draft_cell_size_on_dsv4(
-                            self._dsv4_dflash_kvc(draft_arch)
-                        ),
-                        expected,
-                    )
-
-    def test_dsv4_dense_draft_refuses_an_unresolved_kv_size(self):
-        """An unresolved dense-draft size must not fall back to the (T+1)/T reserve,
-        which under-prices the draft pool; a DSV4-shaped draft never needs it."""
-        from sglang.srt.model_executor.pool_configurator import (
-            _dense_draft_cell_size_on_dsv4,
-        )
-
-        with mock_cpu_env(), get_parallel().override(attn_dcp_size=1):
-            with self.assertRaisesRegex(RuntimeError, "dense draft's KV pool"):
-                _dense_draft_cell_size_on_dsv4(
-                    self._dsv4_dflash_kvc("Qwen3DSparkModel", cell_size=None)
-                )
-            self.assertEqual(
-                _dense_draft_cell_size_on_dsv4(
-                    self._dsv4_dflash_kvc("DeepseekV4ForCausalLMDSpark", cell_size=None)
-                ),
-                0,
-            )
+                with self.subTest(draft_arch=draft_arch, cell_size=cell_size):
+                    kvc = self._dsv4_dflash_kvc(draft_arch, cell_size=cell_size)
+                    if expected is RuntimeError:
+                        with self.assertRaisesRegex(RuntimeError, "dense draft"):
+                            _dense_draft_cell_size_on_dsv4(kvc)
+                    else:
+                        self.assertEqual(_dense_draft_cell_size_on_dsv4(kvc), expected)
 
     def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
         from sglang.srt.model_executor.pool_configurator import (
