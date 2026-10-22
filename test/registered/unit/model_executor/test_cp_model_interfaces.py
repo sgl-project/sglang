@@ -5,8 +5,9 @@ from contextlib import nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as prefill
 import torch
+
+import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as prefill
 from sglang.srt.layers.cp.bcg.bcg import execute_prefill_cp_bcg
 from sglang.srt.layers.cp.bcg.dsv4_bcg import DSV4CPBCGInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
