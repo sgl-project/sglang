@@ -249,7 +249,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         parent = super().get_cpu_copy(
             indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
         )
-        current_platform.synchronize()
         comp = self._qsa_compressed_slots(indices)
         compressed_cpu = [
             buf[comp].to("cpu", non_blocking=True)
@@ -275,7 +274,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         super().load_cpu_copy(
             parent, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
         )
-        current_platform.synchronize()
         comp = self._qsa_compressed_slots(indices)
         for buf, data in zip(self.qsa_compressed_k_buffer_pool, compressed_cpu):
             buf[comp] = data.to(buf.device, non_blocking=True)
