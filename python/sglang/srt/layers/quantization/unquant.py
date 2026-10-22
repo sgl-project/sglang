@@ -128,6 +128,8 @@ _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
+_hopper_bf16_tiny_gemv = None
+_use_hopper_bf16_tiny_gemv = None
 _splitk_tactic = None
 _run_splitk_dense = None
 _direct_default_tactic = None
@@ -321,6 +323,7 @@ def initialize_bf16_gemm_config() -> None:
             raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        global _hopper_bf16_tiny_gemv, _use_hopper_bf16_tiny_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
             hopper_bf16_gemv,
             use_hopper_bf16_gemv,
@@ -328,6 +331,15 @@ def initialize_bf16_gemm_config() -> None:
 
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+
+        if get_platform().is_sm90:
+            from sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv import (
+                hopper_bf16_tiny_gemv,
+                use_hopper_bf16_tiny_gemv,
+            )
+
+            _hopper_bf16_tiny_gemv = hopper_bf16_tiny_gemv
+            _use_hopper_bf16_tiny_gemv = use_hopper_bf16_tiny_gemv
     elif backend.is_cutedsl():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
@@ -381,6 +393,22 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
+def _use_bf16_tiny_gemv(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> bool:
+    return (
+        _use_hopper_bf16_tiny_gemv is not None
+        and bias is None
+        and x.is_cuda
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and _use_hopper_bf16_tiny_gemv(
+            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        )
+    )
+
+
 def _bf16_splitk_gemm_out(
     x_2d: torch.Tensor,
     weight: torch.Tensor,
@@ -429,6 +457,10 @@ def _bf16_gemm_dispatch_impl(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
+    elif _use_bf16_tiny_gemv(x, weight, bias):
+        output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
     elif (
         _use_hopper_bf16_gemv is not None
         and bias is None

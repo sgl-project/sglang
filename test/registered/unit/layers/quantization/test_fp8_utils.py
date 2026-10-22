@@ -80,6 +80,88 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
         self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 32, 1))
 
 
+class TestPrequantizedBlockFp8Routing(CustomTestCase):
+    def test_row_major_scale_routes_to_hopper_and_column_major_to_deepgemm(self):
+        import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+        m, k, n = 6, 256, 128
+        qinput = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+        weight = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones((n // 128, k // 128), dtype=torch.float32)
+        row_major_scale = torch.ones((m, k // 128), dtype=torch.float32)
+        column_major_scale = torch.ones((k // 128, m), dtype=torch.float32).transpose(
+            0, 1
+        )
+        assert row_major_scale.is_contiguous()
+        assert not column_major_scale.is_contiguous()
+
+        hopper_output = torch.full((m, n), 1.0, dtype=torch.bfloat16)
+        deepgemm_output = torch.full((m, n), 2.0, dtype=torch.bfloat16)
+        with (
+            patch.object(fp8_utils, "_use_fp8_block_gemv", return_value=True),
+            patch.object(
+                fp8_utils,
+                "hopper_fp8_block_gemv",
+                return_value=hopper_output,
+            ) as hopper,
+            patch.object(
+                fp8_utils,
+                "w8a8_block_fp8_matmul_deepgemm",
+                return_value=deepgemm_output,
+            ) as deepgemm,
+            patch.object(fp8_utils.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False),
+        ):
+            row_major_output = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                qinput,
+                weight,
+                [128, 128],
+                weight_scale,
+                input_scale=row_major_scale,
+            )
+            torch.testing.assert_close(row_major_output, hopper_output)
+            hopper.assert_called_once()
+            deepgemm.assert_not_called()
+
+            hopper.reset_mock()
+            column_major_output = (
+                fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                    qinput,
+                    weight,
+                    [128, 128],
+                    weight_scale,
+                    input_scale=column_major_scale,
+                )
+            )
+            torch.testing.assert_close(column_major_output, deepgemm_output)
+            hopper.assert_not_called()
+            deepgemm.assert_called_once()
+
+    def test_gemv_gate_rejects_other_platforms_and_shapes(self):
+        from sglang.kernels.ops.gemm.hopper_fp8_block_gemv import (
+            use_hopper_fp8_block_gemv,
+        )
+        from sglang.srt.environ import envs
+
+        for env_on, sm90 in ((False, True), (True, False)):
+            with (
+                envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.override(env_on),
+                patch.object(
+                    fp8_utils,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_sm90=sm90),
+                ),
+            ):
+                self.assertFalse(fp8_utils._fp8_block_gemv_enabled())
+
+        block = [128, 128]
+        self.assertTrue(use_hopper_fp8_block_gemv(8, 5120, 4096, block))
+        self.assertFalse(use_hopper_fp8_block_gemv(9, 5120, 4096, block))
+        self.assertTrue(use_hopper_fp8_block_gemv(16, 1536, 4096, block))
+        self.assertFalse(use_hopper_fp8_block_gemv(17, 1536, 4096, block))
+        self.assertFalse(use_hopper_fp8_block_gemv(1, 1536, 4224, block))
+        self.assertFalse(use_hopper_fp8_block_gemv(1, 1536, 4096, [32, 32]))
+
+
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
         for _ in range(100):
