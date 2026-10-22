@@ -73,18 +73,7 @@ class SGLDModelPatcher(ModelPatcher):
         return n
 
     def model_size(self):
-        """Get the model size in bytes.
-
-        `self.size` is the real byte count the loader computed from the
-        checkpoint header for whichever architecture was loaded. Only fall
-        back to the hardcoded table when a caller built this patcher without
-        that (e.g. ``clone()``, which does pass `self.size` through, or old
-        callers), so every model type gets consistent VRAM accounting
-        instead of just the two that happened to have a table entry.
-
-        A worker on another GPU needs no room on ComfyUI's GPU, so report 0
-        (as `loaded_size` does); otherwise ComfyUI evicts its own models.
-        """
+        """Bytes the worker needs on ComfyUI's GPU; 0 when it runs on another GPU."""
         if self.worker is not None and not getattr(
             self.worker, "shares_comfy_gpu", True
         ):
@@ -102,13 +91,7 @@ class SGLDModelPatcher(ModelPatcher):
         )
 
     def loaded_size(self):
-        """VRAM ComfyUI can reclaim from this patcher.
-
-        The base class reads a counter on the (weightless) wrapper model, so
-        it is always 0 and ComfyUI never considers this patcher worth
-        unloading. The weights are resident in the worker unless it sleeps.
-        """
-        # A patcher for a replaced worker owns nothing that detach() can free.
+        """VRAM ComfyUI can reclaim: the worker's weights while it is awake."""
         if (
             self.worker is None
             or self._is_stale()
@@ -116,8 +99,7 @@ class SGLDModelPatcher(ModelPatcher):
             or not getattr(self.worker, "shares_comfy_gpu", True)
         ):
             return 0
-        # What the worker keeps on the GPU (after offload, TP, quantization),
-        # once measured; the checkpoint size is only the first estimate.
+        # measured after the first run; the checkpoint size until then
         return getattr(self.worker, "resident_bytes", 0) or self.model_size()
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
@@ -125,14 +107,7 @@ class SGLDModelPatcher(ModelPatcher):
         return 0
 
     def detach(self, unpatch_all=True):
-        """Unload from ComfyUI: also release the worker's GPU memory.
-
-        Every ComfyUI unload path (Unload Models, Free memory, making room
-        for the VAE or a text encoder) ends here. The worker is woken again
-        by ``SGLDiffusionGenerator.ensure_executor`` on the next forward.
-        """
-        # A stale patcher must not sleep the current worker, and has nothing
-        # resident (loaded_size() is 0), so there is nothing to free here.
+        """Every ComfyUI unload ends here; sleep the worker (woken by ensure_executor)."""
         if self.worker is not None and not self._is_stale():
             self.worker.sleep_worker(self.worker_token)
         return super().detach(unpatch_all)

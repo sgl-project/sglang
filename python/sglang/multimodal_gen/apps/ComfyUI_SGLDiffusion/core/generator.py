@@ -531,12 +531,10 @@ class SGLDiffusionGenerator:
         self.resident_bytes = int(payload.get("resident_bytes") or 0)
 
     def sleep_worker(self, token=None) -> None:
-        """Move the worker's weights off the GPU (best effort).
+        """Move the worker's weights off the GPU (best effort, failures are logged).
 
-        ``token`` is the patcher's ``worker_token`` (the worker's generator);
-        it guards against a patcher for a replaced worker putting the new one
-        to sleep, while ComfyUI clones of the live patcher still match. Failure is logged, not raised: the worker just
-        stays resident, which is the old behaviour.
+        ``token`` is the patcher's worker_token, so a patcher for a replaced
+        worker cannot put the new one to sleep.
         """
         if token is not None and token is not self.generator:
             return
@@ -671,9 +669,6 @@ class SGLDiffusionGenerator:
         model_config.custom_operations = model_options.get("custom_operations", None)
         model_config.unet_config["disable_unet_model_creation"] = True
         comfyui_model = model_config.get_model({})
-        # Real byte size from the checkpoint header, not a per-architecture
-        # guess: lets ComfyUI's VRAM accounting work the same for every
-        # model type instead of only the ones with a hardcoded entry.
         model_size_bytes = parameters * unet_dtype.itemsize
         return comfyui_model, model_config, model_type, model_size_bytes
 
@@ -739,9 +734,7 @@ class SGLDiffusionGenerator:
             self.get_comfyui_model(detect_path, model_options)
         )
         if _looks_like_gguf(model_path):
-            # Detection sizes tensors by their logical (unpacked) shapes, but
-            # the weights that land in VRAM are the quantized GGUF file, so
-            # size them from the file itself.
+            # detection sizes unpacked shapes; size the quantized file instead
             try:
                 model_size_bytes = os.path.getsize(
                     sgld_options["transformer_weights_path"]
