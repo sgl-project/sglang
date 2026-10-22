@@ -487,4 +487,21 @@ def test_reference_latent_and_its_ids_are_restored_together() -> None:
     bind_comfyui_session(later)
     assert later.image_latent is latent
     assert later.condition_image_latent_ids is ids
+
+
+def test_control_residuals_are_never_cached_across_steps() -> None:
+    sid = "run-control"
+    first = _Req()
+    first.extra = {
+        "comfyui_session_id": sid,
+        "comfyui_control": {"input": [torch.ones(1, 4, 8)]},
+        "other": 1,
+    }
+    bind_comfyui_session(first)
+
+    later = _Req()
+    later.extra = {"comfyui_session_id": sid}
+    bind_comfyui_session(later)
+    assert later.extra["other"] == 1
+    assert "comfyui_control" not in later.extra
     release_comfyui_session(sid)

@@ -288,6 +288,7 @@ class BufferModePipeline:
         self._cache = cache
         self._swa_component = swa_component
         self._auxiliary_swa_component = auxiliary_swa_component
+        self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
@@ -323,6 +324,9 @@ class BufferModePipeline:
     # Arbitrary: a deferral means the admission budget and the allocator disagree
     # about free slots, which waiting on decode rarely fixes.
     max_staged_admission_defers: int = 32
+    # Opt-in: a backup stores only the SWA window ending at its node, the one
+    # a prefetch ending there restores, instead of the node's every SWA page.
+    _swa_tail_only: bool = False
 
     def reset(self) -> None:
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
@@ -533,12 +537,37 @@ class BufferModePipeline:
             return None
         return list(hash_values[-num_pages:])
 
+    def _swa_tail_pages(self, pool: PoolName) -> int:
+        """The pool's backup window; zero keeps every page."""
+        if self._swa_tail_only:
+            for component in self._swa_components():
+                if component.pool_name == pool:
+                    return component.full_window_pages
+        return 0
+
+    def _trim_swa_backup_transfer(
+        self, transfer: PoolTransfer, keys: list[str]
+    ) -> list[str]:
+        """Stage and store only the node's tail window; rows follow the keys."""
+        tail = self._swa_tail_pages(transfer.name)
+        if not tail or len(keys) <= tail:
+            return keys
+        entry = self._cache.cache_controller.mem_pool_host.entry_map[transfer.name]
+        page_size = entry.host_pool.page_size
+        rows = transfer.device_indices
+        assert rows is not None and len(rows) == len(keys) * page_size
+        transfer.device_indices = rows[-tail * page_size :]
+        transfer.keys = keys[-tail:]
+        transfer.hit_policy = PoolHitPolicy.TRAILING_PAGES
+        return transfer.keys
+
     def _backup_pool_keys(
         self, snapshot: BufferBackupSnapshot
     ) -> dict[PoolName, list[str]]:
         """Admission view of the keys a backup writes per pool: the KV chain,
         each aux component's BACKUP_HOST transfers, component overrides on
-        top, every sidecar under its source's keys."""
+        top, the SWA tail under tail-only backups, every sidecar under its
+        source's keys."""
         hash_values = snapshot.hash_values
         tree_core = self._cache.tree_core
         pool_keys: dict[PoolName, list[str]] = {PoolName.KV: list(hash_values)}
@@ -560,6 +589,10 @@ class BufferModePipeline:
                     pool_keys[pool] = list(keys)
                 else:
                     pool_keys.pop(pool, None)
+        for pool, keys in pool_keys.items():
+            tail = self._swa_tail_pages(pool)
+            if tail and len(keys) > tail:
+                pool_keys[pool] = keys[-tail:]
         for spec in self._cache.sidecar_pool_specs:
             source = pool_keys.get(spec.indices_from_pool)
             if source:
@@ -1001,6 +1034,7 @@ class BufferModePipeline:
                     t_keys = self._transfer_keys(transfer, hash_values)
                     if not t_keys:
                         continue
+                    t_keys = self._trim_swa_backup_transfer(transfer, t_keys)
                     if transfer.keys is None:
                         transfer.keys = t_keys
                         transfer.hit_policy = PoolHitPolicy.TRAILING_PAGES
@@ -1109,11 +1143,20 @@ class BufferModePipeline:
         hash_value = (
             list(entry.keys_by_pool[PoolName.KV]) if intent.pool == PoolName.KV else []
         )
+        prefix_keys = snapshot.prefix_keys
+        if intent.pool in (PoolName.SWA, PoolName.AUXILIARY_SWA):
+            keys = entry.keys_by_pool[intent.pool]
+            skipped_pages = len(snapshot.hash_values) - len(keys)
+            if skipped_pages > 0:
+                # A pool-only suffix starts after the omitted node pages.
+                prefix_keys = self._cache.cache_controller.extend_storage_prefix(
+                    prefix_keys, snapshot.hash_values[:skipped_pages]
+                )
         operation_id = self._cache.cache_controller.write_storage(
             entry.host_indices,
             snapshot.key.token_ids,
             hash_value,
-            snapshot.prefix_keys,
+            prefix_keys,
             extra_pools=storage_xfers or None,
         )
         self.ongoing_backup[operation_id] = entry

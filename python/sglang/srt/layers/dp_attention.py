@@ -799,10 +799,9 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     outputs are then discarded by the post-reorder scatter — pure wasted
     compute, and a masked-grouped-GEMM workspace blow-up when they collide
     on the same top-k.  -1 is the drop sentinel both the triton fused_moe
-    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
-    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
-    the mapping table's last entry).  Capture-safe: per-batch state is read
-    only from the replay-updated global_num_tokens_gpu tensor.
+    (filter_expert) and the DeepGEMM EP preprocess honor.  Capture-safe:
+    per-batch state is read only from the replay-updated
+    global_num_tokens_gpu tensor.
     """
     counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
