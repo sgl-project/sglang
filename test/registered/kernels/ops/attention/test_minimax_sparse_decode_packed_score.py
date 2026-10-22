@@ -160,34 +160,31 @@ def _assert_rows_equal(got, want, case, skip_trivial):
         assert torch.equal(got[:, r, :nb], want[:, r, :nb]), f"row {r} ({nb} blocks)"
 
 
-def _selected_blocks(idx, case, dense):
-    # The radix top-k places final-round ties by atomic order, so tied blocks may swap.
-    if not dense:  # block ids: front-packed, -1 padded
-        return [row[row >= 0] for row in idx]
-    # page table: each block's first page, mapped back to its block of the request
-    blocks = ((case.seq_lens + case.blk - 1) // case.blk).clamp(max=TOPK)
+def _selected_blocks(idx, r, nb, case, dense):
+    if not dense:  # block ids [1, rows, topk]: front-packed, -1 padded
+        row = idx[0, r]
+        return row[row >= 0]
+    # page table [rows, pages]: each block's first page, mapped back to its block
+    req = case.req_to_token[int(case.slot_ids[r])]
+    page_to_block = {int(p) // PAGE: b for b, p in enumerate(req[:: case.blk].tolist())}
     ppb = case.blk // PAGE
-    out = []
-    for r, nb in enumerate(blocks.tolist()):
-        req = case.req_to_token[int(case.slot_ids[r])]
-        page_to_block = {
-            int(p) // PAGE: b for b, p in enumerate(req[:: case.blk].tolist())
-        }
-        out.append(
-            torch.tensor([page_to_block[int(p)] for p in idx[r, : nb * ppb : ppb]])
-        )
-    return out
+    pages = idx[r, : min(nb, TOPK) * ppb : ppb].tolist()
+    return torch.tensor([page_to_block[p] for p in pages], device=idx.device)
 
 
 def _assert_selection_equal(got, want, score, case, dense):
-    # Tie-invariant: the scores are already equal, so equal selections hold equal scores.
-    for r, (g, w) in enumerate(
-        zip(_selected_blocks(got, case, dense), _selected_blocks(want, case, dense))
-    ):
-        assert g.numel() == w.numel(), f"row {r}"
-        sg = score[0, r, g.to(score.device).long()].sort().values
-        sw = score[0, r, w.to(score.device).long()].sort().values
-        assert torch.equal(sg, sw), f"row {r}"
+    blocks = (case.seq_lens + case.blk - 1) // case.blk
+    for r, nb in enumerate(blocks.tolist()):
+        g = _selected_blocks(got, r, nb, case, dense)
+        w = _selected_blocks(want, r, nb, case, dense)
+        if nb <= TOPK:  # every block is selected from seq_lens, scores unread
+            assert torch.equal(g, w), f"row {r}"
+            continue
+        # The radix top-k places final-round ties by atomic order, so compare the
+        # selected scores: tied blocks may swap, the score multiset may not.
+        sg = score[0, r, g.long()].sort().values
+        sw = score[0, r, w.long()].sort().values
+        assert g.numel() == w.numel() and torch.equal(sg, sw), f"row {r}"
 
 
 def _check_pair(case, dense):
