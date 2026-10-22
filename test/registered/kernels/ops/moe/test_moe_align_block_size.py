@@ -286,5 +286,82 @@ def test_moe_align_block_size_pad_fill_stays_in_bounds(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_tokens,num_experts", [(65, 4), (512, 128), (65, 1025)])
+def test_moe_align_block_size_completes_expert_capacity(dtype, num_tokens, num_experts):
+    """Unused expert-map slots must be inactive after every graph replay."""
+    block_size, topk = 4, 2
+    original = (
+        torch.arange(num_tokens * topk, device="cuda", dtype=dtype).reshape(
+            num_tokens, topk
+        )
+        % num_experts
+    )
+    routes = original.clone()
+    capacity = min(
+        routes.numel() * block_size,
+        routes.numel() + (num_experts + 1) * (block_size - 1),
+    )
+    capacity = ceil_div(capacity, 4) * 4
+    sorted_ids = torch.empty(capacity, device="cuda", dtype=torch.int32)
+    blocks = ceil_div(capacity, block_size)
+    # Guard words make an out-of-bounds capacity fill observable.
+    expert_storage = torch.full(
+        (blocks + 4,), num_experts, device="cuda", dtype=torch.int32
+    )
+    expert_ids = expert_storage[:blocks]
+    count = torch.empty(1, device="cuda", dtype=torch.int32)
+    cumsum = torch.empty(num_experts + 2, device="cuda", dtype=torch.int32)
+
+    def align():
+        moe_align_block_size(
+            routes,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            count,
+            cumsum,
+            True,
+            pad_expert_ids=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        align()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        align()
+
+    for live in (num_tokens, num_tokens // 2, 0, num_tokens):
+        routes.copy_(original)
+        routes[live:].fill_(-1)
+        sorted_ids.fill_(-99)
+        expert_storage.fill_(num_experts)
+        graph.replay()
+        used = count.item()
+        assert used % block_size == 0
+        assert torch.all(expert_ids[used // block_size :] == -1)
+        assert torch.all(expert_storage[blocks:] == num_experts)
+        assert torch.all(sorted_ids[used:] == routes.numel())
+        # Every real route appears exactly once in its expert's contiguous region.
+        flat_routes = routes.flatten()
+        expected_start = 0
+        for expert in torch.unique(flat_routes).tolist():
+            expected = torch.where(flat_routes == expert)[0]
+            padded = ceil_div(expected.numel(), block_size) * block_size
+            end = expected_start + padded
+            assert torch.all(
+                expert_ids[expected_start // block_size : end // block_size] == expert
+            )
+            actual = sorted_ids[expected_start:end]
+            actual = actual[actual < routes.numel()].long().sort().values
+            assert torch.equal(actual, expected)
+            expected_start = end
+        assert expected_start == used
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

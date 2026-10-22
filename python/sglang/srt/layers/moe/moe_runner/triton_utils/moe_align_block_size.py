@@ -34,6 +34,8 @@ def moe_align_block_size(
     block_size: int,
     num_experts: int,
     ignore_invalid_expert: bool = False,
+    *,
+    pad_expert_ids: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -72,8 +74,13 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    if pad_expert_ids and (not _is_cuda or ignore_invalid_expert):
+        raise ValueError(
+            "Padding expert IDs requires CUDA and the invalid-expert bucket"
+        )
+
     # ===== TO BE REFACTORED ====
-    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI and not pad_expert_ids:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
         if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get() and num_experts <= 8191:
@@ -116,6 +123,7 @@ def moe_align_block_size(
         and topk_ids.numel() <= SMALL_NUMEL_LIMIT
         and num_experts + 1 > _CUDA_SMALL_BATCH_MAX_BUCKETS
         and not ignore_invalid_expert
+        and not pad_expert_ids
     ):
         moe_align_small_numel(
             topk_ids,
@@ -128,11 +136,11 @@ def moe_align_block_size(
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = False
+    use_jit_align = pad_expert_ids
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        use_jit_align |= lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
     if use_jit_align:
         from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
@@ -147,6 +155,7 @@ def moe_align_block_size(
             num_tokens_post_pad,
             cumsum_buffer,
             True,
+            pad_expert_ids=pad_expert_ids,
         )
     # ===== END TO BE REFACTORED ====
     else:

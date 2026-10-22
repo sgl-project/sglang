@@ -11,8 +11,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_moe_align_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_moe_align_module(dtype: torch.dtype, pad_expert_ids: bool) -> Module:
+    args = make_cpp_args(dtype, pad_expert_ids)
     return load_jit(
         "moe_align_block_size",
         *args,
@@ -32,8 +32,11 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     cumsum_buffer: torch.Tensor,
     pad_sorted_token_ids: bool = False,
+    *,
+    pad_expert_ids: bool = False,
 ) -> None:
-    module = _jit_moe_align_module(topk_ids.dtype)
+    """Align routes; optionally define unused expert-map capacity as -1."""
+    module = _jit_moe_align_module(topk_ids.dtype, pad_expert_ids)
     module.moe_align_block_size(
         topk_ids,
         num_experts,
