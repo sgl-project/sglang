@@ -520,8 +520,10 @@ class ReferenceDeepseekMLAAttention(nn.Module):
         qk_rope_head_dim: int,
         dtype: torch.dtype,
         device: str,
+        kv_cache_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        self.kv_cache_dtype = kv_cache_dtype
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.kv_lora_rank = kv_lora_rank
@@ -620,6 +622,10 @@ class ReferenceDeepseekMLAAttention(nn.Module):
                 k_nope.shape[0], self.num_heads, self.qk_rope_head_dim
             )
             k_rope = k_nope.new_empty(k_nope.shape[:-1] + (self.qk_rope_head_dim,))
+        if self.kv_cache_dtype is not None:
+            # Match the stored KV values without using the backend's row mapping.
+            k_nope = k_nope.to(self.kv_cache_dtype).to(hidden_states.dtype)
+            k_rope = k_rope.to(self.kv_cache_dtype).to(hidden_states.dtype)
         return q_nope_out, k_nope, q_rope, k_rope
 
     def reconstruct_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -922,6 +928,7 @@ def build_mla_attention_fixture(
         qk_rope_head_dim=qk_rope_head_dim,
         dtype=dtype,
         device=device,
+        kv_cache_dtype=runner.kv_cache_dtype if fp8_kv_cache else None,
     )
     _copy_mla_weights(actual_module, reference_module)
     prefix_hidden = [

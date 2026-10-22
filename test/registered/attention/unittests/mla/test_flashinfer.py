@@ -1,14 +1,22 @@
 import unittest
+from dataclasses import replace
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
+    _make_forward_batch,
+    build_mla_attention_fixture,
+    expected_mla_output_from_inputs,
     make_mla_cases,
+    make_mla_random_inputs,
+    prepare_mla_runner_inputs,
     run_mla_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+    _init_cuda_graph_capture_metadata,
+    _init_cuda_graph_replay_metadata,
     run_mla_cuda_graph_decode_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
@@ -195,6 +203,103 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                         static_num_tokens=static_num_tokens,
                         **MLA_SHAPE_KWARGS,
                     )
+
+    def test_fp8_paged_prefill_and_decode(self):
+        for case in self.CASES:
+            with self.subTest(case=case.name):
+                run_mla_attention_case(
+                    self, case, fp8_kv_cache=True, **MLA_SHAPE_KWARGS
+                )
+
+    def test_fp8_runner_modes(self):
+        for case in self.CUDA_GRAPH_CASES:
+            run_mla_cuda_graph_decode_case(
+                self, case, fp8_kv_cache=True, **MLA_SHAPE_KWARGS
+            )
+        for case, static_num_tokens in self.SPLIT_OP_CASES:
+            for breakable in (False, True):
+                with self.subTest(breakable=breakable):
+                    run_mla_split_op_extend_case(
+                        self,
+                        case,
+                        breakable=breakable,
+                        static_num_tokens=static_num_tokens,
+                        fp8_kv_cache=True,
+                        **MLA_SHAPE_KWARGS,
+                    )
+
+    def test_fp8_tbo_graph_replay_shares_shadow(self):
+        """TBO readers reuse one shadow without leaking rows between captured forwards."""
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+            FlashInferMLAAttnBackend,
+        )
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        case = self.CUDA_GRAPH_CASES[0]
+        fixture = build_mla_attention_fixture(
+            self,
+            case,
+            fp8_kv_cache=True,
+            disable_cuda_graph=False,
+            **MLA_SHAPE_KWARGS,
+        )
+        tbo = TboAttnBackend.init_new(lambda: FlashInferMLAAttnBackend(fixture.runner))
+        backends = [tbo.primary, *tbo.children]
+        reader = tbo.primary.fp8_kv_reader
+        for backend in backends:
+            self.assertIs(backend.fp8_kv_reader, reader)
+        capture_batch = fixture.forward_batch
+        hidden = [fixture.input_hidden.clone() for _ in backends]
+        for backend in backends:
+            _init_cuda_graph_capture_metadata(backend, case.batch_size, capture_batch)
+            _init_cuda_graph_replay_metadata(backend, case.batch_size, capture_batch)
+
+        def step():
+            outputs = []
+            for backend, inputs in zip(backends, hidden):
+                with forward_context(ForwardContext(attn_backend=backend)):
+                    outputs.append(fixture.actual_module(inputs, capture_batch))
+            return outputs
+
+        with torch.no_grad():
+            step()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = step()
+            shadow = reader._shadow
+            for lengths in ((3, 8, 16), (30, 1, 7), (14, 15, 16)):
+                replay_case = replace(case, prefix_lens=lengths)
+                batch = _make_forward_batch(
+                    replay_case, fixture.runner, max_context_len=64, device="cuda"
+                )
+                inputs = make_mla_random_inputs(
+                    replay_case, fixture, dtype=fixture.runner.dtype, device="cuda"
+                )
+                prepare_mla_runner_inputs(
+                    fixture, replay_case, batch, inputs, max_context_len=64
+                )
+                capture_batch.out_cache_loc.copy_(batch.out_cache_loc)
+                for backend in backends:
+                    _init_cuda_graph_replay_metadata(backend, case.batch_size, batch)
+                expected = []
+                for i, current_hidden in enumerate(hidden):
+                    current_hidden.copy_(inputs["input_hidden"] + i * 0.125)
+                    expected.append(
+                        expected_mla_output_from_inputs(
+                            fixture,
+                            replay_case,
+                            dict(inputs, input_hidden=current_hidden),
+                            None,
+                        )
+                    )
+                graph.replay()
+                for actual, reference in zip(outputs, expected):
+                    torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-2)
+                self.assertIs(reader._shadow, shadow)
 
     def test_runner_mode_eagle_verify_cases(self):
         for case, topk in self.EAGLE_VERIFY_CASES:

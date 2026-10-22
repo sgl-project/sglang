@@ -1,26 +1,4 @@
-"""Bounded FP8 -> query-dtype reads for the absorbed-MLA paged KV pool.
-
-When a FlashInfer MLA kernel requires matching query and KV dtypes, the backend
-must convert an FP8 KV cache. Previously, the attention backend used
-to upcast the *whole* per-layer pool (``get_key_buffer(...).to(q.dtype)``) on
-every layer of every forward, which costs O(pool size) memory and bandwidth and
-can OOM when the pool is large. These helpers convert only the rows that the
-current plan actually references.
-
-Two layouts are provided:
-
-* ``gather_mla_kv_rows`` (eager): copy the referenced rows into a compact
-  buffer of exactly ``len(kv_indices)`` rows (byte gather + cast). The caller
-  then plans the FlashInfer wrapper with ``kv_indices = arange(len(kv_indices))``.
-* ``refresh_mla_kv_shadow`` (CUDA-graph safe): rewrite the referenced rows of
-  a persistent, pool-indexed shadow buffer in place. Physical row ids are kept,
-  so a captured plan is still valid on replay. The grid is fixed and the number
-  of live entries is read on the device from ``kv_indptr[bs]``, so the same
-  launch can be replayed with different batch contents.
-
-Both convert the referenced FP8 values to the query dtype without changing
-their scaling.
-"""
+"""Compact FP8 MLA row gathers and capture-safe physical-row shadow refreshes."""
 
 from __future__ import annotations
 
@@ -81,14 +59,7 @@ def gather_mla_kv_rows(
     kv_indices: torch.Tensor,
     dst_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Return ``kv_buffer[kv_indices].to(dst_dtype)`` without materialising the pool.
-
-    ``kv_buffer`` has shape ``[pool_rows, 1, dim]``; the result has shape
-    ``[len(kv_indices), 1, dim]``. The indices are physical token rows. Rows are
-    gathered as raw bytes and then converted with the same ``.to()`` the old
-    full-pool path used, so the values are bit-identical; the only temporaries
-    are ``len(kv_indices)`` rows, never the pool.
-    """
+    """Gather physical rows as bytes, then convert to the query dtype."""
     src_dtype = kv_buffer.dtype
     rows = torch.index_select(kv_buffer.view(torch.uint8), 0, kv_indices)
     return rows.view(src_dtype).to(dst_dtype)
@@ -102,13 +73,7 @@ def refresh_mla_kv_shadow(
     num_programs: int = 1024,
     rows_per_program: int = 4,
 ) -> None:
-    """Convert ``kv_buffer[kv_indices[:n_live]]`` into ``shadow`` at the same rows.
-
-    ``n_live`` is a 1-element integer device tensor (normally
-    ``kv_indptr[bs:bs+1]``). The fixed launch grid means the call can be
-    captured in a CUDA graph and replayed with a different live count. Rows not
-    referenced in this step keep stale contents and are never read by the plan.
-    """
+    """Refresh physical rows; the live count is read on device during graph replay."""
     max_rows = kv_indices.numel()
     if max_rows == 0:
         return

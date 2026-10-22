@@ -249,6 +249,10 @@ class AttentionBackend(ABC):
         should override this hook for both capture and replay.
         """
 
+    def share_tbo_scratch(self, primary: AttentionBackend) -> None:
+        """Share scratch with the TBO primary; attention calls use one compute stream."""
+        pass
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
