@@ -1747,6 +1747,9 @@ class Envs:
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # DeepSeek-V4.1 ratio-1/2 index layers: pass bf16 head weights to the DeepGEMM fp4 logits
+    # kernels, which then reduce in bf16; needs SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.
+    SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

@@ -21,6 +21,11 @@ _LOGITS_DTYPE = (
     torch.bfloat16 if envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get() else torch.float32
 )
 _LOGITS_DTYPE_BYTES = _LOGITS_DTYPE.itemsize
+# DeepGEMM picks its reduce dtype from the head weights; bf16 weights need bf16 logits.
+_BF16_WEIGHTS = envs.SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16.get()
+assert not _BF16_WEIGHTS or _LOGITS_DTYPE == torch.bfloat16, (
+    "SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16 needs SGLANG_OPT_DSV41_BF16_INDEX_LOGITS"
+)
 # Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
 # DeepSelect reads past a row's end (DeepGEMM pads the stride but its tensor's storage ends at the last row)
 FLAT_LOGITS_WIDTH_ALIGN = 64
@@ -72,6 +77,8 @@ def flat_index_logits_tiles(
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
+    if _BF16_WEIGHTS:
+        weights = weights.to(torch.bfloat16)
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
