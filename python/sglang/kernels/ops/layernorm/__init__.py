@@ -118,3 +118,14 @@ for _op, _target, _backends in (
             )
         )
 del _op, _target, _backends, _bk
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.fused_kda_output_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.fused_kda_output_quant:fused_kda_output_quant",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
