@@ -849,6 +849,19 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
 )
 
 
+def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
+    """Whether the ratio-1/2 sources run as an eager break: inside a breakable graph
+    without the in-graph low-ratio path, or in a decoder tail graph."""
+    return (
+        forward_batch.forward_mode.is_extend()
+        and is_in_breakable_cuda_graph()
+        and (
+            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            or in_replay_tail_graph()
+        )
+    )
+
+
 def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     # Without the in-graph low-ratio path (SM90) the source compressor reads
     # per-request rows on the host, so it runs as an eager break over live rows.
@@ -2440,14 +2453,7 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and (
-                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
-                    or in_replay_tail_graph()
-                )
-            ):
+            if _low_ratio_sources_break(attn_backend, forward_batch):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
                 attn_backend.forward_low_ratio_sources(
@@ -3994,9 +4000,7 @@ class DeepseekV4Model(nn.Module):
                         source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)
-                    if is_in_breakable_cuda_graph() and not getattr(
-                        attn_backend, "low_ratio_prefill_graph", False
-                    ):
+                    if _low_ratio_sources_break(attn_backend, forward_batch):
                         bcg_deepseek_v4_write_tail_source_kv(
                             source.self_attn, source_x, positions
                         )
