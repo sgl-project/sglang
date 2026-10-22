@@ -983,7 +983,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return {}
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
-        host_index_cache = {} if is_set else None
+        host_index_cache = {} if is_set and len(buffer_requests) > 1 else None
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,
