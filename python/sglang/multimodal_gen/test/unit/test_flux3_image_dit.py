@@ -403,6 +403,10 @@ class TestFlux3ImageDiTContract(unittest.TestCase):
                 resolve_flux3_image_dit_quant_config("dit.safetensors", "convrot_int8")
 
         with mock.patch(metadata, return_value=None):
+            with self.assertRaisesRegex(
+                ValueError, "Invalid quantization method: kitchen_int8"
+            ):
+                resolve_flux3_image_dit_quant_config("dit.safetensors", "kitchen_int8")
             config = resolve_flux3_image_dit_quant_config(
                 "dit.safetensors",
                 "convrot_int8",

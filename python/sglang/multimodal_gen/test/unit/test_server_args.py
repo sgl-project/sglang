@@ -844,16 +844,6 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
         self.assertEqual(server_args.residency_mode("transformer"), COMPONENT_OFFLOAD)
         self.assertEqual(server_args.residency_mode("vae"), COMPONENT_OFFLOAD)
 
-    def test_removed_quantization_alias_is_rejected(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        with self.assertRaises(SystemExit) as exc:
-            parser.parse_args(
-                ["--model-path", "/fake", "--quantization", "kitchen_int8"]
-            )
-        self.assertEqual(exc.exception.code, 2)
-
     def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
             add_multimodal_gen_serve_args,
