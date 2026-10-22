@@ -59,7 +59,7 @@ else:
     )
     row_argmax = LazyImport("sglang.kernels.ops.speculative.row_argmax", "row_argmax")
     compute_dflash_correct_drafts_and_bonus = LazyImport(
-        "sglang.srt.speculative.dflash_utils",
+        "sglang.kernels.ops.speculative.dflash",
         "compute_dflash_correct_drafts_and_bonus",
     )
     softmax_temp_triton = LazyImport(
