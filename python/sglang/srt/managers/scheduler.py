@@ -168,6 +168,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RecoverElasticEPProgressOutput,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -2255,6 +2256,17 @@ class Scheduler(
                 output.submission_id,
                 output.responder_rank,
                 output.accepted,
+            )
+        elif isinstance(output, RecoverElasticEPReqOutput):
+            logger.info(
+                "[Elastic EP][recovery] reply_sent operation_id=%s "
+                "submission_id=%s responder_rank=%s accepted=%s "
+                "recovery_phase=%s",
+                output.operation_id,
+                output.submission_id,
+                output.responder_rank,
+                output.success,
+                output.recovery_phase,
             )
 
     @staticmethod
@@ -6109,11 +6121,25 @@ class Scheduler(
             RecoveryOperation,
         )
 
+        responder_rank = get_parallel().dp_rank
+        if responder_rank is None:
+            responder_rank = 0
+        self._send_recovery_progress(
+            recv_req, responder_rank, "scheduler_handler_entered"
+        )
+        logger.info(
+            "[Elastic EP][recovery] scheduler_entered operation_id=%s "
+            "submission_id=%s responder_rank=%s",
+            recv_req.operation_id,
+            recv_req.submission_id,
+            responder_rank,
+        )
         state = ElasticEPStateManager.instance()
         make_output = partial(
             RecoverElasticEPReqOutput,
             operation_id=recv_req.operation_id,
             submission_id=recv_req.submission_id,
+            responder_rank=responder_rank,
         )
         if state is None:
             return make_output(
@@ -6131,8 +6157,36 @@ class Scheduler(
             or recv_req.allocation_id,
         )
         try:
+            self._send_recovery_progress(
+                recv_req, responder_rank, "scheduler_store_started"
+            )
+            logger.info(
+                "[Elastic EP][recovery] store_started operation_id=%s "
+                "submission_id=%s responder_rank=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
             accepted = ElasticEPStateManager.request_recovery(operation)
+            self._send_recovery_progress(
+                recv_req, responder_rank, "scheduler_store_completed"
+            )
+            logger.info(
+                "[Elastic EP][recovery] store_completed operation_id=%s "
+                "submission_id=%s responder_rank=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
         except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "[Elastic EP][recovery] store_failed operation_id=%s "
+                "submission_id=%s responder_rank=%s error_type=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+                type(exc).__name__,
+            )
             return make_output(
                 success=False,
                 conflict=True,
@@ -6140,6 +6194,15 @@ class Scheduler(
                 recovery_phase=state.recovery_phase,
                 terminal=True,
             )
+        except Exception:
+            logger.exception(
+                "[Elastic EP][recovery] store_failed operation_id=%s "
+                "submission_id=%s responder_rank=%s error_type=unexpected",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
+            raise
         if not accepted:
             return make_output(
                 success=False,
@@ -6163,6 +6226,22 @@ class Scheduler(
             success=True,
             message=f"Recovery operation {recv_req.operation_id} is restoring.",
             recovery_phase=state.recovery_phase,
+        )
+
+    def _send_recovery_progress(
+        self,
+        recv_req: RecoverElasticEPReqInput,
+        responder_rank: int,
+        completed_stage: str,
+    ) -> None:
+        self.send_control_output(
+            RecoverElasticEPProgressOutput(
+                operation_id=recv_req.operation_id,
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+                completed_stage=completed_stage,
+            ),
+            recv_req,
         )
 
     def handle_observe_elastic_ep_membership(

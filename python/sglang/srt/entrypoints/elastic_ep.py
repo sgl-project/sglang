@@ -185,17 +185,31 @@ async def recover_elastic_ep(raw_request: Request):
 
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import RecoverElasticEPReqInput
+    from sglang.srt.managers.tokenizer_manager import RecoverySubmissionTimeout
 
-    result = await _global_state.tokenizer_manager.recover_elastic_ep(
-        RecoverElasticEPReqInput(
-            operation_id=operation_id,
-            runtime_instance_id="",
-            topology_generation=topology_generation,
-            allocation_id=allocation_id,
-            rank_offset=rank_offset,
-            failed_allocation_incarnation=failed_allocation_incarnation,
+    try:
+        result = await _global_state.tokenizer_manager.recover_elastic_ep(
+            RecoverElasticEPReqInput(
+                operation_id=operation_id,
+                runtime_instance_id="",
+                topology_generation=topology_generation,
+                allocation_id=allocation_id,
+                rank_offset=rank_offset,
+                failed_allocation_incarnation=failed_allocation_incarnation,
+            )
         )
-    )
+    except RecoverySubmissionTimeout as exc:
+        return ORJSONResponse(
+            {
+                "error": str(exc),
+                "operation_id": exc.operation_id,
+                "submission_id": exc.submission_id,
+                "elapsed_seconds": round(exc.elapsed_seconds, 3),
+                "last_completed_stage": exc.last_completed_stage,
+                "recovery_phase": exc.recovery_phase,
+            },
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+        )
     if not result.success:
         return ORJSONResponse(
             {

@@ -103,6 +103,7 @@ from sglang.srt.managers.io_struct import (
     ObserveElasticEPMembershipReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RecoverElasticEPProgressOutput,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
@@ -231,6 +232,18 @@ _MEMBERSHIP_OBSERVATION_STAGE_ORDER = {
         )
     )
 }
+_RECOVERY_SUBMISSION_STAGE_ORDER = {
+    stage: index
+    for index, stage in enumerate(
+        (
+            "tokenizer_dispatched",
+            "scheduler_handler_entered",
+            "scheduler_store_started",
+            "scheduler_store_completed",
+            "tokenizer_acknowledgement_received",
+        )
+    )
+}
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +267,26 @@ class MembershipObservationTimeout(TimeoutError):
         self.missing_ranks = sorted(set(expected_ranks) - set(received_ranks))
         self.last_completed_stage = last_completed_stage
         self.elapsed_seconds = elapsed_seconds
+
+
+class RecoverySubmissionTimeout(TimeoutError):
+    """The tokenizer could not determine whether recovery was admitted."""
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        submission_id: str,
+        last_completed_stage: str,
+        elapsed_seconds: float,
+        recovery_phase: str,
+    ) -> None:
+        super().__init__("Timed out waiting for the recovery scheduler quorum.")
+        self.operation_id = operation_id
+        self.submission_id = submission_id
+        self.last_completed_stage = last_completed_stage
+        self.elapsed_seconds = elapsed_seconds
+        self.recovery_phase = recovery_phase
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -990,6 +1023,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    RecoverElasticEPProgressOutput,
+                    self._record_recovery_submission_progress,
+                ),
                 (
                     ObserveElasticEPMembershipProgressOutput,
                     self._record_membership_observation_progress,
@@ -3934,23 +3971,96 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 failed_allocation_incarnation=obj.failed_allocation_incarnation,
                 submission_id=uuid.uuid4().hex,
             )
+            submission_id = scheduler_obj.submission_id
+            expected_ranks = [
+                rank
+                for rank, active in enumerate(self.elastic_active_rank_status)
+                if active
+            ]
+            started_at = time.monotonic()
+            logger.info(
+                "[Elastic EP][recovery] submission_started operation_id=%s "
+                "submission_id=%s expected_ranks=%s timeout_seconds=%.3f",
+                operation_id,
+                submission_id,
+                expected_ranks,
+                self.elastic_scheduler_response_timeout,
+            )
+            if not hasattr(self, "_recovery_submission_progress"):
+                self._recovery_submission_progress = {}
+            self._recovery_submission_progress[submission_id] = {
+                rank: "tokenizer_dispatched" for rank in expected_ranks
+            }
             self.auto_create_handle_loop()
             try:
-                responses: List[RecoverElasticEPReqOutput] = await asyncio.wait_for(
-                    self.recover_elastic_ep_communicator(scheduler_obj),
+                responses: List[
+                    RecoverElasticEPReqOutput
+                ] = await self.recover_elastic_ep_communicator(
+                    scheduler_obj,
                     timeout=self.elastic_scheduler_response_timeout,
                 )
+            except FanOutTimeoutError as exc:
+                if self.elastic_recovery_succeeded is not None:
+                    self._recovery_submission_progress.pop(submission_id, None)
+                    return self._current_elastic_recovery_output(operation_id)
+                progress_by_rank = self._recovery_submission_progress.pop(
+                    submission_id,
+                    {rank: "tokenizer_dispatched" for rank in expected_ranks},
+                )
+                for response in exc.partial_results:
+                    if response.responder_rank in progress_by_rank:
+                        progress_by_rank[response.responder_rank] = (
+                            "tokenizer_acknowledgement_received"
+                        )
+                last_completed_stage = (
+                    min(
+                        progress_by_rank.values(),
+                        key=_RECOVERY_SUBMISSION_STAGE_ORDER.__getitem__,
+                    )
+                    if progress_by_rank
+                    else "tokenizer_dispatched"
+                )
+                elapsed_seconds = time.monotonic() - started_at
+                self.elastic_recovery_phase = "submission_unknown"
+                logger.warning(
+                    "[Elastic EP][recovery] timed_out operation_id=%s "
+                    "submission_id=%s last_completed_stage=%s "
+                    "elapsed_seconds=%.3f",
+                    operation_id,
+                    submission_id,
+                    last_completed_stage,
+                    elapsed_seconds,
+                )
+                raise RecoverySubmissionTimeout(
+                    operation_id=operation_id,
+                    submission_id=submission_id,
+                    last_completed_stage=last_completed_stage,
+                    elapsed_seconds=elapsed_seconds,
+                    recovery_phase=self.elastic_recovery_phase,
+                ) from exc
             except BaseException:
+                self._recovery_submission_progress.pop(submission_id, None)
                 if self.elastic_recovery_succeeded is not None:
                     return self._current_elastic_recovery_output(operation_id)
                 self.elastic_recovery_phase = "submission_unknown"
                 raise
+            self._recovery_submission_progress.pop(submission_id, None)
             if self.elastic_recovery_succeeded is not None:
                 return self._current_elastic_recovery_output(operation_id)
             if not responses:
                 self.elastic_recovery_phase = "submission_unknown"
                 raise RuntimeError(
                     "Recovery submission returned no scheduler responses."
+                )
+            for response in responses:
+                logger.info(
+                    "[Elastic EP][recovery] acknowledgement_%s operation_id=%s "
+                    "submission_id=%s responder_rank=%s elapsed_seconds=%.3f",
+                    "received" if response.success else "rejected",
+                    operation_id,
+                    submission_id,
+                    response.responder_rank,
+                    time.monotonic() - started_at,
                 )
             failed = next(
                 (response for response in responses if not response.success), None
@@ -3965,6 +4075,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_recovery_phase = responses[0].recovery_phase
             responses[0].operation_id = operation_id
             return responses[0]
+
+    def _record_recovery_submission_progress(
+        self, progress: RecoverElasticEPProgressOutput
+    ) -> None:
+        submissions = getattr(self, "_recovery_submission_progress", {})
+        progress_by_rank = submissions.get(progress.submission_id)
+        if progress_by_rank is None or progress.responder_rank not in progress_by_rank:
+            return
+        if progress.completed_stage not in _RECOVERY_SUBMISSION_STAGE_ORDER:
+            logger.warning(
+                "[Elastic EP][recovery] progress_rejected operation_id=%s "
+                "submission_id=%s responder_rank=%s completed_stage=%s",
+                progress.operation_id,
+                progress.submission_id,
+                progress.responder_rank,
+                progress.completed_stage,
+            )
+            return
+        previous_stage = progress_by_rank[progress.responder_rank]
+        if (
+            _RECOVERY_SUBMISSION_STAGE_ORDER[progress.completed_stage]
+            > _RECOVERY_SUBMISSION_STAGE_ORDER[previous_stage]
+        ):
+            progress_by_rank[progress.responder_rank] = progress.completed_stage
+        logger.info(
+            "[Elastic EP][recovery] progress_received operation_id=%s "
+            "submission_id=%s responder_rank=%s completed_stage=%s",
+            progress.operation_id,
+            progress.submission_id,
+            progress.responder_rank,
+            progress.completed_stage,
+        )
 
     async def observe_elastic_ep_membership(
         self, obj: ObserveElasticEPMembershipReqInput

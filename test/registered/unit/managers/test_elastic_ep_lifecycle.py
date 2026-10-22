@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 import time
 import unittest
 import uuid
@@ -28,6 +29,9 @@ from sglang.srt.elastic_ep.elastic_ep import (
 from sglang.srt.entrypoints.elastic_ep import (
     observe_elastic_ep_membership as observe_elastic_ep_membership_endpoint,
 )
+from sglang.srt.entrypoints.elastic_ep import (
+    recover_elastic_ep as recover_elastic_ep_endpoint,
+)
 from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.data_parallel_controller import DataParallelController
@@ -37,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     ObserveElasticEPMembershipProgressOutput,
     ObserveElasticEPMembershipReqInput,
     ObserveElasticEPMembershipReqOutput,
+    RecoverElasticEPProgressOutput,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
@@ -47,6 +52,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.tokenizer_manager import (
     MembershipObservationTimeout,
+    RecoverySubmissionTimeout,
     TokenizerManager,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -521,6 +527,121 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         manager._dispatch_to_scheduler.assert_called_once_with(ranks)
 
+    async def test_recovery_traverses_real_zmq_control_route(self):
+        manager = _manager()
+        manager.elastic_worker_count = 2
+        manager.elastic_active_rank_status = [True, False]
+
+        context = zmq.Context()
+
+        def make_channel():
+            endpoint = f"inproc://recovery-{uuid.uuid4().hex}"
+            receiver = context.socket(zmq.PULL)
+            receiver.setsockopt(zmq.RCVTIMEO, 1000)
+            receiver.bind(endpoint)
+            sender = context.socket(zmq.PUSH)
+            sender.connect(endpoint)
+            return sender, receiver
+
+        tokenizer_to_dpc, dpc_receiver = make_channel()
+        dpc_to_scheduler, scheduler_receiver = make_channel()
+        scheduler_to_tokenizer, tokenizer_receiver = make_channel()
+
+        manager.send_to_scheduler = tokenizer_to_dpc
+        manager.tokenizer_ipc_name = None
+        del manager._dispatch_to_scheduler
+
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.workers = [dpc_to_scheduler, None]
+        controller.status = [True, False]
+        controller._active_workers = [0]
+        controller.control_message_step = 1
+        controller.init_dispatcher()
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.flush_wrapper = MagicMock()
+        scheduler.weight_updater = MagicMock()
+        scheduler.profiler_manager = MagicMock()
+        scheduler.rust_server = None
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SenderWrapper(scheduler_to_tokenizer)
+        )
+        scheduler.init_request_dispatcher()
+
+        with get_parallel().override(num_dp_ranks=2):
+            manager.init_request_dispatcher()
+        manager.recover_elastic_ep_communicator.set_fan_out(1)
+
+        state = SimpleNamespace(recovery_phase="restoring", recovery_succeeded=None)
+        try:
+            with (
+                patch.object(ElasticEPStateManager, "instance", return_value=state),
+                patch.object(
+                    ElasticEPStateManager, "request_recovery", return_value=True
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler.get_parallel",
+                    return_value=SimpleNamespace(dp_rank=0),
+                ),
+            ):
+                task = asyncio.create_task(
+                    manager.recover_elastic_ep(
+                        RecoverElasticEPReqInput(
+                            operation_id="recover-1",
+                            runtime_instance_id="ignored",
+                            topology_generation=3,
+                            allocation_id="pod-uid-5",
+                            rank_offset=1,
+                            failed_allocation_incarnation="failed-pod-uid",
+                        )
+                    )
+                )
+                await asyncio.sleep(0)
+
+                dpc_request = sock_recv(dpc_receiver)
+                self.assertIsInstance(dpc_request, RecoverElasticEPReqInput)
+                controller._request_dispatcher(dpc_request)
+
+                scheduler_request = sock_recv(scheduler_receiver)
+                self.assertIsInstance(scheduler_request, RecoverElasticEPReqInput)
+                scheduler_output = scheduler._request_dispatcher(scheduler_request)
+                scheduler.send_control_output(scheduler_output, scheduler_request)
+
+                received_stages = []
+                while True:
+                    tokenizer_output = sock_recv(tokenizer_receiver)
+                    manager._result_dispatcher(tokenizer_output)
+                    if isinstance(tokenizer_output, RecoverElasticEPProgressOutput):
+                        received_stages.append(tokenizer_output.completed_stage)
+                        continue
+                    self.assertIsInstance(tokenizer_output, RecoverElasticEPReqOutput)
+                    break
+
+                result = await task
+        finally:
+            for socket in (
+                tokenizer_to_dpc,
+                dpc_receiver,
+                dpc_to_scheduler,
+                scheduler_receiver,
+                scheduler_to_tokenizer,
+                tokenizer_receiver,
+            ):
+                socket.close(linger=0)
+            context.term()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.recovery_phase, "restoring")
+        self.assertEqual(result.submission_id, scheduler_request.submission_id)
+        self.assertEqual(
+            received_stages,
+            [
+                "scheduler_handler_entered",
+                "scheduler_store_started",
+                "scheduler_store_completed",
+            ],
+        )
+
     async def test_membership_observation_uses_active_survivor_quorum(self):
         """The observation itself must exclude the newly failed rank."""
         manager = _manager()
@@ -955,9 +1076,15 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     moe=SimpleNamespace(elastic_ep_backend="nixl")
                 ),
             ),
-            patch(
-                "sglang.srt.entrypoints.http_server._global_state",
-                SimpleNamespace(tokenizer_manager=tokenizer_manager),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.entrypoints.http_server": SimpleNamespace(
+                        _global_state=SimpleNamespace(
+                            tokenizer_manager=tokenizer_manager
+                        )
+                    )
+                },
             ),
         ):
             response = await observe_elastic_ep_membership_endpoint(request)
@@ -979,16 +1106,14 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_unknown_recovery_submission_is_reconciled(self):
         """A timed-out admission must be resubmitted with the same identity."""
         manager = _manager()
-        manager.recover_elastic_ep_communicator.side_effect = [
-            TimeoutError("response lost"),
-            [
-                RecoverElasticEPReqOutput(
-                    success=True,
-                    message="accepted",
-                    recovery_phase="restoring",
-                )
-            ],
-        ]
+        manager.elastic_active_rank_status = [True, False, False, False]
+        manager.elastic_scheduler_response_timeout = 0.01
+        sent = []
+        manager.recover_elastic_ep_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=1,
+            correlation_attr="submission_id",
+        )
         request = RecoverElasticEPReqInput(
             operation_id="recover-1",
             runtime_instance_id="ignored",
@@ -997,19 +1122,146 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
             rank_offset=2,
         )
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(RecoverySubmissionTimeout):
             await manager.recover_elastic_ep(request)
-        result = await manager.recover_elastic_ep(request)
+        first_submission_id = sent[0].submission_id
+
+        manager.elastic_scheduler_response_timeout = 1
+        retry = asyncio.create_task(manager.recover_elastic_ep(request))
+        await asyncio.sleep(0)
+        second_submission_id = sent[1].submission_id
+        manager.recover_elastic_ep_communicator.handle_recv(
+            RecoverElasticEPReqOutput(
+                success=True,
+                message="late attempt 1",
+                submission_id=first_submission_id,
+                responder_rank=0,
+                recovery_phase="restoring",
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(retry.done())
+        manager.recover_elastic_ep_communicator.handle_recv(
+            RecoverElasticEPReqOutput(
+                success=True,
+                message="attempt 2 accepted",
+                submission_id=second_submission_id,
+                responder_rank=0,
+                recovery_phase="restoring",
+            )
+        )
+        result = await retry
 
         self.assertTrue(result.success)
         self.assertEqual(result.recovery_phase, "restoring")
-        self.assertEqual(manager.recover_elastic_ep_communicator.await_count, 2)
+        self.assertNotEqual(first_submission_id, second_submission_id)
+
+    async def test_recovery_timeout_reports_cross_path_completed_stage(self):
+        manager = _manager()
+        manager.elastic_active_rank_status = [True, False, False, False]
+        manager.elastic_scheduler_response_timeout = 0.01
+        sent = []
+        manager.recover_elastic_ep_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=1,
+            correlation_attr="submission_id",
+        )
+
+        task = asyncio.create_task(
+            manager.recover_elastic_ep(
+                RecoverElasticEPReqInput(
+                    operation_id="recover-1",
+                    runtime_instance_id="ignored",
+                    topology_generation=3,
+                    allocation_id="pod-uid-5",
+                    rank_offset=1,
+                    failed_allocation_incarnation="failed-pod-uid",
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        manager._record_recovery_submission_progress(
+            RecoverElasticEPProgressOutput(
+                operation_id="recover-1",
+                submission_id=sent[0].submission_id,
+                responder_rank=0,
+                completed_stage="scheduler_store_started",
+            )
+        )
+
+        with self.assertRaises(RecoverySubmissionTimeout) as raised:
+            await task
+
+        self.assertEqual(raised.exception.operation_id, "recover-1")
+        self.assertEqual(raised.exception.submission_id, sent[0].submission_id)
+        self.assertEqual(
+            raised.exception.last_completed_stage, "scheduler_store_started"
+        )
+        self.assertEqual(raised.exception.recovery_phase, "submission_unknown")
+        self.assertGreater(raised.exception.elapsed_seconds, 0)
+
+    async def test_recovery_timeout_http_response_preserves_diagnostics(self):
+        request = SimpleNamespace(
+            json=AsyncMock(
+                return_value={
+                    "operation_id": "recover-1",
+                    "topology_generation": 3,
+                    "allocation_id": "pod-uid-5",
+                    "rank_offset": 1,
+                    "failed_allocation_incarnation": "failed-pod-uid",
+                }
+            )
+        )
+        tokenizer_manager = SimpleNamespace(
+            recover_elastic_ep=AsyncMock(
+                side_effect=RecoverySubmissionTimeout(
+                    operation_id="recover-1",
+                    submission_id="submission-1",
+                    last_completed_stage="scheduler_store_started",
+                    elapsed_seconds=30.001,
+                    recovery_phase="submission_unknown",
+                )
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.entrypoints.elastic_ep.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(elastic_ep_backend="nixl")
+                ),
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.entrypoints.http_server": SimpleNamespace(
+                        _global_state=SimpleNamespace(
+                            tokenizer_manager=tokenizer_manager
+                        )
+                    )
+                },
+            ),
+        ):
+            response = await recover_elastic_ep_endpoint(request)
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "error": "Timed out waiting for the recovery scheduler quorum.",
+                "operation_id": "recover-1",
+                "submission_id": "submission-1",
+                "elapsed_seconds": 30.001,
+                "last_completed_stage": "scheduler_store_started",
+                "recovery_phase": "submission_unknown",
+            },
+        )
 
     async def test_terminal_recovery_update_wins_over_late_acceptance(self):
         """A terminal update must not regress to the earlier admission phase."""
         manager = _manager()
 
-        async def complete_then_accept(request):
+        async def complete_then_accept(request, **kwargs):
             manager.forward_elastic_scale_update(
                 ElasticScaleUpdateReq(
                     success=True,
@@ -1139,6 +1391,7 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
             get_parallel().override(
                 attn_tp_size=1,
                 attn_cp_size=1,
+                dp_rank=0,
             )
         )
         self.store = _Store()
@@ -1510,6 +1763,8 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
 
     def test_conflicting_pending_recovery_is_terminal(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rust_server = None
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
         first = RecoverElasticEPReqInput(
             runtime_instance_id="runtime-1",
             topology_generation=3,
@@ -1534,6 +1789,8 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
 
     def test_scheduler_retries_same_recovery_without_conflict(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rust_server = None
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
         request = RecoverElasticEPReqInput(
             runtime_instance_id="runtime-1",
             topology_generation=3,
