@@ -290,3 +290,6 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+    def get_marlin_quant_info(self, layer: Module) -> MarlinMoeQuantInfo:
+        return build_marlin_moe_quant_info(layer)
