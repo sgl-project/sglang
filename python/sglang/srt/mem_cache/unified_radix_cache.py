@@ -2053,14 +2053,48 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
         ).page_aligned(self.page_size)
         if len(key) >= self.prefetch_threshold:
-            transfers = self._build_sidecar_transfers(
-                CacheTransferPhase.PREFETCH,
-                PoolTransfer(name=PoolName.KV, host_indices=None),
-                {},
+            comp_xfers = self._build_prefetch_component_transfers(
+                self.root_node_handle(req.extra_key), key, last_hash=None
+            )
+            transfers = [x for xfers in comp_xfers.values() for x in xfers]
+            transfers.extend(
+                self._build_sidecar_transfers(
+                    CacheTransferPhase.PREFETCH,
+                    PoolTransfer(name=PoolName.KV, host_indices=None),
+                    comp_xfers,
+                )
             )
             self.cache_controller.register_cache_query(
                 req.cache_request_handle, key, transfers
             )
+
+    def _build_prefetch_component_transfers(self, node_id, key, last_hash):
+        """Native component query descriptors; no staging allocation or I/O.
+
+        Both the shared root query and the local suffix query need the same
+        SWA window / Mamba state requirements, not just KV-derived sidecars.
+        """
+        comp_xfers = {}
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            prep = self.components[ct].prepare_prefetch(
+                node_id, prefetch_tokens=len(key)
+            )
+            if prep.staging_tokens == 0:
+                continue
+            transfers = self.tree_core.build_hicache_transfers(
+                ct,
+                node_id,
+                CacheTransferPhase.PREFETCH,
+                token_ids=key.token_ids,
+                prefetch_tokens=len(key),
+                staging_tokens=prep.staging_tokens,
+                last_hash=last_hash,
+            )
+            if transfers:
+                comp_xfers[ct] = transfers
+        return comp_xfers
 
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
@@ -2152,28 +2186,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
-            # Size the component's staging now; it is allocated at hit time,
-            # next to the KV staging, so the query holds no host memory.
-            prep = self.components[ct].prepare_prefetch(
-                last_host_node_id, prefetch_tokens=len(prefetch_key)
-            )
-            if prep.staging_tokens == 0:
-                continue
-            transfers = self.tree_core.build_hicache_transfers(
-                ct,
-                last_host_node_id,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                staging_tokens=prep.staging_tokens,
-                last_hash=last_hash,
-            )
-            if transfers:
-                comp_xfers[ct] = transfers
+        comp_xfers = self._build_prefetch_component_transfers(
+            last_host_node_id, prefetch_key, last_hash
+        )
         if buffer_mode and ComponentType.FULL in self.tree_components:
             transfers = self.components[ComponentType.FULL].build_hicache_transfers(
                 None,

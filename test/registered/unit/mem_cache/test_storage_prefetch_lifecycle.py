@@ -21,13 +21,15 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -300,6 +302,41 @@ class TestWaitingStorageSpan(unittest.TestCase):
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
+    def test_shared_query_keeps_native_swa_and_mamba_requirements(self):
+        cache, _, req = _staged_fixture()
+        cache.host_memory_mode = "cache"
+        cache.tree_core.has_swa_host_pool = cache.tree_core.enable_hicache = True
+        cache.tree_core.is_root = lambda node: node == 0
+        swa, mamba = (
+            SWAComponent.__new__(SWAComponent),
+            MambaComponent.__new__(MambaComponent),
+        )
+        for comp in (swa, mamba):
+            comp.cache, comp.tree_core = cache, cache.tree_core
+        swa.full_window_pages, swa._swa_kv_pool_host = 2, Mock()
+        cache.components = {ComponentType.SWA: swa, ComponentType.MAMBA: mamba}
+        cache.tree_components = [ComponentType.FULL, *cache.components]
+        cache.tree_core.build_hicache_transfers = lambda ct, node, phase, **kw: (
+            cache.components[ct].build_hicache_transfers(None, phase, **kw)
+        )
+        req.full_untruncated_fill_ids = array("q", range(9))
+        req._compute_max_prefix_len = lambda n: n - 1
+        cache.cache_controller.register_cache_query = Mock()
+        cache.register_pp_prefetch_query(req)
+        handle, key, transfers = (
+            cache.cache_controller.register_cache_query.call_args.args
+        )
+        self.assertEqual(handle, req.cache_request_handle)
+        self.assertEqual(len(key), 8)
+        self.assertEqual(
+            [(t.name, len(t.keys), t.hit_policy, t.host_indices) for t in transfers],
+            [
+                (PoolName.SWA, 2, PoolHitPolicy.TRAILING_PAGES, None),
+                (PoolName.MAMBA, 1, PoolHitPolicy.TRAILING_PAGES, None),
+            ],
+        )
+        swa._swa_kv_pool_host.alloc.assert_not_called()
+
     def test_async_readiness_uses_native_deadline_and_finalize(self):
         cache, operation = _timeout_fixture("cache")
         cache._all_reduce_attn_groups = Mock()

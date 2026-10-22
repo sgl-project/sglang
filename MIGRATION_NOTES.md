@@ -56,3 +56,19 @@ The buffer-mode ticket allocation/trim/GET path is retained.
   This is CPU regression coverage, not a full main dependency-matrix or GPU qualification.
 - No GPU, storage-service deployment or benchmark was run for this update.
   Earlier v0.5.22 performance/accuracy numbers do not validate this rebased code.
+
+## Hybrid query preparation (2026-10-22; not hybrid admission enablement)
+
+Shared root queries now reuse the native component transfer builder, including
+SWA trailing-window and Mamba state descriptors. Local prefetch uses that same
+builder; query construction performs no staging allocation or I/O. Native
+query MIN, sidecar key alignment, stop policies and all-or-nothing are unchanged.
+
+The SWA/Mamba admission guard remains. The current Gate still promises only FULL
+token capacity and may shorten a lease to a scalar MIN. Enabling hybrid models
+also requires multi-pool capacity/lock ownership and a common restorable endpoint;
+adding query descriptors alone does not establish either guarantee.
+
+Validation: 47 tests and 50 subtests passed in the CPU container above (storage
+lifecycle, upstream PP ticket and async admission suites), including a regression
+using native SWA/Mamba descriptor methods and real three-rank Gloo. No GPU test.
