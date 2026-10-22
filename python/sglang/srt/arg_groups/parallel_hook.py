@@ -65,6 +65,10 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    inkling = architecture in (
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
@@ -75,7 +79,9 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+    if (
+        nemotron or longcat or kimi_k3 or inkling
+    ) and cfg.enable_attn_tp_input_scattered:
         # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
@@ -311,6 +317,12 @@ def handle_data_parallelism(server_args: Any):
             "_handle_data_parallelism",
             schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
         )
+        if envs.SGLANG_RUST_SERVER.get():
+            declare_resolution(
+                server_args,
+                "_handle_data_parallelism",
+                enable_dp_attention_local_control_broadcast=True,
+            )
         assert cfg.tp_size % cfg.attn_dp_size == 0
         original_chunked_prefill_size = cfg.chunked_prefill_size
         declare_resolution(

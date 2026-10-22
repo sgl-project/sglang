@@ -472,6 +472,8 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -498,13 +500,11 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
                 else len(output_ids_)
             )
-            self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -513,14 +513,7 @@ class _GenerationStreamAccumulator:
         # already computed these and transferred them via the metadata buffer
         # (req.mm_*), so prefer the pre-stored values; otherwise compute them
         # from the request's multimodal items.
-        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
-            image_t = req.mm_image_tokens
-            audio_t = req.mm_audio_tokens
-            video_t = req.mm_video_tokens
-        elif req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.image_tokens.append(image_t)
         self.audio_tokens.append(audio_t)
         self.video_tokens.append(video_t)
