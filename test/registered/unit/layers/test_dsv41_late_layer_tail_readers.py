@@ -273,6 +273,51 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
+class TestTailSourceRows(CustomTestCase):
+    """An eager ratio-1/2 source break in the prefill graph's late-layer tail gets
+    the tail's live rows, while forward_batch still describes the whole extend."""
+
+    def test_eager_break_takes_the_leading_hoisted_rows(self):
+        extend, block = 1792, 1792
+        tail_pos = torch.arange(extend - SWA_WINDOW, extend)
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.tail_source_kv_layer_id = None
+        backend.low_ratios = (1, 2)
+        backend.prefill_candidates = object()
+        # The tail block: the live rows first, then padding rows.
+        backend.forward_metadata = SimpleNamespace(
+            low_ratio_req_indices=torch.cat(
+                [torch.full((SWA_WINDOW,), 3), torch.full((block - SWA_WINDOW,), 9)]
+            ),
+            low_ratio_pos_i64=torch.cat(
+                [tail_pos, torch.zeros(block - SWA_WINDOW, dtype=torch.int64)]
+            ),
+        )
+        seen = {}
+        backend._low_ratio_compress = lambda layer, x, req, pos, fb: seen.update(
+            req=req, pos=pos
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            encoder_swa_replay=False,
+            attn_cp_metadata=None,
+            req_pool_indices=torch.tensor([3]),
+            extend_seq_lens=torch.tensor([extend]),
+        )
+        with patch.object(
+            deepseek_v4_backend, "dsa_use_prefill_cp", return_value=False
+        ):
+            backend.forward_low_ratio_sources(
+                layer=SimpleNamespace(layer_id=20, compressor=object(), indexer=None),
+                x=torch.zeros(SWA_WINDOW, 4),
+                q_lora=None,
+                positions=tail_pos,
+                forward_batch=forward_batch,
+            )
+        self.assertTrue(torch.equal(seen["req"], torch.full((SWA_WINDOW,), 3)))
+        self.assertTrue(torch.equal(seen["pos"], tail_pos))
+
+
 def _prefill_graph_replay(*, any_context, seq_len):
     """The backend's default replayed-context limit and the widths a replay gives
     the full-row and tail metadata, for one request of ``seq_len`` tokens."""

@@ -3219,11 +3219,13 @@ class DeepseekV4AttnBackend(
         if (
             hoisted_req is not None
             and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
+            and hoisted_pos.shape[0] >= positions.shape[0]
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
+            # Bucket-sized under the prefill graph; an eager break sees only the
+            # live rows, which lead them. In the late-layer tail forward_batch
+            # still describes the full rows, so they cannot be rebuilt from it.
+            num_rows = positions.shape[0]
+            req, pos = hoisted_req[:num_rows], hoisted_pos[:num_rows]
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
