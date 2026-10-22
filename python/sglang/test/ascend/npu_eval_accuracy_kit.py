@@ -20,6 +20,7 @@ import hashlib
 import math
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import requests
@@ -72,10 +73,18 @@ def honor_local_sgl_eval_archive():
         local = archive_dir / url.rsplit("/", 1)[-1]
         expected = (expected_sha256 or "").lower()
         if expected and local.is_file() and _sha256_of(local) == expected:
-            # sgl_eval unlinks the path it gets back, so hand it a private copy.
             directory = Path(directory)
             directory.mkdir(parents=True, exist_ok=True)
-            staged = directory / local.name
+            # The staged copy must not reuse the archive's own name: a vendored
+            # prepare script copies it onto <work_dir>/<archive name>, and
+            # urlretrieve() truncates its target first, so an identically named
+            # staged file would be emptied before it is read. sgl_eval unlinks
+            # the path it gets back, so a temp name leaves nothing behind.
+            fd, staged_name = tempfile.mkstemp(
+                prefix=".sgl-eval-archive-", suffix=".tmp", dir=directory
+            )
+            os.close(fd)
+            staged = Path(staged_name)
             shutil.copyfile(local, staged)
             return staged
         return original(url, expected_sha256, directory)
