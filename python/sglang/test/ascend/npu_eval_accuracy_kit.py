@@ -16,6 +16,7 @@ Usage::
         gsm8k_accuracy_thres = 0.6
 """
 
+import math
 import os
 
 import requests
@@ -103,22 +104,34 @@ class NPUGSM8KMixin(GSM8KMixin):
             f"after {_NPU_MAX_ACCURACY_ATTEMPTS} attempts"
         )
 
+    def _resolve_relaxed_threshold(self) -> float:
+        """Return the GSM8K threshold with the NPU 1% tolerance applied.
+
+        ``gsm8k_score_threshold`` wins; the legacy ``gsm8k_accuracy_thres``
+        alias is used when it is unset (NaN). The relaxed value is cached, so
+        re-entering the test cannot compound the tolerance, and it is written
+        back to both attributes because the parent mixin reads it from there.
+        """
+        cached = getattr(self, "_npu_relaxed_threshold", None)
+        if cached is not None:
+            return cached
+
+        threshold = self.gsm8k_score_threshold
+        if math.isnan(threshold):  # canonical knob unset -> legacy alias
+            threshold = self.gsm8k_accuracy_thres
+        relaxed = threshold * _NPU_ACCURACY_TOLERANCE
+
+        self.gsm8k_score_threshold = relaxed
+        self.gsm8k_accuracy_thres = relaxed
+        self._npu_relaxed_threshold = relaxed
+        return relaxed
+
     def test_gsm8k(self):
         if _is_pr_pipeline:
             run_npu_pr_smoke(self.base_url)
             return
-        threshold = self.gsm8k_score_threshold
-        if threshold != threshold:  # NaN → legacy alias
-            threshold = self.gsm8k_accuracy_thres
-        relaxed = threshold * _NPU_ACCURACY_TOLERANCE
 
-        # Patch both so the parent picks up the relaxed threshold. Guard with a
-        # flag so outer retry layers (run_suite --enable-retry) re-entering
-        # test_gsm8k cannot compound the tolerance (0.83 -> 0.8217 -> 0.8135).
-        if not getattr(self, "_npu_threshold_relaxed", False):
-            self.gsm8k_score_threshold = relaxed
-            self.gsm8k_accuracy_thres = relaxed
-            self._npu_threshold_relaxed = True
+        relaxed = self._resolve_relaxed_threshold()
 
         if self.gsm8k_backend == "evalscope":
             self._test_gsm8k_evalscope(relaxed)
