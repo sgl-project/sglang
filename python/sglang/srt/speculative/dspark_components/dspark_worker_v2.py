@@ -1119,7 +1119,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             """
             self._verify_executor.commit_hidden:表示：图内没有完成的，这里补做一次。
             目标模型验证时，除了产生 logits，也产生了 hidden_states。草稿模型下一轮生成草稿时，需要利用这些目标模型特征。
-            所以需要将
+            所以commit_hidden() 利用hidden_states生成本轮预测的token所对应的 KV Cache，并存放到对应的显存池中 。
             """
             self._verify_executor.commit_hidden(
                 batch=batch,
@@ -1155,7 +1155,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-
+        """
+        
+        """
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,

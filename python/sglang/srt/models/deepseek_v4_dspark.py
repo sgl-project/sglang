@@ -886,6 +886,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
+    # 将目标模型 hidden 转换为草稿模型使用的特征
     def write_target_hidden_kv(
         self,
         *,
@@ -896,6 +897,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> None:
         main_x = self.project_target_hidden(main_hidden)
         swa_loc = swa_loc.to(torch.int32)
+
+        # 使用草稿模型各 stage 的 wkv 权重，计算 KV 投影
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],

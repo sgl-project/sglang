@@ -377,6 +377,9 @@ class TargetVerifyExecutor:
         run_compact: bool,
     ) -> None:
         if run_compact:
+            """
+            利用 hidden_staten(x) 计算生成草稿模型的 KV
+            """
             self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
