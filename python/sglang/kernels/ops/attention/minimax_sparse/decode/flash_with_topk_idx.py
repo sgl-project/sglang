@@ -22,9 +22,8 @@ from ..common.utils import (
 # kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
 _JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
 
-# Rows (verify rows x index heads per K head) per packed dot tile: the per-row
-# kernel's minimum tile (BLOCK_SIZE_H 16), so packing adds no MMA rows. Larger
-# groups stay on the per-row kernel.
+# Cap on verify rows x index heads per K head in one packed dot tile;
+# the per-row kernel's minimum BLOCK_SIZE_H, so packing adds no MMA rows.
 _PACKED_SCORE_MAX_ROWS = 16
 
 
@@ -308,8 +307,7 @@ def _decode_score_packed_kernel(
     pid_g = pid_gc % num_groups
     pid_c = pid_gc // num_groups
     pid_h = pid_kh * gqa_group_size
-    # tile row t = (row t // gqa_group_size, head t % gqa_group_size), so each K tile
-    # is read once per group
+    # Tile rows are the group's (verify row, head) pairs, so K is read once per group.
     off_t = tl.arange(0, BLOCK_SIZE_H)
     sub = off_t // gqa_group_size
     head = off_t % gqa_group_size
@@ -383,10 +381,10 @@ def _decode_score_packed_kernel(
         )
         if IS_FP8:
             k = k.to(q.dtype)
-        # Past its own length a row sees the group's later draft tokens: replace them
-        # with -inf rather than add it, which a non-finite dot would turn into NaN.
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+        # Past its own length a row sees the group's later draft tokens;
+        # mask them with tl.where, as adding -inf to a non-finite dot gives NaN.
         qk = tl.where((i + off_n)[None, :] < row_end[:, None], qk, float("-inf"))
         score = tl.reshape(
             qk,
@@ -991,14 +989,14 @@ def _topk_index_merge_kernel(
 
 
 def _num_kv_chunks(rows: int, num_kv_heads: int) -> int:
-    # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
-    # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
+    # NUM_KV_CHUNKS controls how many parallel chunks each (row, kv_head) gets.
+    # Total CTAs = rows * NUM_KV_CHUNKS * num_kv_heads.
     # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
-    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (BS * num_kv_heads), 1, MAX_NUM_KV_CHUNKS)
+    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (rows * num_kv_heads), 1, MAX_NUM_KV_CHUNKS)
     # then rounded down to the nearest power of 2 (merge kernel requires it).
-    # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
+    # Must only depend on cuda-graph-constant quantities (rows, num_kv_heads), not seq_len.
     # Empty chunks early-return cheaply, so over-chunking is nearly free.
-    # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
+    # E.g. with num_kv_heads=1: rows=1 -> NKC=256, CTAs=256; rows=32 -> NKC=128, CTAs=4096.
     TARGET_GRID = 4096
     MAX_NUM_KV_CHUNKS = 256
     target = max(
@@ -1058,9 +1056,8 @@ def _launch_decode_score_packed(
         score.stride(1),
         score.stride(2),
         PACK=packed_queries,
-        # One fixed config, within 13 % of the best BLOCK_SIZE_N x warps x stages
-        # choice on GB300. Autotune would tune on the verify graph warm-up's 1-token
-        # rows and pick per rank.
+        # Fixed config, within 13% of the best BLOCK_SIZE_N x warps x stages on GB300;
+        # autotune would pick per rank from the verify graph warm-up's 1-token rows.
         BLOCK_SIZE_N=max(128, block_size),
         NUM_KV_CHUNKS=num_chunks,
         SCORE_TYPE=score_type,

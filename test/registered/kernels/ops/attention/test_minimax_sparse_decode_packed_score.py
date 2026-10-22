@@ -34,9 +34,8 @@ DTYPES = {
     "fp8_k": (torch.float8_e4m3fn, torch.bfloat16),  # widening: bf16 q, fp8 index K
     "fp8_qk": (torch.float8_e4m3fn, torch.float8_e4m3fn),  # fp8 attn-GEMM mode
 }
-# The per-row reference autotunes ~27 configs per key. Pinning one keeps the file cheap,
-# and one unlike the packed kernel's 128 x 4 warps x 2 stages checks that max scores do
-# not depend on the tile shape (both lower to the same 16-row MMA).
+# Pinned to keep the file cheap, and unlike the packed kernel's fixed tile below;
+# max scores must not depend on the tile, as both kernels lower to the same 16-row MMA.
 REFERENCE_CONFIG = triton.Config({"BLOCK_SIZE_N": 256}, num_warps=8, num_stages=3)
 PACKED_TILE_CONFIG = triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, num_stages=2)
 
@@ -207,14 +206,13 @@ def test_packed_matches_per_row(prefixes, gqa, dtypes, dense, q_row_pad):
 @pytest.mark.parametrize("init,local", [(0, 0), (0, 1), (2, 0), (2, 1)])
 @pytest.mark.parametrize("blk", [64, 128])
 def test_masks_without_local_cover(init, local, blk):
-    """With local_blocks 0 a row's partial last block rests on its own length mask.
-    q >= 0 and large K at the group's later draft positions raise that block's score
-    for any row that reads past its own length (e.g. a group-length mask)."""
+    """With local_blocks 0 a row's partial last block rests on its own length mask."""
     # Every row has more than top-k blocks, so the consumer reads every score.
     prefixes = [2 * TOPK * blk + 5, 3 * TOPK * blk - 2, 5 * TOPK * blk + blk - 3]
     case = _Case(
         prefixes, 1, DTYPES["bf16"], blk=blk, init=init, local=local, max_context=16384
     )
+    # q >= 0 and large K on the later drafts expose any row that reads past its length.
     case.q = case.q.abs()
     for g, prefix in enumerate(prefixes):
         case.k_cache[case.req_to_token[g, prefix + 1 : prefix + NDT].long()] = 4.0
