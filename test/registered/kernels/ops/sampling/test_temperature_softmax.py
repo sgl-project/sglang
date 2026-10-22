@@ -35,6 +35,8 @@ class TestTemperatureSoftmax(CustomTestCase):
             (7, 65537),
             (32, 128257),
             (33, 4096),
+            (48, 154880),
+            (384, 154880),
         ):
             with self.subTest(rows=rows, vocab_size=vocab_size):
                 logits = torch.randn(
@@ -55,7 +57,7 @@ class TestTemperatureSoftmax(CustomTestCase):
             [0, vocab_size // 2, vocab_size - 1], device="cuda", dtype=torch.long
         )
 
-        for rows in (1, 3, 16, 32):
+        for rows in (1, 3, 16, 32, 384):
             with self.subTest(rows=rows):
                 logits = torch.full(
                     (rows, vocab_size),
