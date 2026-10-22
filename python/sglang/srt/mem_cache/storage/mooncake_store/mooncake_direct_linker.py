@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
 import torch
@@ -159,6 +160,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-load-tp{tp_rank}",
         )
         self.load_thread.start()
+        self.session_executor = ThreadPoolExecutor(
+            max_workers=len(self.pools),
+            thread_name_prefix=f"mooncake-session-tp{tp_rank}",
+        )
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -312,6 +317,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
+    def _start_get_session(self, keys: list[str]) -> None:
+        result = self.storage.store.batch_get_session_start(keys)
+        if list(result) != [0] * len(keys):
+            raise RuntimeError(
+                f"Mooncake get session start failed: keys={len(keys)}, results={result}"
+            )
+
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
@@ -330,14 +342,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
+            # Each pool's session start is a separate master RPC; issue them together.
+            session_futures = [
+                (keys, self.session_executor.submit(self._start_get_session, keys))
+                for keys, _ in batches.values()
+            ]
+            failure = None
+            for keys, future in session_futures:
+                try:
+                    future.result()
+                except BaseException as error:
+                    failure = failure or error
+                    continue
                 started.append(keys)
+            if failure is not None:
+                raise failure
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -436,6 +455,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        self.session_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:
