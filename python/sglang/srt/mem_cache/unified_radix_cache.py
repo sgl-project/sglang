@@ -2044,7 +2044,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def register_pp_prefetch_query(self, req):
         # One common root span: local L1/L2 matches can differ across stages.
-        # Only the query uses this span; GET retains each stage's native suffix.
+        # Query MIN sees only L3, not max(local_match, L3) or a local suffix.
+        # Register even when this stage needs no GET; peers may still need one.
         end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
         key = RadixKey(
             req.full_untruncated_fill_ids[:end],

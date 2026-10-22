@@ -21,6 +21,16 @@ resident L1/L2 prefixes differ. The result is clipped to each local operation's
 missing suffix and handed to the native hit queue. The existing ticket state
 handles both arrival orders; the worker never waits for the downstream request.
 
+Chosen minimal contract (2026-10-22): `S_min = MIN(S_i)`, where `S_i` is the
+root-relative L3 query result. No local L1/L2 length is included in that vote:
+neither `MIN(A_i + B_i)` nor `MIN(max(A_i, S_i))` is introduced. PP0 still
+submits the shared task when it has no local GET. After query agreement, each
+stage clips GET to its missing suffix; resident cache is not truncated by
+`S_min`. A storage miss on one stage can conservatively suppress useful GETs
+on peers; this is an accepted hit-rate tradeoff, not a new retry mechanism.
+The existing Gloo regression distinguishes this storage-only MIN from a combined
+local/storage vote, and covers PP0 submitting a task without a local GET.
+
 Cache allocation/eviction, GET and ACK publication remain native. Completion
 groups include only stage-local TP/CP; **no cross-PP completion all-reduce is
 restored**. The existing PPAdmissionGate still performs readiness, protected

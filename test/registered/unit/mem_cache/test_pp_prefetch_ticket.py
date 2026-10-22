@@ -64,8 +64,10 @@ def _cache_query_ranks(rank, rendezvous):
         c._all_reduce.side_effect = lambda tensor, op, groups: (
             torch.distributed.all_reduce(tensor, op=op, group=groups[0])
         )
+        # S_min=12, not MIN(max(A, S))=20: local reuse is not a query vote.
+        local_start = (24, 8, 16)[rank]
         c._storage_hit_query.side_effect = lambda op: case.query_hits(
-            op, 0 if op.request_id == "miss" and rank == 1 else 20 if rank == 2 else 32
+            op, 0 if op.request_id == "miss" and rank == 1 else (12, 32, 20)[rank]
         )
         with patch(
             f"{HybridCacheController.__module__}.pp_cache_admission_enabled",
@@ -74,27 +76,31 @@ def _cache_query_ranks(rank, rendezvous):
             if rank == 0:
                 for rid in ("hit", "miss"):
                     case.register_cache_query(rid)
-                local = case.bind_cache_query("hit")
-                missed = case.bind_cache_query("miss")
+                local = case.bind_cache_query("hit", start=local_start)
+                # PP0 submits "miss" even without a local prefetch operation.
                 c.pp_prefetch_command_queue.put(None)
             c.pp_prefetch_command_thread_func()
             if rank != 0:
                 # The shared query arrived before this stage's native request.
                 case.register_cache_query("hit")
-                local = case.bind_cache_query("hit")
+                local = case.bind_cache_query("hit", start=local_start)
                 if rank != 2:
                     missed = case.bind_cache_query("miss")
             assert c.prefetch_hit_queue.get_nowait() is local
-            assert local.storage_hit_count == 12  # root MIN20 - local anchor8
+            assert c.pp_prefetch_states["hit"].operation.storage_hit_count == 12
+            expected_suffix = (0, 4, 0)[rank]
+            assert local.storage_hit_count == expected_suffix
             assert (
                 local.all_hash_values
-                == c.pp_prefetch_states["hit"].operation.all_hash_values[2:]
+                == c.pp_prefetch_states["hit"].operation.all_hash_values[
+                    local_start // 4 :
+                ]
             )
-            assert local.hash_value == local.all_hash_values[:3]
-            if rank != 2:
+            assert local.hash_value == local.all_hash_values[: expected_suffix // 4]
+            if rank == 1:
                 assert c.prefetch_hit_queue.get_nowait() is missed
                 assert missed.storage_hit_count == 0
-            # Rank2 joined the second query without needing a local GET.
+            # PP0 and PP2 joined the second query without a local GET.
             assert c.prefetch_hit_queue.empty()
             assert c.pp_prefetch_states["miss"].ready_event.is_set()
             c.mem_pool_host.alloc.assert_not_called()
@@ -233,13 +239,13 @@ class TestPPPrefetchTicket(unittest.TestCase):
         )
         return self.c.pp_prefetch_states[rid].ticket
 
-    def bind_cache_query(self, rid="hit"):
+    def bind_cache_query(self, rid="hit", *, start=8):
         return self.c.submit_prefetch(
             CacheRequestHandle(rid, 0),
-            RadixKey(array("q", range(8, 32))),
+            RadixKey(array("q", range(start, 32))),
             "anchor",
             None,
-            list(range(8)),
+            list(range(start)),
             [],
             assume_stored=True,
         ).operation

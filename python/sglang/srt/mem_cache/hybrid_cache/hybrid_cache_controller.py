@@ -1182,6 +1182,8 @@ class HybridCacheController(BaseHiCacheController):
         if state.release_requested or operation.is_terminated():
             return
         query = state.operation
+        # The shared root query already agreed S_min. Subtract the local anchor
+        # only here: zero suffix work does not invalidate resident L1/L2 hits.
         start = operation.storage_start // self.page_size
         pages = len(operation.token_ids) // self.page_size
         hit = max(
