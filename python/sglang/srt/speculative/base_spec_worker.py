@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 class HiCacheDraftMode(str, Enum):
     NONE = "none"
+    FUSED = "fused"
     PACKED = "packed"
     SIDECAR = "sidecar"
 
@@ -279,6 +280,26 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        from sglang.srt.mem_cache.unified_draft_pool import (
+            UnifiedDraftKVPool,
+            fused_draft_host_allocator,
+        )
+
+        if any(fused_draft_host_allocator(pool) is not None for pool in draft_pools):
+            if not (
+                spec_algorithm.is_dflash()
+                and len(draft_pools) == 1
+                and isinstance(draft_pools[0], UnifiedDraftKVPool)
+                and draft_pools[0]._host_sub_pool_name == "full"
+            ):
+                raise NotImplementedError(
+                    "HiCache fused draft KV requires a full-attention DFLASH draft."
+                )
+            # The target's page envelopes already carry every draft layer.
+            # Packing or adding a sidecar would back up the same bytes twice.
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
+            )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = getattr(
@@ -321,6 +342,16 @@ class BaseSpecWorker(ABC):
 
     def init_hicache_draft_plan(self) -> None:
         self._hicache_draft_plan = self._build_hicache_draft_plan()
+
+    def _wait_for_fused_hicache_load(self, batch) -> None:
+        if (
+            self.hicache_draft_plan.mode == HiCacheDraftMode.FUSED
+            and batch.hicache_consumer_index >= 0
+        ):
+            counter = self.target_worker.hicache_layer_transfer_counter
+            # A draft's layer ids do not identify target transfer events. Wait
+            # before dispatch so CUDA graph replay observes this dependency too.
+            counter.events[batch.hicache_consumer_index].wait(counter.num_layers - 1)
 
     def alloc_memory_pool(
         self,

@@ -1755,6 +1755,35 @@ def build_swa_draft_pools(
     return [spec], [entry]
 
 
+def validate_fused_hicache_draft(
+    *,
+    draft_device_pools: tuple[Any, ...],
+    tree_cache: Any,
+) -> None:
+    """Fused draft KV is restored by its target's complete page envelope."""
+    from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+
+    entries = tree_cache.cache_controller.mem_pool_host.entry_map
+    if any(
+        name not in entries
+        or not isinstance(entries[name].host_pool, UnifiedPageEnvelopeHostPool)
+        for name in (PoolName.KV, PoolName.SWA)
+    ):
+        raise NotImplementedError(
+            "Fused DFLASH HiCache requires unified hybrid-SWA page-envelope host "
+            "pools; the selected storage backend or host layout does not preserve "
+            "the fused draft bytes."
+        )
+    target = entries[PoolName.KV].device_pool
+    if len(draft_device_pools) != 1 or not all(
+        isinstance(pool, UnifiedDraftKVPool)
+        and pool._host_sub_pool_name == "full"
+        and pool._unified_buffer is target._unified_buffer
+        for pool in draft_device_pools
+    ):
+        raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
+
+
 def build_hicache_draft_sidecars(
     *,
     draft_device_pools: tuple[Any, ...],

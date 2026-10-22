@@ -326,12 +326,12 @@ class TestDraftBindingDispatch(CustomTestCase):
             self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
     def test_a_draft_kv_dtype_unlike_the_region_refuses_to_bind(self):
-        """The region stores the target's KV dtype, every fp8 flavor as uint8:
-        a draft resolving the target's fp8 binds a pool that casts to it, and
+        """The region stores its declared KV dtype, every fp8 flavor as uint8:
+        a draft resolving the region's fp8 binds a pool that casts to it, and
         one resolving another dtype refuses instead of reading the rows as
         that dtype."""
         bf16 = self._swa_allocator(with_draft_region=True)
-        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+        with self.assertRaisesRegex(ValueError, "dtype used to size its fused region"):
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=bf16,
@@ -349,7 +349,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         self.assertEqual(pools.token_to_kv_pool.dtype, torch.float8_e4m3fn)
         self.assertEqual(pools.token_to_kv_pool.store_dtype, torch.uint8)
-        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+        with self.assertRaisesRegex(ValueError, "dtype used to size its fused region"):
             self._run(
                 algorithm=SpeculativeAlgorithm.EAGLE3,
                 alloc=alloc,
