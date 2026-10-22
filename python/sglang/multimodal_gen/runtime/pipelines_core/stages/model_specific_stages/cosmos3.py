@@ -76,7 +76,11 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    preprocess_image,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_compiler_backend
 
@@ -301,7 +305,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         max_frames: int,
     ) -> torch.Tensor:
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
-        frames = load_video(control_path)
+        frames = load_video(control_path, max_frames=max_frames)
         if not frames:
             raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
         frames = frames[:max_frames]
@@ -465,8 +469,16 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             tensors: list[torch.Tensor] = []
             for src in image_sources:
                 image = load_image(src)
-                image = _resize_crop_pil(image, target_w, target_h)
-                tensors.append(_pil_to_normalized_tensor(image))
+                scale = max(target_w / image.width, target_h / image.height)
+                width, height = math.ceil(scale * image.width), math.ceil(scale * image.height)
+                tensors.append(
+                    preprocess_image(
+                        image,
+                        device=get_local_torch_device(),
+                        sizes=((width, height),),
+                        crop=((height - target_h) // 2, (width - target_w) // 2, target_h, target_w),
+                    )[0].contiguous()
+                )
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
             self.log_info(
                 f"Preprocessed {len(tensors)} conditioning image(s) to "

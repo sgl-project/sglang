@@ -49,8 +49,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.vision import (
     normalize,
-    numpy_to_pt,
-    pil_to_numpy,
+    preprocess_image,
 )
 
 logger = init_logger(__name__)
@@ -1105,8 +1104,7 @@ class ImageVAEEncodingStage(PipelineStage):
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
         if isinstance(image, PIL.Image.Image):
-            image = pil_to_numpy(image)  # to np
-            image = numpy_to_pt(image)  # to pt
+            return preprocess_image(image, device=get_local_torch_device())
 
         do_normalize = True
         if image.min() < 0:
