@@ -3,11 +3,11 @@ name: PR Test (NPU)
 on:
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
-#  pull_request:
-#   branches:
-#     - main
-#     - 'npu/**'
-#     - 'npu-*'
+  pull_request:
+   branches:
+     - main
+     - 'npu/**'
+     - 'npu-*'
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -733,7 +733,19 @@ jobs:
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --precision-mode "${PRECISION_MODE}" \
             --github-output "${GITHUB_OUTPUT}" \
-            --github-summary "${GITHUB_STEP_SUMMARY:-}"
+            --github-summary "${GITHUB_STEP_SUMMARY:-}" \
+            --report-file recommended-tests-report.md
+
+      # Same report as the step summary, downloadable from the run page.
+      - name: Upload recommended tests report
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recommended-tests-report
+          path: recommended-tests-report.md
+          if-no-files-found: warn
+          retention-days: 7
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to the shared disk.

@@ -25,6 +25,8 @@ callers treat as "run the full suite".
 When --github-summary points at $GITHUB_STEP_SUMMARY, a markdown section is
 appended with the recommended test cases, counts, per-suite buckets, and the
 files that matched no suite pool (not run by the bucketed a3 suites).
+--report-file writes the same section to a plain file (e.g. for artifact
+upload, so the report is downloadable from the run page).
 
 Usage:
     python3 bucket_recommended_tests.py \
@@ -32,7 +34,8 @@ Usage:
         --suites base-a-test-npu,base-b-test-1-npu-a3 \
         --precision-mode true \
         --github-output "$GITHUB_OUTPUT" \
-        --github-summary "$GITHUB_STEP_SUMMARY"
+        --github-summary "$GITHUB_STEP_SUMMARY" \
+        --report-file recommended-tests-report.md
 """
 
 import argparse
@@ -82,7 +85,7 @@ def enumerate_suite_files(suite: str, work_dir: Path) -> list:
 
 
 def write_github_summary(
-    summary_file: str,
+    target_files: list,
     raw_entries: list,
     recommended: set,
     all_pool: set,
@@ -91,8 +94,8 @@ def write_github_summary(
     precision_mode: bool,
     skip_all_suites: bool = False,
 ) -> None:
-    """Append a markdown section with the recommendation results to the
-    GitHub Actions step summary ($GITHUB_STEP_SUMMARY)."""
+    """Append a markdown section with the recommendation results to every
+    target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
     unbucketed = sorted(recommended - all_pool)
     lines = []
     lines.append("### Recommended tests from coverage")
@@ -166,9 +169,10 @@ def write_github_summary(
             lines.extend(f"- {f}" for f in files)
             lines.append("")
         lines.append("</details>")
-    with open(summary_file, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"Summary written to: {summary_file}")
+    for target in target_files:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"Summary written to: {target}")
 
 
 def main():
@@ -212,6 +216,13 @@ def main():
         type=str,
         default="",
         help="GITHUB_STEP_SUMMARY file to append a markdown report to (empty = skip)",
+    )
+    parser.add_argument(
+        "--report-file",
+        type=str,
+        default="",
+        help="Also write the markdown report to this file, e.g. for artifact "
+        "upload (empty = skip)",
     )
     args = parser.parse_args()
 
@@ -314,9 +325,9 @@ def main():
                 )
                 out.write(f"should_run_{key}={should_run}\n")
 
-    if args.github_summary:
+    if args.github_summary or args.report_file:
         write_github_summary(
-            args.github_summary,
+            [p for p in (args.github_summary, args.report_file) if p],
             raw_entries,
             recommended,
             all_pool,
