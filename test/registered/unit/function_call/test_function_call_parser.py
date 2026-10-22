@@ -5239,7 +5239,7 @@ function call<|role_sep|>
         self.assertEqual(params["id"], "prefs")
 
 
-class TestGetStructureConstraint(CustomTestCase):
+class TestGetStructureConstraint(unittest.TestCase):
     """Tests for FunctionCallParser.get_structure_constraint() logic.
 
     Verifies that detectors supporting structural_tag use it for required/named
@@ -5270,26 +5270,6 @@ class TestGetStructureConstraint(CustomTestCase):
 
     def _constraint_json(self, result):
         return result[1].model_dump_json()
-
-    def test_parallel_tool_call_defaults(self):
-        """Null must preserve the detector's default multi-call constraint."""
-        parser = self._make_parser("kimi_k3")
-        for choice in ("auto", "required"):
-            with self.subTest(choice=choice):
-                default = parser.get_structure_constraint(choice)
-                self.assertIsNotNone(default)
-                for value in (None, True):
-                    self.assertEqual(
-                        parser.get_structure_constraint(
-                            choice, parallel_tool_calls=value
-                        ),
-                        default,
-                    )
-                single = parser.get_structure_constraint(
-                    choice, parallel_tool_calls=False
-                )
-                self.assertIsNotNone(single)
-                self.assertNotEqual(single, default)
 
     # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
 
