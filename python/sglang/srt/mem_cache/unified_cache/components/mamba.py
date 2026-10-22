@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
@@ -38,6 +39,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     get_and_increase_time_counter,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BaseEvictionResult,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -232,8 +236,8 @@ class MambaComponent(TreeComponent):
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
-            self.tree_core.component_evictable_size_[self.component_type] += len(
-                params.mamba_value
+            self.tree_core.component_evictable_size_[self.component_type] += (
+                self.reclaimable_value_len(node)
             )
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
@@ -263,6 +267,7 @@ class MambaComponent(TreeComponent):
         tail: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow eligible device checkpoints beyond the path cap.
 
@@ -302,8 +307,16 @@ class MambaComponent(TreeComponent):
                 host_frees,
                 target=EvictLayer.DEVICE,
                 tracker=tracker,
+                cache_actions=cache_actions,
             )
-            self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+            self.tree_core._cascade_evict(
+                node,
+                self,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions=cache_actions,
+            )
             excess -= 1
 
     def redistribute_on_node_split(
@@ -323,6 +336,7 @@ class MambaComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -332,7 +346,7 @@ class MambaComponent(TreeComponent):
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
-            freed = len(cd.value)
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
 
@@ -373,6 +387,7 @@ class MambaComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
@@ -427,9 +442,15 @@ class MambaComponent(TreeComponent):
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            x,
+            self,
+            tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         if enabled:
             self._evict_device_cursor = lru.cursor_next()
@@ -463,7 +484,7 @@ class MambaComponent(TreeComponent):
             cd.host_lock_ref += 1
         else:
             if cd.lock_ref == 0 and value is not None:
-                vlen = len(value)
+                vlen = self.reclaimable_value_len(node)
                 self.tree_core.component_evictable_size_[ct] -= vlen
                 self.tree_core.component_protected_size_[ct] += vlen
             cd.lock_ref += 1
@@ -496,17 +517,36 @@ class MambaComponent(TreeComponent):
 
         assert cd.lock_ref > 0, f"Mamba release hit lock_ref=0 on node {node.id}"
         if cd.lock_ref == 1 and value is not None:
-            vlen = len(value)
+            vlen = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] += vlen
             self.tree_core.component_protected_size_[ct] -= vlen
         cd.lock_ref -= 1
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
+    def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
+            if req is not None and get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                lock = req.lock
+                ct = self.component_type
+                if (
+                    lock is not None
+                    and not lock.swa_released
+                    and ct not in lock.receipt.skipped_lock_components
+                ):
+                    # Prefill has consumed the COW source; retain only its KV locks.
+                    self.cache.dec_lock_ref(
+                        lock.node,
+                        replace(
+                            lock.receipt,
+                            skipped_lock_components=tuple(
+                                c for c in self.cache.tree_components if c != ct
+                            ),
+                        ),
+                    )
+                    lock.receipt.skipped_lock_components += (ct,)
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
@@ -610,7 +650,7 @@ class MambaComponent(TreeComponent):
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
+                    new_slot = self._alloc_mamba_slot(req)
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -623,14 +663,14 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
+                new_slot = self._alloc_mamba_slot(req)
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = self._alloc_mamba_slot(req)
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
@@ -692,9 +732,62 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            # One state per node, valid only at the node's end boundary.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = self._alloc_mamba_slot()
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+    ) -> Optional[PoolTransfer]:
+        pool = self.cache.req_to_token_pool
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            pool.mamba_allocator.free(transfer.device_indices)
+            return None
+
+        assert phase == ExternalLinkerLoadPhase.PREPARE
+        if req.kv.holds_mamba:
+            pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        # The layer-gated load writes the request's private state directly.
+        req.kv.mamba_pool_idx = transfer.device_indices[0]
+        self._adopt_loaded_state(req)
+        return transfer
+
+    def _adopt_loaded_state(self, req: Req) -> None:
+        # A loaded state supersedes the replay cursor and the deferred CoW/clear.
+        pool = self.cache.req_to_token_pool
+        write_pos = pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            slot = req.kv.mamba_pool_idx.unsqueeze(0)
+            write_pos[pool.translate_mamba_indices(slot)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 
@@ -922,6 +1015,7 @@ class MambaComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict mamba host resources.
         Internal nodes: private tombstone (free host mamba only).
@@ -942,7 +1036,9 @@ class MambaComponent(TreeComponent):
                 not enabled or self._can_evict_leaf_atomically(x)
             ):
                 # Host leaf: atomic eviction (all components host + delete)
-                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+                self.tree_core._evict_host_leaf(
+                    x, tracker, device_frees, host_frees, cache_actions=cache_actions
+                )
             else:
                 # Internal (or a leaf a session still pins): tombstone Mamba + cascade
                 assert cd.host_value is not None
@@ -953,6 +1049,7 @@ class MambaComponent(TreeComponent):
                     tracker=tracker,
                     device_frees=device_frees,
                     host_frees=host_frees,
+                    cache_actions=cache_actions,
                 )
                 self.tree_core._cascade_evict(
                     x,
@@ -961,6 +1058,7 @@ class MambaComponent(TreeComponent):
                     device_frees=device_frees,
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
+                    cache_actions=cache_actions,
                 )
                 self.tree_core._update_evictable_leaf_sets(x)
             if enabled:
@@ -978,16 +1076,18 @@ class MambaComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
-            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            result = BaseEvictionResult()
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
-                    action.tail_node_id, device_frees, host_frees
+                    action.tail_node_id,
+                    result.device_frees,
+                    result.host_frees,
+                    result.cache_actions,
                 )
             finally:
-                self.cache._free_values(device_frees, host_frees)
+                self.cache._apply_eviction_result(result)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
@@ -1035,14 +1135,7 @@ class _MambaBufferLoadBackContext(BufferLoadBackContext):
         if not success:
             self.component.finalize_load_back(req, self.prep, success=False)
             return
-        # The H2D supersedes the replay cursor and the deferred CoW/clear.
-        req_to_token_pool = self.component.cache.req_to_token_pool
-        write_pos = req_to_token_pool.mamba_pool.replayssm_write_pos
-        if write_pos is not None:
-            slot = req.kv.mamba_pool_idx.unsqueeze(0)
-            write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_needs_clear = False
+        self.component._adopt_loaded_state(req)
 
     def get_insert_fields(self) -> dict[str, torch.Tensor]:
         return {"mamba_value": self.node_copy.device_indices}
