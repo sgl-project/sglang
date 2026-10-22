@@ -1043,11 +1043,11 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
-    # Eager extend: each low ratio's index-K slots (scoring.prefill_k_slots),
-    # shared with the late-layer tail metadata.
+    # Each low ratio's index-K slots (scoring.prefill_k_slots), gathered once by the
+    # extend's metadata builder; the late-layer tail's metadata reads the same dict.
     low_ratio_k_slots: Optional[Dict[int, torch.Tensor]] = None
-    # Eager extend: the indexer's batch-only plan per low ratio, filled by its first
-    # layer (scoring.prefill_index_plan); one per metadata, as the rows differ.
+    # The indexer's batch-only plan per low ratio, filled by its first layer
+    # (scoring.prefill_index_plan); one per metadata, as the rows differ.
     low_ratio_index_plans: Optional[Dict[int, object]] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
@@ -1115,6 +1115,8 @@ class DSV4Metadata:
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
         )
+        self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
+        self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -1935,6 +1937,11 @@ class DeepseekV4AttnBackend(
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
             )
+        # Same requests as the extend in use, so the same index-K slots; other rows,
+        # so its own plans.
+        if self.low_ratios and self.forward_metadata.low_ratio_k_slots is not None:
+            metadata.low_ratio_k_slots = self.forward_metadata.low_ratio_k_slots
+            metadata.low_ratio_index_plans = {}
         return metadata
 
     def _late_layer_tail_cp_layout(
@@ -2724,17 +2731,19 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
-        if (
-            self.low_ratios
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._snapshot_low_ratio_k_slots(forward_batch)
 
         self._activate_request_window()
 
-    def _snapshot_low_ratio_k_slots(self, forward_batch: ForwardBatch) -> None:
+    def _snapshot_low_ratio_k_slots(
+        self, forward_batch: ForwardBatch, metadata: DSV4Metadata, *, publish_rows: bool
+    ) -> None:
         # Gathered once with the metadata instead of in every indexer layer, so no
         # indexer layer reads req_to_token.
+        if not (
+            self.low_ratios
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
         seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
         k_slots = {
             ratio: prefill_k_slots(
@@ -2745,10 +2754,9 @@ class DeepseekV4AttnBackend(
             )
             for ratio in self.low_ratios
         }
-        metadata = self.forward_metadata
         metadata.low_ratio_k_slots = k_slots
         metadata.low_ratio_index_plans = {}
-        if metadata.low_ratio_req_indices is None:
+        if publish_rows:
             # Every source layer would rebuild these rows; the tail and the
             # prefill graph publish theirs at metadata init the same way.
             num_tokens = sum(forward_batch.extend_seq_lens_cpu)
@@ -2758,9 +2766,6 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = forward_batch.positions[:num_tokens].to(
                 torch.int64
             )
-        if self.tail_forward_metadata is not None:
-            self.tail_forward_metadata.low_ratio_k_slots = k_slots
-            self.tail_forward_metadata.low_ratio_index_plans = {}
 
     def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
@@ -3008,6 +3013,9 @@ class DeepseekV4AttnBackend(
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
+            )
+            self._snapshot_low_ratio_k_slots(
+                forward_batch, metadata, publish_rows=not use_prefill_cuda_graph
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -3834,7 +3842,7 @@ class DeepseekV4AttnBackend(
         if k_slots is not None:
             k_slots = k_slots[layer.compress_ratio]
         else:
-            # Graph-captured metadata carries no snapshot.
+            # Only a non-speculative extend's metadata carries a snapshot.
             k_slots = prefill_k_slots(
                 req_to_token=self.req_to_token,
                 req_pool_indices=forward_batch.req_pool_indices,
