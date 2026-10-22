@@ -1,7 +1,8 @@
-"""Target-verify attention, both KV heads per program: full layers, 8 verify tokens, 16 Q heads / 2 KV heads per rank, HD64, FP8 KV, page 16.
+"""Target-verify attention, a KV-head pair per program: full layers, 8 verify tokens, GQA 8, 2 or 4 KV heads per rank
+(16 / 32 Q heads: TP8 / TP4), HD64, FP8 KV, page 16.
 
-One program per (request, split) owns BOTH KV heads (2 x 64 rows = 8 tokens x 16 heads), so every 128-byte KV
-line (head0 64 B | head1 64 B) and every page-table entry is fetched once by one CU.
+One program per (request, split, KV-head pair) owns both heads of its pair (2 x 64 rows = 8 tokens x 16 heads), so
+every 128-byte KV line (head 2p 64 B | head 2p+1 64 B) and every page-table entry is fetched once by one CU.
 QK on FP8 MFMA: Q is quantized per row (token x head, amax/448) in the prologue, K stays FP8 straight from the
 cache; the row scale, the K descale, softmax scale and log2(e) fold into one per-row multiplier used by the exp2 fma.
 PV in BF16 (V upcast) by default, FP8 PV (P biased by 2^8) as a variant.
@@ -17,7 +18,6 @@ import triton.language as tl
 
 QL = 8
 HD = 64
-HKV = 2
 GQA = 8
 
 
@@ -133,9 +133,11 @@ def _vv2_partials(
     QSPLIT: tl.constexpr,
     TPF: tl.constexpr,
 ):
-    slot = tl.program_id(0)
+    slot, pair = tl.program_id(0), tl.program_id(1)
     seq = slot // SPLITS
     split = slot % SPLITS
+    K += pair * 128
+    V += pair * 128
     kvlen = tl.load(SEQ + seq)
     context = kvlen - 8
     mr = tl.arange(0, 64)
@@ -143,7 +145,7 @@ def _vv2_partials(
     nr = tl.arange(0, BN)
     qrel = mr // 8
     qrow = seq * 8 + qrel
-    head0 = mr % 8
+    head0 = pair * 16 + mr % 8
     head1 = 8 + head0
     q0 = tl.load(
         Q + qrow[:, None] * q_stride_0 + head0[:, None] * q_stride_1 + d[None, :]
@@ -305,10 +307,10 @@ def _vv2_reduce(
     tl.store(OUT + token * o_stride_0 + head * o_stride_1 + d, accum * inverse)
 
 
-def pick_splits_v2(num_seqs: int, max_kv: int = 0) -> int:
-    # >= 512 CTAs (2 per CU) when the batch allows it: bs 1 -> 256 ... bs 8 -> 64, bs 16..64 -> 32
+def pick_splits_v2(num_seqs: int, max_kv: int = 0, pairs: int = 1) -> int:
+    # >= 512 CTAs (2 per CU) when the batch allows it: bs 1 -> 256 ... bs 8 -> 64, bs 16..64 -> 32 (one pair)
     s = 32
-    while s < 256 and s * num_seqs < 512:
+    while s < 256 and s * num_seqs * pairs < 512:
         s *= 2
     return s
 
@@ -329,23 +331,25 @@ def gqa_verify_splitkv_2kv(
     num_warps=4,
     num_stages=2,
 ):
-    """Full-attention verify, 8 tokens x 16 Q heads x 2 KV heads per (request, split) program, BF16 QK / PV."""
+    """Full-attention verify, 8 tokens x 16 Q heads x 2 KV heads per (request, split, pair) program, BF16 QK / PV."""
     num_seqs = seqused_k.numel()
-    heads = q.shape[1]
+    heads, kv_heads = q.shape[1], k.shape[2]
+    pairs = kv_heads // 2
     assert q.dtype == torch.bfloat16 and k.dtype == v.dtype
-    assert q.shape[-1] == HD and heads == 16 and k.shape[2] == HKV and k.shape[1] == 16
+    assert q.shape[-1] == HD and kv_heads in (2, 4) and heads == GQA * kv_heads
+    assert k.shape[1] == 16
     assert (
         q.shape[0] == num_seqs * QL
         and k.stride() == v.stride()
         and k.stride(2) == 64
         and k.stride(3) == 1
     )
-    splits = splits or pick_splits_v2(num_seqs)
+    splits = splits or pick_splits_v2(num_seqs, pairs=pairs)
     state_shape = (q.shape[0], heads, splits)
     partial = torch.empty((*state_shape, HD), dtype=torch.float32, device=q.device)
     maximum = torch.empty(state_shape, dtype=torch.float32, device=q.device)
     denom = torch.empty(state_shape, dtype=torch.float32, device=q.device)
-    _vv2_partials[(num_seqs * splits,)](
+    _vv2_partials[(num_seqs * splits, pairs)](
         q,
         k,
         v,

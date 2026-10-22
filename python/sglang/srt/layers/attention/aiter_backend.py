@@ -220,7 +220,7 @@ def _muse_verify_attention(
     pages) on the verify kernels; False leaves the call to unified_attention.
 
     Sliding layers (2047-token window): split-KV up to 8 requests, GQA-folded
-    tiles beyond. Full layers: the two-KV-head kernel (16 Q / 2 KV heads per
+    tiles beyond. Full layers: the KV-head-pair kernel (2 or 4 KV heads per
     rank, bitwise equal to the GQA-folded and 3D paths), else GQA-folded
     split-KV (from 8 requests at 2 KV heads per rank, any batch with more).
     ``kernels`` holds the enabled kernel names.
@@ -263,8 +263,8 @@ def _muse_verify_attention(
         return False
     if sliding_window != 0:
         return False
-    if "full_v2" in kernels and num_query_heads == 16 and k.stride() == v.stride():
-        splits = pick_splits_v2(num_seqs)
+    if "full_v2" in kernels and num_kv_heads in (2, 4) and k.stride() == v.stride():
+        splits = pick_splits_v2(num_seqs, pairs=num_kv_heads // 2)
         if num_seqs not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(num_seqs)
             logger.info(
@@ -279,7 +279,7 @@ def _muse_verify_attention(
         return True
     min_seqs, splits, bn, warps = _MUSE_VERIFY_FULL_GQA
     if num_kv_heads > 2:
-        # No two-KV-head kernel past 2 KV heads: GQA-folded at every batch size (untuned below 8 requests).
+        # With the KV-head-pair kernel off: GQA-folded at every batch size (untuned below 8 requests).
         min_seqs, splits = 1, splits // kv_scale
     if "full_gqa" in kernels and num_seqs >= min_seqs:
         gqa_verify_splitkv(
