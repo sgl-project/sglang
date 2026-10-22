@@ -3044,6 +3044,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         NOTE: This is predefined based on model's chat template
         """
+        if self._encoding_adapter is not None:
+            thinking = self._encoding_adapter.thinking_enabled(request=request)
+            if thinking is not None:
+                return thinking
+
         if not self.reasoning_parser:
             return False
 

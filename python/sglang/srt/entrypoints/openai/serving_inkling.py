@@ -76,3 +76,7 @@ class InklingChatEncodingAdapter:
         context_length: int,
     ) -> None:
         """Inkling resolves nothing beyond ``to_sampling_params``."""
+
+    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
+        """Inkling leaves the decision to the handler's rule."""
+        return None

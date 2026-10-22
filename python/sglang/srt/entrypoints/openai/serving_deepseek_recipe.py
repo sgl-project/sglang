@@ -48,6 +48,7 @@ class RecipeRender(msgspec.Struct, kw_only=True):
     prompt_ids: Optional[list[int]]  # None when the caller skipped tokenization.
     temperature: Optional[float]
     top_p: Optional[float]
+    thinking: bool
     request: Any = None  # recipe's ConversationRequest, for `resolve_max_tokens`.
 
 
@@ -197,6 +198,7 @@ class RecipeEncoder:
             prompt_ids=self._encoding.encode(conversation) if encode else None,
             temperature=converted.inference_options.temperature,
             top_p=converted.inference_options.top_p,
+            thinking=conversation.thinking_mode,
             request=converted,
         )
 
@@ -224,8 +226,8 @@ def overlay_sampling(
 
 
 class DeepSeekRecipeChatEncodingAdapter:
-    """recipe renders and tokenizes the prompt and resolves the API's sampling
-    defaults; output stays with the registered DeepSeek parsers."""
+    """recipe renders and tokenizes the prompt, decides thinking and resolves the
+    API's sampling defaults; output stays with the registered DeepSeek parsers."""
 
     collects_openai_media = True
     output = None
@@ -296,6 +298,15 @@ class DeepSeekRecipeChatEncodingAdapter:
         tools: Optional[list[dict]],
     ) -> list[int]:
         return self.render(request=request, tools=tools).prompt_ids
+
+    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
+        # The API defaults thinking on and reads its own `thinking` field, which
+        # the handler's rule does not; tools do not change the decision.
+        try:
+            return self.render(request=request, tools=None, encode=False).thinking
+        except ValueError as error:
+            logger.debug("deepseek-recipe thinking decision skipped: %s", error)
+            return None
 
     def apply_sampling(
         self,

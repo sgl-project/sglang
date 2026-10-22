@@ -157,6 +157,7 @@ class TestOverlaySampling(CustomTestCase):
             prompt_ids=[0, 1, 2],
             temperature=1.0,
             top_p=0.95,
+            thinking=True,
             request=SimpleNamespace(resolve_max_tokens=lambda prompt, limit: 65536),
         )
         values.update(overrides)
@@ -307,6 +308,112 @@ class TestAdapterRegistry(CustomTestCase):
             adapter.encode_messages(messages=[], request=with_tools, tools=[dumped]),
             adapter.encode_messages(messages=[], request=with_tools, tools=[tool]),
         )
+
+
+class TestHandlerThinking(CustomTestCase):
+    """The handler takes its thinking decision from recipe, whose default is on,
+    so the engine counts reasoning tokens and the parsers split the output."""
+
+    @unittest.skipUnless(
+        recipe.is_deepseek_recipe_available(), "deepseek-recipe is not installed"
+    )
+    def test_thinking_follows_recipe(self):
+        from huggingface_hub import hf_hub_download
+        from transformers import PreTrainedTokenizerFast
+
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        try:
+            tokenizer_file = hf_hub_download(
+                MODEL, "tokenizer.json", revision=REVISION, local_files_only=True
+            )
+        except Exception:  # noqa: BLE001 - not cached: nothing to encode with
+            self.skipTest("the tokenizer is not cached")
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+        reset_context()
+        self.addCleanup(reset_context)
+        args = ServerArgs(
+            model_path="dummy",
+            chat_encoding_backend="recipe",
+            reasoning_parser="deepseek-v41",
+            tool_call_parser="deepseekv41",
+        )
+        publish(args, role="tokenizer")
+        manager = SimpleNamespace(
+            model_path="dummy",
+            served_model_name="dummy",
+            server_args=args,
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(
+                is_multimodal=False,
+                context_len=131072,
+                hf_config=SimpleNamespace(
+                    model_type="deepseek_v41",
+                    architectures=["DeepseekV41ForCausalLM"],
+                    to_dict=lambda: {},
+                ),
+                get_default_sampling_params=lambda: {},
+            ),
+            config_value=lambda name: getattr(args, name),
+        )
+        template_manager = SimpleNamespace(
+            chat_template_name=None,
+            jinja_template_content_format=None,
+            reasoning_config=None,
+            force_reasoning=False,
+            python_chat_template=None,
+            jinja_template_may_reorder_tool_results=False,
+        )
+        chat = OpenAIServingChat(manager, template_manager)
+        think_start = tokenizer.convert_tokens_to_ids("<think>")
+        think_end = tokenizer.convert_tokens_to_ids("</think>")
+        output = "I think.</think>Hello"
+
+        def respond(**fields):
+            request = ChatCompletionRequest(messages=[_user("hi")], **fields)
+            processed = chat._process_messages(request, False)
+            ret = [
+                {
+                    "text": output,
+                    "output_ids": tokenizer.encode(output, add_special_tokens=False),
+                    "index": 0,
+                    "meta_info": {
+                        "id": "chatcmpl-1",
+                        "prompt_tokens": len(processed.prompt_ids),
+                        "completion_tokens": 7,
+                        "cached_tokens": 0,
+                        "weight_version": "v",
+                        "finish_reason": {"type": "stop", "matched": 1},
+                        "output_token_logprobs": [],
+                        "output_top_logprobs": None,
+                    },
+                }
+            ]
+            message = chat._build_chat_response(request, ret, 0).choices[0].message
+            return (
+                processed.prompt_ids[-1],
+                processed.require_reasoning,
+                message.reasoning_content,
+                message.content,
+            )
+
+        # The API's default and its `thinking` field, which SGLang's rule never read.
+        for fields in (
+            {},
+            {"thinking": {"type": "enabled"}},
+            {"reasoning_effort": "high"},
+        ):
+            self.assertEqual(
+                respond(**fields), (think_start, True, "I think.", "Hello"), fields
+            )
+        for fields in (
+            {"thinking": {"type": "disabled"}},
+            {"reasoning_effort": "none"},
+        ):
+            self.assertEqual(respond(**fields)[:2], (think_end, False), fields)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,11 @@ class ChatEncodingAdapter(Protocol):
         """None when the configured parsers leave output to the text parsers."""
         ...
 
+    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
+        """The encoding's own thinking decision for ``request``; None leaves the
+        handler's rule in place."""
+        ...
+
     def encode_messages(
         self,
         *,
