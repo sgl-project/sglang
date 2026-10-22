@@ -276,7 +276,16 @@ class DeepSeekRecipeChatEncodingAdapter:
             body.pop("tools", None)
             body.pop("tool_choice", None)
         else:
-            body["tools"] = [_without_unset(tool) for tool in tools]
+            # `model_dump` adds None for unset fields, which recipe renders as values.
+            body["tools"] = [
+                {k: v for k, v in tool.items() if v is not None}
+                | {
+                    "function": {
+                        k: v for k, v in tool["function"].items() if v is not None
+                    }
+                }
+                for tool in tools
+            ]
         return self._encoder.convert(body, self._default_kwargs, encode=encode)
 
     def encode_messages(
@@ -299,10 +308,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         # Resolved from the request again: the adapter is shared, and a request
         # forwarded with input_ids never went through encode_messages.
         tools = (
-            [
-                tool.model_dump(exclude_unset=True, by_alias=True, mode="json")
-                for tool in request.tools
-            ]
+            [tool.model_dump() for tool in request.tools]
             if request.tools and request.tool_choice != "none"
             else None
         )
@@ -317,12 +323,3 @@ class DeepSeekRecipeChatEncodingAdapter:
             prompt_tokens=prompt_tokens,
             context_length=context_length,
         )
-
-
-def _without_unset(tool: dict[str, Any]) -> dict[str, Any]:
-    """Drop the None fields `model_dump` adds; recipe renders them as values."""
-    cleaned = {key: value for key, value in tool.items() if value is not None}
-    cleaned["function"] = {
-        key: value for key, value in tool["function"].items() if value is not None
-    }
-    return cleaned
