@@ -661,13 +661,9 @@ class AscendAttnBackend(AttentionBackend):
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
                 metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
-                    forward_batch.seq_lens,
+                    metadata.dcp_spec_seq_lens,
                     query_len,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    page_size=self.page_size,
-                    max_local_kv_len=required_mask_width,
-                    local_query_lens=metadata.dcp_spec_seq_lens,
+                    required_mask_width,
                 )
         else:
             if self.needs_cpu_seq_lens:
@@ -1198,13 +1194,9 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
                 dcp_mask = build_mla_dcp_mtp_mask(
-                    seq_lens[:bs],
+                    metadata.dcp_spec_seq_lens,
                     query_len,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    page_size=self.page_size,
-                    max_local_kv_len=active_num_pages * self.page_size,
-                    local_query_lens=metadata.dcp_spec_seq_lens,
+                    active_num_pages * self.page_size,
                 )
                 active_mask_width = active_num_pages * self.page_size
                 metadata.dcp_mtp_attn_mask[:, :, :active_mask_width].copy_(dcp_mask)
