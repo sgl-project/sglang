@@ -1415,7 +1415,8 @@ class Envs:
     # Kernel selection and fused backends
     # ===================================================================
     # Default-on kill switch for the shared model fusion rollout, currently
-    # covering dual GEMM and RMSNorm + static FP8 quantization.
+    # covering dual GEMM, RMSNorm + static FP8 quantization, and Gemma 4's
+    # vocabulary-parallel tied embedding/head (selected at model construction).
     SGLANG_DISABLE_FUSIONS = EnvBoolWithAlias(
         False,
         deprecated_name="SGLANG_ENABLE_FUSIONS",

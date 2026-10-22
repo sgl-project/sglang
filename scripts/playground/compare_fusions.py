@@ -3,7 +3,7 @@
 
 One-batch usage:
     scripts/playground/compare_fusions.py --model MODEL --bs BATCH_SIZES \
-        --eval one-batch --isl INPUT_LEN --osl OUTPUT_LEN \
+        --eval one-batch --isl INPUT_LEN --osl OUTPUT_LEN [--profile] \
         [additional sglang.benchmark.one_batch arguments]
 
 GSM8K usage:
@@ -23,6 +23,12 @@ GSM8K example:
 Set FUSION_BENCH_RESULT_DIR to retain results in a specific directory.
 Set PYTHON to select the interpreter used to launch each benchmark. By default,
 the script uses its own Python interpreter.
+
+With --profile, each fusion mode captures separate prefill and decode PyTorch
+traces per batch size under the result directory's profiles/ folder. Decode
+captures output-token indices [osl // 2, min(osl // 2 + 16, osl)). Each fusion
+mode runs one profiling sweep and compares the timings from that run. TP0
+captures the traces when running with tensor parallelism.
 """
 
 from __future__ import annotations
@@ -131,6 +137,15 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         type=positive_int,
         help="GSM8K server request limit and evaluator thread count",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "capture separate prefill and steady-state decode PyTorch traces "
+            "during each one-batch measurement; decode covers output tokens "
+            "[osl // 2, min(osl // 2 + 16, osl))"
+        ),
+    )
     args, extra_args = parser.parse_known_args()
 
     one_batch_args = (args.batch_sizes, args.input_len, args.output_len)
@@ -139,11 +154,15 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
             parser.error("--eval one-batch requires --bs, --isl, and --osl")
         if args.concurrency is not None:
             parser.error("--concurrency is only valid with --eval gsm8k")
+        if args.profile and args.output_len < 2:
+            parser.error("--profile requires --osl >= 2 to capture decode tokens")
     else:
         if args.concurrency is None:
             parser.error("--eval gsm8k requires --concurrency")
         if any(value is not None for value in one_batch_args):
             parser.error("--bs, --isl, and --osl are only valid with --eval one-batch")
+        if args.profile:
+            parser.error("--profile is only valid with --eval one-batch")
 
     return args, extra_args
 
@@ -153,6 +172,16 @@ def positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
     return parsed
+
+
+def decode_profile_window(output_len: int) -> tuple[int, int]:
+    """Decode step and count for the requested output-token interval.
+
+    Output token zero comes from prefill; decode step zero produces token one.
+    """
+    first_token = output_len // 2
+    end_token = min(first_token + 16, output_len)
+    return first_token - 1, end_token - first_token
 
 
 def parse_batch_sizes(value: str) -> tuple[int, ...]:
@@ -231,6 +260,27 @@ def run_benchmark(
         "--result-filename",
         str(result_file),
     ]
+    if args.profile:
+        profile_dir = (result_dir / "profiles").resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        start_step, num_steps = decode_profile_window(args.output_len)
+        command.extend(
+            [
+                "--profile",
+                "--profile-record-shapes",
+                "--profile-activities",
+                "CPU",
+                "GPU",
+                "--profile-stage",
+                "all",
+                "--profile-prefix",
+                str(profile_dir / label),
+                "--profile-start-step",
+                str(start_step),
+                "--profile-steps",
+                str(num_steps),
+            ]
+        )
     environment = fusion_environment(enable_fusions)
     batch_sizes = ",".join(str(batch_size) for batch_size in args.batch_sizes)
     run_summary = (
@@ -242,6 +292,11 @@ def run_benchmark(
 
     print(f"\n{run_summary}")
     print(f"Results: {result_file}")
+    if args.profile:
+        first_token = args.output_len // 2
+        end_token = min(first_token + 16, args.output_len)
+        print(f"Prefill/decode profiles: {profile_dir}")
+        print(f"Decode output-token interval: [{first_token}, {end_token})")
 
     with log_file.open("w") as log:
         log.write(f"{run_summary}\nResults: {result_file}\n")
@@ -662,6 +717,8 @@ def run_one_batch_comparison(args: argparse.Namespace, extra_args: list[str]) ->
             output_len=args.output_len,
         )
     print(f"\nLogs and JSONL results: {result_dir}")
+    if args.profile:
+        print(f"Prefill and decode traces: {result_dir / 'profiles'}")
 
 
 def run_gsm8k_comparison(args: argparse.Namespace, server_args: list[str]) -> None:

@@ -40,7 +40,6 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_scatter,
@@ -454,12 +453,20 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        *,
+        use_attn_tp_group: Optional[bool] = None,
     ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        # Tied heads inherit their embedding's partition, which can use the
+        # attention group even when independent heads use the full TP group.
+        self.use_attn_tp_group = (
+            get_parallel().enable_dp_lm_head
+            if use_attn_tp_group is None
+            else use_attn_tp_group
+        )
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
@@ -1149,32 +1156,18 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.vocab_size % self.attn_tp_size == 0:
-            global_logits = torch.empty(
-                (
-                    self.attn_tp_size,
-                    logits.shape[0],
-                    self.vocab_size // self.attn_tp_size,
-                ),
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
-            )
-        else:
-            global_logits = torch.empty(
-                (self.vocab_size, logits.shape[0]),
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            global_logits = global_logits.T
-            attn_tp_all_gather(
-                list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
-                logits,
-            )
-        return global_logits
+        # VocabParallelEmbedding pads each shard to the same width. Gather that
+        # physical width, then let _copy_logits_to_buffer trim vocabulary padding.
+        shard_width = logits.shape[-1]
+        global_logits = torch.empty(
+            (self.attn_tp_size, logits.shape[0], shard_width),
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        attn_tp_all_gather_into_tensor(global_logits, logits)
+        return global_logits.permute(1, 0, 2).reshape(
+            logits.shape[0], self.attn_tp_size * shard_width
+        )
 
     def _can_use_tp_lm_head_all_to_all(
         self,
