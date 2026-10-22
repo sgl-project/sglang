@@ -49,6 +49,7 @@ _SESSION_SKIP_EXTRA = frozenset(
         "comfyui_session_id",
         "comfyui_cond_key",
         "comfyui_cache_fp",
+        "comfyui_control",
         "comfyui_num_steps",
         "comfyui_separate_cfg",
     }
