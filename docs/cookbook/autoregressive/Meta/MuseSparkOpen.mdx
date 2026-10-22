@@ -60,7 +60,7 @@ Five aggregated Dynamo + SGLang deployments on GB300, measured with the [Artific
 
 <AccordionGroup>
   <Accordion title="Agg TP8·EP8 (2 nodes), lowest latency · 8 GPUs · concurrency 1">
-  <Tabs>
+  <Tabs sync={false}>
     <Tab title="Env Vars">
 ```bash
 export ETCD_IP=<node running etcd>
@@ -137,7 +137,7 @@ python3 -m dynamo.sglang \
   </Tabs>
   </Accordion>
   <Accordion title="Agg TP8·EP8 (2 nodes), low latency · 8 GPUs · concurrency 4">
-  <Tabs>
+  <Tabs sync={false}>
     <Tab title="Env Vars">
 ```bash
 export ETCD_IP=<node running etcd>
@@ -214,7 +214,7 @@ python3 -m dynamo.sglang \
   </Tabs>
   </Accordion>
   <Accordion title="Agg TP4·EP4, balanced · 4 GPUs · concurrency 16">
-  <Tabs>
+  <Tabs sync={false}>
     <Tab title="Env Vars">
 ```bash
 export ETCD_IP=<node running etcd>
@@ -288,7 +288,7 @@ python3 -m dynamo.sglang \
   </Tabs>
   </Accordion>
   <Accordion title="Agg TP4·EP4, high throughput · 4 GPUs · concurrency 64">
-  <Tabs>
+  <Tabs sync={false}>
     <Tab title="Env Vars">
 ```bash
 export ETCD_IP=<node running etcd>
@@ -364,7 +364,7 @@ python3 -m dynamo.sglang \
   </Tabs>
   </Accordion>
   <Accordion title="Agg TP4·EP4 + HiCache, max throughput · 4 GPUs · concurrency 160">
-  <Tabs>
+  <Tabs sync={false}>
     <Tab title="Env Vars">
 ```bash
 export ETCD_IP=<node running etcd>
