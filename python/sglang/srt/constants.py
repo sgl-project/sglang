@@ -2,11 +2,16 @@
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+# NPU-only: destroys device-side HCCL communicators of every GroupCoordinator
+# during release and rebuilds them during resume. Implies CUDA graph drop +
+# recapture (graphs embed comm buffer addresses).
+GPU_MEMORY_TYPE_COMM = "comm"
 
 GPU_MEMORY_ALL_TYPES = [
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_COMM,
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
