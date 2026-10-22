@@ -246,6 +246,8 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             input_len=131072,
             output_len=1024,
             max_concurrency=8,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=8,
             seed=100,
             warmup_requests=8,
             repeat_rate=0.9,
