@@ -320,7 +320,7 @@ Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 Pruned BF16 / FP8 files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
 are the usual loader inputs. GGUF goes in `SGLDOptions.transformer_weights_path`.
 On a 24 GB card put the 32B CLIP on CPU and enable DiT layerwise offload; use
-`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT.
+`convrot_int8` or GGUF rather than the full unpruned BF16 DiT.
 
 ### Singularity hybrid weights
 
@@ -945,6 +945,63 @@ Quality gaps versus base H3 on hard motion and fine detail are properties of
 the released distillation, not of the SGLang port. Use base MiniMax-H3 when
 output quality matters more than latency.
 </Note>
+
+### FastH3 Omni: Ref2VA, 8-step PDD
+
+[FastVideo/FastVideo-FastH3-Omni-8-Step-V1](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1)
+is a Parallel Decoding Distillation (PDD) student of the MiniMax-H3 Ref2VA
+partition: eight denoiser evaluations over a 32-interval grid, with VSA at 0.9
+sparsity on 128-token (4, 4, 8) tiles and each reference video keeping 0.1 of
+its tiles. Only `task: "ref2va"` is served, with up to 9 images, 3 videos and 3
+audio clips as ordered references (12 in total), at least one of them visual.
+
+Pass the repository directly to `--model-path`. Its registered model overlay
+maps `transformer_ref/` into the base-H3 layout, fuses the 32 interval output
+heads into 8 per-step heads (the math of `tools/fuse_minimax_h3_pdd_heads.py`)
+and links the text encoder and VAEs from the `MiniMaxAI/MiniMax-H3` Ref2VA
+partition pinned by the release. The served model is the native H3 pipeline:
+the release's `pdd_fused_heads` load through the same path as the PDD LoRA
+recipe above, and the PDD grid is the 8-step shifted grid scaled to the
+release's `sigma_max` of 0.999 (FastGen's `max_t`).
+
+```bash 2×H200
+sglang serve \
+  --model-path FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
+  --num-gpus 2 --ulysses-degree 2 \
+  --dit-cpu-offload true --text-encoder-cpu-offload true --vae-cpu-offload true \
+  --port 30010
+```
+
+```json Request
+{
+  "model": "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+  "prompt": "<Picture 1> is the appearance reference for <Subject 1>. [reference generation] ...",
+  "task": "ref2va",
+  "conditions": [{"type": "image", "role": "reference", "uri": "/path/to/subject.png"}],
+  "target": {"short_edge": 480, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+  "seed": 0
+}
+```
+
+Requests default to `num_inference_steps: 8` and clean references
+(`imgvid_cond_noise_aug_for_inference` and `audio_cond_noise_aug_for_inference`
+of 1.0, the release's target-only flow). On CUDA the transformer selects VSA-H3
+when no backend is given; Ref2VA layouts tile every reference video as its own
+region and take a per-region top-k, while text, reference images and audio
+rows stay dense. `--attention-backend-config` keys `vsa_tile_size`,
+`vsa_ref_keep_rate` and `VSA_sparsity` override the trained values.
+
+Warm request latency on 2× H200 (Ulysses 2, DiT / text encoder / VAE CPU
+offload; median of three requests after one full warmup, 124 frames at 24 FPS
+with audio, until the MP4 is saved):
+
+| References | Short edge | Latency |
+| --- | --- | --- |
+| Image | 480 | 26.9 s |
+| Image + audio | 480 | 27.8 s |
+| Video with audio | 480 | 23.2 s |
+| Image | 768 | 46.6 s |
+| Video with audio | 768 | 37.1 s |
 
 ## 7. VDN-H3: hybrid attention, 8-step distill
 
@@ -2189,10 +2246,10 @@ Same card, 50-step run. Speedup is vs BF16+FA. PSNR is vs same-tree INT8+FA (Spe
 | Config | e2e | vs BF16+FA | PSNR mean / min |
 | --- | ---: | ---: | ---: |
 | BF16 + FlashAttention | 1008.6 s | 1.00× | — |
-| `kitchen_int8` + FA | 718.5 s | 1.40× | — |
-| `kitchen_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
-| `kitchen_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
-| `kitchen_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
+| `convrot_int8` + FA | 718.5 s | 1.40× | — |
+| `convrot_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
+| `convrot_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
+| `convrot_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
 
 Prefer FA + `11 / 5 / 1.0` when the bar is FA-like. Sage / hybrid + Spectrum is faster; quality then follows the attention backend, not the skip schedule.
 
