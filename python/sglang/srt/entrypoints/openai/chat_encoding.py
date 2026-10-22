@@ -207,7 +207,10 @@ def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, in
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
-    return spec == "kimi_k3"
+    # dsv41 is the same shape: encoding_dsv41.render_message emits SYSTEM_SP_TOKEN
+    # plus a generation header for any system message past index 0. The Jinja probe
+    # cannot see either one, and DeepSeek-V4.1-Flash ships no chat_template at all.
+    return spec in ("kimi_k3", "dsv41")
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
