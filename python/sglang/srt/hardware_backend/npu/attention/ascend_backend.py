@@ -660,7 +660,10 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
             ):
+                seq_lens_max = forward_batch.seq_lens.max()
                 seq_lens_max += self.speculative_step_id + 1
+            else:
+                seq_lens_max = forward_batch.seq_lens.max()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :seq_lens_max
