@@ -2429,6 +2429,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "timeout",
             "full_kv_discards",
             "aux_kv_discards",
+            "host_mem_insufficient",
         ):
             current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
             previous = self._last_prefetch_outcome.get(outcome, 0.0)

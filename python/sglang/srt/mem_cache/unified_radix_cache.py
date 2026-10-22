@@ -343,6 +343,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # the gap between l3_demand_total_tokens (pre-IO) and
             # l3_actual_read_tokens (post-IO) is explainable in-dict.
             "host_alloc_failed": 0,
+            "host_mem_insufficient": 0,
             "read_failed": 0,
             "l3_expected_tokens": 0,
             "l3_actual_read_tokens": 0,
@@ -3301,6 +3302,17 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request, hit_tokens - alloc_len, reason="host_capacity"
             )
+            if alloc_len < hit_tokens:
+                log_hicache_event(
+                    event="prefetch",
+                    tier="l3_to_l2",
+                    result="partial",
+                    reason="host_mem_insufficient",
+                    rid=request.rid,
+                    tokens=len(operation.token_ids),
+                    extra=f"req_tokens={operation.stats_requested_tokens},storage_hit_count={hit_tokens}, available={cc.mem_pool_host.available_size()},alloc_len={alloc_len}",
+                )
+                self._prefetch_outcome_stats["host_mem_insufficient"] += 1
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
