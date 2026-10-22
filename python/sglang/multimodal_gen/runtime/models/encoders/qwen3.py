@@ -20,10 +20,12 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    load_stacked_weight,
-    maybe_remap_kv_scale_name,
+    load_llm_encoder_weights,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_attention_head_partition,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 
@@ -91,14 +93,10 @@ class Qwen3Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
 
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -432,38 +430,12 @@ class Qwen3ForCausalLM(TextEncoder):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with support for tensor parallelism and weight remapping."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Strip 'model.' prefix from HuggingFace Qwen3 weights
-            if name.startswith("model."):
-                name = name[6:]  # len("model.") == 6
-
-            # Skip rotary embedding weights
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            # Handle KV scale remapping
-            if "scale" in name:
-                kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
-                if kv_scale_name is None:
-                    continue
-                else:
-                    name = kv_scale_name
-
-            name = load_stacked_weight(
-                name,
-                loaded_weight,
-                params_dict,
-                self.config.arch_config.stacked_params_mapping,
-            )
-            if name is not None:
-                loaded_params.add(name)
-
-        return loaded_params
+        return load_llm_encoder_weights(
+            weights,
+            dict(self.named_parameters()),
+            self.config.arch_config.stacked_params_mapping,
+            strip_prefix="model.",
+        )
 
 
 EntryClass = Qwen3ForCausalLM

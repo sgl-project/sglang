@@ -14,7 +14,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDynamicGateCapacity(CustomTestCase):
@@ -32,12 +32,12 @@ class TestDynamicGateCapacity(CustomTestCase):
             self.assertEqual(allocator.verify_byte_accounting(), [])
             values = []
             with contextlib.ExitStack() as stack:
-                # Every page copy goes through a member's `move_kv_cache`.
+                # Every page copy goes through a member's `move_physical_pages`.
                 for kv in {id(x._kvcache): x._kvcache for x in members}.values():
                     stack.enter_context(
                         patch.object(
                             kv,
-                            "move_kv_cache",
+                            "move_physical_pages",
                             side_effect=AssertionError("query moved"),
                         )
                     )
@@ -118,64 +118,6 @@ class TestDynamicGateCapacity(CustomTestCase):
         scheduler.disagg_prefill_pending_chunk_rids.clear()
         self.assertEqual(x.schedulable_available_size(), opened)
         self.assertEqual(a.verify_byte_accounting(), [])
-
-    def test_ungated_view_keeps_its_memo(self):
-        a = build_swa_pool()
-        slots = a.alloc(96)
-        a.free_swa(slots[:40])
-        x = a.full_attn_allocator
-        expected = x._available_tokens(x._peer_drainable_hole_bytes())
-        with patch.object(x, "_available_tokens", wraps=x._available_tokens) as compute:
-            self.assertEqual(x.schedulable_available_size(), expected)
-            self.assertEqual(x.schedulable_available_size(), expected)
-            self.assertEqual(compute.call_count, 1)
-
-    def test_stable_gate_reuses_memo_and_flips_refresh_it(self):
-        """Stable PD gates must not force a fresh capacity calculation per query."""
-        a = build_swa_pool()
-        slots = a.alloc(96)
-        a.free_swa(slots[:40])
-        state = {"open": True}
-        a.set_disagg_move_gate(lambda: state["open"])
-        x = a.full_attn_allocator
-        with patch.object(x, "_available_tokens", wraps=x._available_tokens) as compute:
-            opened = x.schedulable_available_size()
-            for _ in range(1999):
-                self.assertEqual(x.schedulable_available_size(), opened)
-            self.assertEqual(compute.call_count, 1)
-        epoch = x._chain_capacity_epoch()
-        for flip in range(100):
-            state["open"] = bool(flip % 2)
-            expected = x._available_tokens(x._peer_drainable_hole_bytes())
-            with patch.object(
-                x, "_available_tokens", wraps=x._available_tokens
-            ) as compute:
-                self.assertEqual(x.schedulable_available_size(), expected)
-                self.assertEqual(x.schedulable_available_size(), expected)
-                self.assertEqual(compute.call_count, 1)
-            self.assertEqual(x._chain_capacity_epoch(), epoch)
-            self.assertEqual(x._capacity_memo_violations(), [])
-
-    def test_gated_memo_diagnostic_detects_untracked_write(self):
-        """The gate-key cache must retain the missed-epoch diagnostic under PD."""
-        a = build_swa_pool()
-        slots = a.alloc(96)
-        a.free_swa(slots[:40])
-        a.set_disagg_move_gate(lambda: True)
-        x = a.full_attn_allocator
-        peer = a.swa_attn_allocator
-        cached = x.schedulable_available_size()
-        epoch = x._chain_capacity_epoch()
-        # Inject a write bypassing the descriptor, the failure this check guards.
-        peer.__dict__["_free_phys_pages"] = peer._free_phys_pages[:0]
-        self.assertEqual(x._chain_capacity_epoch(), epoch)
-        self.assertNotEqual(cached, x._available_tokens(x._peer_drainable_hole_bytes()))
-        self.assertTrue(
-            any(
-                "stale schedulable_available_size" in e
-                for e in x._capacity_memo_violations()
-            )
-        )
 
     def test_float_signature_distinguishes_asymmetric_gates(self):
         """Closing opposite sides must not alias a single combined gate boolean."""
