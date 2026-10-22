@@ -243,24 +243,31 @@ def qkv_proj_qk_norm_rope_cache(
     q_scale,
     k_scale,
     v_scale,
+    *,
+    num_heads,
+    num_kv_heads,
 ):
     """Fused QKV + gate projection of ``x`` [M <= 32, 8192] with the QK-norm / RoPE / FP8-cache epilogue.
 
-    Returns (Q [M, 1024], K [M, 128], V [M, 128], gate [M, 1024]), BF16.
+    The weight rows are [Q, K, V, gate] for this rank's heads (head_dim 64), e.g. N 2304 at TP8, 4608 at TP4.
+    Returns (Q [M, HQ*64], K [M, HK*64], V [M, HK*64], gate [M, HQ*64]), BF16.
     """
     m, k = x.shape
-    assert 0 < m <= 32 and k == 8192 and weight.shape == (2304, 8192)
+    hq, hk, d = num_heads, num_kv_heads, 64
+    n = (2 * hq + 2 * hk) * d
+    assert 0 < m <= 32 and k == 8192 and weight.shape == (n, 8192)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_contiguous() and weight.is_contiguous()
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
-    partials = torch.empty((8, m, 2304), device=x.device, dtype=torch.float32)
+    # Split-K 8 / block_n 32 were tuned at N 2304 (TP8); not retuned for N 4608.
+    partials = torch.empty((8, m, n), device=x.device, dtype=torch.float32)
     bf16_splitk_gemm_partials(x, weight, partials, block_n=32, block_k=128, split_k=8)
-    qo = torch.empty((m, 1024), device=x.device, dtype=torch.bfloat16)
-    ko = torch.empty((m, 128), device=x.device, dtype=torch.bfloat16)
+    qo = torch.empty((m, hq * d), device=x.device, dtype=torch.bfloat16)
+    ko = torch.empty((m, hk * d), device=x.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)
     go = torch.empty_like(qo)
-    _qkv_epilogue[(m, 16)](
+    _qkv_epilogue[(m, hq)](
         partials,
         positions,
         cos_sin,
@@ -275,11 +282,11 @@ def qkv_proj_qk_norm_rope_cache(
         k_scale,
         v_scale,
         m,
-        2304,
+        n,
         8,
-        16,
-        2,
-        64,
+        hq,
+        hk,
+        d,
         float(eps),
         float(q_scale),
         cos_sin is not None,

@@ -975,16 +975,16 @@ def extend_attention_fwd(
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
 
-    # DFlash draft block: up to 8 requests x 8 query rows, 8 heads on one KV
-    # head, head_dim 128, non-causal, against an FP8 prefix cache. The generic
+    # DFlash draft block: up to 8 requests x 8 query rows, 8 heads per KV head
+    # (1 or 2 KV heads), head_dim 128, non-causal, against an FP8 prefix cache. The generic
     # kernel walks the whole window prefix in one program per (block, head);
     # split-KV spreads it across workgroups, with BF16 probabilities for P.V.
     if (
         _use_dflash_block_splitkv
         and 1 <= batch_size <= 8
         and Lq == Lk == Lv == 128
-        and head_num == 8
-        and k_extend.shape[1] == 1
+        and k_extend.shape[1] in (1, 2)
+        and head_num == 8 * k_extend.shape[1]
         and max_len_extend == 8
         and q_extend.shape[0] == batch_size * 8
         and not is_causal

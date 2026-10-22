@@ -1,4 +1,5 @@
-"""Split-KV attention for a DFlash draft block: 8 query rows x 8 heads x 1 KV head, head_dim 128, non-causal.
+"""Split-KV attention for a DFlash draft block: 8 query rows x 8 heads per KV head (1 KV head per rank at TP8,
+2 at TP4), head_dim 128, non-causal.
 
 Each request's block attends to its FP8 prefix cache (paged through ``kv_indptr`` / ``kv_indices``, left window
 ``window_left``) and to the block's own BF16 K/V. The prefix is split across workgroups; FP32 partials are merged
@@ -30,6 +31,11 @@ def _partials(
     VES: tl.constexpr,
     KBS: tl.constexpr,
     VBS: tl.constexpr,
+    KEH: tl.constexpr,
+    VEH: tl.constexpr,
+    KBH: tl.constexpr,
+    VBH: tl.constexpr,
+    KVH: tl.constexpr,
     KS,
     VS,
     SCALE: tl.constexpr,
@@ -39,7 +45,8 @@ def _partials(
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
-    qb, seq, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    qb, seq = tl.program_id(0), tl.program_id(1)
+    kvh, split = tl.program_id(2) // SPLITS, tl.program_id(2) % SPLITS
     qstart = tl.load(CUQ + seq)
     qlen = tl.load(CUQ + seq + 1) - qstart
     kstart = tl.load(CUK + seq)
@@ -48,7 +55,7 @@ def _partials(
     d = tl.arange(0, 128)
     col = tl.arange(0, BN)
     qr = qb * (BM // 8) + r // 8
-    qh = r % 8
+    qh = kvh * 8 + r % 8
     valid_q = qr < qlen
     qrow = qstart + qr
     q = tl.load(
@@ -71,8 +78,12 @@ def _partials(
         pos = block * BN + col
         valid = pos < prefix
         loc = tl.load(INDICES + kstart + pos, valid, other=0).to(tl.int64)
-        k = tl.load(KB + loc[None, :] * KBS + d[:, None], valid[None, :], other=0.0)
-        v = tl.load(VB + loc[:, None] * VBS + d[None, :], valid[:, None], other=0.0)
+        k = tl.load(
+            KB + loc[None, :] * KBS + kvh * KBH + d[:, None], valid[None, :], other=0.0
+        )
+        v = tl.load(
+            VB + loc[:, None] * VBS + kvh * VBH + d[None, :], valid[:, None], other=0.0
+        )
         score = tl.dot(q.to(k.dtype), k) * (SCALE * 1.4426950408889634) * KS
         allowed = valid_q[:, None] & valid[None, :]
         if WINDOW > 0:
@@ -92,10 +103,14 @@ def _partials(
     if split == 0:
         c = tl.arange(0, 32)
         k = tl.load(
-            KE + (qstart + c[None, :]) * KES + d[:, None], c[None, :] < qlen, other=0.0
+            KE + (qstart + c[None, :]) * KES + kvh * KEH + d[:, None],
+            c[None, :] < qlen,
+            other=0.0,
         )
         v = tl.load(
-            VE + (qstart + c[:, None]) * VES + d[None, :], c[:, None] < qlen, other=0.0
+            VE + (qstart + c[:, None]) * VES + kvh * VEH + d[None, :],
+            c[:, None] < qlen,
+            other=0.0,
         )
         score = tl.dot(q, k) * (SCALE * 1.4426950408889634)
         score = tl.where(valid_q[:, None] & (c[None, :] < qlen), score, float("-inf"))
@@ -106,7 +121,7 @@ def _partials(
         denom = denom * alpha + tl.sum(probability, 1)
         accum = accum * alpha[:, None] + tl.dot(probability.to(v.dtype), v)
         maximum = new_max
-    index = (qrow * 8 + qh) * SPLITS + split
+    index = (qrow * (8 * KVH) + qh) * SPLITS + split
     tl.store(MAXIMUM + index, maximum, valid_q)
     tl.store(DENOM + index, denom, valid_q)
     tl.store(PART + index[:, None] * 128 + d[None, :], accum, valid_q[:, None])
@@ -147,22 +162,24 @@ def dflash_block_splitkv(
     out=None,
     window_left=2048,
 ):
+    kvh = ke.shape[1]
     if not (
         q.dtype == ke.dtype == ve.dtype == torch.bfloat16
-        and q.shape[1:] == (8, 128)
-        and ke.shape == ve.shape == (q.shape[0], 1, 128)
+        and kvh in (1, 2)
+        and q.shape[1:] == (8 * kvh, 128)
+        and ke.shape == ve.shape == (q.shape[0], kvh, 128)
         and kb.dtype == vb.dtype == torch.float8_e4m3fn
         and kb.ndim == vb.ndim == 3
-        and kb.shape[1:] == vb.shape[1:] == (1, 128)
+        and kb.shape[1:] == vb.shape[1:] == (kvh, 128)
         and q.shape[0] == (cuq.numel() - 1) * 8
         and cuk.numel() == cuq.numel()
         and splits in (8, 16, 32)
         and all(t.stride(-1) == 1 for t in (q, ke, ve, kb, vb))
     ):
         raise ValueError(
-            "DFlash split-KV requires flat 8Q/8heads/1KV/HD128 mixed BF16/FP8 tensors"
+            "DFlash split-KV requires flat 8Q/8 heads per KV head/1-2 KV/HD128 mixed BF16/FP8 tensors"
         )
-    rows = q.shape[0] * 8
+    rows = q.shape[0] * q.shape[1]
     part = torch.empty((rows, splits, 128), device=q.device, dtype=torch.float32)
     maximum = torch.empty((rows, splits), device=q.device, dtype=torch.float32)
     denom = torch.empty_like(maximum)
@@ -170,7 +187,7 @@ def dflash_block_splitkv(
         out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     if out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous():
         raise ValueError("Output must be contiguous BF16 with the query shape")
-    _partials[(4, cuq.numel() - 1, splits)](
+    _partials[(4, cuq.numel() - 1, kvh * splits)](
         q,
         ke,
         ve,
@@ -188,6 +205,11 @@ def dflash_block_splitkv(
         ve.stride(0),
         kb.stride(0),
         vb.stride(0),
+        ke.stride(1),
+        ve.stride(1),
+        kb.stride(1),
+        vb.stride(1),
+        kvh,
         kscale,
         vscale,
         softmax_scale,

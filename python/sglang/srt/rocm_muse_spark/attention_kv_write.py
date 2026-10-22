@@ -49,8 +49,8 @@ class _KVWriteTarget(NamedTuple):
 def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
     return (
         attention.head_dim == 64
-        and attention.num_heads == 16
-        and attention.num_kv_heads == 2
+        and attention.num_kv_heads in (2, 4)
+        and attention.num_heads == 8 * attention.num_kv_heads
         and attention.use_qk_norm
         and not attention.use_attn_temperature_tuning
         and (
@@ -134,7 +134,8 @@ def qkv_proj_norm_rope_kv_write(
         and x.shape[1] == 8192
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
-        and projection.weight.shape == (2304, 8192)
+        and projection.weight.shape
+        == ((2 * attention.num_heads + 2 * attention.num_kv_heads) * 64, 8192)
         and projection.weight.dtype == torch.bfloat16
         and projection.weight.is_contiguous()
         and projection.bias is None
@@ -160,6 +161,8 @@ def qkv_proj_norm_rope_kv_write(
         attention.scale_query_by,
         target.k_scale,
         target.v_scale,
+        num_heads=attention.num_heads,
+        num_kv_heads=attention.num_kv_heads,
     )
 
 

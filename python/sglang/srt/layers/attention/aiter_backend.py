@@ -222,7 +222,8 @@ def _muse_verify_attention(
     Sliding layers (2047-token window): split-KV up to 8 requests, GQA-folded
     tiles beyond. Full layers: the two-KV-head kernel (16 Q / 2 KV heads per
     rank, bitwise equal to the GQA-folded and 3D paths), else GQA-folded
-    split-KV from 8 requests. ``kernels`` holds the enabled kernel names.
+    split-KV (from 8 requests at 2 KV heads per rank, any batch with more).
+    ``kernels`` holds the enabled kernel names.
     """
     num_tokens, num_query_heads, head_size = q.shape
     _, block_size, num_kv_heads, _ = k.shape
@@ -241,19 +242,22 @@ def _muse_verify_attention(
         and sinks is None
     ):
         return False
+    # Splits were tuned at 2 KV heads per rank (TP8); more KV heads (TP4: 4) divide them to keep the CTA count.
+    kv_scale = max(1, num_kv_heads // 2)
     if sliding_window == 2047 and window_size[1] == 0:
-        if "swa_splitkv" in kernels and num_query_heads == 16 and 0 < num_seqs <= 8:
+        if "swa_splitkv" in kernels and 0 < num_seqs <= 8:
             swa_verify_splitkv(
                 q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, None,
                 softmax_scale, True, window_size, block_table, softcap,
-                None, k_descale, v_descale, num_splits=16,
+                None, k_descale, v_descale, num_splits=16 // kv_scale,
             )  # fmt: skip
             return True
         if "swa_gqa" in kernels and num_seqs > 8:
             gqa_verify_splitkv(
                 q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
                 sliding_window, k_descale, v_descale,
-                splits=16 if num_seqs <= 16 else 8, bn=64, num_warps=4, num_stages=2,
+                splits=(16 if num_seqs <= 16 else 8) // kv_scale, bn=64, num_warps=4,
+                num_stages=2,
             )  # fmt: skip
             return True
         return False
@@ -274,6 +278,9 @@ def _muse_verify_attention(
         )  # fmt: skip
         return True
     min_seqs, splits, bn, warps = _MUSE_VERIFY_FULL_GQA
+    if num_kv_heads > 2:
+        # No two-KV-head kernel past 2 KV heads: GQA-folded at every batch size (untuned below 8 requests).
+        min_seqs, splits = 1, splits // kv_scale
     if "full_gqa" in kernels and num_seqs >= min_seqs:
         gqa_verify_splitkv(
             q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, 0,
