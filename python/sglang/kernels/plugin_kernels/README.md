@@ -39,10 +39,10 @@ With its server flag set, `srt/kernel_plugins/<hardware>/integration.py`:
 - replaces that model's forward for the steps the spec covers; every other step
   runs the model's own forward.
 
-The kernels stay in their libraries. The library versions that
-`docker/Dockerfile` and `python/pyproject_other.toml` pin import these modules as
-`sglang.srt.megakernels` and `sglang.srt.monokernels`, which alias them. Unit
-tests are in `test/registered/unit/kernel_plugins/<hardware>/`.
+The kernels stay in their libraries, which import the contract from
+`sglang.kernels.plugin_kernels.<hardware>` and, in their tests, the integration
+from `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
+`test/registered/unit/kernel_plugins/<hardware>/`.
 
 ## Operators
 
