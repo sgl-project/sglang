@@ -146,11 +146,11 @@ code is split at the kernel/runtime boundary:
   width declarations, the build and forward contract) and any thin wrappers
   around its kernels, under `<hardware>/<model>/`. It imports nothing from
   `srt`.
-- `srt/kernel_plugins/<hardware>/` holds SGLang's integration: it reads the
-  server configuration at argument resolution, observes weight loading,
-  coordinates TP ranks, plans CUDA graph coverage, installs the model-forward
-  dispatch with its fallback, and hands a plugin the runtime state it may use
-  (`nvidia/binding.py`).
+- `srt/kernel_plugins/<hardware>/binding.py` holds SGLang's integration: it
+  reads the server configuration at argument resolution, observes weight
+  loading, coordinates TP ranks, plans CUDA graph coverage, installs the
+  model-forward dispatch with its fallback, and hands a plugin the runtime
+  state it may use.
 
 | Hardware | Server flag | Library |
 | --- | --- | --- |

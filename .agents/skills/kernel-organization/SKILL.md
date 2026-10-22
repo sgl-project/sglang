@@ -51,7 +51,7 @@ logical grouping and remove the old `_jit_` filename prefix.
   live in `kernels/plugin_kernels/<hardware>/<model>/` (`KernelBackend.PLUGIN`)
   and import nothing from `srt`. SGLang's integration (config checks, weight
   observation, CUDA graph coverage, forward dispatch, the runtime binding) lives
-  in `srt/kernel_plugins/<hardware>/`. An op exposed from the contract side
+  in `srt/kernel_plugins/<hardware>/binding.py`. An op exposed from the contract side
   registers in its logical group with a `KernelSpec` that points into it.
 - Keep shared build/runtime infrastructure (including the Helion runtime
   helper) in `kernels/jit`; operator wrappers call it from their logical group.

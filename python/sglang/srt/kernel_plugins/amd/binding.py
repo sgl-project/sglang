@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang's integration of the AMD monokernel plugins behind --enable-amd-monokernel:
+"""SGLang's binding to the AMD monokernel plugins behind --enable-amd-monokernel:
 startup validation and graph-size alignment, then weight observation and the
 full-forward dispatch installed on the model."""
 

@@ -18,9 +18,9 @@ kernels/plugin_kernels/      # what a plugin implements; imports nothing from sr
                              #   capabilities and widths, build/forward contract
   <hardware>/<model>/        #   thin wrappers around the library's kernels
 srt/kernel_plugins/          # SGLang's integration
-  <hardware>/integration.py  #   startup checks, weight observation, TP agreement,
-                             #   CUDA graph coverage, forward dispatch and fallback
-  nvidia/binding.py          #   the runtime state handed to a megakernel
+  <hardware>/binding.py      #   startup checks, weight observation, TP agreement,
+                             #   CUDA graph coverage, forward dispatch and fallback,
+                             #   and the runtime state handed to the plugin
 ```
 
 | Hardware | Server flag | Library |
@@ -31,7 +31,7 @@ srt/kernel_plugins/          # SGLang's integration
 ## How a plugin runs
 
 A library registers its specs through the `sglang.srt.plugins` entry point.
-With its server flag set, `srt/kernel_plugins/<hardware>/integration.py`:
+With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
 - checks the spec against the resolved configuration at argument resolution,
   before the weights load, and stops the server listing every reason it cannot
   serve;
