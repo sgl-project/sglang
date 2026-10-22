@@ -1,7 +1,7 @@
 ---
 title: "GLM-5.3-Flash"
 metatags:
-  description: "Deploy GLM-5.3-Flash with SGLang on Ascend A3 and A5 NPUs, including single-node and PD disaggregation modes."
+  description: "Deploy GLM-5.3-Flash with SGLang on Ascend A3 and 950PR/DT series NPUs, including single-node and PD disaggregation modes."
 ---
 
 ## Introduction
@@ -11,7 +11,7 @@ Attention (DSA), multi-token prediction (MTP), and ModelSlim quantized weights.
 
 This document demonstrates the deployment of GLM-5.3-Flash on Ascend NPUs using SGLang, including single-node
 prefill-decode mixed deployment, prefill-decode disaggregation, feature configuration, and performance tuning.
-The examples use W8A8 weights on Atlas 800I A3 and W8A8_MXFP8 weights on Ascend A5.
+The examples use W8A8 weights on Atlas 800I A3 and W8A8_MXFP8 weights on Ascend 950PR/DT series.
 
 ## Supported features
 
@@ -59,7 +59,7 @@ Before downloading model weights, check the model size to reserve enough disk sp
 For PD disaggregation, download the weights to a shared directory accessible to both nodes.
 
 - [GLM-5.3-Flash-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) (W8A8, 332.97GB, for Atlas 800I A3)
-- [GLM-5.3-Flash-w8a8-mxfp8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) (W8A8_MXFP8, 338.12GB, for Ascend A5)
+- [GLM-5.3-Flash-w8a8-mxfp8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) (W8A8_MXFP8, 338.12GB, for Ascend 950PR/DT series)
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model. For quantization guidance, see
   [Quantization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization).
 
@@ -69,7 +69,7 @@ Set `MODEL_PATH` to this directory inside the container.
 
 <Info>
 A3 single-node deployment uses one full Atlas 800I A3 node: eight cards and 16 dies, with `--tp-size 16`.
-A5 single-node deployment uses eight NPU devices, with `--tp-size 8`.
+950PR/DT series single-node deployment uses eight NPU devices, with `--tp-size 8`.
 Each PD disaggregation configuration uses two nodes of the same platform: one for prefill and one for decode.
 </Info>
 
@@ -85,7 +85,7 @@ Reserve enough disk space for both the container image and model weights before 
 
 Use a SGLang image with the runtime components required by your target platform and deployment mode.
 Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container.
-For A5 PD disaggregation, choose an image that supports DP attention.
+For 950PR/DT series PD disaggregation, choose an image that supports DP attention.
 
 <Tabs>
   <Tab title="Atlas 800I A3">
@@ -137,18 +137,18 @@ docker exec -it "$NAME" bash
 ```
 
   </Tab>
-  <Tab title="Ascend A5">
+  <Tab title="Ascend 950PR/DT series">
 
 ```bash Command
 # ============================================================
 # Before running, update the following variables:
-#   IMAGE: SGLang image for Ascend A5
+#   IMAGE: SGLang image for Ascend 950PR/DT series
 #   NAME: container name
 #   MODEL_DIR: model weights directory on the host
 # ============================================================
 
-IMAGE="<your A5 image>"
-NAME=sglang-glm53-flash-a5
+IMAGE="<your 950PR/DT series image>"
+NAME=sglang-glm53-flash-950pr-dt-series
 MODEL_DIR=/path/to/model-weights
 
 docker pull "$IMAGE"
@@ -240,9 +240,9 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend A5">
+  <Tab title="Ascend 950PR/DT series">
 
-Use the ModelSlim W8A8_MXFP8 checkpoint on one A5 node, with TP8 and no DP attention.
+Use the ModelSlim W8A8_MXFP8 checkpoint on one 950PR/DT series node, with TP8 and no DP attention.
 Replace `MODEL_PATH` with the checkpoint directory inside the container.
 
 ```shell
@@ -424,9 +424,9 @@ fi
 ```
 
   </Tab>
-  <Tab title="Ascend A5">
+  <Tab title="Ascend 950PR/DT series">
 
-Use W8A8_MXFP8 weights on two A5 nodes. Both instances use TP8 / PP1 / DP2 and NEXTN speculative decoding
+Use W8A8_MXFP8 weights on two 950PR/DT series nodes. Both instances use TP8 / PP1 / DP2 and NEXTN speculative decoding
 with four steps and five draft tokens. The nodes must be able to communicate over the `device_urma` transport.
 
 ```shell
