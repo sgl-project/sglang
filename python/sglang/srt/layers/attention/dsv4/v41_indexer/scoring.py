@@ -319,7 +319,17 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    if req is None:
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
+        )
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
