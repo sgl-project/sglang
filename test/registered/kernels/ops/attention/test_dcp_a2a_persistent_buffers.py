@@ -42,12 +42,8 @@ class TestDCPA2APersistentBuffers(CustomTestCase):
 
     def _make_inputs(self, N=2, B=4, H_per_rank=8, D=128):
         H = N * H_per_rank
-        attn_out = torch.randn(
-            B, H, D, device=self.device, dtype=torch.bfloat16
-        )
-        attn_lse = torch.randn(
-            B, H, device=self.device, dtype=torch.float32
-        )
+        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
+        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
         return attn_out, attn_lse
 
     def test_same_shape_reuses_persistent_buffers(self):
@@ -57,18 +53,14 @@ class TestDCPA2APersistentBuffers(CustomTestCase):
         group = self._make_mock_group(N)
         attn_out, attn_lse = self._make_inputs(N=N)
 
-        dcp_comm.dcp_a2a_lse_reduce(
-            attn_out, attn_lse, group, is_lse_base_on_e=True
-        )
+        dcp_comm.dcp_a2a_lse_reduce(attn_out, attn_lse, group, is_lse_base_on_e=True)
         self.assertEqual(len(dcp_comm._A2A_PERSISTENT_BUFFERS), 1)
 
         first = next(iter(dcp_comm._A2A_PERSISTENT_BUFFERS.values()))
         send_ptr = first["send_combined"].data_ptr()
         recv_ptr = first["recv_combined"].data_ptr()
 
-        dcp_comm.dcp_a2a_lse_reduce(
-            attn_out, attn_lse, group, is_lse_base_on_e=True
-        )
+        dcp_comm.dcp_a2a_lse_reduce(attn_out, attn_lse, group, is_lse_base_on_e=True)
 
         self.assertEqual(len(dcp_comm._A2A_PERSISTENT_BUFFERS), 1)
         second = next(iter(dcp_comm._A2A_PERSISTENT_BUFFERS.values()))
@@ -94,9 +86,7 @@ class TestDCPA2APersistentBuffers(CustomTestCase):
 
         N, B, H_per_rank, D = 2, 4, 8, 128
         group = self._make_mock_group(N)
-        attn_out, attn_lse = self._make_inputs(
-            N=N, B=B, H_per_rank=H_per_rank, D=D
-        )
+        attn_out, attn_lse = self._make_inputs(N=N, B=B, H_per_rank=H_per_rank, D=D)
 
         graph_buffers = {
             "send_combined": torch.empty(
