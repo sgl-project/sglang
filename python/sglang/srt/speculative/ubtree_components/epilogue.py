@@ -456,22 +456,23 @@ class UBTreeVerifyEpilogue:
                 out=state_batch_indices,
             )
             has_track = mamba_track_indices is not None
-            _, mamba_steps_to_track = fused_commit_track_indices(
-                accept_index,
-                accept_lens,
-                self.seq_lens_buf[:bs] if has_track else None,
-                self.node_count,
-                self.mamba_track_interval,
-                last_correct_out=self.last_correct_step_buf,
-                track_steps_out=(self.mamba_steps_to_track_buf if has_track else None),
-            )
+            mamba_steps_to_track = None
+            if has_track:
+                _, mamba_steps_to_track = fused_commit_track_indices(
+                    accept_index,
+                    accept_lens,
+                    self.seq_lens_buf[:bs],
+                    self.node_count,
+                    self.mamba_track_interval,
+                    last_correct_out=self.last_correct_step_buf,
+                    track_steps_out=self.mamba_steps_to_track_buf,
+                )
             commit_kda_tree_after_verify(
                 spec_state=self.kda_spec_state,
                 state_batch_indices=state_batch_indices,
                 factor_cache_indices=self.factor_cache_indices_buf[:bs],
                 accept_index=accept_index,
                 accept_lens=accept_lens,
-                last_correct_step_indices=self.last_correct_step_buf[:bs],
                 tree_width=self.node_count,
                 mamba_track_indices=(mamba_track_indices[:bs] if has_track else None),
                 mamba_steps_to_track=mamba_steps_to_track,

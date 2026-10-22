@@ -330,7 +330,6 @@ def fused_kda_conv_tree_transform(
     conv_bias: torch.Tensor | None,
     conv_state_indices: torch.Tensor,
     intermediate_conv_window: torch.Tensor,
-    intermediate_state_indices: torch.Tensor,
     retrieve_parent_token: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,

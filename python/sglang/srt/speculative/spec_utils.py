@@ -950,12 +950,14 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        mamba_steps_to_track = None
+        if batch.mamba_track_indices is not None:
+            _, mamba_steps_to_track = _verify_commit_step_indices(
+                batch=batch,
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                draft_token_num=draft_token_num,
+            )
         factor_cache_indices = torch.arange(
             accept_lens.shape[0], dtype=torch.int32, device=accept_lens.device
         )
@@ -965,7 +967,6 @@ def commit_mamba_states_after_verify(
             factor_cache_indices=factor_cache_indices,
             accept_index=accept_index,
             accept_lens=accept_lens,
-            last_correct_step_indices=last_correct_step_indices,
             tree_width=draft_token_num,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,

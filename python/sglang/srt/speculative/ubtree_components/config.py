@@ -139,13 +139,11 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
         raise ValueError(
             "UBTREE requires a fixed verify width; adaptive steps are unsupported"
         )
-    if not target_backends or not set(target_backends) <= {
-        "fa3",
-        "flashinfer",
-        "triton",
-    }:
-        raise ValueError("UBTREE target attention requires FA3, FlashInfer, or Triton")
-    if "fa3" in target_backends and cfg.page_size != 1:
+    if not target_backends or set(target_backends) != {"fa3"}:
+        raise ValueError("UBTREE target attention requires FA3")
+    if cfg.speculative_draft_attention_backend != "fa3":
+        raise ValueError("UBTREE draft attention requires FA3")
+    if cfg.page_size != 1:
         raise ValueError("UBTREE with FA3 requires --page-size 1")
     decode = str(cfg.cuda_graph_config.decode.backend).lower()
     if not cfg.disable_cuda_graph and "disabled" not in decode:

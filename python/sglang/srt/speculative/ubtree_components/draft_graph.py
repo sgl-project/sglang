@@ -2,12 +2,7 @@
 # Copyright (c) 2026 The DeepSpec Authors
 # See LICENSE in this directory for the original license.
 
-"""CUDA Graph replay for the UBTree DFlash draft backbone.
-
-The production path captures embedding, transformer layers, and FlashInfer
-attention together.  A segmented non-attention path remains for unit-level
-coverage and backends that do not provide graph metadata.
-"""
+"""Full CUDA Graph replay of the UBTree draft and proposal tail."""
 
 from __future__ import annotations
 
@@ -24,18 +19,6 @@ from sglang.srt.model_executor.runner_utils import (
     get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.models.utils import apply_qk_norm
-
-
-@dataclass
-class _CapturedDraftBucket:
-    input_ids: torch.Tensor
-    positions: torch.Tensor
-    pre_graph: torch.cuda.CUDAGraph
-    pre_output: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    bridge_inputs: list[torch.Tensor]
-    bridge_graphs: list[torch.cuda.CUDAGraph]
-    bridge_outputs: list[tuple[torch.Tensor, ...]]
 
 
 @dataclass
@@ -57,11 +40,10 @@ class UBTreeDraftSegmentGraphRunner:
         *,
         model,
         input_embedding,
-        attn_backend=None,
+        attn_backend,
         batch_sizes: Iterable[int],
         block_size: int,
         hidden_size: int,
-        hidden_dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
         self.model = model
@@ -69,17 +51,12 @@ class UBTreeDraftSegmentGraphRunner:
         self.attn_backend = attn_backend
         self.block_size = int(block_size)
         self.hidden_size = int(hidden_size)
-        self.hidden_dtype = hidden_dtype
         self.device = torch.device(device)
-        self._captured: dict[int, _CapturedDraftBucket] = {}
         self._full_captured: dict[int, _CapturedFullDraftBucket] = {}
         self._requested_batch_sizes = tuple(
             sorted({int(bs) for bs in batch_sizes if int(bs) > 0})
         )
         self._capture_tail = None
-        if self.device.type == "cuda" and self.attn_backend is None:
-            for batch_size in self._requested_batch_sizes:
-                self._captured[batch_size] = self._capture(batch_size)
 
     @property
     def batch_sizes(self) -> tuple[int, ...]:
@@ -103,92 +80,6 @@ class UBTreeDraftSegmentGraphRunner:
 
     def can_run(self, batch_size: int) -> bool:
         return int(batch_size) in self._requested_batch_sizes
-
-    @staticmethod
-    def _prepare_attention(layer, positions, hidden_states, residual):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-        attn = layer.self_attn
-        qkv, _ = attn.qkv_proj(hidden_states)
-        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-        q, k = apply_qk_norm(q, k, attn.q_norm, attn.k_norm, attn.head_dim)
-        q, k = attn.rotary_emb(positions, q, k)
-        return q, k, v, residual
-
-    def _finish_attention(self, layer_idx, positions, attn_output, residual):
-        layer = self.model.layers[layer_idx]
-        attn_output = layer.self_attn.apply_attention_output(attn_output, residual)
-        hidden_states, _ = layer.self_attn.o_proj(attn_output)
-        hidden_states, residual = layer.post_attention_layernorm(
-            hidden_states, residual
-        )
-        hidden_states = layer.mlp(hidden_states)
-        if layer_idx + 1 == len(self.model.layers):
-            hidden_states, _ = self.model.norm(hidden_states, residual)
-            return (hidden_states,)
-        return self._prepare_attention(
-            self.model.layers[layer_idx + 1], positions, hidden_states, residual
-        )
-
-    def _capture(self, batch_size: int) -> _CapturedDraftBucket:
-        rows = batch_size * self.block_size
-        input_ids = torch.zeros(rows, dtype=torch.int64, device=self.device)
-        positions = torch.zeros(rows, dtype=torch.int64, device=self.device)
-        current_stream = torch.cuda.current_stream(self.device)
-        capture_stream = torch.cuda.Stream(device=self.device)
-        capture_stream.wait_stream(current_stream)
-        bridge_inputs: list[torch.Tensor] = []
-        bridge_graphs: list[torch.cuda.CUDAGraph] = []
-        bridge_outputs: list[tuple[torch.Tensor, ...]] = []
-        with torch.cuda.stream(capture_stream):
-            for _ in range(2):
-                input_hidden = self.input_embedding(input_ids).reshape(
-                    rows, self.hidden_size
-                )
-                self._prepare_attention(
-                    self.model.layers[0], positions, input_hidden, None
-                )
-            pre_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(pre_graph):
-                input_hidden = self.input_embedding(input_ids).reshape(
-                    rows, self.hidden_size
-                )
-                pre_output = self._prepare_attention(
-                    self.model.layers[0], positions, input_hidden, None
-                )
-
-            residual = pre_output[3]
-            for layer_idx, layer in enumerate(self.model.layers):
-                attn_input = torch.zeros(
-                    (rows, layer.self_attn.q_size),
-                    dtype=self.hidden_dtype,
-                    device=self.device,
-                )
-                for _ in range(2):
-                    self._finish_attention(layer_idx, positions, attn_input, residual)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    output = self._finish_attention(
-                        layer_idx, positions, attn_input, residual
-                    )
-                bridge_inputs.append(attn_input)
-                bridge_graphs.append(graph)
-                bridge_outputs.append(output)
-                if layer_idx + 1 < len(self.model.layers):
-                    residual = output[3]
-        current_stream.wait_stream(capture_stream)
-        return _CapturedDraftBucket(
-            input_ids=input_ids,
-            positions=positions,
-            pre_graph=pre_graph,
-            pre_output=pre_output,
-            bridge_inputs=bridge_inputs,
-            bridge_graphs=bridge_graphs,
-            bridge_outputs=bridge_outputs,
-        )
 
     def _run_full_model(self, captured, forward_batch):
         self.attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -294,32 +185,10 @@ class UBTreeDraftSegmentGraphRunner:
             raise ValueError(f"input_ids must have shape {expected_shape}")
         if tuple(positions.shape) != expected_shape:
             raise ValueError(f"positions must have shape {expected_shape}")
-        if self.attn_backend is not None:
-            if tuple(forward_batch.out_cache_loc.shape) != expected_shape:
-                raise ValueError(f"out_cache_loc must have shape {expected_shape}")
-            return self._replay_full(
-                input_ids=input_ids, positions=positions, forward_batch=forward_batch
-            )
-
-        captured = self._captured.get(batch_size)
-        if captured is None:
-            return None
-        captured.input_ids.copy_(input_ids)
-        captured.positions.copy_(positions)
-        captured.pre_graph.replay()
-        q, k, v, residual = captured.pre_output
-        for layer_idx, layer in enumerate(self.model.layers):
-            attn_output = layer.self_attn.attn(q, k, v, forward_batch)
-            captured.bridge_inputs[layer_idx].copy_(attn_output)
-            captured.bridge_graphs[layer_idx].replay()
-            output = captured.bridge_outputs[layer_idx]
-            if layer_idx + 1 == len(self.model.layers):
-                hidden_states = output[0]
-            else:
-                q, k, v, residual = output
-        return LogitsProcessorOutput(
-            next_token_logits=None,
-            hidden_states=hidden_states,
+        if tuple(forward_batch.out_cache_loc.shape) != expected_shape:
+            raise ValueError(f"out_cache_loc must have shape {expected_shape}")
+        return self._replay_full(
+            input_ids=input_ids, positions=positions, forward_batch=forward_batch
         )
 
 

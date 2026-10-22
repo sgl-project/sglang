@@ -577,7 +577,6 @@ def commit_kda_tree_after_verify(
     factor_cache_indices: torch.Tensor,
     accept_index: torch.Tensor,
     accept_lens: torch.Tensor,
-    last_correct_step_indices: torch.Tensor,
     tree_width: int,
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,

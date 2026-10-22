@@ -341,6 +341,7 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             speculative_use_block_verification=False,
             speculative_adaptive=False,
             page_size=1,
+            speculative_draft_attention_backend="fa3",
             disable_cuda_graph=False,
             disable_cuda_graph_padding=True,
             cuda_graph_config=SimpleNamespace(
@@ -349,8 +350,12 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             ),
         )
         validate_runtime_config(cfg, ("fa3",))
+        for backend in ("flashinfer", "triton"):
+            with self.subTest(backend=backend), self.assertRaises(ValueError):
+                validate_runtime_config(cfg, (backend,))
         for field, value in [
             ("device", "cpu"),
+            ("speculative_draft_attention_backend", "flashinfer"),
             ("pp_size", 2),
             ("dp_size", 2),
             ("max_running_requests", 2),

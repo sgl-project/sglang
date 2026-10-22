@@ -234,7 +234,7 @@ class UBTreeSelector(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         cfg = parse_ubtree_config(config)
-        vocab_size = int(config.vocab_size)
+        vocab_size = self.vocab_size = int(config.vocab_size)
         hidden_size = int(config.hidden_size)
         self.rank = cfg.rank
         self.candidate_k = cfg.candidate_k

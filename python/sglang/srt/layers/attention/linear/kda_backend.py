@@ -1461,7 +1461,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 conv_bias=layer.bias,
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_view,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
                 retrieve_parent_token=retrieve_parent_token,
                 a=a,
                 b=b,

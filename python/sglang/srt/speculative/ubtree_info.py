@@ -7,15 +7,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
-
-if TYPE_CHECKING:
-    from .ubtree_components.verify_metadata import UBTreeVerifyMetadataBuffers
 
 
 @dataclass
@@ -27,42 +23,7 @@ class UBTreeVerifyInput(EagleVerifyInput):
     # graph-stable buffer and uses it to launch one parallel wave per depth.
     tree_depths: torch.Tensor | None = None
     logical_max_depth: int = 1
-    metadata_buffers: UBTreeVerifyMetadataBuffers | None = None
-    # FA3 can consume the compact [batch, query, tree-key] visibility matrix
-    # directly. FULL_MASK remains the default for all existing backends.
-    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK
-
-    def generate_attn_arg_prefill(
-        self,
-        req_pool_indices,
-        paged_kernel_lens,
-        paged_kernel_lens_sum,
-        req_to_token,
-    ):
-        if self.metadata_buffers is None:
-            return super().generate_attn_arg_prefill(
-                req_pool_indices,
-                paged_kernel_lens,
-                paged_kernel_lens_sum,
-                req_to_token,
-            )
-        return self.metadata_buffers.generate_attn_arg_prefill(
-            req_pool_indices,
-            paged_kernel_lens,
-            paged_kernel_lens_sum,
-            req_to_token,
-        )
-
-    def prepare_packed_custom_mask(
-        self, packed_custom_mask, packed_mask_indptr, *, batch_size: int
-    ) -> bool:
-        if self.metadata_buffers is None:
-            return False
-        return self.metadata_buffers.prepare_packed_custom_mask(
-            packed_custom_mask,
-            packed_mask_indptr,
-            batch_size=batch_size,
-        )
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.QLEN_ONLY
 
     @property
     def uses_direct_parent(self) -> bool:
@@ -87,7 +48,6 @@ def create_ubtree_verify_input(
     custom_mask, num_tokens_per_req: int
 ) -> UBTreeVerifyInput:
     """Build the fixed-width target input used during CUDA Graph capture."""
-    from sglang.srt.environ import envs
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.runtime_context import get_spec
 
@@ -109,9 +69,5 @@ def create_ubtree_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         logical_max_depth=spec.speculative_dflash_block_size,
-        tree_mask_mode=(
-            TreeMaskMode.QLEN_ONLY
-            if envs.SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK.get()
-            else TreeMaskMode.FULL_MASK
-        ),
+        tree_mask_mode=TreeMaskMode.QLEN_ONLY,
     )

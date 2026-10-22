@@ -9,11 +9,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
 from sglang.srt.speculative.ubtree_components.epilogue import UBTreeVerifyEpilogue
 from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
-from sglang.srt.speculative.ubtree_components.tree import build_sglang_full_mask
 from sglang.srt.speculative.ubtree_components.tree_graph import (
-    UBTreeProposalGraphRunner,
+    build_ubtree_proposal,
 )
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -65,24 +65,6 @@ def _make_selector_graph_components(device):
     return config, selector, lm_head
 
 
-def _make_proposal_graph_runner(device, *, batch_sizes):
-    config, selector, lm_head = _make_selector_graph_components(device)
-    return UBTreeProposalGraphRunner(
-        batch_sizes=batch_sizes,
-        depth_count=4,
-        hidden_size=config.hidden_size,
-        hidden_dtype=torch.float32,
-        candidate_k=3,
-        vocab_size=config.vocab_size,
-        lm_head=lm_head,
-        selector=selector,
-        budget=5,
-        supertree_width=3,
-        depth_bonus=0.0,
-        device=device,
-    )
-
-
 def _assert_tree_batches_equal(actual, expected):
     assert actual.__dict__.keys() == expected.__dict__.keys()
     for name in actual.__dict__:
@@ -100,105 +82,36 @@ def _assert_tree_batches_equal(actual, expected):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
-def test_proposal_graph_runner_replays_changing_inputs_exactly():
-    runner = _make_proposal_graph_runner("cuda", batch_sizes=[2])
-    eager = UBTreeProposalGraphRunner(
-        batch_sizes=[],
-        depth_count=runner.depth_count,
-        hidden_size=runner.hidden_size,
-        hidden_dtype=runner.hidden_dtype,
-        candidate_k=runner.candidate_k,
-        vocab_size=runner.vocab_size,
-        lm_head=runner.lm_head,
-        selector=runner.selector,
-        budget=runner.budget,
-        supertree_width=runner.supertree_width,
-        depth_bonus=runner.depth_bonus,
-        device="cuda",
-    )
+def test_proposal_tail_replays_changing_inputs_exactly():
+    config, selector, lm_head = _make_selector_graph_components("cuda")
+    hidden = torch.zeros(2, 4, 8, device="cuda")
+    bonus_tokens = torch.zeros(2, dtype=torch.int64, device="cuda")
+
+    def build():
+        return build_ubtree_proposal(
+            hidden=hidden,
+            bonus_tokens=bonus_tokens,
+            config=parse_ubtree_config(config),
+            num_nodes=6,
+            lm_head=lm_head,
+            selector=selector,
+        )
+
+    for _ in range(2):
+        build()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = build()
     for seed in (61, 62):
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        hidden = torch.randn(2, 4, 8, device="cuda", generator=generator)
-        bonus_tokens = torch.randint(0, 17, (2,), device="cuda", generator=generator)
-        expected = eager(hidden=hidden, bonus_tokens=bonus_tokens)
-        actual = runner(hidden=hidden, bonus_tokens=bonus_tokens)
+        hidden.copy_(torch.randn(2, 4, 8, device="cuda", generator=generator))
+        bonus_tokens.copy_(
+            torch.randint(0, 17, (2,), device="cuda", generator=generator)
+        )
+        expected = build()
+        graph.replay()
         torch.cuda.synchronize()
         _assert_tree_batches_equal(actual, expected)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Triton mask builder requires CUDA"
-)
-def test_verify_metadata_cuda_mask_builder_is_exact_and_stable():
-    from sglang.srt.speculative.ubtree_components.verify_metadata import (
-        UBTreeVerifyMetadataBuffers,
-    )
-
-    metadata = UBTreeVerifyMetadataBuffers(
-        batch_sizes=(2, 4),
-        num_nodes=5,
-        max_context_len=32,
-        device="cuda",
-    )
-    pointer = metadata.custom_mask.data_ptr()
-    for seed, prefix_lens in ((71, [3, 7]), (72, [9]), (73, [1, 4, 8, 11])):
-        raw_bs = len(prefix_lens)
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        visibility = torch.rand(raw_bs, 5, 5, generator=generator, device="cuda") > 0.5
-        visibility.diagonal(dim1=1, dim2=2).fill_(True)
-        prefix_lens_tensor = torch.tensor(prefix_lens, device="cuda")
-        actual = metadata.prepare_custom_mask(
-            visibility,
-            prefix_lens_tensor,
-            prefix_lens_sum=sum(prefix_lens),
-        )
-        expected = build_sglang_full_mask(
-            visibility,
-            prefix_lens_tensor,
-            prefix_lens_sum=sum(prefix_lens),
-        )
-        padded_bs = metadata.graph_batch_size(raw_bs)
-        if padded_bs > raw_bs:
-            expected = torch.cat(
-                (
-                    expected,
-                    torch.ones(
-                        (padded_bs - raw_bs) * 5 * (1 + 5),
-                        dtype=torch.bool,
-                        device="cuda",
-                    ),
-                )
-            )
-        torch.cuda.synchronize()
-        assert actual.data_ptr() == pointer
-        assert torch.equal(actual, expected)
-
-        packed = torch.empty(
-            metadata.custom_mask.numel(), dtype=torch.uint8, device="cuda"
-        )
-        packed_indptr = torch.empty(
-            metadata.max_bs + 1, dtype=torch.int32, device="cuda"
-        )
-        packed_pointer = packed.data_ptr()
-        indptr_pointer = packed_indptr.data_ptr()
-        assert metadata.prepare_packed_custom_mask(
-            packed, packed_indptr, batch_size=padded_bs
-        )
-
-        padded_prefix_lens = torch.ones(padded_bs, dtype=torch.int64, device="cuda")
-        padded_prefix_lens[:raw_bs].copy_(prefix_lens_tensor)
-        bit_indptr = torch.zeros(padded_bs + 1, dtype=torch.int64, device="cuda")
-        bit_indptr[1:] = torch.cumsum(5 * (padded_prefix_lens + 5), dim=0)
-        from flashinfer.quantization import segment_packbits
-
-        expected_packed, expected_packed_indptr = segment_packbits(
-            actual, bit_indptr, bitorder="little"
-        )
-        torch.cuda.synchronize()
-        assert packed.data_ptr() == packed_pointer
-        assert packed_indptr.data_ptr() == indptr_pointer
-        assert torch.equal(packed_indptr[: padded_bs + 1], expected_packed_indptr)
-        assert torch.equal(packed[: expected_packed.numel()], expected_packed)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -293,111 +206,6 @@ def test_prepare_target_kv_move_metadata_is_cuda_graph_replay_safe():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_target_kv_move_graph_replays_with_changing_accept_paths():
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.speculative.ubtree_components.target_kv_graph import (
-        UBTreeTargetKVMoveGraphRunner,
-    )
-
-    device = torch.device("cuda")
-    pool = MHATokenToKVPool(
-        size=255,
-        page_size=1,
-        dtype=torch.float16,
-        head_num=2,
-        head_dim=8,
-        layer_num=2,
-        device=str(device),
-        enable_memory_saver=False,
-        enable_alt_stream=False,
-        enable_kv_cache_copy=True,
-    )
-    req_to_token = torch.zeros((4, 64), dtype=torch.int64, device=device)
-    req_to_token[1, 7:11] = torch.tensor([101, 102, 103, 104], device=device)
-    req_to_token[3, 13:17] = torch.tensor([121, 122, 123, 124], device=device)
-
-    runner = UBTreeTargetKVMoveGraphRunner(
-        kvcache=pool,
-        req_to_token=req_to_token,
-        batch_sizes=(2,),
-        accept_width=4,
-        verify_node_count=5,
-        device=device,
-    )
-    assert runner.batch_sizes == (2,)
-
-    for layer_idx, (key, value) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
-        rows = torch.arange(key.shape[0], dtype=key.dtype, device=device)
-        key.copy_(rows[:, None, None] + 1000 * layer_idx)
-        value.copy_(rows[:, None, None] + 2000 * layer_idx)
-
-    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([7, 13], dtype=torch.int32, device=device)
-    accept_index = torch.tensor(
-        [[1, 3, -1, -1], [5, 9, 7, -1]], dtype=torch.int32, device=device
-    )
-    accept_lens = torch.tensor([2, 3], dtype=torch.int32, device=device)
-    out_cache_loc = torch.tensor(
-        [20, 21, 22, 23, 24, 30, 31, 32, 33, 34],
-        dtype=torch.int64,
-        device=device,
-    )
-    assert runner(
-        req_pool_indices=req_pool_indices,
-        seq_lens=seq_lens,
-        accept_index=accept_index,
-        accept_lens=accept_lens,
-        out_cache_loc=out_cache_loc,
-    )
-    torch.cuda.synchronize()
-
-    first_targets = torch.tensor([101, 102, 121, 122, 123], device=device)
-    first_sources = torch.tensor([21, 23, 30, 34, 32], device=device)
-    for layer_idx, (key, value) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
-        assert torch.equal(
-            key[first_targets],
-            (first_sources.to(key.dtype)[:, None, None] + 1000 * layer_idx).expand_as(
-                key[first_targets]
-            ),
-        )
-        assert torch.equal(
-            value[first_targets],
-            (first_sources.to(value.dtype)[:, None, None] + 2000 * layer_idx).expand_as(
-                value[first_targets]
-            ),
-        )
-
-    # Replay the same graph with different lengths and path indices.
-    seq_lens.copy_(torch.tensor([9, 14], dtype=torch.int32, device=device))
-    accept_index.copy_(torch.tensor([[4, -1, -1, -1], [6, 8, -1, -1]], device=device))
-    accept_lens.copy_(torch.tensor([1, 2], dtype=torch.int32, device=device))
-    assert runner(
-        req_pool_indices=req_pool_indices,
-        seq_lens=seq_lens,
-        accept_index=accept_index,
-        accept_lens=accept_lens,
-        out_cache_loc=out_cache_loc,
-    )
-    torch.cuda.synchronize()
-
-    second_targets = torch.tensor([103, 122, 123], device=device)
-    second_sources = torch.tensor([24, 31, 33], device=device)
-    for layer_idx, (key, value) in enumerate(zip(pool.k_buffer, pool.v_buffer)):
-        assert torch.equal(
-            key[second_targets],
-            (second_sources.to(key.dtype)[:, None, None] + 1000 * layer_idx).expand_as(
-                key[second_targets]
-            ),
-        )
-        assert torch.equal(
-            value[second_targets],
-            (
-                second_sources.to(value.dtype)[:, None, None] + 2000 * layer_idx
-            ).expand_as(value[second_targets]),
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prepare_unified_commit_metadata_is_cuda_graph_replay_safe():
     from sglang.kernels.ops.speculative.ubtree import (
         prepare_unified_commit_metadata,
@@ -457,7 +265,8 @@ def test_prepare_unified_commit_metadata_is_cuda_graph_replay_safe():
     )
 
 
-def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch):
+@pytest.mark.parametrize("track", [False, True])
+def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch, track):
     epilogue = UBTreeVerifyEpilogue(
         max_bs=2,
         node_count=5,
@@ -508,6 +317,7 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch):
         last_correct_out,
         track_steps_out,
     ):
+        assert track, "tracking indices must not be computed without tracking"
         last_correct_out[:2].copy_(torch.tensor([2, 3], dtype=torch.int64))
         track_steps_out[:2].copy_(torch.tensor([0, -1], dtype=torch.int64))
         return last_correct_out[:2], track_steps_out[:2]
@@ -538,7 +348,7 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch):
     logits = torch.full((10, 16), -10.0)
     logits[torch.arange(10), torch.arange(10)] = 10.0
     hidden = torch.arange(20, dtype=torch.float32).view(10, 2)
-    track_indices = torch.tensor([21, 22], dtype=torch.int64)
+    track_indices = torch.tensor([21, 22], dtype=torch.int64) if track else None
     epilogue(
         logits=logits,
         hidden=hidden,
@@ -558,9 +368,112 @@ def test_verify_epilogue_folds_factorized_kda_commit(monkeypatch):
     assert torch.equal(
         committed["accept_lens"], torch.tensor([2, 3], dtype=torch.int32)
     )
-    assert torch.equal(committed["last_correct_step_indices"], torch.tensor([2, 3]))
-    assert torch.equal(committed["mamba_track_indices"], track_indices)
-    assert torch.equal(committed["mamba_steps_to_track"], torch.tensor([0, -1]))
+    if track:
+        assert torch.equal(committed["mamba_track_indices"], track_indices)
+        assert torch.equal(committed["mamba_steps_to_track"], torch.tensor([0, -1]))
+    else:
+        assert committed["mamba_track_indices"] is None
+        assert committed["mamba_steps_to_track"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
+    monkeypatch, graph_replay
+):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative import ubtree_worker_v2 as worker_module
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+    from sglang.srt.speculative.ubtree_components.tree import build_ubtree_batch
+
+    class CountingEpilogue(UBTreeVerifyEpilogue):
+        calls = 0
+
+        def __call__(self, **kwargs):
+            self.calls += 1
+            return super().__call__(**kwargs)
+
+    worker = worker_module.UBTreeWorkerV2.__new__(worker_module.UBTreeWorkerV2)
+    worker.device = "cuda"
+    worker.ubtree_config = SimpleNamespace(block_size=3, depth_count=2)
+    worker._verify_positions_buf = torch.empty((1, 5), dtype=torch.int64, device="cuda")
+    epilogue = worker._verify_epilogue = CountingEpilogue(
+        max_bs=1, node_count=5, max_depth=3, device="cuda"
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        is_extend_in_batch=False,
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+        spec_info=DFlashDraftInputV2.create_idle_input(device="cuda"),
+        seq_lens=torch.tensor([3], dtype=torch.int32, device="cuda"),
+    )
+    tree = build_ubtree_batch(
+        anchor_tokens=torch.tensor([0], device="cuda"),
+        candidate_ids=torch.tensor([[[1, 2], [3, 4]]], device="cuda"),
+        edge_log_probs=torch.log_softmax(torch.zeros((1, 2, 2, 2), device="cuda"), -1),
+        budget=4,
+        supertree_width=2,
+    )
+    worker._draft_tree = lambda *args: (tree, batch.seq_lens, None)
+    worker.req_to_token_pool = None
+    forward = SimpleNamespace(
+        req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        seq_lens=batch.seq_lens,
+        out_cache_loc=torch.arange(5, device="cuda"),
+        mamba_track_indices=None,
+    )
+    logits = torch.zeros((5, 17), device="cuda")
+    logits[:, 11] = 10
+    output = LogitsProcessorOutput(
+        next_token_logits=logits, hidden_states=torch.randn((5, 8), device="cuda")
+    )
+
+    def target_forward(**kwargs):
+        if graph_replay:
+            epilogue(
+                logits=logits,
+                hidden=output.hidden_states,
+                bs=1,
+                req_pool_indices=forward.req_pool_indices,
+                seq_lens=forward.seq_lens,
+                out_cache_loc=forward.out_cache_loc,
+            )
+        return SimpleNamespace(logits_output=output, can_run_cuda_graph=graph_replay)
+
+    worker._target_worker = SimpleNamespace(forward_batch_generation=target_forward)
+    worker._make_next_draft_input_decode = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setattr(
+        worker_module, "eagle_prepare_for_verify", lambda *args: (forward, graph_replay)
+    )
+    published = []
+    result = worker.forward_batch_generation(
+        batch, on_publish=lambda lens: published.append(lens.clone())
+    )
+    assert epilogue.calls == 1
+    assert result.accept_lens.tolist() == [1]
+    assert result.next_token_ids[0].item() == 11
+    assert published[0].tolist() == [4]
+    assert result.extra_keep_alive_refs == [forward]
+    epilogue.predict_buf.zero_()
+    epilogue.compact_predict_buf.zero_()
+    epilogue.accept_lens_buf.zero_()
+    assert result.accept_lens.tolist() == [1]
+    assert result.next_token_ids[0].item() == 11
+
+
+def test_worker_rejects_penalties_before_prefill():
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
+
+    worker = UBTreeWorkerV2.__new__(UBTreeWorkerV2)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        is_extend_in_batch=False,
+        sampling_info=SimpleNamespace(is_all_greedy=True, logit_bias={1: 1}),
+    )
+    with pytest.raises(ValueError, match="without penalties"):
+        worker.forward_batch_generation(batch)
 
 
 if __name__ == "__main__":
