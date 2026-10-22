@@ -48,8 +48,8 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
     # [columns] int64 index-K pool slot of each flattened-K column, from
-    # scoring.prefill_k_slots; gathered with the metadata, per layer only when the
-    # metadata has no snapshot (e.g. the prefill graph's capture pass).
+    # scoring.prefill_k_slots; gathered once with a non-speculative extend's
+    # metadata, per layer otherwise.
     k_slots: torch.Tensor
     # ratio -> scoring.PrefillIndexPlan, filled by the first layer of each ratio and
     # reused by the rest of the forward; None when the metadata has no snapshot, so

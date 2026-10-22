@@ -630,7 +630,6 @@ def _enter_eager_tail_in_prefill_graph(
     backend.tail_forward_metadata = backend._build_late_layer_tail_metadata(
         forward_batch
     )
-    backend._share_low_ratio_k_slots(backend.tail_forward_metadata)
     try:
         saved = backend.enter_late_layer_tail(forward_batch)
     finally:

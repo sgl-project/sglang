@@ -291,7 +291,6 @@ def _prefill_graph_replay(*, any_context, seq_len):
     backend._build_forward_metadata = build_full
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
-    backend._snapshot_low_ratio_k_slots = lambda forward_batch: None
     backend._prefill_graph_replays_any_context = lambda: any_context
     capture = object.__new__(DSV4Metadata)
     capture.prefill_graph_tail = True
