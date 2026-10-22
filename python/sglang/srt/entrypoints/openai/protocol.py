@@ -407,6 +407,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
@@ -603,10 +606,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
-    fps: Optional[float] = None
-    max_frames: Optional[int] = None
-    max_tokens_per_frame: Optional[int] = None
-    max_image_tokens: Optional[int] = None
+    fps: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    max_frames: Optional[int] = Field(default=None, gt=0)
+    max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
+    max_image_tokens: Optional[int] = Field(default=None, gt=0)
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -966,6 +969,9 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

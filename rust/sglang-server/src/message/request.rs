@@ -1,7 +1,7 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
 use bytes::Bytes;
@@ -14,6 +14,7 @@ use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
+use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -55,7 +56,25 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 /// The wire type is the generated `sglang_api_types` request (the schema is
 /// the contract); its carriers become the internal ones through `message::wire`
 /// on the way in.
-pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateRequest>, bool), Error> {
+#[derive(Clone, Debug, Default)]
+pub struct GenerationPolicy {
+    lora_ids: BTreeMap<String, String>,
+    enable_strict_thinking: bool,
+}
+
+impl From<&ServerArgs> for GenerationPolicy {
+    fn from(args: &ServerArgs) -> Self {
+        Self {
+            lora_ids: args.lora_ids.clone(),
+            enable_strict_thinking: args.enable_strict_thinking,
+        }
+    }
+}
+
+pub fn into_requests(
+    req: api_v1::GenerateRequest,
+    policy: &GenerationPolicy,
+) -> Result<(Vec<GenerateRequest>, bool), Error> {
     let api_v1::GenerateRequest {
         rid,
         text,
@@ -79,7 +98,21 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         mm_hashes,
         video_data,
         audio_data,
+        lora_path,
+        routing_key,
+        priority,
+        require_reasoning,
+        max_thinking_tokens,
+        kv_hints,
+        extra_key,
+        cache_salt,
+        session_params,
     } = req;
+    if session_params.is_some() {
+        return Err(Error::Validation(
+            "session_params is not supported by the Rust server".into(),
+        ));
+    }
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
@@ -103,6 +136,16 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
+    let extra_key = extra_key.and_then(wire::string_or_list);
+    let cache_salt = cache_salt.and_then(wire::string_or_list);
+    let lora_path = lora_path.and_then(wire::optional_string_or_list);
+
+    if max_thinking_tokens.is_some() && !policy.enable_strict_thinking {
+        return Err(Error::Validation(
+            "max_thinking_tokens requires the server to be launched with --enable-strict-thinking"
+                .into(),
+        ));
+    }
 
     // Cap the batch BEFORE the columns below allocate anything. Reading the
     // declared length off the input costs nothing; the previous placement (after
@@ -270,6 +313,24 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
+    // Python `_normalize_extra_key` / `_normalize_cache_salt`: one key
+    // broadcasts, a list is per item (batch requests only), and an empty key
+    // means none.
+    let cache_key_column = |value: Option<OneOrMany<String>>, name: &str| {
+        if !is_batch && matches!(value, Some(OneOrMany::Many(_))) {
+            return Err(Error::Validation(format!(
+                "{name} should be a string for a single request."
+            )));
+        }
+        Ok::<Vec<Option<String>>, Error>(
+            fan_out(value, n, name)?
+                .into_iter()
+                .map(|key| key.filter(|key| !key.is_empty()))
+                .collect(),
+        )
+    };
+    let extra_keys = cache_key_column(extra_key, "extra_key")?;
+    let cache_salts = cache_key_column(cache_salt, "cache_salt")?;
     // `mm_hashes` has no batch form: honoring it only here would give the two
     // servers different prefix-cache keys for the same body. Reject instead of
     // dropping it silently as Python does — the field exists to align a
@@ -296,6 +357,14 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
 
     // Every column above is exactly `n` long, so zip them by value: each
     // request takes ownership of its cell, with no indexing or bounds checks.
+    if let Some(value) = &routing_key {
+        check_broadcast_budget(value.len(), n, "routing_key")?;
+    }
+    let lora_ids = flatten_column(fan_out(lora_path, n, "lora_path")?)
+        .into_iter()
+        .map(|name| resolve_lora_id(name, policy))
+        .collect::<Result<Vec<_>, _>>()?;
+    let kv_hints = kv_hints_column(kv_hints, n)?;
     let mut requests: Vec<GenerateRequest> = izip!(
         rids,
         texts,
@@ -311,9 +380,13 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         bootstrap_rooms,
         bootstrap_pair_keys,
         decode_tp_sizes,
+        extra_keys,
+        cache_salts,
         images,
         videos,
         audios,
+        lora_ids,
+        kv_hints,
     )
     .map(
         |(
@@ -331,37 +404,63 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             bootstrap_room,
             bootstrap_pair_key,
             decode_tp_size,
+            extra_key,
+            cache_salt,
             image_data,
             video_data,
             audio_data,
-        )| GenerateRequest {
-            rid,
-            text,
-            input_ids,
-            // Plain text prompts keep the post-processor specials; the
-            // chat flow sets this explicitly.
-            skip_special_tokens: false,
-            sampling_params,
-            stream,
-            // Python `GenerateReqInput` defaults.
-            return_logprob: return_logprob.unwrap_or(false),
-            logprob_start_len: logprob_start_len.unwrap_or(-1),
-            top_logprobs_num: top_logprobs_num.unwrap_or(0),
-            // `Some` here means "these ids were requested", so an empty list
-            // collapses to None.
-            token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-            return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
-            return_hidden_states: return_hidden_states.unwrap_or(false),
-            return_text_in_logprobs,
-            bootstrap_host,
-            bootstrap_port,
-            bootstrap_room,
-            bootstrap_pair_key,
-            decode_tp_size,
-            routed_dp_rank,
-            disagg_prefill_dp_rank,
-            mm: pack_mm(image_data, video_data, audio_data),
-            mm_buffers: Vec::new(),
+            lora_id,
+            kv_hints,
+        )| {
+            let mut sampling_params = sampling_params;
+            if let Some(max_thinking_tokens) = max_thinking_tokens {
+                sampling_params
+                    .custom_params
+                    .get_or_insert_default()
+                    .insert(
+                        "thinking_budget".into(),
+                        super::sampling::CustomParamValue::Unsigned(max_thinking_tokens),
+                    );
+            }
+            GenerateRequest {
+                rid,
+                text,
+                input_ids,
+                // Plain text prompts keep the post-processor specials; the
+                // chat flow sets this explicitly.
+                skip_special_tokens: false,
+                sampling_params,
+                // The decoded request no longer shows which keys the client sent;
+                // the adapter marks this from the body it received.
+                max_new_tokens_defaulted: false,
+                stream,
+                // Python `GenerateReqInput` defaults.
+                return_logprob: return_logprob.unwrap_or(false),
+                logprob_start_len: logprob_start_len.unwrap_or(-1),
+                top_logprobs_num: top_logprobs_num.unwrap_or(0),
+                // `Some` here means "these ids were requested", so an empty list
+                // collapses to None.
+                token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
+                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
+                return_hidden_states: return_hidden_states.unwrap_or(false),
+                return_text_in_logprobs,
+                bootstrap_host,
+                bootstrap_port,
+                bootstrap_room,
+                bootstrap_pair_key,
+                decode_tp_size,
+                routed_dp_rank,
+                disagg_prefill_dp_rank,
+                extra_key,
+                cache_salt,
+                lora_id,
+                routing_key: routing_key.clone(),
+                priority,
+                require_reasoning: require_reasoning.unwrap_or(false),
+                kv_hints,
+                mm: pack_mm(image_data, video_data, audio_data),
+                mm_buffers: Vec::new(),
+            }
         },
     )
     .collect();
@@ -428,9 +527,20 @@ pub enum RequestKind {
     /// the same FSM as every request (validate → register → Queued), but the
     /// stage that answers it is the detok shard itself, never the scheduler
     /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
+    /// (the raw UTF-8 text). Callers: `/v1/completions` `echo` for token-id
+    /// prompts, and `/v1/detokenize`.
+    Detokenize {
+        token_ids: TokenIds,
+        skip_special_tokens: bool,
+    },
+    /// Internal service call: encode one text to token ids (`/v1/tokenize`).
+    /// Walks the same FSM to `Queued`, then the tokenizer pool answers it
+    /// through the request's own sink with one `TokenIds` payload. It never
+    /// reaches a detok shard, so it is not registered with one.
+    Tokenize {
+        text: String,
+        add_special_tokens: bool,
+    },
 }
 
 /// A single in-flight generation request (one item after adapter fan-out),
@@ -467,6 +577,14 @@ pub struct GenerateRequest {
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
+    /// `sampling_params.max_new_tokens` is not the client's: the request sent
+    /// none, so it holds a launch-time preferred value, the launch default
+    /// (HTTP), or the schema default (gRPC). Only a client's own value is
+    /// checked against the context window, as the Python TokenizerManager
+    /// does; this one reaches the scheduler as is, which clamps it to the
+    /// window. A preferred or default value as large as the window would
+    /// otherwise reject every request that leaves the limit to the server.
+    pub max_new_tokens_defaulted: bool,
     /// Whether the caller requested incremental output.
     pub stream: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
@@ -502,6 +620,19 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the
+    /// same key.
+    pub extra_key: Option<String>,
+    /// The prefix cache's second namespace key.
+    pub cache_salt: Option<String>,
+    /// Scheduler/orchestrator controls forwarded by the native API. `lora_id`
+    /// accepts the preloaded adapter identifier; dynamic LoRA loading remains
+    /// owned by the Python registry and is intentionally not implied here.
+    pub lora_id: Option<String>,
+    pub routing_key: Option<String>,
+    pub priority: Option<i64>,
+    pub require_reasoning: bool,
+    pub kv_hints: Option<KvHintsEnvelope>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
@@ -511,6 +642,81 @@ pub struct GenerateRequest {
     /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvHintsEnvelope {
+    protocol_version: String,
+    message_id: String,
+    actions: Vec<KvHintAction>,
+}
+
+#[derive(Debug, Clone)]
+struct KvHintAction {
+    action_id: String,
+    action_type: String,
+    action_version: String,
+    payload: serde_json::Value,
+}
+
+// Python's kv_hints structs are not `array_like`, so they must reach msgspec as
+// maps; a derived Serialize goes through rmp_serde's struct-as-array encoding.
+impl serde::Serialize for KvHintsEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap; // codespell:ignore ser
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("protocol_version", &self.protocol_version)?;
+        map.serialize_entry("message_id", &self.message_id)?;
+        map.serialize_entry("actions", &self.actions)?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for KvHintAction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap; // codespell:ignore ser
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("action_id", &self.action_id)?;
+        map.serialize_entry("action_type", &self.action_type)?;
+        map.serialize_entry("action_version", &self.action_version)?;
+        map.serialize_entry("payload", &self.payload)?;
+        map.end()
+    }
+}
+
+impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {
+    type Error = Error;
+
+    fn try_from(value: api_v1::KvHintsEnvelope) -> Result<Self, Self::Error> {
+        let actions = value
+            .actions
+            .into_iter()
+            .map(|action| {
+                let payload: serde_json::Value = serde_json::from_str(
+                    action.payload.as_deref().unwrap_or("{}"),
+                )
+                .map_err(|error| {
+                    Error::Validation(format!("kv_hints action payload is not JSON: {error}"))
+                })?;
+                if !payload.is_object() {
+                    return Err(Error::Validation(
+                        "kv_hints action payload must be a JSON object".into(),
+                    ));
+                }
+                Ok(KvHintAction {
+                    action_id: action.action_id,
+                    action_type: action.action_type,
+                    action_version: action.action_version,
+                    payload,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Self {
+            protocol_version: value.protocol_version,
+            message_id: value.message_id,
+            actions,
+        })
+    }
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
@@ -626,6 +832,56 @@ pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> 
     Ok(())
 }
 
+/// Map a prompt's adapter name to its launch-time LoRA id. A missing or empty
+/// name runs the base model, as Python treats a falsy `lora_path`.
+fn resolve_lora_id(
+    name: Option<String>,
+    policy: &GenerationPolicy,
+) -> Result<Option<String>, Error> {
+    match name.as_deref() {
+        None | Some("") => Ok(None),
+        Some(name) => policy.lora_ids.get(name).cloned().map(Some).ok_or_else(|| {
+            Error::Validation(format!(
+                "LoRA adapter '{name}' is not loaded; loaded adapters: {:?}",
+                policy.lora_ids.keys().collect::<Vec<_>>()
+            ))
+        }),
+    }
+}
+
+/// Per-prompt `kv_hints`, following Python `_normalize_kv_hints`: one envelope
+/// applies to every prompt, a list carries one nullable envelope per prompt.
+fn kv_hints_column(
+    value: Option<api_v1::KvHintsEnvelopeOrList>,
+    n: usize,
+) -> Result<Vec<Option<KvHintsEnvelope>>, Error> {
+    use api_v1::kv_hints_envelope_or_list::Value;
+    match value.and_then(|v| v.value) {
+        None => Ok(vec![None; n]),
+        Some(Value::One(envelope)) => {
+            let envelope = KvHintsEnvelope::try_from(envelope)?;
+            let per_clone = serde_json::to_vec(&envelope)
+                .expect("KvHintsEnvelope contains only JSON-serializable values")
+                .len()
+                .saturating_mul(JSON_TO_HEAP_FACTOR);
+            check_broadcast_budget(per_clone, n, "kv_hints")?;
+            Ok(vec![Some(envelope); n])
+        }
+        Some(Value::Many(list)) => {
+            if list.items.len() != n {
+                return Err(Error::Validation(format!(
+                    "kv_hints list length {} does not match batch size {n}",
+                    list.items.len()
+                )));
+            }
+            list.items
+                .into_iter()
+                .map(|item| item.envelope.map(KvHintsEnvelope::try_from).transpose())
+                .collect()
+        }
+    }
+}
+
 fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
     value: Option<OneOrMany<T>>,
     n: usize,
@@ -696,7 +952,80 @@ mod tests {
     const TEST_VOCAB: u64 = 1000;
 
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
-        into_requests(serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap())
+        requests_with_policy(body, &GenerationPolicy::default())
+    }
+
+    fn requests_with_policy(
+        body: &str,
+        policy: &GenerationPolicy,
+    ) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        into_requests(
+            serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
+            policy,
+        )
+    }
+
+    #[test]
+    fn launch_policy_is_applied_before_scheduler_submission() {
+        let mut lora_ids = BTreeMap::new();
+        lora_ids.insert("adapter".into(), "stable-id".into());
+        let policy = GenerationPolicy {
+            lora_ids,
+            enable_strict_thinking: true,
+        };
+        let (requests, _) = requests_with_policy(
+            r#"{"text":"hi","lora_path":"adapter","max_thinking_tokens":23}"#,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(requests[0].lora_id.as_deref(), Some("stable-id"));
+        assert!(matches!(
+            requests[0]
+                .sampling_params
+                .custom_params
+                .as_ref()
+                .and_then(|params| params.get("thinking_budget")),
+            Some(super::super::sampling::CustomParamValue::Unsigned(23))
+        ));
+
+        let error =
+            requests_with_policy(r#"{"text":"hi","lora_path":"missing"}"#, &policy).unwrap_err();
+        assert!(error.to_string().contains("not loaded"), "{error}");
+    }
+
+    #[test]
+    fn max_thinking_tokens_requires_strict_thinking() {
+        let error = requests(r#"{"text":"hi","max_thinking_tokens":23}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("--enable-strict-thinking"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_scalar_broadcasts_are_bounded() {
+        let prompts = vec!["x"; 4096];
+        let routing_key = "k".repeat(MAX_BROADCAST_CLONE_BYTES / prompts.len() + 1);
+        let body = serde_json::json!({"text": prompts, "routing_key": routing_key});
+        let error = requests(&body.to_string()).unwrap_err();
+        assert!(error.to_string().contains("routing_key"), "{error}");
+
+        let payload = "v".repeat(MAX_BROADCAST_CLONE_BYTES / 8 / 4096 + 1);
+        let body = serde_json::json!({
+            "text": vec!["x"; 4096],
+            "kv_hints": {
+                "protocol_version": "1",
+                "message_id": "m",
+                "actions": [{
+                    "action_id": "a",
+                    "action_type": "t",
+                    "action_version": "1",
+                    "payload": serde_json::json!({"value": payload}).to_string()
+                }]
+            }
+        });
+        let error = requests(&body.to_string()).unwrap_err();
+        assert!(error.to_string().contains("kv_hints"), "{error}");
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).
@@ -794,28 +1123,28 @@ mod tests {
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
 
-    /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
+    /// Remaining unported `GenerateReqInput` fields are IGNORED, not rejected.
     ///
     /// These are all real fields on Python's `GenerateReqInput` that this server
     /// has not ported. `deny_unknown_fields` turned every one of them into a 400,
     /// so a client that worked against the Python server broke here — and the
-    /// wire-compat fields (`lora_path`, `image_data`, `return_routed_experts`) had
-    /// to be declared and dropped by hand just to let `bench_serving` through.
+    /// wire-compat fields (`image_data`, `return_routed_experts`) had to be
+    /// declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
+    /// The exception is `session_params`: dropping it would silently change the
+    /// answer, so a non-null value is a 400 (as Python's is without that
+    /// session), and `null` passes.
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
-            r#""priority": 3"#,
-            r#""extra_key": "k""#,
             r#""session_id": "s""#,
-            r#""session_params": {"a": 1}"#,
+            r#""session_params": null"#,
             r#""return_sampling_mask": true"#,
             r#""custom_logit_processor": "cls""#,
-            r#""lora_path": "adapter""#,
+            r#""lora_path": null"#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
-            r#""bootstrap_host": "h""#,
             // Python has no top-level `n` either, and ignores it just the same.
             r#""n": 1"#,
             r#""totally_made_up": 1"#,
@@ -826,6 +1155,10 @@ mod tests {
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
         }
+        let field = r#""session_params": {"id": "s"}"#;
+        let body = format!(r#"{{"text": "hi", {field}}}"#);
+        let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "{field}: {err}");
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
@@ -865,9 +1198,9 @@ mod tests {
     }
 
     /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
-    /// its `lora_path`/`return_routed_experts` are accepted-but-ignored and a
-    /// `null` `image_data` means "no multimodal input", so `split` succeeds
-    /// while the real fields survive.
+    /// its optional `lora_path` is null, `return_routed_experts` is
+    /// accepted-but-ignored, and a null `image_data` means "no multimodal
+    /// input", so `split` succeeds while the real fields survive.
     #[test]
     fn accepts_bench_serving_payload() {
         let (ps, is_batch) = requests(
@@ -1187,6 +1520,37 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
+    }
+
+    /// `extra_key` fans out like Python `_normalize_extra_key` (and
+    /// `cache_salt` like `_normalize_cache_salt`, the same rules): one key
+    /// broadcasts, a list is per item and must match the batch (and needs a
+    /// batch), and an empty key means none.
+    #[test]
+    fn cache_keys_fan_out() {
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": "salt"}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("salt"));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": "salt"}"#).unwrap();
+        assert!(ps.iter().all(|p| p.extra_key.as_deref() == Some("salt")));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": ["k", ""]}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("k"));
+        assert_eq!(ps[1].extra_key, None);
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": ""}"#).unwrap();
+        assert_eq!(ps[0].extra_key, None);
+        assert!(requests(r#"{"text": "a", "extra_key": ["k"]}"#).is_err());
+
+        let err = requests(r#"{"text": ["a", "b"], "extra_key": ["k"]}"#).unwrap_err();
+        assert!(err.to_string().contains("extra_key"), "{err}");
+
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "cache_salt": ["s", ""]}"#).unwrap();
+        assert_eq!(ps[0].cache_salt.as_deref(), Some("s"));
+        assert_eq!(ps[1].cache_salt, None);
+        assert!(requests(r#"{"text": "a", "cache_salt": ["s"]}"#).is_err());
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "cache_salt": "s", "require_reasoning": true}"#)
+                .unwrap();
+        assert!(ps.iter().all(|p| p.cache_salt.as_deref() == Some("s")));
+        assert!(ps.iter().all(|p| p.require_reasoning));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The

@@ -7,6 +7,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import (
@@ -233,84 +234,6 @@ def build_ragged_verify_window_triton(
 
 
 _SEARCH_NBITS = 11
-
-
-class CompactRowIndex:
-    @classmethod
-    def execute(
-        cls, *args, **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index_triton(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-
-class CompactVerifyIds:
-    @classmethod
-    def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids_triton(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
 
 
 def compact_verify_ids(
@@ -620,7 +543,7 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
-def build_unified_commit_inject_layout(
+def build_ring_commit_inject_layout(
     *,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -629,13 +552,13 @@ def build_unified_commit_inject_layout(
     stride: int,
     ring_stride: int,
 ) -> CommitInjectLayoutResult:
-    """unified_kv counterpart of build_commit_inject_layout.
+    """Per-request SWA ring counterpart of build_commit_inject_layout.
 
-    Non-unified injection translates the verify tokens' full cache locs through
-    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
-    directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
-    ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
-    are skipped by the scatter. All ops are static-shape (CUDA-graph safe).
+    Paged injection translates the verify tokens' full cache locs through
+    ``full_to_swa_mapping``; a per-request ring is addressed directly by
+    `swa_ring_rows`, so compute the ring row here instead. Uncommitted tokens
+    (col >= commit_len) get loc = -1 and are skipped by the scatter. All ops are
+    static-shape (CUDA-graph safe).
     """
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
@@ -644,7 +567,7 @@ def build_unified_commit_inject_layout(
     state_slot = (
         req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
     )
-    loc = state_slot * ring_stride + positions % ring_stride
+    loc = swa_ring_rows(state_slot, positions, ring_stride)
     col = torch.arange(stride, device=device).view(1, -1)
     committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
     swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
