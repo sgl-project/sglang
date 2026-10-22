@@ -7,6 +7,7 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.runtime_context import (
+    draft_attn_tp_size,
     get_model,
     get_parallel,
     get_spec,
@@ -271,12 +272,9 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            # CP targets run the DFLASH draft on full TP without CP.
             tp_size=(
-                get_parallel().tp_size
+                draft_attn_tp_size()
                 if spec_algorithm.is_dflash()
-                and get_parallel().attn_cp_size > 1
-                and get_parallel().attn_dp_size == 1
                 else get_parallel().attn_tp_size
             ),
         )
