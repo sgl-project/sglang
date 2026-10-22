@@ -35,7 +35,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -338,37 +337,24 @@ def all_gather_kv_cache_for_dcp(
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
     cycle_size = dcp_world_size * interleave_size
-    if interleave_size == 1:
-        left_pads = (prefix_starts_cpu % dcp_world_size > dcp_rank).to(torch.int32)
-        right_pads = (
-            (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % dcp_world_size < dcp_rank
-        ).to(torch.int32)
-        padded_lens = (
-            prefix_kv_lens_cpu
-            + (prefix_starts_cpu % dcp_world_size)
-            + dcp_world_size
-            - 1
-        ) // dcp_world_size
-        local_kv_lens = padded_lens - left_pads - right_pads
-    else:
-        left_pads = get_dcp_lens(
-            prefix_starts_cpu % cycle_size,
-            dcp_world_size,
-            dcp_rank,
-            interleave_size=interleave_size,
-        ).to(torch.int32)
-        padded_lens = (
-            (prefix_kv_lens_cpu + (prefix_starts_cpu % cycle_size) + cycle_size - 1)
-            // cycle_size
-            * interleave_size
-        )
-        local_kv_lens = get_dcp_lens(
-            prefix_kv_lens_cpu,
-            dcp_world_size,
-            dcp_rank,
-            start=prefix_starts_cpu,
-            interleave_size=interleave_size,
-        ).to(torch.int32)
+    start_offset = prefix_starts_cpu % cycle_size
+    end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
+    left_pads = (
+        (start_offset - dcp_rank * interleave_size)
+        .clamp(0, interleave_size)
+        .to(torch.int32)
+    )
+    right_pads = (
+        ((dcp_rank + 1) * interleave_size - 1 - end_offset)
+        .clamp(0, interleave_size)
+        .to(torch.int32)
+    )
+    padded_lens = (
+        (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
+        // cycle_size
+        * interleave_size
+    )
+    local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
         dtype=torch.int32,
