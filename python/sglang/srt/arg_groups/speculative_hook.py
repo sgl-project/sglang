@@ -306,7 +306,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "attention on non-NPU devices."
         )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and not envs.SGLANG_ENABLE_PP_SPEC.get():
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
         )
