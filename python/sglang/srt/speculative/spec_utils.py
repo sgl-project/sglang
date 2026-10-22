@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    draft_attn_parallel_group,
     get_exec,
     get_parallel,
     get_spec,
@@ -736,20 +737,14 @@ def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
     Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group. With prefill CP and no
-    attention DP it uses full TP as ordinary attention TP, matching the borrowed
-    target LM head. Other draft work keeps the target's TP placement.
-    Enter it from outside any draft scope.
+    sync) uses ``draft_attn_parallel_group()``. Other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope.
     """
     if not owns_attention:
         yield
         return
     parallel = get_parallel()
-    group = (
-        parallel.tp_group
-        if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1
-        else parallel.attn_tp_group
-    )
+    group = getattr(parallel, f"{draft_attn_parallel_group()}_group")
     with (
         patch_tensor_parallel_group(group, owns_attention=True),
         parallel.override(enable_prefill_cp=False, enable_cp_tp_group_sharing=False),

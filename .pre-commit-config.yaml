@@ -106,6 +106,12 @@ repos:
         language: system
         files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
         pass_filenames: false
+      - id: check-dockerfile-wheel-pins
+        name: check Dockerfile sgl-deep-gemm/sgl-deep-ep versions match python/pyproject.toml
+        entry: python3 scripts/lint/check_dockerfile_wheel_pins.py
+        language: system
+        files: ^(python/pyproject\.toml|docker/.*Dockerfile.*|scripts/lint/check_dockerfile_wheel_pins\.py)$
+        pass_filenames: false
       - id: check-no-bare-pytest-main
         name: reject bare pytest.main calls in __main__ blocks
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
