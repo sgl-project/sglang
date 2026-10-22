@@ -48,8 +48,8 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     sock_recv,
 )
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.tokenizer_manager import (
     MembershipObservationTimeout,
