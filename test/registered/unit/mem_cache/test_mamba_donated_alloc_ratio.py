@@ -335,13 +335,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         )
 
     @classmethod
-    def _mamba_budget_bytes(cls):
-        """The byte budget the solve hands the state pool: the mamba share of
-        the rest-memory, at the fixture's mamba_full_memory_ratio of 0.5."""
-        return cls.BUDGET_GB * (0.5 / 1.5) * (1 << 30)
-
-    @classmethod
-    def _pool_size(cls, pp_rank, pp_size, fused_state_entry=None):
+    def _pool_size(cls, pp_rank, pp_size):
         from sglang.srt import runtime_context as rc
         from sglang.srt.distributed.utils import get_pp_indices
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -352,9 +346,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
-            fused_entry_bytes=lambda name: (
-                fused_state_entry if name == "mamba" else None
-            ),
+            fused_entry_bytes=lambda name: None,
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
@@ -375,27 +367,6 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
 
-    def test_a_fused_state_entry_is_priced_per_slot(self):
-        """With a draft state block fused into every state slot, the unified
-        factory carves out K x the FUSED entry; the solve must size K from
-        that entry, or the buffer over-commits by K x (fused - host) bytes.
-
-        The fused entry is the host's block plus the draft's, so it is always
-        WIDER than the per-request cost the unfused solve prices -- hence
-        fewer slots, never more. Deriving it from `mamba_cache_per_req` keeps
-        that ordering true; a hard-coded constant silently inverted it.
-        """
-        host_per_req = self._cache_params().mamba_cache_per_req
-        fused_entry = host_per_req + host_per_req // 4  # host + a draft block
-        budget_bytes = self._mamba_budget_bytes()
-
-        unfused = self._pool_size(0, 1)
-        fused = self._pool_size(0, 1, fused_state_entry=fused_entry)
-
-        self.assertEqual(unfused, int((budget_bytes - host_per_req) // host_per_req))
-        self.assertEqual(fused, int((budget_bytes - fused_entry) // fused_entry))
-        self.assertLess(fused, unfused)
-
     def test_stage_is_not_charged_for_the_whole_model(self):
         solo = self._pool_size(0, 1)
         staged = self._pool_size(0, 8)
@@ -410,10 +381,76 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
         )
 
+    @classmethod
+    def _fused_state_charge(cls, pp_rank, pp_size):
+        """(this rank's fused state slot bytes, the bytes the solve charges for
+        its K + 1 slots) with K fixed at 8 and a draft state block per slot."""
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.distributed.utils import get_pp_indices
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftStateGeometry,
+            DraftStateRegion,
+        )
+
+        start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(mamba2_cache_params=cls._cache_params()),
+            layer_info=SimpleNamespace(start_layer=start, end_layer=end),
+            extra_mamba_cache_bytes_per_req=0,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            attn_dp_size=1,
+            pp_size=pp_size,
+            hybrid_gdn_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
+            ),
+        )
+        fake._mamba_host_spec = MethodType(KVCacheConfigurator._mamba_host_spec, fake)
+        region = DraftStateRegion(
+            lane_num=1,
+            state=DraftStateGeometry(
+                conv_state_shapes=((1 << 18,),),
+                conv_dtype=torch.float32,
+                temporal_state_shape=(0, 0, 0),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        fused_entry = fake._mamba_host_spec(region).entry_bytes()
+        fake.fused_entry_bytes = lambda name: fused_entry if name == "mamba" else None
+        with rc.get_context().override_server_args(
+            disable_radix_cache=False,
+            max_mamba_cache_size=8,
+            max_running_requests=None,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+        ):
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
+        return fused_entry, (cls.BUDGET_GB - remaining) * (1 << 30)
+
+    def test_a_fused_state_slot_is_charged_at_its_own_width(self):
+        """BUG REGRESSION: a fused draft state slot is built from this rank's own
+        layers, so the remainder must exclude K + 1 such slots unscaled. Scaling
+        them by the stage share a second time undercharged every slot under PP
+        and let the unified buffer outgrow the budget."""
+        for pp_size in (1, 2, 8):
+            for pp_rank in sorted({0, pp_size - 1}):
+                with self.subTest(pp_size=pp_size, pp_rank=pp_rank):
+                    fused_entry, charged = self._fused_state_charge(pp_rank, pp_size)
+                    self.assertAlmostEqual(charged, 9 * fused_entry, delta=1)
+
 
 class TestExtraMambaCacheSizing(unittest.TestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes,
+        *,
+        pp_size=1,
+        dp_size=1,
+        draft_tokens=None,
+        fused_state_entry=None,
+        **schedule,
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -425,7 +462,9 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
-            fused_entry_bytes=lambda name: None,
+            fused_entry_bytes=lambda name: (
+                fused_state_entry if name == "mamba" else None
+            ),
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
             pp_size=pp_size,
@@ -469,6 +508,24 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_a_fused_draft_state_keeps_the_host_slot_count(self):
+        """BUG REGRESSION: a draft state block fused into every state slot widens
+        the slot, not the request count. The slot count, and the
+        max_running_requests cap it implies, must match the unfused solve, with
+        the widened slots charged in full to the KV remainder; sizing the count
+        from the widened slot ran a fused MTP draft's server with fewer requests
+        than the default pool."""
+        fused = (4 << 20) + (1 << 20)
+        for draft_tokens in (None, 2):
+            with self.subTest(draft_tokens=draft_tokens):
+                slots, remaining = self._size(0, draft_tokens=draft_tokens)
+                fused_slots, fused_remaining = self._size(
+                    0, draft_tokens=draft_tokens, fused_state_entry=fused
+                )
+                self.assertEqual(fused_slots, slots)
+                # The speculative scratch covers the host's layers only.
+                self.assertEqual(remaining - fused_remaining, (slots + 1) * (1 << 20))
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token
