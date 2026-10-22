@@ -876,8 +876,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._stage_domain.is_root:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
+            # Global layer-shaped buffers contain zero rows for other PP stages
+            # and dense/inactive layers. Those rows are not balanced load samples.
+            active_layers = gpu_physical_count.sum(dim=-1) > 0
+            active_layer_count = active_layers.sum()
+            utilization_rate_gpu = (
+                compute_utilization_rate(gpu_physical_count) * active_layers
+            ).sum() / active_layer_count.clamp_min(1)
+            utilization_rate_gpu = torch.where(
+                active_layer_count > 0,
+                utilization_rate_gpu,
+                torch.ones_like(utilization_rate_gpu),
             )
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0

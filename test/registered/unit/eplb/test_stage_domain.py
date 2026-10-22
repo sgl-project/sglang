@@ -261,6 +261,37 @@ def _run_stage_domain_worker(
 
 
 class TestEPLBStageDomain(CustomTestCase):
+    def test_inactive_layers_do_not_dilute_stage_balancedness(self):
+        """Zero rows from other stages must not make a skewed stage look balanced."""
+        accumulator = _StatAccumulator.__new__(_StatAccumulator)
+        accumulator._expert_location_metadata = SimpleNamespace(ep_size=2)
+        accumulator._stage_domain = SimpleNamespace(
+            is_root=True, root_global_rank=0, device_group=None
+        )
+        accumulator._handle_metric_eplb_heatmap = lambda _: None
+        accumulator._reset_server_log_history = False
+        with (
+            get_context().override_server_args(
+                device="cpu",
+                eplb_min_rebalancing_utilization_threshold=1.0,
+                expert_balancedness_report_mode="prometheus",
+            ),
+            patch("torch.distributed.reduce"),
+        ):
+            for counts, expected in (
+                ([[30, 0]], 0.5),
+                ([[0, 0], [30, 0], [0, 0]], 0.5),
+                ([[0, 0], [0, 0]], 1.0),
+            ):
+                with self.subTest(counts=counts):
+                    outputs = {}
+                    accumulator._append_utilization_rate(
+                        1, torch.tensor(counts, dtype=torch.int32), outputs
+                    )
+                    self.assertAlmostEqual(
+                        outputs["metrics"].eplb_balancedness.item(), expected, places=5
+                    )
+
     def test_replica_locality_uses_stage_nodes(self):
         # Four launch nodes, but this stage's EP4 owns only nodes 2 and 3.
         group = SimpleNamespace(
