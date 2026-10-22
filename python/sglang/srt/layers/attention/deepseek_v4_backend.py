@@ -3221,8 +3221,8 @@ class DeepseekV4AttnBackend(
             and hoisted_pos is not None
             and hoisted_pos.shape[0] == positions.shape[0]
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
+            # The hoisted rows are these rows: bucket-sized inside the prefill
+            # graph, or an eager extend's own.
             req, pos = hoisted_req, hoisted_pos
         elif (
             hoisted_req is not None
