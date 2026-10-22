@@ -80,6 +80,96 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
         self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 32, 1))
 
 
+class TestFp8MoeBlockwiseTailAllocation(CustomTestCase):
+    @staticmethod
+    def _create(allow_fp8_blockwise_tail):
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 8
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        quant_config = SimpleNamespace(
+            weight_block_size=[128, 128],
+            activation_scheme="dynamic",
+            is_checkpoint_fp8_serialized=True,
+        )
+        Fp8MoEMethod.create_fp8_moe_weight_(
+            layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=160,
+            block_quant=True,
+            quant_config=quant_config,
+            use_mxfp8=False,
+            is_checkpoint_fp8_serialized=True,
+            is_fp4_expert=False,
+            params_dtype=torch.bfloat16,
+            allow_fp8_blockwise_tail=allow_fp8_blockwise_tail,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        return layer
+
+    def test_partial_block_needs_opt_in_and_uses_merged_w13_grid(self):
+        with self.assertRaises(ValueError):
+            self._create(allow_fp8_blockwise_tail=False)
+
+        layer = self._create(allow_fp8_blockwise_tail=True)
+        # gate|up = 2 * 160 rows share ceil(320 / 128) = 3 scale rows, not 2 * 2.
+        self.assertEqual(tuple(layer.w13_weight_scale_inv.shape), (2, 3, 2))
+        self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 2, 2))
+
+    def test_admission_is_limited_to_pure_tp_triton_moe(self):
+        import sglang.srt.layers.quantization.fp8 as fp8_module
+
+        def admitted(moe_ep_size=1, enable_eplb=False, runner="triton", opt_in=True):
+            method = object.__new__(Fp8MoEMethod)
+            method.use_mxfp8 = False
+            method.is_fp4_expert = False
+            method.quant_config = SimpleNamespace(
+                is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+            )
+            layer = SimpleNamespace(
+                allow_fp8_blockwise_tail=opt_in,
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=8 // moe_ep_size,
+                moe_tp_rank=0,
+            )
+            runtime = SimpleNamespace(
+                moe=SimpleNamespace(
+                    enable_eplb=enable_eplb,
+                    ep_num_redundant_experts=0,
+                    init_expert_location="trivial",
+                ),
+                offload=SimpleNamespace(cpu_offload_gb=0, offload_group_size=-1),
+            )
+            backend = SimpleNamespace(
+                is_triton=lambda: runner == "triton", is_auto=lambda: False
+            )
+            with (
+                patch.object(fp8_module, "_is_cuda", True),
+                patch.object(fp8_module, "_is_hip", False),
+                patch.object(
+                    fp8_module,
+                    "get_parallel",
+                    return_value=SimpleNamespace(moe_dp_size=1, tp_size=8, tp_rank=0),
+                ),
+                patch.object(fp8_module, "get_exec", return_value=runtime),
+                patch.object(
+                    fp8_module,
+                    "get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: True),
+                ),
+                patch.object(
+                    fp8_module, "get_moe_runner_backend", return_value=backend
+                ),
+            ):
+                return method._supports_blockwise_fp8_tail(layer)
+
+        self.assertTrue(admitted())
+        self.assertFalse(admitted(opt_in=False))
+        self.assertFalse(admitted(moe_ep_size=2))
+        self.assertFalse(admitted(enable_eplb=True))
+        self.assertFalse(admitted(runner="deep_gemm"))
+
+
 class TestPrequantizedBlockFp8Routing(CustomTestCase):
     def test_row_major_scale_routes_to_hopper_and_column_major_to_deepgemm(self):
         import sglang.srt.layers.quantization.fp8_utils as fp8_utils
@@ -160,6 +250,44 @@ class TestPrequantizedBlockFp8Routing(CustomTestCase):
         self.assertFalse(use_hopper_fp8_block_gemv(17, 1536, 4096, block))
         self.assertFalse(use_hopper_fp8_block_gemv(1, 1536, 4224, block))
         self.assertFalse(use_hopper_fp8_block_gemv(1, 1536, 4096, [32, 32]))
+
+
+class TestPrequantizedKTailDispatch(CustomTestCase):
+    """A prequantized partial-K [128, 128] input reaches DeepGEMM only within its TMA layout contract."""
+
+    def _route(self, n, k, prequantized):
+        m = 4
+        qinput = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+        weight = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones(((n + 127) // 128, (k + 127) // 128))
+        input_scale = torch.ones((m, (k + 127) // 128)) if prequantized else None
+        out = torch.empty((m, n), dtype=torch.bfloat16)
+        with (
+            patch.object(fp8_utils, "_use_fp8_block_gemv", return_value=False),
+            patch.object(
+                fp8_utils, "w8a8_block_fp8_matmul_deepgemm", return_value=out
+            ) as deepgemm,
+            patch.object(
+                fp8_utils, "triton_w8a8_block_fp8_linear", return_value=out
+            ) as triton,
+            patch.object(fp8_utils.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False),
+        ):
+            fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                qinput if prequantized else qinput.to(torch.bfloat16),
+                weight,
+                [128, 128],
+                weight_scale,
+                input_scale=input_scale,
+            )
+        return "deepgemm" if deepgemm.called else "triton" if triton.called else None
+
+    def test_partial_k_routes_by_input_contract(self):
+        self.assertEqual(self._route(n=128, k=160, prequantized=True), "deepgemm")
+        # A 161-byte fp8 row stride cannot back a DeepGEMM TMA descriptor.
+        self.assertEqual(self._route(n=128, k=161, prequantized=True), "triton")
+        self.assertEqual(self._route(n=96, k=160, prequantized=True), "triton")
+        self.assertEqual(self._route(n=128, k=160, prequantized=False), "triton")
+        self.assertEqual(self._route(n=128, k=256, prequantized=True), "deepgemm")
 
 
 class TestFusedKdaOutputQuantGate(CustomTestCase):

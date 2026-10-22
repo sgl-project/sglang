@@ -1622,8 +1622,22 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             output += bias
         return output.view(*input.shape[:-1], weight.shape[0])
 
-    deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
-        weight.shape, block_size, output_dtype
+    # DeepGEMM accepts a partial final K block when both operands carry ceil(K / 128)
+    # scales; its TMA descriptors need 16-byte-aligned base pointers and fp8 row strides.
+    prequant_k_tail = (
+        input_scale is not None
+        and list(block_size) == [128, 128]
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % block_size[1] != 0
+        and weight.shape[1] % 16 == 0
+        and input.is_contiguous()
+        and weight.is_contiguous()
+        and input.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+    deepgemm_supported = weight.ndim == 2 and (
+        prequant_k_tail
+        or _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype)
     )
     if input_scale is not None:
         if input_scale.dtype == torch.int32:
