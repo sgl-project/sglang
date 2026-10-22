@@ -629,6 +629,48 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertTrue(base.is_pin_memory_available(device="mlu"))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_runtime_defaults_are_resolution_declarations(self):
+        from sglang.srt.arg_groups.overrides import (
+            record_foreign_defaults,
+            resolved_view,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="unused", device="mlu")
+        record_foreign_defaults(
+            args, "platform:mlu", MluSRTPlatform().apply_server_args_defaults
+        )
+        effective = resolved_view(args)
+        self.assertEqual(effective.attention_backend, "mlu")
+        self.assertEqual(effective.prefill_attention_backend, "mlu")
+        self.assertEqual(effective.decode_attention_backend, "mlu")
+        self.assertEqual(effective.sampling_backend, "pytorch")
+        self.assertEqual(effective.page_size, 16)
+        self.assertTrue(effective.disable_custom_all_reduce)
+        # The startup record continues to describe the operator's raw input.
+        self.assertIsNone(args.attention_backend)
+        self.assertIsNone(args.page_size)
+        self.assertFalse(args.disable_custom_all_reduce)
+
+    def test_unsupported_runtime_settings_fail_during_resolution(self):
+        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+        from sglang.srt.server_args import ServerArgs
+
+        for fields in (
+            {"attention_backend": "triton"},
+            {"sampling_backend": "flashinfer"},
+            {"quantization": "awq"},
+            {"speculative_algorithm": "EAGLE"},
+        ):
+            with self.subTest(fields=fields):
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaisesRegex(ValueError, "MLU"):
+                    record_foreign_defaults(
+                        args,
+                        "platform:mlu",
+                        MluSRTPlatform().apply_server_args_defaults,
+                    )
+
 
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""

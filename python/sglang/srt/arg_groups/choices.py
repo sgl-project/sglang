@@ -67,6 +67,7 @@ QUANTIZATION_CHOICES = [
 ]
 
 ATTENTION_BACKEND_CHOICES = [
+    "mlu",
     # Common
     "triton",
     "torch_native",
@@ -231,6 +232,7 @@ add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.extend
 # add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
 # the chunked-prefix gate is evaluated during resolution.
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "mlu",
     "flashinfer",
     "fa3",
     "fa4",

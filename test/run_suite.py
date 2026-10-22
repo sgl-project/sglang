@@ -220,6 +220,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-kernel-main-8-gpu",
         "nightly-xpu-kernel-wheel-1-gpu",
     ],
+    HWBackend.MLU: ["nightly-test-2-mlu"],
 }
 
 
