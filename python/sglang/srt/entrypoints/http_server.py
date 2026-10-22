@@ -2679,6 +2679,22 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _granian_http1_settings():
+    """Granian HTTP/1.1 settings that honor SGLANG_TIMEOUT_KEEP_ALIVE.
+
+    Granian has no separate HTTP/1.1 keep-alive timeout: its HTTP library
+    (hyper) re-arms ``header_read_timeout`` whenever a keep-alive connection
+    goes idle, so that timeout also closes idle connections. Use the
+    keep-alive timeout when it is longer than Granian's default and never go
+    below the default, so the 5 s env default changes nothing here.
+    """
+    from granian.http import HTTP1Settings
+
+    default_ms = HTTP1Settings().header_read_timeout
+    keep_alive_ms = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get() * 1000
+    return HTTP1Settings(header_read_timeout=max(default_ms, keep_alive_ms))
+
+
 def _run_granian_server(
     host,
     port,
@@ -2722,6 +2738,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
