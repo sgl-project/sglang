@@ -56,10 +56,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsa,
 )
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -680,7 +680,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             slot = self._slots[layer_id % 2]
             rows = self._translate_loc_cached(loc)
             self._write_mla_kv_buffer(
-                slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
+                layer_id, slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
@@ -794,7 +794,7 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
             "cannot write indexer keys for a skip-topk layer"
         )
         if pool._shard_extend_active:
-            index_buf_accessor.SetKAndS.execute(
+            dsa_index_k_cache.SetKAndS.execute(
                 pool=pool,
                 buf=pool._slots[layer_id % 2].tensors["index_k"],
                 loc=pool.translate_loc_to_scratch(loc),
@@ -927,7 +927,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
 
         slot = self._acquire_slot_for_read(layer.layer_id)
         rows = self.translate_loc_to_scratch(loc)
-        kv = dequantize_k_cache_paged(self._scratch_kv(slot), rows)
+        kv = dequantize_k_cache_paged_dsa(self._scratch_kv(slot), rows)
         if dst_dtype is not None:
             kv = kv.to(dst_dtype)
         return (

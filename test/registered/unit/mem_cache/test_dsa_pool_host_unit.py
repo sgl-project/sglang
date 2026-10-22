@@ -1,9 +1,11 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -28,6 +30,20 @@ class TestDSAOffloadSignatures(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
                 self.assertIn("mamba_indices", signature.parameters)
+
+
+class TestIndexKeyRelocationGuards(unittest.TestCase):
+    def test_empty_move_returns_without_accessing_storage(self):
+        cache = object.__new__(IndexKeyCache)
+        empty = SimpleNamespace(numel=lambda: 0)
+        cache.move(empty, empty)
+
+    def test_pooled_move_requires_regrouping(self):
+        cache = object.__new__(IndexKeyCache)
+        cache.pool = SimpleNamespace(index_kpool=2)
+        nonempty = SimpleNamespace(numel=lambda: 1)
+        with self.assertRaisesRegex(AssertionError, "requires regrouping"):
+            cache.move(nonempty, nonempty)
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):
@@ -97,7 +113,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
             mla_host = MLATokenToKVPoolHost(
-                device_pool=device_pool,
+                buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=page_size,
@@ -106,6 +122,20 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 device="cpu",
                 allocator_type="default",
                 override_kv_cache_dim=device_pool.kv_cache_dim,
+                device_capacity_tokens=(
+                    device_pool.size
+                    if device_pool.host_capacity_tokens is None
+                    else device_pool.host_capacity_tokens
+                ),
+                start_layer=device_pool.start_layer,
+                end_layer=device_pool.end_layer,
+                target_layer_num=(
+                    (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                    // device_pool.layer_shard_size
+                    if device_pool.layer_shard_enabled
+                    else device_pool.layer_num
+                ),
+                layer_shard_enabled=device_pool.layer_shard_enabled,
             )
             indexer_host = DSAIndexerPoolHost(
                 decl=make_dsa_indexer_pool_decl(device_pool),

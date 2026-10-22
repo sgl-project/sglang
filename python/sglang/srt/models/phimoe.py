@@ -215,6 +215,7 @@ class PhiMoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None

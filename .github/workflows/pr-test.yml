@@ -148,7 +148,12 @@ jobs:
               {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
             ]
-          max-wait-minutes: '480'
+          # 10 min under the 6h GitHub-hosted job cap: setup needs under 2 min, the rest is margin;
+          # timeout-minutes cannot raise the cap, and a wait killed by it ends `cancelled`.
+          max-wait-minutes: '350'
+          # pr-test-finish fails the run on any base-b failure, so this gate only saves GPU time;
+          # a slow base-b lets base-c start rather than costing the base-c run.
+          fail-on-timeout: 'false'
 
   # =============================================== PR Gate ====================================================
   call-gate:
@@ -162,7 +167,7 @@ jobs:
         needs.check-changes.outputs.sgl_kernel == 'true' ||
         needs.check-changes.outputs.jit_kernel == 'true' ||
         needs.check-changes.outputs.multimodal_gen == 'true' ||
-        needs.check-changes.outputs.renderer == 'true'
+        needs.check-changes.outputs.processor == 'true'
       )
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
@@ -296,6 +301,7 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
     secrets: inherit
 
   # =============================================== primary ====================================================
@@ -344,7 +350,8 @@ jobs:
   base-b-test:
     name: base-b-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
@@ -388,8 +395,10 @@ jobs:
 
   base-c-test:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    # wait-for-base-a is listed only to read its result: when it is cancelled,
+    # wait-for-base-b ends `skipped`, which alone would let this stage through.
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
@@ -431,12 +440,13 @@ jobs:
   # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - { runner_config: 2-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
