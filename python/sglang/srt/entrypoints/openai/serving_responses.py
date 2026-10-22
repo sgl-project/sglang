@@ -1146,7 +1146,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None,
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
-        custom_names = custom_tool_names(request.tools)
         encoding_output = self._encoding_output()
         if encoding_output is not None:
             required_json = self._uses_required_tool_json(request, chat_tools)
@@ -1160,69 +1159,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
             )
             if required_json and content:
-                content, tool_call_items = self._parse_required_tool_json(
-                    content, custom_names, request._tool_state.names
-                )
-            else:
-                tool_call_items = [
-                    self._make_tool_call_item(
-                        call.name,
-                        call.parameters,
-                        custom_names,
-                        request._tool_state.names,
-                    )
-                    for call in calls
-                ]
+                content, calls = self._parse_required_tool_json(content)
+            parts, incomplete_calls = [content, *calls], set()
         else:
-            return self._make_text_output_items(
-                request,
-                final_output,
-                chat_tools,
-                custom_names,
-                output_logprobs,
-                require_reasoning=require_reasoning,
+            reasoning_content, parts, incomplete_calls = self._parse_text_output(
+                request, final_output, chat_tools, require_reasoning=require_reasoning
             )
+        return self._output_items(
+            request, reasoning_content, parts, incomplete_calls, output_logprobs
+        )
 
-        output_items = []
-        if reasoning_content:
-            output_items.append(
-                self._make_reasoning_item(
-                    request,
-                    reasoning_content,
-                    item_id=f"rs_{random_uuid()}",
-                    status=None,
-                )
-            )
-        if content:
-            output_text = ResponseOutputText(
-                text=content,
-                annotations=[],  # TODO
-                type="output_text",
-                # logprobs cover all generated tokens, not just the stripped content.
-                logprobs=output_logprobs,
-            )
-            message = ResponseOutputMessage(
-                phase="commentary" if tool_call_items else "final_answer",
-                id=f"msg_{random_uuid()}",
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-            output_items.append(message)
-        output_items.extend(tool_call_items)
-        return output_items
-
-    def _make_text_output_items(
+    def _parse_text_output(
         self,
         request: ResponsesRequest,
         final_output: Any,
         chat_tools: list[Tool],
-        custom_names: set[str],
-        output_logprobs: Optional[list] = None,
         *,
         require_reasoning: bool,
-    ) -> list:
+    ) -> tuple[Optional[str], list[str | ToolCallItem], set[int]]:
+        """The reasoning, then text and calls in output order, and the indices
+        of calls the output cut off."""
         tool_parsing = self._tool_parsing_active(request, chat_tools)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
@@ -1242,17 +1198,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         else:
             reasoning_content = None
             content = final_output
-
-        output_items = []
-        if reasoning_content:
-            output_items.append(
-                self._make_reasoning_item(
-                    request,
-                    reasoning_content,
-                    item_id=f"rs_{random_uuid()}",
-                    status="completed",
-                )
-            )
 
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
@@ -1294,30 +1239,31 @@ class OpenAIServingResponses(OpenAIServingChat):
             and not parsed_via_native
             and not detector_owns_format
         ):
-            try:
-                tool_call_data = orjson.loads(content)
-                if isinstance(tool_call_data, dict):
-                    tool_call_data = [tool_call_data]
-                if isinstance(tool_call_data, list):
-                    for tool in tool_call_data:
-                        if not isinstance(tool, dict) or "name" not in tool:
-                            continue
-                        arguments = json.dumps(
-                            tool.get("parameters", {}), ensure_ascii=False
-                        )
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=len(calls),
-                                name=tool["name"],
-                                parameters=arguments,
-                            )
-                        )
-                    content = ""
-            except Exception as e:
-                logger.error("Required tool JSON parse error: %s", e)
-
+            content, calls = self._parse_required_tool_json(content)
         parts = ordered_parts if ordered_parts is not None else [content, *calls]
-        remaining_calls = len(calls)
+        return reasoning_content, parts, incomplete_calls
+
+    def _output_items(
+        self,
+        request: ResponsesRequest,
+        reasoning_content: Optional[str],
+        parts: list[str | ToolCallItem],
+        incomplete_calls: set[int],
+        output_logprobs: Optional[list],
+    ) -> list:
+        """Output items for the reasoning, then each text and call part."""
+        output_items = []
+        if reasoning_content:
+            output_items.append(
+                self._make_reasoning_item(
+                    request,
+                    reasoning_content,
+                    item_id=f"rs_{random_uuid()}",
+                    status="completed",
+                )
+            )
+        custom_names = custom_tool_names(request.tools)
+        remaining_calls = sum(not isinstance(part, str) for part in parts)
         for part in parts:
             if not isinstance(part, str):
                 item = self._make_tool_call_item(
@@ -1339,7 +1285,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 continue
             output_text = ResponseOutputText(
                 text=part,
-                annotations=[],  # TODO
+                annotations=[],
                 type="output_text",
                 # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
@@ -1357,13 +1303,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_logprobs = None
         return output_items
 
-    def _parse_required_tool_json(
-        self,
-        content: str,
-        custom_names: set[str],
-        tool_names: dict[str, dict[str, str]],
-    ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
-        tool_call_items = []
+    @staticmethod
+    def _parse_required_tool_json(content: str) -> tuple[str, list[ToolCallItem]]:
+        calls = []
         try:
             tool_call_data = orjson.loads(content)
             if isinstance(tool_call_data, dict):
@@ -1375,15 +1317,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     arguments = json.dumps(
                         tool.get("parameters", {}), ensure_ascii=False
                     )
-                    tool_call_items.append(
-                        self._make_tool_call_item(
-                            tool["name"], arguments, custom_names, tool_names
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=len(calls),
+                            name=tool["name"],
+                            parameters=arguments,
                         )
                     )
                 content = ""
         except Exception as e:
             logger.error("Required tool JSON parse error: %s", e)
-        return content, tool_call_items
+        return content, calls
 
     def _make_response_output_items_with_harmony(
         self,
