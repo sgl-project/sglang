@@ -105,9 +105,11 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
                 break
 
         # Under EP the dispatcher already localized topk_ids (-1 = non-local); align
-        # over the global expert count like fused_marlin_moe, not the local E.
+        # over the global expert count like fused_marlin_moe, not the local E. Read
+        # it from the config: the LoRA wrapper builds quant_info before the EP map
+        # exists, so quant_info.global_num_experts stays -1.
         align_num_experts = (
-            quant_info.global_num_experts if quant_info.expert_map is not None else E
+            runner_config.num_experts if quant_info.expert_map is not None else E
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, align_num_experts

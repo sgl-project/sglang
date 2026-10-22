@@ -75,7 +75,7 @@ def _routing(gen):
 class _Experts:
     """Prepare checkpoint-format experts with the production Marlin repack."""
 
-    def __init__(self, w13, w13_s, w2, w2_s):
+    def __init__(self, w13, w13_s, w2, w2_s, *, expert_map=None):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
 
@@ -105,7 +105,12 @@ class _Experts:
         layer.w13_weight_scale_inv.data.copy_(w13_s.view(torch.float8_e8m0fnu))
         layer.w2_weight_scale_inv.data.copy_(w2_s.view(torch.float8_e8m0fnu))
         method.process_weights_after_loading(layer)
-        self.quant_info = method.get_marlin_quant_info(layer)
+        # FusedMoEWithLoRA reads the quant info when it wraps the layer, before the EP
+        # map exists, and sets the map every forward; the stock path reads both at apply.
+        self.lora_quant_info = method.get_marlin_quant_info(layer)
+        self.lora_quant_info.expert_map = expert_map
+        layer.dispatcher.local_expert_mapping = expert_map
+        self.base_quant_info = method.get_marlin_quant_info(layer)
 
 
 def _dispatch(x, topk_weights, topk_ids):
@@ -124,7 +129,7 @@ def _run_stock(experts, x, topk_weights, topk_ids):
     from sglang.srt.layers.moe.moe_runner.marlin import fused_experts_none_to_marlin
 
     return fused_experts_none_to_marlin(
-        _dispatch(x, topk_weights, topk_ids), experts.quant_info, experts.config
+        _dispatch(x, topk_weights, topk_ids), experts.base_quant_info, experts.config
     ).hidden_states
 
 
@@ -138,7 +143,7 @@ def _run_lora(experts, x, topk_weights, topk_ids, lora_info):
         MarlinLoraRunnerCore(experts.config)
         .run_from_dispatch(
             _dispatch(x, topk_weights, topk_ids),
-            experts.quant_info,
+            experts.lora_quant_info,
             experts.config,
             hooks=hooks,
         )
@@ -193,7 +198,7 @@ def _lora_info(adapters, token_slots, *, virtual_experts=True):
 
 
 def _reference(x, topk_weights, topk_ids, w13, w2, token_slots, adapters):
-    """FP32 oracle."""
+    """FP32 oracle; negative expert IDs belong to other EP ranks."""
     xf = x.float()
     slots = torch.tensor(token_slots, device="cuda")
     out = torch.zeros_like(xf)
@@ -279,6 +284,39 @@ class TestMarlinMxfp4MoELoRA(CustomTestCase):
                 torch.testing.assert_close(
                     out[~adapted], self.stock[~adapted], atol=0, rtol=0
                 )
+
+    def test_expert_parallel_ranks_sum_to_the_whole_layer(self):
+        ref = _reference(*self.routing, self.w13, self.w2, MIXED_SLOTS, self.adapters)
+        ep_size = 2
+        local_experts = E // ep_size
+        total = torch.zeros_like(ref)
+        for rank in range(ep_size):
+            with self.subTest(ep_rank=rank):
+                local = slice(rank * local_experts, (rank + 1) * local_experts)
+                expert_map = torch.full((E,), -1, dtype=torch.int32, device="cuda")
+                expert_map[local] = torch.arange(
+                    local_experts, dtype=torch.int32, device="cuda"
+                )
+                experts = _Experts(
+                    *(t[local] for t in self.ckpt), expert_map=expert_map
+                )
+                # The standard dispatcher's localization; -1 marks other ranks' experts.
+                local_ids = expert_map[self.topk_ids.long()]
+                adapters = [tuple(t[local] for t in a) for a in self.adapters]
+                info = _lora_info(adapters, MIXED_SLOTS)
+                out = _run_lora(experts, self.x, self.topk_weights, local_ids, info)
+                rank_ref = _reference(
+                    self.x,
+                    self.topk_weights,
+                    local_ids,
+                    self.w13[local],
+                    self.w2[local],
+                    MIXED_SLOTS,
+                    adapters,
+                )
+                self.assertLess(_rel_err(out, rank_ref), 2e-2)
+                total += out.float()
+        self.assertLess(_rel_err(total, ref), 2e-2)
 
     def test_moe_tensor_parallel_ranks_sum_to_the_whole_layer(self):
         from sglang.srt.lora.layers import FusedMoEWithLoRA
