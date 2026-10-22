@@ -75,10 +75,11 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
 class SparsePrefillWorkspace:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    The workspace contents are fully overwritten before every attention call,
-    so token buckets and compression ratios can safely share one buffer. Sparse
-    prefill executes eagerly and serially on the supported paths, which makes it
-    safe to replace the scratch allocation when a larger extent is needed.
+    Callers normally overwrite the entire workspace. Shared compressed-KV
+    callers keep separate workspaces per ratio and track prefix validity in the
+    per-forward gather cache, including the allocation address. Sparse prefill
+    executes eagerly and serially on the supported paths, so the allocation can
+    be replaced when a larger extent is needed.
     """
 
     def __init__(self, device: torch.device):
@@ -113,14 +114,18 @@ class CompressedGather:
     # chunk-invariant per request; subsequent layers only overwrite that prefix.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
+    # Valid only for this forward's gather layout. Each ratio has its own
+    # workspace; its compressed prefix survives consumer layers' SWA writes.
+    dequantized_source: Optional[tuple[int, int]] = None
 
 
 @dataclass
 class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
-    Fields depend on request/token mappings and compressed page tables, not
-    per-layer k_cache; per-layer top-k combinations are recomputed into reused
+    Gather layouts depend on request/token mappings and compressed page tables.
+    Shared-source dequantization keys live only for this forward; per-layer
+    top-k combinations are recomputed into reused
     buffers.
     """
 
@@ -162,6 +167,9 @@ class SparsePrefillChunkCache:
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
     seq_lens_cpu: Optional[list[int]] = None
+    # CP can leave a request with no query rows on this rank. Such requests
+    # have no representative page-table row and must not be gathered.
+    query_lens_cpu: Optional[list[int]] = None
 
     @classmethod
     def build(
@@ -180,6 +188,7 @@ class SparsePrefillChunkCache:
         total_swa: int,
         request_window_layout=None,
         seq_lens_cpu: Optional[list[int]] = None,
+        query_lens_cpu: Optional[list[int]] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -216,6 +225,7 @@ class SparsePrefillChunkCache:
         cache = cls(
             num_reqs=num_reqs,
             seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max_seq_len,
             swa_window_size=swa_window_size,
@@ -384,6 +394,13 @@ class SparsePrefillChunkCache:
         if seq_lens_cpu is None:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
+        if self.query_lens_cpu is not None:
+            lengths_cpu = [
+                length if queries else 0
+                for length, queries in zip(
+                    lengths_cpu, self.query_lens_cpu, strict=True
+                )
+            ]
         total_compressed = sum(lengths_cpu)
         lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
