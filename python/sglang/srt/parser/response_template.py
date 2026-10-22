@@ -970,7 +970,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 def _typed_tool(tool: dict, held_by: ResponseTemplateField | None = None) -> dict:
     """`tool`, in either API's shape, as template grammars constrain it, strict
     where `held_by` holds its arguments."""
-    function = dict(tool.get("function", tool))
+    function = tool.get("function", tool)
+    if not isinstance(function, dict):
+        return tool
+    function = dict(function)
     parameters = function.get("parameters")
     if isinstance(parameters, dict):
         function["parameters"] = parameters = typed_parameters(parameters)

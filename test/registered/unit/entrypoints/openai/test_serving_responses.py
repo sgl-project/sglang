@@ -832,10 +832,9 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                 yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        request = ResponsesRequest(
-            model="x",
-            input="Weather?",
-            tools=[
+        request_fields.setdefault(
+            "tools",
+            [
                 {
                     "type": "function",
                     "name": "get_weather",
@@ -845,6 +844,10 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     },
                 }
             ],
+        )
+        request = ResponsesRequest(
+            model="x",
+            input="Weather?",
             stream=stream,
             store=False,
             **request_fields,
@@ -1127,6 +1130,33 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         message = response["output"][-1]
         self.assertEqual(message["type"], "message")
         self.assertEqual(message["content"][0]["text"], '{"a": 1}')
+
+    def test_flat_tool_with_a_stray_function_field_is_served(self):
+        """A tool field the parser does not read must not fail the response."""
+        tool = {
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {}},
+            "function": False,
+        }
+        output = self._output(
+            "<think>Check the forecast.</think><answer>Sunny.", matched=2
+        )
+        for parser in ("response_template", "beam"):
+            for stream in (False, True):
+                with self.subTest(parser=parser, stream=stream):
+                    response = self._respond(
+                        stream,
+                        output=output,
+                        reasoning_parser=parser,
+                        tool_call_parser=parser,
+                        tools=[tool],
+                    )
+
+                    self.assertEqual(response["output"][-1]["type"], "message")
+                    self.assertEqual(
+                        response["output"][-1]["content"][0]["text"], "Sunny."
+                    )
 
     def test_tool_markup_inside_an_answer_is_answer_data(self):
         """Tool markup inside a text or JSON answer must stay in the answer, never
