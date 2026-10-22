@@ -18,6 +18,9 @@ its latency is reported separately and is not an apples-to-apples comparison.
 Pass ``--balanced-routing`` to distribute aggregate top-k routes exactly evenly
 across every global expert. This is useful for separating communication and
 synchronization costs from router-induced expert load imbalance.
+
+Teardown closes MSCCL++ dispatchers after releasing captured graphs, then clears
+shared communicators before destroying process groups.
 """
 
 from __future__ import annotations
@@ -325,6 +328,8 @@ class FusedMoEPipeline:
         return self.layer(inputs.hidden_states, inputs.topk_output)
 
     def close(self) -> None:
+        if isinstance(self.layer.dispatcher, MSCCLPPDispatcher):
+            self.layer.dispatcher.close()
         del self.layer
         self._stack.close()
 

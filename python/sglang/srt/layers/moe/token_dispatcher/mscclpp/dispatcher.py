@@ -34,6 +34,10 @@ class _MSCCLPPDispatcherImplBase(ABC):
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
         pass
 
+    @abstractmethod
+    def close(self) -> None:
+        pass
+
 
 class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
     """Share MSCCL++ latency resources across layers to bound memory use."""
@@ -351,6 +355,15 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
         self._active_capacity = None
         return combined_x
 
+    def close(self) -> None:
+        if self._combine_handle is not None:
+            raise RuntimeError("MSCCLPPDispatcher.close called before combine")
+
+        self._active_capacity = None
+        self._dispatch_output_buffer = None
+        self._moe_comm = None
+        self._ep_group = None
+
 
 class MSCCLPPDispatcher(BaseDispatcher):
     """MSCCL++ expert-parallel dispatcher."""
@@ -379,24 +392,40 @@ class MSCCLPPDispatcher(BaseDispatcher):
 
         self.mode = mode
         self.output_layout = output_layout
-        self._dispatcher = _MSCCLPPDispatcherImplLowLatency(
-            group=group,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-            params_dtype=params_dtype,
-            output_layout=output_layout,
+        self._dispatcher: _MSCCLPPDispatcherImplBase | None = (
+            _MSCCLPPDispatcherImplLowLatency(
+                group=group,
+                router_topk=router_topk,
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                params_dtype=params_dtype,
+                output_layout=output_layout,
+            )
         )
 
         self._active_dispatcher: _MSCCLPPDispatcherImplBase | None = None
 
     def _resolve_dispatcher(self) -> _MSCCLPPDispatcherImplBase:
+        if self._dispatcher is None:
+            raise RuntimeError("MSCCLPPDispatcher is closed")
         return self._dispatcher
+
+    def close(self) -> None:
+        """Drop this dispatcher's ownership after all EP ranks finish CUDA work.
+
+        Release captured graphs and borrowed outputs before closing dispatchers
+        and clearing their shared resources.
+        """
+        if self._active_dispatcher is not None:
+            raise RuntimeError("MSCCLPPDispatcher.close called before combine")
+        if self._dispatcher is not None:
+            self._dispatcher.close()
+            self._dispatcher = None
 
     @staticmethod
     def clear_shared_resources() -> None:
-        """Release cached communicators after all dispatchers are no longer used."""
+        """Release cached communicators after all dispatchers are closed."""
         _MSCCLPPDispatcherImplLowLatency._shared_resources.clear()
 
     def dispatch(
@@ -413,6 +442,8 @@ class MSCCLPPDispatcher(BaseDispatcher):
         return dispatch_output
 
     def combine(self, combine_input: MSCCLPPCombineInputBase) -> torch.Tensor:
+        if self._dispatcher is None:
+            raise RuntimeError("MSCCLPPDispatcher is closed")
         dispatcher = self._active_dispatcher
         if dispatcher is None:
             raise RuntimeError("MSCCLPPDispatcher.combine called before dispatch")
