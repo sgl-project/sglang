@@ -1415,6 +1415,8 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            prefill_interleaving=get_schedule().prefill_interleaving,
+            prefill_interleaving_min_continuation_tokens=get_schedule().prefill_interleaving_min_continuation_tokens,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -3985,6 +3987,19 @@ class Scheduler(
 
         return res
 
+    def _max_interleaved_waiting_reqs(self, running_batch: ScheduleBatch) -> int:
+        if running_batch.batch_is_full:
+            return 0
+        # The chunked request keeps its row across chunks but takes an admission slot.
+        slots = self.get_num_allocatable_reqs(
+            len(running_batch.reqs),
+            running_batch=running_batch,
+            num_held_rows=int(self.chunked_req.kv.holds_kv),
+        )
+        if (prefill_max_requests := get_schedule().prefill_max_requests) is not None:
+            slots = min(slots, prefill_max_requests)
+        return slots - 1
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4111,11 +4126,12 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.policy.reserve_interleaved_prefills(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                max_reqs=self._max_interleaved_waiting_reqs(running_batch),
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 

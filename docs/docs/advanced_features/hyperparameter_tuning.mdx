@@ -64,6 +64,12 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
+### Interleave waiting prefills with a continuing request
+
+With chunked prefill, a long prompt fills every chunk and short requests wait behind it. `--prefill-interleaving` caps the continuing chunk so waiting requests that fit finish their prefill in the same pass. It is on by default for `shortest-prefill-first` and opt-in for `hrrn`; `--no-prefill-interleaving` turns it off, and `--prefill-interleaving-min-continuation-tokens` sets the continuation's minimum share of the chunk. Both policies skip waiters that do not fit and admit the selected ones first; `shortest-prefill-first` also takes only waiters shorter than the continuation.
+
+Only one unfinished prefill is supported, so a waiter must finish within the pass, and HRRN aging no longer bounds tail TTFT once non-fitting waiters are bypassed.
+
 ### Tune `--cuda-graph-max-bs-decode`
 By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).
 However, for some models, especially at large tensor parallelism sizes, CUDA graph can be useful for batch sizes up to 512 or 768.
