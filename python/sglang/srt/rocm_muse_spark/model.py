@@ -328,8 +328,8 @@ _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
-# Device memory kept free for the KV pool, CUDA graphs and activations when not every layer gets an a4w4
-# expert copy (TP4: about 103 GB for all layers); arbitrary, not tuned.
+# Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
+# the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
 _dense_tuned_logged: set = set()
 
@@ -753,6 +753,9 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         self.num_local_experts = num_local_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
+        # Set by mxfp4_moe.prepare_a4w4_weights; native_dropped means only the preshuffled copy is left.
+        self.a4w4_weights = None
+        self.native_dropped = False
         self.w13_weight = nn.Parameter(
             torch.empty(
                 num_local_experts,
@@ -1011,14 +1014,29 @@ class MuseSpark1xMoE(nn.Module):
             expert_input = self.pre_expert_norm(expert_input)
         return topk_scores, topk_ids, expert_input
 
-    def uses_a4w4(self, rows: int, target_verify: bool) -> bool:
+    def uses_compact_a4(self, rows: int, target_verify: bool) -> bool:
         return (
-            mxfp4_moe.A4W4_ENABLED
-            and not target_verify
+            mxfp4_moe.COMPACT_A4_ENABLED
+            and target_verify
             and self.mxfp4_checkpoint
-            and rows >= mxfp4_moe.A4W4_MIN_ROWS
-            and getattr(self.experts, "a4w4_weights", None) is not None
+            and self.tp_size == self.ep_size
+            and self.num_local_experts in (32, 64)
+            and self.top_k == 8
+            and rows % 8 == 0
+            and 0 < rows <= mxfp4_moe.COMPACT_A4_MAX_ROWS
         )
+
+    def uses_a4w4(self, rows: int, target_verify: bool) -> bool:
+        if not (
+            mxfp4_moe.A4W4_ENABLED
+            and self.mxfp4_checkpoint
+            and self.experts.a4w4_weights is not None
+        ):
+            return False
+        if self.experts.native_dropped:
+            # Only the preshuffled copy is left: a4w4 runs everything compact A4 does not.
+            return not self.uses_compact_a4(rows, target_verify)
+        return not target_verify and rows >= mxfp4_moe.A4W4_MIN_ROWS
 
     def run_experts(
         self,
@@ -1044,16 +1062,7 @@ class MuseSpark1xMoE(nn.Module):
                 gain,
                 quantized=quantized,
             )
-        if (
-            mxfp4_moe.COMPACT_A4_ENABLED
-            and target_verify
-            and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size
-            and self.num_local_experts in (32, 64)
-            and self.top_k == 8
-            and expert_input.shape[0] % 8 == 0
-            and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
-        ):
+        if self.uses_compact_a4(expert_input.shape[0], target_verify):
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
             assert has_norm and norm_weight is not None
             if not self._compact_a4_reported:
@@ -1433,11 +1442,9 @@ class MuseSparkModel(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-def _a4w4_layer_budget(experts: list) -> int:
-    """How many MoE layers get an a4w4 copy: all when they fit above the reserve, else as many as fit
-    (the same count on every TP rank so each layer takes one path everywhere)."""
-    if not experts:
-        return 0
+def _a4w4_keeps_native(experts: list) -> bool:
+    """Whether every MoE layer can hold the a4w4 copy beside the stored weights above the reserve on every TP rank;
+    otherwise each layer keeps only the preshuffled copy (TP4: about 103 GB per rank for the second copy)."""
     free, _ = torch.cuda.mem_get_info()
     free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
     first = experts[0]
@@ -1450,20 +1457,21 @@ def _a4w4_layer_budget(experts: list) -> int:
             first.w2_weight_scale,
         )
     )
-    fit = max(0, (free - _A4W4_RESERVE_BYTES) // per_layer)
-    count = torch.tensor([min(len(experts), fit)], dtype=torch.int64)
-    torch.distributed.all_reduce(
-        count, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group
+    fits = torch.tensor(
+        [int(free - per_layer * len(experts) >= _A4W4_RESERVE_BYTES)], dtype=torch.int64
     )
-    budget = int(count.item())
+    torch.distributed.all_reduce(
+        fits, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group
+    )
+    keep = bool(fits.item())
     logger.info(
-        "Muse a4w4 prefill MoE copies: %d of %d layers (%.1f GB each, %.1f GB free)",
-        budget,
+        "Muse MXFP4 experts: %s (%d layers, %.1f GB each, %.1f GB free)",
+        "stored + a4w4 copies" if keep else "a4w4 preshuffled copy only",
         len(experts),
         per_layer / 1e9,
         free / 1e9,
     )
-    return budget
+    return keep
 
 
 class MuseSparkTextForCausalLM(nn.Module):
@@ -1884,8 +1892,9 @@ class MuseSparkTextForCausalLM(nn.Module):
                 for module in self.model.modules()
                 if isinstance(module, MuseSpark1xMxfp4Experts)
             ]
-            for module in experts[: _a4w4_layer_budget(experts)]:
-                mxfp4_moe.prepare_a4w4_weights(module)
+            keep_native = bool(experts) and _a4w4_keeps_native(experts)
+            for module in experts:
+                mxfp4_moe.prepare_a4w4_weights(module, keep_native=keep_native)
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):
