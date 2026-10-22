@@ -605,11 +605,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                    # Recapture (sleep/wake, PD role switch) re-enters this
+                    # path: replace the previous hook instead of appending a
+                    # duplicate.
+                    hooks = self.draft_model_runner.capture_tail_hooks
+                    if getattr(self, "_draft_sampler_hook", None) in hooks:
+                        hooks.remove(self._draft_sampler_hook)
                     self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
-                        self.draft_model_runner.capture_tail_hooks.append(
-                            make_draft_sampler_capture_hook(self._draft_sampler)
+                        self._draft_sampler_hook = make_draft_sampler_capture_hook(
+                            self._draft_sampler
                         )
+                        hooks.append(self._draft_sampler_hook)
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             commit = self._deferred_commit()
             if commit is not None:

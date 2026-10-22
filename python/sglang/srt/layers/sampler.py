@@ -116,13 +116,17 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_parallel().tp_group.device_group
-        self.cp_sync_group = None
+        # Cache the GroupCoordinator (stable identity), not the raw
+        # ProcessGroup: NPU sleep-mode comm cleanup ("comm" tag) swaps
+        # device_group in place, so a cached raw PG would dangle after wake.
+        # The tp_sync_group/cp_sync_group properties resolve the live PG.
+        self._tp_sync_pg_source = get_parallel().tp_group
+        self._cp_sync_pg_source = None
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_parallel().attn_tp_group.device_group
+            self._tp_sync_pg_source = get_parallel().attn_tp_group
             # Single-shard drafts may have no context-parallel group.
             if get_parallel().attn_cp_size > 1:
-                self.cp_sync_group = get_parallel().attn_cp_group.device_group
+                self._cp_sync_pg_source = get_parallel().attn_cp_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -135,6 +139,39 @@ class Sampler(nn.Module):
         self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
 
         self.output_logprob_processor = OutputLogprobProcessor()
+
+    @property
+    def tp_sync_group(self):
+        # Resolved per use: after a sleep/wake cycle this is the rebuilt PG.
+        if self._tp_sync_pg_source is None:
+            return None
+        return self._tp_sync_pg_source.device_group
+
+    @tp_sync_group.setter
+    def tp_sync_group(self, value):
+        # Tests clear the sync group with None; a live PG must come from the
+        # coordinator, so only None is assignable here.
+        if value is not None:
+            raise AttributeError(
+                "tp_sync_group is resolved from _tp_sync_pg_source; "
+                "only None may be assigned."
+            )
+        self._tp_sync_pg_source = None
+
+    @property
+    def cp_sync_group(self):
+        if self._cp_sync_pg_source is None:
+            return None
+        return self._cp_sync_pg_source.device_group
+
+    @cp_sync_group.setter
+    def cp_sync_group(self, value):
+        if value is not None:
+            raise AttributeError(
+                "cp_sync_group is resolved from _cp_sync_pg_source; "
+                "only None may be assigned."
+            )
+        self._cp_sync_pg_source = None
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo

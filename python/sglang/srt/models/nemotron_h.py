@@ -252,9 +252,12 @@ class NemotronHMoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
-        self.ep_group = get_parallel().moe_ep_group.device_group
-        self.ep_rank = self.ep_group.rank()
-        self.ep_size = self.ep_group.size()
+        # Scalar rank/size come from the GroupCoordinator (identity-stable):
+        # caching the raw device_group PG would dangle after NPU sleep-mode
+        # comm cleanup swaps it in place.
+        ep_coordinator = get_parallel().moe_ep_group
+        self.ep_rank = ep_coordinator.rank_in_group
+        self.ep_size = ep_coordinator.world_size
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
         self.use_latent_moe = getattr(config, "moe_latent_size", None) is not None

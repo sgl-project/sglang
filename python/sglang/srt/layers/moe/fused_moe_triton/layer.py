@@ -161,15 +161,20 @@ def _weight_layout_method(layer):
 
 
 def _get_deepep_comm_group(a2a_backend):
-    group = get_parallel().tp_group.device_group
-
     if a2a_backend.is_mori():
-        group = get_parallel().tp_group
+        # MoriEPDispatcher consumes the GroupCoordinator itself.
+        return get_parallel().tp_group
 
-    elif _is_npu:
-        group = get_parallel().moe_ep_group.device_group
+    if a2a_backend.is_deepep():
+        # DeepEPDispatcher keeps the GroupCoordinator (identity-stable across
+        # NPU sleep-mode comm cleanup) and resolves device_group per use.
+        return get_parallel().moe_ep_group if _is_npu else get_parallel().tp_group
 
-    return group
+    if _is_npu:
+        return get_parallel().moe_ep_group.device_group
+
+    # mooncake/nixl/pplx dispatchers consume the raw process group.
+    return get_parallel().tp_group.device_group
 
 
 def create_moe_dispatcher(

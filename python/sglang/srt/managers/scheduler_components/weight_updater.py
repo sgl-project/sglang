@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_COMM,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
@@ -45,9 +46,79 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
+
+_IS_NPU = is_npu()
+
+
+def _resolve_tags(raw_tags: Optional[List[str]]) -> List[str]:
+    """Resolve the effective tag set for release.
+
+    An empty/None request defaults to all types (resume instead falls back to
+    the set that was actually released). `comm` is an NPU-only capability: on
+    other platforms it is filtered out of ANY tag set (with a log line) so that
+    the public GPU_MEMORY_ALL_TYPES constant stays a valid cross-platform input.
+    Unknown tags are still an error (see _validate_tags).
+    """
+    if raw_tags is None or len(raw_tags) == 0:
+        tags = list(GPU_MEMORY_ALL_TYPES)
+    else:
+        tags = list(dict.fromkeys(raw_tags))
+    if not _IS_NPU and GPU_MEMORY_TYPE_COMM in tags:
+        logger.info(
+            "The 'comm' memory occupation tag is only supported on NPU; "
+            "ignoring it on this platform."
+        )
+        tags.remove(GPU_MEMORY_TYPE_COMM)
+    return tags
+
+
+def _validate_tags(tags: List[str]) -> None:
+    unknown = sorted(set(tags) - set(GPU_MEMORY_ALL_TYPES))
+    if unknown:
+        raise ValueError(f"Unknown memory occupation tag(s): {unknown}")
+
+
+def _comm_unsupported_reason() -> Optional[str]:
+    """Why comm cleanup cannot be honored here, or None when it can.
+
+    MindSpore runners wrap the torch HCCL handles into MindSpore groups
+    (reuse_hccl_comm); destroying the torch process groups would invalidate
+    those handles with no rebuild path.
+
+    Pipeline parallelism: the comm path synchronizes over the world cpu group,
+    which spans PP stages, but the PP scheduler dispatches control requests
+    inline while relaying them (`ingest_requests()` runs before
+    `_pp_send_pyobj_to_next_stage()`), so the downstream stages never reach the
+    collective and the release deadlocks.
+    """
+    from sglang.srt.configs.model_config import ModelImpl
+
+    if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
+        return (
+            "The 'comm' memory occupation tag is not supported with "
+            "model_impl=mindspore (MindSpore reuses the torch HCCL handles)."
+        )
+    if get_parallel().pp_size > 1:
+        return (
+            "The 'comm' memory occupation tag is not supported with pipeline "
+            f"parallelism (pp_size={get_parallel().pp_size}); release the other "
+            "tags without 'comm' instead."
+        )
+    return None
+
+
+def _comm_supported() -> bool:
+    return _comm_unsupported_reason() is None
+
+
+def _assert_comm_supported() -> None:
+    reason = _comm_unsupported_reason()
+    if reason is not None:
+        raise ValueError(reason)
 
 
 def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
@@ -340,13 +411,36 @@ class SchedulerWeightUpdaterManager:
             ignore_waiting=scheduler is not None and scheduler._engine_paused
         ), "release_memory_occupation should be called only when server is idle."
 
-        tags = recv_req.tags
+        # Client-caused rejections are reported in the output payload instead
+        # of being raised: an exception here would kill the scheduler event
+        # loop (and with it the whole server) instead of reaching the caller.
+        try:
+            tags = _resolve_tags(recv_req.tags)
+            _validate_tags(tags)
+            if GPU_MEMORY_TYPE_COMM in tags:
+                if not recv_req.tags and not _comm_supported():
+                    # A tag-less release means "everything this deployment can
+                    # release": drop the unsupported tag instead of failing the
+                    # whole request (only an explicit request is an error).
+                    logger.info(
+                        "%s Excluding it from the default tag set.",
+                        _comm_unsupported_reason(),
+                    )
+                    tags.remove(GPU_MEMORY_TYPE_COMM)
+                else:
+                    _assert_comm_supported()
+        except ValueError as e:
+            return ReleaseMemoryOccupationReqOutput(error=str(e))
 
-        if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
-
-        for tag in tags:
-            self.offload_tags.add(tag)
+        # Idempotency: a tag already in offload_tags was paused/destroyed by an
+        # earlier release, so its device pages are no longer mapped. Re-running
+        # its branch would touch that unmapped memory (flush_cache clears the
+        # device-side pools, _export_static_state clones device buffers, pause
+        # re-unmaps released pages) and crash the process.
+        tags = [tag for tag in tags if tag not in self.offload_tags]
+        if not tags:
+            return ReleaseMemoryOccupationReqOutput()
+        comm_in_tags = GPU_MEMORY_TYPE_COMM in tags
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
@@ -373,23 +467,87 @@ class SchedulerWeightUpdaterManager:
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+        # With "comm", CUDA graphs are destroyed outright (they embed HCCL comm
+        # buffer addresses) instead of paused, so the pause branch is skipped.
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not comm_in_tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+        if comm_in_tags:
+            from sglang.srt.hardware_backend.npu import sleep_comm_manager
+
+            sleep_comm_manager.release_for_sleep(
+                tp_worker=self.tp_worker, draft_worker=self.draft_worker
+            )
+
         torch.get_device_module().synchronize()
+
+        # Commit tags only after every operation succeeded: a mid-sequence
+        # failure must not leave offload_tags claiming memory that was never
+        # released.
+        self.offload_tags |= set(tags)
 
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        tags = recv_req.tags
+        # Client-caused rejections are reported in the output payload instead
+        # of being raised: an exception here would kill the scheduler event
+        # loop (and with it the whole server) instead of reaching the caller.
+        try:
+            # No tags means "resume what was released", not "resume everything":
+            # a client may have released an explicit subset (e.g. the legacy
+            # weights/kv_cache/cuda_graph triple), and expanding the resume to
+            # all types would reject the tags it never released.
+            if not recv_req.tags:
+                tags = [t for t in GPU_MEMORY_ALL_TYPES if t in self.offload_tags]
+            else:
+                tags = _resolve_tags(recv_req.tags)
+            _validate_tags(tags)
+            comm_released = GPU_MEMORY_TYPE_COMM in self.offload_tags
+            if GPU_MEMORY_TYPE_COMM in tags or comm_released:
+                _assert_comm_supported()
 
-        if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            # Backward compatibility: comm was released but this resume does
+            # not name it (e.g. a legacy client sending the pre-comm triple
+            # weights/kv_cache/cuda_graph). Leaving comms destroyed would be a
+            # silent permanent eager fallback, so auto-include comm instead of
+            # rejecting the request.
+            if comm_released and GPU_MEMORY_TYPE_COMM not in tags:
+                logger.info(
+                    "'comm' was released; auto-adding it to the resume tag "
+                    "set so HCCL comms are rebuilt and graphs recaptured."
+                )
+                tags.append(GPU_MEMORY_TYPE_COMM)
+            comm_in_tags = GPU_MEMORY_TYPE_COMM in tags
 
-        for tag in tags:
-            self.offload_tags.remove(tag)
+            # Graph recapture inside the comm branch runs forward passes, so
+            # every still-offloaded dependency must be resumed together.
+            if comm_in_tags and comm_released:
+                pending = sorted(
+                    (
+                        self.offload_tags
+                        & {GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE}
+                    )
+                    - set(tags)
+                )
+                if pending:
+                    raise ValueError(
+                        f"Resuming 'comm' recaptures CUDA graphs, which "
+                        f"requires the still-offloaded tag(s) {pending} to be "
+                        f"resumed in the same request."
+                    )
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            not_released = sorted(set(tags) - self.offload_tags)
+            if not_released:
+                raise ValueError(
+                    f"Cannot resume memory occupation tag(s) that were never "
+                    f"released: {not_released}"
+                )
+        except ValueError as e:
+            return ResumeMemoryOccupationReqOutput(error=str(e))
+
+        # With "comm", graphs were recaptured fresh (brand-new allocations), so
+        # there is nothing to resume under the cuda_graph tag.
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not comm_in_tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
@@ -418,6 +576,24 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+
+        # Comms are rebuilt LAST: the graph recapture inside runs forward
+        # passes, which read weights (already resumed above) and need the
+        # rebuilt collectives. (comm_in_tags implies comm_released here: the
+        # not_released check above already rejected unreleased tags.)
+        if comm_in_tags:
+            from sglang.srt.hardware_backend.npu import sleep_comm_manager
+
+            sleep_comm_manager.restore_after_sleep(
+                tp_worker=self.tp_worker, draft_worker=self.draft_worker
+            )
+
+        # Commit tags only after every operation succeeded.
+        self.offload_tags -= set(tags)
+        if comm_in_tags:
+            # Graphs were recaptured, not TMS-resumed: even if this resume
+            # did not name cuda_graph, nothing remains offloaded under it.
+            self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         return ResumeMemoryOccupationReqOutput()
 

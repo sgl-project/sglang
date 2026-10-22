@@ -375,7 +375,7 @@ class Dots3MoE(nn.Module):
             )
 
             self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
+                group=get_parallel().tp_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,

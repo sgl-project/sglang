@@ -740,11 +740,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
             if capture_decode_cuda_graph:
                 # Must run before capture so the draft graph folds the head in.
+                # Recapture (sleep/wake, PD role switch) re-enters this path:
+                # replace the previous hook instead of appending a duplicate.
+                hooks = self.draft_model_runner.capture_tail_hooks
+                if getattr(self, "_draft_sampler_hook", None) in hooks:
+                    hooks.remove(self._draft_sampler_hook)
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
-                    self.draft_model_runner.capture_tail_hooks.append(
-                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    self._draft_sampler_hook = make_draft_sampler_capture_hook(
+                        self._draft_sampler
                     )
+                    hooks.append(self._draft_sampler_hook)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
