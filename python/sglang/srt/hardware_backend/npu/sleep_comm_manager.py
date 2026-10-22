@@ -1,87 +1,39 @@
-"""NPU sleep-mode comm cleanup orchestration ("comm" tag).
+"""NPU sleep-mode comm cleanup backend ("comm" tag).
 
-Ordering contract (wired up by SchedulerWeightUpdaterManager):
-  sleep : CUDA graphs are dropped  -> barrier -> HCCL comms destroyed
-  wakeup: HCCL comms rebuilt       -> barrier -> CUDA graphs recaptured
-
-Captured graphs embed HCCL comm buffer addresses, so the two must never be
-alive in a mismatched state. The gloo cpu_group of every GroupCoordinator is
-retained throughout and serves as the cross-rank control plane (barriers,
-consistency checks); mq_broadcaster rides on cpu_group and is kept as well.
-
-destroy_process_group / new_group are collective: every rank must operate on
-the same set of groups in the same order. We therefore sort groups by
-unique_name and all-gather the per-rank group list before touching anything;
-a mismatch aborts the release before any resource has been destroyed.
+Sleep drops graphs, then destroys HCCL comms; wake rebuilds comms, then
+recaptures graphs. Captured graphs embed comm buffer addresses, so the two
+must never be alive in a mismatched state. All ranks must destroy/rebuild the
+same groups in the same order, since both are collective.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, List
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.distributed
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
-    drop_cuda_graphs_for_sleep,
-    force_eager_graphs,
-    recapture_cuda_graphs_after_sleep,
-    release_shared_graph_pool,
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_COMM,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
+from sglang.srt.utils.sleep_comm.backend import (
+    SleepCommBackend,
+    all_ranks_ok,
+    assert_ranks_agree,
+    barrier,
+    group_signatures,
+    iter_rebuildable_groups,
+    world_cpu_group,
 )
 
 logger = logging.getLogger(__name__)
 
-
-def _iter_cleanup_groups() -> List[parallel_state.GroupCoordinator]:
-    """Alive GroupCoordinators participating in comm cleanup, sorted by name.
-
-    Groups excluded from cleanup (mooncake backend, elastic-EP joiners) carry
-    _rebuild_spec=None and are filtered out; release_device_comm() logs them.
-    """
-    groups = []
-    for ref in parallel_state._groups.values():
-        group = ref()
-        if group is None or group._rebuild_spec is None:
-            continue
-        groups.append(group)
-    groups.sort(key=lambda g: g.unique_name)
-    return groups
-
-
-def _world_cpu_group():
-    return parallel_state.get_world_group().cpu_group
-
-
-def _barrier(cpu_group, what: str) -> None:
-    logger.debug(f"[sleep-comm] barrier: {what}")
-    torch.distributed.barrier(group=cpu_group)
-
-
-def _group_signatures(groups) -> List[Any]:
-    """(unique_name, group_ranks) pairs: names alone cannot detect the
-    'same name, different rank set' divergence across ranks."""
-    return [
-        (g.unique_name, tuple(tuple(r) for r in g._rebuild_spec.group_ranks))
-        for g in groups
-    ]
-
-
-def _assert_ranks_agree(signatures: List[Any], cpu_group) -> None:
-    """All ranks must agree on the group set before any destroy/rebuild.
-
-    Cheap insurance against weakref-liveness or registration-order divergence
-    across ranks, which would otherwise deadlock inside new_group. Called
-    before any resource is touched, so raising here is a clean abort.
-    """
-    gathered: List[Any] = [None] * torch.distributed.get_world_size(cpu_group)
-    torch.distributed.all_gather_object(gathered, signatures, group=cpu_group)
-    if any(other != signatures for other in gathered):
-        raise RuntimeError(
-            f"[sleep-comm] ranks disagree on the comm-cleanup group set: "
-            f"{gathered}. Aborting; no resource has been modified."
-        )
+# Device-group-bound communicators: they hold the device group handle, so they
+# are destroyed with the process group and recreated after it is rebuilt.
+_DEVICE_COMM_ATTRS = ("pcie_ipc_comm",)
 
 
 def _target_model_runners(tp_worker) -> List[Any]:
@@ -103,14 +55,16 @@ def _cleanup_graph_runner(runner) -> None:
 def _drop_draft_graphs(draft_worker) -> None:
     if draft_worker is None:
         return
-    # 1. Draft model runners' prefill/decode graphs.
+    from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+        drop_cuda_graphs_for_sleep,
+    )
+
     get_runners = getattr(draft_worker, "_draft_model_runners", None)
     if callable(get_runners):
         for runner in get_runners():
             drop_cuda_graphs_for_sleep(runner)
-    # 2. The spec worker's own draft-decode / draft-extend graph runners.
-    #    EAGLE keeps them on the INNER draft worker (EagleDraftWorker), not on
-    #    the outer wrapper the scheduler hands us, so poke both.
+
+    # EAGLE keeps its graph runners on the inner draft worker.
     workers = [draft_worker]
     inner = getattr(draft_worker, "_draft_worker", None)
     if inner is not None and inner is not draft_worker:
@@ -122,11 +76,9 @@ def _drop_draft_graphs(draft_worker) -> None:
                 continue
             _cleanup_graph_runner(runner)
             setattr(worker, attr, None)
-    # 3. Adaptive spec: every candidate step's runtime state owns graph
-    #    runners of its own. Cleaning only the active step would leak the
-    #    others and, worse, a later step switch would reinstall graphs
-    #    captured on the destroyed comms. Drop all states; the wake path
-    #    (init_cuda_graphs) re-registers and rebuilds them.
+
+    # Every adaptive step owns graph runners; a later step switch would
+    # otherwise reinstall graphs captured on the destroyed comms.
     controller = getattr(draft_worker, "adaptive_controller", None)
     states = getattr(controller, "_states", None)
     if states:
@@ -141,12 +93,7 @@ def _drop_draft_graphs(draft_worker) -> None:
 
 
 def _drop_multimodal_graphs(model_runner) -> None:
-    """Drop ViT graph runners living inside the model (e.g. Qwen3-VL).
-
-    ViT blocks run TP all-gathers that get captured into the ViT graphs, so
-    they must die with the comms like every other graph. Capture is lazy:
-    cleared runners recapture on the next image request after wake.
-    """
+    """Drop ViT graph runners, which also capture TP all-gathers."""
     model = getattr(model_runner, "model", None)
     if model is None:
         return
@@ -168,8 +115,7 @@ def _drop_multimodal_graphs(model_runner) -> None:
         seen.add(id(runner))
         block_graphs.clear()
     if seen:
-        # The NPU ViT runner keeps a class-level pool plus a global pool id;
-        # both must go so nothing references the released memory.
+        # Drop the class-level pool and global pool id along with the graphs.
         ViTNpuGraphRunner._graph_memory_pool = None
         set_graph_pool_id(None)
 
@@ -178,101 +124,175 @@ def _recapture_draft_graphs(draft_worker) -> bool:
     if draft_worker is None:
         return True
     try:
-        # Same entry the scheduler uses at startup; re-captures draft model
-        # runner graphs and the EAGLE worker's own graphs, wrapped in the
-        # contexts (draft_pp/draft_tp/speculative_moe_backend) they require.
         draft_worker.init_cuda_graphs()
         return True
     except Exception:
-        # Draft graphs are an optimization; keep the (eager) draft path alive.
+        # Draft graphs are an optimization; keep the eager draft path alive.
         logger.exception(
             "[sleep-comm] draft CUDA graph recapture failed; draft runs eager."
         )
-        # Never leave half-captured stale runners behind.
         _drop_draft_graphs(draft_worker)
         return False
 
 
-def _destroy_comms(groups, cpu_group) -> int:
-    _barrier(cpu_group, "before comm destroy")
-    free_before, _ = torch.npu.mem_get_info()
-    released = sum(1 for g in groups if g.release_device_comm())
-    _barrier(cpu_group, "after comm destroy")
-    free_after, _ = torch.npu.mem_get_info()
-    logger.info(
-        f"[sleep-comm] destroyed {released} device group(s); "
-        f"free device memory {(free_before / (1 << 30)):.3f} GiB -> "
-        f"{(free_after / (1 << 30)):.3f} GiB"
-    )
-    return released
+class NPUSleepCommBackend(SleepCommBackend):
+    """Destroys device-side HCCL communicators on release and rebuilds them
+    on resume."""
 
+    tag = GPU_MEMORY_TYPE_COMM
+    # This backend owns the graph lifecycle, so core skips the TMS graph pause.
+    handles_cuda_graph = True
+    # Recapture runs forward passes, which read weights and the KV cache.
+    resume_requires = frozenset({GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE})
 
-def _rebuild_comms(groups, cpu_group) -> int:
-    _barrier(cpu_group, "before comm rebuild")
-    restored = sum(1 for g in groups if g.restore_device_comm())
-    _barrier(cpu_group, "after comm rebuild")
-    logger.info(f"[sleep-comm] restored {restored} device group(s)")
-    return restored
+    def __init__(self, tp_worker, draft_worker):
+        super().__init__(tp_worker, draft_worker)
+        self._detached_comms: List[Tuple[Any, str]] = []
 
+    @classmethod
+    def unsupported_reason(cls) -> Optional[str]:
+        """MindSpore reuses the torch HCCL handles, and the PP scheduler
+        dispatches control requests inline, so the world-group barrier in the
+        comm path deadlocks across stages."""
+        from sglang.srt.configs.model_config import ModelImpl
+        from sglang.srt.runtime_context import get_model, get_parallel
 
-def release_for_sleep(tp_worker, draft_worker=None) -> None:
-    """Full comm-cleanup release sequence (see module docstring for order)."""
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
+            return (
+                "The 'comm' memory occupation tag is not supported with "
+                "model_impl=mindspore (MindSpore reuses the torch HCCL handles)."
+            )
+        if get_parallel().pp_size > 1:
+            return (
+                "The 'comm' memory occupation tag is not supported with pipeline "
+                f"parallelism (pp_size={get_parallel().pp_size}); release the other "
+                "tags without 'comm' instead."
+            )
+        return None
 
-    torch.npu.synchronize()
-    cpu_group = _world_cpu_group()
-    groups = _iter_cleanup_groups()
-    _assert_ranks_agree(_group_signatures(groups), cpu_group)
-    _barrier(cpu_group, "before graph drop")
-
-    # 1. Graphs first: they embed HCCL comm buffer addresses.
-    for runner in _target_model_runners(tp_worker):
-        drop_cuda_graphs_for_sleep(runner)
-        _drop_multimodal_graphs(runner)
-    _drop_draft_graphs(draft_worker)
-    release_shared_graph_pool(tp_worker.model_runner)
-
-    # 2. DeepEP buffer references the old comm name; drop it before destroy.
-    DeepEPBuffer.invalidate_buffer()
-
-    # 3. Comms last.
-    _destroy_comms(groups, cpu_group)
-
-
-def restore_after_sleep(tp_worker, draft_worker=None) -> None:
-    """Full comm-cleanup resume sequence (mirror of release_for_sleep)."""
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
-
-    cpu_group = _world_cpu_group()
-    groups = _iter_cleanup_groups()
-    _assert_ranks_agree(_group_signatures(groups), cpu_group)
-
-    # 1. Comms first: recapture runs forward passes that need collectives.
-    _rebuild_comms(groups, cpu_group)
-
-    # 2. Defensive: normally already None after release; the next dispatch
-    #    lazily recreates the buffer on the rebuilt process group.
-    DeepEPBuffer.invalidate_buffer()
-
-    # 3. Recapture graphs on the rebuilt comms.
-    ok = True
-    for runner in _target_model_runners(tp_worker):
-        ok = recapture_cuda_graphs_after_sleep(runner) and ok
-    ok = _recapture_draft_graphs(draft_worker) and ok
-
-    # Recapture may fail on only some ranks; a graph/eager mix across ranks
-    # forks collective sequences (e.g. DP attention requires every rank to
-    # pick the same path). Vote over the retained gloo group: if any rank
-    # failed, every rank falls back to eager together.
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
-    torch.distributed.all_reduce(
-        flag, op=torch.distributed.ReduceOp.MIN, group=cpu_group
-    )
-    if flag.item() == 0:
-        logger.error(
-            "[sleep-comm] CUDA graph recapture failed on at least one rank; "
-            "ALL ranks fall back to eager to keep collectives consistent."
+    def release(self) -> None:
+        """Drop graphs, then the DeepEP buffer, then the HCCL comms."""
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            drop_cuda_graphs_for_sleep,
+            release_shared_graph_pool,
         )
-        for runner in _target_model_runners(tp_worker):
-            force_eager_graphs(runner)
-        _drop_draft_graphs(draft_worker)
+
+        torch.npu.synchronize()
+        cpu_group = world_cpu_group()
+        groups = iter_rebuildable_groups()
+        assert_ranks_agree(group_signatures(groups), cpu_group)
+        barrier(cpu_group, "before graph drop")
+
+        for runner in _target_model_runners(self.tp_worker):
+            drop_cuda_graphs_for_sleep(runner)
+            _drop_multimodal_graphs(runner)
+        _drop_draft_graphs(self.draft_worker)
+        release_shared_graph_pool(self.tp_worker.model_runner)
+
+        DeepEPBuffer.invalidate_buffer()
+        self._destroy_device_comms(groups, cpu_group)
+
+    def resume(self) -> None:
+        """Rebuild comms, then recapture graphs."""
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            force_eager_graphs,
+            recapture_cuda_graphs_after_sleep,
+        )
+
+        cpu_group = world_cpu_group()
+        groups = iter_rebuildable_groups()
+        assert_ranks_agree(group_signatures(groups), cpu_group)
+
+        self._rebuild_device_comms(groups, cpu_group)
+        # Normally already None after release; recreate lazily on next dispatch.
+        DeepEPBuffer.invalidate_buffer()
+
+        ok = True
+        for runner in _target_model_runners(self.tp_worker):
+            ok = recapture_cuda_graphs_after_sleep(runner) and ok
+        ok = _recapture_draft_graphs(self.draft_worker) and ok
+
+        # A graph/eager mix across ranks forks collective sequences, so vote
+        # over the retained gloo group and fall back everywhere together.
+        if not all_ranks_ok(ok, cpu_group):
+            logger.error(
+                "[sleep-comm] CUDA graph recapture failed on at least one rank; "
+                "ALL ranks fall back to eager to keep collectives consistent."
+            )
+            for runner in _target_model_runners(self.tp_worker):
+                force_eager_graphs(runner)
+            _drop_draft_graphs(self.draft_worker)
+
+    def _detach_device_comms(self, group) -> None:
+        """Destroy the communicators bound to ``group``'s device group."""
+        for attr in _DEVICE_COMM_ATTRS:
+            comm = getattr(group, attr, None)
+            if comm is None:
+                continue
+            destroy_fn = getattr(comm, "destroy", None)
+            close_fn = getattr(comm, "close", None)
+            if callable(destroy_fn):
+                destroy_fn()
+            elif callable(close_fn):
+                close_fn()
+            setattr(group, attr, None)
+            self._detached_comms.append((group, attr))
+
+    def _recreate_device_comm(self, group, attr: str) -> None:
+        """Recreate one device-group-bound communicator detached by release."""
+        if attr == "pcie_ipc_comm":
+            from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+                PcieIpcCommunicator,
+            )
+
+            group.pcie_ipc_comm = PcieIpcCommunicator(
+                group=group.device_group,
+                device=group.device,
+                cpu_group=group.cpu_group,
+            )
+        else:
+            raise ValueError(f"Unknown device communicator attribute: {attr}")
+
+    def _destroy_device_comms(self, groups, cpu_group) -> int:
+        barrier(cpu_group, "before comm destroy")
+        free_before, _ = torch.npu.mem_get_info()
+        released = 0
+        for group in groups:
+            if group.device_group is None:
+                continue
+            self._detach_device_comms(group)
+            if group.destroy_device_group():
+                released += 1
+        barrier(cpu_group, "after comm destroy")
+        free_after, _ = torch.npu.mem_get_info()
+        logger.info(
+            f"[sleep-comm] destroyed {released} device group(s); "
+            f"free device memory {(free_before / (1 << 30)):.3f} GiB -> "
+            f"{(free_after / (1 << 30)):.3f} GiB"
+        )
+        return released
+
+    def _rebuild_device_comms(self, groups, cpu_group) -> int:
+        barrier(cpu_group, "before comm rebuild")
+        restored = 0
+        rebuilt = []
+        for group in groups:
+            if not group.rebuild_device_group():
+                continue
+            restored += 1
+            rebuilt.append(group)
+            for detached_group, attr in self._detached_comms:
+                if detached_group is group:
+                    self._recreate_device_comm(group, attr)
+        if rebuilt:
+            rebuilt_ids = {id(group) for group in rebuilt}
+            self._detached_comms = [
+                (group, attr)
+                for group, attr in self._detached_comms
+                if id(group) not in rebuilt_ids
+            ]
+        barrier(cpu_group, "after comm rebuild")
+        logger.info(f"[sleep-comm] restored {restored} device group(s)")
+        return restored

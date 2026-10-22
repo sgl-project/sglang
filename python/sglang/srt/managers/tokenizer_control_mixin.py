@@ -90,10 +90,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.managers.scheduler_components.weight_updater import (
-    _resolve_tags,
-    _validate_tags,
-)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -108,6 +104,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.sleep_comm import validate_tags
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -178,9 +175,7 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
 
 
 def _raise_on_memory_occupation_error(results: List) -> None:
-    """The scheduler reports client-caused release/resume rejections in the
-    output payload (raising there would kill the server); re-raise here so
-    the HTTP layer turns them into a 400."""
+    """Re-raise the scheduler's rejected release/resume as a 400."""
     errors = [r.error for r in results if getattr(r, "error", None)]
     if errors:
         raise ValueError(errors[0])
@@ -918,10 +913,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        # Fail fast in this (HTTP-facing) process: tag errors raised here
-        # surface to the caller as an HTTP 400, whereas an exception inside
-        # the scheduler would kill the whole server.
-        _validate_tags(_resolve_tags(obj.tags))
+        # Validate here (HTTP-facing) so tag errors become a 400, not a server kill.
+        validate_tags(obj.tags or [])
         results = await self.release_memory_occupation_communicator(obj)
         _raise_on_memory_occupation_error(results)
         success, message = FanOutCommunicator.merge_results(results)
@@ -934,7 +927,7 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        _validate_tags(_resolve_tags(obj.tags))
+        validate_tags(obj.tags or [])
         results = await self.resume_memory_occupation_communicator(obj)
         _raise_on_memory_occupation_error(results)
 

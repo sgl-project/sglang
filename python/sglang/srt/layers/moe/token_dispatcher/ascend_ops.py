@@ -144,9 +144,10 @@ class AscendOpsDispatcher(BaseDispatcher):
         super().__init__()
         self.moe_ascend_ops_config = moe_ascend_ops_config or AscendOpsConfig()
         parallel = get_parallel()
-        self.tp_group = parallel.tp_group.device_group
+        # Cache the GroupCoordinators, not the raw PGs: comm cleanup swaps
+        # device_group in place. The properties below resolve the live PG.
+        self._tp_group_coordinator = parallel.tp_group
         self.ep_coordinator = parallel.moe_ep_group
-        self.ep_group = self.ep_coordinator.device_group
         self.ep_size = self.ep_coordinator.world_size
         self.ep_rank = self.ep_coordinator.rank_in_group
         self.num_experts = moe_runner_config.num_experts
@@ -155,6 +156,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.hidden_size = moe_runner_config.hidden_size
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
+        # The PG the cached HCCL comm name was taken from; a comm rebuild
+        # replaces the PG, so the name must be re-fetched.
+        self._ep_comm_name_group: Optional[torch.distributed.ProcessGroup] = None
         self._pad_buffers: dict[tuple, tuple] = {}
         if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
@@ -166,6 +170,16 @@ class AscendOpsDispatcher(BaseDispatcher):
                     "NPU AllGather requires TP=EP, contiguous expert placement "
                     "and no fused shared experts"
                 )
+
+    @property
+    def tp_group(self) -> torch.distributed.ProcessGroup:
+        # Resolved per use, so it is the rebuilt PG after a sleep/wake cycle.
+        return self._tp_group_coordinator.device_group
+
+    @property
+    def ep_group(self) -> torch.distributed.ProcessGroup:
+        # Resolved per use, so it is the rebuilt PG after a sleep/wake cycle.
+        return self.ep_coordinator.device_group
 
     def set_quant_config(self, quant_config: dict) -> None:
         """Store quantization settings used by the routing kernels."""
@@ -405,13 +419,17 @@ class AscendOpsDispatcher(BaseDispatcher):
         return DispatcherOutputDtype(raw)
 
     def _get_ep_comm_name(self) -> str:
-        if self._ep_comm_name is None:
-            backend = self.ep_group._get_backend(torch.device("npu"))
+        group = self.ep_group
+        # Re-fetch after a comm rebuild: the cached name belongs to the old
+        # (destroyed) HCCL communicator.
+        if self._ep_comm_name is None or self._ep_comm_name_group is not group:
+            backend = group._get_backend(torch.device("npu"))
             if hasattr(backend, "get_hccl_comm_name"):
                 name = backend.get_hccl_comm_name(self.ep_rank)
             else:
-                name = self.ep_group.get_hccl_comm_name(self.ep_rank)
+                name = group.get_hccl_comm_name(self.ep_rank)
             self._ep_comm_name = name
+            self._ep_comm_name_group = group
         return self._ep_comm_name
 
     # Prefill: AllGather

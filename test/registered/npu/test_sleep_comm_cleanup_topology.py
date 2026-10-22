@@ -1,23 +1,8 @@
 """NPU CI test for sleep-mode comm cleanup on multi-subgroup topologies.
 
-The destroy/rebuild of device groups must replay the FULL group_ranks list on
-every rank in the original order (torch's new_group is an all-rank contract
-and group names come from a process-level counter). These topologies have
-disjoint non-trivial subgroups — exactly where a naive "rebuild only my own
-subgroup" implementation deadlocks or cross-wires HCCL root info:
-
-  * tp=2 + pp=2: tp subgroups [0,1]/[2,3] and pp subgroups [0,2]/[1,3];
-  * dp-attention (dp=2, tp=2): attn_tp / attn_dp subgroups, and the sampler's
-    attn-tp sync path.
-
-Each class does a full sleep/wake and then requires serving to work again;
-a broken rebuild hangs inside the wake or the first post-wake collective,
-which the request timeout turns into a fast failure.
-
-Pipeline parallelism cannot run the comm cleanup itself (its world-group
-collectives are unreachable from a PP scheduler while the request is still
-being relayed), so the PP class asserts the explicit rejection instead of a
-comm-only sleep/wake cycle.
+A rebuild must replay the FULL group_ranks list in the original order on every
+rank. Covered: tp=2+pp=2 (disjoint tp/pp subgroups) and dp-attention (attn_tp /
+attn_dp subgroups, sampler attn-tp sync). PP rejects the comm tag.
 
 Usage:
 python3 -m unittest test_sleep_comm_cleanup_topology
@@ -107,9 +92,7 @@ def _assert_mem_near_baseline(test_case, baseline_mb, what):
 class _SleepWakeTopologyMixin:
     """Shared full-cycle checks for one server configuration."""
 
-    # Whether this deployment accepts the "comm" tag. PP deployments reject an
-    # explicit "comm" (world-group collectives are unreachable from a PP
-    # scheduler) and drop it from a tag-less request.
+    # PP rejects an explicit "comm" and drops it from a tag-less request.
     comm_supported = True
 
     def test_full_sleep_wake_and_repeat(self):
@@ -141,8 +124,7 @@ class _SleepWakeTopologyMixin:
             self.base_url, "/release_memory_occupation", {"tags": ["comm"]}
         )
         if not self.comm_supported:
-            # Must be a clean rejection (400), not a hang or a dead server:
-            # nothing is released, so memory and greedy output stay untouched.
+            # Clean 400, not a hang: nothing was released.
             self.assertEqual(response.status_code, 400, response.text)
             self.assertIn("pipeline parallelism", response.text)
             _assert_mem_near_baseline(self, used_before_mb, "rejected comm release")
@@ -171,8 +153,7 @@ class TestSleepCommCleanupPP(_SleepWakeTopologyMixin, CustomTestCase):
     """tp=2 pp=2: disjoint TP subgroups per stage and disjoint PP subgroups —
     the topology that exercises the full group_ranks replay most directly."""
 
-    # Pipeline parallelism does not support the comm tag (see the module
-    # docstring), so the comm case asserts the rejection instead.
+    # PP does not support the comm tag; the comm cases assert the rejection.
     comm_supported = False
 
     @classmethod
@@ -214,13 +195,10 @@ class TestSleepCommCleanupPP(_SleepWakeTopologyMixin, CustomTestCase):
         self.assertEqual(text_before, _generate_greedy(self, self.base_url))
 
     def test_resume_comm_is_rejected_under_pp(self):
-        """The resume side applies the same gate: naming "comm" (which PP never
-        released) is a 400 with the PP reason, not a hang or a state change."""
+        """Naming "comm" on resume is also a 400 on PP, not a hang."""
         text_before = _generate_greedy(self, self.base_url)
 
-        response = _post(
-            self.base_url, "/resume_memory_occupation", {"tags": ["comm"]}
-        )
+        response = _post(self.base_url, "/resume_memory_occupation", {"tags": ["comm"]})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("pipeline parallelism", response.text)
 

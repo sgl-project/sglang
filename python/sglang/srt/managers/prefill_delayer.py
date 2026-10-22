@@ -115,9 +115,8 @@ class PrefillDelayer:
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         tp_group = parallel.tp_group
-        # Cache the GroupCoordinator (identity-stable) and resolve the PG per
-        # use: NPU sleep-mode comm cleanup ("comm" tag) swaps device_group in
-        # place, so a cached raw PG would dangle after wake.
+        # Cache the GroupCoordinator and resolve the PG per use: comm cleanup
+        # swaps device_group in place.
         self._gather_pg_source = tp_group
         self._gather_uses_device_group = use_nccl
         if use_nccl:
@@ -146,7 +145,6 @@ class PrefillDelayer:
 
     @property
     def _gather_group(self):
-        # Resolved per use: after a sleep/wake cycle this is the rebuilt PG.
         if self._gather_uses_device_group:
             return self._gather_pg_source.device_group
         return self._gather_pg_source.cpu_group

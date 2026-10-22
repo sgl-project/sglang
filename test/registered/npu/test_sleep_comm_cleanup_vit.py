@@ -1,14 +1,8 @@
 """NPU CI test for sleep-mode comm cleanup with a ViT NPU graph (Qwen3-VL).
 
-With SGLANG_VIT_ENABLE_CUDA_GRAPH=1 the vision tower's blocks (which contain
-TP all-gathers) are captured into ViT NPU graphs held by ViTNpuGraphRunner
-inside the model — outside every model-runner-level graph. A comm sleep must
-drop those graphs and their class-level pool; the wake recaptures lazily on
-the next image request. A stale ViT graph would replay TP collectives on the
-destroyed communicator: hang (request timeout) or wrong color answer.
-
-The image is a solid-red PNG generated in-process (no dataset dependency);
-asking for its color gives a deterministic functional check of the ViT path.
+With SGLANG_VIT_ENABLE_CUDA_GRAPH=1 the vision tower's graphs live inside the
+model, outside every model-runner graph. A comm sleep must drop them and their
+class-level pool; the wake recaptures lazily on the next image request.
 
 Usage:
 python3 -m unittest test_sleep_comm_cleanup_vit
