@@ -1724,7 +1724,11 @@ class TritonAttnBackend(AttentionBackend):
                     # For MLA, scale K manually before storing since MLATokenToKVPool
                     # doesn't accept scale parameters. Clone to protect k from mutation
                     # since it's used later in the attention kernel.
-                    k_scaled = k.clone().div_(layer.k_scale)
+                    k_scaled = (
+                        k
+                        if layer.k_scale_float == 1.0
+                        else k.clone().div_(layer.k_scale)
+                    )
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         loc_info,
@@ -2323,7 +2327,7 @@ class TritonAttnBackend(AttentionBackend):
                     f"entries for {forward_batch.out_cache_loc.shape[0]} tokens"
                 )
             if self.use_mla:
-                if layer.k_scale is not None:
+                if layer.k_scale is not None and layer.k_scale_float != 1.0:
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
