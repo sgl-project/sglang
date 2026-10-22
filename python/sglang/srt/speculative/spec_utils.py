@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    draft_attn_parallel_group,
     get_exec,
     get_parallel,
     get_spec,
@@ -734,15 +735,13 @@ def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
     Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
-    ``attn_tp_group`` is still the target's.
+    sync) uses ``draft_attn_parallel_group()``. Other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope.
     """
     if not owns_attention:
         return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
-    )
+    group = getattr(get_parallel(), f"{draft_attn_parallel_group()}_group")
+    return patch_tensor_parallel_group(group, owns_attention=True)
 
 
 def spec_stage_span(name: str):
