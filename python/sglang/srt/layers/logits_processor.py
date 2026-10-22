@@ -211,6 +211,31 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
         _autotune_run_lm_head = None
 
 
+def _use_fp32_lm_head(config) -> bool:
+    return get_exec().features.enable_fp32_lm_head or getattr(
+        config, "enable_lm_head_fp32", False
+    )
+
+
+def _final_logit_softcapping(config) -> Optional[float]:
+    softcap = getattr(config, "final_logit_softcapping", None)
+    return None if softcap is not None and softcap < 0 else softcap
+
+
+def get_next_token_logits_dtype(config) -> torch.dtype:
+    """Dtype of the next-token logits LogitsProcessor(config) returns.
+
+    Graph runners allocate next_token_logits_buffer with it, so graph replay and
+    eager forward hand the sampler the same dtype.
+    """
+    # The fused cast-and-softcap writes fp32 logits even under a bf16 contract.
+    if _final_logit_softcapping(config):
+        return torch.float
+    if should_force_bfloat16_lm_head(use_fp32_lm_head=_use_fp32_lm_head(config)):
+        return torch.bfloat16
+    return torch.float
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -458,9 +483,8 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
-        self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
-            config, "enable_lm_head_fp32", False
-        )
+        self.use_fp32_lm_head = _use_fp32_lm_head(config)
+        self.next_token_logits_dtype = get_next_token_logits_dtype(config)
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -474,14 +498,7 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
             )
-        self.final_logit_softcapping = getattr(
-            self.config, "final_logit_softcapping", None
-        )
-        if (
-            self.final_logit_softcapping is not None
-            and self.final_logit_softcapping < 0
-        ):
-            self.final_logit_softcapping = None
+        self.final_logit_softcapping = _final_logit_softcapping(self.config)
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
@@ -1175,13 +1192,14 @@ class LogitsProcessor(nn.Module):
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
             logits.shape
         ):
-            assert logits_buffer.dtype == torch.float
+            assert logits_buffer.dtype == self.next_token_logits_dtype, (
+                f"next_token_logits_buffer is {logits_buffer.dtype}, "
+                f"expected {self.next_token_logits_dtype}"
+            )
             logits_buffer.copy_(logits)
             logits = logits_buffer
-        elif should_force_bfloat16_lm_head(use_fp32_lm_head=self.use_fp32_lm_head):
-            logits = logits[:, : self.vocab_size].to(torch.bfloat16)
         else:
-            logits = logits.float()
+            logits = logits.to(self.next_token_logits_dtype)
         return logits
 
     def _get_dllm_logits(

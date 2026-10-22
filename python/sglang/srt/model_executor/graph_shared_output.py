@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
@@ -30,7 +30,7 @@ class GraphSharedOutput:
     ) -> None:
         self.device = torch.device(device)
         self.max_rows = max_rows
-        self._logits_buffers: Dict[int, torch.Tensor] = {}
+        self._logits_buffers: Dict[Tuple[int, torch.dtype], torch.Tensor] = {}
 
     @classmethod
     def create_for_model_runner(
@@ -59,15 +59,18 @@ class GraphSharedOutput:
         cls._process_shared = cls(device=device, max_rows=max_rows)
         return cls._process_shared
 
-    def get_logits_buffer(self, vocab_size: int, *, rows: int) -> torch.Tensor:
+    def get_logits_buffer(
+        self, vocab_size: int, *, rows: int, dtype: torch.dtype
+    ) -> torch.Tensor:
         assert rows <= self.max_rows, (
             f"shared logits buffer holds {self.max_rows} rows but caller "
             f"needs {rows} (vocab_size={vocab_size})"
         )
-        buffer = self._logits_buffers.get(vocab_size)
+        key = (vocab_size, dtype)
+        buffer = self._logits_buffers.get(key)
         if buffer is None:
             buffer = torch.zeros(
-                (self.max_rows, vocab_size), dtype=torch.float, device=self.device
+                (self.max_rows, vocab_size), dtype=dtype, device=self.device
             )
-            self._logits_buffers[vocab_size] = buffer
+            self._logits_buffers[key] = buffer
         return buffer[:rows]
