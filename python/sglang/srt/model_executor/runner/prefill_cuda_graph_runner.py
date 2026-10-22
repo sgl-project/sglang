@@ -97,6 +97,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -1610,8 +1613,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def capture(self) -> None:
         # Foundry CUDA graph persistence: SAVE archives the graphs captured by
         # this loop, LOAD restores them in place of capturing (capture_one).
+        tactics = (
+            flashinfer_tactics_cache_for_persistence(self.model_runner)
+            if get_foundry_adapter().enabled
+            else None
+        )
         with get_foundry_adapter().capture_scope(
-            "prefill", model=self.model_runner.model, req_slots=self._capture_req_slots
+            "prefill",
+            model=self.model_runner.model,
+            req_slots=self._capture_req_slots,
+            flashinfer_tactics=tactics,
         ):
             self._capture_graphs()
 

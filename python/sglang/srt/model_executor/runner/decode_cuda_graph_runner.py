@@ -81,6 +81,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
@@ -1117,8 +1118,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def capture(self) -> None:
         # Foundry CUDA graph persistence: SAVE archives the graphs captured by
         # this loop, LOAD restores them in place of capturing (capture_one).
+        tactics = (
+            flashinfer_tactics_cache_for_persistence(self.model_runner)
+            if get_foundry_adapter().enabled
+            else None
+        )
         with get_foundry_adapter().capture_scope(
-            "decode", model=self.model_runner.model, kind=self._foundry_graph_kind()
+            "decode",
+            model=self.model_runner.model,
+            kind=self._foundry_graph_kind(),
+            flashinfer_tactics=tactics,
         ):
             self._capture_graphs()
 

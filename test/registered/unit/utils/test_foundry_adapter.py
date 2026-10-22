@@ -83,8 +83,10 @@ def _fake_api(
     api.configure_subprocess = lambda server_args=None: scope(
         "configure_subprocess", server_args
     )
-    api.capture_scope = lambda phase, *, model, req_slots=None, kind=None: scope(
-        "capture_scope", phase, model, req_slots, kind
+    api.capture_scope = (
+        lambda phase, *, model, req_slots=None, kind=None, flashinfer_tactics=None: (
+            scope("capture_scope", phase, model, req_slots, kind, flashinfer_tactics)
+        )
     )
     return api
 
@@ -197,19 +199,22 @@ class TestFoundryAdapter(CustomTestCase):
             adapter.record_memory_pool_overrides()
             adapter.before_alloc_memory_pool(False)
             adapter.after_alloc_memory_pool(cfg, False)
-            with adapter.capture_scope("prefill", model=model, req_slots=4):
+            with adapter.capture_scope(
+                "prefill", model=model, req_slots=4, flashinfer_tactics="/t.json"
+            ):
                 pass
             by_name = {name: (args, kwargs) for name, args, kwargs in api.calls}
             self.assertEqual(by_name["after_runner_distributed_init"], ((False,), {}))
             self.assertEqual(by_name["after_alloc_memory_pool"], ((cfg, False), {}))
             self.assertEqual(
-                by_name["capture_scope"], (("prefill", model, 4, None), {})
+                by_name["capture_scope"],
+                (("prefill", model, 4, None, "/t.json"), {}),
             )
             with adapter.capture_scope("decode", model=model, kind="draft_extend"):
                 pass
             self.assertEqual(
                 api.calls[-1],
-                ("capture_scope", ("decode", model, None, "draft_extend"), {}),
+                ("capture_scope", ("decode", model, None, "draft_extend", None), {}),
             )
             self.assertEqual(
                 adapter.capture_one("key", None, pool="pool", stream="stream"),
@@ -310,10 +315,10 @@ _CALL_ARGS = [
      "memory_pool_config=self.memory_pool_config, is_draft_worker=self.is_draft_worker)"),
     (_DECODE, "DecodeCudaGraphRunner.capture",
      "get_foundry_adapter().capture_scope('decode', model=self.model_runner.model, "
-     "kind=self._foundry_graph_kind())"),
+     "kind=self._foundry_graph_kind(), flashinfer_tactics=tactics)"),
     (_PREFILL, "PrefillCudaGraphRunner.capture",
      "get_foundry_adapter().capture_scope('prefill', model=self.model_runner.model, "
-     "req_slots=self._capture_req_slots)"),
+     "req_slots=self._capture_req_slots, flashinfer_tactics=tactics)"),
 ]  # fmt: skip
 
 

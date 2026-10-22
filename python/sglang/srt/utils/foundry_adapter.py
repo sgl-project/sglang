@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Version of foundry.integration.sglang.api this adapter calls: same major,
 # at least this minor.
 FOUNDRY_INTEGRATION_API_MAJOR = 2
-FOUNDRY_INTEGRATION_API_MIN_MINOR = 1
+FOUNDRY_INTEGRATION_API_MIN_MINOR = 2
 # Distribution name (import name ``foundry``) and minimum version, checked
 # when the flag is set.
 FOUNDRY_PACKAGE = "foundry-core"
@@ -122,10 +122,12 @@ class FoundryAdapter:
         model: Any,
         req_slots: Optional[int] = None,
         kind: Optional[str] = None,
+        flashinfer_tactics: Optional[str] = None,
     ):
         """``phase`` is "decode" (with the runner's graph ``kind``) or
         "prefill" (with the runner's fixed request slots); ``model`` is the
-        runner's loaded model."""
+        runner's loaded model; ``flashinfer_tactics`` is the runner's FlashInfer
+        autotune cache file (None: its kernels take no FlashInfer tactics)."""
         yield
 
     def capture_one(
@@ -184,9 +186,15 @@ class _FoundryAdapterReal(FoundryAdapter):
     def after_alloc_memory_pool(self, memory_pool_config, is_draft_worker):
         self._api.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
-    def capture_scope(self, phase, *, model, req_slots=None, kind=None):
+    def capture_scope(
+        self, phase, *, model, req_slots=None, kind=None, flashinfer_tactics=None
+    ):
         return self._api.capture_scope(
-            phase, model=model, req_slots=req_slots, kind=kind
+            phase,
+            model=model,
+            req_slots=req_slots,
+            kind=kind,
+            flashinfer_tactics=flashinfer_tactics,
         )
 
     def capture_one(self, shape_key, forward_fn, *, pool, stream):
