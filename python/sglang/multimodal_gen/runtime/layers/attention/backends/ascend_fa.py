@@ -317,6 +317,8 @@ class AscendFAImpl(AttentionImpl):
             if not self.use_offline_qk_rotation:
                 self._ensure_rot_matrix(head_size)
 
+    # MXFP4 attention adapted from:
+    # https://gitcode.com/Ascend/MindIE-SD/blob/dev/mindiesd/quantization/layer.py
     def _init_mxfp4_attention(self, head_size: int, causal: bool) -> None:
         if causal or head_size != 128 or get_ring_parallel_world_size() > 1:
             raise NotImplementedError(

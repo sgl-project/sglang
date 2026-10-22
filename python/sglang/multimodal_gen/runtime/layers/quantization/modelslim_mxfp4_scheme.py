@@ -251,7 +251,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Let dual-level quantization apply smoothing, as in MindIE-SD.
+        # Let dual-level quantization apply smoothing.
         smooth_scale = (
             layer.mul_scale.to(x_2d.dtype)
             if getattr(layer, "use_mul_scale", False)

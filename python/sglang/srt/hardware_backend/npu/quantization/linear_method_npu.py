@@ -35,12 +35,10 @@ def _get_float4_e2m1fn_x2_dtype():
     # The packed-FP4 dtype MUST come from torch_npu (an int enum, e.g. 296), not
     # from torch. The NPU ops that consume it -- npu_dynamic_mx_quant(dst_type=),
     # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
-    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
-    # builds (it raises, or with None gives "output y must be same shape as input
+    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin
+    # (it raises, or with None gives "output y must be same shape as input
     # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
-    # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
-    # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
+    # float8_e8m0fnu is accepted from torch either way.
     #
     # Lazy import so this NPU-only path keeps the module importable on
     # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
@@ -434,7 +432,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
+    Hardware: A5 NPU with FP4 npu_quant_matmul support
     (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
@@ -608,12 +606,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     On A5 (aclnn-only SoCs, soc_version >= 260) torch_npu itself forces
     ``allow_internal_format=False`` — a request for True is reverted with a
     warning by torch_npu's option register — and the NZ cast still produces a
-    ``FRACTAL_NZ_C0_16`` tensor, which is fine. Older torch_npu (e.g.
-    ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
-    *prefill* with ``x2 should be in ... nz format, but it is 2``;
-    ``2.10.0.post1.dev20260624`` (and later) runs the FRACTAL_NZ path correctly.
-    If you hit ``it is 2``, update torch_npu — do NOT "fix" it by
-    switching the weight to ND.
+    ``FRACTAL_NZ_C0_16`` tensor, which is fine.
 
     ⚠️ A ``atb::OperationSetup`` *segfault during decode* (not prefill) is a
     DIFFERENT, unrelated issue: it is the eager-decode ``ascend`` attention
@@ -634,9 +627,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Cast the packed-FP4 weight to FRACTAL_NZ then transpose. All NPU ops go
-        # through torch.ops.npu.* (no torch_npu). A recent torch_npu build is
-        # required (see class docstring): older builds reject the NZ weight
-        # ("x2 ... it is 2").
+        # through torch.ops.npu.* (no torch_npu).
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         # weight: packed-FP4 uint8 [out, in//2] -> FRACTAL_NZ (float8_e4m3fn view)
@@ -703,12 +694,14 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
+# Activation quantization defaults adapted from:
+# https://gitcode.com/Ascend/MindIE-SD/blob/dev/mindiesd/quantization/layer.py
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """Single-level W4A4 kernel with MindIE-SD activation quantization defaults.
+    """Single-level W4A4 kernel with C7 activation quantization defaults.
 
     Packed ND weights are [in/2, out]; UE8M0 scales are [in/64, out, 2]."""
 
-    # Match MindIE-SD nearest-even activation rounding.
+    # Use nearest-even activation rounding.
     activation_round_mode = "rint"
 
     def create_weights(

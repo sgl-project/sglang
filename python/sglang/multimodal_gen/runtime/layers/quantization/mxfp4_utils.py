@@ -32,8 +32,9 @@ def uses_mxfp4_attention(quant_config, prefix: str) -> bool:
     return True
 
 
+# Adapted from: https://gitcode.com/Ascend/MindIE-SD/blob/dev/mindiesd/quantization/layer.py
 def default_mxfp4_policy(num_steps: int) -> dict[str, str]:
-    """Use W4A8 for the first two and last two steps, as in MindIE-SD."""
+    """Use W4A8 for the first two and last two steps."""
     return {
         str(step): "W4A8"
         for step in range(num_steps)
@@ -76,7 +77,7 @@ def resolve_precision(
 
 
 def mxfp4_quant_kwargs(description: dict) -> dict:
-    """MindIE-SD C7 defaults with checkpoint overrides; pair with round_mode="rint"."""
+    """C7 defaults with checkpoint overrides; pair with round_mode="rint"."""
     return {
         "scale_alg": description.get("mxfp4_scale_alg", 2),
         "dst_type_max": description.get("mxfp4_dst_type_max", 7.25),
