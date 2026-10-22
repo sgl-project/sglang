@@ -24,9 +24,9 @@ export const agentx = {
     "status": "verified-pr"
    },
    "4303": {
-    "run": null,
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "3930": {
     "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39551262792",
@@ -1102,28 +1102,26 @@ export const agentx = {
    "imageStatus": "ok",
    "imageCommit": "c1c287a4",
    "submitted": "dynamo",
-   "setup": [],
+   "setup": [
+    {
+     "script": "Placement",
+     "reason": "2 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
+    }
+   ],
    "disclosures": ["synthetic-acceptance"],
    "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-mem-layout", "page_first_direct"],
-      ["--hicache-ratio", "2"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-b200-sglang-agentic-dspark",
-     "donorHardware": "b200"
+    "available": ["mooncake"],
+    "unavailable": {
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
     "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -1145,9 +1143,25 @@ export const agentx = {
        "cmd": "etcd",
        "env": {},
        "args": [
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"],
         ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+        ["--listen-client-urls", "http://0.0.0.0:2379"]
+       ]
+      },
+      {
+       "kind": "mooncake-master",
+       "count_nodes": 1,
+       "ports": ["8700"],
+       "cmd": "mooncake_master",
+       "env": {},
+       "args": [
+        ["--port", "8700"],
+        ["--client_ttl", "60"],
+        ["--default_kv_lease_ttl", "10000"],
+        ["--enable_http_metadata_server", "true"],
+        ["--eviction_high_watermark_ratio", "0.90"],
+        ["--http_metadata_server_port", "8701"],
+        ["--rpc_thread_num", "64"]
        ]
       },
       {
@@ -1155,32 +1169,26 @@ export const agentx = {
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
        "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "14400"],
         ["--active-decode-blocks-threshold", "None"],
         ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "14400"]
        ],
-       "envRef": 1
-      },
-      {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
        "env": {
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS": "3600",
+        "DYN_ROUTER_QUEUE_THRESHOLD": "None",
+        "DYN_ROUTER_TEMPERATURE": "0",
+        "DYN_TCP_CHANNEL_BUFFER": "128",
+        "DYN_TCP_REQUEST_TIMEOUT": "60",
+        "DYN_TOKENIZER": "fastokens",
+        "DYN_TOKENIZER_CACHE": "1",
+        "DYN_TOKENIZER_CACHE_BYTES": "8000000000",
         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
-       },
-       "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
+       }
       },
       {
        "kind": "worker",
@@ -1190,7 +1198,7 @@ export const agentx = {
        "gpu_pinning": [
         ["0,1"],
         ["2,3"],
-        [null]
+        ["0,1"]
        ],
        "cmd": "python3 -m dynamo.sglang",
        "env": {
@@ -1199,6 +1207,7 @@ export const agentx = {
         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
         "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
         "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
         "MC_TCP_BIND_ADDRESS": "$NODE_IP",
         "MOONCAKE_DEVICE": "$IB_DEVICES",
         "MOONCAKE_GLOBAL_SEGMENT_SIZE": "80gb",
@@ -1209,6 +1218,7 @@ export const agentx = {
         "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
         "NCCL_CUMEM_ENABLE": "1",
         "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
@@ -1223,11 +1233,12 @@ export const agentx = {
         ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
         ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
         ["--host", "0.0.0.0"],
-        ["--port", "30000"],
+        ["--port", "$PREFILL_PORT"],
         ["--disaggregation-mode", "prefill"],
-        ["--disaggregation-bootstrap-port", "8998"],
+        ["--disaggregation-bootstrap-port", "$BOOTSTRAP_PORT"],
+        ["--dist-init-addr", "$NODE_IP:$DIST_PORT"],
         ["--request-plane", "tcp"],
-        ["--kv-events-config", "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\"}"],
+        ["--kv-events-config", "$KV_EVENTS_CONFIG"],
         ["--chunked-prefill-size", "65536"],
         ["--data-parallel-size", "2"],
         ["--disaggregation-transfer-backend", "mooncake"],
@@ -1236,6 +1247,7 @@ export const agentx = {
         ["--enable-dp-attention"],
         ["--enable-dp-attention-local-control-broadcast"],
         ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
         ["--enable-unified-cache-external-linker"],
         ["--expert-parallel-size", "2"],
         ["--hicache-mem-layout", "page_first_direct"],
@@ -1259,7 +1271,8 @@ export const agentx = {
         ["--unified-cache-external-linker-backend", "mooncake"],
         ["--watchdog-timeout", "3600"],
         ["--weight-loader-prefetch-checkpoints"]
-       ]
+       ],
+       "preamble": ["# LOCAL_WORKER_RANK is 0 or 1 on this node; use only 0 on a node with one worker.", "case \"$LOCAL_WORKER_RANK\" in 0) export CUDA_VISIBLE_DEVICES=0,1 ;; 1) export CUDA_VISIBLE_DEVICES=2,3 ;; *) echo \"Set LOCAL_WORKER_RANK to 0 or 1\" >&2; exit 1 ;; esac", "PREFILL_PORT=$((30000 + LOCAL_WORKER_RANK))", "BOOTSTRAP_PORT=$((8998 + LOCAL_WORKER_RANK))", "DIST_PORT=$((20000 + LOCAL_WORKER_RANK))", "export DYN_SYSTEM_PORT=$((8081 + LOCAL_WORKER_RANK))", "KV_EVENTS_CONFIG=$(printf '{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:%s\"}' \"$((5557 + 2 * LOCAL_WORKER_RANK))\")"]
       },
       {
        "kind": "worker",
@@ -1271,9 +1284,11 @@ export const agentx = {
         "DYN_EVENT_PLANE": "zmq",
         "DYN_REQUEST_PLANE": "tcp",
         "DYN_SGL_GATEWAY_WORKERS": "8",
+        "DYN_SYSTEM_PORT": "8081",
         "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
         "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
         "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
         "MC_TCP_BIND_ADDRESS": "$NODE_IP",
         "MOONCAKE_DEVICE": "$IB_DEVICES",
         "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
@@ -1284,6 +1299,7 @@ export const agentx = {
         "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
         "NCCL_CUMEM_ENABLE": "1",
         "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
@@ -1313,6 +1329,7 @@ export const agentx = {
         ["--enable-dp-attention"],
         ["--enable-dp-attention-local-control-broadcast"],
         ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
         ["--enable-unified-cache-external-linker"],
         ["--expert-parallel-size", "16"],
         ["--load-balance-method", "total_tokens"],
@@ -1334,79 +1351,8 @@ export const agentx = {
         ["--unified-cache-external-linker-backend", "mooncake"],
         ["--watchdog-timeout", "3600"],
         ["--weight-loader-prefetch-checkpoints"]
-       ]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
-       "env": {},
-       "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--kv-events-config": null,
-         "--router-mode": null,
-         "--router-session-affinity-ttl-secs": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "from": 4,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--router-mode": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "DYN_SGL_GATEWAY_WORKERS": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_2_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_1_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
-        ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
+       ],
+       "preamble": ["export CUDA_VISIBLE_DEVICES=0,1,2,3"]
       }
      ]
     }
@@ -1424,28 +1370,26 @@ export const agentx = {
    "imageStatus": "ok",
    "imageCommit": "c1c287a4",
    "submitted": "dynamo",
-   "setup": [],
+   "setup": [
+    {
+     "script": "Placement",
+     "reason": "3 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
+    }
+   ],
    "disclosures": ["synthetic-acceptance"],
    "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-mem-layout", "page_first_direct"],
-      ["--hicache-ratio", "2"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-b200-sglang-agentic-dspark",
-     "donorHardware": "b200"
+    "available": ["mooncake"],
+    "unavailable": {
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
     "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -1467,9 +1411,25 @@ export const agentx = {
        "cmd": "etcd",
        "env": {},
        "args": [
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"],
         ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+        ["--listen-client-urls", "http://0.0.0.0:2379"]
+       ]
+      },
+      {
+       "kind": "mooncake-master",
+       "count_nodes": 1,
+       "ports": ["8700"],
+       "cmd": "mooncake_master",
+       "env": {},
+       "args": [
+        ["--port", "8700"],
+        ["--client_ttl", "60"],
+        ["--default_kv_lease_ttl", "10000"],
+        ["--enable_http_metadata_server", "true"],
+        ["--eviction_high_watermark_ratio", "0.90"],
+        ["--http_metadata_server_port", "8701"],
+        ["--rpc_thread_num", "64"]
        ]
       },
       {
@@ -1477,132 +1437,193 @@ export const agentx = {
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
        "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "14400"],
         ["--active-decode-blocks-threshold", "None"],
         ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "14400"]
        ],
-       "envRef": 1
+       "env": {
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS": "3600",
+        "DYN_ROUTER_QUEUE_THRESHOLD": "None",
+        "DYN_ROUTER_TEMPERATURE": "0",
+        "DYN_TCP_CHANNEL_BUFFER": "128",
+        "DYN_TCP_REQUEST_TIMEOUT": "60",
+        "DYN_TOKENIZER": "fastokens",
+        "DYN_TOKENIZER_CACHE": "1",
+        "DYN_TOKENIZER_CACHE_BYTES": "8000000000",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       }
       },
       {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
+       "kind": "worker",
+       "role": "prefill",
+       "workers": 5,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m dynamo.sglang",
        "env": {
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
+        "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+        "MOONCAKE_DEVICE": "$IB_DEVICES",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "80gb",
+        "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+        "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+        "MOONCAKE_PROTOCOL": "rdma",
+        "MOONCAKE_STANDALONE_STORAGE": "0",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_ENABLE_PREFILL_WAR_READ_DONE": "1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "True",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "32768",
+        "SGLANG_OPT_DSV41_MEGA_MHC_PREFILL": "1",
+        "WITH_NVIDIA_PEERMEM": "0"
        },
        "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
-      },
-      {
-       "workers": 5,
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--host", "0.0.0.0"],
+        ["--port", "$PREFILL_PORT"],
+        ["--disaggregation-mode", "prefill"],
+        ["--disaggregation-bootstrap-port", "$BOOTSTRAP_PORT"],
+        ["--dist-init-addr", "$NODE_IP:$DIST_PORT"],
+        ["--request-plane", "tcp"],
+        ["--kv-events-config", "$KV_EVENTS_CONFIG"],
+        ["--chunked-prefill-size", "65536"],
+        ["--data-parallel-size", "2"],
+        ["--disaggregation-transfer-backend", "mooncake"],
+        ["--dsv4-attn-backend", "flashmla_mega"],
+        ["--enable-decoder-swa-bounded-replay"],
+        ["--enable-dp-attention"],
+        ["--enable-dp-attention-local-control-broadcast"],
+        ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
+        ["--enable-unified-cache-external-linker"],
+        ["--expert-parallel-size", "2"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-ratio", "1.02"],
+        ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+        ["--max-prefill-tokens", "32768"],
+        ["--max-running-requests", "128"],
+        ["--mem-fraction-static", "0.85"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\":true}"],
+        ["--moe-a2a-backend", "megamoe"],
+        ["--reasoning-parser", "auto"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "14400"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--speculative-num-steps", "5"],
+        ["--swa-prefix-tails", "2048"],
+        ["--tensor-parallel-size", "2"],
+        ["--tokenizer-backend", "fastokens"],
+        ["--tool-call-parser", "auto"],
+        ["--trust-remote-code"],
+        ["--unified-cache-external-linker-backend", "mooncake"],
+        ["--watchdog-timeout", "3600"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ],
        "gpu_pinning": [
         ["0,1"],
         ["2,3"],
         ["0,1"],
         ["2,3"],
-        [null]
+        ["0,1"]
        ],
-       "diff": {
-        "args": {
-         "--max-prefill-tokens": ["32768"]
-        }
+       "preamble": ["# LOCAL_WORKER_RANK is 0 or 1 on this node; use only 0 on a node with one worker.", "case \"$LOCAL_WORKER_RANK\" in 0) export CUDA_VISIBLE_DEVICES=0,1 ;; 1) export CUDA_VISIBLE_DEVICES=2,3 ;; *) echo \"Set LOCAL_WORKER_RANK to 0 or 1\" >&2; exit 1 ;; esac", "PREFILL_PORT=$((30000 + LOCAL_WORKER_RANK))", "BOOTSTRAP_PORT=$((8998 + LOCAL_WORKER_RANK))", "DIST_PORT=$((20000 + LOCAL_WORKER_RANK))", "export DYN_SYSTEM_PORT=$((8081 + LOCAL_WORKER_RANK))", "KV_EVENTS_CONFIG=$(printf '{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:%s\"}' \"$((5557 + 2 * LOCAL_WORKER_RANK))\")"]
+      },
+      {
+       "kind": "worker",
+       "role": "decode",
+       "workers": 1,
+       "nodes_per_worker": 4,
+       "cmd": "python3 -m dynamo.sglang",
+       "env": {
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_SGL_GATEWAY_WORKERS": "8",
+        "DYN_SYSTEM_PORT": "8081",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
+        "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+        "MOONCAKE_DEVICE": "$IB_DEVICES",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
+        "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+        "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+        "MOONCAKE_PROTOCOL": "rdma",
+        "MOONCAKE_STANDALONE_STORAGE": "0",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "True",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "16384",
+        "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS": "1",
+        "WITH_NVIDIA_PEERMEM": "0"
        },
-       "ref": [5, "dynamo", 3]
-      },
-      {
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["40"],
-         "--disaggregation-decode-extra-slots": ["80"],
-         "--max-running-requests": ["640"]
-        }
-       },
-       "ref": [5, "dynamo", 4]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
-       "env": {},
        "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--kv-events-config": null,
-         "--router-mode": null,
-         "--router-session-affinity-ttl-secs": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "from": 4,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--router-mode": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "DYN_SGL_GATEWAY_WORKERS": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_4_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_3_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_2_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_1_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
         ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
+        ["--port", "30000"],
+        ["--disaggregation-mode", "decode"],
+        ["--dist-init-addr", "$DECODE_HEAD_IP:20000"],
+        ["--nnodes", "4"],
+        ["--node-rank", "$NODE_RANK"],
+        ["--request-plane", "tcp"],
+        ["--cuda-graph-max-bs-decode", "40"],
+        ["--data-parallel-size", "16"],
+        ["--disaggregation-decode-extra-slots", "80"],
+        ["--disaggregation-decode-polling-interval", "8"],
+        ["--disaggregation-transfer-backend", "mooncake"],
+        ["--dsv4-attn-backend", "flashmla_mega"],
+        ["--enable-decoder-swa-bounded-replay"],
+        ["--enable-dp-attention"],
+        ["--enable-dp-attention-local-control-broadcast"],
+        ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
+        ["--enable-unified-cache-external-linker"],
+        ["--expert-parallel-size", "16"],
+        ["--load-balance-method", "total_tokens"],
+        ["--max-running-requests", "640"],
+        ["--mem-fraction-static", "0.85"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\":true}"],
+        ["--moe-a2a-backend", "megamoe"],
+        ["--reasoning-parser", "auto"],
+        ["--router-mode", "round-robin"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--speculative-num-steps", "5"],
+        ["--stream-interval", "32"],
+        ["--swa-prefix-tails", "2048"],
+        ["--tensor-parallel-size", "16"],
+        ["--tokenizer-backend", "fastokens"],
+        ["--tool-call-parser", "auto"],
+        ["--trust-remote-code"],
+        ["--unified-cache-external-linker-backend", "mooncake"],
+        ["--watchdog-timeout", "3600"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ],
+       "preamble": ["export CUDA_VISIBLE_DEVICES=0,1,2,3"]
       }
      ]
     }
@@ -1620,28 +1641,26 @@ export const agentx = {
    "imageStatus": "ok",
    "imageCommit": "c1c287a4",
    "submitted": "dynamo",
-   "setup": [],
+   "setup": [
+    {
+     "script": "Placement",
+     "reason": "4 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
+    }
+   ],
    "disclosures": ["synthetic-acceptance"],
    "kv": {
-    "available": ["none", "hicache", "mooncake"],
-    "unavailable": {},
-    "hicache": {
-     "args": [
-      ["--enable-hierarchical-cache"],
-      ["--hicache-io-backend", "direct"],
-      ["--hicache-mem-layout", "page_first_direct"],
-      ["--hicache-ratio", "2"],
-      ["--hicache-write-policy", "write_back"]
-     ],
-     "donor": "dsv41flash-fp4-b200-sglang-agentic-dspark",
-     "donorHardware": "b200"
+    "available": ["mooncake"],
+    "unavailable": {
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
     "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -1663,9 +1682,25 @@ export const agentx = {
        "cmd": "etcd",
        "env": {},
        "args": [
+        ["--advertise-client-urls", "http://$ETCD_IP:2379"],
         ["--data-dir", "/tmp/etcd"],
-        ["--listen-client-urls", "http://0.0.0.0:2379"],
-        ["--advertise-client-urls", "http://$ETCD_IP:2379"]
+        ["--listen-client-urls", "http://0.0.0.0:2379"]
+       ]
+      },
+      {
+       "kind": "mooncake-master",
+       "count_nodes": 1,
+       "ports": ["8700"],
+       "cmd": "mooncake_master",
+       "env": {},
+       "args": [
+        ["--port", "8700"],
+        ["--client_ttl", "60"],
+        ["--default_kv_lease_ttl", "10000"],
+        ["--enable_http_metadata_server", "true"],
+        ["--eviction_high_watermark_ratio", "0.90"],
+        ["--http_metadata_server_port", "8701"],
+        ["--rpc_thread_num", "64"]
        ]
       },
       {
@@ -1673,35 +1708,105 @@ export const agentx = {
        "count": 1,
        "cmd": "python3 -m dynamo.frontend",
        "args": [
-        ["--http-port", "8000"],
-        ["--router-mode", "kv"],
-        ["--router-session-affinity-ttl-secs", "14400"],
         ["--active-decode-blocks-threshold", "None"],
         ["--active-prefill-tokens-threshold", "None"],
-        ["--active-prefill-tokens-threshold-frac", "None"]
+        ["--active-prefill-tokens-threshold-frac", "None"],
+        ["--http-port", "8000"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "14400"]
        ],
-       "envRef": 1
+       "env": {
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS": "3600",
+        "DYN_ROUTER_QUEUE_THRESHOLD": "None",
+        "DYN_ROUTER_TEMPERATURE": "0",
+        "DYN_TCP_CHANNEL_BUFFER": "128",
+        "DYN_TCP_REQUEST_TIMEOUT": "60",
+        "DYN_TOKENIZER": "fastokens",
+        "DYN_TOKENIZER_CACHE": "1",
+        "DYN_TOKENIZER_CACHE_BYTES": "8000000000",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+       }
       },
       {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
+       "kind": "worker",
+       "role": "prefill",
+       "workers": 8,
+       "nodes_per_worker": 1,
+       "cmd": "python3 -m dynamo.sglang",
        "env": {
-        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379"
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
+        "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+        "MOONCAKE_DEVICE": "$IB_DEVICES",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "80gb",
+        "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+        "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+        "MOONCAKE_PROTOCOL": "rdma",
+        "MOONCAKE_STANDALONE_STORAGE": "0",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_ENABLE_PREFILL_WAR_READ_DONE": "1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "True",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "32768",
+        "SGLANG_OPT_DSV41_MEGA_MHC_PREFILL": "1",
+        "WITH_NVIDIA_PEERMEM": "0"
        },
        "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
-      },
-      {
-       "workers": 8,
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--host", "0.0.0.0"],
+        ["--port", "$PREFILL_PORT"],
+        ["--disaggregation-mode", "prefill"],
+        ["--disaggregation-bootstrap-port", "$BOOTSTRAP_PORT"],
+        ["--dist-init-addr", "$NODE_IP:$DIST_PORT"],
+        ["--request-plane", "tcp"],
+        ["--kv-events-config", "$KV_EVENTS_CONFIG"],
+        ["--chunked-prefill-size", "65536"],
+        ["--data-parallel-size", "2"],
+        ["--disaggregation-transfer-backend", "mooncake"],
+        ["--dsv4-attn-backend", "flashmla_mega"],
+        ["--enable-decoder-swa-bounded-replay"],
+        ["--enable-dp-attention"],
+        ["--enable-dp-attention-local-control-broadcast"],
+        ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
+        ["--enable-unified-cache-external-linker"],
+        ["--expert-parallel-size", "2"],
+        ["--hicache-mem-layout", "page_first_direct"],
+        ["--hicache-ratio", "1.02"],
+        ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+        ["--max-prefill-tokens", "32768"],
+        ["--max-running-requests", "128"],
+        ["--mem-fraction-static", "0.85"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\":true}"],
+        ["--moe-a2a-backend", "megamoe"],
+        ["--reasoning-parser", "auto"],
+        ["--router-mode", "kv"],
+        ["--router-session-affinity-ttl-secs", "14400"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--speculative-num-steps", "5"],
+        ["--swa-prefix-tails", "2048"],
+        ["--tensor-parallel-size", "2"],
+        ["--tokenizer-backend", "fastokens"],
+        ["--tool-call-parser", "auto"],
+        ["--trust-remote-code"],
+        ["--unified-cache-external-linker-backend", "mooncake"],
+        ["--watchdog-timeout", "3600"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ],
        "gpu_pinning": [
         ["0,1"],
         ["2,3"],
@@ -1712,94 +1817,87 @@ export const agentx = {
         ["0,1"],
         ["2,3"]
        ],
-       "ref": [6, "dynamo", 3]
+       "preamble": ["# LOCAL_WORKER_RANK is 0 or 1 on this node; use only 0 on a node with one worker.", "case \"$LOCAL_WORKER_RANK\" in 0) export CUDA_VISIBLE_DEVICES=0,1 ;; 1) export CUDA_VISIBLE_DEVICES=2,3 ;; *) echo \"Set LOCAL_WORKER_RANK to 0 or 1\" >&2; exit 1 ;; esac", "PREFILL_PORT=$((30000 + LOCAL_WORKER_RANK))", "BOOTSTRAP_PORT=$((8998 + LOCAL_WORKER_RANK))", "DIST_PORT=$((20000 + LOCAL_WORKER_RANK))", "export DYN_SYSTEM_PORT=$((8081 + LOCAL_WORKER_RANK))", "KV_EVENTS_CONFIG=$(printf '{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:%s\"}' \"$((5557 + 2 * LOCAL_WORKER_RANK))\")"]
       },
       {
-       "diff": {
-        "args": {
-         "--cuda-graph-max-bs-decode": ["64"],
-         "--disaggregation-decode-extra-slots": ["128"],
-         "--max-running-requests": ["1024"]
-        }
+       "kind": "worker",
+       "role": "decode",
+       "workers": 1,
+       "nodes_per_worker": 4,
+       "cmd": "python3 -m dynamo.sglang",
+       "env": {
+        "DYN_EVENT_PLANE": "zmq",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_SGL_GATEWAY_WORKERS": "8",
+        "DYN_SYSTEM_PORT": "8081",
+        "ETCD_ENDPOINTS": "http://$ETCD_IP:2379",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_FORCE_MNNVL": "1",
+        "MC_STORE_CLIENT_METRIC_INTERVAL": "5",
+        "MC_TCP_BIND_ADDRESS": "$NODE_IP",
+        "MOONCAKE_DEVICE": "$IB_DEVICES",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "140gb",
+        "MOONCAKE_LOCAL_HOSTNAME": "$NODE_IP",
+        "MOONCAKE_MASTER": "$MOONCAKE_MASTER_IP:8700",
+        "MOONCAKE_PROTOCOL": "rdma",
+        "MOONCAKE_STANDALONE_STORAGE": "0",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://$MOONCAKE_MASTER_IP:8701/metadata",
+        "NCCL_CUMEM_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "3600",
+        "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "3600",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "True",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "16384",
+        "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS": "1",
+        "WITH_NVIDIA_PEERMEM": "0"
        },
-       "ref": [5, "dynamo", 4]
-      }
-     ]
-    },
-    "sglang": {
-     "install": [],
-     "files": [],
-     "blocks": [
-      {
-       "kind": "mooncake-master",
-       "count_nodes": 1,
-       "ports": ["8700"],
-       "cmd": "mooncake_master",
-       "env": {},
        "args": [
-        ["--port", "8700"],
-        ["--enable_http_metadata_server", "true"],
-        ["--http_metadata_server_port", "8701"],
-        ["--default_kv_lease_ttl", "10000"],
-        ["--eviction_high_watermark_ratio", "0.90"],
-        ["--client_ttl", "60"],
-        ["--rpc_thread_num", "64"]
-       ]
-      },
-      {
-       "from": 3,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--kv-events-config": null,
-         "--router-mode": null,
-         "--router-session-affinity-ttl-secs": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "from": 4,
-       "cmd": "python3 -m sglang.launch_server",
-       "diff": {
-        "args": {
-         "--skip-server-warmup": [],
-         "--request-plane": null,
-         "--router-mode": null
-        },
-        "env": {
-         "DYN_EVENT_PLANE": null,
-         "DYN_REQUEST_PLANE": null,
-         "DYN_SGL_GATEWAY_WORKERS": null,
-         "ETCD_ENDPOINTS": null
-        }
-       }
-      },
-      {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
-       "env": {},
-       "args": [
-        ["--decode", "http://$DECODE_0_HEAD_IP:30000"],
-        ["--prefill", "http://$PREFILL_7_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_6_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_5_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_4_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_3_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_2_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_1_HEAD_IP:30000", "8998"],
-        ["--prefill", "http://$PREFILL_0_HEAD_IP:30000", "8998"],
-        ["--pd-disaggregation"],
+        ["--model-path", "deepseek-ai/DeepSeek-V4.1-Flash"],
+        ["--served-model-name", "deepseek-ai/DeepSeek-V4.1-Flash"],
         ["--host", "0.0.0.0"],
-        ["--port", "8000"],
-        ["--policy", "cache_aware"]
-       ]
+        ["--port", "30000"],
+        ["--disaggregation-mode", "decode"],
+        ["--dist-init-addr", "$DECODE_HEAD_IP:20000"],
+        ["--nnodes", "4"],
+        ["--node-rank", "$NODE_RANK"],
+        ["--request-plane", "tcp"],
+        ["--cuda-graph-max-bs-decode", "64"],
+        ["--data-parallel-size", "16"],
+        ["--disaggregation-decode-extra-slots", "128"],
+        ["--disaggregation-decode-polling-interval", "8"],
+        ["--disaggregation-transfer-backend", "mooncake"],
+        ["--dsv4-attn-backend", "flashmla_mega"],
+        ["--enable-decoder-swa-bounded-replay"],
+        ["--enable-dp-attention"],
+        ["--enable-dp-attention-local-control-broadcast"],
+        ["--enable-dp-lm-head"],
+        ["--enable-metrics"],
+        ["--enable-unified-cache-external-linker"],
+        ["--expert-parallel-size", "16"],
+        ["--load-balance-method", "total_tokens"],
+        ["--max-running-requests", "1024"],
+        ["--mem-fraction-static", "0.85"],
+        ["--model-loader-extra-config", "{\"enable_multithread_load\":true}"],
+        ["--moe-a2a-backend", "megamoe"],
+        ["--reasoning-parser", "auto"],
+        ["--router-mode", "round-robin"],
+        ["--speculative-algorithm", "DSPARK"],
+        ["--speculative-dspark-block-size", "5"],
+        ["--speculative-num-steps", "5"],
+        ["--stream-interval", "32"],
+        ["--swa-prefix-tails", "2048"],
+        ["--tensor-parallel-size", "16"],
+        ["--tokenizer-backend", "fastokens"],
+        ["--tool-call-parser", "auto"],
+        ["--trust-remote-code"],
+        ["--unified-cache-external-linker-backend", "mooncake"],
+        ["--watchdog-timeout", "3600"],
+        ["--weight-loader-prefetch-checkpoints"]
+       ],
+       "preamble": ["export CUDA_VISIBLE_DEVICES=0,1,2,3"]
       }
      ]
     }
