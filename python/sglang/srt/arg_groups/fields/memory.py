@@ -145,6 +145,14 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = "page_first"
+    hicache_async_ready_sync: A[
+        bool,
+        "Run the per-step HiCache ready-count sync across attention TP ranks "
+        "asynchronously on its own gloo group and consume its result one "
+        "scheduler step later, instead of a blocking all-reduce in every step. "
+        "Applies to the host-cache path without a storage backend, pipeline "
+        "parallelism or attention context parallelism.",
+    ] = False
     hicache_storage_backend: A[
         Optional[str],
         Arg(
