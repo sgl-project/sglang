@@ -556,6 +556,230 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 shuffle_weighted_sum(fake_values, fake_output, fake_map, fake_scores)
             )
 
+    def _assert_reduction_bits_equal(self, actual, expected):
+        torch.testing.assert_close(torch.isnan(actual), torch.isnan(expected))
+        bit_dtype = torch.int32 if expected.dtype == torch.float32 else torch.int16
+        finite_or_inf = ~torch.isnan(expected)
+        torch.testing.assert_close(
+            actual.view(bit_dtype)[finite_or_inf],
+            expected.view(bit_dtype)[finite_or_inf],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_reduction_fuses_score_cast_to_input_dtype(self):
+        """The optional cast matches the previous explicit Torch conversion chain."""
+        width, topk, rows = 17, 2, 5
+        for dtype, value in ((torch.float16, 1025.0), (torch.bfloat16, 129.0)):
+            for weight_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                with self.subTest(dtype=dtype, weight_dtype=weight_dtype):
+                    input_storage = torch.full(
+                        (rows, width + 3), float("nan"), device="cuda", dtype=dtype
+                    )
+                    inputs = input_storage[:, :width]
+                    inputs[0].fill_(-value)
+                    inputs[1].fill_(value)
+                    inputs[2].fill_(1)
+                    inputs[3].fill_(2**120 if dtype == torch.bfloat16 else 1)
+                    mapping = torch.tensor(
+                        [[0, 1]]
+                        + [[2, 2]] * 4
+                        + [[2, -1]] * 2
+                        + [[3, -1], [2, 2], [2, 2], [-1, rows + 5], [2, 2], [2, -1]],
+                        device="cuda",
+                        dtype=torch.int64,
+                    )
+                    tokens = mapping.shape[0]
+                    score_storage = torch.full(
+                        (tokens * 2 + 1, topk * 3 + 2),
+                        float("nan"),
+                        device="cuda",
+                        dtype=weight_dtype,
+                    )
+                    weights = score_storage[
+                        1 : 2 * tokens + 1 : 2, 1 : 3 * topk + 1 : 3
+                    ]
+                    weights.copy_(
+                        torch.tensor(
+                            [
+                                [1.0, 1.0 - 2**-23],
+                                [1.0 + 2**-11, -1.0],
+                                [1.0 + 3 * 2**-11, -1.0],
+                                [1.0 + 2**-8, -1.0],
+                                [1.0 + 3 * 2**-8, -1.0],
+                                [2**-24, float("nan")],
+                                [2**-25, float("nan")],
+                                [2**-133, float("nan")],
+                                [float("inf"), -float("inf")],
+                                [float("nan"), 1.0],
+                                [float("nan"), float("inf")],
+                                [-0.0, 0.0],
+                                [0.5, float("nan")],
+                            ],
+                            device="cuda",
+                            dtype=weight_dtype,
+                        )
+                    )
+                    output = torch.empty((tokens, width), device="cuda", dtype=dtype)
+                    reference = torch.empty_like(output)
+                    triton_output = torch.empty_like(output)
+                    saved = [x.clone() for x in (input_storage, mapping, score_storage)]
+                    shuffle_weighted_sum(
+                        inputs, reference, mapping, weights.to(inputs.dtype)
+                    )
+                    shuffle_weighted_sum(
+                        inputs,
+                        output,
+                        mapping,
+                        weights,
+                        cast_weights_to_input_dtype=True,
+                    )
+                    _shuffle_weighted_sum_triton(
+                        inputs,
+                        triton_output,
+                        mapping,
+                        weights,
+                        cast_weights_to_input_dtype=True,
+                    )
+                    self._assert_reduction_bits_equal(output, reference)
+                    self._assert_reduction_bits_equal(triton_output, reference)
+                    self.assertTrue(bool((output[10].view(torch.int16) == 0).all()))
+                    if weight_dtype == torch.float32:
+                        uncast = torch.empty_like(output)
+                        shuffle_weighted_sum(inputs, uncast, mapping, weights)
+                        self.assertTrue(bool((output[0].view(torch.int16) == 0).all()))
+                        self.assertTrue(bool((uncast[0] != output[0]).all()))
+                        # A wider output must still round scores to the input dtype.
+                        wide_output = output.float()
+                        wide_reference = reference.float()
+                        shuffle_weighted_sum(
+                            inputs,
+                            wide_reference,
+                            mapping,
+                            weights.to(inputs.dtype),
+                        )
+                        shuffle_weighted_sum(
+                            inputs,
+                            wide_output,
+                            mapping,
+                            weights,
+                            cast_weights_to_input_dtype=True,
+                        )
+                        self._assert_reduction_bits_equal(wide_output, wide_reference)
+                    for tensor, before in zip(
+                        (input_storage, mapping, score_storage), saved
+                    ):
+                        torch.testing.assert_close(
+                            tensor, before, rtol=0, atol=0, equal_nan=True
+                        )
+            for weight_dtype in (torch.float64, torch.int64):
+                with self.subTest(dtype=dtype, weight_dtype=weight_dtype):
+                    inputs = torch.ones((1, width), device="cuda", dtype=dtype)
+                    mapping = torch.tensor([[0, 0]], device="cuda", dtype=torch.int32)
+                    weights = torch.tensor(
+                        [[257, -256]], device="cuda", dtype=weight_dtype
+                    )
+                    output = torch.empty_like(inputs)
+                    reference = torch.empty_like(inputs)
+                    shuffle_weighted_sum(
+                        inputs, reference, mapping, weights.to(inputs.dtype)
+                    )
+                    shuffle_weighted_sum(
+                        inputs,
+                        output,
+                        mapping,
+                        weights,
+                        cast_weights_to_input_dtype=True,
+                    )
+                    self._assert_reduction_bits_equal(output, reference)
+
+    def test_reduction_score_cast_survives_graph_and_compile(self):
+        """Captured score casts follow live metadata without changing borrowed tensors."""
+        width = 17
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                value = 1025.0 if dtype == torch.float16 else 129.0
+                initial = torch.tensor(
+                    [[-value] * width, [value] * width, [1.0] * width, [2.0] * width],
+                    device="cuda",
+                    dtype=dtype,
+                )
+                inputs = initial.clone()
+                mapping = torch.tensor(
+                    [[0, 1], [2, 3]], device="cuda", dtype=torch.int64
+                )
+                scores = torch.full((2, 4), float("nan"), device="cuda")
+                weights = scores[:, ::2]
+                weights.copy_(
+                    torch.tensor([[1.0, 1.0 - 2**-23], [0.25, 0.75]], device="cuda")
+                )
+                output = torch.empty((2, width), device="cuda", dtype=dtype)
+                reference = torch.empty_like(output)
+
+                def run(values, result, route_map, route_weights):
+                    shuffle_weighted_sum(
+                        values,
+                        result,
+                        route_map,
+                        route_weights,
+                        cast_weights_to_input_dtype=True,
+                    )
+                    return result + 1
+
+                run(inputs, output, mapping, weights)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    shuffle_weighted_sum(
+                        inputs,
+                        output,
+                        mapping,
+                        weights,
+                        cast_weights_to_input_dtype=True,
+                    )
+                for state in ("partial", "zero", "recovery"):
+                    inputs.copy_(initial)
+                    mapping.copy_(torch.tensor([[0, 1], [2, 3]], device="cuda"))
+                    weights.copy_(
+                        torch.tensor([[1.0, 1.0 - 2**-23], [0.25, 0.75]], device="cuda")
+                    )
+                    if state == "partial":
+                        mapping[1, 1] = -1
+                        inputs[3].fill_(float("nan"))
+                        weights[1, 1] = float("nan")
+                    elif state == "zero":
+                        mapping.fill_(-1)
+                        inputs.fill_(float("nan"))
+                        weights.fill_(float("nan"))
+                    saved = [x.clone() for x in (inputs, mapping, scores)]
+                    shuffle_weighted_sum(
+                        inputs, reference, mapping, weights.to(inputs.dtype)
+                    )
+                    output.fill_(float("nan"))
+                    graph.replay()
+                    self._assert_reduction_bits_equal(output, reference)
+                    for tensor, before in zip((inputs, mapping, scores), saved):
+                        torch.testing.assert_close(
+                            tensor, before, rtol=0, atol=0, equal_nan=True
+                        )
+                if dtype == torch.bfloat16:
+                    compiled = torch.compile(run, fullgraph=True)
+                    with torch.no_grad():
+                        result = compiled(inputs, output, mapping, weights)
+                    self._assert_reduction_bits_equal(output, reference)
+                    torch.testing.assert_close(result, reference + 1, rtol=0, atol=0)
+                    from torch._subclasses.fake_tensor import FakeTensorMode
+
+                    with FakeTensorMode():
+                        self.assertIsNone(
+                            shuffle_weighted_sum(
+                                torch.empty((4, width), device="cuda", dtype=dtype),
+                                torch.empty((2, width), device="cuda", dtype=dtype),
+                                torch.empty((2, 2), device="cuda", dtype=torch.int64),
+                                torch.empty((2, 2), device="cuda"),
+                                cast_weights_to_input_dtype=True,
+                            )
+                        )
+
     def test_native_fp8_padding_survives_graph_replay(self):
         if torch.cuda.get_device_capability()[0] not in (9, 10, 12):
             self.skipTest("CUTLASS block FP8 requires SM90, SM100 or SM120")

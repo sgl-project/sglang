@@ -24,9 +24,15 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_shuffle_weighted_sum_module(
-    dtype: torch.dtype, weight_dtype: torch.dtype, index_dtype: torch.dtype, topk: int
+    dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    topk: int,
+    cast_weights_to_input_dtype: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, weight_dtype, index_dtype, topk, 128)
+    args = make_cpp_args(
+        dtype, weight_dtype, index_dtype, topk, 128, cast_weights_to_input_dtype
+    )
     return load_jit(
         "shuffle_weighted_sum",
         *args,
@@ -49,6 +55,7 @@ def _shuffle_weighted_sum_kernel(
     weight_stride0,
     weight_stride1,
     BLOCK: tl.constexpr,
+    CAST_WEIGHTS_TO_INPUT_DTYPE: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -65,7 +72,10 @@ def _shuffle_weighted_sum_kernel(
             weights + token * weight_stride0 + slot * weight_stride1,
             mask=active,
             other=0,
-        ).to(tl.float32)
+        )
+        if CAST_WEIGHTS_TO_INPUT_DTYPE:
+            factor = factor.to(inputs.dtype.element_ty)
+        factor = factor.to(tl.float32)
         total += values * factor
     tl.store(
         output + token.to(tl.int64) * output_stride + columns,
@@ -79,8 +89,10 @@ def _shuffle_weighted_sum_triton(
     output: torch.Tensor,
     permutation: torch.Tensor,
     weights: torch.Tensor,
+    *,
+    cast_weights_to_input_dtype: bool = False,
 ) -> None:
-    """Sum mapped expert outputs; inactive maps read neither data nor weights."""
+    """Sum mapped rows, optionally rounding scores to the input dtype first."""
     assert inputs.ndim == output.ndim == weights.ndim == 2
     assert inputs.shape[1] == output.shape[1]
     assert inputs.stride(1) == output.stride(1) == 1
@@ -88,6 +100,17 @@ def _shuffle_weighted_sum_triton(
     assert permutation.is_contiguous() and permutation.numel() == weights.numel()
     if output.numel() == 0:
         return
+    if cast_weights_to_input_dtype and (
+        inputs.dtype not in (torch.float16, torch.bfloat16)
+        or weights.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or not inputs.is_cuda
+        or is_hip_runtime()
+        or is_musa_runtime()
+        or is_sail_runtime()
+    ):
+        # Preserve Torch conversion semantics outside the fused CUDA types.
+        weights = weights.to(inputs.dtype)
+        cast_weights_to_input_dtype = False
     _shuffle_weighted_sum_kernel[(output.shape[0], triton.cdiv(output.shape[1], 256))](
         inputs,
         output,
@@ -101,6 +124,7 @@ def _shuffle_weighted_sum_triton(
         weights.stride(0),
         weights.stride(1),
         BLOCK=256,
+        CAST_WEIGHTS_TO_INPUT_DTYPE=cast_weights_to_input_dtype,
     )
 
 
@@ -110,8 +134,10 @@ def shuffle_weighted_sum(
     output: torch.Tensor,
     permutation: torch.Tensor,
     weights: torch.Tensor,
+    *,
+    cast_weights_to_input_dtype: bool = False,
 ) -> None:
-    """Sum mapped expert outputs; inactive maps read neither data nor weights."""
+    """Sum mapped rows, optionally rounding scores to the input dtype first."""
     if (
         inputs.is_cuda
         and inputs.dtype in (torch.float16, torch.bfloat16)
@@ -125,7 +151,17 @@ def shuffle_weighted_sum(
         and not is_sail_runtime()
     ):
         _jit_shuffle_weighted_sum_module(
-            inputs.dtype, weights.dtype, permutation.dtype, weights.shape[1]
+            inputs.dtype,
+            weights.dtype,
+            permutation.dtype,
+            weights.shape[1],
+            cast_weights_to_input_dtype,
         ).reduce(inputs, output, permutation, weights)
     else:
-        _shuffle_weighted_sum_triton(inputs, output, permutation, weights)
+        _shuffle_weighted_sum_triton(
+            inputs,
+            output,
+            permutation,
+            weights,
+            cast_weights_to_input_dtype=cast_weights_to_input_dtype,
+        )

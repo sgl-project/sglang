@@ -354,5 +354,7 @@ def cutlass_fused_experts_fp8(
     if output is None:
         output = torch.empty((m, k), device=device, dtype=out_dtype)
 
-    shuffle_weighted_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    shuffle_weighted_sum(
+        c2, output, c_map, topk_weights, cast_weights_to_input_dtype=True
+    )
     return output
