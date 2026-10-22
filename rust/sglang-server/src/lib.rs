@@ -262,6 +262,12 @@ impl Server {
         self.push_frame(py, crate::message::response::frame_error(rid, message))
     }
 
+    /// Acknowledge health probes the scheduler skipped while busy, after the
+    /// step that followed them. Blocks for backpressure; `False` only on shutdown.
+    pub fn push_health_ack(&self, py: Python<'_>) -> bool {
+        self.push_frame(py, crate::message::response::frame_health_ack())
+    }
+
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
     /// resolved processor config; see `RustMmProcessor.resolve_spec` and
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely

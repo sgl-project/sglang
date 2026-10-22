@@ -22,7 +22,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -34,6 +33,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
+from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -308,13 +308,14 @@ class EngramHasher(nn.Module):
         assert self.history is not None, "EngramHasher.init_history was not called"
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
-        if num_tokens == 0:
-            return torch.empty(
-                (0, self.primes.shape[0], self.offsets.shape[1]),
+        mode = forward_batch.forward_mode
+        if num_tokens == 0 or mode.is_idle():
+            # A DP-attention idle batch carries pad rows; nothing reads its hashes.
+            return torch.zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
                 dtype=torch.int64,
                 device=input_ids.device,
             )
-        mode = forward_batch.forward_mode
         if (
             mode.is_extend()
             and not mode.is_target_verify()

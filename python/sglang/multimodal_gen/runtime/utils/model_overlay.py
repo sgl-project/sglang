@@ -53,6 +53,11 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
         "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
     },
+    "FastVideo/FastVideo-FastH3-Omni-8-Step-V1": {
+        "overlay_repo_id": "Niehen6174/FastH3-Omni-overlay",
+        "overlay_revision": "953ede55daf20a70cc6f0b59464293e2f408608c",
+        "source_revision": "53e0d26a1691aa473b6262d8196a8feb2c297df0",
+    },
 }
 
 
