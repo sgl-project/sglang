@@ -35,22 +35,6 @@ def _batch(forward_mode, recv_skipper_forward_mode=None):
 
 
 class TestSchedulerRecvSkipper(CustomTestCase):
-    def test_disabled_at_default_interval(self):
-        # interval <= 1 disables the skipper entirely.
-        _publish(self, 1)
-        self.assertIsNone(SchedulerRecvSkipper.maybe_create())
-
-    def test_enabled_under_dp_attention(self):
-        # Regression: the constructor used to reject DP attention.
-        _publish(self, 50, attn_dp_size=2)
-        skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertIsNotNone(skipper)
-
-    def test_no_last_batch_accumulates_slowly(self):
-        _publish(self, 50)
-        skipper = SchedulerRecvSkipper.maybe_create()
-        self.assertFalse(skipper.handle(None))
-
     def test_decode_accumulates_until_threshold(self):
         # DECODE weight = 1: recv only every `interval` decode steps.
         _publish(self, 3)

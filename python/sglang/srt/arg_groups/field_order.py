@@ -546,6 +546,7 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_num_resident",
     "enable_nvidia_megakernel",
     "enable_megamoe_for_layernorm_sp",
+    "enable_http_worker_reuseport",
     "linker_load_mode",
 )
 # fmt: on

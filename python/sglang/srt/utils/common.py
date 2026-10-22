@@ -672,6 +672,12 @@ def is_device_stream_capturing(device: torch.device) -> bool:
     return torch.get_device_module(device).is_current_stream_capturing()
 
 
+def create_device_event(device):
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Event()
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
