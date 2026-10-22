@@ -300,7 +300,9 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             ],
         )
         request._response_parser_prefix = "<|start|>assistant"
-        reasoning = "<|channel|>analysis<|message|>Check weather.<|end|><|start|>assistant"
+        reasoning = (
+            "<|channel|>analysis<|message|>Check weather.<|end|><|start|>assistant"
+        )
         call = (
             " to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
             '<rfl:parameter name="city">\n{}\n</rfl:parameter>'
@@ -342,7 +344,9 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             boundaries.extend([split, len(raw)] for split in range(1, len(raw)))
             for ends in boundaries:
                 with self.subTest(raw=raw, ends=ends if len(ends) == 2 else len(ends)):
-                    events = StreamFixture(serving, request, require_reasoning=True).run(
+                    events = StreamFixture(
+                        serving, request, require_reasoning=True
+                    ).run(
                         [
                             engine_chunk(raw[:end], end, finish=end == len(raw))
                             for end in ends
@@ -358,7 +362,8 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     ]
                     self.assertEqual(semantic(done), expected)
                     self.assertEqual(
-                        [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                        [p["sequence_number"] for p in payloads],
+                        list(range(len(payloads))),
                     )
                     for index, item in enumerate(output):
                         deltas = [p for p in payloads if p.get("output_index") == index]
