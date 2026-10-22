@@ -1,11 +1,13 @@
 name: PR Test (NPU)
 
 on:
-  push:
-    branches: [ main ]
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
+    branches:
+      - main
+      - 'npu/**'
+      - 'npu-*'
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -674,7 +676,8 @@ jobs:
             --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --precision-mode "${PRECISION_MODE}" \
-            --github-output "${GITHUB_OUTPUT}"
+            --github-output "${GITHUB_OUTPUT}" \
+            --github-summary "${GITHUB_STEP_SUMMARY:-}"
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to the shared disk.
@@ -864,25 +867,38 @@ jobs:
             python3 -m coverage html --rcfile=/tmp/report-rc \
             --directory="${REPORT_DIR}"
 
-          # NPU-only view, generated in parallel with the full report:
-          # denominator = the whole hardware_backend/npu tree, files never
-          # imported by the traced processes count as 0% ([run] source
-          # semantics). source has no report-time CLI flag, so it needs a
-          # separate rcfile; putting it in /tmp/report-rc would shrink the
-          # full report's scope too. [paths] is shared so measured files
-          # still resolve to the covstub copy.
-          {
-            echo "[run]"
-            echo "branch = True"
-            echo "source = ${COVSTUB}/sglang/srt/hardware_backend/npu"
-            echo "[paths]"
-            echo "sglang ="
-            echo "    ${COVSTUB}/sglang/"
-            echo "    */python/sglang/"
-          } > /tmp/report-rc-npu
+          # NPU-only view: [run] source does NOT filter at report time, so
+          # the old source-based rcfile produced a report identical to the
+          # full one. Instead: copy the combined data and touch the
+          # unexecuted npu .py files into the copy (the same 0% mechanism
+          # coverage uses for source, but via os.walk so the PEP 420
+          # namespace tree — no __init__.py — counts fully), then filter
+          # with --include, which does apply at report time.
+          cp /tmp/.coverage-all /tmp/.coverage-npu
+          python3 - "${COVSTUB}" <<'PYEOF'
+          import os
+          import sys
+          from coverage import CoverageData
+
+          npu_root = os.path.join(sys.argv[1], "sglang", "srt", "hardware_backend", "npu")
+          data = CoverageData(basename="/tmp/.coverage-npu")
+          data.read()
+          measured = set(data.measured_files())
+          added = 0
+          for root, _, files in os.walk(npu_root):
+              for f in files:
+                  if f.endswith(".py"):
+                      p = os.path.join(root, f)
+                      if p not in measured:
+                          data.touch_file(p)
+                          added += 1
+          data.write()
+          print(f"NPU view: {len(measured)} measured, touched {added} unexecuted files")
+          PYEOF
           rm -rf "${REPORT_DIR}-npu"
-          COVERAGE_FILE=/tmp/.coverage-all \
-            python3 -m coverage html --rcfile=/tmp/report-rc-npu \
+          COVERAGE_FILE=/tmp/.coverage-npu \
+            python3 -m coverage html --rcfile=/tmp/report-rc \
+            --include='*/sglang/srt/hardware_backend/npu/*' \
             --directory="${REPORT_DIR}-npu"
 
           # Surface the totals directly on the run page.
@@ -895,8 +911,9 @@ jobs:
               COVERAGE_FILE=/tmp/.coverage-all \
                 python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
               echo "python/sglang/srt/hardware_backend/npu (full-tree denominator):"
-              COVERAGE_FILE=/tmp/.coverage-all \
-                python3 -m coverage report --rcfile=/tmp/report-rc-npu | tail -n 1
+              COVERAGE_FILE=/tmp/.coverage-npu \
+                python3 -m coverage report --rcfile=/tmp/report-rc \
+                --include='*/sglang/srt/hardware_backend/npu/*' | tail -n 1
               echo '```'
               echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`htmlcov/index.html\` (NPU-only view: \`htmlcov-npu/index.html\`)."
             } >> "${GITHUB_STEP_SUMMARY}"
@@ -922,6 +939,24 @@ jobs:
         run: |
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
+
+      - name: Upload outputs and test case map
+        # Report upload must never block the baseline publish pipeline.
+        # Must run before the publish step mv's the files to the fixed
+        # PUBLISH_DIR (fixed names there race with concurrent runs).
+        # ~300MB artifact; short retention beats the 90-day default so
+        # storage does not accumulate across runs.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: precise-test-outputs
+          # Two paths -> artifact root becomes RUN_DIR, so the archive
+          # holds outputs.tar.gz and test_case_map.json side by side.
+          path: |
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/outputs.tar.gz
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/test_case_map.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Publish outputs and map to shared disk
         shell: bash
