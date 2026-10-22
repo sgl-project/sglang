@@ -116,7 +116,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
@@ -244,9 +244,9 @@ def _create_flashmla_metadata():
 
     if is_hip():
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
-    return flash_mla.get_mla_metadata()[0]
+    return get_mla_metadata()[0]
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):

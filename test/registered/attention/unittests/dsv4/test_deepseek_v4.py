@@ -12,7 +12,6 @@ extra-K softmax reference. Compressor math correctness (i.e. verifying the
 gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
-import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -21,11 +20,6 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-
-_FLASH_MLA_AVAILABLE = (
-    importlib.util.find_spec("sgl_kernel") is not None
-    and importlib.util.find_spec("sgl_kernel.flash_mla") is not None
-)
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
@@ -52,7 +46,6 @@ register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-@unittest.skipIf(not _FLASH_MLA_AVAILABLE, "flash_mla is required for DSV4 SWA")
 class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     CASES = make_dsv4_cases("dsv4")
     CUDA_GRAPH_DECODE_CASES = (

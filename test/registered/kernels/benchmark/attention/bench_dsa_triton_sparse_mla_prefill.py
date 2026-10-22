@@ -18,10 +18,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
-try:
-    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-except ImportError:
-    flash_mla_sparse_fwd = None
+from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
 try:
     # Same form as the kernel under test, but reachable only on gfx950. Kept as
@@ -38,9 +35,7 @@ except ImportError:
 def _flashmla_runnable() -> bool:
     # The op refuses anything but SM90a / SM100f at call time, so gate on the
     # device rather than on the import succeeding.
-    return flash_mla_sparse_fwd is not None and (
-        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10)
-    )
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10)
 
 
 HAS_FLASHMLA = _flashmla_runnable()
@@ -142,7 +137,7 @@ def bench_dsa_triton_sparse_mla_prefill(
 
     if provider == "flashmla_sparse":
         if not HAS_FLASHMLA:
-            raise RuntimeError("sgl_kernel.flash_mla.flash_mla_sparse_fwd unavailable")
+            raise RuntimeError("FlashMLA's flash_mla_sparse_fwd needs SM90 or SM100")
         kv_3d = kv.unsqueeze(1)
         idx_3d = indices.unsqueeze(1)
         # The kernel requires num_heads % 64 on SM90 and % 128 on SM100+, so the
