@@ -49,6 +49,7 @@ class TestImagePreprocessing(CustomTestCase):
     def test_flux2_and_qwen_edit_vae_processor_parity(self):
         rng = np.random.default_rng(71)
         flux = Flux2PipelineConfig()
+        flux.vae_config.arch_config.vae_scale_factor = 8
         processor = Flux2ImageProcessor(vae_scale_factor=16)
         qwen = QwenImageEditPlusPipelineConfig()
         qwen_processor = VaeImageProcessor(vae_scale_factor=8)
