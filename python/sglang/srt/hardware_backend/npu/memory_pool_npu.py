@@ -1047,29 +1047,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
-    def get_mla_kv_buffer(
-        self,
-        layer: "RadixAttention",
-        loc: torch.Tensor,
-        dst_dtype: Optional[torch.dtype] = None,
-    ):
-        """Read token-level MLA KV rows in the requested dtype."""
-        dst_dtype = dst_dtype or self.dtype
-        layer_id = layer.layer_id
-
-        def read(cache: torch.Tensor, head_dim: int):
-            if self.use_fia_nz:
-                rows = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
-                values = torch.index_select(cache.view(-1, 16), 0, rows.reshape(-1))
-            else:
-                values = torch.index_select(cache.flatten(0, -2), 0, loc)
-            return values.view(loc.numel(), 1, head_dim).to(dst_dtype)
-
-        return (
-            read(self.get_key_buffer(layer_id), self.kv_lora_rank),
-            read(self.get_value_buffer(layer_id), self.qk_rope_head_dim),
-        )
-
     def _set_fia_nz_kv_buffer(
         self,
         layer_id: int,

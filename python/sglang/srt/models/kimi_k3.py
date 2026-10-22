@@ -109,7 +109,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -3103,6 +3102,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if _is_npu:
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3115,8 +3116,6 @@ class KimiK3LinearForCausalLM(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
-            prefix_indices_only=_is_npu,
-            interleave_size=get_token_to_kv_pool().page_size if _is_npu else 1,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

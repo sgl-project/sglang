@@ -24,10 +24,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import (
-    localize_dcp_indices,
-    update_local_kv_lens_for_dcp,
-)
+from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -45,17 +42,7 @@ def prepare_decode_context_parallel_metadata(
     kv_cache_dtype,
     kv_cache_device,
     create_chunked_prefix_cache_kv_indices_fn,
-    *,
-    prefix_indices_only: bool = False,
-    interleave_size: int = 1,
 ) -> Optional[DecodeContextParallelMetadata]:
-    """Prepare MLA prefix reads, optionally without the packed gather buffer.
-
-    Consumers that gather latent and RoPE separately request only the local
-    prefix indices. The default also prepares the packed KV gather plan.
-    Index-only consumers pass their ownership granularity as interleave_size;
-    the packed plan retains its default token-interleaved layout.
-    """
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
@@ -92,24 +79,6 @@ def prepare_decode_context_parallel_metadata(
         dcp_prefix_kv_indices,
         req_to_token.shape[1],
     )
-    if prefix_indices_only:
-        local_indices = localize_dcp_indices(
-            dcp_prefix_kv_indices,
-            parallel.dcp_size,
-            parallel.dcp_rank,
-            interleave_size=interleave_size,
-        )
-        local_mask = local_indices >= 0
-        if interleave_size > 1:
-            return DecodeContextParallelMetadata(
-                dcp_local_prefix_kv_indices=local_indices[local_mask],
-            )
-        translator = get_attn_backend().kv_index_translator
-        return DecodeContextParallelMetadata(
-            dcp_local_prefix_kv_indices=translator.translate_dcp_read_ids(
-                dcp_prefix_kv_indices[local_mask]
-            ),
-        )
     dcp_kv_indptr = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
