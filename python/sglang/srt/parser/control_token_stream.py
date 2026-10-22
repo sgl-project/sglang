@@ -1,6 +1,6 @@
 import logging
 from bisect import bisect_left, bisect_right
-from typing import Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, TypeVar
 from weakref import WeakKeyDictionary
 
 import msgspec
@@ -18,6 +18,7 @@ _MASK = "\x00"
 _COMPACT_EVERY = 64
 
 ParserMatchMode = Literal["auto", "strict", "text"]
+_T = TypeVar("_T")
 
 _control_ids_cache: WeakKeyDictionary = WeakKeyDictionary()
 _special_ids_cache: WeakKeyDictionary = WeakKeyDictionary()
@@ -90,6 +91,85 @@ def _find_all(text: str, char: str) -> Iterable[int]:
         i = text.find(char, i + 1)
 
 
+class _Alignment:
+    """The parser text matched against the decoded text, for parser text that
+    shows the text of special tokens or leaves it out."""
+
+    def __init__(self, show_special: bool):
+        self.show_special = show_special
+        self.matched_len = 0
+        # Decoded text the parser text has not reached yet, and parser text
+        # not matched to it yet.
+        self.decoded_ahead = ""
+        self.consumed_ahead = ""
+        # Specials before this index of the stream's specials are matched.
+        self.next_special = 0
+        # Special-token texts in the matched parser text: starts, ends, and
+        # the running total of their lengths.
+        self._skip_starts: List[int] = []
+        self._skip_ends: List[int] = []
+        self._skip_total: List[int] = []
+
+    def frontier(self) -> int:
+        """The decoded-text position the matched parser text ends at."""
+        return self.matched_len - (self._skip_total[-1] if self._skip_total else 0)
+
+    def decoded_pos(self, pos: int) -> Optional[int]:
+        """Where parser-text position ``pos`` falls in the decoded text, or
+        None inside a special token's text."""
+        i = bisect_right(self._skip_starts, pos) - 1
+        if i < 0:
+            return pos
+        if pos < self._skip_ends[i]:
+            return None
+        return pos - self._skip_total[i]
+
+    def match(
+        self, decoded: str, consumed: str, specials: List[Tuple[int, str]]
+    ) -> bool:
+        """Match the next decoded and parser text; False where they disagree."""
+        decoded = self.decoded_ahead + decoded
+        consumed = self.consumed_ahead + consumed
+        while True:
+            special_pos, special = self._next_special(specials)
+            if special_pos == self.frontier():
+                if not consumed.startswith(special):
+                    if not special.startswith(consumed):
+                        return False
+                    break
+                self._skip(special)
+                consumed = consumed[len(special) :]
+                continue
+            n = min(len(decoded), len(consumed))
+            if special_pos >= 0:
+                n = min(n, special_pos - self.frontier())
+            if decoded[:n] != consumed[:n]:
+                return False
+            self.matched_len += n
+            decoded = decoded[n:]
+            consumed = consumed[n:]
+            if special_pos != self.frontier():
+                break
+        self.decoded_ahead = decoded
+        self.consumed_ahead = consumed
+        return True
+
+    def _next_special(self, specials: List[Tuple[int, str]]) -> Tuple[int, str]:
+        if self.show_special and self.next_special < len(specials):
+            return specials[self.next_special]
+        return -1, ""
+
+    def _skip(self, special: str) -> None:
+        start = self.matched_len
+        self._skip_starts.append(start)
+        self._skip_ends.append(start + len(special))
+        self._skip_total.append(
+            (self._skip_total[-1] if self._skip_total else 0) + len(special)
+        )
+        self.matched_len += len(special)
+        self.next_special += 1
+
+
 class ControlTokenStream:
     """A request's output ids, decoded next to the text its parser receives.
 
@@ -99,9 +179,10 @@ class ControlTokenStream:
     kind wrote; ``view()`` is the same-length text with every other marker
     defused, for bounded regexes whose spans then slice the text itself.
 
-    The ids decode without special tokens; where the parser text keeps the text
-    of a special token the ids hold (serving keeps them for tool-call requests),
-    it is skipped over, so either detokenizer setting lines up.
+    The ids decode without special tokens. The parser text either shows the
+    text of every special token the ids hold, where they hold it (serving does
+    for tool-call requests), or none; each reading is matched while the text
+    agrees with it, and markers resolve only where every such reading agrees.
 
     Matching is by id once output ids, even none, have been observed; text the
     ids have not reached yet holds no markers. Before that, and in "auto" mode
@@ -129,25 +210,13 @@ class ControlTokenStream:
         self._decoded_len = 0
         self._consumed: List[str] = []
         self.consumed_len = 0
-        # Decoded text the parser text has not reached yet, and parser text
-        # not matched to it yet.
-        self._decoded_ahead = ""
-        self._consumed_ahead = ""
-        # Parser text matched against the decoded text so far, and the special
-        # tokens in it that the decoded text skips: starts, ends, running total.
-        self._matched_len = 0
-        self._skip_starts: List[int] = []
-        self._skip_ends: List[int] = []
-        self._skip_total: List[int] = []
-        # Special tokens the decoder skipped, by decoded position, in id order;
-        # those before ``_next_special`` are matched or left out of the text.
+        self._alignments = [_Alignment(show_special) for show_special in (True, False)]
+        # Special tokens the decoder skipped, by decoded position, in id order.
         self._specials: List[Tuple[int, str]] = []
-        self._next_special = 0
         # Ids after the last decoded piece that decode to nothing yet, such as
         # bytes of an unfinished character and the special tokens after them.
         self._undecoded: List[int] = []
         self._fed = False
-        self._aligned = True
         # The last view, by where its text starts in the consumed text.
         self._view_start = -1
         self._view = ""
@@ -183,7 +252,7 @@ class ControlTokenStream:
     @property
     def active(self) -> bool:
         """Whether markers match by id."""
-        return self._fed and self._aligned
+        return self._fed and bool(self._alignments)
 
     def feed(self, token_ids: Iterable[int]) -> None:
         self._fed = True
@@ -199,6 +268,7 @@ class ControlTokenStream:
                 else:
                     self._undecoded.append(token_id)
                 continue
+            self._place_held_specials(self._undecoded + [token_id], piece)
             self._undecoded = []
             pieces.append(piece)
             self._decoded_len += len(piece)
@@ -207,6 +277,23 @@ class ControlTokenStream:
                 self._control_starts[self._decoded_len - len(marker)] = marker
         if pieces:
             self._match(decoded="".join(pieces))
+
+    def _place_held_specials(self, token_ids: List[int], piece: str) -> None:
+        """Record the special tokens among ``token_ids``, which decode to
+        ``piece`` once the decoder catches up, where each falls in it."""
+        parts = self._render(token_ids)
+        if not any(special for _, special in parts):
+            return
+        # Bytes completing a character across a special token render apart;
+        # the special has no position in the decoded character then.
+        if "".join(text for text, special in parts if not special) != piece:
+            return
+        pos = self._decoded_len
+        for text, special in parts:
+            if special:
+                self._specials.append((pos, text))
+            else:
+                pos += len(text)
 
     def invalidate(self, reason: str) -> None:
         """The observed ids no longer describe the parser text."""
@@ -256,12 +343,15 @@ class ControlTokenStream:
     def check_sourced(self) -> None:
         """Check, once all output is parsed, that the ids cover the parser text.
         Ids decoding past the text are fine; stop text is trimmed from it."""
-        if not self._fed or not self._aligned or not self._consumed_ahead:
+        if not self._fed or not self._alignments:
             return
-        if any(
-            self._remaining_text(keep_special).startswith(self._consumed_ahead)
-            for keep_special in (True, False)
-        ):
+        sourced = [
+            a
+            for a in self._alignments
+            if self._remaining_text(a).startswith(a.consumed_ahead)
+        ]
+        if sourced:
+            self._alignments = sourced
             return
         if self._strict:
             raise ParserMatchError(
@@ -270,32 +360,42 @@ class ControlTokenStream:
             )
         _log_once("Output text runs past its output ids; no markers match in it.")
 
-    def _remaining_text(self, keep_special: bool) -> str:
-        """What the ids past the matched text render to at the end of output,
-        with or without the text of their special tokens."""
+    def _remaining_text(self, alignment: _Alignment) -> str:
+        """What the ids past ``alignment``'s matched text render to at the
+        end of output."""
         parts = []
-        pos = self._decoded_frontier()
-        ahead = self._decoded_ahead
-        for special_pos, special in self._specials[self._next_special :]:
-            parts.append(ahead[: special_pos - pos])
-            ahead = ahead[special_pos - pos :]
-            pos = special_pos
-            if keep_special:
+        pos = alignment.frontier()
+        ahead = alignment.decoded_ahead
+        if alignment.show_special:
+            for special_pos, special in self._specials[alignment.next_special :]:
+                parts.append(ahead[: special_pos - pos])
+                ahead = ahead[special_pos - pos :]
+                pos = special_pos
                 parts.append(special)
         parts.append(ahead)
         # Unfinished bytes render as U+FFFD, as the detokenizer flushes them.
+        parts.extend(
+            text
+            for text, special in self._render(self._undecoded)
+            if alignment.show_special or not special
+        )
+        return "".join(parts)
+
+    def _render(self, token_ids: List[int]) -> List[Tuple[str, bool]]:
+        """``token_ids`` as (text, is_special) parts: runs of ordinary ids
+        decoded on their own, and special tokens."""
+        parts = []
         run = []
-        for token_id in self._undecoded:
+        for token_id in token_ids:
             special = self._special_ids.get(token_id)
             if special is None:
                 run.append(token_id)
                 continue
-            parts.append(self._backend.decode(run, skip_special_tokens=False))
+            parts.append((self._backend.decode(run), False))
             run = []
-            if keep_special:
-                parts.append(special)
-        parts.append(self._backend.decode(run, skip_special_tokens=False))
-        return "".join(parts)
+            parts.append((special, True))
+        parts.append((self._backend.decode(run), False))
+        return parts
 
     def view(self, text: str) -> str:
         """``text``, which must end the consumed text, with every marker that
@@ -307,7 +407,7 @@ class ControlTokenStream:
         # the last view whose ids were decoded keeps the Python work per chunk small.
         reuse = 0
         if start == self._view_start:
-            reuse = max(0, min(len(self._view), self._matched_len - start))
+            reuse = max(0, min(len(self._view), self._matched_len() - start))
         view = self._view[:reuse] + self._defuse(text[reuse:], start + reuse)
         self._view_start, self._view = start, view
         return view
@@ -353,7 +453,9 @@ class ControlTokenStream:
         text and start at a token boundary."""
         if not self.active or not self._is_tail(text):
             return None
-        start = self._decoded_pos(self.consumed_len - len(text))
+        start = self._agreed(
+            a.decoded_pos(self.consumed_len - len(text)) for a in self._alignments
+        )
         if start is None:
             return None
         i = bisect_left(self._token_starts, start)
@@ -361,21 +463,22 @@ class ControlTokenStream:
             return None
         return self.output_ids[i:]
 
-    def _decoded_pos(self, pos: int) -> Optional[int]:
-        """Where parser-text position ``pos`` falls in the decoded text, or
-        None inside a special token the decoded text skips."""
-        i = bisect_right(self._skip_starts, pos) - 1
-        if i < 0:
-            return pos
-        if pos < self._skip_ends[i]:
-            return None
-        return pos - self._skip_total[i]
+    def _matched_len(self) -> int:
+        """How much of the consumed text every reading has matched."""
+        return min(a.matched_len for a in self._alignments)
 
     def _marker_at(self, pos: int) -> Optional[str]:
         """The marker a control token writes at parser-text position ``pos``."""
-        if pos >= self._matched_len:
+        if pos >= self._matched_len():
             return None
-        return self._control_starts.get(self._decoded_pos(pos))
+        return self._agreed(
+            self._control_starts.get(a.decoded_pos(pos)) for a in self._alignments
+        )
+
+    @staticmethod
+    def _agreed(answers: Iterable[_T]) -> Optional[_T]:
+        answers = set(answers)
+        return answers.pop() if len(answers) == 1 else None
 
     def _is_tail(self, text: str) -> bool:
         if len(text) > self.consumed_len:
@@ -391,69 +494,24 @@ class ControlTokenStream:
         return True
 
     def _match(self, decoded: str = "", consumed: str = "") -> None:
-        if not self._aligned:
+        if not self._alignments:
             return
-        decoded = self._decoded_ahead + decoded
-        consumed = self._consumed_ahead + consumed
-        while True:
-            pos = self._decoded_frontier()
-            special, next_pos = self._special_from(pos)
-            if special is not None and next_pos == pos:
-                if consumed.startswith(special):
-                    self._skip(special)
-                    consumed = consumed[len(special) :]
-                elif special.startswith(consumed):
-                    break
-                self._next_special += 1
-                continue
-            n = min(len(decoded), len(consumed))
-            if special is not None:
-                n = min(n, next_pos - pos)
-            if decoded[:n] != consumed[:n]:
-                self._lose_alignment(
-                    "parser text does not match the decoded output ids"
-                )
-                return
-            self._matched_len += n
-            decoded = decoded[n:]
-            consumed = consumed[n:]
-            if special is None or pos + n != next_pos:
-                break
-        self._decoded_ahead = decoded
-        self._consumed_ahead = consumed
-
-    def _decoded_frontier(self) -> int:
-        """The decoded-text position the matched parser text ends at."""
-        return self._matched_len - (self._skip_total[-1] if self._skip_total else 0)
-
-    def _special_from(self, pos: int) -> Tuple[Optional[str], int]:
-        """The next special token the decoder skipped at or after ``pos``;
-        those before it were left out of the parser text."""
-        while self._next_special < len(self._specials):
-            special_pos, special = self._specials[self._next_special]
-            if special_pos >= pos:
-                return special, special_pos
-            self._next_special += 1
-        return None, -1
-
-    def _skip(self, special: str) -> None:
-        start = self._matched_len
-        self._skip_starts.append(start)
-        self._skip_ends.append(start + len(special))
-        self._skip_total.append(
-            (self._skip_total[-1] if self._skip_total else 0) + len(special)
-        )
-        self._matched_len += len(special)
+        agreeing = [
+            a for a in self._alignments if a.match(decoded, consumed, self._specials)
+        ]
+        if not agreeing:
+            self._lose_alignment("parser text does not match the decoded output ids")
+            return
+        self._alignments = agreeing
 
     def _lose_alignment(self, reason: str) -> None:
         if self._strict:
             raise ParserMatchError(f"Cannot match markers by output token id: {reason}")
-        if self._aligned:
+        if self._alignments:
             logger.warning(
                 "Matching markers as text for the rest of this output: %s.", reason
             )
-        self._aligned = False
-        self._decoded_ahead = self._consumed_ahead = ""
+        self._alignments = []
 
 
 class OutputIdsCursor:

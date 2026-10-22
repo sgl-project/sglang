@@ -4251,11 +4251,13 @@ class TestGlmControlTokenIds(unittest.TestCase):
         skip_special_tokens=True,
         cumulative=False,
         stream_reasoning=True,
+        split_text=False,
     ):
         """glm45 over ``ids`` streamed in chunks that end at each of ``cuts``,
-        each chunk's ids observed before its text is parsed. The text shown
-        ends at ``text`` (all of ``ids`` decoded by default), holding back an
-        incomplete character until the last chunk as the detokenizer does."""
+        each chunk's ids observed before its text is parsed, character by
+        character if ``split_text``. The text shown ends at ``text`` (all of
+        ``ids`` decoded by default), holding back an incomplete character until
+        the last chunk as the detokenizer does."""
         if text is None:
             text = self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
         parser = self._reasoning_parser(match_mode, stream_reasoning)
@@ -4272,8 +4274,11 @@ class TestGlmControlTokenIds(unittest.TestCase):
                     ids[:end], skip_special_tokens=skip_special_tokens
                 )
                 shown = decoded.rstrip("\ufffd")[: len(text)]
-            r, n = parser.parse_stream_chunk(shown[len(sent) :])
-            reasoning, content, sent = reasoning + r, content + n, shown
+            new_text = shown[len(sent) :]
+            for piece in list(new_text) if split_text else [new_text]:
+                r, n = parser.parse_stream_chunk(piece)
+                reasoning, content = reasoning + r, content + n
+            sent = shown
         r, n = parser.parse_stream_end()
         return reasoning + r, content + n
 
@@ -4401,6 +4406,59 @@ class TestGlmControlTokenIds(unittest.TestCase):
                                 self.assertEqual(
                                     got, ("a", content), (cuts, cumulative)
                                 )
+
+    def test_special_tokens_keep_matching_by_id_around_them(self):
+        """A special token held behind an unfinished character keeps its place
+        once later text decodes, and a special token followed by its own text
+        spelled with ordinary tokens leaves that text visible when special
+        tokens are skipped. Markers after either keep matching by id, whether
+        the text shows special tokens or not and however it arrives."""
+        held = self._encode("\U0001f99c")[:-1]
+        tail = [_Spelled("</think>"), "c", "</think>", "d"]
+        assistant = "<|assistant|>"
+        cases = {
+            "held character, special token": (
+                self._ids(["a"]) + held + self._ids([assistant, "x", *tail]),
+                ("a\ufffd<|assistant|>x</think>c", "d"),
+                ("a\ufffdx</think>c", "d"),
+            ),
+            "special token, its spelled text": (
+                self._ids(["a", assistant, _Spelled(assistant), "b", *tail]),
+                ("a<|assistant|><|assistant|>b</think>c", "d"),
+                ("a<|assistant|>b</think>c", "d"),
+            ),
+        }
+        for name, (ids, kept, skipped) in cases.items():
+            for skip_special_tokens, expected in ((False, kept), (True, skipped)):
+                text = self.tokenizer.decode(
+                    ids, skip_special_tokens=skip_special_tokens
+                )
+                for match_mode in ("strict", "auto"):
+                    with self.subTest(
+                        name,
+                        skip_special_tokens=skip_special_tokens,
+                        match_mode=match_mode,
+                    ):
+                        self.assertEqual(
+                            self._reasoning_parser(match_mode).parse_non_stream(
+                                text, output_ids=ids
+                            ),
+                            expected,
+                        )
+                        for cuts in self._chunkings(ids):
+                            for cumulative in (False, True):
+                                for split_text in (False, True):
+                                    got = self._stream_reasoning(
+                                        ids,
+                                        cuts,
+                                        match_mode,
+                                        skip_special_tokens=skip_special_tokens,
+                                        cumulative=cumulative,
+                                        split_text=split_text,
+                                    )
+                                    self.assertEqual(
+                                        got, expected, (cuts, cumulative, split_text)
+                                    )
 
 
 class TestLing3Detector(unittest.TestCase):
