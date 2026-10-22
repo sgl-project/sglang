@@ -147,6 +147,15 @@ class GuidanceGrammar(BaseGrammarObject):
         self.ll_matcher.consume_token(token)
         self._check_err()
 
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        # consume_token on a rejected token leaves the matcher in its error state,
+        # so validate the whole sequence before consuming any of it.
+        if self.finished or self.ll_matcher.validate_tokens(tokens) != len(tokens):
+            return False
+        for token in tokens:
+            self.accept_token(token)
+        return True
+
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
             return
