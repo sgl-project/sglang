@@ -248,12 +248,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
-    if cfg.speculative_skip_dp_mlp_sync:
-        assert cfg.speculative_algorithm == "EAGLE", (
-            "--speculative-skip-dp-mlp-sync is only supported with "
-            f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
-        )
-
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
             cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")

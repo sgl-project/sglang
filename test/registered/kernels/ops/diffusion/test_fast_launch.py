@@ -175,7 +175,10 @@ def _float(n=4096, offset=0):
 
 
 @torch.no_grad()
-def test_toy_wrapper_replays():
+@pytest.mark.parametrize("has_launch_hooks", [True, False])
+def test_toy_wrapper_replays(monkeypatch, has_launch_hooks):
+    if not has_launch_hooks:
+        monkeypatch.setattr(fast_launch, "knobs", None)
     toy = _Counted(_copy_out)
     for _ in range(3):
         x = _float()

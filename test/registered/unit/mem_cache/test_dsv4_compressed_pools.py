@@ -43,21 +43,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
-    def test_swa_key_page_size_uses_physical_paged_size(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.request_window = None
-        pool.swa_page_size = 256
-        for physical_page_size in (256, 64):
-            with self.subTest(physical_page_size=physical_page_size):
-                pool.swa_kv_pool = SimpleNamespace(page_size=physical_page_size)
-                self.assertEqual(pool.get_swa_key_page_size(), physical_page_size)
-
-    def test_swa_key_page_size_without_paged_pool(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.swa_kv_pool = None
-        pool.request_window = SimpleNamespace(page_size=256)
-        self.assertEqual(pool.get_swa_key_page_size(), 256)
-
     def test_physical_kv_pages_cover_reserved_logical_page(self):
         size = 8192
         self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
@@ -464,6 +449,29 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
                 prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
             )
 
+    def test_dspark_draft_keeps_the_mark_for_either_storage(self):
+        # Ring or paged, a DSpark draft sends one request-row item, so the PD
+        # roles' state pairs; another algorithm's draft and the target keep none.
+        item = torch.zeros(1, dtype=torch.int64).nbytes
+        for algorithm, encoder_replay, expected in (
+            ("DSPARK", True, [item]),
+            ("DSPARK", False, [item]),
+            ("EAGLE", False, []),
+        ):
+            with self.subTest(algorithm=algorithm, encoder_replay=encoder_replay):
+                override = get_context().override_server_args(
+                    speculative_algorithm=algorithm,
+                    enable_encoder_swa_bounded_replay=encoder_replay,
+                )
+                override.install()
+                try:
+                    target = self.make_pool(draft=False)
+                    draft = self.make_pool(draft=True)
+                finally:
+                    override.restore()
+                self.assertEqual(draft.get_swa_valid_from_buf_infos()[2], expected)
+                self.assertEqual(target.get_swa_valid_from_buf_infos(), ([], [], []))
+
     def test_pd_window_pages_carry_the_last_window(self):
         window = self.make_pool(draft=False).request_window
         page, slot, sliding = window.page_size, 2, 128
@@ -498,48 +506,54 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         mapping = torch.full((3000,), -1, dtype=torch.int64)
         for slot in range(3):
             mapping[req_to_token[slot]] = slot * self.RING + positions % self.RING
-        gather = compute_dspark_window_gather(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_rep,
-            block_size=block_size,
-            swa_window=128,
-        )
         out_loc = torch.cat(
             [req_to_token[s, p : p + block_size] for s, p in zip(slots, prefix_lens)]
         )
-        paged = build_dspark_swa_page_indices(
-            req_to_token=req_to_token,
-            full_to_swa_mapping=mapping,
-            req_pool_indices_per_request=gather.req_pool_indices_per_request,
-            offsets=gather.offsets,
-            invalid=gather.invalid,
-            out_loc=out_loc,
-            context_lens=gather.context_lens,
-            block_size=block_size,
-            swa_window=128,
-            page_index_aligned_size=64,
-        )
-        ring = BuildDsparkSwaRingIndices.torch(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_rep,
-            valid_from=torch.zeros(3, dtype=torch.int64),
-            ring_size=self.RING,
-            block_size=block_size,
-            swa_window=128,
-            page_index_aligned_size=64,
-        )
-        for got, want in zip(ring, paged):
-            torch.testing.assert_close(got, want)
+        # Per slot: a fresh request, and PD decode's marks from two prefix hits,
+        # one inside the window and one past its start.
+        for valid_from in ([0, 0, 0], [150, 290, 0]):
+            with self.subTest(valid_from=valid_from):
+                valid_from = torch.tensor(valid_from, dtype=torch.int64)
+                gather = compute_dspark_window_gather(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_rep,
+                    block_size=block_size,
+                    swa_window=128,
+                    valid_from=valid_from,
+                )
+                paged = build_dspark_swa_page_indices(
+                    req_to_token=req_to_token,
+                    full_to_swa_mapping=mapping,
+                    req_pool_indices_per_request=gather.req_pool_indices_per_request,
+                    offsets=gather.offsets,
+                    invalid=gather.invalid,
+                    out_loc=out_loc,
+                    context_lens=gather.context_lens,
+                    block_size=block_size,
+                    swa_window=128,
+                    page_index_aligned_size=64,
+                )
+                ring = BuildDsparkSwaRingIndices.torch(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_rep,
+                    valid_from=valid_from,
+                    ring_size=self.RING,
+                    block_size=block_size,
+                    swa_window=128,
+                    page_index_aligned_size=64,
+                )
+                for got, want in zip(ring, paged):
+                    torch.testing.assert_close(got, want)
 
     def test_ring_window_starts_at_valid_from(self):
         draft = self.make_pool(draft=True)
         # Slot 1 was placed at a 290-token prefix hit; 10 positions are its own.
-        draft.reset_swa_req_ring(torch.tensor([1]), torch.tensor([290]))
+        draft.set_swa_valid_from(torch.tensor([1]), torch.tensor([290]))
         seq_lens_casual, req_rep = self._block_inputs([300], [1])
         indices, lengths = BuildDsparkSwaRingIndices.torch(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_rep,
-            valid_from=draft.swa_req_ring_valid_from,
+            valid_from=draft.swa_valid_from,
             ring_size=self.RING,
             block_size=5,
             swa_window=128,
@@ -634,6 +648,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         layout = window_layout(
             torch.ones(rows, dtype=torch.int64),
             torch.arange(rows),
+            zero_row=pool.request_window.zero_row,
             capacity=pool.request_window.capacity,
             num_groups=1,
         )

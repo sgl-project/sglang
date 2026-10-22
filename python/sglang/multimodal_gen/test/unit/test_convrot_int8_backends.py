@@ -662,42 +662,6 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
             config.get_quant_method(LinearBase(256, 4), "gate")
 
 
-@patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_JIT_KERNEL)
-def test_serialized_layers_log_the_backend_split_once_loaded(_jit, _comfy, caplog):
-    """Serialized layers skip online quantization, so the backend split must be
-    reported when their weights are in place instead."""
-    import logging
-
-    markers = {
-        "fc1": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256},
-        "small": {
-            "format": "int8_tensorwise",
-            "convrot": True,
-            "convrot_groupsize": 16,
-        },
-    }
-    with (
-        patch(_JIT_AVAILABLE, return_value=True),
-        patch(_COMFY_AVAILABLE, return_value=True),
-        caplog.at_level(logging.INFO),
-    ):
-        config = ConvRotInt8Config(layer_markers=markers)
-        fc1 = ReplicatedLinear(256, 16, bias=False, quant_config=config, prefix="fc1")
-        small = ReplicatedLinear(
-            64, 16, bias=False, quant_config=config, prefix="small"
-        )
-        fc1.quant_method.process_weights_after_loading(fc1)
-        assert not [r for r in caplog.records if "serialized INT8" in r.getMessage()]
-        small.quant_method.process_weights_after_loading(small)
-    lines = [
-        r.getMessage() for r in caplog.records if "serialized INT8" in r.getMessage()
-    ]
-    assert lines == [
-        "convrot_int8: loaded 2 serialized INT8 linear layers (jit 1, comfy_kitchen 1)"
-    ]
-
-
 def test_kitchen_int8_is_a_deprecated_alias_of_convrot_int8(caplog):
     """Existing `--quantization kitchen_int8` commands must keep working under the
     new name, with one deprecation warning per process."""

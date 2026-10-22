@@ -234,6 +234,7 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
+            spec_algorithm=spec_algorithm,
         )
 
 
@@ -241,6 +242,7 @@ def _resolve_dflash_draft_cell_size(
     *,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
+    spec_algorithm: SpeculativeAlgorithm,
 ) -> int | None:
     """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
 
@@ -269,8 +271,14 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            # The draft pool shards KV heads like the target pool (by attention TP).
-            tp_size=get_parallel().attn_tp_size,
+            # CP targets run the DFLASH draft on full TP without CP.
+            tp_size=(
+                get_parallel().tp_size
+                if spec_algorithm.is_dflash()
+                and get_parallel().attn_cp_size > 1
+                and get_parallel().attn_dp_size == 1
+                else get_parallel().attn_tp_size
+            ),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
