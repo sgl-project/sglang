@@ -4406,6 +4406,10 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_dcp_remote_decode_layout(self):
+        get_layout = getattr(self.full_kv_pool, "get_dcp_remote_decode_layout", None)
+        return get_layout() if get_layout is not None else []
+
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)

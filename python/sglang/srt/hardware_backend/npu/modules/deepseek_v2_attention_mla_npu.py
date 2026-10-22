@@ -9,6 +9,10 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import (
+    forward_mla_attention_npu,
+    get_mla_dcp_backend,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -281,6 +285,10 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    if backend.uses_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
     return (
         q_pe,
         k_pe,
@@ -308,17 +316,17 @@ def forward_mla_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    attn_output = forward_mla_attention_npu(
+        m,
+        backend,
+        forward_batch,
         q_nope_out,
         k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
+        q_pe,
+        k_pe,
         **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
     )
-
-    attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_output = attn_output.contiguous()
     if (
@@ -549,29 +557,18 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
-    attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
-    attn_output = attn(
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    attn_output = forward_mla_attention_npu(
+        m,
+        backend,
+        forward_batch,
         q_nope_out.contiguous(),
         k_nope.contiguous(),
-        k_nope.contiguous(),
-        forward_batch,
+        q_pe.contiguous(),
+        k_pe.contiguous(),
         save_kv_cache=not mla_preprocess_used,
-        q_rope=q_pe.contiguous(),
-        k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
-    if use_dcp:
-        attn_output, lse = attn_output
-        attn_output = attn_output.view(
-            -1,
-            m.num_local_heads * runtime_context.get_parallel().attn_dcp_size,
-            m.kv_lora_rank,
-        )
-        attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
-            attn_output, lse, runtime_context.get_parallel().dcp_group
-        )
-    attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     if _is_npu_arch35 or (
         forward_batch.forward_mode.is_extend()

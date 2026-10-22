@@ -315,6 +315,9 @@ class PrefillBootstrapQueue:
         dcp_remote_decode_layout = []
         if self.transfer_backend == TransferBackend.ASCEND:
             for pool in (self.token_to_kv_pool, draft_kv_pool):
+                if pool is not None and pool is draft_kv_pool:
+                    dcp_remote_decode_layout.extend([True] * num_draft_entries)
+                    continue
                 get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
                 if get_layout is not None:
                     dcp_remote_decode_layout.extend(get_layout())
@@ -349,6 +352,11 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            full_attention_layer_ids=getattr(
+                self.scheduler.model_config.hf_text_config,
+                "full_attention_layer_ids",
+                None,
+            ),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

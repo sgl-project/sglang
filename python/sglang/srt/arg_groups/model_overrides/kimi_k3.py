@@ -81,6 +81,13 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
+        if get_platform().is_npu:
+            overrides.update(
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+            )
+            return overrides
+
         prefill_backend, decode_backend = attention_backends_of(cfg)
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()

@@ -106,8 +106,11 @@ class AscendKVManager(MooncakeKVManager):
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
-    def _is_npu_dsa_layout(self) -> bool:
-        return getattr(self.kv_args, "kv_buf_groups", 1) == 3
+    def _uses_page_interleaved_dcp(self) -> bool:
+        return (
+            getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)
+            or self.is_hybrid_mla_backend
+        )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
@@ -142,11 +145,11 @@ class AscendKVManager(MooncakeKVManager):
             self.engine.batch_register(ptrs, lens)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
-        if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
+        if self._uses_page_interleaved_dcp() and self.dcp_size != dst_dcp_size:
             if self.dcp_size == 1 and dst_dcp_size > 1:
                 return True
             raise RuntimeError(
-                "NPU DSA PD supports prefill DCP 1 -> decode DCP N only, got "
+                "NPU MLA PD supports prefill DCP 1 -> decode DCP N only, got "
                 f"prefill={self.dcp_size}, decode={dst_dcp_size}"
             )
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
@@ -162,7 +165,7 @@ class AscendKVManager(MooncakeKVManager):
     def prepare_dcp_token_item_lens(
         self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
     ) -> List[int]:
-        if not self._is_npu_dsa_layout():
+        if not self._uses_page_interleaved_dcp():
             return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
         self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
@@ -424,7 +427,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
     ) -> int:
-        if not self._is_npu_dsa_layout():
+        if not self._uses_page_interleaved_dcp():
             return super().send_kvcache_dcp(
                 mooncake_session_id,
                 prefill_kv_indices,

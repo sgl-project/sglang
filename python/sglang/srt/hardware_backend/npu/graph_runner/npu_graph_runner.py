@@ -44,6 +44,7 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
@@ -131,9 +132,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
+        mla_backend = get_mla_dcp_backend(self.attn_backend)
+        self.mla_dcp_graph = getattr(mla_backend, "dense_mla_dcp_target", False)
         self.use_fias_v2_bsnd = (
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
+            and not self.mla_dcp_graph
         )
 
     def _init_arch_map(self):
@@ -368,12 +372,21 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
+        mla_dcp_graph = getattr(self, "mla_dcp_graph", False)
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if mla_dcp_graph:
+                seq_lens = get_mla_dcp_backend(
+                    self._replay_attn_backend()
+                ).get_mla_dcp_graph_replay_lengths(
+                    forward_batch,
+                    bs=self.bs,
+                    query_len=self.captured_req_width,
+                )
+            elif forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
                 # recompute from the live batch as before — reading the

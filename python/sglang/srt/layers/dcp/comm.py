@@ -320,6 +320,8 @@ def all_gather_kv_cache_for_dcp(
     prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
+    *,
+    interleave_size: int = 1,
 ):
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
@@ -334,16 +336,24 @@ def all_gather_kv_cache_for_dcp(
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
-    left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
-    left_pads = left_pads.to(torch.int32)
+    cycle_size = dcp_world_size * interleave_size
+    start_offset = prefix_starts_cpu % cycle_size
+    end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
+    left_pads = (
+        (start_offset - dcp_rank * interleave_size)
+        .clamp(0, interleave_size)
+        .to(torch.int32)
+    )
     right_pads = (
-        prefix_starts_cpu + prefix_kv_lens_cpu - 1
-    ) % dcp_world_size < dcp_rank
-    right_pads = right_pads.to(torch.int32)
+        ((dcp_rank + 1) * interleave_size - 1 - end_offset)
+        .clamp(0, interleave_size)
+        .to(torch.int32)
+    )
     padded_lens = (
-        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
-    ) // dcp_world_size
-
+        (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
+        // cycle_size
+        * interleave_size
+    )
     local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
@@ -364,7 +374,13 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
 
-    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    if interleave_size == 1:
+        gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    else:
+        gathered_pages = _all_gather_dcp_kv_cache(
+            padded_kv_cache.reshape(-1, interleave_size, *padded_kv_cache.shape[1:])
+        )
+        gatherd_kv_cache = gathered_pages.flatten(0, 1)
 
     # 2. re-org kv cache to query orders
     padded_lens_cu = torch.zeros(
@@ -377,7 +393,7 @@ def all_gather_kv_cache_for_dcp(
         kv_cache_tuple += (
             gatherd_kv_cache[
                 padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
+                + (prefix_starts_cpu[req_idx] % cycle_size) :
             ][: prefix_kv_lens_cpu[req_idx]],
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
