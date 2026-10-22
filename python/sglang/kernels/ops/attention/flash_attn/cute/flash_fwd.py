@@ -87,6 +87,8 @@ class FlashAttentionForwardBase:
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
         """
         self.dtype = dtype
+        # Output dtype; subclasses with quantized Q/K/V (SM120 FP8 KV) override.
+        self.o_dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -207,10 +209,19 @@ class FlashAttentionForwardBase:
                 raise TypeError("Q/K/V must have the same data type")
             if const_expr(mO_type != Float32):
                 raise TypeError("SplitKV partial output (mO) must be Float32")
+        elif const_expr(self.o_dtype != self.dtype):
+            # Quantized Q/K/V (SM120 FP8 KV) with a wider output dtype.
+            if const_expr(not (mQ_type == mK_type == mV_type)):
+                raise TypeError("Q/K/V must have the same data type")
+            if const_expr(mO_type != self.o_dtype):
+                raise TypeError(f"Output (mO) must be {self.o_dtype}")
         elif const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
             raise TypeError("All tensors must have the same data type")
-        if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Only Float16 or BFloat16 is supported")
+        if const_expr(
+            mQ_type not in [cutlass.Float16, cutlass.BFloat16]
+            and not (self.o_dtype != self.dtype and mQ_type == cutlass.Float8E4M3FN)
+        ):
+            raise TypeError("Only Float16, BFloat16 or SM120 FP8 KV is supported")
         if const_expr(mLSE_type not in [None, Float32]):
             raise TypeError("LSE tensor must be Float32")
         if const_expr(mCuSeqlensQ_type not in [None, Int32]):
@@ -278,7 +289,7 @@ class FlashAttentionForwardBase:
         # atom_universal_copy: universal copy atom for O store
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
+            self.o_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
         # tQ_layout and tK_layout: thread layout for QK load
@@ -304,10 +315,15 @@ class FlashAttentionForwardBase:
             (self.num_producer_threads // tV_shape_dim_1, tV_shape_dim_1),
             order=(1, 0),
         )
-        # TODO: need a different layout for O if O dtype is not the same as V dtype
         # tO_layout: thread layout for O store
+        if const_expr(self.o_dtype == self.dtype):
+            o_copy_elems = async_copy_elems
+            tO_shape_dim_1 = tV_shape_dim_1
+        else:
+            o_copy_elems = universal_copy_bits // self.o_dtype.width
+            tO_shape_dim_1 = sO_layout_atom.outer.shape[1] // o_copy_elems
         tO_layout = cute.make_ordered_layout(
-            (self.num_epilogue_threads // tV_shape_dim_1, tV_shape_dim_1),
+            (self.num_epilogue_threads // tO_shape_dim_1, tO_shape_dim_1),
             order=(1, 0),
         )
         # So that we don't have to check if we overshoot kBlockM when we store O
@@ -315,7 +331,7 @@ class FlashAttentionForwardBase:
 
         # Value layouts for copies
         vQKV_layout = cute.make_layout((1, async_copy_elems))
-        vO_layout = vQKV_layout
+        vO_layout = cute.make_layout((1, o_copy_elems))
 
         self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(
             atom_async_copy, tQ_layout, vQKV_layout
@@ -393,15 +409,15 @@ class FlashAttentionForwardBase:
             )
             return
         # store acc_O
-        rO = cute.make_fragment_like(acc_O, self.dtype)
-        rO.store(acc_O.load().to(self.dtype))
+        rO = cute.make_fragment_like(acc_O, self.o_dtype)
+        rO.store(acc_O.load().to(self.o_dtype))
         # Make sure all threads have finished reading V
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue),
             number_of_threads=self.num_epilogue_threads,
         )
         smem_copy_atom_O = utils.get_smem_store_atom(
-            self.arch.major * 10 + self.arch.minor, self.dtype
+            self.arch.major * 10 + self.arch.minor, self.o_dtype
         )
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(
             tidx
@@ -485,7 +501,7 @@ class FlashAttentionForwardBase:
             )
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOrO = cute.make_fragment_like(tOsO, self.dtype)
+            tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             # load acc O from smem to rmem for wider vectorization
             cute.autovec_copy(tOsO, tOrO)
             if const_expr(not self.pack_gqa):

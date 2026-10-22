@@ -368,6 +368,42 @@ def _select_low_hd_decode_num_splits(
     )
 
 
+def _is_wide_hd_fp8_paged_decode(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    paged_kv: bool,
+    max_seqlen_q: int,
+    element_size: int,
+) -> bool:
+    """FP8 paged decode with head dims above 256 (one-warp, one-stage tile)."""
+    return (
+        head_dim > 256
+        and head_dim_v > 256
+        and paged_kv
+        and max_seqlen_q == 1
+        and element_size == 1
+    )
+
+
+def _select_wide_hd_decode_num_splits(
+    *,
+    total_mblocks: int,
+    num_n_blocks: int,
+) -> int:
+    """Split the wide-HD FP8 decode kernel to keep about 2k CTAs in flight.
+
+    The one-warp kernel has a long serial KV loop per CTA, so the generic
+    0.8-wave target leaves it latency bound. Capping at 16 splits also bounds
+    the split partial buffers at large decode batch.
+    """
+    if num_n_blocks <= 4 or total_mblocks <= 0:
+        return 1
+    target_splits = max(1, 2048 // total_mblocks)
+    grain_splits = min(16, target_splits)
+    return _normalize_num_splits(grain_splits, num_n_blocks)
+
+
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
     return (
         type(tensor),
@@ -621,6 +657,7 @@ class Sm120ForwardPolicy:
         window_size_right: Optional[int],
         pack_gqa: bool,
         paged_kv: bool,
+        dtype=None,
     ) -> Sm120ForwardConfig:
         if has_bias:
             if max(head_dim, head_dim_v) > 128:
@@ -648,6 +685,7 @@ class Sm120ForwardPolicy:
                 window_size_right=window_size_right,
                 pack_gqa=pack_gqa,
                 paged_kv=paged_kv,
+                dtype=dtype,
             )
         else:
             tile_m, tile_n = tile_mn
@@ -732,6 +770,18 @@ class Sm120ForwardPolicy:
                         num_n_blocks=num_n_blocks,
                         hardware=_get_decode_hardware(device),
                     )
+            elif _is_wide_hd_fp8_paged_decode(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                paged_kv=paged_kv,
+                max_seqlen_q=max_seqlen_q,
+                element_size=element_size,
+            ):
+                # Wide-HD FP8 decode is latency bound at the generic split count.
+                num_splits = _select_wide_hd_decode_num_splits(
+                    total_mblocks=total_mblocks,
+                    num_n_blocks=num_n_blocks,
+                )
             else:
                 num_splits = generic_heuristic(
                     total_mblocks,
@@ -974,6 +1024,7 @@ class Sm120ForwardPolicy:
                     config.tile_n,
                     config.num_stages,
                     False,
+                    dtype=dtype,
                 )
                 + bias_smem_bytes
             )
@@ -1152,6 +1203,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             _EMPTY_AUX_DATA,
             None,
             0,
+            None,  # descale_tensors
         )
         return out, None
 
@@ -1454,6 +1506,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             _EMPTY_AUX_DATA,
             None,
             0,
+            None,  # descale_tensors
         )
         if plan.actual_num_splits > 1:
             plan.compiled_combine(

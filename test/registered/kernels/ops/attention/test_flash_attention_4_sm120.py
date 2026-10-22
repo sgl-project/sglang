@@ -2150,6 +2150,168 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     assert all(plan.split_qk_n is expected_split_qk for plan in captured_plans)
 
 
+def _random_e4m3(*shape: int) -> torch.Tensor:
+    return torch.randn(*shape, device="cuda").to(torch.float8_e4m3fn)
+
+
+def _random_descales(batch_size: int, num_kv_heads: int) -> torch.Tensor:
+    return torch.empty(batch_size, num_kv_heads, device="cuda").uniform_(0.5, 2.0)
+
+
+def _dequantize(x: torch.Tensor, descale: torch.Tensor) -> torch.Tensor:
+    """Apply one sequence's per-KV-head descale to (tokens, heads, dim) E4M3."""
+    return x.float() * descale.repeat_interleave(x.shape[1] // descale.numel())[:, None]
+
+
+def _assert_fp8_attention_close(output: torch.Tensor, reference: torch.Tensor):
+    # P is rounded to E4M3 for the PV MMA, so compare globally, not per element.
+    assert output.dtype == torch.bfloat16
+    output = output.float().flatten()
+    reference = reference.flatten()
+    cosine = torch.nn.functional.cosine_similarity(output, reference, dim=0)
+    assert cosine.item() > 0.999
+    assert ((output - reference).norm() / reference.norm()).item() < 4e-2
+
+
+@pytest.mark.parametrize(
+    ("dtype", "head_dim", "pack_gqa"),
+    [
+        (torch.float8_e4m3fn, 128, False),
+        (torch.float8_e4m3fn, 256, True),
+        (torch.float8_e4m3fn, 512, False),
+        (torch.float8_e4m3fn, 512, True),
+        (torch.bfloat16, 512, None),
+    ],
+)
+def test_sm120_varlen_prefill_fp8_and_hd512_match_reference(dtype, head_dim, pack_gqa):
+    """Non-paged prefill with per-(batch, KV head) FP8 descales, and HD512."""
+    torch.manual_seed(20260901 + head_dim)
+    num_q_heads, num_kv_heads = 8, 2
+    lengths = (96, 33, 257)
+    is_fp8 = dtype == torch.float8_e4m3fn
+    if is_fp8:
+        q_parts = [_random_e4m3(n, num_q_heads, head_dim) for n in lengths]
+        k_parts = [_random_e4m3(n, num_kv_heads, head_dim) for n in lengths]
+        v_parts = [_random_e4m3(n, num_kv_heads, head_dim) for n in lengths]
+        descales = [_random_descales(len(lengths), num_kv_heads) for _ in range(3)]
+        descale_kwargs = dict(zip(("q_descale", "k_descale", "v_descale"), descales))
+    else:
+        q_parts, k_parts, v_parts = (
+            [
+                torch.randn(n, heads, head_dim, device="cuda", dtype=dtype)
+                for n in lengths
+            ]
+            for heads in (num_q_heads, num_kv_heads, num_kv_heads)
+        )
+        descale_kwargs = {}
+    cu_seqlens = torch.tensor((0, *lengths), device="cuda").cumsum(0).to(torch.int32)
+    output, lse = flash_attn_varlen_func(
+        torch.cat(q_parts),
+        torch.cat(k_parts),
+        torch.cat(v_parts),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        pack_gqa=pack_gqa,
+        return_softmax_lse=True,
+        **descale_kwargs,
+    )
+    references = []
+    for batch_idx, parts in enumerate(zip(q_parts, k_parts, v_parts)):
+        if is_fp8:
+            parts = [
+                _dequantize(part, descale[batch_idx])
+                for part, descale in zip(parts, descales)
+            ]
+        references.append(_attention_reference(*parts, causal=True))
+    output_reference = torch.cat([reference[0] for reference in references])
+    lse_reference = torch.cat([reference[1] for reference in references], dim=1)
+    if is_fp8:
+        _assert_fp8_attention_close(output, output_reference)
+        # Scores are exact E4M3 products, so the LSE tracks FP32 closely.
+        torch.testing.assert_close(lse, lse_reference, atol=2e-4, rtol=0.0)
+    else:
+        # BF16 P rounding grows the worst element with head dim; the mean does not.
+        error = (output.float() - output_reference).abs()
+        assert error.max().item() < 1.5e-2
+        assert error.mean().item() < 5e-4
+        torch.testing.assert_close(lse, lse_reference, atol=2e-4, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "q_len", "window_left", "use_sink"),
+    [
+        (256, 1, 127, True),
+        (512, 1, None, False),
+        (256, 64, None, False),
+        (512, 64, 127, True),
+    ],
+)
+def test_sm120_paged_fp8_kv_matches_reference(head_dim, q_len, window_left, use_sink):
+    """Paged FP8 decode and prefill, including the split HD512 decode path."""
+    torch.manual_seed(20260902 + head_dim + q_len)
+    num_q_heads, num_kv_heads = 8, 2
+    page_size, pages_per_sequence = 64, 8
+    k_lengths = (500, 301)
+    batch_size = len(k_lengths)
+    num_pages = batch_size * pages_per_sequence
+    q = _random_e4m3(batch_size * q_len, num_q_heads, head_dim)
+    k_cache = _random_e4m3(num_pages, page_size, num_kv_heads, head_dim)
+    v_cache = _random_e4m3(num_pages, page_size, num_kv_heads, head_dim)
+    q_descale, k_descale, v_descale = (
+        _random_descales(batch_size, num_kv_heads) for _ in range(3)
+    )
+    page_table = (
+        torch.randperm(num_pages, device="cuda")
+        .to(torch.int32)
+        .view(batch_size, pages_per_sequence)
+    )
+    sinks = (
+        torch.randn(num_q_heads, device="cuda", dtype=torch.bfloat16)
+        if use_sink
+        else None
+    )
+    reference_window = (None, None) if window_left is None else (window_left, 0)
+    output = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=torch.tensor(k_lengths, device="cuda", dtype=torch.int32),
+        page_table=page_table,
+        cu_seqlens_q=torch.arange(
+            0, (batch_size + 1) * q_len, q_len, device="cuda", dtype=torch.int32
+        ),
+        max_seqlen_q=q_len,
+        causal=True,
+        window_size=(-1, -1) if window_left is None else reference_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    references = []
+    for batch_idx, k_len in enumerate(k_lengths):
+        pages = page_table[batch_idx]
+        k = k_cache.index_select(0, pages).flatten(0, 1)[:k_len]
+        v = v_cache.index_select(0, pages).flatten(0, 1)[:k_len]
+        references.append(
+            _attention_reference(
+                _dequantize(
+                    q[batch_idx * q_len : (batch_idx + 1) * q_len],
+                    q_descale[batch_idx],
+                ),
+                _dequantize(k, k_descale[batch_idx]),
+                _dequantize(v, v_descale[batch_idx]),
+                causal=True,
+                window_size=reference_window,
+                sinks=sinks,
+            )[0]
+        )
+    _assert_fp8_attention_close(output, torch.cat(references))
+
+
 if __name__ == "__main__":
     import sys
 

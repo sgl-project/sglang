@@ -22,6 +22,7 @@ from cutlass.pipeline import PipelineAsync, PipelineState
 from quack import layout_utils
 
 from sglang.kernels.ops.attention.fa4_sm120.flash_fwd import (
+    FP8_P_SCALE,
     FlashAttentionForwardSm120,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import utils
@@ -65,18 +66,23 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         self.num_epilogue_threads = self.num_threads
 
     def _get_tiled_mma(self):
-        mma_op = warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16))
+        if const_expr(self.is_fp8):
+            mma_op = warp.MmaFP8Op(self.dtype, Float32, (16, 8, 32))
+            mma_k = 32
+        else:
+            mma_op = warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16))
+            mma_k = 16
         tiled_mma_qk = cute.make_tiled_mma(
             mma_op,
             (1, 1, 1),
-            permutation_mnk=(16, self.query_mma_n, 16),
+            permutation_mnk=(16, self.query_mma_n, mma_k),
         )
         # Each warp covers 64 value rows; the four disjoint SMEM views cover
         # HDV=256 without a CTA-level M permutation.
         tiled_mma_pv = cute.make_tiled_mma(
             mma_op,
             (1, 1, 1),
-            permutation_mnk=(64, self.query_mma_n, 16),
+            permutation_mnk=(64, self.query_mma_n, mma_k),
         )
         return tiled_mma_qk, tiled_mma_pv
 
@@ -344,6 +350,9 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         for r in cutlass.range(num_query_rows, unroll_full=True):
             query_row = tScS_qk[r, 0][1]
             warp_scale = sRowScale[warp_scale_base + warp_idx, query_row]
+            if const_expr(self.is_fp8):
+                # Pre-scale P for the E4M3 store below.
+                warp_scale = warp_scale * FP8_P_SCALE
             acc_S_qk[r, None].store(acc_S_qk[r, None].load() * warp_scale)
         for r in cutlass.range(num_query_rows, unroll_full=True):
             query_row = tScS_qk[r, 0][1]
@@ -425,7 +434,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             if query_row < row_limit:
                 for c in cutlass.range(cute.size(acc_O_qd, mode=[1]), unroll_full=True):
                     value_col = warp_idx * const_expr(64) + tOcO_qd[r, c][0]
-                    mO_cur[query_row, value_col] = self.dtype(acc_O_qd[r, c])
+                    mO_cur[query_row, value_col] = self.o_dtype(acc_O_qd[r, c])
 
         if const_expr(mLSE is not None):
             if tidx < self.query_mma_n:
@@ -477,6 +486,7 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         is_qk_owner: cutlass.Constexpr[bool],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        descale_tensors=None,
     ):
         assert self.paged_kv
         assert self.pack_gqa
@@ -489,6 +499,13 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
         assert self.qhead_per_kvhead <= self.query_mma_n
         assert is_qk_owner
 
+        v_descale = Float32(1.0)
+        if const_expr(descale_tensors is not None):
+            qk_descale, v_descale = self._load_effective_descales(
+                descale_tensors, batch_idx, head_idx
+            )
+            # score_mod is None, so the log2 scale multiplies raw scores.
+            softmax_scale_log2 = softmax_scale_log2 * qk_descale
         mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
         warp_idx = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
@@ -502,10 +519,17 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             self.dtype,
         )
-        smem_copy_atom_v_major = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-            self.dtype,
-        )
+        if const_expr(self.is_fp8):
+            # A 16-bit transposing ldmatrix would swap packed E4M3 pairs.
+            smem_copy_atom_v_major = cute.make_copy_atom(
+                warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2),
+                self.dtype,
+            )
+        else:
+            smem_copy_atom_v_major = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+                self.dtype,
+            )
         smem_thr_copy_K = utils.make_tiled_copy_A(
             smem_copy_atom_k_major, tiled_mma_qk
         ).get_slice(lane_idx)
@@ -696,6 +720,9 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             sRowScale,
             final_scale_row,
         )
+        if const_expr(self.is_fp8):
+            # Apply v_descale and undo the P pre-scale; LSE is unaffected.
+            acc_O.store(acc_O.load() * (v_descale / FP8_P_SCALE))
         self._store_transposed_output(
             acc_O,
             mO,
