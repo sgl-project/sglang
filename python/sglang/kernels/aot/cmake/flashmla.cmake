@@ -85,6 +85,19 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     endif()
 endif()
 
+execute_process(COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-arch OUTPUT_VARIABLE FLASHMLA_NVCC_ARCHS ERROR_QUIET)
+if(FLASHMLA_NVCC_ARCHS MATCHES "compute_107")
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_107a,code=sm_107a"
+    )
+    # The pinned cutlass lists no SM107; without the patch sm_107a compiles but drops setmaxnreg.
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/patch_cutlass_sm107.py
+                ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+endif()
+
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
