@@ -269,7 +269,7 @@ class InputValidationStage(PipelineStage):
                 preprocess_image(
                     img,
                     device=self.device,
-                size=(rw, rh),
+                    size=(rw, rh),
                     crop=((rh - oh) // 2, (rw - ow) // 2, oh, ow),
                 )
                 .contiguous()

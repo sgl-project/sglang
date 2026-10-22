@@ -2,6 +2,8 @@
 """Guard input rounding, crop geometry and strides across CPU/CUDA preprocessing."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -15,6 +17,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3ImagePreprocessStage,
+    _pil_to_normalized_tensor,
+    _resize_crop_pil,
+)
 from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -83,6 +93,45 @@ class TestImagePreprocessing(CustomTestCase):
                 qwen.preprocess_vae_image(batch, qwen_processor)
                 torch.testing.assert_close(batch.vae_image[0], expected, rtol=0, atol=0)
                 self.assertEqual(batch.vae_image[0].stride(), expected.stride())
+
+    def test_cosmos_image_stage_and_shared_vae_fallback(self):
+        rng = np.random.default_rng(19)
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "input.png"
+            for shape in ((1081, 1921), (731, 517)):
+                image = Image.fromarray(
+                    rng.integers(0, 256, (*shape, 3), dtype=np.uint8)
+                )
+                image.save(source)
+                batch = Req(
+                    sampling_params=SamplingParams(
+                        prompt="test",
+                        seed=42,
+                        image_path=str(source),
+                        width=832,
+                        height=480,
+                    )
+                )
+                Cosmos3ImagePreprocessStage().forward(batch, None)
+                expected = (
+                    _pil_to_normalized_tensor(_resize_crop_pil(image, 832, 480))
+                    .unsqueeze(0)
+                    .cuda()
+                )
+                torch.testing.assert_close(
+                    batch.preprocessed_image, expected, rtol=0, atol=0
+                )
+                self.assertEqual(batch.preprocessed_image.stride(), expected.stride())
+
+        stage = ImageVAEEncodingStage(vae=None)
+        for values in (np.linspace(-255, 255, 256), np.arange(256)):
+            image = Image.fromarray(values.astype(np.float32).reshape(16, 16))
+            expected = torch.from_numpy(np.array(image)[None, None] / 255.0)
+            if expected.min() >= 0:
+                expected = 2 * expected - 1
+            torch.testing.assert_close(
+                stage.preprocess(image), expected, rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":
