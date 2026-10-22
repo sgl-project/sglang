@@ -71,6 +71,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "apply_prefill_cp_cuda_graph_default",
         "handle_kv_cache_sharding",
         "handle_moe_kernel_config",
+        "handle_moe_load_balancer",
         "handle_a2a_moe",
         "handle_eplb_and_dispatch",
         "handle_expert_distribution_metrics",

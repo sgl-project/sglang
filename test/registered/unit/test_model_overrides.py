@@ -194,6 +194,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
+                    "moe_load_balancer_algorithm",
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",

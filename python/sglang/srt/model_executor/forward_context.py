@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +45,9 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # The active batch's mode; MoE routing policies that differ between
+    # prefill and decode (sglang.srt.eplb.moe_load_balancer_glue) read it here.
+    forward_mode: Optional[ForwardMode] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -88,10 +91,17 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            # Unit tests pass lightweight batch stand-ins without a mode.
+            forward_mode=getattr(forward_batch, "forward_mode", None),
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            forward_mode=_current.forward_mode,
+        )
     prev = set_forward_context(ctx)
     try:
         yield

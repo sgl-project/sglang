@@ -395,6 +395,10 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
+        if _placement_is_coupled():
+            # The policy solves per source rank: count this rank's own TopK
+            # selections rather than what its local experts received.
+            return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
         if get_exec().moe.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
@@ -418,6 +422,8 @@ class _SinglePassGatherer(ABC):
                     rank,
                     elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
+            elif get_exec().moe.deepep_mode == "auto":
+                return _DeepepAutoSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -644,7 +650,12 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         num_tokens_per_expert,
     ):
         assert isinstance(local_physical_count_of_layer, list)
-        self._on_layer_data(layer_idx, local_physical_count_of_layer)
+        self._on_layer_data(
+            layer_idx,
+            local_physical_count_of_layer[
+                : self._expert_location_metadata.num_local_physical_experts
+            ],
+        )
 
     def collect(self) -> Dict:
         local_physical_count = super()._collect_objects(
@@ -667,6 +678,9 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
+        local_physical_count_of_layer = local_physical_count_of_layer[
+            : self._expert_location_metadata.num_local_physical_experts
+        ]
         if local_physical_count_of_layer.shape[0] != self._data.shape[1]:
             if not self._elastic_ep_enabled:
                 self._data[layer_idx, :] += local_physical_count_of_layer
@@ -681,6 +695,52 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
                     (0, n - local_physical_count_of_layer.shape[0]),
                 )
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepepAutoSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    """Gather exact physical counts for DeepEP's per-forward dispatch mode.
+
+    DeepEP auto mode resolves to normal whenever the DP batch contains extend
+    tokens, and to low-latency otherwise. Mirror that decision here so normal
+    forwards use physical IDs from select-experts while low-latency forwards use
+    the local physical counts returned by dispatch. Counting both hooks would
+    double count low-latency forwards because select-experts is also invoked on
+    that path.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, enable_global_physical_experts=True)
+        self._is_extend_in_batch = False
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        self._is_extend_in_batch = forward_batch.is_extend_in_batch
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if not self._is_extend_in_batch:
+            return
+
+        topk_ids = topk_ids.flatten()
+        mask = topk_ids != -1
+        self._data[layer_idx, :].scatter_add_(
+            dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
+        )
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        if self._is_extend_in_batch:
+            return
+
+        num_local_physical_experts = (
+            self._expert_location_metadata.num_local_physical_experts
+        )
+        start = self._rank * num_local_physical_experts
+        end = start + num_local_physical_experts
+        # Waterfill's fused shared expert is the final local DeepEP slot.  It
+        # is not part of EPLB's routed-expert placement statistics.
+        self._data[layer_idx, start:end] += local_physical_count_of_layer[
+            :num_local_physical_experts
+        ]
 
 
 def _convert_per_token_to_global_physical_count(
@@ -947,6 +1007,20 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
 
+def _placement_is_coupled() -> bool:
+    """Whether the EvenMoE routing expression names the L1 policy owning placement.
+
+    Such a policy plans from live traffic one layer at a time and consumes the
+    statistics per source EP rank, so the recorder keeps the rank dimension.
+    """
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_configured_moe_load_balancer_pipeline,
+    )
+
+    pipeline = get_configured_moe_load_balancer_pipeline()
+    return pipeline is not None and pipeline.placement_policy is not None
+
+
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -991,15 +1065,27 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        coupled = _placement_is_coupled()
+        if coupled:
+            from sglang.srt.runtime_context import get_parallel
+
+            group = get_parallel().moe_ep_group
+            local_count = logical_count_of_buffered_step.sum(dim=0).contiguous()
+            logical_count_of_buffered_step = group.all_gather(
+                local_count, dim=0
+            ).reshape(group.world_size, *local_count.shape)
+        else:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            )
 
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if coupled:
+            output["logical_count_layout"] = "rank_layer_expert"
 
         if output_mode == "file":
             if self._rank == 0:

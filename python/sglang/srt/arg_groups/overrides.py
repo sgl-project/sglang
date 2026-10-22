@@ -1555,8 +1555,17 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 
 @register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
-    """Set shared-expert fusion requirements for the selected A2A backend."""
-    if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
+    """Set shared-expert fusion requirements for the selected A2A backend:
+    Waterfill (native or through the MoE load balancer) requires the fusion
+    enabled; FlashInfer, FlashInfer MegaMOE, and DeepEP v2 A2A require it disabled.
+    """
+    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+
+    pipeline = get_moe_load_balancer_pipeline(view.moe_load_balancer_algorithm)
+    routes_shared = pipeline is not None and pipeline.capabilities.routes_shared_expert
+    if view.moe_a2a_backend in ("deepep", "megamoe") and (
+        view.enable_waterfill or routes_shared
+    ):
         if view.disable_shared_experts_fusion:
             logger.warning(
                 "disable_shared_experts_fusion is overridden to False because Waterfill requires shared expert fusion."
@@ -1596,6 +1605,11 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 def _a2a_backend_overrides(view: Any) -> dict:
 
     moe_a2a_backend = view.moe_a2a_backend
+    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+
+    pipeline = get_moe_load_balancer_pipeline(view.moe_load_balancer_algorithm)
+    if pipeline is not None and pipeline.capabilities.requires_deepep:
+        moe_a2a_backend = "deepep"
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "
