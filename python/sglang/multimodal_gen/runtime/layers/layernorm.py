@@ -4,7 +4,6 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
 
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -30,6 +29,7 @@ from sglang.kernels.ops.layernorm.rmsnorm_hf import (
     is_supported_rmsnorm_hf_hidden_size,
     rmsnorm_hf,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1155,12 +1155,7 @@ def apply_qk_norm_rope(
         raise ValueError(
             f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
         )
-    fused_enabled = os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    fused_enabled = envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
     q_has_supported_layout = q.is_contiguous()
     k_has_supported_layout = k.is_contiguous()
     if allow_strided_qk:

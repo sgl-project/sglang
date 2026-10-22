@@ -36,9 +36,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
-    canonical_quantization_method,
-)
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -251,6 +248,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "AnimaPipelineConfig",
+        "Flux3ImagePipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -269,6 +267,13 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
+)
+
+# Pipeline configs identified purely by ``--pipeline-class-name`` (their weights
+# are local paths, not HuggingFace ids), so the model-id whitelist does not
+# apply: selecting the pipeline is already an explicit opt-in.
+BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS = frozenset(
+    {"Flux3ImagePipelineConfig"}
 )
 
 
@@ -478,9 +483,6 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
-    _automatic_component_attention_backend_keys: set[str] = field(
-        default_factory=set, init=False, repr=False
-    )
     _required_resident_components: set[str] = field(
         default_factory=set, init=False, repr=False
     )
@@ -628,8 +630,6 @@ class ServerArgs(DisaggServerArgsMixin):
     decoder_sp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
-    pool_control_endpoint: str | None = None
-    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -818,13 +818,17 @@ class ServerArgs(DisaggServerArgsMixin):
         # branches on Python-side state replays its capture-time branch.
         if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-            and self._is_breakable_cuda_graph_supported_model()
+            and (
+                pipeline_config_name
+                in BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS
+                or self._is_breakable_cuda_graph_supported_model()
+            )
         ):
             logger.warning(
                 "[Diffusion BCG] not validated for %s (%s); enabling it as "
                 "requested. Warmup warns if nothing gets captured; compare outputs "
                 "against eager before relying on it. Validated: Anima Base v1.0, "
-                "FLUX.1-dev, FLUX.2-Klein, "
+                "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
                 "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
@@ -1171,7 +1175,6 @@ class ServerArgs(DisaggServerArgsMixin):
                     logger.info(
                         "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
                     )
-                    self._automatic_component_attention_backend_keys.add("text_encoder")
                 else:
                     logger.warning(
                         "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
@@ -1210,7 +1213,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder; laser_attn applies to the transformer"
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
-            self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
             if (
@@ -1451,15 +1453,6 @@ class ServerArgs(DisaggServerArgsMixin):
     ) -> None:
         """Select a component's backend on the user's behalf."""
         self.component_attention_backends[component_name] = backend
-        self._automatic_component_attention_backend_keys.add(component_name)
-
-    def is_component_attention_backend_automatic(
-        self, component_name: str | None
-    ) -> bool:
-        return (
-            component_name is not None
-            and component_name in self._automatic_component_attention_backend_keys
-        )
 
     def resolve_component_backend_by_role(
         self, *component_names: str | None
@@ -2111,14 +2104,10 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
             normalized_direct_gpu_loading[component_name] = enabled
         self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
-        if self.quantization is not None:
-            self.quantization = canonical_quantization_method(self.quantization)
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
-            quantization = canonical_quantization_method(
-                str(quantization).strip().lower()
-            )
+            quantization = str(quantization).strip().lower()
             if not component or not quantization:
                 raise ValueError(
                     "Component quantization entries require a component and method"
@@ -2955,8 +2944,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
                 "12.0 and 12.1, else on comfy_kitchen; see "
-                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND; 'kitchen_int8' is a "
-                "deprecated alias). Other methods "
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "

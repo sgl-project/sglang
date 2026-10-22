@@ -317,6 +317,12 @@ def handle_data_parallelism(server_args: Any):
             "_handle_data_parallelism",
             schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
         )
+        if envs.SGLANG_RUST_SERVER.get():
+            declare_resolution(
+                server_args,
+                "_handle_data_parallelism",
+                enable_dp_attention_local_control_broadcast=True,
+            )
         assert cfg.tp_size % cfg.attn_dp_size == 0
         original_chunked_prefill_size = cfg.chunked_prefill_size
         declare_resolution(
