@@ -5,14 +5,21 @@ import logging
 import os
 import random
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import psutil
 import zmq
+from zmq.auth.thread import ThreadAuthenticator
 
 logger = logging.getLogger(__name__)
+
+# libzmq allows one ZAP handler per context, so sockets created from the same
+# context share an authenticator. Keyed by `zmq.Context.underlying`.
+_zmq_authenticators: dict[int, ThreadAuthenticator] = {}
+_zmq_authenticators_lock = threading.Lock()
 
 
 def get_open_port() -> int:
@@ -222,10 +229,33 @@ def bind_port(port):
     return try_bind_socket(port=port, listen=True)
 
 
+def restrict_zmq_peers(context: zmq.Context, socket: zmq.Socket) -> None:
+    """Reject TCP peers outside `SGLANG_ZMQ_ALLOWED_PEERS` (CVE-2026-93034).
+
+    Must be called before `socket` binds. No-op when the allowlist is unset.
+    """
+    from sglang.srt.environ import envs
+
+    peers = envs.SGLANG_ZMQ_ALLOWED_PEERS.get()
+    if not peers:
+        return
+    with _zmq_authenticators_lock:
+        if context.underlying not in _zmq_authenticators:
+            auth = ThreadAuthenticator(context)
+            auth.start()
+            # ZAP compares the peer address as a string; libzmq formats it
+            # the same way as `ipaddress` (compressed, lowercase).
+            auth.allow(*(ipaddress.ip_address(p).compressed for p in peers))
+            _zmq_authenticators[context.underlying] = auth
+    # ZAP only vets NULL-mechanism connections when a domain is set.
+    socket.zap_domain = b"sglang"
+
+
 def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    restrict_peers: bool = False,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -236,12 +266,16 @@ def get_zmq_socket_on_host(
             "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
             sockets to the network (CVE-2026-3060). Callers that need
             cross-machine reachability must pass an explicit host.
+        restrict_peers: Apply `restrict_zmq_peers`. Off by default because
+            disaggregation sockets accept peers from other jobs.
 
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
     config_socket(socket, socket_type)
+    if restrict_peers:
+        restrict_zmq_peers(context, socket)
     if host is None:
         host = "127.0.0.1"
     if is_valid_ipv6_address(host):
@@ -420,6 +454,7 @@ def get_zmq_socket(
     if endpoint is None:
         # Bind to random TCP port
         config_socket(socket, socket_type)
+        restrict_zmq_peers(context, socket)
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
     else:
@@ -429,11 +464,43 @@ def get_zmq_socket(
         config_socket(socket, socket_type)
 
         if bind:
+            if endpoint.startswith("tcp://"):
+                restrict_zmq_peers(context, socket)
             socket.bind(endpoint)
         else:
-            socket.connect(endpoint)
+            zmq_connect(socket, endpoint)
 
         return socket
+
+
+def zmq_connect(socket: zmq.Socket, endpoint: str) -> None:
+    """Connect `socket`, pinning TCP connects to `SGLANG_ZMQ_SOURCE_IP`.
+
+    `restrict_zmq_peers` admits peers by source address. On a host with
+    several addresses (e.g. a container on host networking) the kernel may
+    pick a source outside the allowlist, and a rejected PUSH blocks forever.
+    The pin uses libzmq's `tcp://<source_endpoint>;<endpoint>` form, zmq_tcp(7).
+    """
+    socket.connect(_with_source_ip(endpoint))
+
+
+def _with_source_ip(endpoint: str) -> str:
+    from sglang.srt.environ import envs
+
+    source = envs.SGLANG_ZMQ_SOURCE_IP.get()
+    if not source or not endpoint.startswith("tcp://") or ";" in endpoint:
+        return endpoint
+    address = endpoint[len("tcp://") :]
+    host = address.rsplit(":", 1)[0].strip("[]")
+    try:
+        source_ip, host_ip = ipaddress.ip_address(source), ipaddress.ip_address(host)
+    except ValueError:
+        return endpoint
+    # A source of the other family cannot reach the host.
+    if source_ip.version != host_ip.version:
+        return endpoint
+    source_host = f"[{source_ip}]" if source_ip.version == 6 else str(source_ip)
+    return f"tcp://{source_host}:0;{address}"
 
 
 def is_zmq_endpoint_ipv6(endpoint: str) -> bool:

@@ -12,6 +12,7 @@ Modules, in dependency order (there are no cycles)::
     toolchain  compilers, tvm-ffi locations, platform base flags
     ninja      generating and running build.ninja, reading its depfiles
     cache      build_key / deps_key, cache layout, publication
+    sailify    CUDA -> PPU source conversion for hgcc builds
     loader     load_jit
     parallel   parallel_compile: several builds at once
 """

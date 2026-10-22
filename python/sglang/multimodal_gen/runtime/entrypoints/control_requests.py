@@ -25,9 +25,7 @@ class SetLoraReq(msgspec.Struct):
 
 class MergeLoraWeightsReq(msgspec.Struct):
     target: str = "all"
-    # Default 1.0 matches the old behavior; an explicit None keeps each
-    # adapter's own strength.
-    strength: Optional[float] = 1.0
+    strength: float = 1.0
 
 
 class UnmergeLoraWeightsReq(msgspec.Struct):

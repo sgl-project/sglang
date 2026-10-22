@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.fused_packed_swiglu_fp8_rowwise",
+        KernelBackend.TRITON,
+        "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
+        frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    ),
+    (
         "diffusion.residual_gate_fp32",
         KernelBackend.TRITON,
         "modulate.residual_gate_fp32:residual_gate_fp32",
@@ -149,7 +155,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.scale_residual_norm_scale_shift_nvfp4",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.norm_scale_shift_jit:try_fused_scale_residual_norm_scale_shift_nvfp4",
         _CUDA,
     ),
@@ -173,13 +179,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.layernorm_modulate",
-        KernelBackend.TRITON,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate",
         _CUDA,
     ),
     (
         "diffusion.qk_head_layernorm",
-        KernelBackend.TRITON,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_qk_head_layernorm",
         _CUDA,
     ),
@@ -346,6 +352,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.flux3_video_qknorm_rope",
+        KernelBackend.TRITON,
+        "rope.flux3_video_qknorm_rope_triton:flux3_video_qknorm_rope",
+        _CUDA,
+    ),
+    (
         "diffusion.interleaved_rope_fp64",
         KernelBackend.JIT,
         "rope.interleaved_rope_fp64_jit:fused_interleaved_rope_fp64",
@@ -504,13 +516,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
         "diffusion.silu_mul_mxfp8",
         KernelBackend.TRITON,
-        "sglang.kernels.ops.quantization.mxfp8_swizzled_triton:silu_mul_mxfp8",
+        "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:silu_mul_mxfp8",
         _CUDA,
     ),
     (
         "diffusion.indexed_scale_shift_mxfp8_",
         KernelBackend.TRITON,
-        "sglang.kernels.ops.quantization.mxfp8_swizzled_triton:indexed_scale_shift_mxfp8_",
+        "modulate.indexed_scale_shift_mxfp8_triton:indexed_scale_shift_mxfp8_",
         _CUDA,
     ),
     (
@@ -612,6 +624,7 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
@@ -727,6 +740,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
     "fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
+    "flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
@@ -786,10 +801,10 @@ _EXPORTS: dict[str, str] = {
     "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
     "can_use_mxfp8_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
-    "can_use_silu_mul_mxfp8": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
-    "indexed_scale_shift_mxfp8_": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
+    "can_use_silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
+    "indexed_scale_shift_mxfp8_": "modulate.indexed_scale_shift_mxfp8_triton",
     "mxfp8_quantize_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
-    "silu_mul_mxfp8": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
+    "silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",

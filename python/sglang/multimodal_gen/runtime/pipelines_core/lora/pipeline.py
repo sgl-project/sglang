@@ -46,7 +46,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     get_peft_lora_alpha,
     load_peft_config,
-    lora_rank,
     scale_fused_sections,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -151,7 +150,7 @@ def _store_fused_lora_groups(
             a_list, scaled_b or b_list, None if scaled_b else adapter_alpha
         )
         if scaled_b:
-            fused_alpha = lora_rank(a.shape)
+            fused_alpha = a.shape[-2]
         adapter[str(a_key)] = a.to(device)
         adapter[b_key] = b.to(device)
         if fused_alpha is not None:
@@ -168,7 +167,6 @@ class LoRAPipeline(ComposedPipelineBase):
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
-    loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
@@ -200,7 +198,6 @@ class LoRAPipeline(ComposedPipelineBase):
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
-        self.loaded_adapter_files = {}
         self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
@@ -801,70 +798,71 @@ class LoRAPipeline(ComposedPipelineBase):
         missing_layers_by_adapter = [[] for _ in lora_nicknames]
         applied_count_by_adapter = [0 for _ in lora_nicknames]
         for name, layer in lora_layers.items():
-            applicable = [
-                idx
-                for idx, nickname in enumerate(lora_nicknames)
-                if name + ".lora_A" in self.lora_adapters[nickname]
-                and name + ".lora_B" in self.lora_adapters[nickname]
-            ]
-            for idx in range(len(lora_nicknames)):
-                if idx not in applicable:
-                    missing_layers_by_adapter[idx].append(name)
-            if not applicable:
-                if clear_existing:
-                    # A previous adapter may still be merged here.
-                    if layer.merged:
-                        layer.unmerge_lora_weights()
-                    layer.clear_lora_weights()
-                    layer.disable_lora = True
-                elif not layer.lora_weights_list:
-                    layer.disable_lora = True
-                continue
-
-            use_cache = merge_cache is not None and merge_weights
+            adapted_before = adapted_count
             # Apply all LoRA adapters in order
-            for pos, idx in enumerate(applicable):
-                nickname = lora_nicknames[idx]
-                path = lora_paths[idx]
-                lora_strength = strengths[idx]
+            for idx, (nickname, path, lora_strength) in enumerate(
+                zip(lora_nicknames, lora_paths, strengths)
+            ):
                 lora_A_name = name + ".lora_A"
                 lora_B_name = name + ".lora_B"
-                inferred_rank = lora_rank(
-                    self.lora_adapters[nickname][lora_A_name].shape
-                )
-                alpha_key = name + ".alpha"
-                adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
-                if alpha_key in self.lora_adapters[nickname]:
-                    inferred_alpha = float(
-                        self.lora_adapters[nickname][alpha_key].item()
+                if (
+                    lora_A_name in self.lora_adapters[nickname]
+                    and lora_B_name in self.lora_adapters[nickname]
+                ):
+                    inferred_rank = int(
+                        self.lora_adapters[nickname][lora_A_name].shape[-2]
                     )
-                elif adapter_lora_alpha is not None:
-                    inferred_alpha = adapter_lora_alpha
+                    alpha_key = name + ".alpha"
+                    adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
+                    if alpha_key in self.lora_adapters[nickname]:
+                        inferred_alpha = int(
+                            self.lora_adapters[nickname][alpha_key].item()
+                        )
+                    elif adapter_lora_alpha is not None:
+                        inferred_alpha = adapter_lora_alpha
+                    else:
+                        # Some distilled LoRAs omit per-layer alpha and rely on the
+                        # default LoRA scale of alpha == rank. Falling back to rank
+                        # keeps the effective delta consistent with the official path.
+                        inferred_alpha = inferred_rank
+
+                    layer.lora_rank = inferred_rank
+                    layer.lora_alpha = inferred_alpha
+
+                    use_cache = merge_cache is not None and merge_weights
+                    layer.set_lora_weights(
+                        self.lora_adapters[nickname][lora_A_name],
+                        self.lora_adapters[nickname][lora_B_name],
+                        output_offset=self.lora_adapters[nickname].get(
+                            name + ".lora_output_offset"
+                        ),
+                        lora_path=path,
+                        strength=lora_strength,
+                        merge_weights=merge_weights and not use_cache,
+                        # Clear on the first adapter that covers this layer
+                        clear_existing=clear_existing
+                        and adapted_count == adapted_before,
+                    )
+                    if use_cache and idx == len(lora_nicknames) - 1:
+                        self._merge_via_cache(name, layer, merge_cache)
+                    adapted_count += 1
+                    applied_count_by_adapter[idx] += 1
                 else:
-                    # Some distilled LoRAs omit per-layer alpha and rely on the
-                    # default LoRA scale of alpha == rank. Falling back to rank
-                    # keeps the effective delta consistent with the official path.
-                    inferred_alpha = inferred_rank
-
-                layer.lora_rank = inferred_rank
-                layer.lora_alpha = inferred_alpha
-
-                layer.set_lora_weights(
-                    self.lora_adapters[nickname][lora_A_name],
-                    self.lora_adapters[nickname][lora_B_name],
-                    output_offset=self.lora_adapters[nickname].get(
-                        name + ".lora_output_offset"
-                    ),
-                    lora_path=path,
-                    strength=lora_strength,
-                    merge_weights=merge_weights and not use_cache,
-                    # Clear on the first adapter that actually covers this layer
-                    clear_existing=clear_existing and pos == 0,
-                )
-                adapted_count += 1
-                applied_count_by_adapter[idx] += 1
-            if use_cache:
-                self._merge_via_cache(name, layer, merge_cache)
+                    missing_layers_by_adapter[idx].append(name)
+                    # Only disable if no LoRA was applied at all
+                    if idx == len(lora_nicknames) - 1:
+                        has_any_lora = any(
+                            name + ".lora_A" in self.lora_adapters[n]
+                            and name + ".lora_B" in self.lora_adapters[n]
+                            for n in lora_nicknames
+                        )
+                        if not has_any_lora:
+                            # A previous adapter may still be merged here.
+                            if clear_existing:
+                                if layer.merged:
+                                    layer.unmerge_lora_weights()
+                                layer.clear_lora_weights()
+                            layer.disable_lora = True
 
         if rank == 0:
             total_layers = len(lora_layers)
@@ -1022,7 +1020,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
-        # Built locally and swapped in at the end so a failed load keeps the old adapter.
+        # Swapped in at the end so a failed load keeps the previous adapter.
         new_adapter: dict[str, torch.Tensor] = {}
 
         config = self.server_args.pipeline_config.dit_config.arch_config
@@ -1039,7 +1037,7 @@ class LoRAPipeline(ComposedPipelineBase):
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
-            name = name.removesuffix(".weight")
+            name = name.replace(".weight", "")
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
@@ -1049,7 +1047,7 @@ class LoRAPipeline(ComposedPipelineBase):
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
                 # A/B of one fused layer must be laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
+                if target_name.endswith((".lora_A", ".lora_B")):
                     continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
@@ -1081,7 +1079,6 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_adapters[lora_nickname] = new_adapter
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
-        self.loaded_adapter_files[lora_nickname] = lora_local_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
@@ -1191,7 +1188,6 @@ class LoRAPipeline(ComposedPipelineBase):
             )
 
             # Skip if LoRA configuration matches exactly (including order and strength)
-            # Modules can hold different configs after per-module targets, so check each
             first_module_name, first_lora_layers_dict = target_modules[0]
             first_effective_merge_weights = self._should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
@@ -1267,7 +1263,6 @@ class LoRAPipeline(ComposedPipelineBase):
                             tgt_paths,
                             tgt_strengths,
                             enabled=cache_merged and effective_merge_weights,
-                            nicknames=tgt_nicknames,
                         )
                         count = self._apply_lora_to_layers(
                             lora_layers_dict,
@@ -1385,7 +1380,6 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_paths: list[str | None],
         strengths: list[float],
         enabled: bool,
-        nicknames: list[str] | None = None,
     ) -> LoraMergeCache | None:
         if not enabled or envs.SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE:
             return None
@@ -1399,21 +1393,9 @@ class LoRAPipeline(ComposedPipelineBase):
             # Sharded weights would need per-rank stores; not worth it until a
             # multi-GPU consumer deployment exists.
             return None
-        # Key on the resolved local file: the user-facing path may be a repo id.
-        files = [
-            (
-                getattr(self, "loaded_adapter_files", {}).get(nicknames[i])
-                if nicknames
-                else None
-            )
-            or path
-            for i, path in enumerate(lora_paths)
-        ]
-        if not all(os.path.isfile(f) for f in files):
-            return None
         adapters = [
-            (f, strength, self.server_args.lora_alpha)
-            for f, strength in zip(files, strengths)
+            (path, strength, self.server_args.lora_alpha)
+            for path, strength in zip(lora_paths, strengths)
         ]
         key = lora_merge_cache_key([self.server_args.model_path, module_name], adapters)
         expected = sum(
@@ -1458,23 +1440,18 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
                 self.cur_adapter_config.pop(module_name, None)
-                self.cur_adapter_name.pop(module_name, None)
-                self.cur_adapter_path.pop(module_name, None)
                 logger.info("LoRA weights deactivated for %s", module_name)
 
     def _record_merge_strength(self, module_name: str, strength: float) -> None:
         self.cur_adapter_strength[module_name] = strength
         config = self.cur_adapter_config.get(module_name)
         if config is not None:
-            nicknames, _ = config
             self.cur_adapter_config[module_name] = (
-                nicknames,
-                [strength] * len(nicknames),
+                config[0],
+                [strength] * len(config[0]),
             )
 
-    def merge_lora_weights(
-        self, target: str = "all", strength: float | None = None
-    ) -> None:
+    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights into the base model for the specified target.
 
@@ -1483,8 +1460,7 @@ class LoRAPipeline(ComposedPipelineBase):
         Args:
             target: Which transformer(s) to merge. One of "all", "transformer",
                     "transformer_2", "critic".
-            strength: Override applied to every adapter on the target. None keeps
-                    each adapter's own strength.
+            strength: LoRA strength for merge, default 1.0.
         """
         self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
@@ -1504,11 +1480,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         if layer.merged:
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
-                        if strength is not None:
-                            layer.strength = strength
+                        layer.strength = strength
                     self.is_lora_merged[module_name] = False
-                    if strength is not None:
-                        self._record_merge_strength(module_name, strength)
+                    self._record_merge_strength(module_name, strength)
                     logger.info(
                         "Dynamic LoRA activated for %s (strength: %s)",
                         module_name,
@@ -1517,9 +1491,13 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
                 if self.is_lora_merged.get(module_name, False):
                     # Check if strength is the same - if so, skip (idempotent)
-                    if strength is None or (
-                        self.cur_adapter_strength.get(module_name) == strength
-                    ):
+                    config = self.cur_adapter_config.get(module_name)
+                    current = (
+                        config[1]
+                        if config
+                        else [self.cur_adapter_strength.get(module_name)]
+                    )
+                    if all(s == strength for s in current):
                         logger.warning(
                             "LoRA weights are already merged for %s with same strength",
                             module_name,
@@ -1542,8 +1520,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         logger.warning("Could not merge layer %s: %s", name, e)
                         continue
                 self.is_lora_merged[module_name] = True
-                if strength is not None:
-                    self._record_merge_strength(module_name, strength)
+                self._record_merge_strength(module_name, strength)
                 logger.info(
                     "LoRA weights merged for %s (strength: %s)", module_name, strength
                 )
@@ -1571,24 +1548,8 @@ class LoRAPipeline(ComposedPipelineBase):
         if not target_modules:
             return
 
-        merged_modules = [
-            (module_name, lora_layers_dict)
-            for module_name, lora_layers_dict in target_modules
-            if self.is_lora_merged.get(module_name, False)
-        ]
-        # One context for the merged modules only; entering it per module would
-        # re-materialize every target each time.
-        with self._weight_update_context(merged_modules):
-            self._unmerge_target_modules(target_modules)
-        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-            finish_offload_writeback,
-        )
+        # Disable layerwise offload if enabled: load all layers to GPU
 
-        finish_offload_writeback()
-
-    def _unmerge_target_modules(
-        self, target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]]
-    ) -> None:
         for module_name, lora_layers_dict in target_modules:
             if not self.is_lora_merged.get(module_name, False):
                 if self._has_active_unmerged_lora(lora_layers_dict):
@@ -1603,29 +1564,35 @@ class LoRAPipeline(ComposedPipelineBase):
                         "LoRA weights are not merged for %s, skipping", module_name
                     )
                 continue
-            for name, layer in lora_layers_dict.items():
-                # Check layer-level state to avoid raising exception
-                if hasattr(layer, "merged") and not layer.merged:
-                    logger.warning("Layer %s is not merged, skipping", name)
-                    # Still disable LoRA to prevent on-the-fly computation
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                    continue
-                try:
-                    layer.unmerge_lora_weights()
-                    # Disable LoRA after unmerge to prevent on-the-fly computation
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                except ValueError as e:
-                    logger.warning("Could not unmerge layer %s: %s", name, e)
-                    # Still disable LoRA even if unmerge failed
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                    continue
-            self.is_lora_merged[module_name] = False
-            self.cur_adapter_strength.pop(module_name, None)
-            self.cur_adapter_config.pop(module_name, None)
+            with self._weight_update_context(target_modules):
+                for name, layer in lora_layers_dict.items():
+                    # Check layer-level state to avoid raising exception
+                    if hasattr(layer, "merged") and not layer.merged:
+                        logger.warning("Layer %s is not merged, skipping", name)
+                        # Still disable LoRA to prevent on-the-fly computation
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                        continue
+                    try:
+                        layer.unmerge_lora_weights()
+                        # Disable LoRA after unmerge to prevent on-the-fly computation
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                    except ValueError as e:
+                        logger.warning("Could not unmerge layer %s: %s", name, e)
+                        # Still disable LoRA even if unmerge failed
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                        continue
+                self.is_lora_merged[module_name] = False
+                self.cur_adapter_strength.pop(module_name, None)
+                self.cur_adapter_config.pop(module_name, None)
             logger.info("LoRA weights unmerged for %s", module_name)
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            finish_offload_writeback,
+        )
+
+        finish_offload_writeback()
 
     def get_lora_status(self) -> dict[str, Any]:
         """

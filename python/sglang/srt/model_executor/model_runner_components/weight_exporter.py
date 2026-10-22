@@ -24,11 +24,19 @@ class WeightExporter:
     get_model: Callable[[], Any]
     _weights_send_group: dict = field(default_factory=dict)
 
-    def _check_weight_export_supported(self):
+    def _weight_export_unsupported_reason(self) -> Optional[str]:
         for module in self.get_model().modules():
             reason = getattr(module, "_weight_export_error", None)
             if reason is not None:
-                raise RuntimeError(reason)
+                return reason
+        return None
+
+    def _check_weight_export_supported(self):
+        # Save paths run under handle_rpc_request, which reports the raise as a
+        # failed RpcReqOutput; direct control requests return their failure.
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            raise RuntimeError(reason)
 
     def init_weights_send_group_for_remote_instance(
         self,
@@ -39,7 +47,10 @@ class WeightExporter:
         group_name,
         backend="nccl",
     ):
-        self._check_weight_export_supported()
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return False, reason
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -88,7 +99,10 @@ class WeightExporter:
         ports,
         group_name,
     ):
-        self._check_weight_export_supported()
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return False, reason
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -160,7 +174,10 @@ class WeightExporter:
         Only used for unit test with an unoptimized performance.
         For optimized performance, please use torch.save and torch.load.
         """
-        self._check_weight_export_supported()
+        reason = self._weight_export_unsupported_reason()
+        if reason is not None:
+            logger.error(reason)
+            return None
         # TODO: (chenyang) Add support for Qwen models.
         try:
             return self.get_model().get_weights_by_name(

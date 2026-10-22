@@ -20,7 +20,7 @@ use crate::message::ids::Rid;
 #[cfg(test)]
 use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
-use crate::message::wire::merge_preferred_sampling;
+use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
     response::{error_response, error_value},
@@ -196,12 +196,22 @@ async fn generate(
     {
         return native_error(StatusCode::BAD_REQUEST, &error, false);
     }
+    // Read before the fills below: only a `max_new_tokens` the client sent is
+    // checked against the context window.
+    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
     if let Some(preferred) = &state.server_args.preferred_sampling_params
         && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
     {
+        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
+    }
+    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
+    let default_max_new_tokens = serde_json::json!({
+        "max_new_tokens": state.server_args.default_max_new_tokens,
+    });
+    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
     }
     // The schema (sglang_api_types) is the contract: decode errors carry
@@ -213,13 +223,14 @@ async fn generate(
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (payloads, is_batch) = match into_requests(body, &state.generation_policy) {
+    let (mut payloads, is_batch) = match into_requests(body, &state.generation_policy) {
         Ok(v) => v,
         // Request normalization only returns validation failures.
         Err(e) => {
             return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
         }
     };
+    client_max_new_tokens.mark(&mut payloads);
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
@@ -705,6 +716,155 @@ mod tests {
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
         assert_eq!(value["meta_info"]["completion_tokens"], 1);
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
+    /// whether that value is marked defaulted.
+    async fn submitted_max_new_tokens(
+        server_args: crate::message::config::ServerArgs,
+        body: serde_json::Value,
+        items: usize,
+    ) -> Vec<(Option<i64>, bool)> {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = crate::api_server::core::CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            crate::api_server::core::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                metadata: crate::api_server::core::CoreMetadata::default(),
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            generation_policy: GenerationPolicy::from(&server_args),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+        });
+        let responder = tokio::spawn(async move {
+            let mut submitted = Vec::new();
+            for _ in 0..items {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected an intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("/generate must submit a generation request");
+                };
+                submitted.push((
+                    generate.sampling_params.max_new_tokens,
+                    generate.max_new_tokens_defaulted,
+                ));
+                request.sink.try_send(done(0, "ok")).unwrap();
+            }
+            submitted
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        responder.await.unwrap()
+    }
+
+    /// An item whose `sampling_params` name no `max_new_tokens` is marked
+    /// defaulted and keeps the value the fills gave it (the preferred one, else
+    /// the launch default); one that names it, even as null, keeps the client's. A
+    /// list is marked object by object, and one object marks every item.
+    #[tokio::test]
+    async fn generate_marks_each_max_new_tokens_the_client_omits() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        let args = |preferred: Option<serde_json::Value>| ServerArgs {
+            preferred_sampling_params: preferred.map(PreferredSamplingParams),
+            ..Default::default()
+        };
+        let preferred = Some(serde_json::json!({"temperature": 1.0, "max_new_tokens": 4096}));
+        let cases = [
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1]}),
+                vec![(Some(4096), true)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"top_p": 0.5}}),
+                vec![(Some(4096), true)],
+            ),
+            (
+                args(None),
+                serde_json::json!({"input_ids": [1]}),
+                vec![(Some(128), true)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": 8}}),
+                vec![(Some(8), false)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": null}}),
+                vec![(None, false)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({
+                    "input_ids": [[1], [2]],
+                    "sampling_params": [{}, {"max_new_tokens": 8}],
+                }),
+                vec![(Some(4096), true), (Some(8), false)],
+            ),
+            (
+                args(preferred),
+                serde_json::json!({
+                    "input_ids": [[1], [2]],
+                    "sampling_params": {"max_new_tokens": 8},
+                }),
+                vec![(Some(8), false), (Some(8), false)],
+            ),
+        ];
+        for (server_args, body, expected) in cases {
+            let submitted =
+                submitted_max_new_tokens(server_args, body.clone(), expected.len()).await;
+            assert_eq!(submitted, expected, "{body}");
+        }
+    }
+
+    /// An omitted `max_new_tokens` takes the launch default, beneath the
+    /// request's own value and the preferred sampling params; a `None`
+    /// default is no limit. Whichever fill supplies it, it is marked defaulted.
+    #[tokio::test]
+    async fn omitted_max_new_tokens_takes_the_launch_default() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        let args = |default_max_new_tokens, preferred: Option<serde_json::Value>| ServerArgs {
+            default_max_new_tokens,
+            preferred_sampling_params: preferred.map(PreferredSamplingParams),
+            ..Default::default()
+        };
+        let omitted = serde_json::json!({"input_ids": [1, 2]});
+        let explicit = serde_json::json!({
+            "input_ids": [1, 2],
+            "sampling_params": {"max_new_tokens": 3},
+        });
+        let preferred = Some(serde_json::json!({"max_new_tokens": 7}));
+        for (server_args, body, expected) in [
+            (args(Some(4096), None), &omitted, (Some(4096), true)),
+            (args(None, None), &omitted, (None, true)),
+            (args(Some(4096), preferred), &omitted, (Some(7), true)),
+            (args(Some(4096), None), &explicit, (Some(3), false)),
+        ] {
+            assert_eq!(
+                submitted_max_new_tokens(server_args, body.clone(), 1).await,
+                vec![expected],
+                "{body}"
+            );
+        }
     }
 
     #[test]
