@@ -852,9 +852,9 @@ class NemotronHModel(nn.Module):
             self.norm_f = PPMissingLayer(return_tuple=True)
         self.layers_to_capture: set[int] = set()
 
-    @property
-    def supports_hybrid_prefill_graph(self) -> bool:
-        return is_sm120()
+    # The breakable prefill graph runs the attention and Mamba2 layers in its
+    # breaks and the MoE layers through their MoE handler, on every GPU.
+    supports_hybrid_prefill_graph = True
 
     def forward(
         self,
@@ -1224,6 +1224,17 @@ class NemotronHForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
+        else:
+            # Layer i's output is captured at the input of layer i + 1.
+            self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         if not self.pp_group.is_last_rank:

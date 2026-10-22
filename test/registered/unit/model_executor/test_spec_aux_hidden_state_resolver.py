@@ -22,6 +22,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state as _mod
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, stage="weekly", runner_config="cpu")
@@ -38,7 +40,7 @@ def _config(*, num_nextn_predict_layers, num_hidden_layers=1):
 
 
 class TestEagleResolverDraftConfig(unittest.TestCase):
-    def _resolve_with(self, *, draft_path, target, draft):
+    def _resolve_with(self, *, draft_path, target, draft, spec_algorithm=None):
         """Run the EAGLE resolver with the config factory stubbed: `draft`
         answers the draft-mode read, `target` is the runner's own config."""
         config = _mod.SpecAuxHiddenStateConfig()
@@ -56,10 +58,12 @@ class TestEagleResolverDraftConfig(unittest.TestCase):
                 config=config,
                 server_args=None,
                 model_config=target,
-                spec_algorithm=SimpleNamespace(
+                spec_algorithm=spec_algorithm
+                or SimpleNamespace(
                     is_eagle=lambda: True,
                     is_standalone=lambda: False,
                     is_eagle3=lambda: False,
+                    uses_aux_hidden_states=lambda: False,
                 ),
                 is_draft_worker=False,
             )
@@ -85,6 +89,43 @@ class TestEagleResolverDraftConfig(unittest.TestCase):
         self.assertIs(config.draft_model_config, draft)
         self.assertEqual(config.draft_kv_num_layers, 2)
         self.assertEqual(config.eagle_draft_num_layers, 2)
+
+    def test_aux_capture_follows_uses_aux_hidden_states_not_is_eagle3(self):
+        """A plugin that captures aux hidden states gets EAGLE-3's capture
+        config while it stays out of every other is_eagle3() branch; an
+        EAGLE-family plugin that does not ask captures nothing."""
+
+        class EaglePlugin(CustomSpecAlgo):
+            def is_eagle(self):
+                return True
+
+        class AuxPlugin(EaglePlugin):
+            def uses_aux_hidden_states(self):
+                return True
+
+        draft = _config(num_nextn_predict_layers=None, num_hidden_layers=1)
+        draft.hf_config = SimpleNamespace(
+            eagle_config={"eagle_aux_hidden_state_layer_ids": [1, 30, 60]}
+        )
+        for algo, captures in (
+            (AuxPlugin("AUX", factory=None), True),
+            (EaglePlugin("PLAIN", factory=None), False),
+            (SpeculativeAlgorithm.EAGLE3, True),
+            (SpeculativeAlgorithm.EAGLE, False),
+        ):
+            with self.subTest(algo=algo):
+                config = self._resolve_with(
+                    draft_path="/draft",
+                    target=_config(num_nextn_predict_layers=None),
+                    draft=draft,
+                    spec_algorithm=algo,
+                )
+                self.assertIs(config.eagle_use_aux_hidden_state, captures)
+                self.assertEqual(
+                    config.eagle_aux_hidden_state_layer_ids,
+                    [1, 30, 60] if captures else None,
+                )
+        self.assertFalse(AuxPlugin("AUX", factory=None).is_eagle3())
 
 
 class TestDSparkResolverStages(unittest.TestCase):

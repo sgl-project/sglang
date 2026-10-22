@@ -359,6 +359,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_beta = b_b
         else:
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+            # GDN prefill (fused_gdn_gating) and decode (fused_recurrent) round
+            # sigmoid(b) to the input dtype; do the same so a verify step updates
+            # the state exactly like the decode step it replaces. KDA keeps fp32.
+            if not IS_KDA:
+                b_beta = b_beta.to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --

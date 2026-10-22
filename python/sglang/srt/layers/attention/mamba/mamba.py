@@ -15,6 +15,9 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.distributed import (
     divide,
 )
+from sglang.srt.layers.attention.linear.verify_extension import (
+    LinearAttnVerifyExtension,
+)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.dp_attention import (
@@ -457,7 +460,11 @@ class MambaMixer2(torch.nn.Module):
         metadata: Mamba2Metadata,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        verify_extension: Optional[LinearAttnVerifyExtension] = None,
     ):
+        # `verify_extension`: the algorithm's target-verify kernels for this
+        # forward (linear/verify_extension.py), set only for a target verify
+        # with tree links.
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
         # need a stable buffer); otherwise the caller uses the return value and
@@ -670,19 +677,34 @@ class MambaMixer2(torch.nn.Module):
                     num_decodes, draft_token_num, -1
                 ).transpose(1, 2)
 
-                hidden_states_B_C_d_processed = causal_conv1d_update_triton(
-                    hidden_states_B_C_d_reshaped,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_tensor_d[:num_decodes],
-                    intermediate_conv_window=layer_cache.intermediate_conv_window[0],
-                    intermediate_state_indices=self.intermediate_state_indices,
-                    retrieve_next_token=metadata.retrieve_next_token,
-                    retrieve_next_sibling=metadata.retrieve_next_sibling,
-                    retrieve_parent_token=metadata.retrieve_parent_token,
-                )
+                hidden_states_B_C_d_processed = None
+                if verify_extension is not None:
+                    hidden_states_B_C_d_processed = verify_extension.conv_update(
+                        self,
+                        hidden_states_B_C_d_reshaped,
+                        conv_states=conv_state,
+                        cache_indices=state_indices_tensor_d[:num_decodes],
+                        intermediate_conv_window=layer_cache.intermediate_conv_window[
+                            0
+                        ],
+                        intermediate_state_indices=self.intermediate_state_indices,
+                    )
+                if hidden_states_B_C_d_processed is None:
+                    hidden_states_B_C_d_processed = causal_conv1d_update_triton(
+                        hidden_states_B_C_d_reshaped,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=state_indices_tensor_d[:num_decodes],
+                        intermediate_conv_window=layer_cache.intermediate_conv_window[
+                            0
+                        ],
+                        intermediate_state_indices=self.intermediate_state_indices,
+                        retrieve_next_token=metadata.retrieve_next_token,
+                        retrieve_next_sibling=metadata.retrieve_next_sibling,
+                        retrieve_parent_token=metadata.retrieve_parent_token,
+                    )
                 hidden_states_B_C_d = hidden_states_B_C_d_processed.transpose(
                     1, 2
                 ).view(num_decode_tokens, -1)
@@ -718,40 +740,54 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
             if is_target_verify:
-                selective_state_update(
-                    ssm_state,
-                    hidden_states_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    dt_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    A_d,
-                    B_d.view(num_decodes, draft_token_num, n_groups, -1),
-                    C_d.view(num_decodes, draft_token_num, n_groups, -1),
-                    D_d,
-                    z=None,
+                # (batch, width, heads, head_dim) views of the verify rows.
+                verify_shape = (
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                )
+                x_v = hidden_states_d.view(verify_shape)
+                dt_v = dt_d.view(verify_shape)
+                B_v = B_d.view(num_decodes, draft_token_num, n_groups, -1)
+                C_v = C_d.view(num_decodes, draft_token_num, n_groups, -1)
+                out_v = preallocated_ssm_out_d.view(verify_shape)
+                verify_state_indices = state_indices_tensor_d[:num_decodes]
+                handled = verify_extension is not None and verify_extension.ssm_update(
+                    self,
+                    x=x_v,
+                    dt=dt_v,
+                    A=A_d,
+                    B=B_v,
+                    C=C_v,
+                    D=D_d,
                     dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=layer_cache.intermediate_ssm,
-                    cache_steps=draft_token_num,
-                    retrieve_parent_token=metadata.retrieve_parent_token,
+                    ssm_states=ssm_state,
+                    cache_indices=verify_state_indices,
+                    out=out_v,
+                    intermediate_states=layer_cache.intermediate_ssm,
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
+                if not handled:
+                    selective_state_update(
+                        ssm_state,
+                        x_v,
+                        dt_v,
+                        A_d,
+                        B_v,
+                        C_v,
+                        D_d,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=verify_state_indices,
+                        out=out_v,
+                        disable_state_update=True,
+                        intermediate_states_buffer=layer_cache.intermediate_ssm,
+                        cache_steps=draft_token_num,
+                        retrieve_parent_token=metadata.retrieve_parent_token,
+                        intermediate_state_indices=self.intermediate_state_indices,
+                    )
             else:
                 selective_state_update(
                     ssm_state,

@@ -354,13 +354,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self,
         intermediate_states_buffer: torch.Tensor,
         batch_size: int,
+        width: int,
         force_scratch: bool = False,
     ) -> tuple[torch.Tensor, bool]:
-        # FlashInfer requires exact capture B, which may exceed the pool-scoped
-        # buffer; padded tiers use stable scratch and copy owned rows back.
+        # MTP writes packed [B,T,H,V,K] snapshots, not the pool's reserved-width
+        # stride. Narrow or padded tiers need exact-shape scratch and copyback.
         if not force_scratch:
-            direct = intermediate_states_buffer[:batch_size]
-            if direct.shape[0] == batch_size:
+            direct = intermediate_states_buffer[:batch_size, :width]
+            if direct.shape[0] == batch_size and direct.is_contiguous():
                 return direct, False
 
         stream_key = (
@@ -368,7 +369,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if intermediate_states_buffer.device.type == "cuda"
             else None
         )
-        shape = (batch_size, *intermediate_states_buffer.shape[1:])
+        shape = (batch_size, width, *intermediate_states_buffer.shape[2:])
         key = (
             intermediate_states_buffer.device,
             intermediate_states_buffer.dtype,
@@ -640,9 +641,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         intermediate_states_buffer_mtp = intermediate_states_buffer
         copy_verify_intermediate_back = False
-        if intermediate_states_buffer is not None and (
-            self.use_state_pool or stable_rows
-        ):
+        if intermediate_states_buffer is not None:
             # FlashInfer writes positional rows; isolate them in exact-B scratch.
             (
                 intermediate_states_buffer_mtp,
@@ -650,6 +649,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ) = self._prepare_verify_intermediate_buffer(
                 intermediate_states_buffer,
                 batch_size,
+                draft_token_num,
                 force_scratch=stable_rows,
             )
         if not self._mutable_inputs_are_aligned(
@@ -718,13 +718,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if stable_rows and intermediate_states_buffer is not None:
             # Persist positional output under PP-stable request rows.
             copy_verify_intermediate_rows(
-                intermediate_states_buffer,
+                intermediate_states_buffer[:, :draft_token_num],
                 intermediate_states_buffer_mtp,
                 intermediate_state_indices[:batch_size],
             )
         elif copy_verify_intermediate_back:
-            intermediate_states_buffer.copy_(
-                intermediate_states_buffer_mtp[: intermediate_states_buffer.shape[0]]
+            owned_rows = min(batch_size, intermediate_states_buffer.shape[0])
+            intermediate_states_buffer[:owned_rows, :draft_token_num].copy_(
+                intermediate_states_buffer_mtp[:owned_rows]
             )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)

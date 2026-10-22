@@ -248,6 +248,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
+    if cfg.speculative_algorithm_config is not None:
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+        if not isinstance(algo, CustomSpecAlgo):
+            raise ValueError(
+                "--speculative-algorithm-config is only read by speculative "
+                "algorithms registered via SpeculativeAlgorithm.register, got "
+                f"speculative_algorithm={cfg.speculative_algorithm}."
+            )
+
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
             cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")

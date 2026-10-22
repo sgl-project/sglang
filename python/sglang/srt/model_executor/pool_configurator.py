@@ -252,8 +252,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
 
-        # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
-        # which holds for EAGLE/MTP drafts that reuse the target's attention config.
+        # EAGLE/STANDALONE: a private draft pool holds one slot per target token
+        # at the DRAFT's KV geometry; the per-layer share of the target's cell is
+        # the fallback for drafts whose geometry is not an MHA config read here.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -304,9 +305,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    draft_kv_size = int(
-                        self._cell_size * draft_num_layers / int(num_layers)
+                    draft_kv_size = self._eagle_draft_mha_cell_size(
+                        kvc, draft_num_layers
                     )
+                    if draft_kv_size is None:
+                        draft_kv_size = int(
+                            self._cell_size * draft_num_layers / int(num_layers)
+                        )
                     self._cell_size += draft_kv_size * draft_loc_space_scale
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
@@ -332,6 +337,40 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+    def _eagle_draft_mha_cell_size(
+        self, kvc: KVCacheConfigurator, draft_num_layers: int
+    ) -> Optional[int]:
+        """Bytes per token the draft worker's MHA pool costs on this rank, from the
+        draft checkpoint's own KV heads, head dims and KV dtype (resolved as the
+        draft runner resolves it). None when the draft config is unknown or not
+        MHA, so the caller keeps the target-layer-ratio estimate."""
+        draft = kvc.spec_aux_config.draft_model_config
+        if draft is None or draft.attention_arch != AttentionArch.MHA:
+            return None
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        # `auto` with a quantized draft resolves to fp8 only inside the draft
+        # runner (it reads the loaded model's quant config); this prices the
+        # unquantized pool, which is the larger of the two.
+        _, draft_kv_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+            model=None,
+            model_dtype=draft.dtype,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend=get_spec().speculative_draft_attention_backend,
+            speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+        )
+        num_kv_heads = draft.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        return (
+            num_kv_heads
+            * (draft.head_dim + draft.v_head_dim)
+            * draft_num_layers
+            * torch._utils._element_size(draft_kv_dtype)
+        )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""

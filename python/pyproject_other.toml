@@ -17,6 +17,7 @@ classifiers = [
 dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm"]
 
 [project.optional-dependencies]
+eagle4 = ["eagle-harness==0.1.1"]
 # runtime_base: torch-free subset of runtime_common.
 # Used by srt_empty for device-agnostic install on non-NVIDIA platforms.
 # NOTE: Do NOT add packages that depend on torch/triton here — they belong in runtime_common.

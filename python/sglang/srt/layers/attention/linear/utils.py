@@ -109,13 +109,16 @@ def resolve_linear_attn_backends(
 
 
 def select_verify_intermediate_state_indices(
-    default_indices, req_pool_indices, valid, pool_size: int
+    default_indices, req_pool_indices, row_valid, pool_size: int
 ):
+    """``row_valid()`` returns the per-request validity mask; it is called only
+    under PP speculative decoding, so other verifies launch no mask kernel."""
     if not pp_spec_stable_rows_enabled():
         return default_indices
 
     import torch
 
+    valid = row_valid()
     req_rows = req_pool_indices[: valid.shape[0]]
     return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
         torch.int32

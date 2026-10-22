@@ -25,12 +25,10 @@ from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
     gathered_softcap_logits,
+    softcap_to_float32_logits,
 )
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
-)
-from sglang.kernels.ops.activation.softcap import (
-    softcap_to_float32_logits,
 )
 from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
@@ -220,6 +218,12 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Greedy next-token ids, shape: [#seq] int64. Set instead of
+    # next_token_logits (which is then None) when the forward asked for greedy
+    # ids only (LogitsMetadata.greedy_tokens_only).
+    next_token_ids: Optional[torch.Tensor] = dataclasses.field(
+        default=None, kw_only=True
+    )
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -350,6 +354,10 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # Return only the greedy next-token ids of the sampled rows, without
+    # gathering their logits (see SpecInput.greedy_tokens_only).
+    greedy_tokens_only: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -412,6 +420,10 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            greedy_tokens_only=(
+                forward_batch.spec_info is not None
+                and forward_batch.spec_info.greedy_tokens_only
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -494,6 +506,14 @@ class LogitsProcessor(nn.Module):
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            skip_entry_sync=True,
+        )
+        # Gathers the per-rank (max, index) pairs of _get_greedy_tokens.
+        self._greedy_tokens_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
@@ -601,6 +621,18 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            next_token_ids = (
+                self._get_greedy_tokens(pruned_states, lm_head)
+                if logits_metadata.greedy_tokens_only and sample_indices is None
+                else None
+            )
+            if next_token_ids is not None:
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_ids=next_token_ids,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -1062,6 +1094,40 @@ class LogitsProcessor(nn.Module):
             )
         assert output.dtype == torch.float32
         return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
+
+    def _get_greedy_tokens(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> Optional[torch.Tensor]:
+        """The argmax of the logits _get_logits returns, [rows] int64, without
+        gathering them: each rank reduces its part of the tensor-parallel
+        vocabulary to (max, index) and the ranks gather those pairs. Ties
+        resolve to the lowest id, as in torch.argmax. None where the logits are
+        not a plain vocab-parallel split (DP-attention or attention-TP gathers,
+        soft-capping, which can tie distinct logits)."""
+        shard = getattr(lm_head, "shard_indices", None)
+        if (
+            shard is None
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_attn_tp_group
+            or self.final_logit_softcapping
+        ):
+            return None
+        with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+            logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        values, ids = logits[:, : shard.num_org_elements].max(dim=-1)
+        if not self.do_tensor_parallel_all_gather:
+            return ids
+        # One 16-byte row per rank: (fp32 max bits, global id, 0, 0).
+        rows = ids.shape[0]
+        pairs = torch.zeros(rows, 4, dtype=torch.int32, device=ids.device)
+        pairs[:, 0] = values.float().view(torch.int32)
+        pairs[:, 1] = ids + shard.org_vocab_start_index
+        gathered = self._greedy_tokens_gatherer(pairs.view(torch.bfloat16))
+        gathered = gathered.view(torch.int32).view(rows, -1, 4)
+        best = gathered[:, :, 0].view(torch.float32).argmax(dim=-1, keepdim=True)
+        return gathered[:, :, 1].gather(1, best).squeeze(1).long()
 
     def _compute_lm_head(
         self,

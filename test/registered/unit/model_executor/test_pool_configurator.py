@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
@@ -188,6 +190,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        draft_model_config=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -398,6 +401,41 @@ class TestDefaultConfigurator(CustomTestCase):
 
             fused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
+
+    def test_private_draft_pool_is_priced_at_the_drafts_own_kv_geometry(self):
+        """A private EAGLE draft pool holds one slot per target token at the
+        DRAFT's KV geometry. A 1-layer draft with 40 KV heads of 128 next to a
+        16-layer target with 4 KV heads of 256 costs 20480 bytes per token, not
+        the per-layer share of the target's cell (65536 / 16 = 4096): sizing by
+        the layer ratio over-allocates the target pool by the difference, and
+        the real draft pool then lands outside --mem-fraction-static."""
+        mr = _make_model_runner(
+            self,
+            speculative_algorithm="EAGLE",
+            num_kv_heads=4,
+            head_dim=256,
+            v_head_dim=256,
+            num_layers=16,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.draft_model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            head_dim=128,
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+            get_num_kv_heads=lambda tp_size, dcp_size=1: 40,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            configurator = create_memory_pool_configurator(mr)
+        target_cell = 4 * (256 + 256) * 16 * KV_SIZE
+        draft_cell = 40 * (128 + 128) * 1 * KV_SIZE
+        self.assertEqual(configurator._cell_size, target_cell + draft_cell)
 
 
 class TestHybridSWAConfigurator(CustomTestCase):

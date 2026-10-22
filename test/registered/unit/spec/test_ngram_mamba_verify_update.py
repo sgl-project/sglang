@@ -303,7 +303,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
             return_value=True,
         ):
             result = select_verify_intermediate_state_indices(
-                default, req_rows, cache_indices >= 0, pool_size=64
+                default, req_rows, lambda: cache_indices >= 0, pool_size=64
             )
 
         torch.testing.assert_close(

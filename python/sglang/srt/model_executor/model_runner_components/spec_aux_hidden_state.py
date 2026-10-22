@@ -133,7 +133,7 @@ def _resolve_eagle_aux_hidden_state(
             draft_model_config.swa_attention_layer_ids
         )
 
-    if spec_algorithm.is_eagle3():
+    if spec_algorithm.uses_aux_hidden_states():
         config.eagle_use_aux_hidden_state = True
         try:
             eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)

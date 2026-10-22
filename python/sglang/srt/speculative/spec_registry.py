@@ -4,6 +4,7 @@ should use that classmethod API; do not import from this module directly.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
@@ -12,8 +13,16 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.verify_extension import (
+        LinearAttnStateLayout,
+        LinearAttnVerifyExtension,
+    )
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphRunnerInfo,
+        DecodeGraphVariants,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -75,6 +84,13 @@ class CustomSpecAlgo:
     def is_eagle3(self) -> bool:
         return False
 
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft,
+        from the layers the draft's ``eagle_config`` names, and the draft reads
+        their concatenation. Lets an EAGLE-family plugin get only that
+        EAGLE-3 behavior without answering ``is_eagle3()``."""
+        return False
+
     def is_frozen_kv_mtp(self) -> bool:
         return False
 
@@ -111,12 +127,100 @@ class CustomSpecAlgo:
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
+    def supports_mm_inputs(self) -> bool:
+        """Whether requests with multimodal inputs may be served. ``False``
+        also switches the server warmup to a text-only request."""
+        return True
+
+    def validate_request(
+        self, req: Req, *, has_mm_inputs: bool, enable_overlap: bool
+    ) -> Optional[str]:
+        """Return why this algorithm cannot serve ``req``, or ``None``.
+
+        Called by the scheduler on admission, before the request is queued; a
+        message aborts the request with it. ``has_mm_inputs`` says whether the
+        request carries images / audio / video (``req`` does not hold them
+        yet). Overrides should call ``super().validate_request(...)`` to keep
+        the ``supports_mm_inputs()`` check.
+        """
+        if has_mm_inputs and not self.supports_mm_inputs():
+            return (
+                f"Speculative algorithm {self.name} does not support multimodal inputs."
+            )
+        if self.name == "EAGLE_HARNESS":
+            # The 0.1.1 plugin's fused tail does not consult custom processors
+            # or watermark state. Reject at admission, before it can select
+            # the greedy token-only graph for such a request.
+            if getattr(req, "custom_logit_processor", None) is not None:
+                return "EAGLE-4 does not support custom logit processors."
+            if getattr(getattr(req, "sampling_params", None), "watermark", None):
+                return "EAGLE-4 does not support watermarking."
+        return None
+
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
 
+    def need_topk(self) -> bool:
+        """Whether the decode relay carries the draft top-k (``topk_p`` /
+        ``topk_index``). Follows ``is_eagle()`` like the builtins."""
+        return self.is_eagle() or self.is_standalone()
+
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states. Follows ``is_eagle()`` like the builtins."""
+        return self.is_eagle()
+
+    def create_future_map(
+        self,
+        device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
+    ) -> FutureMap:
+        """The scheduler's step-to-step relay (always on, overlap or not)."""
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
+
+    def req_to_token_extra_len(self, page_size: int) -> int:
+        """Minimum ``req_to_token`` row headroom (tokens) past the context
+        length that this algorithm writes into, e.g. draft / verify slots
+        allocated past ``seq_len``. The row is sized to the max of this and
+        the default headroom, so returning 0 (the default) keeps it."""
+        return 0
+
+    def create_decode_graph_variants(
+        self, info: DecodeGraphRunnerInfo
+    ) -> Optional[DecodeGraphVariants]:
+        """Extra CUDA-graph variants for a decode / target-verify runner
+        (see ``model_executor/runner/decode_graph_variants.py``), for example
+        one target-verify graph per verify width. Called once per runner,
+        target and draft alike, before the runner captures; ``info`` says
+        which (``is_draft_worker``, ``capture_forward_mode``), the widest
+        verify it fits and its device. ``None`` (the default) keeps one graph
+        per batch size at the static width."""
+        return None
+
+    def create_linear_attn_verify_extension(
+        self, state: LinearAttnStateLayout
+    ) -> Optional[LinearAttnVerifyExtension]:
+        """Target-verify extension for a GDN or Mamba2 linear-attention
+        backend with this ``state`` (``state.kind``; see
+        ``layers/attention/linear/verify_extension.py``): replace the verify
+        conv1d and recurrence with your own kernels, for example a verify over
+        a non-chain draft layout. Called once per backend. ``None`` (the
+        default) keeps the backend's kernels."""
+        return None
 
     def resolve_max_speculative_num_draft_tokens(
         self, server_args: ServerArgs
@@ -134,6 +238,13 @@ class CustomSpecAlgo:
     def create_worker(self, server_args: ServerArgs) -> Type:
 
         cfg = resolving_view(server_args)
+        # eagle-harness 0.1.1 builds its own CUDA/HIP draft and verify kernels.
+        # It cannot use the builtin EAGLE NPU/CPU kernels as a fallback.
+        if self.name == "EAGLE_HARNESS" and cfg.device != "cuda":
+            raise NotImplementedError(
+                "EAGLE-4 (EAGLE_HARNESS) requires CUDA or ROCm; "
+                f"device={cfg.device!r} is not supported by eagle-harness 0.1.1."
+            )
         if not cfg.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
@@ -198,7 +309,7 @@ def _reserved_names() -> frozenset:
 
 def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     """Fail fast if ``spec_class`` drifts from the ``SpeculativeAlgorithm``
-    duck-typing contract.
+    duck-typing contract (every public instance method of the enum).
 
     ``from_string`` returns either type and callers dispatch on the shared
     ``is_*()`` / ``supports_*()`` interface without isinstance checks, so every
@@ -217,10 +328,12 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     # empty interface and turn this guard into a silent no-op.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+    # Every public instance method: the scheduler and model runner call more
+    # than the predicates (e.g. ``create_future_map`` at scheduler init).
     interface = {
         name
-        for name in vars(SpeculativeAlgorithm)
-        if name.startswith(("is_", "supports_"))
+        for name, value in vars(SpeculativeAlgorithm).items()
+        if not name.startswith("_") and inspect.isfunction(value)
     }
     missing = sorted(interface - set(dir(spec_class)))
     if missing:

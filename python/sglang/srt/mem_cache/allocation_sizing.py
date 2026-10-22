@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -75,9 +77,18 @@ def page_aligned_decode_alloc_lens(
     *,
     reserve: int,
     page_size: int,
+    free_tokens: Optional[int] = None,
+    row_len: Optional[int] = None,
 ):
     """Whole-page decode alloc lens: nxt rounds committed up to page so allocated
-    == recorded (unaligned tails leak at ps>1)."""
+    == recorded (unaligned tails leak at ps>1).
+
+    With ``free_tokens`` (the allocator's free size) and ``row_len`` (the
+    req_to_token row width), a request that is short of ``reserve`` is topped up
+    to twice ``reserve`` when the pool keeps ``reserve`` free per request after
+    the allocation. Its next steps then allocate nothing until the committed
+    length catches up, instead of a few slots every step.
+    """
     cur_kv_lens = [0] * len(reqs)
     nxt_kv_lens = [0] * len(reqs)
     num_needed_tokens = 0
@@ -90,6 +101,19 @@ def page_aligned_decode_alloc_lens(
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
+    if num_needed_tokens == 0 or free_tokens is None or row_len is None:
+        return cur_kv_lens, nxt_kv_lens, num_needed_tokens
+
+    row_end = row_len // page_size * page_size
+    topped = list(nxt_kv_lens)
+    for i, r in enumerate(reqs):
+        if nxt_kv_lens[i] > cur_kv_lens[i]:
+            chunk_end = r.kv.kv_committed_len + 2 * reserve
+            chunk_end = (chunk_end + page_size - 1) // page_size * page_size
+            topped[i] = max(nxt_kv_lens[i], min(chunk_end, row_end))
+    num_topped_tokens = num_needed_tokens + sum(topped) - sum(nxt_kv_lens)
+    if free_tokens - num_topped_tokens >= reserve * len(reqs):
+        return cur_kv_lens, topped, num_topped_tokens
     return cur_kv_lens, nxt_kv_lens, num_needed_tokens
 
 
@@ -113,4 +137,5 @@ def get_req_to_token_extra_context_len() -> int:
             # UNO's double-buffer reserve applies at every page size. Larger
             # pages may additionally round the allocation up by page_size - 1.
             extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+        extra = max(extra, spec_algo.req_to_token_extra_len(page_size))
     return extra

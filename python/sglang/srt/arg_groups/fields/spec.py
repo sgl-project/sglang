@@ -32,6 +32,13 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
+    speculative_algorithm_config: A[
+        Optional[str],
+        Arg(
+            help="JSON configuration for a plugin-registered speculative algorithm.",
+            resolvable=True,
+        ),
+    ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[
         Optional[str],

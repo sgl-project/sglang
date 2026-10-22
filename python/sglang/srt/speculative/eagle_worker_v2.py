@@ -1274,7 +1274,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         self._draft_worker = (
-            EagleDraftWorker(
+            self.create_draft_worker(
                 server_args,
                 gpu_id,
                 nccl_port,
@@ -1302,6 +1302,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def create_draft_worker(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ) -> EagleDraftWorker:
+        """Build the drafter on the last PP stage, retaining the pool lifecycle."""
+        return EagleDraftWorker(server_args, gpu_id, nccl_port, target_worker)
 
     @property
     def last_shared_read_runner(self):
