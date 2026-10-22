@@ -2760,8 +2760,15 @@ class DeepseekV4AttnBackend(
                 torch.int64
             )
         if self.tail_forward_metadata is not None:
-            self.tail_forward_metadata.low_ratio_k_slots = k_slots
-            self.tail_forward_metadata.low_ratio_index_plans = {}
+            self._share_low_ratio_k_slots(self.tail_forward_metadata)
+
+    def _share_low_ratio_k_slots(self, metadata: DSV4Metadata) -> None:
+        # The late-layer tail's metadata reads this forward's snapshot; its rows
+        # differ from the extend's, so it caches its own index plans.
+        metadata.low_ratio_k_slots = self.forward_metadata.low_ratio_k_slots
+        metadata.low_ratio_index_plans = (
+            None if metadata.low_ratio_k_slots is None else {}
+        )
 
     def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
