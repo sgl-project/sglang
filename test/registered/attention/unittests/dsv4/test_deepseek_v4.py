@@ -511,15 +511,13 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
 
-    def _make_prefill_backend(self, *, is_dsv41=False, hisparse_coordinator=None):
+    def _make_prefill_backend(self, *, hisparse_coordinator=None):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
             DSV4Metadata,
         )
 
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
-        backend.is_dsv41 = is_dsv41
         backend.hisparse_coordinator = hisparse_coordinator
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
@@ -583,18 +581,14 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
         batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-        for is_dsv41, hisparse_coordinator in ((True, None), (False, object())):
-            with self.subTest(is_dsv41=is_dsv41, hisparse=hisparse_coordinator):
-                backend = self._make_prefill_backend(
-                    is_dsv41=is_dsv41, hisparse_coordinator=hisparse_coordinator
-                )
+        backend = self._make_prefill_backend(hisparse_coordinator=object())
 
-                shared_read_ends = backend.resolve_prefill_shared_read_ends(
-                    batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
-                )
+        shared_read_ends = backend.resolve_prefill_shared_read_ends(
+            batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
+        )
 
-                self.assertIs(shared_read_ends, SharedReadEnds.UNKNOWN)
-                backend._build_sparse_prefill_chunk_cache.assert_not_called()
+        self.assertIs(shared_read_ends, SharedReadEnds.UNKNOWN)
+        backend._build_sparse_prefill_chunk_cache.assert_not_called()
 
     def test_refresh_replay_metadata_preserves_captured_tensor_storage(self):
         capture_metadata = self._make_core_metadata(0)
