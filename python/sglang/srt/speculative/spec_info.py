@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     _RESERVED_ALIASES,
@@ -141,8 +140,9 @@ class SpeculativeAlgorithm(Enum):
 
         The backend must still declare a pre-replay read end.
         """
-        # DSPARK's draft KV inject reads the SWA mapping after the target prefill.
-        return self.is_none() or self.is_dflash()
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
+        return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -448,13 +448,6 @@ class SpecInput(ABC):
         batch_size: int,
     ) -> None:
         return None
-
-
-def dflash_draft_kv_head_tp_size() -> int:
-    """TP width a dense DFLASH-family draft shards its KV heads by: the attention-TP
-    group when it owns attention (see draft_tp_context), else the full TP group."""
-    parallel = get_parallel()
-    return parallel.attn_tp_size if parallel.attn_dp_enabled else parallel.tp_size
 
 
 def spec_scale_global_num_tokens(

@@ -7,6 +7,7 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.runtime_context import (
+    draft_attn_tp_size,
     get_model,
     get_spec,
 )
@@ -249,7 +250,6 @@ def _resolve_dflash_draft_cell_size(
     """
     from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
     from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
-    from sglang.srt.speculative.spec_info import dflash_draft_kv_head_tp_size
 
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
@@ -269,7 +269,7 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=dflash_draft_kv_head_tp_size(),
+            tp_size=draft_attn_tp_size(),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
