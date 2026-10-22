@@ -169,6 +169,10 @@ class XPUAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
+        # Descale for an fp8 KV cache written without scales (k_scale is None).
+        self.unit_kv_descale = torch.ones(
+            (), dtype=torch.float32, device=model_runner.device
+        )
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
@@ -751,19 +755,19 @@ class XPUAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
 
-        # currently no FP8 KV cache supported
         k_descale, v_descale = None, None
-        # # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # # has corresponding quantization method so that layer.k_scale is not None,
-        # # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        # if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
-        #     if layer.k_scale is not None:
-        #         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        #         k_descale = layer.k_scale.expand(descale_shape)
-        #         v_descale = layer.v_scale.expand(descale_shape)
-        #     q = q.to(self.kv_cache_dtype)
-        #     q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-        #     k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # Unlike fa3, sgl-kernel-xpu's fp8 KV kernels always require descales and a
+        # bf16 query, so an fp8 cache without k_scale gets 1.0 and q is not cast.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            elif self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                k_descale = v_descale = self.unit_kv_descale
         # Mirror FlashAttentionBackend: ENCODER_ONLY / bidirectional layers
         # (DFLASH draft full_attention) are non-causal, not just cross-attention.
         causal = not (
@@ -1439,14 +1443,19 @@ class XPUAttentionBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # Unlike fa3, sgl-kernel-xpu's fp8 KV kernels always require descales and a
+        # bf16 query, so an fp8 cache without k_scale gets 1.0 and only MLA casts q.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            elif self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                k_descale = v_descale = self.unit_kv_descale
+            if self.use_mla:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
 
