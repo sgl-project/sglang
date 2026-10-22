@@ -37,7 +37,7 @@ registry = load_module(
 register_cpu_ci = registry.register_cpu_ci
 register_ppu_ci = registry.register_ppu_ci
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_ppu_ci(est_time=15, suite="stage-b-test-1-gpu-ppu")
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu-ppu")
 
 
 def mapping_line(library):
@@ -583,6 +583,22 @@ class TestPodObserver(unittest.TestCase):
             job="ans16-1",
         )
         self.assertEqual(output.with_suffix(".status").read_text().strip(), "ok")
+
+    def test_pr_observer_uses_resolved_name_and_records_timestamps(self):
+        with mock.patch.dict(
+            os.environ,
+            {"PPU_ENV_JOB_NAME": "ppu-pr-exact-hash", "PPU_ENV_PR_TIMINGS": "true"},
+        ):
+            output = self.run_observer(
+                'case "$*" in *ppu-job=ppu-pr-exact-hash*) ;; *) exit 9;; esac\n'
+                'case "$*" in *creationTimestamp*) printf "2026-01-01T00:00:00Z\\t2026-01-01T00:00:03Z\\t2026-01-01T00:00:11Z\\n";;\n'
+                '*) printf "ppu-pr-exact-hash-worker-0\\tu0\\tn0\\timage:tag\\tsha256:aaa\\n";; esac\n',
+                expected="1",
+            )
+        self.assertEqual(output.with_suffix(".status").read_text().strip(), "ok")
+        self.assertEqual(
+            len(output.with_suffix(".timing.tsv").read_text().strip().split("\t")), 3
+        )
 
     def test_observer_never_archives_other_job_rows(self):
         output = self.run_observer(

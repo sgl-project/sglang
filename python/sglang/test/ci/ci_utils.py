@@ -158,6 +158,12 @@ def run_unittest_files(
     enable_retry: bool = False,
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
+    *,
+    pytest_mode: bool = False,
+    require_nonempty: bool = False,
+    junit_dir: Optional[str] = None,
+    suite_timeout: Optional[float] = None,
+    allowed_skips: tuple = (),
 ):
     """
     Run a list of test files.
@@ -173,6 +179,25 @@ def run_unittest_files(
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
     """
+    if pytest_mode:
+        if not junit_dir or enable_retry or timeout_per_file is None:
+            raise ValueError(
+                "pytest mode requires JUnit output, a fixed timeout, and no retries"
+            )
+        from sglang.test.ci.pr_runner import run_pytest_files
+
+        return run_pytest_files(
+            [f.filename if isinstance(f, CIRegistry) else f.name for f in files],
+            junit_dir,
+            timeout_per_file,
+            suite_timeout,
+            continue_on_error,
+            allowed_skips,
+        )
+    if junit_dir or suite_timeout or allowed_skips:
+        raise ValueError("JUnit, suite budget, and skip policy require --pytest")
+    if require_nonempty and not files:
+        return 1
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
         cuda_coredump.cleanup_dump_dir()

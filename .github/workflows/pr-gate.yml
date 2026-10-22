@@ -13,6 +13,10 @@ on:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
         default: 120
+      rate-limit-workflow-id:
+        description: "Workflow whose past runs count against the cooldown; each caller passes its own file name"
+        type: string
+        default: pr-test.yml
 
 jobs:
   pr-gate:
@@ -167,7 +171,7 @@ jobs:
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
-              workflow_id: 'pr-test.yml',
+              workflow_id: '${{ inputs.rate-limit-workflow-id }}',
               event: eventName,
               per_page: 100,
             });
@@ -198,8 +202,12 @@ jobs:
                   return false;
                 }
 
-                // Gate jobs that don't consume significant CI resources
-                const gateJobs = ['check-changes', 'pr-gate', 'call-gate', 'pr-test-finish'];
+                // Gate jobs that don't consume significant CI resources.
+                // 'pr-test-ppu-finish' is the PPU line's finish job, same role
+                // as 'pr-test-finish': it runs on always() and goes red with
+                // the gate, so without this entry a gate-blocked PPU run would
+                // count against its own cooldown and renew it every attempt.
+                const gateJobs = ['check-changes', 'pr-gate', 'call-gate', 'pr-test-finish', 'pr-test-ppu-finish'];
                 const jobsBeyondGate = jobs.filter(j => !gateJobs.some(g => j.name === g || j.name.startsWith(g + ' ')));
 
                 // A job "ran" if it reached a terminal conclusion state that indicates actual execution

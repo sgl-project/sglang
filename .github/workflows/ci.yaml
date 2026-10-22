@@ -9,12 +9,17 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The GITHUB_TOKEN's scopes narrow down the workflow_call chain, so the
+  # pr-gate job inside pr-test-ppu.yml needs this declared here to list
+  # workflow runs for its cooldown check.
+  actions: read
 
 concurrency:
+  # Review-only runs must not cancel CPU/hardware jobs they do not schedule.
   # Ignored review and unrelated-label events use a per-run suffix so they
   # cannot cancel active PR CI.
   group: >-
-    ci-${{ github.event.pull_request.number }}-${{
+    ci-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{
     ((github.event_name == 'pull_request_review' &&
     (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
     (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
@@ -39,6 +44,31 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate registered tests
         run: python3 scripts/lint/check_registered_tests.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install CI filter test dependencies
+        run: |
+          python3 -m pip install PyYAML==6.0.3 pytest==8.3.5
+          npm install --prefix "$RUNNER_TEMP/ppu-ci-filter-tests" \
+            --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            picomatch@2.3.1 minimatch@9.0.5
+      - name: Validate CI path filters and authorization contracts
+        env:
+          NODE_PATH: ${{ runner.temp }}/ppu-ci-filter-tests/node_modules
+        run: python3 -m unittest discover -s scripts/ci/utils/tests -p 'test_run_ci_*.py' -v
+
+  # CPU validation runs without run-ci or private worker credentials. Reuse the
+  # same path selector as hardware CI so documentation-only PRs skip the suite.
+  cpu-precheck:
+    name: CPU Shortlist
+    needs: precheck
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+    uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      cpu_only: true
 
   ai-code-review:
     name: AI Code Review (Copilot Gate)
@@ -58,12 +88,17 @@ jobs:
   # is an independent merge gate and does not delay PPU feedback.
   # For labeled events, only adding run-ci starts Full CI; adding another label
   # to a PR that already has run-ci must not create a duplicate run.
+  # The selected CPU suite must also pass, including evidence validation. Only
+  # reuse its result from this workflow run; do not trust a previous PR revision.
   ci:
     name: Full CI
-    needs: registration-validation
+    needs: [registration-validation, cpu-precheck]
     if: >-
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'run-ci') &&
       (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      cpu_precheck_result: ${{ needs.cpu-precheck.result }}
+      cpu_precheck_evidence_ok: ${{ needs.cpu-precheck.outputs.cpu_evidence_ok }}
     secrets: inherit

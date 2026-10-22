@@ -7,6 +7,12 @@ on:
   # event on the workflow_call path. Manual verification keeps using
   # workflow_dispatch, which bypasses the PR-event gate.
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: "Run all PPU PR suites regardless of changed paths"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -26,31 +32,61 @@ on:
         required: false
         type: boolean
         default: true
+      cpu_only:
+        description: 'Run path-selected CPU validation without the PR authorization gate or hardware jobs.'
+        required: false
+        type: boolean
+        default: false
+      cpu_precheck_result:
+        description: 'Completed CPU-only workflow result from the same caller run; empty runs CPU locally.'
+        required: false
+        type: string
+        default: ''
+      cpu_precheck_evidence_ok:
+        description: 'Verified CPU evidence output from that CPU-only workflow.'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      cpu_evidence_ok:
+        description: 'True only after the selected CPU shortlist and evidence validation succeed.'
+        value: ${{ jobs.stage-a-test-cpu-ppu.outputs.evidence_ok }}
 
 concurrency:
-  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  group: pr-test-ppu-${{ inputs.cpu_only && 'cpu' || 'full' }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
   contents: read
   pull-requests: read
+  actions: read
+
+# Container jobs otherwise default to sh; evidence validation uses Bash arrays.
+defaults:
+  run:
+    shell: bash
 
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
+  PPU_SMALL_MODEL_PATH: /nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct
 
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
-    # PPU runner consumption is gated behind the `run-ci` label on the
-    # pull_request event. A called workflow inherits the caller's event,
-    # so the default-enabled gate also applies on the ci.yaml -> workflow_call
-    # path. Manual runs (workflow_dispatch) bypass the gate via the event check.
-    if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    # No event/label `if` here: this job is cheap and its outputs drive the
+    # real gate. The run-ci label check lives in the pr-gate job below, which
+    # re-fetches labels live -- a workflow-level `if` reads the event payload
+    # frozen at trigger time, so a label added before a rerun would never
+    # un-skip (the same reason the CUDA line gates at runtime). Manual runs
+    # (workflow_dispatch) are unaffected: pr-gate's checks are PR-event-only.
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
-        || steps.run-mode.outputs.run_all_tests == 'true' }}
+      cpu: ${{ steps.filter.outputs.cpu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu_single: ${{ steps.filter.outputs.ppu_single == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu_kernel: ${{ steps.filter.outputs.ppu_kernel == 'true' || steps.filter.outputs.ppu_multi == 'true' || steps.filter.outputs.ppu_ci == 'true' || steps.filter.outputs.ppu_build == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      ppu_multi: ${{ steps.filter.outputs.ppu_multi == 'true' || steps.filter.outputs.ppu_ci == 'true' || steps.filter.outputs.ppu_build == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      changes_exist: ${{ steps.filter.outputs.cpu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,53 +107,182 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          # File matching is authoritative; auto-labels are informational and
+          # may be stale or not yet applied. Never skip solely on documentation
+          # label presence: a mixed documentation/code PR must still run.
+          # Keep these groups aligned with .github/labeler.yml.
+          # Do NOT exclude all *.txt/JSON/YAML: requirements, CMakeLists.txt,
+          # test fixtures, and eval configs can affect PPU execution.
+          # AND the include union with every exclusion on each individual file.
+          # The default 'some' would let a negated pattern match unrelated files.
+          predicate-quantifier: every
           filters: |
-            ppu_code:
-              - ".github/workflows/pr-test-ppu.yml"
-              - "python/pyproject_other.toml"
-              - "python/sglang/!(multimodal_gen)/**"
-              - "python/sglang/srt/hardware_backend/ppu/**"
-              - "python/sglang/srt/platforms/ppu.py"
-              - "test/registered/**"
-              - "scripts/ci/ppu/**"
+            ppu_ci:
+              - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
 
-  # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
-  # Covers the two independent boot failure surfaces measured on ppu1
-  # (ci-mechanism-gap-review §10.3): test_ppu_basic.py proves the offline
-  # engine initializes and decodes (~194s), test_anthropic_server.py proves
-  # a real HTTP server comes up (~40s). The 27 no-runtime unit/mock files
-  # were deliberately left out: all-green there says nothing about the PPU
-  # hardware path.
-  #
-  # K8s form: the orchestration shell is CPU-only and holds no device; the
-  # flytiger-eco/ppu-distributed-action submits a worker pod onto a board that
-  # carries the requested label (OAM-810E), stages this checkout under
-  # /workspace/source, and runs the command there. The kernel is built from
-  # source and cached on /mnt/wl_nas by scripts/ci/ppu/ppu_build_kernel.sh
-  # (invoked from ppu_install_dependency.sh) -- no prebuilt wheel artifact.
+            # One positive union per group; exemptions bind to each changed file.
+            # paths-filter v3 expands renames into old-path deletions/new additions.
+            cpu:
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
+              - '!test/{srt/models/diffusion,registered/diffusion}/**'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_single:
+              - '{python/sglang/**,test/**,sgl-kernel/**,.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,scripts/lint/check_registered_tests.py,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in},docker/*ppu*,docker/ppu/**}'
+              - '!python/sglang/{multimodal_gen,kernels/ops/diffusion}/**'
+              - '!test/{srt/models/diffusion,registered/diffusion}/**'
+              - '!test/registered/ppu/{test_ppu_constraints.py,test_ppu_environment_fingerprint_unit.py,accuracy_eval/test_ppu_accuracy_eval_unit.py,pd_perf_eval/test_ppu_pd_perf_eval_unit.py,pr/test_cpu_eval.py}'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_kernel:
+              - '{sgl-kernel/**,python/sglang/{kernels/**,srt/{layers/{attention,rotary_embedding}/**,mem_cache/**,hardware_backend/ppu/**,platforms/ppu.py}},test/{ppu/unit/test_topk_prefill_bf16_alignment.py,registered/ppu/pr/test_kernels.py}}'
+              - '!python/sglang/kernels/ops/diffusion/**'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_multi:
+              - '{python/sglang/srt/{distributed/**,hardware_backend/ppu/moe/**,layers/moe/token_dispatcher/**},python/sglang/kernels/**/{communication,distributed,deepep,allreduce,allgather}/**,python/sglang/kernels/**/*{all_reduce,all_gather,allreduce,allgather,all_to_all,alltoall,deepep}*,sgl-kernel/**/*{allreduce,allgather,all_to_all,alltoall,deepep}*,test/registered/ppu/pr/test_two_ppu.py}'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+            ppu_build:
+              - '{test/run_suite.py,python/sglang/test/{ci/**,ppu_pr_utils.py},scripts/lint/check_registered_tests.py,python/sglang/kernels/aot/{setup*,CMakeLists.txt,cmake/**,requirements*.txt},docker/*ppu*,docker/ppu/**}'
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
+              - '!**/*.[rR][sS][tT]'
+              - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+
+      - name: Summarize PPU test selection
+        env:
+          CPU: ${{ steps.filter.outputs.cpu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+          SINGLE: ${{ steps.filter.outputs.ppu_single == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+          KERNEL: ${{ steps.filter.outputs.ppu_kernel == 'true' || steps.filter.outputs.ppu_multi == 'true' || steps.filter.outputs.ppu_ci == 'true' || steps.filter.outputs.ppu_build == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+          MULTI: ${{ steps.filter.outputs.ppu_multi == 'true' || steps.filter.outputs.ppu_ci == 'true' || steps.filter.outputs.ppu_build == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+        run: |
+          {
+            echo '## PPU PR test selection'
+            echo '| Execution lane | Selected |'
+            echo '| --- | --- |'
+            echo "| CPU shortlist | $CPU |"
+            echo "| Single PPU smoke + body | $SINGLE |"
+            echo "| Kernel probes in body pod | $KERNEL |"
+            echo "| Two PPU smoke | $MULTI |"
+            if [[ "$CPU" == true ]]; then
+              echo 'CPU shortlist runs before run-ci authorization; selected hardware lanes still require PR authorization and prerequisite success.'
+            else
+              echo 'No PPU-relevant executable/configuration changes: skip the PR gate and all PPU stages.'
+            fi
+            echo 'Caps include setup; the 20–40 minute warm-cache target is not a measured duration. Queue delays and cold builds are separate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==================== PR Gate ==================== #
+  # The shared gate still blocks draft PRs and requires the run-ci label.
+  # PPU PR CI disables cooldown checks without changing other callers.
+  # Only invoke the gate when there is PPU work to do.
+  pr-gate:
+    needs: check-changes
+    if: inputs.cpu_only != true && needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: ${{ inputs.require_run_ci_label }}
+      cool-down-minutes: 0
+    secrets: inherit
+
+  # CPU needs only path selection. Full CI reuses the caller's verified result;
+  # standalone/manual runs execute the same shortlist and evidence checks here.
+  stage-a-test-cpu-ppu:
+    needs: check-changes
+    if: needs.check-changes.outputs.cpu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok || steps.reuse.outputs.evidence_ok }}
+    env:
+      PPU_EVIDENCE_DIR: /tmp/ppu-pr/${{ github.run_id }}/${{ github.run_attempt }}/stage-a-test-cpu-ppu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Reuse verified CPU precheck
+        id: reuse
+        if: inputs.cpu_precheck_result != ''
+        env:
+          CPU_RESULT: ${{ inputs.cpu_precheck_result }}
+          CPU_EVIDENCE_OK: ${{ inputs.cpu_precheck_evidence_ok }}
+        run: |
+          if [[ "$CPU_RESULT" != success || "$CPU_EVIDENCE_OK" != true ]]; then
+            echo 'CPU precheck did not succeed with verified evidence.' >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: inputs.cpu_precheck_result == ''
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            python/pyproject_other.toml
+            scripts/ci/ppu/install_pr_cpu.sh
+      - name: Run CPU shortlist
+        id: worker
+        if: inputs.cpu_precheck_result == ''
+        run: bash scripts/ci/ppu/run_pr_suite.sh cpu
+      - name: Validate CPU evidence
+        id: evidence
+        if: always() && inputs.cpu_precheck_result == ''
+        env:
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+        run: |
+          python3 scripts/ci/ppu/pr_report.py sanitize --directory "$PPU_EVIDENCE_DIR"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$PPU_EVIDENCE_DIR" --lane cpu
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$PPU_EVIDENCE_DIR" --lane cpu
+          [[ "$WORKER_OUTCOME" == success ]]
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.cpu_precheck_result == ''
+        with:
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ env.PPU_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # Container-hook runners cannot load checkout-local step actions. Like vLLM,
+  # invoke the published worker action directly and run repository scripts in the
+  # job container. Pin all three lanes to the same reviewed action revision.
+  # Shared NAS remains writable by explicit policy; PR cache/evidence paths are
+  # separate destinations, not a filesystem access-control boundary.
+  # Allow cold dependency/kernel setup while keeping test-suite limits unchanged.
+  # Each worker deadline leaves five minutes for orchestration and evidence.
   stage-a-test-1-gpu-ppu:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.ppu_single == 'true' && needs.pr-gate.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 120
+    timeout-minutes: 45
+    outputs:
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
-      # Two checkout attempts: the fetch to github.com is the least reliable
-      # step in a K8s run and a lost one takes the entry down with it; a
-      # second attempt after a 90s wait roughly doubles what an entry survives.
       - name: Checkout code
         id: checkout
         continue-on-error: true
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
-          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
-          # changes via `git diff HEAD~1`.
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
-        shell: bash
         run: sleep 90
       - name: Checkout code (second attempt)
         if: steps.checkout.outcome == 'failure'
@@ -125,63 +290,103 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-
-      - name: Run PPU smoke test (stage-a) via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+      - uses: actions/setup-python@v5
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
+        env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '2400'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute PPU smoke worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=OAM-810E"
-          command: |
-            ppu-smi
-            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
-            [global]
-            index-url = https://mirrors.aliyun.com/pypi/simple/
-            trusted-host = mirrors.aliyun.com
-            PIPEOF
-            cd /workspace/source &&
-            bash scripts/ci/ppu/ppu_install_dependency.sh &&
-            git config --global --add safe.directory /workspace/source &&
-            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
-            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
-            cd test &&
-            python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
-          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
-          # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
-          # budget). A smoke gate must fail fast and retries would mask flakiness
-          # (ci-mechanism-gap-review §10.3 fact 1).
-          # PIP_INDEX_URL/PIP_TRUSTED_HOST: the sdk2.2.0 base image ships a pip
-          # index pointing at the Artifactory PyPI repo, which outranks
-          # ~/.pip/pip.conf and returns 401 for the CI credentials (run
-          # 37901303379). Env vars take precedence over every pip config file.
-          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_TEST_MAX_RETRY=0,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh smoke
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/smoke:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
             shm_size: 8Gi
-          timeout_minutes: 110
+          timeout_minutes: 40
+          cleanup_policy: always
+      - name: Export sanitized evidence
+        id: export
+        if: always()
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          source="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          directory="$(mktemp -d "$RUNNER_TEMP/ppu-evidence.XXXXXX")/sanitized"
+          python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
+          echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
+          echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: smoke
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ steps.export.outputs.artifact_directory }}
+          if-no-files-found: error
+          retention-days: 14
 
-  # ==================== Stage B: 1-GPU body ==================== #
-  # Serial after stage-a: stage-a is listed in needs directly so a stage-a
-  # failure fast-fails this stage via !failure(). On K8s the serial chain is
-  # expressed through `needs` alone -- no wait-for-jobs job is required, since
-  # each stage is its own GitHub job (not a matrix leg) and the dependency
-  # graph already serializes them and carries the verdict forward.
+  # Both base-b bodies wait for selected CPU/smoke success, not for each other.
   stage-b-test-1-gpu-ppu:
-    needs: [check-changes, stage-a-test-1-gpu-ppu]
-    # `always()` overrides skip-on-skipped-dependency so this job still
-    # evaluates when stage-a was skipped; !failure() fast-fails when stage-a
-    # went red. That fast-fail is the point of the serial chain.
+    needs: [check-changes, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: |
-      always() &&
-      !failure() &&
-      !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      always() && !failure() && !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.ppu_single == 'true' &&
+      (needs.check-changes.outputs.cpu == 'false' || needs.stage-a-test-cpu-ppu.result == 'success') &&
+      needs.stage-a-test-1-gpu-ppu.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    outputs:
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
       - name: Checkout code
         id: checkout
@@ -192,7 +397,6 @@ jobs:
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
-        shell: bash
         run: sleep 90
       - name: Checkout code (second attempt)
         if: steps.checkout.outcome == 'failure'
@@ -200,49 +404,104 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-
-      - name: Run PPU 1-GPU tests (stage-b) via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+      - uses: actions/setup-python@v5
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
+        env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '3300'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute PPU body worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=OAM-810E"
-          command: |
-            ppu-smi
-            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
-            [global]
-            index-url = https://mirrors.aliyun.com/pypi/simple/
-            trusted-host = mirrors.aliyun.com
-            PIPEOF
-            cd /workspace/source &&
-            bash scripts/ci/ppu/ppu_install_dependency.sh &&
-            git config --global --add safe.directory /workspace/source &&
-            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
-            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
-            cd test &&
-            python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
-          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh body
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/body:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=${{ needs.check-changes.outputs.ppu_kernel }},PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
             shm_size: 8Gi
-          timeout_minutes: 110
+          timeout_minutes: 55
+          cleanup_policy: always
+      - name: Export sanitized evidence
+        id: export
+        if: always()
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          source="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          directory="$(mktemp -d "$RUNNER_TEMP/ppu-evidence.XXXXXX")/sanitized"
+          python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
+          echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
+          echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: body
+          KERNEL: ${{ needs.check-changes.outputs.ppu_kernel }}
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ steps.export.outputs.artifact_directory }}
+          if-no-files-found: error
+          retention-days: 14
 
-  # ==================== Stage C: 2-GPU ==================== #
   stage-c-test-2-gpu-ppu:
-    # Same serial deviation as stage-b: stage-b is in needs directly so
-    # !failure() fast-fails on every trigger.
-    needs: [check-changes, stage-b-test-1-gpu-ppu]
+    # Legacy stage-c ID is retained for compatibility; this is a parallel body.
+    name: Two-PPU parallel body (legacy stage-c)
+    needs: [check-changes, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: |
-      always() &&
-      !failure() &&
-      !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      always() && !failure() && !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.ppu_multi == 'true' &&
+      (needs.check-changes.outputs.cpu == 'false' || needs.stage-a-test-cpu-ppu.result == 'success') &&
+      needs.stage-a-test-1-gpu-ppu.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    outputs:
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
       - name: Checkout code
         id: checkout
@@ -253,7 +512,6 @@ jobs:
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
-        shell: bash
         run: sleep 90
       - name: Checkout code (second attempt)
         if: steps.checkout.outcome == 'failure'
@@ -261,60 +519,102 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-
-      - name: Run PPU 2-GPU tests (stage-c) via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+      - uses: actions/setup-python@v5
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
+        env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '3300'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute two-PPU worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 2
-          node_selector: "board-type=OAM-810E"
-          command: |
-            ppu-smi
-            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
-            [global]
-            index-url = https://mirrors.aliyun.com/pypi/simple/
-            trusted-host = mirrors.aliyun.com
-            PIPEOF
-            export CUDA_VISIBLE_DEVICES=0,1 &&
-            cd /workspace/source &&
-            bash scripts/ci/ppu/ppu_install_dependency.sh &&
-            git config --global --add safe.directory /workspace/source &&
-            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
-            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
-            cd test &&
-            python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error
-          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh multi
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/multi:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
-            host_network: true
             shm_size: 8Gi
-          timeout_minutes: 110
+          timeout_minutes: 55
+          cleanup_policy: always
+      - name: Export sanitized evidence
+        id: export
+        if: always()
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          source="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          directory="$(mktemp -d "$RUNNER_TEMP/ppu-evidence.XXXXXX")/sanitized"
+          python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
+          echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
+          echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: multi
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ steps.export.outputs.artifact_directory }}
+          if-no-files-found: error
+          retention-days: 14
 
-  # ==================== Finish ==================== #
   pr-test-ppu-finish:
     needs:
-      [
-        check-changes,
-        stage-a-test-1-gpu-ppu,
-        stage-b-test-1-gpu-ppu,
-        stage-c-test-2-gpu-ppu,
-      ]
+      [check-changes, pr-gate, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu, stage-b-test-1-gpu-ppu, stage-c-test-2-gpu-ppu]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check all dependent job statuses
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Require selected jobs and evidence
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          CPU_ONLY: ${{ inputs.cpu_only }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
-              echo "Job $job did not succeed (result: $result)."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
+          args=()
+          [[ "$CPU_ONLY" != true ]] || args+=(--cpu-only)
+          python3 scripts/ci/ppu/pr_report.py aggregate "${args[@]}"

@@ -36,6 +36,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-cpu",
         "base-c-test-cpu",
         "base-b-test-cpu-arm64",
+        "stage-a-test-cpu-ppu",
     ],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
@@ -119,11 +120,10 @@ PER_COMMIT_SUITES = {
         "stage-b-e2e-mlx",
     ],
     HWBackend.PPU: [
-        # Three-stage serial chain (mirrors pr-test-amd.yml): stage-a is the
-        # < 5 min smoke gate, stage-b the 1-GPU body, stage-c 2-GPU tests.
-        # pr-test-ppu.yml serializes them via .github/actions/wait-for-jobs.
+        # CPU/smoke precede parallel bodies; stage-c keeps its legacy name.
         "stage-a-test-1-gpu-ppu",
         "stage-b-test-1-gpu-ppu",
+        "stage-b-kernel-test-1-gpu-ppu",
         "stage-c-test-2-gpu-ppu",
     ],
 }
@@ -423,6 +423,8 @@ def run_a_suite(args):
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+    if getattr(args, "require_nonempty", False) and skipped_tests:
+        raise ValueError("Strict PR selection contains disabled registrations")
 
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suite, repo_root)
@@ -456,6 +458,18 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        **(
+            {
+                "pytest_mode": args.pytest,
+                "require_nonempty": args.require_nonempty,
+                "junit_dir": args.junit_dir,
+                "suite_timeout": args.suite_timeout,
+                "allowed_skips": tuple(args.allow_skip),
+            }
+            if getattr(args, "pytest", False)
+            or getattr(args, "require_nonempty", False)
+            else {}
+        ),
     )
 
 
@@ -539,7 +553,33 @@ def main():
         default=None,
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
+    parser.add_argument(
+        "--pytest",
+        action="store_true",
+        help="Strict per-file pytest/JUnit execution (no retries).",
+    )
+    parser.add_argument("--require-nonempty", action="store_true")
+    parser.add_argument("--junit-dir")
+    parser.add_argument("--suite-timeout", type=float)
+    parser.add_argument(
+        "--allow-skip",
+        action="append",
+        default=[],
+        help="Exact JUnit classname.method of a documented platform skip.",
+    )
     args = parser.parse_args()
+    if args.pytest and (
+        not args.junit_dir or args.enable_retry or args.timeout_from_est_time
+    ):
+        parser.error(
+            "--pytest requires --junit-dir and fixed timeouts, without retries"
+        )
+    if not args.pytest and (args.junit_dir or args.suite_timeout or args.allow_skip):
+        parser.error("JUnit, suite budget, and skip policy require --pytest")
+    if args.timeout_per_file <= 0 or (
+        args.suite_timeout is not None and args.suite_timeout <= 0
+    ):
+        parser.error("timeouts must be positive")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):

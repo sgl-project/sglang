@@ -22,11 +22,47 @@ jit-kernel:
 documentation:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/*.md'
-      - '**/*.mdx'
+      - '**/*.[mM][dD]'
+      - '**/*.[mM][dD][xX]'
+      - '**/*.[rR][sS][tT]'
       - 'docs/**/*'
-      - 'README*'
-      - 'docs/**/*'
+      - '**/README*'
+      - '**/CHANGELOG*'
+      - '**/LICENSE*'
+      - '**/NOTICE*'
+
+# PPU selection groups. These labels describe changes; they never grant
+# run-ci authorization. Keep patterns aligned with pr-test-ppu.yml filters
+# (checked by scripts/ci/utils/tests/test_run_ci_workflows.py).
+# Documentation is excluded even when it lives beside runtime code/tests.
+ppu-runtime:
+  - changed-files:
+    - all-globs-to-any-file:
+      - 'python/sglang/**'
+      - '!python/sglang/multimodal_gen/**'
+      - '!**/*.[mM][dD]'
+      - '!**/*.[mM][dD][xX]'
+      - '!**/*.[rR][sS][tT]'
+      - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+
+ppu-tests:
+  - changed-files:
+    - all-globs-to-any-file:
+      - 'test/**'
+      - '!**/*.[mM][dD]'
+      - '!**/*.[mM][dD][xX]'
+      - '!**/*.[rR][sS][tT]'
+      - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
+
+ppu-ci:
+  - changed-files:
+    - all-globs-to-any-file:
+      # One include union, AND each exclusion, for the same changed file.
+      - '{.github/workflows/{ci.yaml,pr-test-ppu.yml,pr-gate.yml,labeler.yml},.github/labeler.yml,.github/actions/**,scripts/ci/{ppu,utils}/**,python/{pyproject*.toml,setup.py,setup.cfg,requirements*.{txt,in}},requirements*.{txt,in}}'
+      - '!**/*.[mM][dD]'
+      - '!**/*.[mM][dD][xX]'
+      - '!**/*.[rR][sS][tT]'
+      - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
 
 # Dependencies
 dependencies:

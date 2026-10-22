@@ -17,7 +17,7 @@ import copy
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.pd_perf_eval_kit import (
     PD_HIGHEST_BINDABLE_PORT,
     PD_PERF_CONFIG_SCHEMA_VERSION,
@@ -54,7 +54,7 @@ from sglang.test.kits.perf_eval_kit import (
 # should turn the gate red immediately rather than surface hours into a nightly
 # measurement that holds two boards.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu-ppu")
 
 DATA_ROOT = Path(__file__).parent
 CONFIG_DIR = DATA_ROOT / "configs"

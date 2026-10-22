@@ -15,6 +15,7 @@ python3 -m unittest test_ppu_basic.TestPPUBasic.test_basic_generation
 import unittest
 
 from sglang.test.ci.ci_register import register_ppu_ci
+from sglang.test.ppu_pr_utils import small_model
 from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
@@ -22,10 +23,6 @@ from sglang.test.test_utils import (
 )
 
 register_ppu_ci(est_time=120, suite="stage-a-test-1-gpu-ppu")
-
-PPU_CI_MODEL_PATH = (
-    "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/"
-)
 
 
 class TestPPUBasic(CustomTestCase):
@@ -53,7 +50,7 @@ class TestPPUBasic(CustomTestCase):
         if is_in_ci():
             args += ["--input", "64", "--output", "4"]
 
-        _, decode_throughput, _ = run_bench_one_batch(PPU_CI_MODEL_PATH, args)
+        _, decode_throughput, _ = run_bench_one_batch(small_model(), args)
         self.assertGreater(decode_throughput, 0, "PPU decode throughput must be > 0")
 
 

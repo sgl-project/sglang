@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import top_k_per_row_prefill_bf16
@@ -33,6 +34,27 @@ def run_case(name: str, B: int, K: int, starts, lens):
         )
         assert torch.equal(got, ref), f"{name}: row {i} mismatch (n={n})"
     print(f"PASS {name}")
+
+
+def test_topk_alignment(case):
+    run_case(*case)
+
+
+# Keep standalone execution while making all eight scenarios visible to JUnit.
+test_topk_alignment = pytest.mark.parametrize(
+    "case",
+    [
+        ("stream_misaligned_odd_starts", 4, 40000, [1, 3, 5, 7], [39992] * 4),
+        ("stream_misaligned_odd_stride", 3, 40001, [0, 0, 0], [40001, 39999, 33000]),
+        ("stream_aligned", 3, 40000, [0, 0, 0], [40000, 32768, 32769]),
+        ("stream_boundary_lengths", 4, 40000, [0, 1, 2, 3], [8192, 8193, 16385, 2048]),
+        ("register_2pass_misaligned", 2, 20000, [1, 3], [19998, 19998]),
+        ("register_2pass_aligned", 2, 20000, [0, 0], [20000, 16500]),
+        ("register_1pass_misaligned", 2, 10000, [1, 2], [9998, 5000]),
+        ("register_naive", 2, 1000, [1, 0], [999, 999]),
+    ],
+    ids=lambda case: case[0],
+)(test_topk_alignment)
 
 
 def main():
