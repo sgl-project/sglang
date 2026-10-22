@@ -90,7 +90,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "transformers==5.19.0",
-  "uvicorn",
+  "uvicorn>=0.51",
   "uvloop",
   "watchfiles",
   "xgrammar==0.2.7",
