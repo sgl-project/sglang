@@ -1180,6 +1180,9 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,

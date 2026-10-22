@@ -626,6 +626,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
 
     # === Derived from ScheduleBatch.reqs ===
+    # True for synthetic capture batches; init_new snapshots real request ranges.
+    # Running decode rows do not complete a prefill.
+    contains_last_prefill_chunk: bool = True
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -1009,6 +1012,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        contains_last_prefill_chunk = False
+        if batch.forward_mode.is_extend_without_speculative():
+            decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
+            contains_last_prefill_chunk = any(
+                req.extend_end == len(req.full_untruncated_fill_ids)
+                for req in batch.reqs
+                if id(req) not in decoding_req_ids
+            )
+
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
@@ -1066,6 +1078,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            contains_last_prefill_chunk=contains_last_prefill_chunk,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
@@ -1143,14 +1156,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
-        num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded():
-            ret.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
-        ret.global_num_token_non_padded_cpu = num_tokens
+        ret._init_num_token_non_padded(
+            device=device, is_draft_worker=model_runner.is_draft_worker
+        )
 
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
@@ -1340,6 +1348,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
+
+    def _init_num_token_non_padded(self, *, device, is_draft_worker: bool) -> None:
+        if self.input_ids is not None:
+            num_tokens = len(self.input_ids)
+        elif (
+            is_draft_worker
+            and self.spec_info is not None
+            and self.forward_mode.is_decode()
+        ):
+            assert self.spec_info.num_tokens_per_req > 0
+            num_tokens = self.batch_size * self.spec_info.num_tokens_per_req
+        else:
+            num_tokens = 0
+        if enable_num_token_non_padded():
+            self.global_num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(device),
+            ).to(device, non_blocking=True)
+        self.global_num_token_non_padded_cpu = num_tokens
 
     def set_local_num_token_non_padded(self, *, sharded: bool) -> None:
         """Derive the LOCAL num_token_non_padded from the invariant GLOBAL scalar.
