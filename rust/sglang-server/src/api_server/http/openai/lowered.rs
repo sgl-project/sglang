@@ -23,8 +23,9 @@ use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::{render_body, render_chat};
 use super::{AppState, ChatFormatter};
+use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
-    RequestTiming, drain_unary, generate_requests, generation_event_stream,
+    RequestTiming, drain_unary, generate_requests, generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -259,7 +260,7 @@ pub(super) async fn chat(
         .map(|call| (call, timing.clone()))
         .collect();
     let incremental = state.server_args.incremental_streaming_output;
-    let frames = generation_event_stream(calls, incremental, is_batch).map(python_abort_frame);
+    let frames = generation_event_stream_with(calls, incremental, is_batch, python_error_frame);
     let mut frames = Box::pin(frames);
     // An error before the first frame answers the whole request, as on Python.
     let mut first = Vec::new();
@@ -294,29 +295,28 @@ pub(super) async fn chat(
     )
 }
 
-/// The core streams every failure as an error frame; Python's `/generate`
-/// streams only a `ValueError` (400) so, and a status-coded abort as a frame
-/// whose `finish_reason` carries the status, which its chat layer answers
-/// with an error event under that status.
-fn python_abort_frame(data: String) -> String {
-    if !data.starts_with(r#"{"error":"#) {
-        return data;
-    }
-    let Ok(frame) = serde_json::from_str::<Value>(&data) else {
-        return data;
+/// Python's `/generate` streams a scheduler abort, whatever its status, as a
+/// frame whose `finish_reason` carries the status, which its chat layer
+/// answers with an error event under that status; other failures stay
+/// error frames.
+fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
+    let CoreError::RuntimeRejected {
+        message,
+        legacy_http_status,
+        ..
+    } = error
+    else {
+        return serde_json::to_string(&error.stream_error(index))
+            .expect("api.v1 types serialize to JSON");
     };
-    let code = frame["error"]["code"].as_u64().unwrap_or(400);
-    if code == 400 {
-        return data;
-    }
     let finish_reason = serde_json::json!({
         "type": "abort",
-        "message": frame["error"]["message"],
-        "status_code": code,
+        "message": message,
+        "status_code": legacy_http_status,
     });
     serde_json::json!({
         "text": "",
-        "index": frame["index"],
+        "index": index,
         "meta_info": {"finish_reason": finish_reason},
     })
     .to_string()
@@ -466,32 +466,44 @@ mod tests {
         );
     }
 
-    /// A status-coded abort in a stream is Python's error event under that
-    /// status, then the stream's end, not a 400 `BadRequestError`.
+    /// A scheduler abort in a stream, whatever its status, is Python's error
+    /// event under that status, then the stream's end, not a unary 400.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
-        let app = lowered_state(|_| ResponseItem::Error(Error::QueueFull));
-        let messages = json!([{"role": "user", "content": "hi"}]);
-        let body = json!({"model": "model", "messages": messages, "stream": true});
-        let response = post_json(app, "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
-            .await
-            .unwrap();
-        let text = String::from_utf8(bytes.to_vec()).unwrap();
-        let error: Value = text
-            .split("\n\n")
-            .filter_map(|event| event.strip_prefix("data: "))
-            .find_map(|data| {
-                serde_json::from_str::<Value>(data)
-                    .ok()?
-                    .get("error")
-                    .cloned()
-            })
-            .unwrap_or_else(|| panic!("no error event: {text}"));
-        assert_eq!(error["type"], "SERVICE_UNAVAILABLE");
-        assert_eq!(error["code"], 503);
-        assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        for (status, name) in [(503, "SERVICE_UNAVAILABLE"), (400, "BAD_REQUEST")] {
+            let app = lowered_state(move |rid| {
+                let mut item = chunk(rid, "", true);
+                let ResponseItem::Done(output) = &mut item else {
+                    unreachable!()
+                };
+                let abort = json!({"type": "abort", "message": "aborted", "status_code": status});
+                output.finish_reason = Some(serde_json::from_value(abort).unwrap());
+                item
+            });
+            let messages = json!([{"role": "user", "content": "hi"}]);
+            let body = json!({"model": "model", "messages": messages, "stream": true});
+            let response = post_json(app, "/v1/chat/completions", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let error: Value = text
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: "))
+                .find_map(|data| {
+                    serde_json::from_str::<Value>(data)
+                        .ok()?
+                        .get("error")
+                        .cloned()
+                })
+                .unwrap_or_else(|| panic!("no error event: {text}"));
+            assert_eq!(
+                (error["type"].as_str(), error["code"].as_u64()),
+                (Some(name), Some(status))
+            );
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        }
     }
 
     /// The router's override headers reach the request, as they reach
