@@ -1293,7 +1293,8 @@ class HiCacheController:
         self, operation: StorageOperation, need_size: int
     ) -> bool:
         """Whether a prefetch bounce can fit when its host pools are empty."""
-        return need_size <= self.mem_pool_host.size
+        # need_size is in logical tokens; under DCP each row holds dcp_size.
+        return need_size <= self.mem_pool_host.logical_size
 
     def free_prefetch_host_buffers(
         self, operation: StorageOperation, host_indices: torch.Tensor

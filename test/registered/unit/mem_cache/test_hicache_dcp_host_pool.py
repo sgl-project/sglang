@@ -186,6 +186,22 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                 cc.prefetch_tokens_occupied += len(next_page)
                 self.assertTrue(cc.prefetch_rate_limited())
 
+    def test_prefetch_fit_uses_logical_capacity(self):
+        """A logical-token bounce up to the full logical pool must fit under DCP."""
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                cc = self._attach_storage(pool)
+                operation = mock.Mock()
+                self.assertTrue(
+                    cc.can_fit_prefetch_host_buffers(operation, pool.logical_size)
+                )
+                self.assertFalse(
+                    cc.can_fit_prefetch_host_buffers(
+                        operation, pool.logical_size + pool.logical_page_size
+                    )
+                )
+
     def test_runtime_attach_rejects_dcp_buffer_only(self):
         for dcp_size in (2, 8):
             with self.subTest(dcp_size=dcp_size):
