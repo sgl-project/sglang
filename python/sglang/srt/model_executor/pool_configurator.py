@@ -118,10 +118,20 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 def _dense_draft_cell_size_on_dsv4(kvc: KVCacheConfigurator) -> int:
     """Bytes/token of a DFLASH-family draft that keeps its own MHA pool beside a DSV4
     target; 0 when the draft is DSV4-shaped and shares the target's layout."""
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return 0
     draft_model_config = kvc.spec_aux_config.draft_model_config
     if draft_model_config is None or is_deepseek_v4(draft_model_config.hf_config):
         return 0
-    return _dflash_draft_cell_size(kvc)
+    cell_size = _dflash_draft_cell_size(kvc)
+    # The (T+1)/T fallback prices one DSV4 layer, far below a dense draft's KV.
+    if cell_size <= 0:
+        raise RuntimeError(
+            "Cannot reserve the dense draft's KV pool beside the DSV4 target: its "
+            "bytes/token did not resolve (see the 'Could not resolve DFLASH draft "
+            "KV bytes/token' warning above)."
+        )
+    return cell_size
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:

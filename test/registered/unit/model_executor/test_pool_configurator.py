@@ -1620,8 +1620,11 @@ class TestSWAPoolFloor(CustomTestCase):
             window_size=128,
             hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
         )
-        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        spec = SimpleNamespace(
+            is_dspark=lambda: True, is_dflash_family=lambda: True, is_none=lambda: False
+        )
         kvc = SimpleNamespace(
+            is_draft_worker=False,
             kv_cache_dtype_str="fp8_e4m3",
             model_config=cfg,
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
@@ -1751,29 +1754,28 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(cfg.bytes_per_swa_token, 100.0)
         self.assertEqual(cfg._spec_infl, 1.0)
 
+    @staticmethod
+    def _dsv4_dflash_kvc(draft_arch, cell_size=10240):
+        spec = MagicMock()
+        spec.is_dflash_family.return_value = True
+        draft_model_config = (
+            None
+            if draft_arch is None
+            else SimpleNamespace(hf_config=SimpleNamespace(architectures=[draft_arch]))
+        )
+        return SimpleNamespace(
+            is_draft_worker=False,
+            spec_algorithm=spec,
+            spec_aux_config=SimpleNamespace(
+                draft_model_config=draft_model_config,
+                dflash_draft_cell_size_per_token=cell_size,
+            ),
+        )
+
     def test_dsv4_dense_draft_detected_by_draft_architecture(self):
         from sglang.srt.model_executor.pool_configurator import (
             _dense_draft_cell_size_on_dsv4,
         )
-
-        def _kvc(draft_arch):
-            spec = MagicMock()
-            spec.is_dflash_family.return_value = True
-            draft_model_config = (
-                None
-                if draft_arch is None
-                else SimpleNamespace(
-                    hf_config=SimpleNamespace(architectures=[draft_arch])
-                )
-            )
-            return SimpleNamespace(
-                is_draft_worker=False,
-                spec_algorithm=spec,
-                spec_aux_config=SimpleNamespace(
-                    draft_model_config=draft_model_config,
-                    dflash_draft_cell_size_per_token=10240,
-                ),
-            )
 
         with mock_cpu_env(), get_parallel().override(attn_dcp_size=1):
             for draft_arch, expected in (
@@ -1783,8 +1785,30 @@ class TestSWAPoolFloor(CustomTestCase):
             ):
                 with self.subTest(draft_arch=draft_arch):
                     self.assertEqual(
-                        _dense_draft_cell_size_on_dsv4(_kvc(draft_arch)), expected
+                        _dense_draft_cell_size_on_dsv4(
+                            self._dsv4_dflash_kvc(draft_arch)
+                        ),
+                        expected,
                     )
+
+    def test_dsv4_dense_draft_refuses_an_unresolved_kv_size(self):
+        """An unresolved dense-draft size must not fall back to the (T+1)/T reserve,
+        which under-prices the draft pool; a DSV4-shaped draft never needs it."""
+        from sglang.srt.model_executor.pool_configurator import (
+            _dense_draft_cell_size_on_dsv4,
+        )
+
+        with mock_cpu_env(), get_parallel().override(attn_dcp_size=1):
+            with self.assertRaisesRegex(RuntimeError, "dense draft's KV pool"):
+                _dense_draft_cell_size_on_dsv4(
+                    self._dsv4_dflash_kvc("Qwen3DSparkModel", cell_size=None)
+                )
+            self.assertEqual(
+                _dense_draft_cell_size_on_dsv4(
+                    self._dsv4_dflash_kvc("DeepseekV4ForCausalLMDSpark", cell_size=None)
+                ),
+                0,
+            )
 
     def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
         from sglang.srt.model_executor.pool_configurator import (
