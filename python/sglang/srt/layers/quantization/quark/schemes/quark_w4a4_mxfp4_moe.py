@@ -651,6 +651,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:
                 raise ValueError("Expected w13 or w2.")
 
+            if copy_numel_counter.copied_numel == 0:
+                return
+
             assert current_loaded <= target_loaded_numel, (
                 f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
             )
