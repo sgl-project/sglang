@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
 )
@@ -309,7 +308,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         ]
         self.assertEqual(len(set(prefixes)), len(variants))
 
-    def test_dcp_logical_batches_groups_and_pp_queries(self):
+    def test_dcp_logical_batches_groups_and_pp_isolation(self):
         base = replace(
             _make_config(is_mla_model=True, tp_size=4),
             dcp_size=2,
@@ -342,13 +341,13 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                     for key in call["keys"]
                 }
                 self.assertEqual(store.batch_exists(pages), 0)
-                self.assertEqual(
-                    store.batch_exists(
-                        pages,
-                        HiCacheStorageExtraInfo(extra_info={"pp_rank": 1 - stage}),
-                    ),
-                    2,
+                # Each PP stage queries its own keys; the controller reduces
+                # local hit counts across stages to find the usable prefix.
+                other_store, other_fake = _make_store(
+                    storage_config=replace(cfg, pp_rank=1 - stage)
                 )
+                other_fake.existing_keys = fake.existing_keys
+                self.assertEqual(other_store.batch_exists(pages), 2)
         self.assertTrue(all(group == groups[0] for group in groups))
         self.assertEqual(len(set(groups[0])), 2)
 
