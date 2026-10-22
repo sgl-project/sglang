@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <limits>
+#include <type_traits>
 
 namespace sglang {
 
@@ -47,15 +49,10 @@ template <>
 struct WeightTrait<fp8_e4m3_t> {
   using packed2_t = fp8x2_e4m3_t;
   static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
-  // SATFINITE saturates +-inf / out-of-range values, but converts NaN to an
-  // fp8 NaN code. A single upper clamp is enough to sanitize: IEEE fminf
-  // returns the non-NaN operand, so NaN / +inf quantize to +448, and -inf
-  // passes through for SATFINITE to saturate to -448 -- non-finite inputs
-  // never reach an fp8 NaN code, matching the v1/v2/Triton kernels.
-  // CUDA-graph capture warmup runs the model on whatever the (reused,
-  // uninitialized) buffers contain, and relies on this: an fp8 NaN code would
-  // poison the downstream GEMM and trip the sampler NaN check. For finite
-  // inputs the clamp is bit-identical to bare SATFINITE.
+  // Keep the existing sanitization for FP16 and FP32 inputs. BF16 uses the
+  // saturating FP8 conversion directly so NaNs remain observable downstream.
+  // SATFINITE already saturates infinities and out-of-range finite values;
+  // the upper clamp additionally maps NaN to +448.
   SGL_DEVICE static packed2_t quant(const float2 v) {
     return packed2_t{float2{fminf(v.x, kMaxValue), fminf(v.y, kMaxValue)}};
   }
@@ -209,6 +206,29 @@ struct MaskedQuantKernelParams {
   uint32_t masked_m_stride;  // 1 (int32) or 2 (int64)
 };
 
+struct SortedQuantKernelParams {
+  QuantKernelParams base;
+  // Sorted, block-padded MoE layout (moe_align_block_size output): a row at or
+  // past *num_tokens_post_padded, or holding the padding sentinel
+  // (>= num_valid_tokens), is never read by the MoE GEMM. Must match token_mask
+  // in fused_moe_kernel.
+  const int32_t* __restrict__ sorted_token_ids;
+  const int32_t* __restrict__ num_tokens_post_padded;
+  uint32_t num_valid_tokens;
+};
+
+namespace detail {
+
+SGL_DEVICE const QuantKernelParams& base_params(const QuantKernelParams& params) {
+  return params;
+}
+
+SGL_DEVICE const QuantKernelParams& base_params(const SortedQuantKernelParams& params) {
+  return params.base;
+}
+
+}  // namespace detail
+
 // PDL is a launch-scheduling knob, not a quant property, so it is a separate
 // template parameter of the kernels/launchers rather than part of QuantTrait.
 template <
@@ -306,15 +326,18 @@ struct QuantTrait {
       scale_inv = static_cast<uint8_t>(exp);
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
-      // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
-      // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
-      // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
-      // WeightTrait<fp8_e4m3_t>).
+      // BF16 can represent the multiplier, so preserve NaNs instead of hiding
+      // them as +448. FP16 retains sanitization because its multiplier can
+      // overflow even for finite inputs (including zero * inf).
       const auto max_clip = cast<T>(kMaxValue);
       const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        if constexpr (std::is_same_v<T, bf16_t>) {
+          out[i] = static_cast<Q2>(__hmin2_nan(__hmul2(in[i], scale2), max_clip2));
+        } else {
+          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        }
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
@@ -323,7 +346,12 @@ struct QuantTrait {
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = WTrait::quant(detail::mul2(cast<float2>(in[i]), quant_scale2));
+        const auto scaled = detail::mul2(cast<float2>(in[i]), quant_scale2);
+        if constexpr (std::is_same_v<T, bf16_t> && std::is_same_v<Q, fp8_e4m3_t>) {
+          out[i] = Q2{scaled};
+        } else {
+          out[i] = WTrait::quant(scaled);
+        }
       }
     }
 
@@ -392,12 +420,14 @@ struct QuantTrait {
 };
 
 // ---------------------------------------------------------------------------
-// Flat schedule: one subwarp (kNumLanes) per group over a linear grid.
+// Flat schedule: one subwarp (kNumLanes) per group over a linear grid. With
+// kSortedRows, rows are in the sorted MoE layout and padding rows are skipped.
 // ---------------------------------------------------------------------------
-template <typename Trait, bool kUsePDL>
+template <typename Trait, bool kUsePDL, bool kSortedRows = false>
 __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_kernel(
-    const __grid_constant__ QuantKernelParams params) {
+    const __grid_constant__ std::conditional_t<kSortedRows, SortedQuantKernelParams, QuantKernelParams> kernel_params) {
   using namespace device;
+  const QuantKernelParams& params = detail::base_params(kernel_params);
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
   constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
   const auto num_groups = params.scale.num_groups;
@@ -412,6 +442,16 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
   const auto token_idx = work_id / num_groups;
   const auto group_idx = work_id % num_groups;
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kSortedRows) {
+    // run() reduces across the whole warp, so only warps whose rows are all
+    // padding exit; a mixed warp also quantizes its padding rows (never read).
+    // The host checks sorted_token_ids covers every row, so both loads issue together.
+    const auto& sorted = kernel_params;
+    const auto num_post = static_cast<uint32_t>(*sorted.num_tokens_post_padded);
+    const auto sorted_id = static_cast<uint32_t>(sorted.sorted_token_ids[token_idx]);
+    const bool skip = token_idx >= num_post || sorted_id >= sorted.num_valid_tokens;
+    if (__all_sync(warp::kFullMask, skip)) return;
+  }
   Trait::run(params, 0, token_idx, group_idx, lane_id);
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -562,6 +602,17 @@ QuantHostContext<Trait> build_quant_context( //
   };
 }
 
+template <typename Trait, bool kUsePDL, bool kSortedRows, typename Params>
+void launch_flat_kernel(const QuantHostContext<Trait>& ctx, const Params& params) {
+  using namespace host;
+  const auto& p = ctx.params;
+  const int64_t total_threads = int64_t{p.num_tokens} * p.scale.num_groups * Trait::kNumLanes;
+  if (total_threads == 0) return;
+  const uint32_t num_blocks = div_ceil(total_threads, int64_t{Trait::kBlockSize});
+  LaunchKernel(num_blocks, Trait::kBlockSize, ctx.device)
+      .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL, kSortedRows>, params);
+}
+
 template <
     typename InputType,
     typename QuantType,
@@ -575,14 +626,48 @@ struct PerTokenGroupQuantFlatKernel {
   using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
-    using namespace host;
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
-    const auto& p = ctx.params;
-    const int64_t total_threads = int64_t{p.num_tokens} * p.scale.num_groups * Trait::kNumLanes;
-    if (total_threads == 0) return;
-    const uint32_t num_blocks = div_ceil(total_threads, int64_t{Trait::kBlockSize});
-    LaunchKernel(num_blocks, Trait::kBlockSize, ctx.device)
-        .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL>, p);
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
+  }
+};
+
+template <
+    typename InputType,
+    typename QuantType,
+    uint32_t kGroupSize,
+    bool kUe8m0,
+    bool kRowMajor,
+    bool kAligned,
+    bool kFuseSiluAndMul,
+    bool kUsePDL>
+struct PerTokenGroupQuantSortedKernel {
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+
+  /// \brief Flat quantization over the sorted, block-padded MoE layout.
+  /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
+  /// \param num_tokens_post_padded Device scalar; rows at or past it are padding.
+  /// Rows the MoE GEMM never reads may be skipped and left unwritten.
+  static void
+  run(tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      tvm::ffi::TensorView sorted_token_ids,
+      tvm::ffi::TensorView num_tokens_post_padded,
+      int64_t num_valid_tokens) {
+    using namespace host;
+    CHECK_HOST(is_type<int32_t>(sorted_token_ids.dtype())) << "sorted_token_ids must have dtype int32";
+    CHECK_HOST(is_type<int32_t>(num_tokens_post_padded.dtype())) << "num_tokens_post_padded must have dtype int32";
+    CHECK_HOST(0 <= num_valid_tokens && num_valid_tokens <= std::numeric_limits<int32_t>::max())
+        << "num_valid_tokens out of range: " << num_valid_tokens;
+    const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    CHECK_HOST(sorted_token_ids.numel() >= ctx.params.num_tokens) << "sorted_token_ids must cover every row";
+    const auto params = SortedQuantKernelParams{
+        ctx.params,
+        static_cast<const int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<const int32_t*>(num_tokens_post_padded.data_ptr()),
+        static_cast<uint32_t>(num_valid_tokens),
+    };
+    launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/true>(ctx, params);
   }
 };
 

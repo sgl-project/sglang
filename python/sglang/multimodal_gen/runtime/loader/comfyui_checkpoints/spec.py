@@ -70,7 +70,15 @@ class ComfyUICheckpointSpec:
     # mapping is applied repeatedly until it reaches a fixed point and the
     # config rules would rewrite names this spec already resolved.
     inherit_config_mapping: bool = True
+    # Serialized ComfyUI quantization: per-layer markers keyed by SGLang module
+    # prefix ({} for an unquantized file). MiniMax-H3 reads its own when unset.
+    quant_markers: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None
+    # Drops checkpoint keys that are not DiT weights (e.g. all-in-one files).
+    checkpoint_key_filter: Callable[[str], bool] | None = None
 
+
+# Methods whose no-arg config quantizes BF16 weights after loading.
+_ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
 
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
 _SPECS_DISCOVERED = False
@@ -91,6 +99,7 @@ def _discover_checkpoint_specs() -> None:
         flux,
         minimax_h3,
         qwen_image,
+        qwen_image21,
         zimage,
     )
 
@@ -185,6 +194,51 @@ def _load_comfyui_gguf_transformer(
         model_cls.param_names_mapping = original_mapping
 
 
+def _resolve_online_quant_spec(
+    *,
+    server_args: ServerArgs,
+    model_cls,
+    cls_name: str,
+    model_path: str,
+    dit_config,
+):
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        resolve_transformer_quant_load_spec,
+    )
+
+    if server_args.quantization not in _ONLINE_QUANTIZATIONS:
+        raise ValueError(
+            f"--quantization {server_args.quantization} needs a pre-quantized "
+            "checkpoint; a BF16 ComfyUI file can only be quantized online with "
+            f"one of {sorted(_ONLINE_QUANTIZATIONS)}"
+        )
+    return resolve_transformer_quant_load_spec(
+        hf_config={},
+        server_args=server_args,
+        safetensors_list=[model_path],
+        component_model_path=os.path.dirname(model_path) or ".",
+        model_cls=model_cls,
+        cls_name=cls_name,
+        component_name="transformer",
+        arch_config=dit_config.arch_config,
+    )
+
+
+def _online_quant_load_plan(*, server_args: ServerArgs, quant_spec) -> WeightLoadPlan:
+    starts_on_cpu = server_args.should_start_component_on_cpu("transformer")
+    # Matches the native loader: only ConvRot INT8 quantizes from host weights.
+    checkpoint_load_device = (
+        torch.device("cpu")
+        if starts_on_cpu and quant_spec.is_convrot_int8
+        else get_local_torch_device()
+    )
+    return WeightLoadPlan.for_component(
+        checkpoint_load_device=checkpoint_load_device,
+        needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+        component_starts_on_cpu=starts_on_cpu,
+    )
+
+
 def load_comfyui_transformer(
     pipeline: ComposedPipelineBase,
     server_args: ServerArgs,
@@ -248,17 +302,22 @@ def load_comfyui_transformer(
             )
 
         quant_config = None
-        checkpoint_key_filter = None
+        checkpoint_key_filter = spec.checkpoint_key_filter
         weight_load_plan = None
         # GGUF already sets AdaLN curve from tensor meta. Pruned BF16
         # safetensors keep the same adaln_t_table; without this the DiT is
         # built as the unpruned MLP and load fails on that extra parameter.
-        if spec.dit_cls_name == "MiniMaxH3DiTModel":
-            adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
-                [model_path]
-            )
+        if spec.dit_cls_name == "MiniMaxH3DiTModel" or spec.quant_markers:
+            if spec.quant_markers:
+                # Format support is checked by the quantization resolver below.
+                adaln_curve_shape = None
+                layer_markers = spec.quant_markers([model_path])
+            else:
+                adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                    [model_path]
+                )
             if layer_markers:
-                if any(
+                if not spec.quant_markers and any(
                     marker.get("format") != "int8_tensorwise"
                     for marker in layer_markers.values()
                 ):
@@ -277,7 +336,12 @@ def load_comfyui_transformer(
                         "Comfy quantized checkpoints do not support FSDP inference; use TP and/or sequence parallelism instead"
                     )
                 quant_config = resolve_minimax_h3_checkpoint_quantization(layer_markers)
-                checkpoint_key_filter = comfy_quant_key_filter
+                spec_filter = spec.checkpoint_key_filter
+                checkpoint_key_filter = (
+                    comfy_quant_key_filter
+                    if spec_filter is None
+                    else lambda key: comfy_quant_key_filter(key) and spec_filter(key)
+                )
                 checkpoint_device = (
                     torch.device("cpu")
                     if server_args.should_start_component_on_cpu("transformer")
@@ -295,6 +359,23 @@ def load_comfyui_transformer(
                     "MiniMax-H3 ComfyUI checkpoint uses AdaLN curve %s",
                     adaln_curve_shape,
                 )
+
+        post_load_hooks = []
+        if quant_config is None and server_args.quantization is not None:
+            # A BF16 file has no markers; quantize it online like a native directory.
+            quant_spec = _resolve_online_quant_spec(
+                server_args=server_args,
+                model_cls=model_cls,
+                cls_name=spec.dit_cls_name,
+                model_path=model_path,
+                dit_config=dit_config,
+            )
+            quant_config = quant_spec.quant_config
+            param_dtype = quant_spec.param_dtype
+            post_load_hooks = quant_spec.post_load_hooks
+            weight_load_plan = _online_quant_load_plan(
+                server_args=server_args, quant_spec=quant_spec
+            )
 
         logger.info(
             "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
@@ -333,6 +414,8 @@ def load_comfyui_transformer(
             )
         finally:
             model_cls.param_names_mapping = original_mapping
+        for post_load_hook in post_load_hooks:
+            post_load_hook(model)
 
     for param in model.parameters():
         param.requires_grad = False

@@ -158,6 +158,12 @@ class BaseSpecWorker(ABC):
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
 
+    @property
+    def draft_swa_window(self) -> int:
+        """Tokens back from the committed length that the draft reads in the
+        target's swa sub-pool; 0 when the target's own window covers them."""
+        return 0
+
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
         """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
         # NGRAM and UNO have no draft model
@@ -180,8 +186,15 @@ class BaseSpecWorker(ABC):
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
+        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
+
         draft_runners = self._draft_model_runners()
-        return draft_runners[0].token_to_kv_pool if draft_runners else None
+        if not draft_runners:
+            return None
+        pool = draft_runners[0].token_to_kv_pool
+        if fused_draft_host_allocator(pool) is not None:
+            return None
+        return pool
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -253,6 +266,7 @@ class BaseSpecWorker(ABC):
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
+        target_model_runner.mtp_draft_mamba_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
@@ -265,24 +279,37 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if (
-            "InklingForConditionalGenerationMTP"
-            in draft_runners[0].model_config.hf_config.architectures
-        ):
-            raise NotImplementedError(
-                "HiCache does not support Inkling MTP draft state yet."
-            )
-
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
+            target_mamba_pool = getattr(
+                target_model_runner.req_to_token_pool, "mamba_pool", None
+            )
+            draft_mamba_pools = tuple(
+                getattr(runner.req_to_token_pool, "mamba_pool", None)
+                for runner in draft_runners
+            )
+            # Shared state is already backed up with the target. Separate
+            # draft state follows the target's Mamba slot indices.
+            if any(
+                pool is not None and pool is not target_mamba_pool
+                for pool in draft_mamba_pools
+            ):
+                assert target_mamba_pool is not None, (
+                    "Packed draft state requires target Mamba slot indices"
+                )
+                assert all(
+                    pool is not None and pool is not target_mamba_pool
+                    for pool in draft_mamba_pools
+                ), "Packed MTP requires separate state for every draft layer"
+                target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
             )
 
-        if get_memory().enable_unified_cache_external_linker:
+        if get_memory().enable_unified_cache_external_linker and len(draft_pools) > 1:
             raise NotImplementedError(
-                "The external linker only supports packed draft KV caches."
+                "The external linker supports one non-packed draft KV pool."
             )
 
         return HiCacheDraftPlan(
