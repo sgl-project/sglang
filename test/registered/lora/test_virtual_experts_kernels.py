@@ -313,12 +313,12 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 
     def test_negative_sentinels_preserved(self):
         """Virtual scratch IDs stay bounded without changing borrowed route metadata."""
-        for dtype in (torch.int32, torch.int64):
-            with self.subTest(dtype=dtype):
-                self._check_remap_domain(dtype)
+        for dtype, max_loras in product((torch.int32, torch.int64), (1, 4)):
+            with self.subTest(dtype=dtype, max_loras=max_loras):
+                self._check_remap_domain(dtype, max_loras)
 
-    def _check_remap_domain(self, dtype):
-        num_experts, max_loras = 16, 4
+    def _check_remap_domain(self, dtype, max_loras):
+        num_experts = 16
         wide = 2**40 if dtype == torch.int64 else 2**30
         topk_ids = torch.tensor(
             [
@@ -365,7 +365,7 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                     if use_enabled
                     else None
                 )
-                if enabled is not None:
+                if enabled is not None and max_loras > 1:
                     enabled[1] = 0
 
                 def run():
@@ -390,11 +390,14 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                     token_lora_mapping.copy_(original_mapping)
                     if enabled is not None:
                         enabled.fill_(1)
-                        enabled[1] = 0
+                        if max_loras > 1:
+                            enabled[1] = 0
                     if state == "disabled":
-                        token_lora_mapping.fill_(-1)
                         if enabled is not None:
+                            token_lora_mapping.zero_()
                             enabled.zero_()
+                        else:
+                            token_lora_mapping.fill_(-1)
                     elif state == "inactive":
                         topk_ids.fill_(-1)
                     saved_ids, saved_mapping = (

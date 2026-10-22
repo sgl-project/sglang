@@ -160,7 +160,8 @@ def test_gate_delta_activation_skips_unwritten_routes_and_adapters(
 
 @pytest.mark.skipif(not _CUDA_BF16_AVAILABLE, reason="CUDA BF16 required")
 @pytest.mark.parametrize("shared_b", [False, True])
-def test_private_delta_projection_writes_inactive_routes_on_replay(shared_b):
+@pytest.mark.parametrize("slots", [1, 3])
+def test_private_delta_projection_writes_inactive_routes_on_replay(shared_b, slots):
     from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
@@ -168,9 +169,11 @@ def test_private_delta_projection_writes_inactive_routes_on_replay(shared_b):
     from sglang.srt.lora.marlin_lora_temp.activation import silu_and_mul_add_delta
 
     device, dtype = "cuda", torch.bfloat16
-    m, k, e, slots, h, n, r = 6, 2, 2, 3, 32, 32, 8
+    m, k, e, h, n, r = 6, 2, 2, 32, 32, 8
     ids = torch.tensor([[0, 1]] * m, device=device, dtype=torch.int32)
-    mapping = torch.tensor([0, 1, 2, 0, 1, 2], device=device, dtype=torch.int32)
+    mapping = torch.tensor(
+        [0, 1, 2, 0, 1, 2], device=device, dtype=torch.int32
+    ).remainder(slots)
     enabled = torch.ones(slots * 2, device=device, dtype=torch.int32)[::2]
     x = torch.zeros((m, h), device=device, dtype=dtype)
     x[:, 0] = 0.125
@@ -229,11 +232,15 @@ def test_private_delta_projection_writes_inactive_routes_on_replay(shared_b):
         for state in ("valid", "mixed", "disabled", "all-inactive", "recovered"):
             ids.copy_(torch.tensor([[0, 1]] * m, device=device, dtype=ids.dtype))
             mapping.copy_(
-                torch.tensor([0, 1, 2, 0, 1, 2], device=device, dtype=mapping.dtype)
+                torch.tensor(
+                    [0, 1, 2, 0, 1, 2], device=device, dtype=mapping.dtype
+                ).remainder(slots)
             )
             enabled.fill_(1)
             if state == "mixed":
-                ids[0, 0], mapping[1], mapping[2], enabled[1] = -1, -1, slots, 0
+                ids[0, 0], mapping[1], mapping[2] = -1, -1, slots
+                if slots > 1:
+                    enabled[1] = 0
             elif state == "disabled":
                 enabled.zero_()
             elif state == "all-inactive":

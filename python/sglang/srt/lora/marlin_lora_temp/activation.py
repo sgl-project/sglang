@@ -15,7 +15,45 @@ import triton.language as tl
 
 
 @triton.jit
+def _silu_mul_add_delta_row(
+    x_ptr,
+    d_ptr,
+    out_ptr,
+    N,
+    row,
+    cols,
+    mask,
+    delta_mask,
+):
+    x_row = x_ptr + row * 2 * N
+    d_row = d_ptr + row * 2 * N
+    gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_row + N + cols, mask=mask, other=0.0).to(tl.float32)
+    gate += tl.load(d_row + cols, mask=delta_mask, other=0.0).to(tl.float32)
+    up += tl.load(d_row + N + cols, mask=delta_mask, other=0.0).to(tl.float32)
+
+    silu = gate * tl.sigmoid(gate)
+    out = silu * up
+    tl.store(out_ptr + row * N + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
 def _silu_mul_add_delta_kernel(
+    x_ptr,
+    d_ptr,
+    out_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < N
+    _silu_mul_add_delta_row(x_ptr, d_ptr, out_ptr, N, row, cols, mask, mask)
+
+
+@triton.jit
+def _silu_mul_add_delta_checked_kernel(
     x_ptr,  # [T, 2N] gemm1 output, [gate || up]
     d_ptr,  # [T, 2N] LoRA gate_up delta, same layout
     out_ptr,  # [T, N]
@@ -59,16 +97,7 @@ def _silu_mul_add_delta_kernel(
     if HAS_ROUTING:
         delta_mask = delta_mask & enabled
 
-    x_row = x_ptr + row * 2 * N
-    d_row = d_ptr + row * 2 * N
-    gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(x_row + N + cols, mask=mask, other=0.0).to(tl.float32)
-    gate += tl.load(d_row + cols, mask=delta_mask, other=0.0).to(tl.float32)
-    up += tl.load(d_row + N + cols, mask=delta_mask, other=0.0).to(tl.float32)
-
-    silu = gate * tl.sigmoid(gate)
-    out = silu * up
-    tl.store(out_ptr + row * N + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+    _silu_mul_add_delta_row(x_ptr, d_ptr, out_ptr, N, row, cols, mask, delta_mask)
 
 
 def silu_and_mul_add_delta(
@@ -105,7 +134,16 @@ def silu_and_mul_add_delta(
     if T == 0:
         return
     BLOCK = 512
-    _silu_mul_add_delta_kernel[(T, triton.cdiv(N, BLOCK))](
+    if topk_ids is None:
+        _silu_mul_add_delta_kernel[(T, triton.cdiv(N, BLOCK))](
+            gemm1_out,
+            gate_up_delta,
+            out,
+            N,
+            BLOCK=BLOCK,
+        )
+        return
+    _silu_mul_add_delta_checked_kernel[(T, triton.cdiv(N, BLOCK))](
         gemm1_out,
         gate_up_delta,
         out,

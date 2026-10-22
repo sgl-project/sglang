@@ -58,14 +58,17 @@ def _fused_virtual_topk_ids_kernel(
     lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
     mask_val = (lora_id >= 0) & (lora_id < NUM_SLOTS)
     if HAS_ADAPTER_ENABLED:
-        mask_val = mask_val & (
-            tl.load(
-                adapter_enabled_ptr + lora_id * stride_enabled,
-                mask=valid & mask_val,
-                other=0,
+        if NUM_SLOTS == 1:
+            mask_val = mask_val & (tl.load(adapter_enabled_ptr) != 0)
+        else:
+            mask_val = mask_val & (
+                tl.load(
+                    adapter_enabled_ptr + lora_id * stride_enabled,
+                    mask=valid & mask_val,
+                    other=0,
+                )
+                != 0
             )
-            != 0
-        )
     safe_lora = tl.where(mask_val, lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)

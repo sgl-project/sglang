@@ -66,9 +66,11 @@ def _weighted_topk_rank_sum_kernel(
         ).to(tl.float32)
         weight = tl.load(
             topk_weights_ptr + token * stride_wm + k * stride_wk,
-            mask=route_mask,
+            mask=token_mask,
             other=0.0,
         ).to(tl.float32)
+        if HAS_TOPK_IDS:
+            weight = tl.where(route_mask, weight, 0.0)
         accumulator += routed_rank * weight[:, None]
 
     accumulator *= scale
@@ -92,9 +94,9 @@ def weighted_topk_rank_sum(
     """Compute ``output[m] = scale * sum_k(gamma[m,k] * rank[m,k])``.
 
     ``inactive_ranks_are_zero`` certifies that the rank producer writes literal
-    zero for every dropped route. Scores remain masked by the original IDs, so
-    undefined inactive weights are never consumed. The default also masks rank
-    loads and admits poisoned private payloads.
+    zero for every dropped route. Original IDs select inactive scores to zero
+    before multiplication, excluding NaNs from those scores. The default also
+    masks rank loads and admits poisoned private payloads.
     """
 
     assert routed_rank.ndim == 3
