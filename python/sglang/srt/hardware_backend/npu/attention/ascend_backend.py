@@ -987,6 +987,18 @@ class AscendAttnBackend(AttentionBackend):
             if "dcp_block_tables" in self.graph_metadata:
                 metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
                 metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
+        if (
+            get_parallel().dcp_enabled
+            and "dcp_spec_block_tables" in self.graph_metadata
+            and forward_mode.is_target_verify()
+        ):
+            num_spec_rows = bs * self.speculative_num_draft_tokens
+            metadata.dcp_spec_block_tables = self.graph_metadata[
+                "dcp_spec_block_tables"
+            ][:num_spec_rows]
+            metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
+                :num_spec_rows
+            ]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -997,19 +1009,11 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens = seq_lens
         if self.dense_mla_dcp_target:
             metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
-        if (
-            forward_mode.is_target_verify()
-            and "dcp_spec_seq_lens" in self.graph_metadata
-        ):
-            num_spec_rows = bs * self.speculative_num_draft_tokens
-            metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
-                :num_spec_rows
-            ]
-            if self.dsa_dcp_target:
-                metadata.dcp_spec_block_tables = self.graph_metadata[
-                    "dcp_spec_block_tables"
-                ][:num_spec_rows]
-            elif self.dense_mla_dcp_target:
+            if forward_mode.is_target_verify():
+                num_spec_rows = bs * self.speculative_num_draft_tokens
+                metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
+                    :num_spec_rows
+                ]
                 metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
                     :bs
                 ]
