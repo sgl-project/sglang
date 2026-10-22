@@ -1002,13 +1002,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
         use_strided_prefill_z = False
-        packed_verify = False
+        packed_verify = strided_verify = False
         if forward_batch.forward_mode.is_target_verify():
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
+            takes_views = getattr(backend, "target_verify_takes_projection_views", None)
+            strided_verify = takes_views is not None and takes_views(forward_batch)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
             and (forward_batch.forward_mode.is_decode() or packed_verify)
@@ -1032,11 +1034,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            # The strided views feed only prefill GDN; DP-relabeled decode rows
-            # run the decode kernels, so pick the layout from the logical mode.
-            use_strided_prefill_z = (
-                _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
+            # The strided views feed only prefill GDN and a verify extension
+            # that reads them; DP-relabeled decode rows run the decode kernels,
+            # so pick the layout from the logical mode.
+            use_strided_prefill_z = _is_cuda and (
+                forward_batch.logical_forward_mode.is_extend_without_speculative()
+                or strided_verify
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1876,12 +1879,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
-            packed = 0
-            for module in self.modules():
-                if isinstance(module, Qwen3_5GatedDeltaNet):
-                    module.finalize_fused_in_proj()
-                    packed += int(module._fused_in_proj_weight is not None)
+        packed = 0
+        for module in self.modules():
+            if isinstance(module, Qwen3_5GatedDeltaNet):
+                module.finalize_fused_in_proj()
+                packed += int(module._fused_in_proj_weight is not None)
+        if packed:
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
@@ -2409,6 +2412,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        prepare = getattr(self.model, "prepare_before_cuda_graph_capture", None)
+        if prepare is not None:
+            prepare(model_runner)
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")

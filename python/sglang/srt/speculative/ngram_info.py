@@ -116,6 +116,9 @@ class NgramVerifyInput(SpecInput):
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        return seq_lens_cpu + self.draft_token_num
+
     def filter_batch(
         self,
         new_indices: torch.Tensor,

@@ -1,11 +1,15 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -182,6 +186,27 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         self.assertIs(v2.create_worker(server_args), MagicMock)
 
+    def test_mm_requests_rejected_only_when_unsupported(self):
+        """The default validate_request turns supports_mm_inputs()=False into a
+        rejection of multimodal requests, and admits text-only ones."""
+        kwargs = dict(enable_overlap=False)
+        self.assertIsNone(
+            self.algo.validate_request(None, has_mm_inputs=True, **kwargs)
+        )
+
+        class _TextOnly(CustomSpecAlgo):
+            def supports_mm_inputs(self):
+                return False
+
+        text_only = _TextOnly("MY_TEXT", factory=MagicMock())
+        self.assertIsNone(
+            text_only.validate_request(None, has_mm_inputs=False, **kwargs)
+        )
+        self.assertIn(
+            "multimodal",
+            text_only.validate_request(None, has_mm_inputs=True, **kwargs),
+        )
+
     def test_create_worker_calls_factory(self):
         server_args = MagicMock()
         server_args.disable_overlap_schedule = True
@@ -201,6 +226,9 @@ class TestServerArgsHook(_RegistryIsolated):
             def handle_server_args(self, server_args):
                 server_args.custom_spec_handle_seen = self.name
                 server_args.speculative_num_draft_tokens = 7
+                server_args.custom_spec_config_seen = (
+                    server_args.speculative_algorithm_config
+                )
 
         @SpeculativeAlgorithm.register(
             "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
@@ -222,6 +250,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
             speculative_adaptive=False,
+            speculative_algorithm_config='{"k": 1}',
         )
 
         handle_speculative_decoding(server_args)
@@ -231,6 +260,18 @@ class TestServerArgsHook(_RegistryIsolated):
         )
         self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.speculative_num_draft_tokens, 7)
+        self.assertEqual(server_args.custom_spec_config_seen, '{"k": 1}')
+
+    def test_algorithm_config_rejected_without_a_registered_algorithm(self):
+        """Builtins never read --speculative-algorithm-config, so setting it
+        with one (or with no algorithm) must fail instead of being ignored."""
+        for algorithm in ("EAGLE", None):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.speculative_algorithm = algorithm
+                server_args.speculative_algorithm_config = '{"k": 1}'
+                with self.assertRaisesRegex(ValueError, "algorithm-config"):
+                    handle_speculative_decoding(server_args)
 
 
 class TestSubclassOverride(_RegistryIsolated):
@@ -312,15 +353,91 @@ class TestConformanceGuard(_RegistryIsolated):
                 return MagicMock
 
     def test_enum_interface_subset_of_custom_spec_algo(self):
-        # Every is_*/supports_* method on the enum exists on CustomSpecAlgo.
-        # vars() (not dir()) because EnumMeta.__dir__ hides instance methods.
+        # Every public method on the enum exists on CustomSpecAlgo: the
+        # scheduler calls more than the predicates (create_future_map at init,
+        # need_topk in the relay). vars() (not dir()) because EnumMeta.__dir__
+        # hides instance methods.
         interface = {
             name
-            for name in vars(SpeculativeAlgorithm)
-            if name.startswith(("is_", "supports_"))
+            for name, value in vars(SpeculativeAlgorithm).items()
+            if not name.startswith("_") and inspect.isfunction(value)
         }
-        self.assertTrue(interface)  # guard against an empty (no-op) interface
+        self.assertIn("create_future_map", interface)
         self.assertEqual(interface - set(dir(CustomSpecAlgo)), set())
+
+    def test_missing_scheduler_method_raises(self):
+        Stub = type(
+            "Stub",
+            (),
+            {
+                name: value
+                for name, value in vars(CustomSpecAlgo).items()
+                if name != "create_future_map"
+            },
+        )
+        with self.assertRaisesRegex(TypeError, "create_future_map"):
+            _assert_custom_spec_algo_conforms(Stub)
+
+
+class TestRelayDefaults(_RegistryIsolated):
+    """The relay-facing defaults follow the algorithm's is_eagle()."""
+
+    def test_need_topk_and_hidden_states_follow_is_eagle(self):
+        class EagleLike(CustomSpecAlgo):
+            def is_eagle(self) -> bool:
+                return True
+
+        plain = CustomSpecAlgo("MY_PLAIN", MagicMock)
+        eagle = EagleLike("MY_EAGLE_LIKE", MagicMock)
+        self.assertFalse(plain.need_topk())
+        self.assertFalse(plain.carries_draft_hidden_states())
+        self.assertTrue(eagle.need_topk())
+        self.assertTrue(eagle.carries_draft_hidden_states())
+
+    def test_create_future_map_builds_the_relay_for_this_algorithm(self):
+        from sglang.srt.managers import overlap_utils
+
+        algo = CustomSpecAlgo("MY_RELAY", MagicMock)
+        pool = MagicMock()
+        with patch.object(overlap_utils, "FutureMap") as future_map:
+            result = algo.create_future_map(
+                torch.device("cpu"), pool, needs_cpu_seq_lens=False
+            )
+        future_map.assert_called_once_with(
+            torch.device("cpu"), algo, pool, False, False
+        )
+        self.assertIs(result, future_map.return_value)
+
+
+class TestEagle4HostGuards(_RegistryIsolated):
+    """The CUDA plugin must not silently bypass unsupported request features."""
+
+    def setUp(self):
+        super().setUp()
+        self.algo = CustomSpecAlgo(
+            name="EAGLE_HARNESS", factory=lambda args: None, supports_overlap=True
+        )
+
+    def test_unsupported_devices_fail_before_the_factory(self):
+        for device in ("cpu", "npu", "xpu", "mps"):
+            with (
+                self.subTest(device=device),
+                self.assertRaisesRegex(NotImplementedError, "requires CUDA or ROCm"),
+            ):
+                self.algo.create_worker(SimpleNamespace(device=device))
+
+    def test_custom_processors_and_watermarks_fail_at_admission(self):
+        for req, message in (
+            (SimpleNamespace(custom_logit_processor="custom"), "custom logit"),
+            (
+                SimpleNamespace(sampling_params=SimpleNamespace(watermark=True)),
+                "watermark",
+            ),
+        ):
+            error = self.algo.validate_request(
+                req, has_mm_inputs=False, enable_overlap=True
+            )
+            self.assertIn(message, error)
 
 
 class TestCrossTypeIdentity(_RegistryIsolated):

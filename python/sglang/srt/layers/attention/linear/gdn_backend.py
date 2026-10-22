@@ -20,6 +20,11 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.linear.verify_extension import (
+    LinearAttnStateLayout,
+    LinearAttnVerifyExtension,
+    LinearAttnVerifyLayout,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -518,6 +523,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
+    # Speculative target-verify kernels of the algorithm, if it supplies any
+    # (layers/attention/linear/verify_extension.py).
+    verify_extension: Optional[LinearAttnVerifyExtension] = None
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -546,6 +554,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        # Only a pool with speculative state runs target verify forwards.
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            self.verify_extension = (
+                model_runner.spec_algorithm.create_linear_attn_verify_extension(
+                    LinearAttnStateLayout(
+                        conv_state_len=self.conv_states_shape[-1],
+                        conv_dtype=mamba_cache.conv[0].dtype,
+                        ssm_dtype=mamba_cache.temporal.dtype,
+                        num_v_heads=mamba_cache.temporal.shape[-3],
+                        has_state_snapshots=mamba_cache.intermediate_ssm is not None,
+                        device=torch.device(self.device),
+                    )
+                )
+            )
+        # The verify layout the extension handles this forward, else None.
+        self._verify_extension_layout: Optional[LinearAttnVerifyLayout] = None
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.verify_extension is not None:
+            self.verify_extension.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=True)
 
     def init_forward_metadata_out_graph(
         self,
@@ -582,6 +617,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=False)
+
+    def target_verify_takes_projection_views(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.forward_mode.is_target_verify()
+            and self._verify_extension_layout is not None
+            and self.verify_extension.reads_strided_inputs()
+        )
+
+    def _begin_verify_extension(self, forward_batch: ForwardBatch, *, in_graph: bool):
+        metadata = self.forward_metadata
+        layout = None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and metadata.retrieve_parent_token is not None
+        ):
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            if mamba_pool.mamba_cache.intermediate_ssm is None or (
+                getattr(mamba_pool, "replayssm_spec_fold", False)
+                or getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            ):
+                raise RuntimeError(
+                    "A linear-attention verify extension needs the per-step "
+                    "state snapshot verify path; this target uses ReplaySSM."
+                )
+            layout = LinearAttnVerifyLayout(
+                next_token=metadata.retrieve_next_token,
+                next_sibling=metadata.retrieve_next_sibling,
+                parent_token=metadata.retrieve_parent_token,
+                cache_indices=metadata.mamba_cache_indices,
+                query_start_loc=metadata.query_start_loc,
+                width=forward_batch.spec_info.draft_token_num,
+            )
+        self._verify_extension_layout = layout
+        self.verify_extension.begin_forward(layout, in_graph=in_graph)
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -993,7 +1064,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
             mamba_pool = self.req_to_token_pool.mamba_pool
@@ -1044,19 +1115,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            mixed_qkv_processed = None
+            if self._verify_extension_layout is not None:
+                mixed_qkv_processed = self.verify_extension.conv_update(
+                    layer,
+                    mixed_qkv_reshaped,
+                    conv_states=conv_states,
+                    cache_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                )
+            if mixed_qkv_processed is None:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
@@ -1080,7 +1162,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not self._use_strided_target_verify_qkv
+            # The recurrence reads strided q/k/v: an extension's answer for the
+            # forwards it handles, main's strided-QKV routing for the rest.
+            and not (
+                self.verify_extension.reads_strided_inputs()
+                if self._verify_extension_layout is not None
+                else self._use_strided_target_verify_qkv
+            )
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1144,23 +1232,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )
-                core_attn_out = self.kernel_dispatcher.target_verify(
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a,
-                    b=b,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
-                    stable_rows=pp_spec_stable_rows_enabled(),
-                )
+                core_attn_out = None
+                if self._verify_extension_layout is not None:
+                    core_attn_out = self.verify_extension.recurrent_update(
+                        layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        a=a,
+                        b=b,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        intermediate_states=intermediate_state_cache,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                if core_attn_out is None:
+                    core_attn_out = self.kernel_dispatcher.target_verify(
+                        A_log=layer.A_log,
+                        dt_bias=layer.dt_bias,
+                        q=query,
+                        k=key,
+                        v=value,
+                        a=a,
+                        b=b,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        intermediate_states_buffer=intermediate_state_cache,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=forward_batch.spec_info.draft_token_num,
+                        retrieve_parent_token=retrieve_parent_token,
+                        stable_rows=pp_spec_stable_rows_enabled(),
+                    )
         else:
             g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None

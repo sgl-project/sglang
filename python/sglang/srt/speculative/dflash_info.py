@@ -218,3 +218,7 @@ class DFlashVerifyInput(SpecInput):
                 )
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
+
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        # DFLASH batches carry seq_lens_cpu = prefix + verify window.
+        return seq_lens_cpu

@@ -16,6 +16,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -47,7 +48,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    FlashInferVerifyVariant,
+    SpecInput,
+    SpecInputType,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -79,6 +84,7 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
+        packbits,
     )
     from flashinfer.cascade import merge_state
 
@@ -211,6 +217,8 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
     uniform_verify_width: Optional[int] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    mask_indptr_host: Optional[torch.Tensor] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
@@ -259,8 +267,12 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
-
-    if custom_mask is not None:
+    if packed_custom_mask is not None:
+        self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+            packed_custom_mask, non_blocking=non_blocking
+        )
+        self._mask_indptr_buf.copy_(mask_indptr_host, non_blocking=non_blocking)
+    elif custom_mask is not None:
         # EAGLE's mask remains data-dependent: pack every actual tree-mask
         # bit, including rejected branches. Only its row lengths are known
         # on the host, so no device scalar read is needed for allocation.
@@ -554,6 +566,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        if not skip_prefill and not self.use_paged:
+            # Prefix-free graph capture never exercises the ragged/paged merge.
+            num_heads = (
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
+            )
+            value = torch.zeros(
+                (1, num_heads, model_runner.model_config.v_head_dim),
+                dtype=model_runner.dtype,
+                device=model_runner.device,
+            )
+            lse = torch.zeros(
+                (1, num_heads), dtype=torch.float32, device=model_runner.device
+            )
+            _safe_merge_state(value, lse, value, lse)
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -566,6 +594,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+        # Target-verify graph wrappers by (bs, num_tokens): a runner with
+        # speculative graph variants captures several verify widths per bs,
+        # and each graph keeps the wrappers it was captured with.
+        self.target_verify_cuda_graph_wrappers = {}
+        # Wrappers built with a speculative input's attention variant, which
+        # computes the mask itself (SpecInput.flashinfer_verify_variant).
+        self.variant_mask_wrappers = weakref.WeakSet()
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
@@ -785,7 +820,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.target_verify_cuda_graph_wrappers.get(
+                    (bs, forward_batch.positions.numel()),
+                    self.prefill_cuda_graph_metadata[bs],
+                ),
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -863,26 +901,30 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_target_verify()
             and spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-            and getattr(spec_info, "custom_mask", None) is None
+            and seq_lens_cpu is not None
+            and spec_info.attn_kv_lens_cpu(seq_lens_cpu[:bs]) is not None
+            # A packed mask's size is host-known for one request only.
+            and (
+                getattr(spec_info, "custom_mask", None) is None
+                or bs == 1
+                or self.target_verify_cuda_graph_wrappers[(bs, num_tokens)][0]
+                in self.variant_mask_wrappers
+            )
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
             and self.dispatch_reason is None
         ):
-            # DFLASH target-verify replays are shape-static per
-            # (bs, draft_token_num): qo_indptr is a constant arange stride of
-            # num_tokens_per_req, and the batch carries seq_lens_cpu =
-            # prefix + draft_token_num (dspark_draft._run_forward /
-            # dspark_verify.run_non_compact / dflash_worker_v2 all add the
-            # verify window host-side), which equals the device kv length
-            # generate_attn_arg_prefill produces. The host-kwargs assembly in
-            # call_begin_forward therefore applies verbatim; installing the
-            # sync-free plan removes three blocking .to("cpu") reads per
+            # Target-verify replays are shape-static per (bs, num_tokens):
+            # qo_indptr is a constant arange stride of num_tokens_per_req, and
+            # the spec input knows its KV lengths from the host seq_lens_cpu
+            # (SpecInput.attn_kv_lens_cpu). The sync-free plan removes the
+            # blocking .to("cpu") reads (and the mask packing's size read) per
             # replay that otherwise stall the CPU behind the in-flight graph.
-            # EAGLE uses the separate opt-in branch below because it must
-            # also pack its actual tree mask on every replay.
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            # This keys off the capture-time spec_info of these wrappers. The
+            # opt-in branch below also installs it for EAGLE batches of several
+            # requests with a mask, which fast_prefill_plan packs on the GPU.
+            for w in self.target_verify_cuda_graph_wrappers[(bs, num_tokens)]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         if (
@@ -898,7 +940,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and self.flashinfer_kv_cache_dtype
             in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
         ):
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            for w in self.target_verify_cuda_graph_wrappers[(bs, num_tokens)]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1171,7 +1213,12 @@ class FlashInferAttnBackend(AttentionBackend):
             wrappers = self.decode_cuda_graph_metadata[bs]
         return wrappers
 
-    def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
+    def _create_prefill_wrappers(
+        self,
+        bs: int,
+        use_custom_mask: bool = False,
+        variant: Optional[FlashInferVerifyVariant] = None,
+    ) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
         # `custom_mask_buf` is initialized (not whether a custom mask is provided).
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
@@ -1187,6 +1234,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 if use_custom_mask
                 else {}
             )
+            if variant is not None:
+                assert self.prefill_backend == "fa2" and self.num_wrappers == 1, (
+                    "attention variants are supported on one fa2 wrapper"
+                )
+                extra = {
+                    "custom_mask_buf": variant.mask_buf,
+                    "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    "jit_args": list(variant.jit_args),
+                    "variant_owns_mask": True,
+                }
             wrappers.append(
                 BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -1200,6 +1257,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     **extra,
                 )
             )
+        if variant is not None:
+            self.variant_mask_wrappers.update(wrappers)
         return wrappers
 
     @staticmethod
@@ -1329,8 +1388,34 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+            variant = (
+                spec_info.flashinfer_verify_variant(
+                    bs,
+                    num_tokens,
+                    q_dtype=self.indices_updater_prefill.q_data_type,
+                    kv_dtype=self.indices_updater_prefill.data_type,
+                    head_dim=self.indices_updater_prefill.head_dim,
+                )
+                if forward_mode.is_target_verify() and spec_info is not None
+                else None
+            )
+            # Several output variants can capture the same attention shape.
+            # Reuse its wrappers so replay refreshes the plan buffers retained
+            # by every graph of that shape.
+            prefill_wrappers = (
+                self.target_verify_cuda_graph_wrappers.get((bs, num_tokens))
+                if forward_mode.is_target_verify()
+                else None
+            )
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(
+                    bs, use_custom_mask, variant
+                )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if forward_mode.is_target_verify():
+                self.target_verify_cuda_graph_wrappers[(bs, num_tokens)] = (
+                    prefill_wrappers
+                )
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
@@ -2322,8 +2407,13 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = multi_item_params.token_pos_in_items_len
             max_item_len_ptr = multi_item_params.max_item_len_ptr
         else:
-            # No multi-item scoring - use standard parameters
-            use_custom_mask = custom_mask
+            # No multi-item scoring - use standard parameters. An attention
+            # variant computes the mask itself.
+            use_custom_mask = (
+                None
+                if wrapper_paged in self.attn_backend.variant_mask_wrappers
+                else custom_mask
+            )
             prefix_len_ptr = None
             token_pos_in_items_ptr = None
             token_pos_in_items_len = 0
@@ -2337,6 +2427,7 @@ class FlashInferIndicesUpdaterPrefill:
             and use_custom_mask is None
             and wrapper_paged.is_cuda_graph_enabled
             and wrapper_paged._custom_mask_buf is not None
+            and wrapper_paged not in self.attn_backend.variant_mask_wrappers
         ):
             raise RuntimeError(
                 f"{spec_info.spec_input_type} verify planned without a custom mask on "
@@ -2362,13 +2453,7 @@ class FlashInferIndicesUpdaterPrefill:
             assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
                 f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             )
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
-            eagle_verify = spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
-            assert use_custom_mask is None or eagle_verify
-            if eagle_verify:
-                # EAGLE carries the committed prefix length; its generated KV
-                # layout includes the complete candidate window after it.
-                seq_lens_cpu_i32 = seq_lens_cpu_i32 + num_tokens_per_req
+            kv_lens_cpu = spec_info.attn_kv_lens_cpu(seq_lens_cpu).to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2377,15 +2462,29 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_cpu, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
+                kv_lens_host=kv_lens_cpu,
                 max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
+                max_kv_len=int(kv_lens_cpu.max()),
             )
-            if eagle_verify:
+            if use_custom_mask is not None and bs == 1:
+                # One request: its [num_tokens_per_req, kv_len] mask packs to a
+                # host-known size.
+                mask_bits = num_tokens_per_req * int(kv_lens_cpu[0])
+                paged_plan_kwargs["packed_custom_mask"] = packbits(
+                    use_custom_mask[:mask_bits], "little"
+                )
+                paged_plan_kwargs["mask_indptr_host"] = torch.tensor(
+                    [0, (mask_bits + 7) // 8], dtype=torch.int32
+                )
+            elif use_custom_mask is not None:
+                # Several requests with a mask: only the opt-in EAGLE branch
+                # installs this plan for them, and every request verifies the
+                # same number of tokens.
+                assert spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
                 paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
         if window_left >= 0:

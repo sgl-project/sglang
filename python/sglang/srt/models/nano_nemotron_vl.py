@@ -249,6 +249,9 @@ class NemotronH_Nano_VL_V2(EVS):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.language_model.set_dflash_layers_to_capture(layer_ids)
 

@@ -186,6 +186,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     add_prometheus_middleware,
     build_server_info,
@@ -529,6 +530,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    get_spec,
     publish,
 )
 
@@ -2336,6 +2338,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         and not get_disagg().language_model_only
         and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
+        and SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).supports_mm_inputs()
     )
     if model_info["is_generation"]:
         if is_vlm and not get_serving().skip_tokenizer_init:

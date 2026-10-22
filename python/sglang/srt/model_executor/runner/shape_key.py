@@ -28,3 +28,6 @@ class ShapeKey:
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None
+    # Speculative graph variant (decode_graph_variants.py); None selects the
+    # default.
+    spec_variant: Optional[str] = None

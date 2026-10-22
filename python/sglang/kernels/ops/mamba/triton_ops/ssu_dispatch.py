@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -273,7 +274,8 @@ def selective_state_update(
         out: Preallocated output tensor (in-place updated)
         disable_state_update: If True, don't write back to state (for speculative verify)
         intermediate_states_buffer: Buffer to cache intermediate states
-        cache_steps: Total number of steps in the buffer
+        cache_steps: Total number of steps in the buffer (taken from
+            ``intermediate_states_buffer``'s per-slot pitch when it is given)
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
@@ -282,6 +284,13 @@ def selective_state_update(
         "Mamba selective_state_update backend not initialized. "
         "Call initialize_mamba_selective_state_update_backend() first."
     )
+    if intermediate_states_buffer is not None:
+        # The kernels address snapshot (slot, step) as slot * cache_steps + step.
+        # A verify narrower than the buffer (adaptive speculative steps) keeps
+        # the allocated per-slot pitch, so take it from the buffer.
+        cache_steps = intermediate_states_buffer.stride(0) // math.prod(
+            intermediate_states_buffer.shape[2:]
+        )
 
     _mamba_ssu_backend(
         state,

@@ -332,6 +332,59 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(captured_ptrs[0], captured_ptrs[1])
         self.assertEqual(len(kernel._verify_intermediate_buffers), 1)
 
+    def test_narrow_mtp_snapshots_keep_pool_row_stride(self):
+        for bs in (1, 2, 8):
+            for width in (1, 2, 4, 8):
+                for stable_rows in (False, True):
+                    with self.subTest(bs=bs, width=width, stable_rows=stable_rows):
+                        kernel = _make_kernel_without_flashinfer()
+                        kernel.use_state_pool = True
+                        pool = torch.full((10, 8, 2, 4, 4), -1, dtype=torch.bfloat16)
+                        rows = torch.arange(bs - 1, -1, -1, dtype=torch.int32)
+                        if stable_rows:
+                            rows += 1
+
+                        def packed_mtp(**kwargs):
+                            # FlashInfer's MTP ABI indexes snapshots as [B,T,H,V,K],
+                            # not with the larger pool's reserved token stride.
+                            snapshot = kwargs["intermediate_states_buffer"]
+                            packed = snapshot.view(-1)[: bs * width * 2 * 4 * 4]
+                            packed = packed.view(bs, width, 2, 4, 4)
+                            for row in range(bs):
+                                for step in range(width):
+                                    packed[row, step].fill_(10 * row + step)
+                            return torch.zeros_like(kwargs["v"]), None
+
+                        kernel._mtp_fn = packed_mtp
+                        kernel.target_verify(
+                            torch.zeros(2),
+                            torch.zeros(2, dtype=torch.bfloat16),
+                            torch.empty(1, bs * width, 1, 4, dtype=torch.bfloat16),
+                            torch.empty(1, bs * width, 1, 4, dtype=torch.bfloat16),
+                            torch.empty(1, bs * width, 2, 4, dtype=torch.bfloat16),
+                            torch.empty(1, bs * width, 2, dtype=torch.bfloat16),
+                            torch.empty(1, bs * width, 2, dtype=torch.bfloat16),
+                            ssm_states=torch.zeros(10, 2, 4, 4, dtype=torch.bfloat16),
+                            cache_indices=rows,
+                            query_start_loc=torch.arange(bs + 1, dtype=torch.int32)
+                            * width,
+                            intermediate_states_buffer=pool,
+                            intermediate_state_indices=rows,
+                            cache_steps=8,
+                            retrieve_parent_token=None,
+                            stable_rows=stable_rows,
+                        )
+                        for row in range(bs):
+                            dest = int(rows[row]) if stable_rows else row
+                            for step in range(width):
+                                torch.testing.assert_close(
+                                    pool[dest, step],
+                                    torch.full_like(pool[dest, step], 10 * row + step),
+                                )
+                        torch.testing.assert_close(
+                            pool[:, width:], torch.full_like(pool[:, width:], -1)
+                        )
+
     def test_mtp_pool_sized_batch_keeps_zero_copy_fast_path(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True

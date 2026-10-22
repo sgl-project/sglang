@@ -22,6 +22,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.verify_extension import (
+    LinearAttnStateLayout,
+    LinearAttnVerifyExtension,
+    LinearAttnVerifyLayout,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -34,7 +39,7 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -58,6 +63,13 @@ _validate_mamba_replay_state_indices = (
 
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
+
+    def target_verify_takes_projection_views(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this forward is a target verify whose conv and recurrence
+        take token-strided views of a layer's input projection, so the layer
+        may skip splitting it into copies. The builtin verify kernels take the
+        copies (False); a verify extension may say otherwise."""
+        return False
 
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
@@ -402,13 +414,13 @@ class MambaAttnBackendBase(AttentionBackend):
             or spec_info.retrieve_next_token is None  # dummy / capture runs
         ):
             return
-        bs_without_pad = spec_info.retrieve_next_token.shape[0]
-        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+        bs_without_pad, width = spec_info.retrieve_next_token.shape
+        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad, :width].copy_(
             spec_info.retrieve_next_token
         )
-        self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
-            spec_info.retrieve_next_sibling
-        )
+        self.retrieve_next_sibling_list[cuda_graph_bs - 1][
+            :bs_without_pad, :width
+        ].copy_(spec_info.retrieve_next_sibling)
 
     def _init_track_conv_indices(
         self,
@@ -664,6 +676,28 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        # Query starts of target-verify graphs narrower than draft_token_num
+        # (a runner may capture several verify widths), built on first use.
+        self._cuda_graph_max_bs = max_bs
+        self._cuda_graph_verify_width = draft_token_num
+        self._narrow_verify_query_start_loc = {}
+
+    def _verify_query_start_loc(self, width: int) -> torch.Tensor:
+        """Static target-verify query starts strided by ``width`` tokens per
+        request."""
+        if width == self._cuda_graph_verify_width:
+            return self.cached_cuda_graph_verify_query_start_loc
+        query_start_loc = self._narrow_verify_query_start_loc.get(width)
+        if query_start_loc is None:
+            query_start_loc = torch.arange(
+                0,
+                self._cuda_graph_max_bs * width + 1,
+                step=width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._narrow_verify_query_start_loc[width] = query_start_loc
+        return query_start_loc
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert max_num_tokens % max_bs == 0, (
@@ -896,17 +930,23 @@ class MambaAttnBackendBase(AttentionBackend):
                         padded_bs=bs, cap=spec_info.draft_token_num
                     )
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
-            elif num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                # Strided by this forward's verify width, which a runner that
+                # captures several verify widths narrows below the captured one.
+                verify_query_start_loc = self._verify_query_start_loc(
+                    spec_info.draft_token_num
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
-                )
+                if num_padding == 0:
+                    self.query_start_loc_list[bs - 1].copy_(
+                        verify_query_start_loc[: bs + 1]
+                    )
+                else:
+                    self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
+                        verify_query_start_loc[: bs - num_padding]
+                    )
+                    self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
+                        (bs - num_padding) * spec_info.draft_token_num
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]
@@ -916,11 +956,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
             ):
-                bs_without_pad = spec_info.retrieve_next_token.shape[0]
-                self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                # A verify narrower than the buffers fills their first
+                # `width` columns.
+                bs_without_pad, width = spec_info.retrieve_next_token.shape
+                self.retrieve_next_token_list[bs - 1][:bs_without_pad, :width].copy_(
                     spec_info.retrieve_next_token
                 )
-                self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                self.retrieve_next_sibling_list[bs - 1][:bs_without_pad, :width].copy_(
                     spec_info.retrieve_next_sibling
                 )
             return ForwardMetadata(
@@ -1067,12 +1109,38 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
     needs_cpu_seq_lens: bool = False
+    # Speculative target-verify kernels of the algorithm, if it supplies any
+    # (layers/attention/linear/verify_extension.py).
+    verify_extension: Optional[LinearAttnVerifyExtension] = None
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        self.conv_states_shape = mamba_cache.conv[0].shape
+        # Only a pool with speculative state runs target verify forwards.
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            # temporal: (layers, slots, heads, head_dim, state); conv:
+            # (layers, slots, heads * head_dim + 2 * groups * state, width).
+            num_heads, head_dim, state_size = mamba_cache.temporal.shape[-3:]
+            conv_dim = self.conv_states_shape[-2]
+            self.verify_extension = (
+                model_runner.spec_algorithm.create_linear_attn_verify_extension(
+                    LinearAttnStateLayout(
+                        conv_state_len=self.conv_states_shape[-1],
+                        conv_dtype=mamba_cache.conv[0].dtype,
+                        ssm_dtype=mamba_cache.temporal.dtype,
+                        num_v_heads=num_heads,
+                        has_state_snapshots=mamba_cache.intermediate_ssm is not None,
+                        device=torch.device(self.device),
+                        kind="mamba2",
+                        head_dim=head_dim,
+                        ssm_state_size=state_size,
+                        n_groups=(conv_dim - num_heads * head_dim) // (2 * state_size),
+                    )
+                )
+            )
+        # The verify layout the extension handles this forward, else None.
+        self._verify_extension_layout: Optional[LinearAttnVerifyLayout] = None
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
@@ -1119,6 +1187,41 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=False)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.verify_extension is not None:
+            self.verify_extension.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=True)
+
+    def _begin_verify_extension(self, forward_batch: ForwardBatch, *, in_graph: bool):
+        metadata = self.forward_metadata
+        layout = None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and metadata.retrieve_parent_token is not None
+        ):
+            if self.req_to_token_pool.mamba_pool.mamba_cache.intermediate_ssm is None:
+                raise RuntimeError(
+                    "A linear-attention verify extension needs the per-step "
+                    "state snapshot verify path."
+                )
+            layout = LinearAttnVerifyLayout(
+                next_token=metadata.retrieve_next_token,
+                next_sibling=metadata.retrieve_next_sibling,
+                parent_token=metadata.retrieve_parent_token,
+                cache_indices=metadata.mamba_cache_indices,
+                query_start_loc=metadata.query_start_loc,
+                width=forward_batch.spec_info.draft_token_num,
+            )
+        self._verify_extension_layout = layout
+        self.verify_extension.begin_forward(layout, in_graph=in_graph)
 
     def forward(
         self,
@@ -1144,6 +1247,11 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata=self.forward_metadata,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            verify_extension=(
+                self.verify_extension
+                if self._verify_extension_layout is not None
+                else None
+            ),
         )
 
         if forward_batch.mamba_track_mask is not None:

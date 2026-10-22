@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -35,10 +36,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.dllm_config = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
                 scheduler._record_kv_event_lora_name = MagicMock()
-                scheduler.spec_algorithm = SimpleNamespace(
-                    is_dflash_family=lambda: False,
-                    is_uno=lambda: False,
-                )
+                scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                scheduler.enable_overlap = False
                 scheduler._add_request_to_queue = MagicMock()
                 scheduler.output_streamer = MagicMock()
                 recv_req = MagicMock(

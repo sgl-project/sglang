@@ -152,6 +152,9 @@ class EagleVerifyInput(SpecInput):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        return seq_lens_cpu + self.draft_token_num
+
 
 @dataclass
 class EagleDraftInput(SpecInput):
@@ -456,3 +459,7 @@ class EagleDraftExtendInput(SpecInput):
             kv_lens_sum=host_kv_lens_sum,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        # The draft-extend lengths already include the write window.
+        return seq_lens_cpu

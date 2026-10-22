@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -20,9 +21,17 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.verify_extension import (
+        LinearAttnStateLayout,
+        LinearAttnVerifyExtension,
+    )
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphRunnerInfo,
+        DecodeGraphVariants,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -111,6 +120,11 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft
+        (EAGLE-3 style, layers from the draft's ``eagle_config``)."""
+        return self.is_eagle3()
+
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
@@ -171,6 +185,26 @@ class SpeculativeAlgorithm(Enum):
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
+    def supports_mm_inputs(self) -> bool:
+        """Whether requests with multimodal inputs may be served (also picks
+        the multimodal server warmup)."""
+        return True
+
+    def validate_request(
+        self, req: Req, *, has_mm_inputs: bool, enable_overlap: bool
+    ) -> Optional[str]:
+        """Return why this algorithm cannot serve ``req``, or ``None``. The
+        scheduler aborts the request with the message before admitting it."""
+        if self.is_dflash_family():
+            from sglang.srt.speculative.dflash_utils import validate_dflash_request
+
+            return validate_dflash_request(req, enable_overlap)
+        if self.is_uno():
+            from sglang.srt.speculative.uno_validation import validate_uno_request
+
+            return validate_uno_request(req)
+        return None
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
@@ -227,6 +261,25 @@ class SpeculativeAlgorithm(Enum):
             return build_dflash_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        return None
+
+    def req_to_token_extra_len(self, page_size: int) -> int:
+        """Extra ``req_to_token`` row headroom (tokens) this algorithm needs;
+        builtins are covered by the default headroom."""
+        return 0
+
+    def create_decode_graph_variants(
+        self, info: DecodeGraphRunnerInfo
+    ) -> Optional[DecodeGraphVariants]:
+        """Extra CUDA-graph variants for the runner ``info`` describes;
+        builtins capture one graph per batch size at the static width."""
+        return None
+
+    def create_linear_attn_verify_extension(
+        self, state: LinearAttnStateLayout
+    ) -> Optional[LinearAttnVerifyExtension]:
+        """Target-verify extension for a GDN or Mamba2 linear-attention
+        backend; builtins run the backend's own verify kernels."""
         return None
 
     def need_topk(self) -> bool:
@@ -382,6 +435,20 @@ class SpecInputType(IntEnum):
     PP_SPEC_RELAY = auto()
 
 
+@dataclasses.dataclass(frozen=True)
+class FlashInferVerifyVariant:
+    """A custom FlashInfer attention variant for target-verify prefill
+    wrappers, built through FlashInfer's public JIT API:
+    ``BatchPrefillWithPagedKVCacheWrapper(jit_args=jit_args,
+    custom_mask_buf=mask_buf, variant_owns_mask=True)`` on the fa2 backend."""
+
+    # Arguments of flashinfer.jit.gen_customize_batch_prefill_module.
+    jit_args: Tuple[Any, ...]
+    # The wrappers' custom_mask_buf, which the variant reads as
+    # maybe_custom_mask; its owner fills it before each replay.
+    mask_buf: torch.Tensor
+
+
 class SpecInput(ABC):
     # Whether this input carries all state required for CUDA graph replay.
     # Algorithm-specific dataclass subclasses can override this per input.
@@ -417,6 +484,15 @@ class SpecInput(ABC):
     window_kv_indptr: Optional[torch.Tensor] = None
     window_kv_indices: Optional[torch.Tensor] = None
 
+    # Whether a forward carrying this input reads only the greedy argmax of
+    # its rows (an all-greedy verify without logprobs, grammar or penalties).
+    # The logits processor then returns LogitsProcessorOutput.next_token_ids
+    # and leaves next_token_logits None, so nothing can read logits that were
+    # never gathered. Where it cannot compute ids that way it returns logits
+    # as usual, so a consumer must accept both. Class-level default (same
+    # rationale as ragged_verify_layout).
+    greedy_tokens_only: bool = False
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -447,6 +523,32 @@ class SpecInput(ABC):
         pad_tensor_to_size: Callable[..., torch.Tensor],
         batch_size: int,
     ) -> None:
+        return None
+
+    def flashinfer_verify_variant(
+        self,
+        bs: int,
+        num_tokens: int,
+        *,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        head_dim: int,
+    ) -> Optional[FlashInferVerifyVariant]:
+        """Called by the FlashInfer backend when it creates the target-verify
+        CUDA-graph wrappers of a (bs, num_tokens) graph under capture, with
+        their query and KV-cache dtypes and head dim. Return a
+        FlashInferVerifyVariant to build them with that attention variant
+        instead of the default custom-mask kernel; None (default) keeps the
+        default. The variant computes the mask itself, so these wrappers are
+        planned without one."""
+        return None
+
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> Optional[torch.Tensor]:
+        """Host copy of the per-request KV lengths this input's
+        generate_attn_arg_prefill lays out, from the batch's host
+        ``seq_lens_cpu``. None (default) when they are not known on the host.
+        Lets the attention backend plan a CUDA-graph replay without reading
+        the layout back from the device."""
         return None
 
 
