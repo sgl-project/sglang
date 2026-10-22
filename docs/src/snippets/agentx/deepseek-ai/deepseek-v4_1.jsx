@@ -3,7 +3,7 @@
 // (SemiAnalysisAI/InferenceX main@6046414d2d1a plus open PRs #3930, #4333, #4341, #4342, #4343, #4344, #4346, #4350, #4303), with SA-specific settings removed.
 export const agentx = {
  "model": "DeepSeek-V4.1",
- "generatedOn": "2026-10-21",
+ "generatedOn": "2026-10-22",
  "source": {
   "repo": "https://github.com/SemiAnalysisAI/InferenceX",
   "main": "6046414d2d1ad2fb17aa857f01fd3146f429b4fc",
@@ -49,9 +49,9 @@ export const agentx = {
     "status": "in-progress"
    },
    "4303": {
-    "run": null,
-    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
-    "status": "in-progress"
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
+    "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
+    "status": "verified-pr"
    }
   }
  },
@@ -1127,16 +1127,16 @@ export const agentx = {
    "kv": {
     "available": ["mooncake"],
     "unavailable": {
-     "none": "Not mirrored for this pending submission.",
-     "hicache": "Not mirrored for this pending submission."
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
-    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
+    "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
-    "run": null,
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -1395,16 +1395,16 @@ export const agentx = {
    "kv": {
     "available": ["mooncake"],
     "unavailable": {
-     "none": "Not mirrored for this pending submission.",
-     "hicache": "Not mirrored for this pending submission."
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
-    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
+    "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
-    "run": null,
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
@@ -4609,16 +4609,16 @@ export const agentx = {
    "kv": {
     "available": ["mooncake"],
     "unavailable": {
-     "none": "Not mirrored for this pending submission.",
-     "hicache": "Not mirrored for this pending submission."
+     "none": "Not included in the verified submission.",
+     "hicache": "Not included in the verified submission."
     }
    },
    "prov": {
-    "sha": "70d63156d511f52e8139db3c53bc7b5281d2cf73",
+    "sha": "a0e5be74248f09552f88904f90dc71e8f190a3e9",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
-    "run": null,
+    "run": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39695060576",
     "pr": "4303",
-    "status": "in-progress"
+    "status": "verified-pr"
    },
    "points": [
     {
