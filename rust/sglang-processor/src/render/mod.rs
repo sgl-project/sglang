@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 use dynamo_renderer::deepseek::common::tokens;
+use dynamo_renderer::deepseek::v41::DeepSeekV41Formatter;
 use dynamo_renderer::kimi_k3::KimiK3Formatter;
 use dynamo_renderer::{
     OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt, RenderedSegment,
@@ -125,7 +126,19 @@ impl ChatFormatter {
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
                 body["messages"] = messages;
-                let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
+                let (prompt, prefix) = match self.render_request(body, &HashMap::new()) {
+                    // Dynamo's encoder renders, its own way, what SGLang's declines.
+                    Err(TemplateError::EngineOnly { .. })
+                        if matches!(self, ChatFormatter::DeepSeekV41) =>
+                    {
+                        return DeepSeekV41Formatter
+                            .render_prompt(request)
+                            .map_err(|error| TemplateError::Renderer {
+                                message: error.to_string(),
+                            });
+                    }
+                    rendered => rendered?,
+                };
                 let prompt = prompt.into_text();
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
