@@ -1047,7 +1047,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str], tool_names=None
+        name: str,
+        arguments: str,
+        custom_names: set[str],
+        tool_names: dict[str, dict[str, str]],
     ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
         """A call against a ``custom`` tool reports its freeform payload rather
         than the JSON arguments of the shim function tool."""
@@ -1057,14 +1060,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="custom_tool_call",
                 id=f"ctc_{random_uuid()[:8]}",
                 call_id=call_id,
-                **response_tool_name(name, tool_names or {}),
+                **response_tool_name(name, tool_names),
                 input=decode_custom_tool_input(arguments),
             )
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=call_id,
             type="function_call",
-            **response_tool_name(name, tool_names or {}),
+            **response_tool_name(name, tool_names),
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
         )
@@ -1158,11 +1161,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             if required_json and content:
                 content, tool_call_items = self._parse_required_tool_json(
-                    content, custom_names
+                    content, custom_names, request._tool_state.names
                 )
             else:
                 tool_call_items = [
-                    self._make_tool_call_item(call.name, call.parameters, custom_names)
+                    self._make_tool_call_item(
+                        call.name,
+                        call.parameters,
+                        custom_names,
+                        request._tool_state.names,
+                    )
                     for call in calls
                 ]
         else:
@@ -1350,7 +1358,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         return output_items
 
     def _parse_required_tool_json(
-        self, content: str, custom_names: set[str]
+        self,
+        content: str,
+        custom_names: set[str],
+        tool_names: dict[str, dict[str, str]],
     ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
         tool_call_items = []
         try:
@@ -1365,7 +1376,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tool.get("parameters", {}), ensure_ascii=False
                     )
                     tool_call_items.append(
-                        self._make_tool_call_item(tool["name"], arguments, custom_names)
+                        self._make_tool_call_item(
+                            tool["name"], arguments, custom_names, tool_names
+                        )
                     )
                 content = ""
         except Exception as e:

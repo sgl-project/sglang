@@ -415,6 +415,49 @@ def test_named_namespace_choice_reaches_ordinary_serving_path():
     assert json.loads(call["arguments"]) == {"city": "Paris"}
 
 
+@pytest.mark.parametrize("required", [False, True])
+def test_native_encoder_calls_keep_their_namespace(required):
+    """Calls a native chat encoder returns must name their public namespace, also
+    when required-tool JSON carries them."""
+    from sglang.srt.entrypoints.openai.responses_tools.adapter import (
+        ResponseToolAdapter,
+    )
+    from sglang.srt.function_call.core_types import ToolCallItem
+
+    serving = make_serving()
+    serving.reasoning_parser = None
+    # Without a tool parser, required calls arrive as the generic JSON array.
+    serving.tool_call_parser = None if required else "qwen25"
+    arguments = '{"city": "Paris"}'
+    if required:
+        output = ("", f'[{{"name": "office__weather", "parameters": {arguments}}}]', [])
+    else:
+        call = ToolCallItem(tool_index=0, name="office__weather", parameters=arguments)
+        output = ("", "", [call])
+
+    class Encoder:
+        def parse_responses_output(self, **_):
+            return output
+
+    request, _ = ResponseToolAdapter.from_request(
+        ResponsesRequest(
+            input="Weather?",
+            tools=[namespace()],
+            tool_choice="required" if required else "auto",
+        ),
+        use_harmony=False,
+        tool_call_parser=serving.tool_call_parser,
+    )
+    with patch.object(serving, "_encoding_output", return_value=Encoder()):
+        items = serving._make_response_output_items(
+            request, "", None, require_reasoning=False, output_ids=[1]
+        )
+
+    (call,) = [item.model_dump() for item in items if item.type == "function_call"]
+    assert (call["name"], call["namespace"]) == ("weather", "office")
+    assert json.loads(call["arguments"]) == {"city": "Paris"}
+
+
 def test_namespace_reuses_qwen_parser_and_unknown_name_filter():
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
