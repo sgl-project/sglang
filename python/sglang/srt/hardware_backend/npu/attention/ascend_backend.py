@@ -545,7 +545,7 @@ class AscendAttnBackend(AttentionBackend):
                     int(local_kv_lens.max().item()) if local_kv_lens.numel() else 0
                 )
                 num_pages = max(1, (max_len + self.page_size - 1) // self.page_size)
-            block_tables = torch.zeros(
+            block_tables = torch.empty(
                 (req_pool_indices.numel(), num_pages),
                 dtype=torch.int32,
                 device=self.req_to_token.device,
@@ -603,32 +603,15 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.dense_mla_dcp_target and self.uses_dcp_partial_attention(forward_batch):
+        dense_mla_dcp_partial = (
+            self.dense_mla_dcp_target and self.uses_dcp_partial_attention(forward_batch)
+        )
+        if dense_mla_dcp_partial:
             metadata = self.forward_metadata
-            if forward_batch.forward_mode.is_target_verify():
-                query_len = int(forward_batch.spec_info.draft_token_num)
-                effective_seq_lens = forward_batch.seq_lens.to(torch.int64) + query_len
-                metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
-                    effective_seq_lens,
-                    query_len,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    interleave_size=self.page_size,
-                )
-            else:
-                metadata.dcp_spec_seq_lens = None
-                metadata.dcp_mtp_attn_mask = None
-                effective_seq_lens = forward_batch.seq_lens
-                if (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    and forward_batch.spec_info is not None
-                ):
-                    effective_seq_lens = effective_seq_lens + int(
-                        self.speculative_step_id + 1
-                    )
             # Derive FIA's Host lengths from the CPU mirror without a device readback.
             effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
             if forward_batch.forward_mode.is_target_verify():
+                query_len = int(forward_batch.spec_info.draft_token_num)
                 spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is not None and spec_algorithm.is_dflash_family():
                     # Active Host lengths already include verify tokens; Ascend's
@@ -651,6 +634,81 @@ class AscendAttnBackend(AttentionBackend):
                     effective_seq_lens_cpu, forward_batch.req_pool_indices
                 )
             )
+        elif self.needs_cpu_seq_lens:
+            seq_lens_max = forward_batch.seq_lens.max()
+            if forward_batch.forward_mode.is_target_verify():
+                if (
+                    forward_batch.spec_algorithm is not None
+                    and forward_batch.spec_algorithm.is_dflash()
+                ):
+                    # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
+                    # one verify block, which already covers the draft block.
+                    seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+                else:
+                    # Overlap scheduling can publish the CPU sequence length one
+                    # step ahead of the device tensor. FIA consumes seq_lens_cpu
+                    # below, so derive the block-table width from the same source.
+                    # Otherwise a page-aligned request can expose KV_S=N while
+                    # asking FIA for N+1.
+                    spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
+                    seq_lens_max = (
+                        forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+                    )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                seq_lens_max += self.speculative_step_id + 1
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
+            )
+            if self.is_hybrid_swa:
+                self.forward_metadata.block_tables_swa = (
+                    (
+                        self.full_to_swa_index_mapping[
+                            self.req_to_token_pool.req_to_token[
+                                forward_batch.req_pool_indices, :seq_lens_max
+                            ]
+                        ][:, :: self.page_size]
+                        // self.page_size
+                    )
+                    .to(torch.int32)
+                    .contiguous()
+                )
+        else:
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :: self.page_size
+                ]
+                // self.page_size
+            )
+        if forward_batch.extend_seq_lens is not None:
+            self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
+            self.forward_metadata.extend_seq_lens_cpu_int = (
+                forward_batch.extend_seq_lens.cpu().int()
+            )
+        if dense_mla_dcp_partial:
+            if forward_batch.forward_mode.is_target_verify():
+                effective_seq_lens = forward_batch.seq_lens.to(torch.int64) + query_len
+                metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
+                    effective_seq_lens,
+                    query_len,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    interleave_size=self.page_size,
+                )
+            else:
+                effective_seq_lens = forward_batch.seq_lens
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is not None
+                ):
+                    effective_seq_lens = effective_seq_lens + int(
+                        self.speculative_step_id + 1
+                    )
             metadata.seq_lens = get_dcp_lens(
                 effective_seq_lens,
                 self.dcp_size,
@@ -665,99 +723,40 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     required_mask_width,
                 )
+        elif forward_batch.seq_lens is not None:
+            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
         else:
-            if self.needs_cpu_seq_lens:
-                seq_lens_max = forward_batch.seq_lens.max()
-                if forward_batch.forward_mode.is_target_verify():
-                    if (
-                        forward_batch.spec_algorithm is not None
-                        and forward_batch.spec_algorithm.is_dflash()
-                    ):
-                        # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
-                        # one verify block, which already covers the draft block.
-                        seq_lens_max = forward_batch.seq_lens_cpu.max().item()
-                    else:
-                        # Overlap scheduling can publish the CPU sequence length one
-                        # step ahead of the device tensor. FIA consumes seq_lens_cpu
-                        # below, so derive the block-table width from the same source.
-                        # Otherwise a page-aligned request can expose KV_S=N while
-                        # asking FIA for N+1.
-                        spec_tokens_per_req = int(
-                            forward_batch.spec_info.draft_token_num
-                        )
-                        seq_lens_max = (
-                            forward_batch.seq_lens_cpu.max().item()
-                            + spec_tokens_per_req
-                        )
-                elif (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    and forward_batch.spec_info is not None
-                ):
-                    seq_lens_max += self.speculative_step_id + 1
-                self.forward_metadata.block_tables = (
-                    self.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, :seq_lens_max
-                    ][:, :: self.page_size]
-                    // self.page_size
-                )
-                if self.is_hybrid_swa:
-                    self.forward_metadata.block_tables_swa = (
-                        (
-                            self.full_to_swa_index_mapping[
-                                self.req_to_token_pool.req_to_token[
-                                    forward_batch.req_pool_indices, :seq_lens_max
-                                ]
-                            ][:, :: self.page_size]
-                            // self.page_size
-                        )
-                        .to(torch.int32)
-                        .contiguous()
-                    )
-            else:
-                self.forward_metadata.block_tables = (
-                    self.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, :: self.page_size
-                    ]
-                    // self.page_size
-                )
-            if forward_batch.seq_lens is not None:
-                self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
-            else:
-                self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
-                    self.device
-                ).int()
+            self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
+                self.device
+            ).int()
 
-            if self.needs_cpu_seq_lens:
-                self.forward_metadata.seq_lens_cpu_int = (
-                    forward_batch.seq_lens_cpu.int()
-                )
-            # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
-            # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
-            # only rebind the Host-side IntArray when captured as a Python list.
+        if self.needs_cpu_seq_lens and not dense_mla_dcp_partial:
+            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
+        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
+        # only rebind the Host-side IntArray when captured as a Python list.
 
-            if forward_batch.forward_mode.is_target_verify():
-                spec_algorithm = forward_batch.spec_algorithm
-                if spec_algorithm is None or not spec_algorithm.is_dflash_family():
-                    self.forward_metadata.seq_lens_cpu_int += int(
-                        forward_batch.spec_info.draft_token_num
-                    )
-            elif (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.spec_info is not None
-            ):
-                self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
-
-        if forward_batch.extend_seq_lens is not None:
-            self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
-            self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
-            )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+
+        if forward_batch.forward_mode.is_target_verify():
+            spec_algorithm = forward_batch.spec_algorithm
+            if not dense_mla_dcp_partial and (
+                spec_algorithm is None or not spec_algorithm.is_dflash_family()
+            ):
+                self.forward_metadata.seq_lens_cpu_int += int(
+                    forward_batch.spec_info.draft_token_num
+                )
+        elif (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+            and not dense_mla_dcp_partial
+        ):
+            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -1832,7 +1831,6 @@ class AscendAttnBackend(AttentionBackend):
     def _load_mla_prefix_cache(
         self,
         layer: RadixAttention,
-        forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Load a full MLA prefix, gathering rank-local DCP shards if needed."""
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2376,9 +2374,7 @@ class AscendAttnBackend(AttentionBackend):
             if layer.qk_head_dim == layer.v_head_dim:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-                kv_cached, k_rope_cached = self._load_mla_prefix_cache(
-                    layer, forward_batch
-                )
+                kv_cached, k_rope_cached = self._load_mla_prefix_cache(layer)
                 k_rope_cached = k_rope_cached.reshape(-1, 1, self.qk_rope_head_dim)
 
                 assert layer.kv_b_proj is not None
@@ -2470,9 +2466,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
                 # 2nd, load history kvcache(kv_a and k_pe) and calculate k_nope
-                kv_cached, k_rope_cached = self._load_mla_prefix_cache(
-                    layer, forward_batch
-                )
+                kv_cached, k_rope_cached = self._load_mla_prefix_cache(layer)
                 k_rope_cached = k_rope_cached.reshape(-1, 1, self.qk_rope_head_dim)
 
                 assert layer.kv_b_proj is not None
@@ -2907,10 +2901,7 @@ class AscendAttnBackend(AttentionBackend):
                 ],
             )
 
-            return (
-                attn_output.view(num_tokens, num_heads * self.kv_lora_rank),
-                softmax_lse,
-            )
+            return attn_output, softmax_lse
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -3564,7 +3555,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.graph_mode
             and not self.enable_torch_compile
-            and not self.dense_mla_dcp_deployment
+            and not self.dense_mla_dcp_target
         ):
             return self.forward_decode_graph(
                 q,
