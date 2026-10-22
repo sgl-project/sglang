@@ -84,10 +84,6 @@ class SchedulerStats:
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
-    # Token-weighted prefix cache hit rate over the most recent 1000 admitted
-    # requests. Only set when --enable-cache-hit-rate is on; None means the
-    # window was never fed, and the gauge stays unpublished.
-    cache_hit_rate_window: Optional[float] = None
     decode_sum_seq_lens: int = 0
 
     # Memory pool usage ratios (0.0–1.0).
@@ -384,15 +380,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.cache_hit_rate_window = Gauge(
-            name="sglang:cache_hit_rate_window",
-            documentation=(
-                "The prefix cache hit rate over the most recent 1000 admitted "
-                "requests. Only exported when --enable-cache-hit-rate is set."
-            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1631,10 +1618,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
-        # --enable-cache-hit-rate off leaves this None: never publish, so the
-        # new gauge cannot be mistaken for a measured zero.
-        if stats.cache_hit_rate_window is not None:
-            self._log_gauge(self.cache_hit_rate_window, stats.cache_hit_rate_window)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
 
         # Memory pool usage ratios

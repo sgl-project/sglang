@@ -646,8 +646,10 @@ class PrefillAdder:
         self.log_cache_num_reqs = 0
         self.log_cache_query_tokens = 0
         self.log_cache_hit_tokens = 0
-        # Off by default: sampling stays a no-op unless --enable-cache-hit-rate.
-        self.enable_cache_hit_rate = get_observability().enable_cache_hit_rate
+        # Off by default: sampling stays a no-op unless the flag below is set.
+        self.enable_prefix_cache_hit_rate_window = (
+            get_observability().enable_prefix_cache_hit_rate_window
+        )
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -927,22 +929,15 @@ class PrefillAdder:
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
 
-    def _record_prefix_cache_sample(self, req: Req) -> None:
-        """Record one request-level (queries, hits) sample for the hit-rate window.
-
-        Mirrors vLLM's `PrefixCacheStats`: recorded once per admission, with
-        queries = the full prompt length and hits = the radix-cache match, so a
-        prompt split into N chunks contributes exactly one sample instead of N.
-        Chunked continuations (`add_chunked_req`) and dllm staging re-adds are
-        deliberately excluded -- their tokens are already inside the admission
-        sample. Retracted requests are counted again on re-admission, matching
-        vLLM, which records every admission including preempted ones.
-        """
-        if not self.enable_cache_hit_rate:
+    def _record_prefix_cache_sample(self, req: Req, hit_tokens: int) -> None:
+        # Called once per admission, so a chunked prompt yields one sample.
+        # hits is the device tier only: vLLM counts external (host/storage)
+        # hits separately instead of folding them into the window.
+        if not self.enable_prefix_cache_hit_rate_window:
             return
         self.log_cache_num_reqs += 1
         self.log_cache_query_tokens += len(req.full_untruncated_fill_ids)
-        self.log_cache_hit_tokens += req.prefix_len
+        self.log_cache_hit_tokens += hit_tokens
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
@@ -956,6 +951,7 @@ class PrefillAdder:
             )
             return
 
+        device_hit = 0
         if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
@@ -967,6 +963,7 @@ class PrefillAdder:
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
+        self._record_prefix_cache_sample(req=req, hit_tokens=device_hit)
 
         fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
         reason = None
@@ -1651,7 +1648,6 @@ class PrefillAdder:
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
-        self._record_prefix_cache_sample(req)
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,

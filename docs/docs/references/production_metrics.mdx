@@ -27,9 +27,6 @@ sglang:token_usage{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28
 # HELP sglang:cache_hit_rate The cache hit rate
 # TYPE sglang:cache_hit_rate gauge
 sglang:cache_hit_rate{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.007507552643049313
-# HELP sglang:cache_hit_rate_window The prefix cache hit rate over the most recent 1000 admitted requests. Only exported when --enable-cache-hit-rate is set.
-# TYPE sglang:cache_hit_rate_window gauge
-sglang:cache_hit_rate_window{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.6123456790123457
 # HELP sglang:time_to_first_token_seconds Histogram of time to first token in seconds.
 # TYPE sglang:time_to_first_token_seconds histogram
 sglang:time_to_first_token_seconds_sum{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2.3518979474117756e+06
@@ -120,32 +117,39 @@ sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 
 ## Prefix cache hit rate
 
-SGLang exposes prefix cache hit rate as two independent gauges, because they answer different questions:
+`sglang:cache_hit_rate` is the hit rate over the tokens admitted in one scheduler reporting interval: token-weighted, excluding tokens that had to be reprocessed after a retraction. It is exported whenever `--enable-metrics` is on and its semantics do not depend on any flag.
 
-- `sglang:cache_hit_rate`: hit rate over the tokens admitted in one scheduler reporting interval. Token-weighted, excluding tokens that had to be reprocessed after a retraction. Exported whenever `--enable-metrics` is on.
-- `sglang:cache_hit_rate_window`: token-weighted hit rate over the most recent 1000 admitted requests, using the same sliding-window semantics as vLLM. Use this one when comparing SGLang against vLLM. It requires both `--enable-metrics` and `--enable-cache-hit-rate`, and is absent from `/metrics` when the flag is off.
+`--enable-prefix-cache-hit-rate-window` additionally reports a token-weighted hit rate over the most recent **1000 admitted requests**, using the same sliding-window semantics vLLM uses for its log line (`CachingMetrics`). It is log-only: no new metric is exported.
 
-`sglang:cache_hit_rate_window` records one sample per admitted request: the full prompt length as queries, the radix cache match as hits. A long prompt served in several chunks therefore counts once instead of once per chunk. Preempted requests are counted again on re-admission, and flushing the prefix cache clears the window.
+```bash Command
+python -m sglang.launch_server \
+  --model-path <your_model_path> \
+  --enable-prefix-cache-hit-rate-window
+```
 
-`--enable-cache-hit-rate` also adds `cache hit rate: X%` to the prefill and decode scheduler log lines, which is useful when metrics collection is off:
+The rate is appended to the prefill and decode scheduler log lines. It needs neither `--enable-metrics` nor a Prometheus scrape:
 
 ```text Output
 Prefill batch, #new-seq: 6, #new-token: 2512, #cached-token: 2048, cache hit rate: 81.5%, token usage: 0.28, #running-req: 32, #queue-req: 12
 Decode batch, #running-req: 32, token usage: 0.28, cuda graph: True, cache hit rate: 81.5%, gen throughput (token/s): 86.51, #queue-req: 12
 ```
 
-The log lines do not need `--enable-metrics`; the gauges do.
+How the window is counted:
 
-```bash Command
-python -m sglang.launch_server \
-  --model-path <your_model_path> \
-  --enable-metrics \
-  --enable-cache-hit-rate
-```
+- One sample per admitted request -- the full prompt length as queries, the device-tier radix cache match as hits. A prompt served in several chunks counts once, not once per chunk.
+- Host and storage tier hits (HiCache) are excluded, matching vLLM, which reports external hits separately.
+- Retracted (preempted) requests are excluded, again matching vLLM, which tracks them in separate preempted counters.
+- The line is omitted while the window is empty -- before the first admission, right after a prefix cache flush, and on a PD decode node, which never admits requests.
+- Flushing the prefix cache clears the window.
+
+For a Prometheus-side approximation of the same ratio, divide the existing counters:
 
 ```promql
-max by (model_name) (sglang:cache_hit_rate_window)
+sum(rate(sglang:cached_tokens_total{cache_source="device"}[5m]))
+  / sum(rate(sglang:prompt_tokens_total[5m]))
 ```
+
+These two counters are recorded when a request finishes rather than at admission, so the result lags the log line slightly.
 
 ## Request-level time per output token (TPOT)
 

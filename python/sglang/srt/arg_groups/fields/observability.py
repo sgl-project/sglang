@@ -79,9 +79,9 @@ class Observability(msgspec.Struct):
         bool,
         "Enable estimated MFU-related prometheus metrics.",
     ] = False
-    enable_cache_hit_rate: A[
+    enable_prefix_cache_hit_rate_window: A[
         bool,
-        "Report the token-weighted prefix cache hit rate over the most recent 1000 admitted requests (vLLM CachingMetrics semantics). Adds the rate to the prefill and decode log lines and exports it as sglang:cache_hit_rate_window. sglang:cache_hit_rate keeps its per-report semantics either way.",
+        "Add a token-weighted prefix cache hit rate over the most recent 1000 admitted requests (vLLM CachingMetrics semantics) to the prefill and decode log lines. Log-only: it does not affect the sglang:cache_hit_rate gauge, which keeps its per-report semantics either way.",
     ] = False
     enable_metrics_for_all_schedulers: A[
         bool,
