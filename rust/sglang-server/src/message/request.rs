@@ -847,6 +847,18 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
     column.into_iter().map(Option::flatten).collect()
 }
 
+/// Reject `n` copies of one prompt (chat's `n` choices) before they are
+/// cloned: the batch cap and clone budget a `/generate` list is held to.
+pub(crate) fn check_prompt_copies(per_clone: usize, n: usize) -> Result<(), Error> {
+    if batch_size_exceeds_limit(n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
+        return Err(Error::Validation(format!(
+            "batch size {n} exceeds the maximum of {}",
+            *MAX_BATCH_REQS_PER_HTTP_REQ
+        )));
+    }
+    check_broadcast_budget(per_clone, n, "input_ids")
+}
+
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
 pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing

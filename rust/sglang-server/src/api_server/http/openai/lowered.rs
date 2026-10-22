@@ -25,6 +25,7 @@ use crate::api_server::http::native_api::{
     RequestTiming, drain_unary, generate_requests, generation_event_stream,
 };
 use crate::message::config::ServerArgs;
+use crate::message::request::check_prompt_copies;
 
 /// The server facts and tokenizer the processor's chat layer reads.
 pub struct OpenAiChat {
@@ -135,11 +136,24 @@ pub(super) async fn chat(
     // The core samples one sequence per request, so `n` choices are a batch of
     // the prompt, whose indexed frames are what Python's `n` streams.
     let n = generate["sampling_params"]["n"].as_u64().unwrap_or(1);
-    if n > 1 {
-        generate["sampling_params"]["n"] = 1.into();
-        generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n as usize]);
-    }
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
     let stream = generate["stream"] == true;
+    if n > 1 {
+        // Bounded before the prompt is copied: a huge `n` would overflow or
+        // exhaust the allocation.
+        let per_clone = generate["input_ids"]
+            .as_array()
+            .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
+        if let Err(error) = check_prompt_copies(per_clone, n) {
+            return Some(openai_error(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                stream,
+            ));
+        }
+        generate["sampling_params"]["n"] = 1.into();
+        generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
+    }
     let (requests, is_batch) = match generate_requests(state, generate) {
         Ok(requests) => requests,
         Err((code, message, _)) => return Some(openai_error(code, message, stream)),
@@ -159,24 +173,20 @@ pub(super) async fn chat(
             }
         }))
         .await;
-        let status = drained
-            .iter()
-            .map(|(status, _)| *status)
-            .find(|status| *status != StatusCode::OK)
-            .unwrap_or(StatusCode::OK);
+        // One failed choice fails the request, as Python's batch does.
+        if let Some((status, item)) = drained.iter().find(|(status, _)| *status != StatusCode::OK) {
+            let body = serde_json::to_vec(item).expect("api.v1 types serialize to JSON");
+            return Some(failed_response(*status, &body));
+        }
         let items: Vec<_> = drained.into_iter().map(|(_, item)| item).collect();
         let body = match is_batch {
             true => serde_json::to_vec(&items),
             false => serde_json::to_vec(&items[0]),
         }
         .expect("api.v1 types serialize to JSON");
-        let reply = match status {
-            StatusCode::OK => responder.unary(&body),
-            _ => Responder::rejected(&body),
-        };
-        return Some(match reply {
+        return Some(match responder.unary(&body) {
             Some(reply) => reply_response(reply),
-            None => (status, body).into_response(),
+            None => (StatusCode::OK, body).into_response(),
         });
     }
 
@@ -219,6 +229,30 @@ pub(super) async fn chat(
     )
 }
 
+/// A failed unary choice, as Python's chat layer answers its abort: a 400 is
+/// the `ValueError` the processor maps; any other status is the
+/// `HTTPException` `OpenAIServingBase` answers with that status as the type.
+fn failed_response(status: StatusCode, body: &[u8]) -> Response {
+    if status == StatusCode::BAD_REQUEST
+        && let Some(reply) = Responder::rejected(body)
+    {
+        return reply_response(reply);
+    }
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|body| Some(body.pointer("/error/message")?.as_str()?.to_owned()))
+        .unwrap_or_default();
+    let code = status.as_u16();
+    let error = serde_json::json!({
+        "object": "error",
+        "message": message,
+        "type": code.to_string(),
+        "param": null,
+        "code": code,
+    });
+    (status, axum::Json(error)).into_response()
+}
+
 fn reply_response(reply: Reply) -> Response {
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, [(CONTENT_TYPE, "application/json")], reply.body).into_response()
@@ -229,8 +263,14 @@ mod tests {
     use serde_json::json;
     use sglang_processor::dynamo_tokenizers::Tokenizer;
 
-    use super::super::test_utils::{answering_app_state_with, body_json, post_json};
+    use axum::Router;
+
+    use super::super::test_utils::{
+        answering_app_state_with, answering_app_state_with_item, body_json, chunk, post_json,
+    };
     use super::*;
+    use crate::message::response::ResponseItem;
+    use crate::utils::error::Error;
 
     /// A word-level tokenizer; the mocked core ignores the prompt ids.
     fn tokenizer() -> Tokenizer {
@@ -256,6 +296,59 @@ mod tests {
         let state = answering_app_state_with(Arc::new(args), formatter, Some(tokenizer()), text);
         let app = super::super::routes().with_state(state);
         body_json(post_json(app, "/v1/chat/completions", body).await).await
+    }
+
+    fn lowered_state(answer: impl Fn(&str) -> ResponseItem + Send + 'static) -> Router {
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("deepseek-v41".into()),
+            ..Default::default()
+        };
+        let formatter = ChatFormatter::DeepSeekV41;
+        let state =
+            answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), answer);
+        super::super::routes().with_state(state)
+    }
+
+    /// An `n` past the batch cap is a 400 before the prompt is copied, not a
+    /// capacity-overflow panic.
+    #[tokio::test]
+    async fn oversized_n_is_rejected_before_copying_the_prompt() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let body = json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": i64::MAX,
+        });
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(response).await;
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("exceeds the maximum"), "{message}");
+    }
+
+    /// A scheduler failure keeps its 500, as Python's `HTTPException` does,
+    /// and a validation failure is the 400 `BadRequestError`.
+    #[tokio::test]
+    async fn failed_choice_keeps_its_status() {
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
+        let response = post_json(app, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let value = body_json(response).await;
+        assert_eq!(
+            (value["type"].as_str(), value["code"].as_u64()),
+            (Some("500"), Some(500))
+        );
+        assert!(
+            value["message"].as_str().unwrap().contains("boom"),
+            "{value}"
+        );
+
+        let app = lowered_state(|_| ResponseItem::Error(Error::Validation("bad".into())));
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["type"], "BadRequestError");
     }
 
     /// `separate_reasoning`, which the typed handler ignores, is Python's.
