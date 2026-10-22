@@ -40,7 +40,7 @@ configuration:
 ```bash
 --enable-unified-cache-external-linker \
 --linker-load-mode prefetch \
---hicache-storage-prefetch-policy timeout
+--linker-prefetch-policy timeout
 ```
 
 Keep Mooncake connection settings in `--hicache-storage-backend-extra-config`.
@@ -53,7 +53,7 @@ supports Full/SWA components, requires PP=1, reads on every attention TP rank,
 and allows multiple requests in flight through the existing load thread.
 Admission can select later ready requests while others are still loading.
 
-Select the same `--hicache-storage-prefetch-policy` used by HiCache:
+Select the linker admission policy with `--linker-prefetch-policy`:
 
 - `best_effort`: use completed KV when the request reaches admission; otherwise
   stop waiting and recompute.

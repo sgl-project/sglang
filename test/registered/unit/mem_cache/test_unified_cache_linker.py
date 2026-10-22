@@ -365,7 +365,8 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         backend.lookup = MagicMock(wraps=backend.lookup)
         backend.restorable = [1, 2, 3]
         with get_context().override_server_args(
-            hicache_storage_prefetch_policy=policy,
+            linker_prefetch_policy=policy,
+            hicache_storage_prefetch_policy="best_effort",
             hicache_storage_backend_extra_config=(
                 '{"prefetch_timeout_base":1,"prefetch_timeout_per_ki_token":512}'
             ),

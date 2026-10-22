@@ -405,7 +405,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+            self.prefetch_stop_policy = get_memory().linker_prefetch_policy
             (
                 _,
                 _,
