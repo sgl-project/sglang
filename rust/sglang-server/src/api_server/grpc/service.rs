@@ -12,8 +12,8 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::{CoreHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
-use crate::message::request::into_requests;
-use crate::message::wire::fill_preferred_sampling;
+use crate::message::request::{GenerationPolicy, into_requests};
+use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -32,6 +32,8 @@ struct AdapterConfig {
     response_timeout: Duration,
     /// `/health_generate`'s heartbeat window (`SGLANG_HEALTH_CHECK_TIMEOUT`).
     health_timeout: Duration,
+    has_tokenizer: bool,
+    generation_policy: GenerationPolicy,
 }
 
 /// Tonic-facing implementation backed by the transport-neutral core.
@@ -51,6 +53,8 @@ impl GrpcService {
                 health_timeout: Duration::from_secs(
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
+                has_tokenizer: !server_args.skip_tokenizer_init,
+                generation_policy: server_args.into(),
             },
         }
     }
@@ -69,6 +73,8 @@ impl GrpcService {
                 incremental_streaming_output,
                 response_timeout,
                 health_timeout: Duration::from_millis(20),
+                has_tokenizer: true,
+                generation_policy: GenerationPolicy::default(),
             },
         }
     }
@@ -86,6 +92,9 @@ impl SglangService for GrpcService {
         request: Request<api::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let mut request = request.into_inner();
+        // Read before the fills below: only a `max_new_tokens` the client set
+        // is checked against the context window.
+        let client_max_new_tokens = ClientMaxNewTokens::of_proto(request.sampling_params.as_ref());
         if let Some(preferred) = &self.config.preferred_sampling_params {
             request.sampling_params =
                 fill_preferred_sampling(request.sampling_params.take(), &preferred.0)
@@ -95,8 +104,9 @@ impl SglangService for GrpcService {
         // schema default, as an absent JSON key does.
         request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
-        let (payloads, is_batch) =
-            into_requests(request).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (mut payloads, is_batch) = into_requests(request, &self.config.generation_policy)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        client_max_new_tokens.mark(&mut payloads);
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
         // the same boundary here.
@@ -154,6 +164,52 @@ impl SglangService for GrpcService {
             .map(Response::new)
             .map_err(Status::internal)
     }
+
+    async fn list_models(
+        &self,
+        _request: Request<api::ListModelsRequest>,
+    ) -> Result<Response<api::ListModelsResponse>, Status> {
+        Ok(Response::new(api::ListModelsResponse {
+            models: self.core.list_models(),
+        }))
+    }
+
+    async fn detokenize(
+        &self,
+        request: Request<api::DetokenizeRequest>,
+    ) -> Result<Response<api::DetokenizeResponse>, Status> {
+        if !self.config.has_tokenizer {
+            return Err(Status::unimplemented("detokenization requires a tokenizer"));
+        }
+        let text = tokio::time::timeout(
+            self.config.response_timeout,
+            self.core.detokenize(
+                request.into_inner().tokens,
+                true, /* skip_special_tokens */
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("detokenization timed out"))?
+        .map_err(native_api::status)?;
+        Ok(Response::new(api::DetokenizeResponse { text }))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<api::AbortRequest>,
+    ) -> Result<Response<api::AbortResponse>, Status> {
+        let request = request.into_inner();
+        if request.abort_all != request.rid.is_empty() {
+            return Err(Status::invalid_argument(
+                "provide either a nonempty rid or abort_all=true, not both",
+            ));
+        }
+        Ok(Response::new(api::AbortResponse {
+            success: self
+                .core
+                .abort((!request.abort_all).then_some(request.rid.as_str())),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -168,7 +224,7 @@ mod tests {
 
     use super::GrpcService;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
-    use crate::message::config::PreferredSamplingParams;
+    use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
     use crate::message::finish_reason::FinishReason;
     use crate::message::ids::Rid;
     use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
@@ -211,7 +267,14 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    metadata: CoreMetadata::default(),
+                    metadata: CoreMetadata::from(&ServerArgs {
+                        served_model_name: "test-model".into(),
+                        model_config: ModelConfig {
+                            context_len: 4096,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
                 },
             );
             Self {
@@ -254,8 +317,11 @@ mod tests {
             token_ids: vec![token_id],
             finish_reason: finished.then(stop_reason),
             prompt_tokens: 3,
+            cached_tokens: 2,
+            reasoning_tokens: 0,
             text: text.into(),
             completion_tokens: 1,
+            stop_token_trimmed: false,
             extras: None,
         }
     }
@@ -361,6 +427,7 @@ mod tests {
         let first_meta = meta(&first);
         assert_eq!(first_meta.id, "request-1");
         assert_eq!(first_meta.prompt_tokens, 3);
+        assert_eq!(first_meta.cached_tokens, 2);
         assert_eq!(first_meta.completion_tokens, 1);
         assert!(first_meta.finish_reason.is_none());
         assert!(first_meta.e2e_latency.is_none());
@@ -635,6 +702,7 @@ mod tests {
 
     /// Launch-time preferred sampling params fill the fields a protobuf request
     /// left unset, beneath the ones it set: the HTTP precedence at the gRPC entry.
+    /// A filled `max_new_tokens` is marked defaulted; a set one is the client's.
     #[tokio::test]
     async fn preferred_sampling_params_fill_unset_fields() {
         let preferred = PreferredSamplingParams(serde_json::json!({
@@ -642,25 +710,34 @@ mod tests {
             "max_new_tokens": 32,
         }));
         let harness = Harness::build(1, false, Duration::from_secs(1), true, Some(preferred));
-        let mut request = ids_request(&[1], None);
-        request.sampling_params = Some(api::SamplingParamsOrList {
-            value: Some(api::sampling_params_or_list::Value::One(
-                api::SamplingParams {
-                    temperature: Some(0.8),
-                    ..Default::default()
-                },
-            )),
-        });
-        let _stream = harness
-            .service
-            .generate(Request::new(request))
-            .await
-            .unwrap()
-            .into_inner();
+        for (max_new_tokens, expected) in [(None, (Some(32), true)), (Some(8), (Some(8), false))] {
+            let mut request = ids_request(&[1], None);
+            request.sampling_params = Some(api::SamplingParamsOrList {
+                value: Some(api::sampling_params_or_list::Value::One(
+                    api::SamplingParams {
+                        temperature: Some(0.8),
+                        max_new_tokens,
+                        ..Default::default()
+                    },
+                )),
+            });
+            let _stream = harness
+                .service
+                .generate(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
 
-        let intake = harness.next_generation().await;
-        assert_eq!(intake.request.sampling_params.temperature, 0.8);
-        assert_eq!(intake.request.sampling_params.max_new_tokens, Some(32));
+            let intake = harness.next_generation().await;
+            assert_eq!(intake.request.sampling_params.temperature, 0.8);
+            assert_eq!(
+                (
+                    intake.request.sampling_params.max_new_tokens,
+                    intake.request.max_new_tokens_defaulted,
+                ),
+                expected
+            );
+        }
     }
 
     /// Protobuf has no null: a sampling field the client left unset takes the
@@ -689,6 +766,7 @@ mod tests {
         let intake = harness.next_generation().await;
         assert_eq!(intake.request.sampling_params.temperature, 0.8);
         assert_eq!(intake.request.sampling_params.max_new_tokens, Some(128));
+        assert!(intake.request.max_new_tokens_defaulted);
         assert_eq!(intake.request.sampling_params.top_p, 1.0);
     }
 
@@ -714,5 +792,180 @@ mod tests {
         assert_eq!(error.code(), Code::Unavailable);
         let probe = stalled.next_generation().await;
         assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
+    }
+
+    #[tokio::test]
+    async fn list_models_uses_static_metadata_without_intake() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        let models = harness
+            .service
+            .list_models(Request::new(api::ListModelsRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .models;
+        assert_eq!(
+            models,
+            vec![api::ModelCard {
+                id: "test-model".into(),
+                root: "test-model".into(),
+                parent: None,
+                max_model_len: 4096,
+            }]
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn detokenize_returns_text_and_maps_invalid_ids() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        for invalid in [false, true] {
+            let tokens = if invalid { vec![-1] } else { vec![1, 2] };
+            let decode = harness
+                .service
+                .detokenize(Request::new(api::DetokenizeRequest {
+                    tokens: tokens.clone(),
+                }));
+            let runtime = async {
+                let TmEvent::Intake { request, admission } =
+                    harness.intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected intake");
+                };
+                assert!(admission.try_accept());
+                assert!(
+                    matches!(&request.kind, RequestKind::Detokenize { token_ids, skip_special_tokens: true } if *token_ids == tokens)
+                );
+                let reply = if invalid {
+                    ResponseItem::Error(crate::utils::error::Error::Validation(
+                        "invalid token ID".into(),
+                    ))
+                } else {
+                    ResponseItem::Data(bytes::Bytes::from_static("héllo".as_bytes()))
+                };
+                request.sink.try_send(reply).unwrap();
+            };
+            let (result, ()) = tokio::join!(decode, runtime);
+            if invalid {
+                assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+            } else {
+                assert_eq!(result.unwrap().into_inner().text, "héllo");
+            }
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn detokenize_rejects_missing_tokenizer_without_submission() {
+        let mut harness = Harness::new(2, false, Duration::from_secs(1));
+        harness.service.config.has_tokenizer = false;
+        let error = harness
+            .service
+            .detokenize(Request::new(api::DetokenizeRequest { tokens: vec![1] }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn detokenize_timeout_releases_the_internal_call() {
+        let harness = Harness::new(2, false, Duration::from_millis(10));
+        let decode = harness
+            .service
+            .detokenize(Request::new(api::DetokenizeRequest { tokens: vec![1] }));
+        let runtime = async {
+            let TmEvent::Intake { request, admission } =
+                harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            let aborted = harness.abort_rx.recv_async().await.unwrap();
+            assert_eq!(aborted.rid(), &request.rid);
+        };
+        let (result, ()) = tokio::join!(decode, runtime);
+        assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_rpc_cancels_generation_with_an_in_stream_error() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("abort-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        let reply = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "abort-me".into(),
+                abort_all: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.success);
+        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
+        let error = stream_error(stream.next().await.unwrap().unwrap());
+        assert_eq!(error.error.unwrap().code, 499);
+        assert!(stream.next().await.is_none());
+        assert!(
+            !harness
+                .service
+                .abort(Request::new(api::AbortRequest {
+                    rid: "abort-me".into(),
+                    abort_all: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .success
+        );
+        drop(stream);
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_validates_selector_and_supports_all() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        for (rid, abort_all) in [("", false), ("ambiguous", true)] {
+            let error = harness
+                .service
+                .abort(Request::new(api::AbortRequest {
+                    rid: rid.into(),
+                    abort_all,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+        let stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("all"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        assert!(
+            harness
+                .service
+                .abort(Request::new(api::AbortRequest {
+                    rid: String::new(),
+                    abort_all: true,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .success
+        );
+        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
+        drop(stream);
+        assert!(harness.abort_rx.try_recv().is_err());
     }
 }

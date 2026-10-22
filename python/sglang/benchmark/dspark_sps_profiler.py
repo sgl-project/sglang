@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["msgspec", "requests", "plotly", "kaleido", "numpy"]
 # ///
 from __future__ import annotations
@@ -983,9 +983,7 @@ def postprocess_round(
             )
         graph_tier = aligned_verify_tokens.pop()
         budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
-
         batch_tokens = batch_size_per_rank + budget
-
         if graph_tier < batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "

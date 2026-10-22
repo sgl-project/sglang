@@ -80,11 +80,11 @@ class Disagg(msgspec.Struct):
     ] = 8998
     disaggregation_ib_device: A[
         Optional[str],
-        'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
+        'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Supported by Mooncake and NIXL UCX. Mapping keys are process-visible GPU IDs (after CUDA_VISIBLE_DEVICES); use HCA names without port suffixes for NIXL UCX. Default is None, which preserves backend device selection.',
     ] = None
     disaggregation_decode_enable_radix_cache: A[
         bool,
-        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
+        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, --disaggregation-transfer-backend fake, and speculative algorithms other than EAGLE, EAGLE3, and DSPARK.",
     ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
