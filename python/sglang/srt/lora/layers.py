@@ -716,11 +716,12 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer, lora_backend)
         q_proj_shard_size = self.base_layer.q_proj_shard_size
         kv_proj_shard_size = self.base_layer.kv_proj_shard_size
+        v_proj_shard_size = self.base_layer.v_proj_shard_size
         offsets = [
             0,
             q_proj_shard_size,
             q_proj_shard_size + kv_proj_shard_size,
-            q_proj_shard_size + 2 * kv_proj_shard_size,
+            q_proj_shard_size + kv_proj_shard_size + v_proj_shard_size,
         ]
         self.output_offset = torch.tensor(
             offsets,
@@ -735,7 +736,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
         # For computing number of launched blocks
-        self.max_qkv_out_dim = max(q_proj_shard_size, kv_proj_shard_size)
+        self.max_qkv_out_dim = max(
+            q_proj_shard_size, kv_proj_shard_size, v_proj_shard_size
+        )
 
     def set_lora_info(
         self,
@@ -780,8 +783,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         """Adapter-side q/k/v lora_B rows, at the unreplicated kv heads."""
         base_layer = self.base_layer
         q_size = base_layer.total_num_heads * base_layer.head_size
-        kv_size = base_layer.total_num_kv_heads * base_layer.head_size
-        return q_size, kv_size, kv_size
+        k_size = base_layer.total_num_kv_heads * base_layer.head_size
+        v_size = base_layer.total_num_kv_heads * base_layer.v_head_size
+        return q_size, k_size, v_size
 
     def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
         q_shard = self.base_layer.q_proj_shard_size
@@ -794,7 +798,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             shard_size = base_layer.q_proj_shard_size
             shard = get_group_rank_size(base_layer.tp_group)[0]
         else:
-            shard_size = base_layer.kv_proj_shard_size
+            shard_size = (
+                base_layer.kv_proj_shard_size
+                if member == 1
+                else base_layer.v_proj_shard_size
+            )
             kv_tp_rank, _ = get_group_rank_size(base_layer.kv_tp_group)
             shard = kv_tp_rank // base_layer.num_kv_head_replicas
         return B[shard * shard_size : (shard + 1) * shard_size, :]
