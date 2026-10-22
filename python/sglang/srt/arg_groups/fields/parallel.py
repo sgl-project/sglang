@@ -181,6 +181,16 @@ class Parallel(msgspec.Struct):
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
     ] = False
+    cp_decode_attn_mode: A[
+        Optional[str],
+        Arg(
+            help="Target decode/verify attention layout under prefill CP. 'tp' "
+            "enables attention weight slicing; 'dp' shards query rows with full "
+            "heads on SM90 DeepSeek-V4.1. DP keeps KV replicated and DSpark "
+            "draft attention TP. Omit to preserve --enable-cp-decode-attn-tp.",
+            choices=("tp", "dp"),
+        ),
+    ] = None
     enable_kv_cache_sharding: A[
         bool,
         "Shard at-rest KV cache storage at page granularity across the group "

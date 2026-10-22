@@ -190,6 +190,32 @@ def handle_model_specific_adjustments(server_args: Any):
             "(DeepSeek Sparse Attention) models."
         )
 
+    if cfg.cp_decode_attn_mode is not None:
+        if not cfg.enable_prefill_cp:
+            raise ValueError("--cp-decode-attn-mode requires --enable-prefill-cp")
+        if cfg.cp_decode_attn_mode == "dp":
+            if not (
+                hf_config.model_type == "deepseek_v41"
+                and get_platform().is_sm90
+                and cfg.cp_strategy in (None, "interleave")
+                and cfg.tp_size > 1
+                and cfg.nnodes == 1
+                and cfg.dp_size == cfg.attn_dp_size == 1
+                and not cfg.enable_dsa_cache_layer_split
+                and not cfg.enable_kv_cache_sharding
+            ):
+                raise ValueError(
+                    "CP decode attention DP requires single-node SM90 DeepSeek-V4.1 "
+                    "with interleave CP, tp_size>1, dp_size=attn_dp_size=1, "
+                    "and replicated KV/index-K caches"
+                )
+        # DP bypasses slicing only for target MQALayer forwards. Keep the
+        # established TP layout for DSpark draft attention.
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            enable_cp_decode_attn_tp=True,
+        )
     if cfg.enable_cp_decode_attn_tp:
         from sglang.srt.layers.cp.cp_decode_attn_tp import (
             CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,

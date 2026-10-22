@@ -79,7 +79,7 @@ class CpDecodeAttnTpContext:
         ) and not dsa_use_prefill_cp(forward_batch)
 
     def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
-        assert dim in (0, 1)
+        assert 0 <= dim < tensor.dim()
         chunk = tensor.shape[dim] // self.decode_tp_size
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
         return sliced if dim == 0 else sliced.contiguous()
@@ -157,9 +157,19 @@ class CpDecodeAttnTpContext:
             return []
 
         attrs = [(linear_instance, "weight", dim)]
+        if getattr(linear_instance, "_block_fp8_bf16_weight", None) is not None:
+            attrs.append((linear_instance, "_block_fp8_bf16_weight", dim))
         for scale_name in ("weight_scale_inv", "weight_scale"):
-            if getattr(linear_instance, scale_name, None) is not None:
-                attrs.append((linear_instance, scale_name, dim))
+            scale = getattr(linear_instance, scale_name, None)
+            if scale is None or scale.numel() == 1:
+                continue
+            # Per-output-channel scales are independent of an input-K slice.
+            if dim == 1 and scale.ndim == 1:
+                continue
+            # wo_a block scales can be [groups, N/128, K/128].
+            scale_dim = scale.ndim - 1 if dim == 1 else 0
+            if scale.shape[scale_dim] != 1:
+                attrs.append((linear_instance, scale_name, scale_dim))
         return attrs
 
     # ==================== Context manager ====================
