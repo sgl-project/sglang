@@ -12,6 +12,7 @@ class SparseKVBudget:
     selected_kv_bytes: int
     host_kv_bytes: int
     adapter_bytes: int = 0
+    copy_sfa_bytes: int = 0
 
     @property
     def managed_hbm_bytes(self) -> int:
@@ -21,6 +22,7 @@ class SparseKVBudget:
             + self.policy_bytes
             + self.selected_kv_bytes
             + self.adapter_bytes
+            + self.copy_sfa_bytes
         )
 
 
@@ -34,6 +36,8 @@ def resolve_sparse_kv_budget(
     cache_tokens: int = 0,
     hbm_budget_bytes: int = 0,
     indexer_impl: str = "legacy",
+    copy_sfa: bool = False,
+    copy_sfa_query_heads: int = 128,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
 
@@ -59,6 +63,13 @@ def resolve_sparse_kv_budget(
 
     if indexer_impl not in ("legacy", "li_reference", "lim"):
         raise ValueError(f"Unknown sparse indexer implementation: {indexer_impl}.")
+    if copy_sfa:
+        if top_k != 2048 or cache_tokens not in (0, 2048):
+            raise ValueError("Copy-SFA requires K=C=2048.")
+        if copy_sfa_query_heads <= 0 or copy_sfa_query_heads > 128:
+            raise ValueError("Copy-SFA padded query heads must be in [1,128].")
+        context_len = (context_len + 127) // 128 * 128
+        cache_tokens = 2048
     experimental = indexer_impl != "legacy"
     native = indexer_impl == "lim"
     map_width = (
@@ -76,7 +87,7 @@ def resolve_sparse_kv_budget(
         adapter_bytes = (
             request_rows
             * (
-                (top_k + 128) * (kv_bytes_per_token + 4)
+                (top_k + (0 if copy_sfa else 128)) * (kv_bytes_per_token + 4)
                 + 2 * top_k * 4
                 + 2 * 32768 * 4
                 + 64 * 4
@@ -127,6 +138,14 @@ def resolve_sparse_kv_budget(
         if cache_tokens > top_k and not native
         else 0
     ) + slot_ids_bytes
+    copy_sfa_bytes = 0
+    if copy_sfa:
+        copy_sfa_bytes = (
+            num_layers * (request_rows + 1) * cache_tokens * 4
+            + request_rows * (4 * top_k + 5) * 4
+            + (request_rows + 1) * ((cache_tokens + context_len) // 128) * 4
+            + request_rows * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
+        )
     result = SparseKVBudget(
         cache_tokens=cache_tokens,
         device_kv_bytes=request_rows * num_layers * cache_tokens * kv_bytes_per_token,
@@ -135,6 +154,7 @@ def resolve_sparse_kv_budget(
         selected_kv_bytes=selected_kv_bytes,
         host_kv_bytes=request_rows * num_layers * context_len * kv_bytes_per_token,
         adapter_bytes=adapter_bytes,
+        copy_sfa_bytes=copy_sfa_bytes,
     )
     if hbm_budget_bytes and result.managed_hbm_bytes > hbm_budget_bytes:
         raise ValueError(

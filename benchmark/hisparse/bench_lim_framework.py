@@ -109,7 +109,10 @@ class FrameworkCase:
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
         ):
             self.manager = SparseKVCacheManager(
-                self.pool, SimpleNamespace(get_kvcache=lambda: kv), K
+                self.pool,
+                SimpleNamespace(get_kvcache=lambda: kv),
+                K,
+                copy_sfa_padded_query_heads=args.query_heads,
             )
         for layer in range(args.layers):
             self.manager.host_kv_buffer[layer].copy_(fixture.host + layer)
@@ -123,6 +126,9 @@ class FrameworkCase:
                 (args.batch,), args.context + args.tail, device="npu", dtype=torch.int32
             ),
             out_cache_loc=fixture.table[:, -1] * PAGE + args.tail - 1,
+            seq_lens_cpu=torch.full(
+                (args.batch,), args.context + args.tail, dtype=torch.int32
+            ),
         )
         self.new_kv = []
         if getattr(args, "include_new_token_d2h", False):
@@ -141,7 +147,7 @@ class FrameworkCase:
                 block_tables=fixture.table,
                 actual_seq_lengths_q=None,
                 actual_seq_lengths_kv=None,
-                seq_lens_cpu_int=None,
+                seq_lens_cpu_int=[args.context + args.tail] * args.batch,
                 seq_lens=self.batch.seq_lens,
                 sparse_kv_lim_plan=None,
             ),

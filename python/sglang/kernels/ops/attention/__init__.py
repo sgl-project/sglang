@@ -83,6 +83,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="attention.fused_scatter_copy_sparse_flash_attention",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.npu_copy_sfa:fused_scatter_copy_sparse_flash_attention",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.TRITON,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),

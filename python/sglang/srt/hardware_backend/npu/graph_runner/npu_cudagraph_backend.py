@@ -24,6 +24,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -138,6 +139,20 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+        if (
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+            and forward_batch.forward_mode.is_decode()
+        ):
+            # Copy-SFA v1 uses a fixed 2048-token cache window. Decide from
+            # scheduler-owned CPU metadata before graph replay, so short or
+            # mixed-context batches take the eager materialization path. The
+            # captured graph itself stays shape-stable and can be reused once
+            # every live row meets the fixed-window requirement.
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None:
+                return False
+            if any(0 < int(seq_len) < 2048 for seq_len in seq_lens_cpu.tolist()):
+                return False
         return shape_key in self._graphs
 
     @contextmanager

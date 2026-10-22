@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
-
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
@@ -35,6 +35,34 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
+
+
+def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
+    manager = backend.sparse_kv_manager
+    if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get() or manager is None:
+        return False
+    if (
+        not forward_batch.forward_mode.is_decode()
+        or getattr(forward_batch, "spec_info", None) is not None
+    ):
+        return False
+    if not getattr(forward_batch, "sparse_kv_copy_sfa_capture", False):
+        seq_lens_cpu = backend.forward_metadata.seq_lens_cpu_int
+        if seq_lens_cpu is None:
+            return False
+        live = [length for length in seq_lens_cpu if int(length) > 0]
+        if not live or min(map(int, live)) < 2048:
+            return False
+    return (
+        layer.tp_k_head_num == 1
+        and backend.kv_lora_rank == 512
+        and backend.qk_rope_head_dim == 64
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and normalize_batch_topk_indices(topk_indices).shape[1] == 2048
+        and manager.cache_capacity == 2048
+        and manager.sparse_context_len == 2048
+        and q.shape[0] == forward_batch.batch_size
+    )
 
 
 def forward_sparsity_driven_kv_offload(
@@ -113,6 +141,26 @@ def forward_sparsity_driven_kv_offload(
             actual_seq_qlen,
             actual_seq_lengths_kv,
         )
+    elif forward_batch.forward_mode.is_decode() and _copy_sfa_decode_eligible(
+        backend, forward_batch, layer, q_nope, topk_indices
+    ):
+        batch_size = forward_batch.batch_size
+        padded_query_heads = q_nope.numel() // (batch_size * backend.kv_lora_rank)
+        attn_out = sparse_kv_manager.copy_sfa_decode(
+            layer,
+            forward_batch,
+            q_nope.view(batch_size, 1, padded_query_heads, backend.kv_lora_rank),
+            q_pe.view(batch_size, 1, padded_query_heads, backend.qk_rope_head_dim),
+            layer.tp_q_head_num,
+            layer.scaling,
+            topk_indices,
+            lim_plan=(
+                backend.forward_metadata.sparse_kv_lim_plan
+                if sparse_kv_manager.lim_adapter is not None
+                and sparse_kv_manager.lim_adapter.is_native
+                else None
+            ),
+        )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
         num_kv_heads = layer.tp_k_head_num
@@ -162,7 +210,20 @@ def forward_sparsity_driven_kv_offload(
         selected_kv_buffer = sparse_kv_manager.selected_kv_buffer[:batch_size]
         selected_kv_buffer.zero_()
         adapter = sparse_kv_manager.lim_adapter
-        if adapter is not None and adapter.is_native:
+        if adapter is not None and adapter.full_visible:
+            plan = backend.forward_metadata.sparse_kv_lim_plan
+            if plan is None:
+                raise RuntimeError(
+                    "Full-visible LIM attention requires an indexer plan."
+                )
+            adapter.gather_full_visible(
+                sparse_kv_manager,
+                plan,
+                layer.layer_id - sparse_kv_manager.start_layer,
+                selected_kv_buffer,
+                copy=unidex_copy_inplace,
+            )
+        elif adapter is not None and adapter.is_native:
             plan = backend.forward_metadata.sparse_kv_lim_plan
             if plan is None:
                 raise RuntimeError(
@@ -182,7 +243,7 @@ def forward_sparsity_driven_kv_offload(
             )
 
         _wait_stream_event(stream, sparse_kv_manager.miss_done)
-        if adapter is not None:
+        if adapter is not None and not adapter.full_visible:
             plan = backend.forward_metadata.sparse_kv_lim_plan
             if plan is None:
                 raise RuntimeError(
@@ -299,6 +360,14 @@ def forward_sparsity_driven_kv_offload(
         )
 
         _wait_stream_event(stream, sparse_kv_manager.refill_done)
+        if sparse_kv_manager.copy_sfa_enabled and adapter is None:
+            # The materialization fallback rewrites payload residency without
+            # maintaining the native planner's inverse map. Reenter Copy-SFA
+            # with a cold cache instead of publishing stale hits.
+            layer_index = layer.layer_id - sparse_kv_manager.start_layer
+            rows = forward_batch.req_pool_indices.long()
+            sparse_kv_manager.device_slot_map[layer_index].index_fill_(0, rows, -1)
+            sparse_kv_manager.device_slot_owner[layer_index].index_fill_(0, rows, -1)
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(

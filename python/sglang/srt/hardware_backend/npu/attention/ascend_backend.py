@@ -368,6 +368,14 @@ class AscendAttnBackend(AttentionBackend):
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
         )
+        if (
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+            and get_spec().speculative_num_draft_tokens is not None
+        ):
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_COPY_SFA currently supports only non-speculative "
+                "Q1 decode; disable speculative decoding or Copy-SFA."
+            )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
@@ -380,6 +388,20 @@ class AscendAttnBackend(AttentionBackend):
                 model_runner.token_to_kv_pool_allocator,
                 sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
                     model_config=model_runner.model_config
+                ),
+                copy_sfa_padded_query_heads=(
+                    next(
+                        (
+                            padding
+                            for padding in (1, 2, 4, 8, 16, 32, 64, 128)
+                            if padding
+                            >= model_runner.model_config.num_attention_heads
+                            // get_parallel().attn_tp_size
+                        ),
+                        None,
+                    )
+                    if envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+                    else None
                 ),
             )
             register_sparse_kv_manager(self.sparse_kv_manager)
@@ -1357,7 +1379,6 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
-
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()

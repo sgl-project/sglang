@@ -5,7 +5,6 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
@@ -14,6 +13,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     resolve_sparse_kv_budget,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+    LIMDecodeAdapter,
     prepare_lim_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +23,66 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
+    def test_copy_sfa_packs_native_miss_stride_and_masks_interior_padding(self):
+        batch, top_k = 3, 2048
+        ints = lambda *shape: torch.empty(*shape, dtype=torch.int32)
+        manager = SimpleNamespace(
+            max_context_len=4224,
+            planner_topk_src_ids=ints(batch, 1, top_k),
+            planner_topk_dst_slots=ints(batch, 1, top_k),
+            planner_topk_miss_counts=ints(batch),
+            planner_miss_src_ids=ints(batch, top_k),
+            planner_miss_dst_slots=ints(batch, top_k),
+            planner_miss_counts=ints(batch),
+            planner_actual_seq_lengths_query=torch.arange(
+                1, batch + 1, dtype=torch.int32
+            ),
+            planner_actual_seq_lengths_kv=ints(batch),
+            planner_num_cache_tokens=ints(batch),
+            hbm_page_offsets=torch.arange(16, dtype=torch.int32),
+            dram_page_offsets=torch.arange(33, dtype=torch.int32),
+            planner_hbm_block_table=ints(batch, 16),
+            planner_dram_block_table=ints(batch, 33),
+        )
+        adapter = LIMDecodeAdapter.__new__(LIMDecodeAdapter)
+        adapter.top_k = adapter.capacity = top_k
+        sources = torch.arange(batch * 32768, dtype=torch.int32).view(batch, 32768)
+        plan = SimpleNamespace(
+            source_ids=torch.arange(top_k, dtype=torch.int32).expand(batch, -1).clone(),
+            device_slots=torch.arange(top_k, dtype=torch.int32).expand(batch, -1),
+            topk_misses=torch.tensor([3, 99, 7], dtype=torch.int32),
+            miss_sources=sources,
+            miss_slots=sources + 1,
+            miss_counts=torch.tensor([3, 99, 7], dtype=torch.int32),
+            valid_rows=torch.tensor([True, False, True]),
+            sparse_rows=torch.tensor([True, False, True]),
+            request_slots=torch.tensor([3, 4, 1], dtype=torch.int32),
+        )
+        plan.source_ids[1].fill_(-1)
+        metadata = adapter.copy_sfa_metadata(manager, plan)
+        self.assertTrue(all(t.is_contiguous() for t in metadata))
+        torch.testing.assert_close(metadata[3][2], sources[2, :top_k])
+        self.assertEqual(metadata[5].tolist(), [3, 0, 7])
+        self.assertEqual(metadata[7].tolist(), [2048, 0, 2048])
+        self.assertTrue(torch.all(metadata[1][1] == -1))
+        self.assertTrue(torch.all(metadata[3][1] == -1))
+        self.assertEqual(metadata[9][:, 0].tolist(), [48, 0, 16])
+        self.assertEqual(metadata[10][:, 0].tolist(), [99, 0, 33])
+
+    def test_full_visible_q1_transition_padding_and_reuse(self):
+        previous = torch.tensor([-1, -1, 2048, 3000, -1], dtype=torch.int32)
+        result = prepare_lim_rows(
+            torch.tensor([2048, 2049, 2177, 0]),
+            torch.tensor([1, 2, 3, 0]),
+            previous,
+            2048,
+            4,
+            full_visible=True,
+        )
+        self.assertEqual(result[2].tolist(), [2048, 2049, 2177, 0])
+        self.assertEqual(result[5].tolist(), [-2, -1, -2, -3])
+        self.assertEqual(result[0].tolist(), [1, 2, 3, 4])
+
     def test_page_boundary_and_cold_to_warm(self):
         previous = torch.full((5,), -1, dtype=torch.int32)
         slots = torch.tensor([1, 2, 3])
@@ -49,6 +109,31 @@ class TestLIMState(CustomTestCase):
             torch.tensor([8193]), torch.tensor([1]), previous, 4096, 4
         )
         self.assertEqual(result[5].tolist(), [-2])
+
+    def test_copy_sfa_budget_includes_planner_and_page_aligned_host_rows(self):
+        budget = resolve_sparse_kv_budget(
+            request_rows=3,
+            context_len=4097,
+            num_layers=4,
+            top_k=2048,
+            kv_bytes_per_token=1152,
+            indexer_impl="lim",
+            copy_sfa=True,
+            copy_sfa_query_heads=8,
+        )
+        self.assertEqual(budget.cache_tokens, 2048)
+        self.assertEqual(budget.host_kv_bytes, 3 * 4 * 4224 * 1152)
+        self.assertGreater(budget.copy_sfa_bytes, 4 * 4 * 2048 * 4)
+        with self.assertRaisesRegex(ValueError, "K=C=2048"):
+            resolve_sparse_kv_budget(
+                request_rows=3,
+                context_len=4097,
+                num_layers=4,
+                top_k=2048,
+                kv_bytes_per_token=1152,
+                cache_tokens=4096,
+                copy_sfa=True,
+            )
 
     def test_native_budget_accounts_actual_persistent_buffers(self):
         kwargs = dict(

@@ -1093,6 +1093,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
+        sparse_kv_manager = getattr(attn_backend, "sparse_kv_manager", None)
+        forward_batch.sparse_kv_copy_sfa_capture = bool(
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+            and sparse_kv_manager is not None
+            and self.captured_req_width == 1
+            and forward_batch.forward_mode.is_decode()
+            and sparse_kv_manager.cache_capacity == 2048
+        )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         # Trip the coordinator so the hisparse code path is captured into the

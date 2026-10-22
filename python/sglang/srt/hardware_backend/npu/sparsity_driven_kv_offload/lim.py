@@ -1,9 +1,9 @@
 """Q1 framework bridge from the DSA indexer to native LIM cache plans.
 
-LIM selects TopK from a stable page-aligned prefix. Both experimental modes
-append the same visible tail to attention; the default legacy selection policy
-is unchanged. Runtime state belongs to this manager-owned adapter, while the
-current plan travels on Ascend ForwardMetadata for IndexShare consumers.
+By default LIM selects a page-aligned prefix and appends its visible tail.
+With Copy-SFA, Q1 and C=K=2048 select over the complete visible sequence.
+Runtime state belongs to this manager-owned adapter, while the current plan
+travels on Ascend ForwardMetadata for IndexShare consumers.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
@@ -33,12 +32,14 @@ class LIMSelection:
     seq_lens: torch.Tensor
 
 
-def prepare_lim_rows(seq_lens, request_slots, last_prefix, capacity, request_rows):
+def prepare_lim_rows(
+    seq_lens, request_slots, last_prefix, capacity, request_rows, *, full_visible=False
+):
     """Derive native states without host scalar reads, including padding/reset."""
     valid = (request_slots > 0) & (request_slots < request_rows) & (seq_lens > 0)
     safe_slots = torch.where(valid, request_slots, request_rows).to(torch.int32)
     lengths = torch.where(valid, seq_lens, 0).to(torch.int32)
-    prefix = ((lengths - 1).clamp(min=0) // 128) * 128
+    prefix = lengths if full_visible else ((lengths - 1).clamp(min=0) // 128) * 128
     sparse = valid & (prefix >= capacity)
     previous = last_prefix[safe_slots.long()]
     warm = sparse & (previous >= 0) & (prefix >= previous)
@@ -55,8 +56,9 @@ class LIMDecodeAdapter:
         self.capacity = manager.device_cache_size
         self.rows = manager.size
         self.top_k = manager.sparse_context_len
+        self.full_visible = manager.copy_sfa_enabled
         self.source_capacity = (manager.max_context_len + 127) // 128 * 128
-        self.width = self.top_k + 128
+        self.width = self.top_k if self.full_visible else self.top_k + 128
         device = manager.device
         self.operator = load_fused_lim_operator() if self.is_native else None
         self.source_ids = torch.empty(
@@ -140,7 +142,18 @@ class LIMDecodeAdapter:
             self.last_prefix[layer_index],
             self.capacity,
             self.rows,
+            full_visible=self.full_visible,
         )
+        if self.full_visible and not getattr(
+            forward_batch, "sparse_kv_copy_sfa_capture", False
+        ):
+            cpu_lengths = forward_batch.seq_lens_cpu
+            # Mixed/short batches use a host gather without populating resident
+            # KV. Force the following fused step to cold-fill its cache.
+            if cpu_lengths is None or any(
+                0 < int(length) < self.top_k for length in cpu_lengths.tolist()
+            ):
+                next_prefix = torch.full_like(next_prefix, -1)
         table = self.block_table[:batch]
         table.zero_()
         table[:, : block_table.shape[1]].copy_(block_table)
@@ -206,6 +219,91 @@ class LIMDecodeAdapter:
             slots,
             lengths,
         )
+
+    def copy_sfa_metadata(self, manager, plan):
+        """Adapt native LIM plans to contiguous Copy-SFA metadata, without replanning."""
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
+            fill_request_block_table,
+        )
+
+        batch = plan.source_ids.shape[0]
+        valid = plan.valid_rows & plan.sparse_rows
+        manager.planner_topk_src_ids[:batch, 0].copy_(plan.source_ids)
+        manager.planner_topk_dst_slots[:batch, 0].copy_(
+            torch.where(valid[:, None], plan.device_slots, -1)
+        )
+        manager.planner_topk_miss_counts[:batch].copy_(
+            torch.where(valid, plan.topk_misses, 0)
+        )
+        # Native LIM's ABI has a 32768-wide miss row. A slice alone is strided
+        # at B>1; Copy-SFA requires tightly packed [B,2048] rows.
+        manager.planner_miss_src_ids[:batch].copy_(
+            torch.where(valid[:, None], plan.miss_sources[:, : self.top_k], -1)
+        )
+        manager.planner_miss_dst_slots[:batch].copy_(
+            torch.where(valid[:, None], plan.miss_slots[:, : self.top_k], -1)
+        )
+        manager.planner_miss_counts[:batch].copy_(
+            torch.where(valid, plan.miss_counts, 0)
+        )
+        lengths = valid.to(torch.int32) * self.top_k
+        manager.planner_actual_seq_lengths_kv[:batch].copy_(lengths)
+        manager.planner_num_cache_tokens[:batch].copy_(lengths)
+        for pages, offsets, output in (
+            (
+                self.capacity // 128,
+                manager.hbm_page_offsets,
+                manager.planner_hbm_block_table,
+            ),
+            (
+                manager.max_context_len // 128,
+                manager.dram_page_offsets,
+                manager.planner_dram_block_table,
+            ),
+        ):
+            fill_request_block_table(
+                plan.request_slots, valid, offsets, pages, output[:batch]
+            )
+        return (
+            manager.planner_topk_src_ids[:batch],
+            manager.planner_topk_dst_slots[:batch],
+            manager.planner_topk_miss_counts[:batch],
+            manager.planner_miss_src_ids[:batch],
+            manager.planner_miss_dst_slots[:batch],
+            manager.planner_miss_counts[:batch],
+            manager.planner_actual_seq_lengths_query[:batch],
+            manager.planner_actual_seq_lengths_kv[:batch],
+            manager.planner_num_cache_tokens[:batch],
+            manager.planner_hbm_block_table[:batch],
+            manager.planner_dram_block_table[:batch],
+        )
+
+    def gather_full_visible(self, manager, plan, layer_index, selected, *, copy):
+        """Short/mixed fallback: gather the selected IDs, preserving resident KV."""
+        batch = selected.shape[0]
+        sources = plan.source_ids.long()
+        valid = (
+            plan.valid_rows[:, None]
+            & (sources >= 0)
+            & (sources < plan.seq_lens[:, None])
+        )
+        rows = plan.request_slots.long().clamp(max=self.rows - 1)
+        copy(
+            manager.host_kv_buffer[layer_index],
+            selected,
+            (rows[:, None] * manager.max_context_len + sources)
+            .reshape(-1)
+            .contiguous(),
+            torch.arange(batch * self.top_k, device=selected.device),
+            valid.reshape(-1).contiguous(),
+            2,
+            2,
+            block_dim=24,
+            src_ptr=manager.dev_ptr_list[layer_index],
+        )
+        stream = torch.npu.current_stream(manager.device)
+        stream.record_event(manager.miss_done)
+        stream.record_event(manager.refill_done)
 
     def materialize(self, manager, plan, layer_index, selected, stream, *, copy):
         """Consume native plans directly; no Python lookup, sort or LRU rebuild."""
