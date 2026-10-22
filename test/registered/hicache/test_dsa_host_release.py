@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,6 +20,11 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDSAHostRelease(CustomTestCase):
+    def setUp(self):
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def test_destroy_releases_index_pages_for_registration_reuse(self):
         pool = DSATokenToKVPool(
             size=256,
@@ -33,7 +39,11 @@ class TestDSAHostRelease(CustomTestCase):
             index_head_dim=128,
         )
         anchor = MLATokenToKVPoolHost(
-            pool,
+            pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
             host_to_device_ratio=2,
             host_size=0,
             page_size=64,

@@ -141,6 +141,17 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
@@ -182,7 +193,13 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
     )
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost,
-        device_pool=device_pool,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
         layout=layout,
     )
     assert host_pool.can_use_jit, (
@@ -359,7 +376,13 @@ def _run_page_first_staged_write_back_mha(
     )
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost,
-        device_pool=device_pool,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
         layout=layout,
     )
     assert can_use_write_back_jit_kernel(

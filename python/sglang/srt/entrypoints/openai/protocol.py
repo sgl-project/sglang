@@ -398,8 +398,18 @@ class CompletionRequest(PDRoutingFields):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     images_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
@@ -596,10 +606,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
-    fps: Optional[float] = None
-    max_frames: Optional[int] = None
-    max_tokens_per_frame: Optional[int] = None
-    max_image_tokens: Optional[int] = None
+    fps: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    max_frames: Optional[int] = Field(default=None, gt=0)
+    max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
+    max_image_tokens: Optional[int] = Field(default=None, gt=0)
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -904,6 +914,11 @@ class ChatCompletionRequest(PDRoutingFields):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
+    # choices[].logprobs top_logprobs are then empty.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
+    return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -954,10 +969,20 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -1149,6 +1174,7 @@ class ChatCompletionRequest(PDRoutingFields):
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
+            "watermark": self.watermark,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -1211,6 +1237,13 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.tool_calls is None:
+            data.pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -1285,6 +1318,13 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.delta.tool_calls is None:
+            data["delta"].pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):

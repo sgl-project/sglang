@@ -160,6 +160,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
             ),
             decision_config=None,
             joint_head_config=None,
+            pointer_head=None,
         )
         pad, video = (
             tokenizer.encode(token, add_special_tokens=False)[0]

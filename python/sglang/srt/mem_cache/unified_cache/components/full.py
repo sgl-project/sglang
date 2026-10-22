@@ -18,7 +18,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    FreeComponentDeviceSlot,
+    UpdatePendingBackupOnNodeSplit,
+)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
@@ -31,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -170,6 +174,7 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -180,8 +185,8 @@ class FullComponent(TreeComponent):
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
             # Progress toward an eviction request and the ledger move are
-            # both in allocator units (see reclaimable_tokens).
-            freed = self.reclaimable_tokens(node)
+            # both in allocator units (see reclaimable_value_len).
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
@@ -216,6 +221,7 @@ class FullComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> Optional[NodeId]:
         ct = self.component_type
         lv = self._evict_device_last_node
@@ -247,6 +253,7 @@ class FullComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
@@ -260,7 +267,9 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            self.tree_core._evict_host_leaf(
+                x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
             if (
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves
@@ -309,7 +318,7 @@ class FullComponent(TreeComponent):
                 f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             )
             if cd.lock_ref == 0:
-                key_len = self.reclaimable_tokens(cur)
+                key_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_evictable_size_[ct] -= key_len
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
@@ -358,7 +367,7 @@ class FullComponent(TreeComponent):
                 f"FULL segment release hit lock_ref=0 on node {cur.id}"
             )
             if cd.lock_ref == 1 and cd.value is not None:
-                key_len = self.reclaimable_tokens(cur)
+                key_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_evictable_size_[ct] += key_len
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
@@ -370,7 +379,7 @@ class FullComponent(TreeComponent):
 
     def build_hicache_transfers(
         self,
-        node: UnifiedTreeNode,
+        node: Optional[UnifiedTreeNode],
         phase: CacheTransferPhase,
         *,
         mamba_pool_idx: Optional[torch.Tensor] = None,
@@ -379,6 +388,8 @@ class FullComponent(TreeComponent):
         prefetch_tokens: int = 0,
         staging_tokens: int = 0,
         last_hash: Optional[str] = None,
+        # Buffer-mode PREFETCH describes prefix_key without a resident node.
+        prefix_key: Optional[RadixKey] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -389,6 +400,7 @@ class FullComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            assert node is not None
             # `node` is best_match_node. FULL device evict only from leaves,
             # so once we hit a device-on node, everything above is also device-on
             backed_up: list[torch.Tensor] = []
@@ -449,7 +461,7 @@ class FullComponent(TreeComponent):
                 offset += n_len
                 # Full uses leaf sets, not LRU. A value materialized under
                 # lock is protected; the last release moves it to evictable.
-                ledger = self.reclaimable_tokens(n)
+                ledger = self.reclaimable_value_len(n)
                 if cd.lock_ref > 0:
                     self.tree_core.component_protected_size_[ct] += ledger
                 else:
@@ -523,7 +535,10 @@ class FullComponent(TreeComponent):
             self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
 
     def apply_component_action(self, action: ComponentAction) -> None:
-        if isinstance(action, FreeComponentDeviceSlot):
+        if isinstance(action, UpdatePendingBackupOnNodeSplit):
+            # Custom FULL components track buffer-write dependencies.
+            pass
+        elif isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
@@ -531,7 +546,7 @@ class FullComponent(TreeComponent):
                     alloc.full_attn_allocator.free_segment(indices, start_pos=0)
                 else:
                     alloc.free_segment(indices, start_pos=0)
-            return
-        raise AssertionError(
-            f"FullComponent: unhandled ComponentAction {type(action).__name__}"
-        )
+        else:
+            raise AssertionError(
+                f"FullComponent: unhandled ComponentAction {type(action).__name__}"
+            )
