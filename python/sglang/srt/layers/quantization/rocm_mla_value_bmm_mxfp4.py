@@ -19,7 +19,8 @@ try:
         pid_grid,
         remap_xcd,
     )
-except ImportError:  # AITER before ROCm/aiter#6505
+except ImportError:
+    # AITER before ROCm/aiter#6505; drop once the minimum AITER includes it.
     from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -41,10 +42,8 @@ _MXFP4_QUANT_BLOCK_SIZE_TL = tl.constexpr(_MXFP4_QUANT_BLOCK_SIZE)
             args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0
             and args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0
         ),
-        "GRID_MN": lambda args: (
-            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
-        ),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
