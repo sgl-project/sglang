@@ -239,3 +239,44 @@ def test_mxfp8_recipes_keep_activation_and_weight_groups_separate(block_size, wi
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize(
+    ("block_shape", "use_mxfp8", "is_fp4_experts", "group"),
+    [
+        # DeepSeek-V4.1-Flash: FP4 experts in a checkpoint with weight_block_size [32, 32].
+        ([32, 32], False, True, 128),
+        ([1, 32], True, False, 32),
+        ([128, 128], False, False, 128),
+    ],
+)
+def test_activation_group_matches_recipe_a(
+    block_shape, use_mxfp8, is_fp4_experts, group
+):
+    """Masked and contiguous GEMMs must quantize activations at recipe_a's group.
+
+    The masked path once used the checkpoint block size (32 for V4.1-Flash), so its
+    down-projection scales disagreed with recipe_a=(1, 128) and DeepGEMM rejected them.
+    """
+    from unittest.mock import patch
+
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+    with patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True):
+        quant = DeepGemmMoeQuantInfo(
+            None,
+            None,
+            True,
+            block_shape=block_shape,
+            is_fp4_experts=is_fp4_experts,
+            use_mxfp8=use_mxfp8,
+        )
+    assert quant.activation_group_size() == group
+    hidden = 2304
+    width = -(-hidden // (group * 4)) if use_mxfp8 else hidden // group
+    recipe_a, _ = quant.scale_recipes(
+        activation_block_size=group, hidden_size=hidden, activation_scale_width=width
+    )
+    if recipe_a is not None:
+        assert recipe_a[1] == group

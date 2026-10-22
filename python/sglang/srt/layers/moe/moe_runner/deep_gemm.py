@@ -310,6 +310,12 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
                 "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
             )
 
+    def activation_group_size(self) -> int:
+        """Group size of the FP8 activations the grouped GEMMs consume."""
+        # FP4 experts pair 1x32 weights with 1x128 activations (recipe_a), so a
+        # [32, 32] checkpoint block size must not leak into activation quant.
+        return self.block_shape[1] if self.use_mxfp8 else 128
+
     def scale_recipes(
         self,
         *,
@@ -422,7 +428,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
-        scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+        scale_block_size = quant_info.activation_group_size()
 
         if all_tokens == 0:
             if trace_deepep_v2_contig:
@@ -746,7 +752,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         use_mxfp8 = quant_info.use_mxfp8
-        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        scale_block_size = quant_info.activation_group_size()
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
