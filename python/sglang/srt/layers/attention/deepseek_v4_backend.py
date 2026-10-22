@@ -3950,27 +3950,26 @@ class DeepseekV4AttnBackend(
         """Idle never trusts its metadata, which may be stale or unset: it writes
         the request window's idle layout, or translates the zero-padded
         out_cache_loc to the dummy slot."""
+        out_cache_loc = forward_batch.out_cache_loc
+        window = self.token_to_kv_pool.request_window
+        if forward_batch.forward_mode.is_idle():
+            if window is not None:
+                return window.activate_idle(out_cache_loc.shape[0])
+            return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         metadata = self.forward_metadata
-        if self.token_to_kv_pool.request_window is not None:
-            if forward_batch.forward_mode.is_idle():
-                return self.token_to_kv_pool.request_window.activate_idle(
-                    forward_batch.out_cache_loc.shape[0]
-                )
+        if window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
-            self.token_to_kv_pool.request_window.activate(layout)
+            window.activate(layout)
             return layout.write_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
             return metadata.late_layer_tail.swa_out_cache_loc
-        out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
-        if (
-            cached is not None
-            and not forward_batch.forward_mode.is_idle()
-            and cached.shape[0] == out_cache_loc.shape[0]
-        ):
+        if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
             return cached
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
