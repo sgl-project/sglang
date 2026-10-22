@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPv2Fp8ScaleFormat,
     get_deepep_v2_fp8_scale_format,
+    get_deepep_v2_masked_tokens_per_rank,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -272,6 +273,7 @@ class _DeepEPv2Impl:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         activation_scale_block_size: int = _SCALE_BLOCK_SIZE,
+        num_max_masked_tokens_per_rank: Optional[int] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -281,6 +283,10 @@ class _DeepEPv2Impl:
         self.scale_format = scale_format
         self.activation_scale_block_size = activation_scale_block_size
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.num_max_masked_tokens_per_rank = min(
+            num_max_masked_tokens_per_rank or num_max_dispatch_tokens_per_rank,
+            num_max_dispatch_tokens_per_rank,
+        )
         self.use_fp8_dispatch = use_fp8_dispatch
         self._handle = None
         self._pad_empty_combine = False
@@ -354,6 +360,12 @@ class _DeepEPv2Impl:
         self._validate_common(hidden_states, topk_ids)
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
+        if use_masked and hidden_states.shape[0] > self.num_max_masked_tokens_per_rank:
+            raise ValueError(
+                f"DeepEP v2 masked dispatch of {hidden_states.shape[0]} rows exceeds "
+                f"SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK="
+                f"{self.num_max_masked_tokens_per_rank}."
+            )
         use_expand_layout = is_decode or self._prefill_expand_enabled
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
@@ -450,8 +462,8 @@ class _DeepEPv2Impl:
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # Every rank can send its full dispatch capacity to one expert.
-            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
+            # Every rank can send its full masked capacity to one expert.
+            masked_max_m = self.num_max_masked_tokens_per_rank * ep_group_size
             total_expanded = recv_capacity
 
         # Publish ownership only after the returned metadata is validated.
@@ -531,6 +543,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch=use_fp8_dispatch,
             activation_scale_block_size=activation_scale_block_size,
+            num_max_masked_tokens_per_rank=get_deepep_v2_masked_tokens_per_rank(),
         )
 
     def dispatch(

@@ -141,6 +141,37 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         finally:
             importlib.reload(deepep_v2)
 
+    def test_masked_capacity_defaults_to_and_is_capped_by_dispatch(self):
+        """Decode slabs are sized by the masked capacity, never above the buffer's."""
+        from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
+
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(8192):
+            self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 8192)
+            with envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.override(768):
+                self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 768)
+            with envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.override(10000):
+                self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 8192)
+
+    def test_masked_dispatch_rejects_rows_over_masked_capacity(self):
+        """A decode batch above the masked capacity must fail, not overflow the slab."""
+        impl = object.__new__(deepep_v2._DeepEPv2Impl)
+        impl._handle = None
+        impl.num_max_dispatch_tokens_per_rank = 64
+        impl.num_max_masked_tokens_per_rank = 8
+        impl.hidden_size = 128
+        impl.activation_scale_block_size = 128
+        impl.router_topk = 2
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        out = StandardTopKOutput(
+            topk_weights=torch.ones(9, 2),
+            topk_ids=torch.zeros(9, 2, dtype=torch.int32),
+            router_logits=None,
+        )
+        with patch.object(deepep_v2, "get_is_extend_in_batch", return_value=False):
+            with self.assertRaisesRegex(ValueError, "NUM_MAX_MASKED_TOKENS_PER_RANK"):
+                impl.dispatch(torch.empty(9, 128), out)
+
     def test_key_keeps_process_group_object(self):
         group = _FakeGroup()
         self._get(group)

@@ -696,13 +696,17 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
                 "--max-prefill-tokens."
             )
 
+    from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
+
+    masked_capacity = get_deepep_v2_masked_tokens_per_rank()
     graph_bs, tokens_per_req = _decode_graph_dispatch_tokens_per_rank(server_args)
     graph_tokens = graph_bs * tokens_per_req
-    if graph_tokens > capacity:
+    if graph_tokens > masked_capacity:
         raise ValueError(
-            "DeepEP v2 per-rank decode CUDA graph exceeds "
-            "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
-            f"required={graph_tokens}, capacity={capacity} "
+            "DeepEP v2 per-rank decode CUDA graph exceeds the masked dispatch "
+            "capacity (SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK, capped by "
+            "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK): "
+            f"required={graph_tokens}, capacity={masked_capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
             "the environment value or lower --cuda-graph-max-bs-decode."
         )
