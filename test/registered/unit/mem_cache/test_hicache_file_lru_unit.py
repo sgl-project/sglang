@@ -298,18 +298,26 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_mla_rank0_owns_eviction(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=0, tp_size=2)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
-    def test_mla_rank1_skips_eviction(self):
+    def test_mla_rank1_only_creates_its_mamba_files(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
-        self.assertFalse(b._evictor.is_storage_owner)
-        self.assertFalse(b._evictor.enabled)
-        # Non-owner MLA ranks must not create new files when eviction is on.
+        # Replicated MLA files are created by rank 0 only.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
-        self.assertEqual(len(b._evictor._lru), 0)
-        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertTrue(b.set("a.mamba", _t(50)))
+        self.assertEqual(b._evictor._total_bytes, 50)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV files, but Mamba pages must not overwrite another rank's."""
+        ranks = [
+            self.make_backend(is_mla=True, tp_rank=rank, tp_size=2, subdir="shared")
+            for rank in range(2)
+        ]
+        for rank, b in enumerate(ranks):
+            self.assertTrue(b.set("a.mamba", _t(16, rank + 1)))
+        for rank, b in enumerate(ranks):
+            self.assertTrue(torch.equal(b.get("a.mamba", _t(16)), _t(16, rank + 1)))
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.
@@ -324,7 +332,6 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_non_mla_each_rank_owns_its_files(self):
         # Non-MLA: even rank > 0 is its own owner because suffix isolates files.
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
 
@@ -583,7 +590,9 @@ class TestDcpStorage(unittest.TestCase):
                     owner = not mla or rank < dcp
                     self.assertEqual(cfg.is_storage_writer, owner)
                     self.assertEqual(controller.backup_skip, not owner)
-                    self.assertEqual(backend._evictor.is_storage_owner, owner)
+                    self.assertEqual(
+                        backend._evictor._owns(backend._get_suffixed_key("page")), owner
+                    )
                     key = backend._get_suffixed_key("page")
                     keys.append(key)
                     if dcp == 1:
@@ -695,7 +704,10 @@ class TestDcpStorage(unittest.TestCase):
                     self.assertEqual(cc.backup_skip, rank >= dcp)
                     # Old MLA state keys must miss, even when KV exists.
                     backend.set("page", _t(2))
-                    backend.set("page.mamba", _t(2, 99))
+                    legacy_path = Path(self.directory) / (
+                        f"page.mamba{backend.config_suffix}.bin"
+                    )
+                    legacy_path.write_bytes(bytes([99, 99]))
                     self.assertEqual(
                         backend.batch_exists_v2(["page"], [transfer]).kv_hit_pages, 0
                     )
@@ -818,7 +830,6 @@ class TestDcpStorage(unittest.TestCase):
             "non_mla",
             "dummy",
             "split",
-            "scales",
             "extra_pool",
             "file",
             "mooncake",
@@ -831,9 +842,6 @@ class TestDcpStorage(unittest.TestCase):
             host.layout = "page_first"
             if case == "split":
                 host.layout = "page_first_kv_split"
-            host.device_pool = SimpleNamespace(
-                kv_scale_buffer=object() if case == "scales" else None
-            )
             cc = HiCacheController.__new__(HiCacheController)
             cc.enable_storage = False
             cc.storage_host_pool = object() if case == "non_mla" else host
@@ -871,6 +879,24 @@ class TestDcpStorage(unittest.TestCase):
                 )
             self.assertEqual(cc._stop_storage_threads.call_count, int(accepted))
             self.assertFalse(cc.enable_storage)
+
+
+class TestUncachedBatchExists(HiCacheFileLRUTestBase):
+    def test_lookup_only_checks_requested_component_files(self):
+        b = self.make_backend(enable_metadata_cache=False)
+        for key in ("k1", "k2", "k1.mamba"):
+            self.assertTrue(b.set(key, _t(50)))
+        # A directory named like a cache page must not count as a hit.
+        os.mkdir(os.path.join(b.file_path, f"{b._get_component_key('k3')}.bin"))
+        keys = ["k1", "k2", "k3"]
+        with mock.patch("os.scandir", side_effect=AssertionError("full-store scan")):
+            self.assertEqual(b.batch_exists_v2(keys).kv_hit_pages, 2)
+            result = b.batch_exists_v2(keys, [PoolTransfer(name=PoolName.MAMBA)])
+            self.assertEqual(result.kv_hit_pages, 1)
+            self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], 1)
+            os.remove(os.path.join(b.file_path, f"{b._get_component_key('k1')}.bin"))
+            self.assertEqual(b.batch_exists_v2(keys).kv_hit_pages, 0)
+            self.assertEqual(b.batch_exists_v2([]).kv_hit_pages, 0)
 
 
 if __name__ == "__main__":
