@@ -5,13 +5,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from sampling_mask_reference import assert_distribution, reference_distribution
 
 from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.test.ascend.sampling_mask_reference import (
+    assert_distribution,
+    reference_distribution,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase

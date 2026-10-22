@@ -6,8 +6,11 @@ import subprocess
 import unittest
 
 import requests
-from sampling_mask_reference import assert_distribution, reference_distribution
 
+from sglang.test.ascend.sampling_mask_reference import (
+    assert_distribution,
+    reference_distribution,
+)
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_V4_FLASH_BF16_MODEL_PATH,
     GLM_5_2_BF16_MODEL_PATH,
