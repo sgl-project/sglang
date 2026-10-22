@@ -66,7 +66,6 @@ def maybe_write_dsv4_extend(
 
 def _c4_state_rows(
     req_to_token_pool,
-    token_to_kv_pool,
     req_pool_idx,
     seq_len,
     *,
@@ -93,6 +92,10 @@ def _c4_state_rows(
     positions = np.arange(start, seq_len, dtype=np.int64)
     if positions.size == 0:
         return np.empty((0,), dtype=np.int32)
+    allocator = getattr(req_to_token_pool, "_dsv4_allocator", None)
+    if allocator is None:
+        return np.empty((0,), dtype=np.int32)
+    token_to_kv_pool = allocator.get_kvcache()
     pools = getattr(token_to_kv_pool, "compress_state_pools", None) or []
     pool = next((p for p in pools if p is not None and p.ratio == 4), None)
     if pool is None:
@@ -111,7 +114,6 @@ def dsv4_state_payloads(
     seq_len: int,
     page_size: int,
     *,
-    token_to_kv_pool,
     prefix_len: int = 0,
 ):
     """Build NPU-specific DSV4 PD payloads.
@@ -120,15 +122,17 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` — live C4 compress-state rows. The component is separate
-      from ``StateType.SWA`` because prefill and decode may use different ring
-      sizes (8 without MTP, 16 with it); each peer maps the same logical token
-      positions through its own SWA pages, so item size stays one state row.
+    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows. The component is
+      separate from ``StateType.SWA`` because prefill and decode may use
+      different ring sizes (8 without MTP, 16 with it); each peer maps the same
+      logical token positions through its own SWA pages, so an item stays one
+      state row. A3 keeps the C4 state inside the SWA payload.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -147,15 +151,16 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    def c4_state_rows():
-        return _c4_state_rows(
-            req_to_token_pool, token_to_kv_pool, req_pool_idx, seq_len
-        )
+    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
 
-    return {
-        AscendStateType.DSV4_C128: c128_kv_pages,
-        AscendStateType.DSV4_C4_STATE: c4_state_rows,
-    }
+    if is_npu_arch35():
+
+        def c4_state_rows():
+            return _c4_state_rows(req_to_token_pool, req_pool_idx, seq_len)
+
+        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_rows
+
+    return payloads
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
