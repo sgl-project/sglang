@@ -25,7 +25,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUFinalizeRouting
 from sglang.srt.hardware_backend.npu.moe.init_routing import NPUMoEInitRouting_v2
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -444,23 +447,34 @@ class AscendOpsDispatcher(BaseDispatcher):
         quant_mode = self._routing_quant_mode()
         if quant_mode not in (-1, 1):
             raise NotImplementedError("NPU AllGather supports BF16 and INT8 routing")
-        # Ranks may have different row counts, including zero; use tensor sizes.
         world_size = dist.get_world_size(group)
-        local_size = torch.tensor(
-            [hidden_states.shape[0]], dtype=torch.int32, device=hidden_states.device
-        )
-        sizes = torch.empty(world_size, dtype=torch.int32, device=hidden_states.device)
-        dist.all_gather_into_tensor(sizes, local_size, group=group)
-        row_sizes = sizes.tolist()
+        # Attention TP is one: scheduler counts include the actual DP padding.
+        # Reuse CPU metadata to avoid a device count collective and D2H per layer.
+        sizes = get_dp_global_num_tokens()
+        if sizes is None:
+            raise RuntimeError("NPU AllGather requires scheduler DP token counts")
+        if (
+            len(sizes) != world_size
+            or sizes[dist.get_rank(group)] != hidden_states.shape[0]
+        ):
+            raise ValueError("NPU AllGather input rows disagree with DP token counts")
+        row_sizes = list(sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
             raise RuntimeError("NPU prefill requires at least one global token")
 
+        equal_rows = min(row_sizes) == max_rows
+
         def gather_rows(tensor):
-            padded = tensor.new_zeros((max_rows, *tensor.shape[1:]))
-            padded[: tensor.shape[0]].copy_(tensor)
+            if equal_rows:
+                padded = tensor.contiguous()
+            else:
+                padded = tensor.new_zeros((max_rows, *tensor.shape[1:]))
+                padded[: tensor.shape[0]].copy_(tensor)
             gathered = tensor.new_empty((world_size * max_rows, *tensor.shape[1:]))
             dist.all_gather_into_tensor(gathered, padded, group=group)
+            if equal_rows:
+                return gathered
             return torch.cat(
                 [
                     gathered[rank * max_rows : rank * max_rows + rows]
@@ -485,18 +499,14 @@ class AscendOpsDispatcher(BaseDispatcher):
         x, row_idx, expert_tokens, scales = self._init_routing_tokens(
             hidden_states, local_ids, self.num_local_experts, quant_mode
         )
-        # Trim unused routing capacity before expert computation.
-        num_routed_rows = int(expert_tokens.sum().item())
-        x = x[:num_routed_rows]
-        if scales is not None:
-            scales = scales[:num_routed_rows]
-        # Give every dropped route an in-bounds zero row, filled at combine.
-        row_idx = row_idx.masked_fill(~is_local.reshape(-1), num_routed_rows)
+        # Grouped GEMM and activation use device counts, so keep the capacity.
+        # If any route is dropped, the final capacity row is unused. Combine
+        # zeros unused rows on device before this sentinel is read by finalize.
+        row_idx = row_idx.masked_fill(~is_local.reshape(-1), local_ids.numel() - 1)
         self._allgather_state = {
             "group": group,
             "row_sizes": row_sizes,
             "input_dtype": input_dtype,
-            "num_routed_rows": num_routed_rows,
         }
         self._dispatch_output = AscendOpsDispatchOutput(
             hidden_states=x,
@@ -517,18 +527,20 @@ class AscendOpsDispatcher(BaseDispatcher):
         dispatched = self._dispatch_output
         sizes = state["row_sizes"]
         group = state["group"]
-        num_routed_rows = state["num_routed_rows"]
-        valid_output = hidden_states[:num_routed_rows]
         # Operator constraint: finalize mode 2 requires the full
         # [global_tokens * top_k, hidden] shape, not just the valid expert rows.
-        # Dropped routes must read an explicit zero row: 0 * NaN is still NaN,
-        # so zero weights cannot make uninitialized GEMM rows safe to read.
         expert_output = torch.zeros(
             (dispatched.topk_ids.numel(), self.hidden_size),
             dtype=torch.float32,
-            device=valid_output.device,
+            device=hidden_states.device,
         )
-        expert_output[:num_routed_rows].copy_(valid_output)
+        expert_output[: hidden_states.shape[0]].copy_(hidden_states)
+        # Keep the valid count on device. Zero unused capacity before finalize:
+        # dropped routes must not read NaN even when their weight is zero.
+        unused_rows = torch.arange(
+            expert_output.shape[0], device=expert_output.device
+        ) >= dispatched.expert_tokens.sum()
+        expert_output.masked_fill_(unused_rows[:, None], 0)
         # Keep weighted expert sums in FP32 across ranks. Rounding each
         # rank's partial output to BF16 before ReduceScatter loses precision.
         contributions = self._finalize_routing._finalize_routing(
@@ -537,15 +549,18 @@ class AscendOpsDispatcher(BaseDispatcher):
             expanded_row_idx=dispatched.expanded_row_idx,
             topk_ids=dispatched.topk_ids,
         )
-        # Restore equal-sized chunks in source-rank order for ReduceScatter.
+        # Equal-sized chunks already have the layout required by ReduceScatter.
         max_rows = max(sizes)
-        padded = contributions.new_zeros((len(sizes) * max_rows, self.hidden_size))
-        offset = 0
-        for rank, rows in enumerate(sizes):
-            padded[rank * max_rows : rank * max_rows + rows].copy_(
-                contributions[offset : offset + rows]
-            )
-            offset += rows
+        if min(sizes) == max_rows:
+            padded = contributions
+        else:
+            padded = contributions.new_zeros((len(sizes) * max_rows, self.hidden_size))
+            offset = 0
+            for rank, rows in enumerate(sizes):
+                padded[rank * max_rows : rank * max_rows + rows].copy_(
+                    contributions[offset : offset + rows]
+                )
+                offset += rows
         output = contributions.new_empty((max_rows, self.hidden_size))
         dist.reduce_scatter_tensor(output, padded, group=group)
         output = output[: sizes[dist.get_rank(group)]].to(state["input_dtype"])
