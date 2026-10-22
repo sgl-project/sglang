@@ -259,6 +259,31 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertTrue(reasoning.answer_started)
         self.assertEqual(tool_parser.parse_non_stream(generation), (generation, []))
 
+    def test_answer_opened_by_the_prompt_continues_as_text(self):
+        """Under a grammar that admits calls or an answer, generation that
+        continues an answer the prompt opened is text, streamed or not."""
+        prefix = PREFIX + "<|channel|>final<|message|>The capital is "
+        for constrained in (False, True):
+            with self.subTest(constrained=constrained):
+                parser = FunctionCallParser(
+                    tools=[_tool()],
+                    tool_call_parser="beam",
+                    prefix=prefix,
+                    constrained=constrained,
+                )
+                streaming = FunctionCallParser(
+                    tools=[_tool()],
+                    tool_call_parser="beam",
+                    prefix=prefix,
+                    constrained=constrained,
+                )
+                streamed = "".join(
+                    streaming.parse_stream_chunk(char)[0] for char in "Paris."
+                )
+
+                self.assertEqual(parser.parse_non_stream("Paris."), ("Paris.", []))
+                self.assertEqual(streamed + streaming.parse_stream_end()[0], "Paris.")
+
     def test_undeclared_tool_calls_follow_the_forwarding_setting(self):
         command = _parameter("command", "pwd")
         generation = _continuation_call(

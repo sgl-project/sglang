@@ -794,9 +794,8 @@ class ServingChatTestCase(CustomTestCase):
 
     def _convert_rendered_as(self, prompt, request=None, **fields):
         if request is None:
-            request = ChatCompletionRequest(
-                model="x", messages=[{"role": "user", "content": "Weather?"}], **fields
-            )
+            fields.setdefault("messages", [{"role": "user", "content": "Weather?"}])
+            request = ChatCompletionRequest(model="x", **fields)
         # The engine, and so the response parsers, read the rendered prompt.
         rendered = MessageProcessingResult(
             prompt=prompt,
@@ -986,11 +985,11 @@ class ServingChatTestCase(CustomTestCase):
             ([], "Plan", payload, ["stop"]),
         )
 
-    def _served(self, output, stream, *, incremental=True, **fields):
+    def _served(
+        self, output, stream, *, incremental=True, prompt="<assistant>", **fields
+    ):
         output = copy.deepcopy(output)
-        adapted, request = self._convert_rendered_as(
-            "<assistant>", stream=stream, **fields
-        )
+        adapted, request = self._convert_rendered_as(prompt, stream=stream, **fields)
         if not stream:
             choice = self.chat._build_chat_response(request, [output], 0).choices[0]
             message = choice.message
@@ -2102,7 +2101,7 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
         tokenizer = self.tm.tokenizer
-        tokenizer.encode.side_effect = lambda text: [text]
+        tokenizer.encode.side_effect = lambda text, **_: [text]
         for prompt, resumed in (
             ("<|start|>assistant", "<|channel|>final<|message|>The capital is "),
             ("<|start|>assistant<|channel|>analysis<|message|>", "The capital is "),
@@ -2116,18 +2115,15 @@ class ServingChatTestCase(CustomTestCase):
                     [0, resumed],
                 )
 
-        request = ChatCompletionRequest(
-            model="x",
-            messages=[
+        prompt = "<|start|>assistant<|channel|>final<|message|>The capital is "
+        continued = {
+            "messages": [
                 {"role": "user", "content": "Capital?"},
                 {"role": "assistant", "content": "The capital is "},
             ],
-            continue_final_message=True,
-        )
-        adapted, _ = self._convert_rendered_as(
-            "<|start|>assistant<|channel|>final<|message|>The capital is ",
-            request=request,
-        )
+            "continue_final_message": True,
+        }
+        adapted, _ = self._convert_rendered_as(prompt, **continued)
         grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
         self.assertFalse(adapted.require_reasoning)
         self.assertTrue(_is_grammar_accept_string(grammar, "Paris.<|return|>"))
@@ -2136,6 +2132,22 @@ class ServingChatTestCase(CustomTestCase):
                 grammar, "Paris.<|end|><|start|>assistant<|channel|>final<|message|>"
             )
         )
+        # With tools, the rest of the answer is still served as generated.
+        for separate in (True, False):
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    separate=separate, stream=stream, incremental=incremental
+                ):
+                    served = self._served(
+                        self._stopped_on_token("Paris.", 2),
+                        stream,
+                        incremental=incremental,
+                        prompt=prompt,
+                        tools=[_WEATHER_TOOL],
+                        separate_reasoning=separate,
+                        **continued,
+                    )
+                    self.assertEqual(served, ("", "Paris.", []))
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None

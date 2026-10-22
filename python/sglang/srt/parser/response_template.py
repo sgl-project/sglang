@@ -317,6 +317,15 @@ class ResponseTemplateStreamAdapter:
         )
         self._prefix_end = len(self._parser.input_text)
         self._track(self._parser.initial_events)
+        if (
+            self._grammar_start == GRAMMAR_AT_ANSWER
+            and self._open_region is not None
+            and self._open_region["field"] == _CONTENT_FIELD
+        ):
+            # The prompt opened the answer, so all generated text is answer
+            # text, and none of the prompt's passes through.
+            self._verbatim = True
+            return []
         for event in reversed(self._parser.initial_events):
             if event.get("field") == _TOOL_FIELD and event["type"] != "region_chunk":
                 return [event] if event["type"] == "region_open" else []
@@ -328,6 +337,8 @@ class ResponseTemplateStreamAdapter:
         if self._verbatim:
             return [_passthrough_chunk(text)] if text else []
         events = self._start(tools)
+        if self._verbatim:
+            return [_passthrough_chunk(text)] if text else []
         return self._end_reasoning(events + self._track(self._parser.feed(text)))
 
     def finalize(self, tools: Sequence[Any] | None = None) -> list[dict]:
