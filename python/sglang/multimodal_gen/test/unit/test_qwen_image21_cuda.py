@@ -656,3 +656,157 @@ def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(
     assert packed is not None
     assert torch.equal(packed[:rows], attn.to_q.weight)
     assert torch.equal(packed[2 * rows :], attn.to_v.weight)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
+    reason="Shared FP8 projections are enabled only on SM89",
+)
+@pytest.mark.parametrize("count", [2, 3])
+def test_shared_fp8_projections_preserve_results_and_fallbacks(model, count):
+    """Sharing quantization must preserve each projection, updates and hooks.
+
+    Unequal channel scales and non-contiguous batched inputs catch accidental
+    tensorwise scaling or flattening of the batch dimensions. Static scales
+    and forward hooks must continue through the original layer forwards.
+    """
+    from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+
+    layers = [
+        ColumnParallelLinear(
+            128, 128, bias=False, params_dtype=torch.bfloat16, quant_config=Fp8Config()
+        ).cuda()
+        for _ in range(count)
+    ]
+    with torch.no_grad():
+        for index, layer in enumerate(layers):
+            layer.weight.normal_(std=0.1 * (index + 1))
+            layer.quant_method.process_weights_after_loading(layer)
+        x = torch.randn(2, 7, 256, device="cuda", dtype=torch.bfloat16)[..., ::2]
+        x[0, 0].zero_()
+        x[1, 0] *= 100
+        assert not x.is_contiguous()
+        for update in (False, True):
+            if update:
+                # No retained scale/weight view may hide an in-place update.
+                layers[-1].weight_scale.mul_(1.5)
+            expected = tuple(layer(x)[0] for layer in layers)
+            actual = model_module._shared_fp8_projections(x, layers)
+            assert actual is not None
+            for result, reference in zip(actual, expected, strict=True):
+                assert result.shape == x.shape
+                assert result.is_contiguous()
+                torch.testing.assert_close(result, reference, atol=0, rtol=0)
+        handle = layers[0].register_forward_hook(lambda module, args, output: output)
+        try:
+            assert model_module._shared_fp8_projections(x, layers) is None
+        finally:
+            handle.remove()
+        layers[0].input_scale = torch.nn.Parameter(
+            torch.ones(1, device="cuda"), requires_grad=False
+        )
+        assert model_module._shared_fp8_projections(x, layers) is None
+        layers[0].input_scale = None
+        for layer in layers:
+            layer.cpu()
+        assert model_module._shared_fp8_projections(x, layers) is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
+    reason="Fused FP8 down projections are enabled only on SM89",
+)
+def test_silu_mul_fp8_projection_preserves_results_and_fallbacks(model, monkeypatch):
+    """Prequantized down projection must preserve GEMM, updates and hooks."""
+    from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+
+    monkeypatch.setattr(
+        model_module, "_SILU_MUL_FP8_FUSION", BitExactFusionGate("test SiLU FP8")
+    )
+    layer = RowParallelLinear(
+        12288, 128, bias=False, params_dtype=torch.bfloat16, quant_config=Fp8Config()
+    ).cuda()
+    with torch.no_grad():
+        layer.weight.normal_(std=0.1)
+        layer.quant_method.process_weights_after_loading(layer)
+        gate = torch.randn((1, 4096, 12288), device="cuda", dtype=torch.bfloat16)
+        up = torch.randn_like(gate)
+        gate[:, 0].zero_()
+        for update in (False, True):
+            if update:
+                layer.weight_scale.mul_(1.5)
+            expected = layer(torch.nn.functional.silu(gate) * up)[0]
+            actual = model_module._silu_mul_fp8_projection(gate, up, layer)
+            assert actual is not None
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert model_module._SILU_MUL_FP8_FUSION.verified
+        handle = layer.register_forward_hook(lambda module, args, output: output)
+        try:
+            assert model_module._silu_mul_fp8_projection(gate, up, layer) is None
+        finally:
+            handle.remove()
+        layer.input_scale = torch.nn.Parameter(
+            torch.ones(1, device="cuda"), requires_grad=False
+        )
+        assert model_module._silu_mul_fp8_projection(gate, up, layer) is None
+        layer.input_scale = None
+        assert (
+            model_module._silu_mul_fp8_projection(gate[:, :22], up[:, :22], layer)
+            is None
+        )
+        layer.tp_size = 2
+        assert model_module._silu_mul_fp8_projection(gate, up, layer) is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
+    reason="Norm FP8 projections are enabled only on SM89",
+)
+def test_modulation_fp8_projections_preserve_results_and_fallbacks(model, monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+
+    monkeypatch.setattr(
+        model_module, "_NORM_FP8_FUSION", BitExactFusionGate("test norm FP8")
+    )
+    norm = torch.nn.LayerNorm(4096, eps=1e-6, elementwise_affine=False).cuda()
+    layers = [
+        ColumnParallelLinear(
+            4096, 128, bias=False, params_dtype=torch.bfloat16, quant_config=Fp8Config()
+        ).cuda()
+        for _ in range(3)
+    ]
+    with torch.no_grad():
+        for layer in layers:
+            layer.weight.normal_(std=0.1)
+            layer.quant_method.process_weights_after_loading(layer)
+        x = torch.randn((1, 4096, 4096), device="cuda", dtype=torch.bfloat16)
+        scale = torch.randn((1, 1, 4096), device="cuda", dtype=torch.bfloat16)
+        for module, names in (
+            (model.transformer_blocks[0].attn, ("to_q", "to_k", "to_v")),
+            (model.transformer_blocks[0].img_mlp, ("gate_layer", "proj")),
+        ):
+            for name, layer in zip(names, layers):
+                monkeypatch.setattr(module, name, layer)
+            normalized = norm(x) * (1 + scale)
+            expected = tuple(layer(normalized)[0] for layer in layers[: len(names)])
+            actual = model_module._modulation_fp8_projections(x, norm, scale, module)
+            assert actual is not None
+            assert model_module._NORM_FP8_FUSION.verified
+            for result, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(result, reference, atol=0, rtol=0)
+            for hooked in (module, norm, layers[0]):
+                handle = hooked.register_forward_pre_hook(lambda module, args: None)
+                try:
+                    assert (
+                        model_module._modulation_fp8_projections(x, norm, scale, module)
+                        is None
+                    )
+                finally:
+                    handle.remove()
+            assert (
+                model_module._modulation_fp8_projections(x[:, :32], norm, scale, module)
+                is None
+            )
