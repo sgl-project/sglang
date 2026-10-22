@@ -1854,7 +1854,6 @@ class ResponseToolState(msgspec.Struct, frozen=True):
     public_tools: list[ResponseTool] | None = None
     public_choice: str | dict[str, Any] | None = None
     names: dict[str, dict[str, str]] = {}
-    custom_names: set[str] = set()
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):

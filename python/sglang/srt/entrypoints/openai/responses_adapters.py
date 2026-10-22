@@ -19,30 +19,7 @@ import json
 import zlib
 from typing import Any, Dict, Optional, Set, Tuple
 
-from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from pydantic import BaseModel
-
-
-def harmony_output_item(state, item, *, partial=False):
-    """A Harmony output item under its public name, and a custom tool's call
-    as a `custom_tool_call`."""
-    if item.type != "function_call":
-        return item
-    public_name = response_tool_name(item.name, state.names)
-    if item.name in state.custom_names:
-        # Harmony leaves a call cut off by the end of generation in_progress.
-        unfinished = partial or item.status == "in_progress"
-        decode = (
-            decode_custom_tool_input_prefix if unfinished else decode_custom_tool_input
-        )
-        return ResponseCustomToolCall(
-            type="custom_tool_call",
-            id=item.id,
-            call_id=item.call_id,
-            input=decode(item.arguments),
-            **public_name,
-        )
-    return item.model_copy(update=public_name)
 
 
 class ResponseToolChoiceError(ValueError):
@@ -136,34 +113,6 @@ def flatten_response_input(item):
         if not isinstance(name, str) or not name:
             raise ValueError(f"{item['type']} input items require a name")
         item["name"] = flat_namespace_tool_name(item.pop("namespace", None), name)
-    return item
-
-
-def harmony_custom_tool(tool):
-    """Render a custom tool through Harmony's existing function schema."""
-    if tool["type"] != "custom":
-        return tool
-    tool = {
-        **tool,
-        "type": "function",
-        "parameters": custom_tool_parameters(),
-        # Harmony requires a description; a custom tool's is optional.
-        "description": custom_tool_description(
-            tool.get("description"), tool.get("format")
-        )
-        or "",
-    }
-    tool.pop("format", None)
-    return tool
-
-
-def harmony_custom_input(item):
-    if isinstance(item, dict) and item.get("type") == "custom_tool_call":
-        item = dict(item)
-        item.update(
-            type="function_call",
-            arguments=encode_custom_tool_input(item.pop("input", "")),
-        )
     return item
 
 

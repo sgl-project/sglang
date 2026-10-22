@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapt Beam's trained built-in tools independently of namespace mapping."""
+"""Translate Responses tools to the flat function tools Beam's template renders:
+namespaced tools under joined names, and shell as Beam's trained bash."""
 
 import json
 from typing import Union
@@ -8,12 +9,16 @@ from openai.types.responses import ResponseFunctionShellToolCall
 from openai.types.responses.response_input_item_param import ShellCall, ShellCallOutput
 from pydantic import BaseModel, TypeAdapter
 
-from sglang.srt.entrypoints.openai.responses_tools.adapter import ResponseToolAdapter
+from sglang.srt.entrypoints.openai.responses_adapters import (
+    flatten_response_input,
+    flatten_response_tools,
+    response_tool_choice,
+)
 
 _SHELL_INPUT = TypeAdapter(Union[ShellCall, ShellCallOutput])
 
 
-class BeamToolAdapter(ResponseToolAdapter):
+class BeamToolAdapter:
     def __init__(self, tools, choice="auto"):
         self.public_choice = choice
         self.flat_tools = []
@@ -45,13 +50,39 @@ class BeamToolAdapter(ResponseToolAdapter):
             else:
                 self._add(tool)
 
-    def prepare(self, request, *, tool_call_parser):
-        if self.builtins:
-            if tool_call_parser not in ("beam", "response_template"):
-                raise ValueError(
-                    "Beam built-in tools require the beam or response_template tool-call parser"
-                )
-        return request.chat_template_kwargs
+    @classmethod
+    def from_request(cls, request, *, tool_call_parser):
+        """Translate tool definitions while retaining their public representation."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ResponseTool,
+            ResponseToolState,
+        )
+
+        flat_tools, names = flatten_response_tools(request.tools)
+        adapter = cls(flat_tools, request.tool_choice)
+        if adapter.builtins and tool_call_parser not in ("beam", "response_template"):
+            raise ValueError(
+                "Beam built-in tools require the beam or response_template tool-call parser"
+            )
+        adapted_choice = adapter.choice()
+        choice = response_tool_choice(adapted_choice, adapter.flat_tools, names)
+        state = ResponseToolState(
+            public_tools=request.tools,
+            public_choice=(
+                request.tool_choice
+                if adapted_choice != request.tool_choice
+                else request.effective_tool_choice()
+            ),
+            names=names,
+        )
+        translated = request.model_copy(
+            update={
+                "tools": [ResponseTool.model_validate(t) for t in adapter.flat_tools],
+                "tool_choice": choice,
+            }
+        )
+        translated._tool_state = state
+        return translated, adapter
 
     def _builtin(self, name, kind, description, parameters):
         self._add(
@@ -129,7 +160,7 @@ class BeamToolAdapter(ResponseToolAdapter):
                 "call_id": output["call_id"],
                 "output": _SHELL_INPUT.dump_json(output, exclude_none=True).decode(),
             }
-        return item
+        return flatten_response_input(item)
 
     def output_item(self, item):
         if not isinstance(item, dict) or item.get("type") not in (

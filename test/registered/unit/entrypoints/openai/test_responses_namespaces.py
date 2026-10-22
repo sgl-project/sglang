@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     response_tool_choice,
     response_tool_name,
 )
+from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
 from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -113,7 +114,7 @@ def test_named_choice_matches_public_namespace(tools, choice):
     with pytest.raises(ValueError, match="not declared"):
         response_tool_choice(choice, flat, names)
     response = asyncio.run(
-        make_serving().create_responses(
+        make_serving(model_type="beam").create_responses(
             ResponsesRequest(input="hi", tools=tools, tool_choice=choice)
         )
     )
@@ -128,28 +129,22 @@ def test_replayed_call_requires_name(kind, name):
     if name is not None:
         call["name"] = name
     response = asyncio.run(
-        make_serving().create_responses(ResponsesRequest(model="x", input=[call]))
+        make_serving(model_type="beam").create_responses(
+            ResponsesRequest(model="x", input=[call])
+        )
     )
     assert response.status_code == 400
     assert "require a name" in json.loads(response.body)["error"]["message"]
 
 
-@pytest.mark.parametrize("use_harmony", [False, True])
-def test_tool_translation_keeps_request_and_private_state_separate(use_harmony):
-    from sglang.srt.entrypoints.openai.responses_tools.adapter import (
-        ResponseToolAdapter,
-    )
-
+def test_tool_translation_keeps_request_and_private_state_separate():
     request = ResponsesRequest(input="hi", tools=[namespace("custom")])
     public = request.model_dump()
-    translated, _ = ResponseToolAdapter.from_request(
-        request, use_harmony=use_harmony, tool_call_parser=None
-    )
+    translated, _ = BeamToolAdapter.from_request(request, tool_call_parser=None)
     assert request.model_dump() == public
     assert translated.tools[0].name == "office__weather"
-    assert translated.tools[0].type == ("function" if use_harmony else "custom")
+    assert translated.tools[0].type == "custom"
     assert translated._tool_state.public_tools == request.tools
-    assert translated._tool_state.custom_names == {"office__weather"}
     assert translated.model_dump().keys() == public.keys()
     assert "_tool_state" not in ResponsesRequest.model_json_schema()["properties"]
     assert request._tool_state.names == {}
@@ -167,7 +162,7 @@ def test_namespace_mapping_preserves_extra_tool_options():
 @pytest.mark.parametrize("kind", ["function", "custom"])
 @pytest.mark.parametrize("nsname", ["office", "n" * 128])
 def test_namespace_beam_generation_and_continuation(stream, kind, nsname, choice):
-    serving = make_serving()
+    serving = make_serving(model_type="beam")
     serving.enable_response_store = True
     serving.reasoning_parser = serving.tool_call_parser = "beam"
     serving._reasoning_detector = BeamReasoningDetector()
@@ -274,154 +269,10 @@ def test_namespace_beam_generation_and_continuation(stream, kind, nsname, choice
         asyncio.run(run())
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize(
-    "kind,cutoff,described",
-    [
-        ("function", False, True),
-        ("custom", False, True),
-        ("custom", False, False),  # a custom tool's description is optional
-        ("custom", True, True),  # generation stops inside the payload
-    ],
-)
-def test_harmony_namespace_handler(stream, kind, cutoff, described):
-    from openai_harmony import Conversation, Message, Role
-
-    from sglang.srt.entrypoints.harmony_utils import get_encoding
-
-    serving = make_serving()
-    serving.use_harmony = True
-    serving.default_chat_template_kwargs = {}
-    value = 'quote " newline\n 😀'
-    args = json.dumps({"input": value} if kind == "custom" else {"city": value})
-    tokens = get_encoding().render_conversation(
-        Conversation.from_messages(
-            [
-                Message.from_role_and_content(Role.ASSISTANT, args)
-                .with_channel("commentary")
-                .with_recipient("functions.office__weather")
-            ]
-        )
-    )
-
-    prefix = get_encoding().render_conversation_for_completion(
-        Conversation.from_messages([]), Role.ASSISTANT
-    )
-    tokens = tokens[len(prefix) :]
-    if cutoff:
-        tokens = next(
-            tokens[:end]
-            for end in range(len(tokens))
-            if get_encoding().decode(tokens[:end]).endswith('{"input": "quote')
-        )
-        value = "quote"
-    tool = namespace(kind)
-    if not described:
-        del tool["description"], tool["tools"][0]["description"]
-
-    async def generate(*args):
-        for index in range(1, len(tokens) + 1) if stream else [len(tokens)]:
-            chunk = engine_chunk("", index, finish=index == len(tokens))
-            if cutoff and index == len(tokens):
-                chunk["meta_info"]["finish_reason"] = {"type": "length"}
-            chunk["output_ids"] = tokens[:index]
-            yield chunk
-
-    serving.tokenizer_manager.generate_request = generate
-
-    async def run():
-        response = await serving.create_responses(
-            ResponsesRequest(
-                model="x",
-                input="Call tool",
-                stream=stream,
-                store=False,
-                tools=[tool],
-            )
-        )
-        if stream:
-            events = event_payloads([e async for e in response])
-            response = events[-1]["response"]
-            if kind == "custom":
-                assert (
-                    "".join(
-                        e["delta"]
-                        for e in events
-                        if e["type"] == "response.custom_tool_call_input.delta"
-                    )
-                    == value
-                )
-                assert not any(
-                    e["type"].startswith("response.function_call_arguments")
-                    for e in events
-                )
-        else:
-            assert response.output[-1].name == "weather"
-            assert response.output[-1].namespace == "office"
-            response = response.model_dump()
-        call = response["output"][0]
-        assert call["namespace"] == "office" and call["name"] == "weather"
-        if kind == "custom":
-            assert call["input"] == value
-        else:
-            assert json.loads(call["arguments"]) == {"city": value}
-
-    asyncio.run(run())
-
-
-def test_named_namespace_choice_reaches_ordinary_serving_path():
-    serving = make_serving()
-    serving.tool_call_parser = None
-    serving.reasoning_parser = None
-    seen = []
-
-    def render(chat_request, is_multimodal):
-        seen.append(chat_request)
-        return MessageProcessingResult(
-            prompt="prompt",
-            prompt_ids=[1, 2, 3],
-            image_data=None,
-            audio_data=None,
-            video_data=None,
-            modalities=[],
-            stop=[],
-        )
-
-    async def generate(*args):
-        yield engine_chunk(
-            '[{"name":"office__weather","parameters":{"city":"Paris"}}]', finish=True
-        )
-
-    serving.tokenizer_manager.generate_request = generate
-    with patch.object(serving, "_apply_conversation_template", side_effect=render):
-        response = asyncio.run(
-            serving.create_responses(
-                ResponsesRequest(
-                    model="x",
-                    store=False,
-                    input="Weather?",
-                    tools=[namespace()],
-                    tool_choice={
-                        "type": "function",
-                        "name": "weather",
-                        "namespace": "office",
-                    },
-                )
-            )
-        )
-    assert seen[0].tool_choice.function.name == "office__weather"
-    call = response.model_dump()["output"][0]
-    assert call["name"] == "weather" and call["namespace"] == "office"
-    assert json.loads(call["arguments"]) == {"city": "Paris"}
-
-
 @pytest.mark.parametrize("required", [False, True])
 def test_native_encoder_calls_keep_their_namespace(required):
     """Calls a native chat encoder returns must name their public namespace, also
     when required-tool JSON carries them."""
-    from sglang.srt.entrypoints.openai.responses_tools.adapter import (
-        ResponseToolAdapter,
-    )
     from sglang.srt.function_call.core_types import ToolCallItem
 
     serving = make_serving()
@@ -439,13 +290,12 @@ def test_native_encoder_calls_keep_their_namespace(required):
         def parse_responses_output(self, **_):
             return output
 
-    request, _ = ResponseToolAdapter.from_request(
+    request, _ = BeamToolAdapter.from_request(
         ResponsesRequest(
             input="Weather?",
             tools=[namespace()],
             tool_choice="required" if required else "auto",
         ),
-        use_harmony=False,
         tool_call_parser=serving.tool_call_parser,
     )
     with patch.object(serving, "_encoding_output", return_value=Encoder()):
@@ -456,25 +306,6 @@ def test_native_encoder_calls_keep_their_namespace(required):
     (call,) = [item.model_dump() for item in items if item.type == "function_call"]
     assert (call["name"], call["namespace"]) == ("weather", "office")
     assert json.loads(call["arguments"]) == {"city": "Paris"}
-
-
-def test_namespace_reuses_qwen_parser_and_unknown_name_filter():
-    from sglang.srt.function_call.function_call_parser import FunctionCallParser
-
-    serving = make_serving()
-    flat, _ = flatten([namespace()])
-    request = ResponsesRequest(model="x", input="hi", tools=flat)
-    tools = serving._response_tools_to_chat_tools(request)
-    parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
-    _, calls = parser.parse_non_stream(
-        '<tool_call>\n{"name":"office__weather","arguments":{"city":"Paris"}}\n</tool_call>'
-    )
-    assert calls[0].name == "office__weather"
-    parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
-    _, calls = parser.parse_non_stream(
-        '<tool_call>\n{"name":"undeclared","arguments":{}}\n</tool_call>'
-    )
-    assert calls == []
 
 
 if __name__ == "__main__":

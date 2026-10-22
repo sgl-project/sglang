@@ -78,13 +78,6 @@ def test_shell_rejects_unsupported_options_and_collisions(tools):
         registry(tools)
 
 
-def test_shell_is_not_enabled_on_other_models():
-    from sglang.srt.entrypoints.openai.responses_tools.adapter import get_tool_adapter
-
-    with pytest.raises(ValueError, match="not supported"):
-        get_tool_adapter("llama")([SHELL])
-
-
 @pytest.mark.parametrize(
     "action",
     [

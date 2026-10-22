@@ -86,13 +86,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_reasoning_state,
     encode_custom_tool_input,
     encode_reasoning_state,
-    flatten_response_input,
-    harmony_custom_input,
-    harmony_output_item,
     label_developer_content,
     response_tool_name,
 )
-from sglang.srt.entrypoints.openai.responses_tools.adapter import get_tool_adapter
+from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _incomplete_tool_call_indices,
@@ -208,8 +205,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_server.has_tool("python") if tool_server else False
         )
         self.tool_server = tool_server
-        self._tool_adapter_cls = get_tool_adapter(
-            self.tokenizer_manager.model_config.hf_config.model_type
+        # Beam renders namespaced and built-in tools as flat function tools.
+        self._translates_tools = (
+            self.tokenizer_manager.model_config.hf_config.model_type == "beam"
         )
         # Get from model config
         self.use_harmony = (
@@ -318,16 +316,16 @@ class OpenAIServingResponses(OpenAIServingChat):
     async def create_responses(self, request, raw_request=None):
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
-        try:
-            request, adapter = self._tool_adapter_cls.from_request(
-                request,
-                use_harmony=self.use_harmony,
-                tool_call_parser=self.tool_call_parser,
-            )
-        except ResponseToolChoiceError as exc:
-            return self.create_error_response(str(exc), param="tool_choice")
-        except ValueError as exc:
-            return self.create_error_response(str(exc), param="tools")
+        adapter = None
+        if self._translates_tools:
+            try:
+                request, adapter = BeamToolAdapter.from_request(
+                    request, tool_call_parser=self.tool_call_parser
+                )
+            except ResponseToolChoiceError as exc:
+                return self.create_error_response(str(exc), param="tool_choice")
+            except ValueError as exc:
+                return self.create_error_response(str(exc), param="tools")
         return await self._create_responses(request, raw_request, tool_adapter=adapter)
 
     async def _create_responses(
@@ -871,10 +869,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             output = (
                 output_items
                 if output_items is not None
-                else [
-                    harmony_output_item(request._tool_state, item)
-                    for item in self._make_response_output_items_with_harmony(context)
-                ]
+                else self._make_response_output_items_with_harmony(context)
             )
             # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
@@ -1666,9 +1661,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         for input_item in self._response_input_history(request):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
-            normalized = self._normalize_response_message_for_chat(
-                flatten_response_input(input_item)
-            )
+            normalized = self._normalize_response_message_for_chat(input_item)
             if normalized is not None:
                 messages.append(normalized)
 
@@ -1743,16 +1736,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = [
-                    harmony_custom_input(flatten_response_input(i))
-                    for i in prev_response.output
-                ]
+                prev_outputs = list(prev_response.output)
             else:
                 prev_outputs = []
             for response_msg in request.input:
-                response_msg = harmony_custom_input(
-                    flatten_response_input(response_msg)
-                )
                 messages.append(parse_response_input(response_msg, prev_outputs))
                 item_type = (
                     response_msg.get("type")
@@ -1911,7 +1898,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     item_id=item.id,
                     status=item.status,
                 )
-            item = harmony_output_item(request._tool_state, item, partial=not done)
             snapshot = item.model_dump()
             output_index = len(emitted_items)
             if active_item is None:
@@ -1921,7 +1907,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 for field in ("content", "summary"):
                     if field in active_item:
                         active_item[field] = []
-                for field in ("arguments", "input", "code"):
+                for field in ("arguments", "code"):
                     if field in active_item:
                         active_item[field] = ""
                 if "encrypted_content" in active_item:
@@ -2012,7 +1998,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             for field, event_prefix in (
                 ("arguments", "response.function_call_arguments"),
-                ("input", "response.custom_tool_call_input"),
                 ("code", "response.code_interpreter_call_code"),
             ):
                 if field not in snapshot:
@@ -2065,6 +2050,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             status="in_progress",
             usage=None,
         ).model_dump()
+        initial_response["tools"] = []
         yield _send_event("response.created", response=initial_response)
         yield _send_event("response.in_progress", response=initial_response)
 
@@ -2104,6 +2090,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items=emitted_items,
         )
         response_dict = final_response.model_dump()
+        response_dict["tools"] = []
         yield _send_event(f"response.{final_response.status}", response=response_dict)
 
     async def responses_stream_generator_non_harmony(
