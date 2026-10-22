@@ -536,30 +536,32 @@ class AscendAttnBackend(AttentionBackend):
                 interleave_size=self.page_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
-        if block_tables is None:
-            if self.use_dsa:
-                max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
-                num_pages = (max_len + page_stride - 1) // page_stride
-            else:
+        if self.use_dsa and block_tables is None:
+            max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
+            block_tables = (
+                self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
+            ).to(torch.int32)
+        else:
+            if block_tables is None:
                 max_len = (
                     int(local_kv_lens.max().item()) if local_kv_lens.numel() else 0
                 )
                 num_pages = max(1, (max_len + self.page_size - 1) // self.page_size)
-            block_tables = torch.empty(
-                (req_pool_indices.numel(), num_pages),
-                dtype=torch.int32,
-                device=self.req_to_token.device,
-            )
-        if req_pool_indices.numel():
-            torch.div(
-                self.req_to_token[
-                    req_pool_indices,
-                    : block_tables.shape[1] * page_stride : page_stride,
-                ],
-                page_stride,
-                rounding_mode="floor",
-                out=block_tables,
-            )
+                block_tables = torch.empty(
+                    (req_pool_indices.numel(), num_pages),
+                    dtype=torch.int32,
+                    device=self.req_to_token.device,
+                )
+            if req_pool_indices.numel():
+                torch.div(
+                    self.req_to_token[
+                        req_pool_indices,
+                        : block_tables.shape[1] * page_stride : page_stride,
+                    ],
+                    page_stride,
+                    rounding_mode="floor",
+                    out=block_tables,
+                )
         if is_spec:
             block_tables = block_tables.repeat_interleave(
                 self.speculative_num_draft_tokens, dim=0
