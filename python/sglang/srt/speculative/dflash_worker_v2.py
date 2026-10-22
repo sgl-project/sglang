@@ -1386,15 +1386,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH with dp attention does not support target embeddings "
                 "with added-vocabulary rows."
             )
+        # A replicated table (e.g. enable_tp=False) already holds every row.
+        if embed_module.tp_size == 1:
+            self._full_embed_gpu = embed_module.weight
+            return
         tp_group = (
             get_parallel().attn_tp_group
             if embed_module.use_attn_tp_group
             else get_parallel().tp_group
         )
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            self._full_embed_gpu = embed_module.weight
-            return
 
         local_w = embed_module.weight.data
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
@@ -1402,7 +1402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Gather the equal padded vocabulary rows; the valid tail can differ by rank.
         shard_t = local_w[: embed_module.shard_indices.num_org_elements_padded]
         shard_t = shard_t.contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
+        parts = [torch.empty_like(shard_t) for _ in range(embed_module.tp_size)]
         dist.all_gather(parts, shard_t, group=tp_group.device_group)
         self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
         if get_parallel().tp_rank == 0:
