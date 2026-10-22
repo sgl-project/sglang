@@ -1531,8 +1531,9 @@ class CommonKVManager(BaseKVManager):
                 "the same speculative algorithm and draft KV layout."
             )
 
-        # Every send path rejects head-sharded MXFP8 block scales across
-        # attention TP sizes, so each request would fail at its first transfer.
+        # Every send path rejects head-sharded KV block scales (MXFP8, FP4)
+        # across attention TP sizes, so each request would fail at its first
+        # transfer.
         if (
             info.attn_tp_size != self.attn_tp_size
             and not self.is_mla_backend
@@ -1546,7 +1547,7 @@ class CommonKVManager(BaseKVManager):
             if block_scale_states:
                 raise RuntimeError(
                     "PD Disaggregation does NOT support different attention TP "
-                    "sizes with MXFP8 KV cache: prefill attn_tp_size="
+                    "sizes with a block-scaled (MXFP8/FP4) KV cache: prefill attn_tp_size="
                     f"{info.attn_tp_size}, decode attn_tp_size={self.attn_tp_size}, "
                     f"state types {[st.value for st in block_scale_states]}."
                 )
