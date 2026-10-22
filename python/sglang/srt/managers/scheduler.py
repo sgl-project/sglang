@@ -3626,6 +3626,7 @@ class Scheduler(
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             token_indices_to_pool=recv_req.token_indices_to_pool,
             decision_layout=recv_req.decision_layout,
+            valen_layout=recv_req.valen_layout,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
