@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMo
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class TestCutlassFp8InactiveRoutes(CustomTestCase):
@@ -580,7 +580,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                     inputs[0].fill_(-value)
                     inputs[1].fill_(value)
                     inputs[2].fill_(1)
-                    inputs[3].fill_(2**120 if dtype == torch.bfloat16 else 1)
+                    inputs[3].fill_(2.0**120 if dtype == torch.bfloat16 else 1.0)
                     mapping = torch.tensor(
                         [[0, 1]]
                         + [[2, 2]] * 4
