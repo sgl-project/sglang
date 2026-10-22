@@ -99,6 +99,25 @@ def window_layout(
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
+    if req.is_cuda and torch.version.hip is None:
+        from sglang.kernels.ops.kvcache.dsv41_window_layout import build_window_layout
+
+        group, first, last = _first_row_offsets(req)
+        return WindowLayout(
+            *build_window_layout(
+                req,
+                pos,
+                group,
+                first,
+                last,
+                zero_row=zero_row,
+                window=window,
+                capacity=capacity,
+                floor=floor,
+                num_groups=num_groups,
+                padded_rows=padded_rows,
+            )
+        )
     req = req.to(torch.int64)
     pos = pos.to(torch.int64)
     device = pos.device
