@@ -44,6 +44,9 @@ def _make_queue(rids, *, tp_world_size=1, cp_world_size=1):
     )
     queue.finalize_bootstrap = MagicMock(return_value=True)
     queue.ensure_metadata_buffer = MagicMock(return_value=True)
+    # pop_bootstrapped is wrapped by scheduler_stage_method (added via a main
+    # merge); the decorator reads self.scheduler_stage_metrics. None disables it.
+    queue.scheduler_stage_metrics = None
     queue._tp_world_size = tp_world_size
     queue._cp_world_size = cp_world_size
     return queue
@@ -359,6 +362,97 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
         poll.assert_not_called()
         self.assertEqual([r.rid for r in queue.queue], ["rid-local-only"])
 
+
+class TestPrefillBootstrapPollerLengthInvariant(CustomTestCase):
+    """Cross-rank regression: the whole point of rid alignment is that the
+    ``pollers`` list handed to ``poll_and_all_reduce_attn_cp_tp_group`` has an
+    identical length (and identical rid set) on *every* rank. Unequal lengths
+    are what makes the collective desync — a Gloo ``EnforceNotMet`` abort on a
+    Gloo backend, or a silent all_reduce/all_gather hang (watchdog timeout) on
+    others. The single-rank tests above exercise the alignment logic; this one
+    drives several divergent ranks through ``pop_bootstrapped`` and asserts the
+    invariant directly, so it fails against the pre-fix code and passes here.
+    """
+
+    def _run_rank(self, local_rids, all_ranks_rids, *, tp_world_size):
+        """Drive one rank's pop_bootstrapped with the group's rid lists visible
+        to all_gather_object, and return the rids actually polled on this rank."""
+        queue = _make_queue(local_rids, tp_world_size=tp_world_size)
+
+        def all_gather_object(gathered, obj, group=None):
+            # Every rank contributes its own local rid list to the gather.
+            for i, rids in enumerate(all_ranks_rids):
+                gathered[i] = list(rids)
+
+        polled = {}
+
+        def fake_poll(pollers, cp_group, tp_group):
+            # Record what this rank would collectively poll, then return a
+            # uniform WaitingForInput so the queue drains deterministically.
+            polled["rids"] = [
+                next(r.rid for r in queue.queue if r.disagg_kv_sender is s)
+                for s in pollers
+            ]
+            return [KVPoll.WaitingForInput] * len(pollers)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.dist.get_world_size",
+                side_effect=_world_size_side_effect(queue),
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.dist.all_reduce",
+                side_effect=lambda tensor, op=None, group=None: tensor.fill_(1),
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.dist.all_gather_object",
+                side_effect=all_gather_object,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=fake_poll,
+            ),
+        ):
+            queue.pop_bootstrapped()
+        return polled.get("rids", [])
+
+    def test_poller_length_identical_across_divergent_ranks(self):
+        # Async bootstrap completion removes different rids on different ranks
+        # within one scheduler iteration — the exact condition that used to
+        # desync the collective. Each rank's queue is a different subset.
+        all_ranks_rids = [
+            ["r1", "r3", "r4"],  # rank 0 already drained r2
+            ["r1", "r2", "r3", "r4"],  # rank 1 still has all
+            ["r1", "r2", "r4"],  # rank 2 already drained r3
+        ]
+        polled_per_rank = [
+            self._run_rank(local, all_ranks_rids, tp_world_size=len(all_ranks_rids))
+            for local in all_ranks_rids
+        ]
+
+        # Invariant 1: every rank polls the same number of senders.
+        lengths = {len(p) for p in polled_per_rank}
+        self.assertEqual(
+            len(lengths),
+            1,
+            f"poller lengths diverged across ranks: {[len(p) for p in polled_per_rank]}",
+        )
+
+        # Invariant 2: every rank polls the *same* rids (the intersection),
+        # not merely an equal count — position-based truncation could satisfy
+        # the length check while still aligning different requests.
+        self.assertTrue(
+            all(p == polled_per_rank[0] for p in polled_per_rank),
+            f"polled rids diverged across ranks: {polled_per_rank}",
+        )
+        # The intersection of all three ranks is exactly {r1, r4}.
+        self.assertEqual(polled_per_rank[0], ["r1", "r4"])
+
+    def test_single_rank_never_gathers(self):
+        # Sanity: with world size 1 there is no cross-rank collective to keep
+        # in lock-step, so the alignment path must not be taken.
+        polled = self._run_rank(["r1", "r2"], [["r1", "r2"]], tp_world_size=1)
+        self.assertEqual(polled, ["r1", "r2"])
 
 if __name__ == "__main__":
     unittest.main()
