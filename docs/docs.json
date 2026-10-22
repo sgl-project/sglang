@@ -1497,6 +1497,12 @@
                     ]
                   },
                   {
+                    "group": "Recursive",
+                    "pages": [
+                      "cookbook/autoregressive/Recursive/Flint"
+                    ]
+                  },
+                  {
                     "group": "Poolside",
                     "pages": [
                       "cookbook/autoregressive/Poolside/Laguna-S-2.1",
