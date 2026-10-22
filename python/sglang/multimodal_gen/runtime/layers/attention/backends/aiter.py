@@ -363,10 +363,6 @@ class AITerImpl(AttentionImpl):
             if output is not None:
                 return output
 
-        # gfx1250 runs FlyDSL, whose Python JIT reads thread-local MLIR state.
-        # ENABLE_CK=0 runs aiter's Triton flash_attn_func, which opens a config
-        # JSON and builds a Triton kernel Dynamo cannot reconstruct. Either
-        # break sits inside the DiT block loop and skips the compiled forward.
         if USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
             return self._forward_bf16_eager(query, key, value)
         return self._forward_bf16(query, key, value)
