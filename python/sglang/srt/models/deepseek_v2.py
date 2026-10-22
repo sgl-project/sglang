@@ -273,6 +273,31 @@ _enable_pcg_dsv2_dual_stream = (
 )
 _hip_shared_act_mxfp8 = _is_hip and envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
 
+_MOE_DEBUG_STAGES: set = set()
+
+
+def _debug_moe_stage(name: str, t: torch.Tensor) -> None:
+    """One-shot magnitude print of the A2A MoE path on global rank 0.
+
+    Backend agnostic (deepep and ascend_ops both reach ``forward_deepep``), so
+    the two can be compared on the same layer. Each name prints once per
+    process to keep the device syncs off the per-layer hot path.
+    """
+    if not envs.SGLANG_ASCEND_OPS_DEBUG.get() or name in _MOE_DEBUG_STAGES:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    _MOE_DEBUG_STAGES.add(name)
+    x = t.float()
+    print(
+        f"[moe layer] {name} {tuple(t.shape)}:{t.dtype} "
+        f"row_amax={x.abs().amax(dim=1)[:8].tolist()} "
+        f"rms={x.pow(2).mean().sqrt().item():.6f}",
+        flush=True,
+    )
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -1698,6 +1723,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        _debug_moe_stage("routed_out", final_hidden_states)
 
         if (
             hidden_states.shape[0] > 0
@@ -1723,6 +1749,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
+        _debug_moe_stage("mo_out", final_hidden_states)
         return final_hidden_states
 
     def _forward_shared_experts(
