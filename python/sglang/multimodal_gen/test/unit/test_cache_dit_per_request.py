@@ -390,10 +390,6 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
             self.stage._parse_cache_dit_scm_bins()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCacheDitRemountAfterDisable(unittest.TestCase):
     def test_knob_change_remounts_a_registered_transformer(self):
         """A per-request knob change unmounts and remounts Cache-DiT; with a
@@ -421,3 +417,7 @@ class TestCacheDitRemountAfterDisable(unittest.TestCase):
             )
             self.assertTrue(hasattr(transformer, "_context_manager"))
             cache_dit_integration.disable_cache_on_transformer(transformer)
+
+
+if __name__ == "__main__":
+    unittest.main()

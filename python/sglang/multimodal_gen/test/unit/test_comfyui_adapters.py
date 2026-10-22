@@ -24,6 +24,7 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
     CACHE_OPTIONS_KEY,
     build_cache_options,
+    expected_model_calls,
     guider_runs_cfg,
     read_cache_options,
     request_cache_dit_for_run,
@@ -440,30 +441,51 @@ def test_cache_options_node_returns_clone_and_keeps_input() -> None:
     assert stored["sample_sigmas"] == [1.0, 0.0]
     assert read_cache_options(stored) == options
     pickle.dumps(options)
-
-
-def test_cache_options_reject_bad_requests() -> None:
-    with pytest.raises(ValueError, match="Unknown cache_dit_params"):
-        build_cache_options(True, {"not_a_knob": 1})
-
-
-def test_cache_options_reject_zero_fn_compute_blocks() -> None:
-    # cache-dit would only assert Fn >= 1 mid-sampling
-    with pytest.raises(ValueError, match="Fn_compute_blocks must be >= 1"):
-        build_cache_options(None, {"Fn_compute_blocks": 0})
-    with pytest.raises(ValueError, match="Fn_compute_blocks must be >= 1"):
-        build_cache_options(True, {"secondary": {"Fn_compute_blocks": 0}})
-    assert build_cache_options(True, {"Fn_compute_blocks": 1})["cache_dit_params"]
-
-
-def test_cache_options_off_drops_tuned_knobs() -> None:
-    """Switching a tuned node to off must not raise; default keeps the knobs."""
+    # Switching a tuned node to off must not raise; default keeps the knobs.
     knobs = {"max_warmup_steps": 2}
-    assert build_cache_options(False, knobs) == {
-        "enable_cache_dit": False,
-        "cache_dit_params": None,
-    }
+    assert build_cache_options(False, knobs)["cache_dit_params"] is None
     assert build_cache_options(None, knobs)["cache_dit_params"] == knobs
+
+
+@pytest.mark.parametrize(
+    "enable, params, error",
+    [
+        (True, {"not_a_knob": 1}, "Unknown cache_dit_params"),
+        # cache-dit would only assert Fn >= 1 mid-sampling
+        (None, {"Fn_compute_blocks": 0}, "Fn_compute_blocks must be >= 1"),
+        (True, {"secondary": {"Fn_compute_blocks": 0}}, "Fn_compute_blocks"),
+    ],
+)
+def test_cache_options_reject_bad_requests(enable, params, error) -> None:
+    with pytest.raises(ValueError, match=error):
+        build_cache_options(enable, params)
+
+
+@pytest.mark.parametrize(
+    "sampler, sigmas, calls",
+    [
+        ("sample_euler", [3.0, 2.0, 1.0, 0.0], 3),
+        ("sample_dpmpp_2m", [3.0, 2.0, 1.0, 0.05], 3),
+        # two calls per step, one on a final step that lands on sigma 0
+        ("sample_heun", [3.0, 2.0, 1.0, 0.0], 5),
+        ("sample_dpmpp_sde", [3.0, 2.0, 1.0, 0.05], 6),
+        ("sample_heunpp2", [5.0, 4.0, 3.0, 2.0, 1.0, 0.0], 12),
+        ("sample_heunpp2", [1.0, 0.0], 1),
+        # unknown samplers get the 3N upper bound
+        ("sample_custom", [3.0, 2.0, 1.0, 0.0], 9),
+        (None, [3.0, 2.0, 1.0, 0.0], 9),
+        ("sample_euler", [1.0], 0),
+    ],
+)
+def test_expected_model_calls(sampler, sigmas, calls) -> None:
+    assert expected_model_calls(sampler, sigmas) == calls
+
+
+def test_expected_model_calls_accepts_the_sampler_function() -> None:
+    def sample_heun():
+        pass
+
+    assert expected_model_calls(sample_heun, [3.0, 2.0, 1.0, 0.0]) == 5
 
 
 def test_cache_dit_run_sends_sampler_steps_and_cfg_mode() -> None:

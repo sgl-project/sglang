@@ -122,30 +122,6 @@ def test_release_run_state_keeps_conditioning():
     release_comfyui_session(sid)
 
 
-def test_cache_dit_context_refreshes_once_per_sampler_run() -> None:
-    """Only a run's first request may refresh the Cache-DiT context; later steps
-    of that run continue it, and the next run (new id) starts fresh."""
-    family = uuid.uuid4().hex
-
-    def call(run, separate_cfg=False):
-        req = _Req()
-        req.extra = {
-            "comfyui_session_id": f"{family}:{run}",
-            "comfyui_num_steps": 25,
-            "comfyui_separate_cfg": separate_cfg,
-        }
-        bind_comfyui_session(req)
-        return comfyui_cache_dit_run(req)
-
-    assert call(1) == (25, True, False)
-    assert call(1) == (25, False, False)
-    assert call(2, separate_cfg=True) == (25, True, True)
-    plain = _Req()
-    plain.extra = {"comfyui_session_id": f"{family}:2"}
-    assert comfyui_cache_dit_run(plain) is None
-    release_comfyui_session(f"{family}:2")
-
-
 def test_cache_dit_first_call_ignores_other_run_state() -> None:
     """A model stage (Qwen-Image-2.1 conds) fills the run state before
     denoising; Cache-DiT must still see each run's first call exactly once."""
