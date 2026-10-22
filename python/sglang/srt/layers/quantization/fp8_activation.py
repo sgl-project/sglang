@@ -20,7 +20,6 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.activation import SiluAndMul
     from sglang.srt.layers.linear import RowParallelLinear
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class DenseSiluAndMulQuant:
@@ -28,19 +27,23 @@ class DenseSiluAndMulQuant:
 
     def __init__(self, down_proj: RowParallelLinear) -> None:
         self.enabled = False
+        self.down_proj = down_proj
         self.quant_method = down_proj.quant_method
         if not (is_cuda() and get_platform().is_sm100 and get_parallel().tp_size == 1):
             return
 
         from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.linear import RowParallelLinear
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
         from sglang.srt.layers.quantization.fp8_utils import (
+            _deepgemm_block_fp8_supported,
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
         method = self.quant_method
         if not (
-            type(method) is Fp8LinearMethod
+            type(down_proj) is RowParallelLinear
+            and type(method) is Fp8LinearMethod
             and method.weight_block_size == [128, 128]
             and method.quant_config.activation_scheme == "dynamic"
             and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
@@ -53,31 +56,33 @@ class DenseSiluAndMulQuant:
             if backend.args or set(backend.keywords) - {"act_scale_ue8m0"}:
                 return
             backend = backend.func
-        self.enabled = backend is deepgemm_w8a8_block_fp8_linear_with_fallback
+        # The supported loader preserves matrix geometry, not tensor identity/device.
+        self.weight_shape = (down_proj.output_size, down_proj.input_size_per_partition)
+        self.enabled = (
+            backend is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and _deepgemm_block_fp8_supported(
+                self.weight_shape, method.weight_block_size, torch.bfloat16
+            )
+        )
 
-    def __call__(
+    def forward_decode(
         self,
         x: torch.Tensor,
         act_fn: SiluAndMul,
         down_proj: RowParallelLinear,
-        forward_batch: ForwardBatch | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if (
-            not self.enabled
-            or torch.compiler.is_compiling()
-            or forward_batch is None
-            or not forward_batch.forward_mode.is_decode()
-        ):
+        """Try fusion for decode; callers must bypass this helper in other modes."""
+        if not self.enabled or torch.compiler.is_compiling():
             return act_fn(x)
 
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
         from sglang.srt.layers.activation import SiluAndMul
-        from sglang.srt.layers.linear import RowParallelLinear
 
         deterministic = get_exec().deterministic
         if (
-            type(down_proj) is not RowParallelLinear
+            down_proj is not self.down_proj
             or down_proj.quant_method is not self.quant_method
+            or down_proj.weight.shape != self.weight_shape
             or type(act_fn) is not SiluAndMul
             or (act_fn._forward_method or act_fn._resolve_forward_method())
             != act_fn.forward_cuda
@@ -96,9 +101,7 @@ class DenseSiluAndMulQuant:
             or x.data_ptr() % 32 != 0
             or x.stride(0) % 16 != 0
             or x.device != down_proj.weight.device
-            or x.shape[1] != 2 * down_proj.weight.shape[1]
-            or down_proj.weight.shape[1] % 128 != 0
-            or down_proj.weight.shape[0] % 64 != 0
+            or x.shape[1] != 2 * self.weight_shape[1]
         ):
             return act_fn(x)
 

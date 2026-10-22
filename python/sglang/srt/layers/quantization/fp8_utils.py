@@ -1413,6 +1413,25 @@ def _deepgemm_block_fp8_supported(
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 
 
+def _deepgemm_packed_input_valid(input, weight, input_scale, weight_scale) -> bool:
+    """Validate the group-128, column-major TMA layout for packed activations."""
+    if input.ndim != 2 or weight.ndim != 2:
+        return False
+    m, k = input.shape
+    packed_groups = ceil_div(k // 128, 4)
+    padded_m = ceil_align(m, 4)
+    return (
+        input.is_cuda
+        and input.is_contiguous()
+        and k == weight.shape[1]
+        and input.device == weight.device == input_scale.device == weight_scale.device
+        and input_scale.shape == (m, packed_groups)
+        and input_scale.stride() == (1, padded_m)
+        and input.data_ptr() % 16 == 0
+        and input_scale.data_ptr() % 16 == 0
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1423,28 +1442,19 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
+        weight.shape, block_size, output_dtype
+    )
     if input_scale is not None:
         if input_scale.dtype == torch.int32:
             # Packed activation scales cannot go through the Triton fallback.
-            # Accept exactly the group-128, column-major TMA layout we produce.
             if not (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and input.ndim == 2
-                and input.is_contiguous()
-                and input.is_cuda
-                and weight.ndim == 2
-                and input.shape[1] == weight.shape[1]
-                and input.device == weight.device
-                and input_scale.device == input.device
-                and weight_scale.device == input.device
-                and input_scale.shape
-                == (input.shape[0], ceil_div(input.shape[1] // 128, 4))
-                and input_scale.stride() == (1, ceil_align(input.shape[0], 4))
-                and input.data_ptr() % 16 == 0
-                and input_scale.data_ptr() % 16 == 0
+                deepgemm_supported
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                 and list(block_size) == [128, 128]
-                and _deepgemm_block_fp8_supported(
-                    weight.shape, block_size, torch.bfloat16
+                and _deepgemm_packed_input_valid(
+                    input, weight, input_scale, weight_scale
                 )
             ):
                 raise ValueError(
@@ -1454,10 +1464,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         else:
             assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
-    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
-
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):
+    if not deepgemm_supported:
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32

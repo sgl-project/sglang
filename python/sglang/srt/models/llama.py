@@ -131,8 +131,8 @@ class LlamaMLP(nn.Module):
         else:
             gate_up, _ = self.gate_up_proj(x)
             if forward_batch is not None and forward_batch.forward_mode.is_decode():
-                x = self.activation_quant(
-                    gate_up, self.act_fn, self.down_proj, forward_batch
+                x = self.activation_quant.forward_decode(
+                    gate_up, self.act_fn, self.down_proj
                 )
             else:
                 x = self.act_fn(gate_up)

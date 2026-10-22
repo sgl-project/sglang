@@ -21,7 +21,7 @@ import itertools
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.jit.utils import get_ci_test_range, should_run_full_tests
 from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
@@ -528,6 +528,18 @@ def test_fused_silu(scale_ue8m0, column_major):
     assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
 
 
+def _check_dense_silu(x, scale_ue8m0, column_major):
+    original = x.view(torch.int16).clone()
+    kwargs = dict(scale_ue8m0=scale_ue8m0, column_major_scales=column_major)
+    expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
+    q, s = per_token_group_quant(
+        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
+    )
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), expected_s.view(torch.int32))
+    assert torch.equal(x.view(torch.int16), original)
+
+
 @pytest.mark.parametrize(
     "dtype,scale_ue8m0,column_major",
     get_ci_test_range(
@@ -564,15 +576,36 @@ def test_dense_silu_bitexact(dtype, shape, scale_ue8m0, column_major):
         device="cuda",
         dtype=dtype,
     )
-    original = x.view(torch.int16).clone()
-    kwargs = dict(scale_ue8m0=scale_ue8m0, column_major_scales=column_major)
-    expected_q, expected_s = per_token_group_quant(silu_and_mul(x), **kwargs)
-    q, s = per_token_group_quant(
-        x, fuse_silu_and_mul=True, silu_and_mul_mode="dense", **kwargs
-    )
-    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
-    assert torch.equal(s.view(torch.int32), expected_s.view(torch.int32))
-    assert torch.equal(x.view(torch.int16), original)
+    _check_dense_silu(x, scale_ue8m0, column_major)
+
+
+@pytest.mark.skipif(
+    not should_run_full_tests(),
+    reason="Set SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 for the sweep",
+)
+def test_dense_silu_extended():
+    """Opt-in amplitude/layout sweep and all 65,536 BF16/FP16 gate encodings."""
+    torch.manual_seed(20261017)
+    layouts = list(itertools.product((False, True), repeat=2))
+    for dtype in (torch.bfloat16, torch.float16):
+        for (m, k), amplitude in itertools.product(
+            ((1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)),
+            (0, 0.001, 1, 10, 100),
+        ):
+            x = (torch.randn(m, 2 * k, device="cuda") * amplitude).to(dtype)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
+        # Signed zeros, subnormals, finite extremes, infinities and NaNs.
+        gate = (
+            torch.arange(65536, device="cuda", dtype=torch.int32)
+            .to(torch.int16)
+            .view(dtype)
+            .reshape(64, 1024)
+        )
+        for up_value in (0, 0.25, 1, 1.125, -2.25):
+            x = torch.cat((gate, torch.full_like(gate, up_value)), dim=1)
+            for ue8m0, column in layouts:
+                _check_dense_silu(x, ue8m0, column)
 
 
 def test_dense_silu_graph_replay():

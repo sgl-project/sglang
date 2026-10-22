@@ -56,9 +56,6 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
 
     def test_mlp_parity_and_graph_replay(self):
         """Cold first-decode dispatch and graph replay must match the unfused MLP."""
-        from sglang.srt.models.llama import LlamaDecoderLayer
-        from sglang.srt.models.qwen2 import Qwen2DecoderLayer
-
         batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
         torch.manual_seed(123)
         with torch.inference_mode():
@@ -71,58 +68,13 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                     with self.subTest(model=model, m=m):
                         x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
                         gate_up, _ = mlp.gate_up_proj(x)
-                        quantized = mlp.activation_quant(
-                            gate_up, mlp.act_fn, mlp.down_proj, batch
+                        quantized = mlp.activation_quant.forward_decode(
+                            gate_up, mlp.act_fn, mlp.down_proj
                         )
                         self.assertIsInstance(quantized, tuple)
                         expected = mlp(x)
                         actual = mlp(x, batch)
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                        if m == 1:
-                            # Non-decode output must not depend on the fusion helper.
-                            with mock.patch.object(
-                                type(mlp.activation_quant),
-                                "__call__",
-                                side_effect=AssertionError(
-                                    "non-decode entered fusion dispatch"
-                                ),
-                            ):
-                                for mode in (None, *ForwardMode):
-                                    if mode == ForwardMode.DECODE:
-                                        continue
-                                    candidate = (
-                                        SimpleNamespace(forward_mode=mode)
-                                        if mode is not None
-                                        else None
-                                    )
-                                    torch.testing.assert_close(
-                                        mlp(x, candidate), expected, rtol=0, atol=0
-                                    )
-                            # Isolate attention/communication, but exercise the actual
-                            # decoder -> real MLP handoff. Dropping forward_batch must fail.
-                            boundary = SimpleNamespace(
-                                prepare=lambda x, batch, **kw: x,
-                                finish=lambda x, batch: x,
-                            )
-                            decoder = SimpleNamespace(
-                                attn_boundary=boundary,
-                                ffn_boundary=boundary,
-                                self_attn=lambda **kw: kw["hidden_states"],
-                                mlp=mlp,
-                            )
-                            forward = {
-                                "llama": LlamaDecoderLayer.forward,
-                                "qwen": Qwen2DecoderLayer.forward,
-                            }[model]
-                            with mock.patch.object(
-                                mlp.act_fn,
-                                "forward",
-                                side_effect=AssertionError(
-                                    "decode used separate activation"
-                                ),
-                            ):
-                                actual = forward(decoder, None, x, batch)
-                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             actual = mlp(x, batch)
@@ -131,26 +83,80 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                             graph.replay()
                             torch.testing.assert_close(actual, mlp(x), rtol=0, atol=0)
 
-    def test_fallback_modes_and_overrides(self):
-        """Excluded execution modes must return the original activation, not a tuple."""
+    @torch.inference_mode()
+    def test_non_decode_bypass(self):
+        """Every non-decode mode must avoid the helper and preserve MLP output."""
+        for model in ("llama", "qwen"):
+            mlp = self._make_mlp(model)
+            x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+            expected = mlp(x)
+            with mock.patch.object(
+                type(mlp.activation_quant),
+                "forward_decode",
+                side_effect=AssertionError("non-decode entered fusion dispatch"),
+            ):
+                for mode in (None, *ForwardMode):
+                    if mode == ForwardMode.DECODE:
+                        continue
+                    with self.subTest(model=model, mode=mode):
+                        batch = (
+                            SimpleNamespace(forward_mode=mode)
+                            if mode is not None
+                            else None
+                        )
+                        torch.testing.assert_close(
+                            mlp(x, batch), expected, rtol=0, atol=0
+                        )
+
+    @torch.inference_mode()
+    def test_decoder_handoff(self):
+        """Dropping forward_batch between the decoder and real MLP must fail."""
+        from sglang.srt.models.llama import LlamaDecoderLayer
+        from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        boundary = SimpleNamespace(
+            prepare=lambda x, batch, **kw: x, finish=lambda x, batch: x
+        )
+        for model, decoder_cls in (
+            ("llama", LlamaDecoderLayer),
+            ("qwen", Qwen2DecoderLayer),
+        ):
+            mlp = self._make_mlp(model)
+            x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+            expected = mlp(x)
+            # Only attention/communication are stubbed; run the real decoder and MLP.
+            decoder = SimpleNamespace(
+                attn_boundary=boundary,
+                ffn_boundary=boundary,
+                self_attn=lambda **kw: kw["hidden_states"],
+                mlp=mlp,
+            )
+            with (
+                self.subTest(model=model),
+                mock.patch.object(
+                    mlp.act_fn,
+                    "forward",
+                    side_effect=AssertionError("decode used separate activation"),
+                ),
+            ):
+                actual = decoder_cls.forward(decoder, None, x, batch)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_decode_fallback_overrides_and_inputs(self):
+        """Overrides and unsupported inputs must retain the original activation."""
         from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
         from sglang.kernels.spec import KernelBackend
         from sglang.srt.runtime_context import get_exec, get_forward, get_lora
 
         mlp = self._make_mlp("llama")
         x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
-        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
-        def check(candidate_batch=batch, *, value=x, projection=mlp.down_proj):
-            actual = mlp.activation_quant(
-                value, mlp.act_fn, projection, candidate_batch
-            )
+        def check(*, value=x, projection=mlp.down_proj):
+            actual = mlp.activation_quant.forward_decode(value, mlp.act_fn, projection)
             self.assertIsInstance(actual, torch.Tensor)
             torch.testing.assert_close(actual, mlp.act_fn(value), rtol=0, atol=0)
 
-        for mode in (ForwardMode.EXTEND, ForwardMode.IDLE, ForwardMode.TARGET_VERIFY):
-            check(SimpleNamespace(forward_mode=mode))
-        check(None)
         with get_forward().scoped(sp_active=True):
             check()
         with get_lora().override(enable_lora=True):
@@ -169,21 +175,25 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             set_fused_op_backend(old_backend)
         for dtype in (torch.float16, torch.float32):
             check(value=x.to(dtype))
+        # Contiguous single-row views may still have an unaligned row stride.
+        check(value=x[:1].as_strided((1, 1536), (1, 1)))
 
         wrapped_projection = SimpleNamespace(
             quant_method=mlp.down_proj.quant_method,
             weight=mlp.down_proj.weight,
         )
         check(projection=wrapped_projection)
-        actual = mlp.activation_quant(x, torch.nn.Identity(), mlp.down_proj, batch)
+        actual = mlp.activation_quant.forward_decode(
+            x, torch.nn.Identity(), mlp.down_proj
+        )
         self.assertIs(actual, x)
 
         mlp.act_fn.enter_torch_compile(x.shape[0])
         try:
             check()
             compiled = torch.compile(
-                lambda value: mlp.activation_quant(
-                    value, mlp.act_fn, mlp.down_proj, batch
+                lambda value: mlp.activation_quant.forward_decode(
+                    value, mlp.act_fn, mlp.down_proj
                 ),
                 backend="eager",
                 fullgraph=True,
@@ -209,7 +219,6 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             ({"use_mxfp8": True}, "auto"),
             ({"weight_block_size": [32, 32], "scale_fmt": "ue8m0"}, "auto"),
         ]
-        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
         act = SiluAndMul()
         x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
         expected = act(x)
@@ -234,7 +243,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                 ).cuda()
                 helper = DenseSiluAndMulQuant(layer)
                 torch.testing.assert_close(
-                    helper(x, act, layer, batch), expected, rtol=0, atol=0
+                    helper.forward_decode(x, act, layer), expected, rtol=0, atol=0
                 )
         mlp = self._make_mlp("llama")
         for scope in (
@@ -244,8 +253,59 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             with scope:
                 helper = DenseSiluAndMulQuant(mlp.down_proj)
             torch.testing.assert_close(
-                helper(x, act, mlp.down_proj, batch), expected, rtol=0, atol=0
+                helper.forward_decode(x, act, mlp.down_proj), expected, rtol=0, atol=0
             )
+
+    @torch.inference_mode()
+    def test_fixed_geometry_and_live_projection_guards(self):
+        """Cache support rules, but reject changed geometry/methods and other layers."""
+        from sglang.srt.layers.linear import RowParallelLinear
+        from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
+
+        mlp = self._make_mlp("llama")
+        layer = mlp.down_proj
+        helper = mlp.activation_quant
+        x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
+        expected = mlp.act_fn(x)
+        # Same-shape weight reloads remain eligible without redoing support checks.
+        with (
+            mock.patch.object(
+                layer, "weight", torch.nn.Parameter(layer.weight.clone(), False)
+            ),
+            mock.patch.object(
+                fp8_utils, "_deepgemm_block_fp8_supported", side_effect=AssertionError
+            ),
+        ):
+            self.assertIsInstance(helper.forward_decode(x, mlp.act_fn, layer), tuple)
+        for attr, value in (
+            ("weight", torch.nn.Parameter(layer.weight.reshape(1024, 384), False)),
+            ("quant_method", object()),
+        ):
+            with self.subTest(attr=attr), mock.patch.object(layer, attr, value):
+                torch.testing.assert_close(
+                    helper.forward_decode(x, mlp.act_fn, layer),
+                    expected,
+                    rtol=0,
+                    atol=0,
+                )
+        for n, k in ((512, 768), (513, 768), (512, 769)):
+            other = RowParallelLinear(
+                k,
+                n,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=layer.quant_method.quant_config,
+            )
+            with self.subTest(n=n, k=k):
+                self.assertEqual(
+                    DenseSiluAndMulQuant(other).enabled, (n, k) == (512, 768)
+                )
+                torch.testing.assert_close(
+                    helper.forward_decode(x, mlp.act_fn, other),
+                    expected,
+                    rtol=0,
+                    atol=0,
+                )
 
 
 if __name__ == "__main__":

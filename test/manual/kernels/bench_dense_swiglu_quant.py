@@ -1,11 +1,10 @@
-"""Extended parity sweep and paired B200 MLP timing for dense SwiGLU fusion.
+"""Paired B200 MLP timing for dense SwiGLU fusion.
 
 Synthetic weights test the operator pipeline, not model quality or serving TBT.
-Run with --check-only for the broad numerical sweep (including all gate bits).
+Operator parity and the opt-in numerical sweep live in test_per_token_group_quant.py.
 """
 
 import argparse
-import itertools
 import json
 import random
 import statistics
@@ -18,67 +17,6 @@ from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
 
-def quantize(x, fused, ue8m0=True, column=True):
-    return per_token_group_quant(
-        x if fused else silu_and_mul(x),
-        scale_ue8m0=ue8m0,
-        column_major_scales=column,
-        fuse_silu_and_mul=fused,
-        silu_and_mul_mode="dense" if fused else "legacy",
-    )
-
-
-def check(x, ue8m0, column):
-    original = x.view(torch.int16).clone()
-    expected = quantize(x, False, ue8m0, column)
-    actual = quantize(x, True, ue8m0, column)
-    for name, a, b in zip(("FP8", "scale"), actual, expected):
-        bits = torch.uint8 if name == "FP8" else torch.int32
-        if not torch.equal(a.view(bits), b.view(bits)):
-            raise AssertionError((name, x.shape, x.dtype, ue8m0, column))
-    assert torch.equal(x.view(torch.int16), original)
-    return actual[0].numel()
-
-
-def correctness():
-    cases = elements = 0
-    layouts = list(itertools.product((False, True), repeat=2))
-    torch.manual_seed(20261017)
-    for dtype in (torch.bfloat16, torch.float16):
-        for shape, amplitude in itertools.product(
-            ((1, 768), (3, 4096), (32, 12288), (32, 14336), (128, 28672)),
-            (0, 0.001, 1, 10, 100),
-        ):
-            m, k = shape
-            x = (torch.randn(m, 2 * k, device="cuda") * amplitude).to(dtype)
-            for ue8m0, column in layouts:
-                elements += check(x, ue8m0, column)
-                cases += 1
-        # All 65,536 gate encodings: signed zeros, subnormals, finite extremes,
-        # infinities and NaNs. Different up values exercise product rounding.
-        gate = (
-            torch.arange(65536, device="cuda", dtype=torch.int32)
-            .to(torch.int16)
-            .view(dtype)
-            .reshape(64, 1024)
-        )
-        for up_value in (0, 0.25, 1, 1.125, -2.25):
-            x = torch.cat((gate, torch.full_like(gate, up_value)), dim=1)
-            for ue8m0, column in layouts:
-                elements += check(x, ue8m0, column)
-                cases += 1
-        print(
-            json.dumps(
-                {
-                    "dtype": str(dtype),
-                    "cases_passed": cases,
-                    "FP8_bytes_checked": elements,
-                }
-            ),
-            flush=True,
-        )
-
-
 def mlp(x, gate_up, gate_scale, down, down_scale, *, fused):
     from sglang.srt.layers.quantization.fp8_utils import (
         deepgemm_w8a8_block_fp8_linear_with_fallback as linear,
@@ -86,7 +24,13 @@ def mlp(x, gate_up, gate_scale, down, down_scale, *, fused):
 
     projected = linear(x, gate_up, [128, 128], gate_scale)
     if fused:
-        q, s = quantize(projected, True)
+        q, s = per_token_group_quant(
+            projected,
+            scale_ue8m0=True,
+            column_major_scales=True,
+            fuse_silu_and_mul=True,
+            silu_and_mul_mode="dense",
+        )
         return linear(q, down, [128, 128], down_scale, s)
     return linear(silu_and_mul(projected), down, [128, 128], down_scale)
 
@@ -179,7 +123,6 @@ def benchmark(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 32, 128])
     parser.add_argument("--intermediate-size", type=int, default=14336)
@@ -201,7 +144,4 @@ if __name__ == "__main__":
         flush=True,
     )
     with torch.inference_mode():
-        if args.check_only:
-            correctness()
-        else:
-            benchmark(args)
+        benchmark(args)
