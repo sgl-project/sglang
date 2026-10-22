@@ -2724,17 +2724,18 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
-        if (
-            self.low_ratios
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._snapshot_low_ratio_k_slots(forward_batch)
+        self._snapshot_low_ratio_k_slots(forward_batch)
 
         self._activate_request_window()
 
     def _snapshot_low_ratio_k_slots(self, forward_batch: ForwardBatch) -> None:
         # Gathered once with the metadata instead of in every indexer layer, so no
         # indexer layer reads req_to_token.
+        if not (
+            self.low_ratios
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
         seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
         k_slots = {
             ratio: prefill_k_slots(
@@ -3132,11 +3133,7 @@ class DeepseekV4AttnBackend(
             if capture_metadata.prefill_graph_tail
             else None
         )
-        if (
-            self.low_ratios
-            and metadata_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._snapshot_low_ratio_k_slots(metadata_batch)
+        self._snapshot_low_ratio_k_slots(metadata_batch)
 
     def _prefill_graph_tail_metadata(
         self, forward_batch: ForwardBatch, max_seq_len: int
