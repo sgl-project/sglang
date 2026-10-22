@@ -82,11 +82,28 @@ class TestMmRoutingLabels(CustomTestCase):
         unlabeled = MultimodalDataItem(modality=Modality.IMAGE, hash=0xFEEDFACE)
         for item in (labeled, unlabeled):
             item.set_pad_value()
+        events.enable_mm_routing_labels()
         events.register_mm_routing_labels([labeled, unlabeled])
         for value in labeled.padding_values():
             self.assertEqual(self.registry.get(value), LABEL_U)
         for value in unlabeled.padding_values():
             self.assertIsNone(self.registry.get(value))
+
+    def test_registration_waits_for_an_enabled_event_recorder(self):
+        # Only the rank that records KV events reads labels; the other
+        # tensor-parallel ranks build disabled recorders and register nothing.
+        labeled = MultimodalDataItem(
+            modality=Modality.IMAGE, hash=0xDEADBEEF, routing_label=LABEL_U
+        )
+        labeled.set_pad_value()
+        events.KVCacheEventRecorder(enabled=False, page_size=16)
+        events.register_mm_routing_labels([labeled])
+        self.assertFalse(self.registry)
+
+        events.KVCacheEventRecorder(enabled=True, page_size=16)
+        events.register_mm_routing_labels([labeled])
+        for value in labeled.padding_values():
+            self.assertEqual(self.registry.get(value), LABEL_U)
 
     def test_label_does_not_change_item_identity(self):
         labeled = MultimodalDataItem(

@@ -129,11 +129,16 @@ class MmRoutingLabels:
     item maps to the label of the first labeled request that brought it in.
     Entries can expire while blocks stay cached; their later events then carry
     no span and the router treats those tokens as unmapped (fail closed).
+
+    Only a process that records KV events reads labels, so registration is a
+    no-op until an enabled event recorder turns it on. Tensor-parallel ranks
+    that do not publish events never fill it.
     """
 
     def __init__(self, capacity: int = 1 << 20):
         self._labels: OrderedDict[int, str] = OrderedDict()
         self._capacity = capacity
+        self.enabled = False
 
     def register(self, pad_values, label: str) -> None:
         for value in pad_values:
@@ -154,7 +159,14 @@ class MmRoutingLabels:
 MM_ROUTING_LABELS = MmRoutingLabels()
 
 
+def enable_mm_routing_labels() -> None:
+    """Record routing labels in this process: it records KV events."""
+    MM_ROUTING_LABELS.enabled = True
+
+
 def register_mm_routing_labels(mm_items) -> None:
+    if not MM_ROUTING_LABELS.enabled:
+        return
     for item in mm_items or ():
         label = getattr(item, "routing_label", None)
         if label:
@@ -204,6 +216,8 @@ class KVCacheEventRecorder:
         lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
+        if enabled:
+            enable_mm_routing_labels()
         self.page_size = page_size
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()

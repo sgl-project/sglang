@@ -27,7 +27,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KvEventLoraNames, mm_routing_spans
+from sglang.srt.mem_cache.events import (
+    KvEventLoraNames,
+    enable_mm_routing_labels,
+    mm_routing_spans,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -292,6 +296,8 @@ class _RustKVCacheEventRecorder:
     ):
         self._binding = binding
         self.enabled = enabled
+        if enabled:
+            enable_mm_routing_labels()
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
 
