@@ -23,7 +23,9 @@ def test_sparse_flashmla_sink_padding_refreshes_reused_buffer(monkeypatch):
         q = kwargs["q"]
         return q.new_zeros((*q.shape[:2], kwargs["d_v"])), None, None
 
-    monkeypatch.setattr(flash_mla_interface, "flash_mla_sparse_fwd", capture_flash_mla_sparse_fwd)
+    monkeypatch.setattr(
+        flash_mla_interface, "flash_mla_sparse_fwd", capture_flash_mla_sparse_fwd
+    )
 
     q = torch.zeros((1, 64, 8), device="cuda")
     kv_cache = torch.zeros((1, 1, 8), device="cuda")

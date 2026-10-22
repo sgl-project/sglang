@@ -65,10 +65,17 @@ class Case:
         )
         self.interleaved = (
             paged_view(interleave_pages(main_split, page, 512, 16), page, 528),
-            paged_view(interleave_pages(extra_split, extra_page, 256, 32), extra_page, 288),
+            paged_view(
+                interleave_pages(extra_split, extra_page, 256, 32), extra_page, 288
+            ),
         )
         self.indices = torch.randint(
-            0, main_pages * page, (n, topk), generator=g, device="cuda", dtype=torch.int32
+            0,
+            main_pages * page,
+            (n, topk),
+            generator=g,
+            device="cuda",
+            dtype=torch.int32,
         )
         self.extra_indices = torch.randint(
             0,
@@ -114,7 +121,9 @@ class Case:
             block_table=None,
             cache_seqlens=None,
             tile_scheduler_metadata=(
-                flash_mla_interface.get_mla_metadata()[0] if sched_meta is None else sched_meta
+                flash_mla_interface.get_mla_metadata()[0]
+                if sched_meta is None
+                else sched_meta
             ),
             softmax_scale=SM_SCALE,
             is_fp8_kvcache=True,
@@ -129,8 +138,7 @@ class Case:
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] == 10,
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
     "the current FlashMLA V4.1 kernels need SM100/SM103",
 )
 class TestFlashMLAV41(CustomTestCase):
@@ -225,7 +233,13 @@ class TestFlashMLAV41(CustomTestCase):
                 with torch.cuda.graph(graph):
                     out = c.decode(flash_mla_interface.get_mla_metadata()[0])
                 fresh = Case(*shape, seed=19)
-                for name in ("q", "indices", "extra_indices", "lengths", "extra_lengths"):
+                for name in (
+                    "q",
+                    "indices",
+                    "extra_indices",
+                    "lengths",
+                    "extra_lengths",
+                ):
                     getattr(c, name).copy_(getattr(fresh, name))
                 graph.replay()
                 torch.cuda.synchronize()
