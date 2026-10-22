@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineCon
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlusPipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 from sglang.srt.environ import envs
@@ -75,7 +76,10 @@ class TestImagePreprocessing(CustomTestCase):
                 self.assertEqual(actual.stride(), expected.stride())
                 out_w, out_h = qwen.calculate_vae_image_size(image, width, height)
                 expected = qwen_processor.preprocess(image, out_h, out_w).cuda()
-                batch = Req(condition_image=[image])
+                batch = Req(
+                    sampling_params=SamplingParams(prompt="test", seed=42),
+                    condition_image=[image],
+                )
                 qwen.preprocess_vae_image(batch, qwen_processor)
                 torch.testing.assert_close(batch.vae_image[0], expected, rtol=0, atol=0)
                 self.assertEqual(batch.vae_image[0].stride(), expected.stride())
