@@ -1134,6 +1134,8 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5",
@@ -1210,6 +1212,7 @@
                 ]
               },
               "docs/hardware-platforms/mthreads_gpu",
+              "docs/hardware-platforms/sail",
               "docs/hardware-platforms/tpu",
               "docs/hardware-platforms/xpu",
               "docs/hardware-platforms/plugin"
@@ -1324,6 +1327,7 @@
                   {
                     "group": "DeepReinforce",
                     "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.5",
                       "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
                     ]
                   },
@@ -1490,6 +1494,12 @@
                       "cookbook/autoregressive/Tencent/Hy4-Preview",
                       "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
+                  },
+                  {
+                    "group": "Recursive",
+                    "pages": [
+                      "cookbook/autoregressive/Recursive/Flint"
                     ]
                   },
                   {

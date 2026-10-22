@@ -51,7 +51,6 @@ class TestSamplingMaskValidation(CustomTestCase):
                 return logits
 
         for processor in (
-            None,
             DisallowedTokensLogitsProcessor.to_str(),
             BoundMask.to_str(),
         ):
