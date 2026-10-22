@@ -1240,6 +1240,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             attention_backend=None,
                             prefill_attention_backend=None,
                             decode_attention_backend=None,
+                            enable_lora=None,
+                            lora_paths=None,
+                            lora_target_modules=None,
                         )
                         expected = {"attention_backend": "fa4"}
                         if runner == "auto" and a2a_backend == "none":
@@ -1250,6 +1253,101 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             ),
                             [("_mimo_v2_overrides", expected)],
                         )
+
+    def test_mimo_v2_expert_lora_needs_marlin_on_mxfp4_experts(self):
+        from sglang.srt.arg_groups.model_overrides.mimo_v2 import (
+            _lora_wraps_experts,
+            _mimo_v2_overrides,
+        )
+
+        attention = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        experts = ["gate_proj", "up_proj", "down_proj"]
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+
+        def adapter(name, target_modules):
+            path = os.path.join(root, name)
+            os.makedirs(path)
+            config = {"target_modules": target_modules, "r": 8, "lora_alpha": 16}
+            with open(os.path.join(path, "adapter_config.json"), "w") as f:
+                json.dump(config, f)
+            return path
+
+        attn = adapter("attn", attention)
+        expert = adapter("expert", attention + experts)
+        all_linear = adapter("all_linear", "all-linear")
+        unreadable = os.path.join(root, "missing_config")
+        os.makedirs(unreadable)
+
+        def _args(**kw):
+            defaults = dict(
+                speculative_algorithm=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend="triton",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_lora=None,
+                lora_paths=[f"expert={expert}"],
+                lora_target_modules=None,
+                _model_config=SimpleNamespace(is_fp4_experts=True),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        # Targets from the initial adapters (no CLI targets) or from the CLI.
+        expert_lora = [
+            dict(),
+            dict(lora_paths={"expert": expert}),
+            dict(lora_paths=[{"lora_name": "l", "lora_path": all_linear}]),
+            dict(lora_paths=[attn, f"expert={expert}"]),
+            dict(lora_paths=[unreadable]),  # unresolved: keep the expert checks
+            dict(lora_paths=[attn], lora_target_modules=["all"]),
+            dict(lora_paths=[attn], lora_target_modules=attention + experts),
+            dict(lora_target_modules=["gate_up_proj", "down_proj"]),
+        ]
+        # LoRA leaves the experts alone: attention-only targets, one expert
+        # projection, or LoRA off.
+        no_expert_lora = [
+            dict(lora_paths=[f"attn={attn}"]),
+            dict(lora_paths={"attn": attn}, enable_lora=True),
+            dict(lora_target_modules=attention),
+            dict(lora_target_modules=attention + ["gate_proj"]),
+            dict(enable_lora=False),
+            dict(lora_paths=None),
+        ]
+        for cases, expected in ((expert_lora, True), (no_expert_lora, False)):
+            for kw in cases:
+                with self.subTest(targets=kw):
+                    self.assertEqual(_lora_wraps_experts(_args(**kw)), expected)
+
+        for sm100, default_runner in ((True, "flashinfer_mxfp4"), (False, "marlin")):
+            with override_platform(is_sm100=sm100, is_sm90=not sm100):
+                for path, runner in (
+                    (attn, default_runner),
+                    (expert, "marlin"),
+                    (all_linear, "marlin"),
+                ):
+                    with self.subTest(sm100=sm100, adapter=path):
+                        args = _args(lora_paths=[path])
+                        self.assertEqual(
+                            _mimo_v2_overrides(args, _hf("fp8")),
+                            {"moe_runner_backend": runner},
+                        )
+                        args.moe_runner_backend = (
+                            "flashinfer_mxfp4" if path == attn else "marlin"
+                        )
+                        self.assertEqual(_mimo_v2_overrides(args, _hf("fp8")), {})
+                for bad in (
+                    dict(moe_runner_backend="flashinfer_mxfp4"),
+                    dict(moe_runner_backend="deep_gemm"),
+                    dict(moe_a2a_backend="deepep"),
+                ):
+                    with self.subTest(sm100=sm100, bad=bad):
+                        with self.assertRaisesRegex(
+                            ValueError, "--moe-runner-backend marlin"
+                        ):
+                            _mimo_v2_overrides(_args(**bad), _hf("fp8"))
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
