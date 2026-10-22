@@ -169,6 +169,22 @@ class TestShortestPrefillFirst(CustomTestCase):
             self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
 
+    def test_shared_prefix_holds_the_longer_request_not_the_shorter(self):
+        # long and short share a 32-token prefix (the dedupe threshold). Deduping in
+        # queue order kept long and held short behind every request, so short waited
+        # as long as SPF deferred long.
+        shared = list(range(32))
+        long = _make_req("long", "", shared + list(range(1000, 5000)))
+        other = _make_req("other", "", list(range(20000, 26000)))
+        short = _make_req("short", "", shared + list(range(9000, 9393)))
+        for arrived, req in enumerate([long, other, short]):
+            req.full_untruncated_fill_ids = req.origin_input_ids[:]
+            req.time_stats.wait_queue_entry_time = arrived
+        queue = [long, other, short]
+        self.policy.calc_priority(queue)
+        # Now long is the one held: it sorts behind other until short is admitted.
+        self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
+
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
         replay.output_ids.extend([0] * 64)

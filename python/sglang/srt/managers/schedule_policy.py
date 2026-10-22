@@ -346,50 +346,59 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
+        # NOTE(sang): This logic is for in-batch prefix caching;
+        # If there are more than 1 request that have small matching prefix from
+        # existing cache, but all those requests share the same prefix, we prefer
+        # to schedule only one of them so that we can increase the cache hit rate.
+        # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
+        # threshold means we cannot use in-batch prefix caching for short prefixes.
+        # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
+        candidates = []
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
+            match_kv_cache(r, self.tree_cache, prefix_ids)
+            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                candidates.append((r, prefix_ids))
+
+        if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            # The first request of a shared-prefix group runs; the rest wait for it.
+            # Pick the shortest: in queue order, a short request that shares a few
+            # tokens with a queued long one waits as long as SPF defers the long one.
+            candidates.sort(key=lambda c: SchedulePolicy._shortest_prefill_work(c[0]))
+
+        for r, prefix_ids in candidates:
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
-
-            # NOTE(sang): This logic is for in-batch prefix caching;
-            # If there are more than 1 request that have small matching prefix from
-            # existing cache, but all those requests share the same prefix, we prefer
-            # to schedule only one of them so that we can increase the cache hit rate.
-            # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
-            # threshold means we cannot use in-batch prefix caching for short prefixes.
-            # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
+            match_result = self.waiting_queue_radix_tree.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids=prefix_ids,
+                        extra_key=extra_key,
+                        cache_salt=cache_salt,
+                    )
+                )
+            )
+            if envs.SGLANG_RADIX_FORCE_MISS.get():
+                match_result = zero_match_result(
+                    self.waiting_queue_radix_tree, match_result, extra_key=extra_key
+                )
+            if (
+                match_result.device_prefix_len
+                >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
+            ):
+                temporary_deprioritized.add(r.rid)
+            else:
+                # Insert with a dummy key
+                self.waiting_queue_radix_tree.insert(
+                    InsertParams(
                         key=RadixKey(
                             token_ids=prefix_ids,
                             extra_key=extra_key,
                             cache_salt=cache_salt,
-                        )
+                        ),
+                        value=torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
                 )
-                if envs.SGLANG_RADIX_FORCE_MISS.get():
-                    match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
-                    )
-                if (
-                    match_result.device_prefix_len
-                    >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-                ):
-                    temporary_deprioritized.add(r.rid)
-                else:
-                    # Insert with a dummy key
-                    self.waiting_queue_radix_tree.insert(
-                        InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids,
-                                extra_key=extra_key,
-                                cache_salt=cache_salt,
-                            ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
-                        )
-                    )
         return temporary_deprioritized
 
     @staticmethod
