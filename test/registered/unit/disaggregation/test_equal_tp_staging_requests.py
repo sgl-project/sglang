@@ -3,7 +3,6 @@ import pathlib
 import unittest
 from types import SimpleNamespace as NS
 
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

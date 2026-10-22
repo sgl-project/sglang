@@ -82,10 +82,12 @@ class DirectPath(CustomTestCase):
         info = NS(is_dummy=False, dst_kv_indices=list(range(32)))
         mgr = NS(
             transfer_infos={7: {"s": info}},
-            _fragmented_groups=lambda src, dst: 1
-            + sum(
-                src[i] != src[i - 1] + 1 or dst[i] != dst[i - 1] + 1
-                for i in range(1, len(src))
+            _fragmented_groups=lambda src, dst: (
+                1
+                + sum(
+                    src[i] != src[i - 1] + 1 or dst[i] != dst[i - 1] + 1
+                    for i in range(1, len(src))
+                )
             ),
         )
         sender = NS(
@@ -199,8 +201,9 @@ class TestSchedulerSendRange(CustomTestCase):
             List=list,
             Tuple=__import__("typing").Tuple,
             get_schedule=lambda: NS(chunked_prefill_size=16),
-            kv_to_page_indices=lambda indices, page_size: indices[::page_size]
-            // page_size,
+            kv_to_page_indices=lambda indices, page_size: (
+                indices[::page_size] // page_size
+            ),
             logger=NS(debug=lambda *args: None),
             envs=NS(SGLANG_DISAGG_STAGING_MIN_GROUPS=NS(get=lambda: 4)),
         )
@@ -275,7 +278,6 @@ class TestSchedulerSendRange(CustomTestCase):
             np.concatenate([x[1] for x in sends]).tolist(), list(range(32))
         )
 
-
     def test_finite_dcp_pack_limit_is_retained_when_splitting(self):
         # A DCP pack-buffer cap (sender.get_max_transfer_tokens) smaller than
         # the staging grid must survive equal-TP splitting: segments stay within
@@ -302,8 +304,9 @@ class TestSchedulerSendRange(CustomTestCase):
             List=list,
             Tuple=__import__("typing").Tuple,
             get_schedule=lambda: NS(chunked_prefill_size=16),
-            kv_to_page_indices=lambda indices, page_size: indices[::page_size]
-            // page_size,
+            kv_to_page_indices=lambda indices, page_size: (
+                indices[::page_size] // page_size
+            ),
             logger=NS(debug=lambda *args: None),
             envs=NS(SGLANG_DISAGG_STAGING_MIN_GROUPS=NS(get=lambda: 4)),
         )

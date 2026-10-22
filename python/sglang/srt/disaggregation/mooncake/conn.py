@@ -34,7 +34,6 @@ from sglang.srt.disaggregation.common.staging_handler import (
     StagingManagerMixin,
     StagingRegisterInfo,
     StagingTransferInfo,
-    handle_staging_rsp,
     handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -2888,8 +2887,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 with self.session_lock:
                                     self.session_failures[req.mooncake_session_id] += 1
                                     # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                    if self.session_failures[req.mooncake_session_id] >= 1:
-                                        self.failed_sessions.add(req.mooncake_session_id)
+                                    if (
+                                        self.session_failures[req.mooncake_session_id]
+                                        >= 1
+                                    ):
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
                                         logger.error(
                                             f"Session {req.mooncake_session_id} failed."
                                         )
