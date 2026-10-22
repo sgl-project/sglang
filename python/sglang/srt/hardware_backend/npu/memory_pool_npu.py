@@ -1,9 +1,7 @@
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
-import triton
 
-from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -1034,46 +1032,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         if self.use_fia_nz:
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
-            return
-
-        if (
-            self.dcp_size > 1
-            and not self.is_draft_worker
-            and self.index_head_dim is None
-            and self.dtype in (torch.float16, torch.bfloat16)
-        ):
-            if loc.numel() == 0:
-                return
-
-            # KVLocPlan has already localized page-interleaved slots. This
-            # fixed-shape store only skips -1 rows; it does not shard again.
-            loc = loc.contiguous()
-            for dst, src in (
-                (self.k_buffer[layer_id - self.start_layer], cache_k),
-                (self.v_buffer[layer_id - self.start_layer], cache_v),
-            ):
-                if src.shape[-1] == 0:
-                    continue
-                src = src.reshape(-1, src.shape[-1])
-                if src.stride(-1) != 1:
-                    src = src.contiguous()
-                dst = dst.view(-1, src.shape[-1])
-                set_mla_kv_buffer_kernel[(loc.numel(), 1)](
-                    dst,
-                    src,
-                    src,
-                    loc,
-                    -1,
-                    buffer_stride=dst.stride(0),
-                    nope_stride=src.stride(0),
-                    rope_stride=src.stride(0),
-                    nope_dim=src.shape[-1],
-                    rope_dim=0,
-                    BLOCK=triton.next_power_of_2(src.shape[-1]),
-                    DCP_RANK=0,
-                    DCP_WORLD_SIZE=1,
-                    USE_GDC=False,
-                )
             return
 
         torch_npu.npu_scatter_nd_update_(
