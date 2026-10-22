@@ -3,7 +3,8 @@
 import threading
 import unittest
 from queue import Queue
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.embedding_cache_controller import (
     _build_storage_transfer_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -79,6 +81,98 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.prefetch_tp_group = None
     ctrl._copy_streams = {}
     return ctrl
+
+
+class TestControllerInitialization(CustomTestCase):
+    def test_only_all_rank_get_creates_a_collective_group(self):
+        for tp_size, tp_rank, all_rank_get in (
+            (1, 0, False),
+            (1, 0, True),
+            (2, 0, False),
+            (2, 1, False),
+            (2, 0, True),
+            (2, 1, True),
+        ):
+            with self.subTest(
+                tp_size=tp_size, tp_rank=tp_rank, all_rank_get=all_rank_get
+            ):
+                cpu_group = object()
+                parallel = SimpleNamespace(
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    tp_group=SimpleNamespace(cpu_group=cpu_group),
+                )
+                pools = (_make_pool(), _make_pool(modality="audio"))
+                store = MagicMock()
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.embedding_cache_controller.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch.object(
+                        EmbeddingCacheController, "_create_pools", return_value=pools
+                    ) as create_pools,
+                    patch(
+                        "sglang.srt.mem_cache.embedding_cache_controller.threading.Thread"
+                    ) as thread,
+                    patch.object(
+                        torch.distributed,
+                        "get_process_group_ranks",
+                        return_value=list(range(tp_size)),
+                    ) as get_ranks,
+                    patch(
+                        "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
+                    ) as create_group,
+                ):
+                    ctrl = EmbeddingCacheController(
+                        embedding_store=store, all_rank_get=all_rank_get
+                    )
+
+                create_pools.assert_called_once_with(pin_memory=True)
+                self.assertEqual(store.register_buffer.call_count, 2)
+                self.assertIs(
+                    store.register_buffer.call_args_list[0].args[0], pools[0].tensor
+                )
+                self.assertIs(
+                    store.register_buffer.call_args_list[1].args[0], pools[1].tensor
+                )
+                thread.return_value.start.assert_called_once_with()
+                if all_rank_get and tp_size > 1:
+                    get_ranks.assert_called_once_with(cpu_group)
+                    create_group.assert_called_once_with(
+                        group_ranks=list(range(tp_size)), backend="gloo"
+                    )
+                    self.assertIs(ctrl.prefetch_tp_group, create_group.return_value)
+                else:
+                    get_ranks.assert_not_called()
+                    create_group.assert_not_called()
+                    self.assertIsNone(ctrl.prefetch_tp_group)
+
+    def test_prefetch_progress_collective_is_opt_in(self):
+        for all_rank_get in (False, True):
+            with self.subTest(all_rank_get=all_rank_get):
+                ctrl = _make_controller()
+                ctrl.tp_world_size = 2
+                ctrl.all_rank_get = all_rank_get
+                ctrl.prefetch_tp_group = object()
+                with patch.object(
+                    torch.distributed,
+                    "all_reduce",
+                    side_effect=lambda tensor, **kwargs: tensor.zero_(),
+                ) as all_reduce:
+                    ready = ctrl.check_prefetch_progress("req")
+                self.assertEqual(ready, not all_rank_get)
+                if all_rank_get:
+                    all_reduce.assert_called_once()
+                    self.assertIs(
+                        all_reduce.call_args.kwargs["group"], ctrl.prefetch_tp_group
+                    )
+                    self.assertEqual(
+                        all_reduce.call_args.kwargs["op"],
+                        torch.distributed.ReduceOp.MIN,
+                    )
+                else:
+                    all_reduce.assert_not_called()
 
 
 class TestRangePageAllocator(unittest.TestCase):
