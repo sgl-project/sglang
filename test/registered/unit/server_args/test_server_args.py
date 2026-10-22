@@ -48,6 +48,7 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     handle_kv_cache_sharding,
     validate_kv_shard_attention_backend,
 )
+from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -1279,6 +1280,28 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
+
+
+class TestLoraForwardDomains(unittest.TestCase):
+    def test_rejects_concurrent_forwards(self):
+        for runner in ("auto", "lora_cutedsl"):
+            for options in (
+                {"enable_pdmux": True},
+                {"enable_two_batch_overlap": True},
+            ):
+                with self.subTest(runner=runner, options=options):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        tp_size=2,
+                        enable_lora=True,
+                        lora_backend="triton_v2",
+                        moe_runner_backend=runner,
+                        max_lora_rank=8,
+                        lora_target_modules=["down_proj"],
+                        **options,
+                    )
+                    with self.assertRaises(ValueError):
+                        check_lora_server_args(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
