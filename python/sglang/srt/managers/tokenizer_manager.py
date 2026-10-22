@@ -119,7 +119,6 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
-    MultimodalProcessorOutput,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -1276,12 +1275,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 hex_hash,
                             )
                     # The scheduler reuses these ids as-is; set_hash changed the pads.
-                    if mm_inputs.padded_input_ids is not None:
-                        mm_inputs.padded_input_ids = (
-                            MultimodalProcessorOutput.build_padded_input_ids(
-                                input_ids, mm_inputs.mm_items
-                            )
-                        )
+                    padded_input_ids = mm_inputs.padded_input_ids
+                    if padded_input_ids is not None:
+                        for item in mm_inputs.mm_items:
+                            for start, end in item.offsets:
+                                padded_input_ids[start : end + 1] = (
+                                    item.padding_sequence(end - start + 1)
+                                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
