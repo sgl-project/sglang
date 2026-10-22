@@ -58,7 +58,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.mm_utils import general_mm_embed_routine, pad_mm_tokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
@@ -136,6 +141,46 @@ def _resolve_attention_backend_model_cls(config: PretrainedConfig):
                 e,
             )
     return None
+
+
+def _nested_causal_lm(model: PreTrainedModel) -> Optional[PreTrainedModel]:
+    """``language_model`` that is still a full *ForCausalLM (BLIP-2 in
+    transformers 5.x), wrapping its decoder at ``.model`` instead of the
+    flattened layout the base weight mapper assumes."""
+    children = dict(model.named_children())
+    language_model = children.get("language_model")
+    if language_model is None:
+        return None
+    lm_children = dict(language_model.named_children())
+    if "model" in lm_children and "lm_head" in lm_children:
+        return language_model
+    return None
+
+
+class _TextBackboneAdapter:
+    """Presents the HF text backbone with the sglang language-model call
+    signature that ``general_mm_embed_routine`` drives."""
+
+    def __init__(self, owner: "TransformersBase"):
+        self._owner = owner
+        self.pp_group = owner.pp_group
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self._owner.model.get_input_embeddings()
+
+    def __call__(
+        self,
+        input_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._owner._run_hf_backbone(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
 
 
 def _encoder_accepts_feature_kwarg(encoder, feature_kwarg: str) -> bool:
@@ -629,6 +674,10 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
+        # The module whose forward yields LM hidden states; multimodal
+        # subclasses may point it at a nested text decoder instead.
+        self._text_backbone: nn.Module = self.model
+
         self.vocab_size = getattr(
             self.text_config,
             "vocab_size",
@@ -1022,7 +1071,7 @@ class TransformersBase(nn.Module):
             )
             hf_input_ids = None
 
-        return self.model(
+        return self._text_backbone(
             input_ids=hf_input_ids,
             inputs_embeds=hf_input_embeds,
             use_cache=False,
@@ -1361,6 +1410,23 @@ class MultiModalMixin:
                 | self.weight_mapper
             )
 
+        # BLIP-2 style: the top-level HF forward re-runs the image encoder and
+        # requires pixel_values on every step, so drive the nested decoder
+        # directly and merge image features here (general_mm_embed_routine).
+        self._nested_language_model = _nested_causal_lm(self.model)
+        self._text_backbone_adapter: Optional[_TextBackboneAdapter] = None
+        if self._nested_language_model is not None:
+            self._text_backbone = self._nested_language_model.model
+            self._text_backbone_adapter = _TextBackboneAdapter(self)
+            # Right operand wins on equal keys; the base mapper flattens
+            # "language_model.model." for v5 VLMs, which is wrong here.
+            self.weight_mapper = self.weight_mapper | WeightsMapper(
+                orig_to_new_prefix={
+                    "language_model.model.": "model.language_model.model.",
+                    "language_model.lm_head.": "lm_head.",
+                }
+            )
+
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
         if isinstance(rope_scaling, Mapping) and "mrope_section" in rope_scaling:
@@ -1369,9 +1435,38 @@ class MultiModalMixin:
         return "mrope" in rope_type
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        # general_mm_embed_routine locates image slots by the items' pad
+        # sentinels; the HF-driven merge wants the raw placeholder ids instead.
+        if self._text_backbone_adapter is not None:
+            return pad_mm_tokens(input_ids, mm_inputs)
         return input_ids
 
+    def _qformer_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Blip2Model.get_image_features returns raw ViT states; the LLM
+        consumes language_projection(qformer(query_tokens, vit_states))."""
+        model = self.model
+        image_embeds = model.vision_model(pixel_values=pixel_values).last_hidden_state
+        query_tokens = model.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        query_output = model.qformer(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=torch.ones(
+                image_embeds.shape[:-1], dtype=torch.long, device=image_embeds.device
+            ),
+            return_dict=True,
+        ).last_hidden_state
+        return model.language_projection(query_output)
+
+    def _has_qformer_bridge(self) -> bool:
+        children = {name for name, _ in self.model.named_children()}
+        return {"vision_model", "qformer", "language_projection"} <= children and any(
+            name == "query_tokens"
+            for name, _ in self.model.named_parameters(recurse=False)
+        )
+
     def _get_modality_encoder(self, modality_name: str):
+        if modality_name == "image" and self._has_qformer_bridge():
+            return self._qformer_image_features
         for name in self._mm_encoder_candidates[modality_name]:
             fn = getattr(self.model, name, None)
             if fn is not None:
@@ -1590,6 +1685,19 @@ class MultiModalMixin:
                 positions=positions,
                 forward_batch=forward_batch,
                 input_embeds=input_embeds,
+            )
+
+        if self._text_backbone_adapter is not None:
+            return general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self._text_backbone_adapter,
+                data_embedding_funcs={
+                    Modality.IMAGE: self.get_image_feature,
+                    Modality.VIDEO: self.get_video_feature,
+                    Modality.AUDIO: self.get_audio_feature,
+                },
+                positions=positions,
             )
 
         if (
