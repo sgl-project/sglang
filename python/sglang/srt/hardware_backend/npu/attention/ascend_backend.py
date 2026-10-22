@@ -694,8 +694,18 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         if dense_mla_dcp_partial:
+            effective_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
-                effective_seq_lens = forward_batch.seq_lens.to(torch.int64) + query_len
+                effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
+            elif forward_batch.spec_info is not None:
+                effective_seq_lens = effective_seq_lens + (self.speculative_step_id + 1)
+            metadata.seq_lens = get_dcp_lens(
+                effective_seq_lens,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.page_size,
+            ).int()
+            if forward_batch.forward_mode.is_target_verify():
                 metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
                     effective_seq_lens,
                     query_len,
@@ -703,22 +713,6 @@ class AscendAttnBackend(AttentionBackend):
                     self.dcp_rank,
                     interleave_size=self.page_size,
                 )
-            else:
-                effective_seq_lens = forward_batch.seq_lens
-                if (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    and forward_batch.spec_info is not None
-                ):
-                    effective_seq_lens = effective_seq_lens + (
-                        self.speculative_step_id + 1
-                    )
-            metadata.seq_lens = get_dcp_lens(
-                effective_seq_lens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).int()
-            if metadata.dcp_spec_seq_lens is not None:
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
                 metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
