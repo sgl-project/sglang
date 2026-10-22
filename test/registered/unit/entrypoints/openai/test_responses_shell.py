@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+from unittest.mock import Mock
 
 import pytest
 from utils import engine_chunk, event_payloads, make_serving
@@ -76,6 +77,22 @@ def test_shell_uses_bash_command_schema():
 def test_shell_rejects_unsupported_options_and_collisions(tools):
     with pytest.raises(ValueError):
         registry(tools)
+
+
+@pytest.mark.parametrize("choice", ["auto", {"type": "shell"}])
+def test_shell_is_not_enabled_on_other_models(choice):
+    serving = make_serving()
+    serving.tokenizer_manager.generate_request = generate = Mock()
+
+    response = asyncio.run(
+        serving.create_responses(
+            ResponsesRequest(input="Run", tools=[SHELL], tool_choice=choice)
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["param"] == "tools"
+    generate.assert_not_called()
 
 
 @pytest.mark.parametrize(

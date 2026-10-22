@@ -329,6 +329,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self.create_error_response(str(exc), param="tool_choice")
             except ValueError as exc:
                 return self.create_error_response(str(exc), param="tools")
+        elif any(tool.type == "shell" for tool in request.tools):
+            return self.create_error_response(
+                "Shell tools are not supported by this model", param="tools"
+            )
 
         if not self.enable_response_store and request.previous_response_id is not None:
             return self._response_store_disabled_error("previous_response_id")
