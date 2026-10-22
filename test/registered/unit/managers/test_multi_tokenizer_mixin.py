@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.entrypoints import http_server
+from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -30,39 +31,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
-    TokenizerWorker,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
     _send_output_to_tokenizer_workers,
-    get_tokenizer_worker_class,
 )
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-
-class CustomTokenizerWorker(TokenizerWorker):
-    pass
-
-
-class NotAWorker:
-    pass
-
-
-class DefaultServerArgs:
-    def get_tokenizer_worker_class(self):
-        return TokenizerWorker
-
-
-class CustomServerArgs:
-    def get_tokenizer_worker_class(self):
-        return CustomTokenizerWorker
-
-
-class InvalidServerArgs:
-    def get_tokenizer_worker_class(self):
-        return NotAWorker
 
 
 def _make_batch_str_output() -> BatchStrOutput:
@@ -501,7 +477,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
             ],
         )
 
-    def test_return_path_groups_noncontiguous_owners(self):
+    def test_return_path_batching_preserves_owner_order(self):
         output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
         output.rids = ["rid-0", "rid-1", "rid-2"]
         output.output_strs = ["first", "second", "third"]
@@ -515,22 +491,32 @@ class TestMultiTokenizerMixin(CustomTestCase):
             )
         )
 
-        _send_output_to_tokenizer_workers(output, ipcs, mapping)
-
-        self.assertEqual(
-            sent,
-            [
-                (
-                    "worker-b",
-                    ["rid-0", "rid-2"],
-                    ["first", "third"],
-                    ["worker-b", "worker-b"],
-                    True,
-                ),
-                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
-            ],
-        )
-        self.assertEqual(pickle.dumps(output), original)
+        expected_grouped = [
+            (
+                "worker-b",
+                ["rid-0", "rid-2"],
+                ["first", "third"],
+                ["worker-b", "worker-b"],
+                True,
+            ),
+            ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+        ]
+        expected_individual = [
+            ("worker-b", ["rid-0"], ["first"], None, True),
+            ("worker-a", ["rid-1"], ["second"], None, True),
+            ("worker-b", ["rid-2"], ["third"], None, True),
+        ]
+        for batching in (True, False):
+            sent.clear()
+            with (
+                self.subTest(batching=batching),
+                envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.override(batching),
+            ):
+                _send_output_to_tokenizer_workers(output, ipcs, mapping)
+            self.assertEqual(
+                sent, expected_grouped if batching else expected_individual
+            )
+            self.assertEqual(pickle.dumps(output), original)
 
     def test_return_path_falls_back_before_sending_any_group(self):
         output = _make_batch_embedding_output()
@@ -585,19 +571,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
             worker.multi_http_worker_event_loop()
 
         self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
-
-    def test_get_tokenizer_worker_class_uses_default(self):
-        self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
-
-    def test_get_tokenizer_worker_class_resolves_custom_class(self):
-        self.assertIs(
-            get_tokenizer_worker_class(CustomServerArgs()),
-            CustomTokenizerWorker,
-        )
-
-    def test_get_tokenizer_worker_class_rejects_non_worker(self):
-        with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
-            get_tokenizer_worker_class(InvalidServerArgs())
 
 
 if __name__ == "__main__":
