@@ -11,13 +11,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
     CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
 };
 #[cfg(test)]
 use crate::message::ids::Rid;
+#[cfg(test)]
+use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
-use crate::message::wire::merge_preferred_sampling;
+use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
     response::{error_response, error_value},
@@ -26,7 +29,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -102,12 +105,12 @@ fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
     );
-    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
-        probe.clone()
+        get(move |state: State<Arc<AppState>>| health_generate(state, timeout, false))
     } else {
         get(health_without_generation)
     };
+    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
         .route("/health", health)
         .route("/health_generate", probe)
@@ -125,7 +128,8 @@ async fn health_without_generation(State(state): State<Arc<AppState>>) -> Respon
 /// producing output. 200 if the response heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
 /// It also returns 503 until startup warmup completes. (`/health` uses the same
-/// handler when its env gate is on.)
+/// handler when its env gate is on, without `metadata_headers`.) A healthy
+/// `/health_generate` carries the configured `health_generate_headers`.
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
@@ -135,9 +139,24 @@ async fn health_without_generation(State(state): State<Arc<AppState>>) -> Respon
 async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
+    metadata_headers: bool,
 ) -> Response {
     match state.core.probe_health(timeout).await {
-        Ok(HealthStatus::Healthy) => StatusCode::OK.into_response(),
+        Ok(HealthStatus::Healthy) => {
+            let mut response = StatusCode::OK.into_response();
+            if metadata_headers {
+                // Validated at startup (`ServerArgs::validate`).
+                for (name, value) in &state.server_args.health_generate_headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        response.headers_mut().insert(name, value);
+                    }
+                }
+            }
+            response
+        }
         Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
@@ -160,6 +179,7 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let mut body = match body {
@@ -171,12 +191,27 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut body, &headers)
+    {
+        return native_error(StatusCode::BAD_REQUEST, &error, false);
+    }
+    // Read before the fills below: only a `max_new_tokens` the client sent is
+    // checked against the context window.
+    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
     if let Some(preferred) = &state.server_args.preferred_sampling_params
         && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
     {
+        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
+    }
+    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
+    let default_max_new_tokens = serde_json::json!({
+        "max_new_tokens": state.server_args.default_max_new_tokens,
+    });
+    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
     }
     // The schema (sglang_api_types) is the contract: decode errors carry
@@ -188,13 +223,14 @@ async fn generate(
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (payloads, is_batch) = match into_requests(body) {
+    let (mut payloads, is_batch) = match into_requests(body, &state.generation_policy) {
         Ok(v) => v,
         // Request normalization only returns validation failures.
         Err(e) => {
             return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
         }
     };
+    client_max_new_tokens.mark(&mut payloads);
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
@@ -548,13 +584,64 @@ mod tests {
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 
-        let response = health_generate(State(state), Duration::ZERO).await;
+        let response = health_generate(State(state), Duration::ZERO, true).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// A healthy `/health_generate` carries the configured metadata headers;
+    /// `/health` sharing the probe does not.
+    #[tokio::test]
+    async fn healthy_probe_carries_configured_headers() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let activity: crate::tokenizer_manager::from_scheduler::ActivityCounter =
+            Default::default();
+        let server_args = crate::message::config::ServerArgs {
+            health_generate_headers: [
+                ("x-custom-header".to_string(), "v".to_string()),
+                ("x-rust-server".to_string(), "health".to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState {
+            core: crate::api_server::core::CoreHandle::new(
+                intake_tx,
+                abort_tx,
+                crate::api_server::core::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: activity.clone(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: crate::api_server::core::CoreMetadata::default(),
+                },
+            ),
+            generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+        });
+        // Each probe that reaches intake counts as scheduler output.
+        tokio::spawn(async move {
+            while intake_rx.recv_async().await.is_ok() {
+                activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        let response = health_generate(State(state.clone()), Duration::from_secs(5), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-custom-header"], "v");
+        assert_eq!(response.headers()["x-rust-server"], "health");
+
+        let response = health_generate(State(state), Duration::from_secs(5), false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-custom-header").is_none());
     }
 
     #[tokio::test]
@@ -576,6 +663,7 @@ mod tests {
         let state = Arc::new(AppState {
             core,
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 
@@ -628,6 +716,155 @@ mod tests {
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
         assert_eq!(value["meta_info"]["completion_tokens"], 1);
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
+    /// whether that value is marked defaulted.
+    async fn submitted_max_new_tokens(
+        server_args: crate::message::config::ServerArgs,
+        body: serde_json::Value,
+        items: usize,
+    ) -> Vec<(Option<i64>, bool)> {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = crate::api_server::core::CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            crate::api_server::core::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                metadata: crate::api_server::core::CoreMetadata::default(),
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            generation_policy: GenerationPolicy::from(&server_args),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+        });
+        let responder = tokio::spawn(async move {
+            let mut submitted = Vec::new();
+            for _ in 0..items {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected an intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("/generate must submit a generation request");
+                };
+                submitted.push((
+                    generate.sampling_params.max_new_tokens,
+                    generate.max_new_tokens_defaulted,
+                ));
+                request.sink.try_send(done(0, "ok")).unwrap();
+            }
+            submitted
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        responder.await.unwrap()
+    }
+
+    /// An item whose `sampling_params` name no `max_new_tokens` is marked
+    /// defaulted and keeps the value the fills gave it (the preferred one, else
+    /// the launch default); one that names it, even as null, keeps the client's. A
+    /// list is marked object by object, and one object marks every item.
+    #[tokio::test]
+    async fn generate_marks_each_max_new_tokens_the_client_omits() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        let args = |preferred: Option<serde_json::Value>| ServerArgs {
+            preferred_sampling_params: preferred.map(PreferredSamplingParams),
+            ..Default::default()
+        };
+        let preferred = Some(serde_json::json!({"temperature": 1.0, "max_new_tokens": 4096}));
+        let cases = [
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1]}),
+                vec![(Some(4096), true)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"top_p": 0.5}}),
+                vec![(Some(4096), true)],
+            ),
+            (
+                args(None),
+                serde_json::json!({"input_ids": [1]}),
+                vec![(Some(128), true)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": 8}}),
+                vec![(Some(8), false)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": null}}),
+                vec![(None, false)],
+            ),
+            (
+                args(preferred.clone()),
+                serde_json::json!({
+                    "input_ids": [[1], [2]],
+                    "sampling_params": [{}, {"max_new_tokens": 8}],
+                }),
+                vec![(Some(4096), true), (Some(8), false)],
+            ),
+            (
+                args(preferred),
+                serde_json::json!({
+                    "input_ids": [[1], [2]],
+                    "sampling_params": {"max_new_tokens": 8},
+                }),
+                vec![(Some(8), false), (Some(8), false)],
+            ),
+        ];
+        for (server_args, body, expected) in cases {
+            let submitted =
+                submitted_max_new_tokens(server_args, body.clone(), expected.len()).await;
+            assert_eq!(submitted, expected, "{body}");
+        }
+    }
+
+    /// An omitted `max_new_tokens` takes the launch default, beneath the
+    /// request's own value and the preferred sampling params; a `None`
+    /// default is no limit. Whichever fill supplies it, it is marked defaulted.
+    #[tokio::test]
+    async fn omitted_max_new_tokens_takes_the_launch_default() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        let args = |default_max_new_tokens, preferred: Option<serde_json::Value>| ServerArgs {
+            default_max_new_tokens,
+            preferred_sampling_params: preferred.map(PreferredSamplingParams),
+            ..Default::default()
+        };
+        let omitted = serde_json::json!({"input_ids": [1, 2]});
+        let explicit = serde_json::json!({
+            "input_ids": [1, 2],
+            "sampling_params": {"max_new_tokens": 3},
+        });
+        let preferred = Some(serde_json::json!({"max_new_tokens": 7}));
+        for (server_args, body, expected) in [
+            (args(Some(4096), None), &omitted, (Some(4096), true)),
+            (args(None, None), &omitted, (None, true)),
+            (args(Some(4096), preferred), &omitted, (Some(7), true)),
+            (args(Some(4096), None), &explicit, (Some(3), false)),
+        ] {
+            assert_eq!(
+                submitted_max_new_tokens(server_args, body.clone(), 1).await,
+                vec![expected],
+                "{body}"
+            );
+        }
     }
 
     #[test]
