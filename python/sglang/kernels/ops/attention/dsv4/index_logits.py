@@ -4,7 +4,8 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 
 from __future__ import annotations
 
-from typing import Iterator, Tuple
+import functools
+from typing import Iterator, Optional, Tuple
 
 import torch
 
@@ -17,15 +18,34 @@ from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
-_LOGITS_DTYPE = (
-    torch.bfloat16 if envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get() else torch.float32
-)
-_LOGITS_DTYPE_BYTES = _LOGITS_DTYPE.itemsize
-# DeepGEMM picks its reduce dtype from the head weights; bf16 weights need bf16 logits.
-_BF16_WEIGHTS = envs.SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16.get()
-assert not _BF16_WEIGHTS or _LOGITS_DTYPE == torch.bfloat16, (
-    "SGLANG_OPT_DSV41_INDEX_WEIGHTS_BF16 needs SGLANG_OPT_DSV41_BF16_INDEX_LOGITS"
-)
+
+@functools.cache
+def _is_sm100() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability()[0] == 10
+    )
+
+
+@functools.cache
+def index_logits_dtype() -> torch.dtype:
+    """bf16 on SM100, where the reference kernels score in bf16; fp32 elsewhere.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS, when set, overrides the choice."""
+    forced = envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get()
+    bf16 = _is_sm100() if forced is None else forced
+    return torch.bfloat16 if bf16 else torch.float32
+
+
+@functools.cache
+def index_weights_dtype() -> torch.dtype:
+    """DeepGEMM reduces in the head weights' dtype and takes bf16 weights only on
+    SM100 with bf16 logits."""
+    if index_logits_dtype() == torch.bfloat16 and _is_sm100():
+        return torch.bfloat16
+    return torch.float32
+
+
 # Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
 # DeepSelect reads past a row's end (DeepGEMM pads the stride but its tensor's storage ends at the last row)
 FLAT_LOGITS_WIDTH_ALIGN = 64
@@ -37,10 +57,12 @@ def flat_index_logits_rows_per_tile(
     *,
     heads: int,
     budget_bytes: int,
-    item_size: int = _LOGITS_DTYPE_BYTES,
+    item_size: Optional[int] = None,
 ) -> int:
     """Rows per logits tile within ``budget_bytes`` (sized as fp32, which also
     bounds bf16), at the kernel's row alignment."""
+    if item_size is None:
+        item_size = index_logits_dtype().itemsize
     row_alignment = 128 // heads
     # NOTE: for bf16, the estimated row bytes is 2 times the actual bytes
     effective_width = width * item_size // 4
@@ -77,8 +99,8 @@ def flat_index_logits_tiles(
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
-    if _BF16_WEIGHTS:
-        weights = weights.to(torch.bfloat16)
+    weights = weights.to(index_weights_dtype())
+    logits_dtype = index_logits_dtype()
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
@@ -92,7 +114,7 @@ def flat_index_logits_tiles(
                 tile_starts + lengths[tile],
                 False,
                 width,
-                logits_dtype=_LOGITS_DTYPE,
+                logits_dtype=logits_dtype,
             ),
         )
 
@@ -115,13 +137,13 @@ def deep_gemm_fp4_paged_mqa_logits(
     return fp8_fp4_paged_mqa_logits(
         q_fp4,
         k_cache,
-        weights,
+        weights.to(index_weights_dtype()),
         sl,
         page_table,
         deep_gemm_metadata,
         max_seq_len,
         False,
-        logits_dtype=_LOGITS_DTYPE,
+        logits_dtype=index_logits_dtype(),
     )
 
 
