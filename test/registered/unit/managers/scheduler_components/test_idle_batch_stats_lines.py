@@ -200,11 +200,16 @@ class TestIdleBatchStatsLines(CustomTestCase):
                 ranks.append(rank)
             logged_at = [[], []]
             with self.assertLogs(f"{_MODULE}", level="INFO") as logs:
-                # Past the first rank's idle interval only.
-                self.clock.now = 0.803
+                # The first idle step closes the open forward on both ranks.
+                self.clock.now = 0.01
                 for rank in ranks:
                     rank.maybe_report_idle_stats()
-                self.assertEqual(len(logs.output), 1)
+                self.assertEqual(len(logs.output), 2)
+                # Past the first rank's idle interval only.
+                self.clock.now = 0.813
+                for rank in ranks:
+                    rank.maybe_report_idle_stats()
+                self.assertEqual(len(logs.output), 3)
                 # Traffic resumes: every rank runs the same forwards.
                 for forward in range(1, 5):
                     self.clock.now += 0.01
@@ -239,7 +244,7 @@ class TestIdleBatchStatsLines(CustomTestCase):
                 _idle_forward(reporter)
                 assert_exported(count=1, throughput=32.0)
 
-                # A burst shorter than the interval, closed by a timed line.
+                # A burst shorter than the interval, closed by the first idle step.
                 reporter.num_generated_tokens = 4
                 reporter.forward_ct_decode += 1
                 self.clock.now = 1.5
@@ -263,37 +268,77 @@ class TestIdleBatchStatsLines(CustomTestCase):
                 assert_exported(count=4, throughput=12.0)
         self.assertAlmostEqual(reporter.last_gen_throughput, 12.0)
 
-    def test_fully_idle_refresh_leaves_throughput_to_timed_lines(self):
-        """Going fully idle publishes the stale gauges at once; it must not zero
-        the throughput before a timed line closes the window holding the tail."""
+    def test_going_idle_exports_the_tail_window_then_zero(self):
+        """The first idle step exports the window holding the last burst's tail
+        before the fully idle refresh runs; without the device timer the refresh
+        then finds nothing stale, and the throughput gauge reads the tail's
+        rate, then 0."""
         with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
             reporter = _make_reporter(
                 _make_scheduler(DisaggregationMode.DECODE), metrics_enabled=True
             )
             # A busy window exported one running request, which then finished
-            # after 4 more tokens.
+            # after one more forward of 4 tokens.
             reporter.stats.num_running_reqs = QueueCount.from_reqs([object()])
-            reporter.stats.gen_throughput = 50.0
             reporter.num_generated_tokens = 4
+            reporter.forward_ct_decode = 1
+            reporter.metrics_collector.last_log_time = 0.0
             exported = []
             with self.assertLogs(f"{_MODULE}", level="INFO"):
-                self.clock.now = 0.5
-                reporter._maybe_log_idle_metrics()
-                exported.append(reporter.stats.gen_throughput)
-                for now in (1.0, 2.0):
+                for now in (0.5, 1.5):
                     self.clock.now = now
+                    # on_idle's order: idle stats line, then the fully idle refresh.
                     reporter.maybe_report_idle_stats()
+                    reporter._maybe_log_idle_metrics()
                     exported.append(reporter.stats.gen_throughput)
-        self.assertEqual(reporter.metrics_collector.log_stats.call_count, 3)
+        self.assertEqual(reporter.metrics_collector.log_stats.call_count, 2)
         self.assertEqual(reporter.stats.num_running_reqs.total, 0)
-        self.assertEqual(exported, [50.0, 4.0, 0.0])
+        self.assertEqual(exported, [8.0, 0.0])
 
-    def test_fully_idle_refresh_zeroes_throughput_without_idle_lines(self):
-        """Without idle decode lines, nothing else replaces the last window's
-        throughput when the worker goes fully idle."""
+    def test_device_timer_refresh_keeps_only_the_tail_rate(self):
+        """With the device timer, a finite occupancy makes the fully idle refresh
+        export right after the line that closed the last window. After an
+        idle-start line it keeps that line's tail rate; after a batch line
+        (decode-log-interval 1, no idle-start line) the window was busy, so it
+        zeroes the rate."""
+        for tail in (True, False):
+            with (
+                self.subTest(tail=tail),
+                patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True),
+                patch(f"{_MODULE}.ENABLE_METRICS_DEVICE_TIMER", True),
+            ):
+                self.clock.now = 0.0
+                reporter = _make_reporter(
+                    _make_scheduler(DisaggregationMode.DECODE), metrics_enabled=True
+                )
+                reporter.forward_pass_device_timer = SimpleNamespace(
+                    _report=lambda: None
+                )
+                reporter.metrics_collector.last_log_time = 0.0
+                reporter.fwd_occupancy = 50.0
+                reporter.num_generated_tokens = 4
+                reporter.forward_ct_decode = 1
+                with self.assertLogs(f"{_MODULE}", level="INFO"):
+                    self.clock.now = 0.5
+                    if tail:
+                        reporter.maybe_report_idle_stats()
+                    else:
+                        reporter.decode_log_interval = 1
+                        reporter.report_decode_stats(
+                            can_run_cuda_graph=False,
+                            running_batch=reporter.scheduler.running_batch,
+                        )
+                    reporter._maybe_log_idle_metrics()
+                self.assertEqual(reporter.metrics_collector.log_stats.call_count, 2)
+                self.assertEqual(reporter.stats.gen_throughput, 8.0 if tail else 0)
+
+    def test_fully_idle_refresh_zeroes_throughput(self):
+        """A stale running-request gauge means the last export was a busy window;
+        once fully idle, its throughput is stale too."""
         cases = (
             (False, DisaggregationMode.DECODE),
             (True, DisaggregationMode.NULL),
+            (True, DisaggregationMode.DECODE),
         )
         for log_idle, mode in cases:
             with (
@@ -338,8 +383,8 @@ class TestIdleBatchStatsLines(CustomTestCase):
             self.assertEqual(window.start_ns, 5)
 
     def test_decode_sol_hook_gets_the_time_per_forward(self):
-        """The decode SoL hook takes per-iteration time, so a window closed by a
-        timed line divides by the forwards it holds, and one without any skips
+        """The decode SoL hook takes per-iteration time, so a window closed at an
+        idle step divides by the forwards it holds, and one without any skips
         the hook."""
         with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
             reporter = _make_reporter(
@@ -417,8 +462,8 @@ class TestIdleBatchStatsLines(CustomTestCase):
                             logged_at[i].append(forward)
         self.assertEqual(logged_at[0], logged_at[1])
 
-    def test_step_time_skips_a_window_shortened_by_a_timed_line(self):
-        """A timed line closes a window without advancing the forward count, so
+    def test_step_time_skips_a_window_shortened_by_an_idle_line(self):
+        """An idle line closes a window without advancing the forward count, so
         the next batch line closes a window of fewer than decode-log-interval
         forwards; dividing its gap by the interval would understate the step."""
         with (
@@ -545,6 +590,130 @@ class TestIdleBatchStatsLines(CustomTestCase):
             all("est. prefill TFLOPS/s (per GPU): 0.00" in l for l in logs.output)
         )
 
+    def test_decode_idle_boundary_lines_bound_the_idle_stretch(self):
+        """With decode-log-interval > 1, the first idle step closes the forwards
+        since the previous line, and the line right before the next forward
+        ends the idle stretch; the busy windows on either side then hold no
+        idle time, and neither line moves the forward count. The end line is
+        logged once the forward's requests are admitted, but none of them ran
+        in its window."""
+        with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
+            reporter = _make_reporter(
+                _make_scheduler(DisaggregationMode.DECODE), metrics_enabled=True
+            )
+            exported = []
+            running = []
+
+            def log_stats(stats) -> None:
+                exported.append(stats.gen_throughput)
+                running.append(stats.num_running_reqs.total)
+
+            reporter.metrics_collector.log_stats.side_effect = log_stats
+
+            def forward_at(now: float) -> None:
+                self.clock.now = now
+                reporter.num_generated_tokens += 3
+                reporter.forward_ct_decode += 1
+                reporter.report_decode_stats(
+                    can_run_cuda_graph=False,
+                    running_batch=reporter.scheduler.running_batch,
+                )
+
+            def idle_step_at(now: float) -> None:
+                self.clock.now = now
+                reporter.maybe_report_idle_stats()
+
+            def launch_at(now: float) -> None:
+                self.clock.now = now
+                reporter.maybe_report_idle_end()
+
+            with self.assertLogs(f"{_MODULE}", level="INFO") as logs:
+                forward_at(0.1)
+                forward_at(0.2)  # a batch line closes [0, 0.2]
+                forward_at(0.3)
+                idle_step_at(0.35)  # idle starts: closes [0.2, 0.35]
+                idle_step_at(0.5)
+                idle_step_at(1.35)  # a timed line
+                reporter.scheduler.running_batch.reqs = [
+                    SimpleNamespace(seqlen=8, routing_key=None)
+                ] * 2
+                launch_at(1.8)  # idle ends: closes [1.35, 1.8]
+                launch_at(1.81)  # one end line per idle stretch
+                forward_at(1.9)  # a batch line closes [1.8, 1.9]
+                forward_at(2.0)
+                idle_step_at(2.05)  # idle starts: closes [1.9, 2.05]
+                launch_at(2.1)  # no timed line in this short stretch, so no end line
+                forward_at(2.2)  # a batch line closes [2.05, 2.2]
+        self.assertEqual(len(logs.output), 7)
+        self.assertEqual(reporter.forward_ct_decode, 6)
+        expected = [6 / 0.2, 3 / 0.15, 0.0, 0.0, 3 / 0.1, 3 / 0.15, 3 / 0.15]
+        self.assertEqual(len(exported), len(expected))
+        for got, want in zip(exported, expected):
+            self.assertAlmostEqual(got, want)
+        self.assertIn("#running-req: 0,", logs.output[3])
+        self.assertEqual(running[3:5], [0, 2])
+
+    def test_decode_idle_end_counts_admitted_requests_by_routing_key(self):
+        """No request ran in an idle-end line's window, but its forward already
+        admitted some; the running+waiting routing distribution still counts
+        them, since they are in neither queue any more."""
+        with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
+            reporter = _make_reporter(
+                _make_scheduler(DisaggregationMode.DECODE), metrics_enabled=True
+            )
+            reporter.scheduler.running_batch.reqs = [
+                SimpleNamespace(seqlen=8, routing_key="a")
+            ] * 2
+            reporter.scheduler.waiting_queue = [SimpleNamespace(routing_key="b")]
+            with self.assertLogs(f"{_MODULE}", level="INFO") as logs:
+                self.clock.now = 0.3
+                reporter.maybe_report_idle_end()
+        self.assertIn("#running-req: 0,", logs.output[0])
+        self.assertEqual(reporter.stats.num_running_reqs.total, 0)
+        self.assertEqual(reporter.stats.num_unique_running_routing_keys, 0)
+        self.assertEqual(sorted(reporter.stats.routing_key_all_req_counts), [1, 2])
+
+    def test_first_forward_after_startup_gets_an_idle_end_line(self):
+        """Startup counts as an idle stretch covered by timed lines, so the first
+        forward closes it even before any timed line was logged."""
+        with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
+            reporter = _make_reporter(
+                _make_scheduler(DisaggregationMode.DECODE), metrics_enabled=False
+            )
+            with self.assertLogs(f"{_MODULE}", level="INFO") as logs:
+                self.clock.now = 0.3
+                reporter.maybe_report_idle_end()
+                reporter.maybe_report_idle_end()
+        self.assertEqual(len(logs.output), 1)
+
+    def test_prefill_idle_end_line_leaves_the_batch_window_busy(self):
+        """The first prefill after timed lines measures its input throughput
+        over its own forward, not the idle time before it."""
+        with patch(f"{_MODULE}.LOG_IDLE_BATCH_STATS", True):
+            reporter = _make_reporter(
+                _make_scheduler(DisaggregationMode.PREFILL), metrics_enabled=False
+            )
+            with self.assertLogs(f"{_MODULE}", level="INFO") as logs:
+                self.clock.now = 1.0
+                reporter.maybe_report_idle_stats()
+                self.clock.now = 1.5
+                reporter.maybe_report_idle_end()
+                reporter.maybe_report_idle_end()
+                self.clock.now = 1.7
+                reporter.report_prefill_stats(
+                    batch=SimpleNamespace(reqs=[], forward_iter=None),
+                    prefill_stats=PrefillStats(
+                        log_input_tokens=100,
+                        log_hit_tokens=0,
+                        new_token_ratio=0.0,
+                        num_running_reqs=QueueCount(),
+                        num_new_seqs=1,
+                    ),
+                    can_run_cuda_graph=False,
+                )
+        self.assertEqual(len(logs.output), 3)
+        self.assertIn("input throughput (token/s): 500.00", logs.output[2])
+
     def test_idle_lines_are_off_by_default(self):
         reporter = _make_reporter(
             _make_scheduler(DisaggregationMode.PREFILL), metrics_enabled=False
@@ -552,6 +721,7 @@ class TestIdleBatchStatsLines(CustomTestCase):
         self.clock.now = 60.0
         with self.assertNoLogs(f"{_MODULE}", level="INFO"):
             reporter.maybe_report_idle_stats()
+            reporter.maybe_report_idle_end()
             _idle_forward(reporter)
 
 

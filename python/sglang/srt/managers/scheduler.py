@@ -4744,6 +4744,7 @@ class Scheduler(
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        self.metrics_reporter.maybe_report_idle_end()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
