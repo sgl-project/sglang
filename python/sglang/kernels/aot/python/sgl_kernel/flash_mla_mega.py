@@ -1,7 +1,7 @@
 from typing import Optional
 
 import torch
-from sgl_kernel.flash_mla import _flashmla_import_error
+from sgl_kernel.flash_mla import _flashmla_import_error, _require_v41
 
 
 def is_flash_mla_mega_available() -> bool:
@@ -94,3 +94,63 @@ def permute_mega_wo_weight(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_mega()
     return tuple(torch.ops.sgl_kernel.flash_mla_mega_permute_wo.default(weight, scale))
+
+
+def flash_mla_mega_prefill_v41(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, ...]:
+    _require_v41()
+    return tuple(
+        torch.ops.sgl_flashmla_v41.mega_prefill.default(
+            q,
+            kv,
+            indices,
+            positions,
+            cos_sin_cache,
+            softmax_scale,
+            q.shape[1] // 8,
+            attn_sink,
+            topk_length,
+        )
+    )
+
+
+def flash_mla_mega_decode_v41(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    softmax_scale: float,
+    *,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _require_v41()
+    return tuple(
+        torch.ops.sgl_flashmla_v41.mega_decode.default(
+            q,
+            kv,
+            indices,
+            positions,
+            cos_sin_cache,
+            softmax_scale,
+            q.shape[1] // 8,
+            attn_sink,
+            topk_length,
+            extra_kv,
+            extra_indices,
+            extra_topk_length,
+        )
+    )

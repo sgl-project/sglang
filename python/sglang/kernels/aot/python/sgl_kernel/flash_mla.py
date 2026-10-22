@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -9,6 +10,15 @@ except Exception as _e:
     _flashmla_import_error = _e
 else:
     _flashmla_import_error = None
+
+try:
+    torch.ops.load_library(
+        os.path.join(os.path.dirname(__file__), "flashmla_v41_ops.so")
+    )
+except Exception as _e:
+    _flashmla_v41_import_error = _e
+else:
+    _flashmla_v41_import_error = None
 
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
@@ -376,3 +386,42 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length
     )
     return results
+
+
+def is_flash_mla_v41_available() -> bool:
+    return _flashmla_v41_import_error is None
+
+
+def _require_v41() -> None:
+    if _flashmla_v41_import_error is not None:
+        raise ImportError(
+            "FlashMLA V4.1 ops require sgl-kernel built with CUDA >= 13.0 on SM100/SM103"
+        ) from _flashmla_v41_import_error
+
+
+def flash_mla_v41_sparse_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: float,
+    *,
+    head_dim_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _require_v41()
+    return torch.ops.sgl_flashmla_v41.sparse_decode_fwd.default(
+        q,
+        kv,
+        indices,
+        topk_length,
+        attn_sink,
+        extra_kv,
+        extra_indices,
+        extra_topk_length,
+        head_dim_v,
+        softmax_scale,
+    )

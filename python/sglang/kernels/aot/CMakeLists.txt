@@ -546,6 +546,11 @@ install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 # ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla_v41.cmake)
+    install(TARGETS flashmla_v41_ops LIBRARY DESTINATION "sgl_kernel")
+endif()
+
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"
