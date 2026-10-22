@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import argparse
 import json
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import (
+    A,
+    Arg,
+)
 
 
 class Mm(msgspec.Struct):
@@ -47,9 +58,14 @@ class Mm(msgspec.Struct):
         bool, "Enable prefix multimodal cache. Currently only supports mm-only."
     ] = False
     mm_enable_dp_encoder: A[
-        bool,
-        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
+        ),
+    ] = None
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -118,9 +134,8 @@ class Mm(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for the multimodal global embedding cache. "
-            "Used when --enable-mm-global-cache is set. mooncake uses the "
-            "Mooncake distributed store (RDMA); npu_memcache uses Ascend MemCache.",
-            choices=["mooncake", "npu_memcache"],
+            "Used when --enable-mm-global-cache is set.",
+            choices=["mooncake"],
         ),
     ] = "mooncake"
     disable_fast_image_processor: A[

@@ -125,9 +125,3 @@ EmbeddingStoreFactory.register_backend(
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store",
     "MooncakeEmbeddingStore",
 )
-
-EmbeddingStoreFactory.register_backend(
-    "npu_memcache",
-    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_embedding_store",
-    "NpuMemcacheEmbeddingStore",
-)
