@@ -24,12 +24,10 @@ register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
 class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # PR runs the mixin smoke request; nightly runs the full GSM8K set.
     gsm8k_num_examples = 1319
-    # sgl_eval vs evalscope on the same model: evalscope runs gsm8k 4-shot and
-    # samples at temperature 1.0, sgl_eval runs it 0-shot with greedy decoding.
-    # The 0.83 evalscope baseline therefore reads 0.809-0.823 here (1319 questions).
-    gsm8k_accuracy_thres = 0.79
-    gsm8k_backend = "sgl_eval"
-    gsm8k_max_tokens = 4096
+    # evalscope is the harness the 0.83 Moonlight bf16 baseline was calibrated
+    # with (4-shot chat, temperature 1.0).
+    gsm8k_accuracy_thres = 0.83
+    gsm8k_backend = "evalscope"
 
     @classmethod
     def setUpClass(cls):
