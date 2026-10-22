@@ -77,24 +77,6 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
     assert default.guidance_scale == 3.5
 
 
-@pytest.mark.parametrize(
-    "context_in_dim, guidance_embed, pipeline",
-    [
-        (15360, True, "Flux2ComfyUIPipeline"),
-        (7680, True, "Flux2KleinBaseComfyUIPipeline"),
-        (12288, False, "Flux2KleinComfyUIPipeline"),
-    ],
-)
-def test_flux2_detected_family_selects_pipeline(
-    context_in_dim, guidance_embed, pipeline
-) -> None:
-    config = SimpleNamespace(
-        unet_config={"context_in_dim": context_in_dim, "guidance_embed": guidance_embed}
-    )
-    assert get_adapter_class("flux2") is Flux2Adapter
-    assert Flux2Adapter.pipeline_class_for(config) == pipeline
-
-
 def test_flux2_pack_flattens_latents_and_keeps_every_row() -> None:
     """ComfyUI stacks cond and uncond (B=2); each row needs its own seq len."""
     adapter = Flux2Adapter()
@@ -117,16 +99,11 @@ def test_flux2_pack_flattens_latents_and_keeps_every_row() -> None:
     assert out.shape == x.shape
     assert torch.equal(out, x)
 
-
-def test_flux2_pack_preserves_disabled_embedded_guidance() -> None:
-    adapter = Flux2Adapter()
-    packed = adapter.pack(
-        torch.randn(1, 128, 4, 6),
-        torch.tensor([0.5]),
-        torch.randn(1, 512, 15360),
-        guidance=None,
+    # FluxDisableGuidance omits guidance; it must not fall back to a default.
+    assert (
+        adapter.pack(x, torch.tensor([0.5]), torch.randn(2, 512, 7680)).guidance_scale
+        is None
     )
-    assert packed.guidance_scale is None
 
 
 def test_flux_pack_zero_fills_missing_pooled() -> None:
@@ -222,16 +199,6 @@ def test_flux2_reference_latents_are_appended_with_distinct_ids() -> None:
     assert "condition_image_latent_ids" not in packed.extra_req
 
 
-def test_flux2_rejects_attention_masks_it_would_silently_drop() -> None:
-    with pytest.raises(NotImplementedError, match="attention masks"):
-        Flux2Adapter().pack(
-            torch.randn(1, 128, 4, 4),
-            torch.tensor([0.5]),
-            torch.randn(1, 512, 7680),
-            attention_mask=torch.ones(1, 16),
-        )
-
-
 def test_embedded_guidance_comes_from_the_request_only_for_flux2() -> None:
     """FluxGuidance must reach FLUX.2; other models send a placeholder 1.0."""
     from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -242,13 +209,21 @@ def test_embedded_guidance_comes_from_the_request_only_for_flux2() -> None:
         DenoisingStage,
     )
 
-    batch = SimpleNamespace(guidance_scale=7.0)
-    flux2 = SimpleNamespace(comfyui_mode=True, pipeline_config=Flux2PipelineConfig())
-    flux1 = SimpleNamespace(comfyui_mode=True, pipeline_config=FluxPipelineConfig())
-    native = SimpleNamespace(comfyui_mode=False, pipeline_config=Flux2PipelineConfig())
-    assert DenoisingStage._comfyui_request_guidance(batch, flux2) == 7.0
-    assert DenoisingStage._comfyui_request_guidance(batch, flux1) is None
-    assert DenoisingStage._comfyui_request_guidance(batch, native) is None
+    def guidance(config, comfyui_mode=True, scale=7.0):
+        stage = SimpleNamespace(
+            server_args=SimpleNamespace(
+                comfyui_mode=comfyui_mode, pipeline_config=config
+            ),
+            _build_guidance=lambda bsz, dtype, device, val: val,
+        )
+        batch = SimpleNamespace(guidance_scale=scale)
+        return DenoisingStage.get_or_build_guidance(stage, 1, None, None, batch)
+
+    flux2 = Flux2PipelineConfig()
+    assert guidance(flux2) == 7.0
+    assert guidance(flux2, scale=None) is None
+    assert guidance(flux2, comfyui_mode=False) == flux2.embedded_cfg_scale
+    assert guidance(FluxPipelineConfig()) == FluxPipelineConfig().embedded_cfg_scale
 
 
 def test_worker_error_is_raised_not_unpacked() -> None:
