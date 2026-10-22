@@ -140,7 +140,13 @@ class TestRequestWindowCopy(CustomTestCase):
             pos = torch.cat(
                 [torch.arange(n, device="cuda") + 191 + shift for n in lengths]
             )
-            return window_layout(req, pos, capacity=capacity, num_groups=len(lengths))
+            return window_layout(
+                req,
+                pos,
+                zero_row=window.zero_row,
+                capacity=capacity,
+                num_groups=len(lengths),
+            )
 
         active = metadata(lens, 0)
         window.activate(active)
