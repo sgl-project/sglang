@@ -3,7 +3,7 @@ LIM + Copy-SFA integration on 209 — 2026-10-22
 STATUS
 The source merge, normal kernel wheel build, native tests and real-framework
 fixture have completed. GPQA Diamond inference HAS NOT STARTED. Another
-GLM service occupies all 16 NPUs on 209; stopping that service requires the
+TP16 inference service occupies all 16 NPUs on 209; stopping that service requires the
 pending user decision. There is no GPQA score or end-to-end performance claim.
 
 WEIGHTS AND DISK
