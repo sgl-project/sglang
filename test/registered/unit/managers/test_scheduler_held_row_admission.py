@@ -90,6 +90,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.disaggregation_mode = disaggregation_mode
         s.enable_hicache_storage = False
         s.enable_lmcache = False
+        s.enable_unified_cache_external_linker = False
         s.truncation_align_size = None
         s.model_config = None
         s.enable_overlap = False
