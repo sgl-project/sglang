@@ -14,12 +14,12 @@ import argparse
 import torch
 
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
-    gather_dequant_requant_fp8_paged,
+    gather_dequant_requant_fp8_paged_dsa,
 )
 from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
     gather_dequant_nvfp4_mla_cache_generation,
 )
-from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
 
@@ -100,7 +100,7 @@ def main() -> None:
             )
 
         def run_flashmla(selected=flat):
-            return gather_dequant_requant_fp8_paged(flashmla_cache, selected)
+            return gather_dequant_requant_fp8_paged_dsa(flashmla_cache, selected)
 
         def run_raw_fp8(selected=flat_long):
             return fp8_cache.index_select(0, selected)

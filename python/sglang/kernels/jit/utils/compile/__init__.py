@@ -12,7 +12,9 @@ Modules, in dependency order (there are no cycles)::
     toolchain  compilers, tvm-ffi locations, platform base flags
     ninja      generating and running build.ninja, reading its depfiles
     cache      build_key / deps_key, cache layout, publication
+    sailify    CUDA -> PPU source conversion for hgcc builds
     loader     load_jit
+    parallel   parallel_compile: several builds at once
 """
 
 from sglang.kernels.jit.utils.compile.cpp_args import (
@@ -22,6 +24,7 @@ from sglang.kernels.jit.utils.compile.cpp_args import (
     make_cpp_args,
 )
 from sglang.kernels.jit.utils.compile.loader import load_jit
+from sglang.kernels.jit.utils.compile.parallel import parallel_compile
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
     DEFAULT_INCLUDE,
@@ -43,4 +46,5 @@ __all__ = [
     "cuda_stubs_dir",
     "load_jit",
     "make_cpp_args",
+    "parallel_compile",
 ]

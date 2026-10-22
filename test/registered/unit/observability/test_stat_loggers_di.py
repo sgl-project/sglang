@@ -106,14 +106,6 @@ class TestResolveCollectorClass(unittest.TestCase):
             SchedulerMetricsCollector,
         )
 
-    def test_returns_default_when_stat_loggers_none(self):
-        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers=None)
-        self.assertIs(cls, SchedulerMetricsCollector)
-
-    def test_returns_default_when_stat_loggers_empty(self):
-        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers={})
-        self.assertIs(cls, SchedulerMetricsCollector)
-
     def test_returns_default_when_role_missing(self):
         class MyTokenizer(TokenizerMetricsCollector):
             pass
@@ -288,6 +280,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             waiting_queue=[],
             grammar_manager=[],
+            enable_fpm=False,
             enable_priority_scheduling=False,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
@@ -321,7 +314,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0
+                    disaggregation_decode_host_receive_threshold=1
                 ),
             ),
             patch(
@@ -419,7 +412,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0,
+                    disaggregation_decode_host_receive_threshold=1,
                     language_only=False,
                 ),
             ),

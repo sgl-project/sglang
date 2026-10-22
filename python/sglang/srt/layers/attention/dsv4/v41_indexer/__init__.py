@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.utils import is_cuda
+
 from .full_topk import FullTopKIndexer
 from .types import (
     CandidateMetadata,
@@ -39,8 +41,9 @@ __all__ = [
 
 @functools.cache
 def is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
-    return torch.cuda.get_device_capability()[0] >= 10
+    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
+    # take the torch indexer.
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
 @functools.cache
@@ -120,7 +123,6 @@ def make_candidate_indexer(
 
     sparse_table = SparseTableBackend(
         token_to_kv_pool=token_to_kv_pool,
-        req_to_token=req_to_token,
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
