@@ -11,12 +11,13 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     advance_to_nth_chunk,
     base_engine_kwargs,
     exhaust_row_pool,
+    run_until,
     run_until_finished,
     warmup_radix,
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=460, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=297, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=460, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -55,9 +56,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         )
         assert r.rid == "explicit-rid-test", f"explicit rid not honored: {r.rid!r}"
         yield
-        assert (
-            t.find_req_by_rid("explicit-rid-test") is not None
-        ), "explicit rid not visible to the scheduler after one step"
+        assert t.find_req_by_rid("explicit-rid-test") is not None, (
+            "explicit rid not visible to the scheduler after one step"
+        )
 
     def test_find_req_by_rid_hit_and_miss(self):
         self.server.execute_script(self._script_find_req_by_rid_hit_and_miss)
@@ -67,12 +68,12 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4)
         yield
         found = t.find_req_by_rid(r.rid)
-        assert (
-            found is not None and found.rid == r.rid
-        ), f"find_req_by_rid missed the live rid {r.rid!r}"
-        assert (
-            t.find_req_by_rid("no-such-rid") is None
-        ), "find_req_by_rid returned a req for an unknown rid"
+        assert found is not None and found.rid == r.rid, (
+            f"find_req_by_rid missed the live rid {r.rid!r}"
+        )
+        assert t.find_req_by_rid("no-such-rid") is None, (
+            "find_req_by_rid returned a req for an unknown rid"
+        )
         yield from run_until_finished(r)
 
     def test_is_finished_reflects_completion(self):
@@ -93,9 +94,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_req_handle_req_property(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4)
         yield
-        assert (
-            r.req is not None and r.req.rid == r.rid
-        ), f"handle.req did not resolve to the live req for {r.rid!r}"
+        assert r.req is not None and r.req.rid == r.rid, (
+            f"handle.req did not resolve to the live req for {r.rid!r}"
+        )
         bogus = ScriptedReqHandle(rid="no-such-rid", context=t)
         assert bogus.req is None, "handle.req returned a req for an unknown rid"
         yield from run_until_finished(r)
@@ -121,12 +122,12 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from advance_to_nth_chunk(r, 1)
         assert r.is_chunking, "handle.is_chunking False during multi-chunk prefill"
-        assert t.is_chunking(
-            r.rid
-        ), "context.is_chunking False during multi-chunk prefill"
-        assert not t.is_chunking(
-            "no-such-rid"
-        ), "context.is_chunking True for an unknown rid"
+        assert t.is_chunking(r.rid), (
+            "context.is_chunking False during multi-chunk prefill"
+        )
+        assert not t.is_chunking("no-such-rid"), (
+            "context.is_chunking True for an unknown rid"
+        )
         yield from run_until_finished(r)
         assert not r.is_chunking, "handle.is_chunking still True after finish"
         assert not t.is_chunking(r.rid), "context.is_chunking still True after finish"
@@ -146,9 +147,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert (
-            req is not None and req in t.scheduler.waiting_queue
-        ), f"pause(retract) did not park the req in waiting_queue; found {req!r}"
+        assert req is not None and req in t.scheduler.waiting_queue, (
+            f"pause(retract) did not park the req in waiting_queue; found {req!r}"
+        )
 
         frozen = len(req.output_ids)
         for _ in range(3):
@@ -180,9 +181,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert (
-            req is not None and req not in t.scheduler.waiting_queue
-        ), f"pause(in_place) should not retract the req to waiting_queue; found {req!r}"
+        assert req is not None and req not in t.scheduler.waiting_queue, (
+            f"pause(in_place) should not retract the req to waiting_queue; found {req!r}"
+        )
 
         for _ in range(3):
             yield
@@ -242,9 +243,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
         t.flush_cache()
         yield
-        assert (
-            not t.get_all_node_hit_counts()
-        ), "flush_cache did not clear the radix tree"
+        assert not t.get_all_node_hit_counts(), (
+            "flush_cache did not clear the radix tree"
+        )
 
     def test_get_all_node_hit_counts_increments_on_cache_hit(self):
         self.server.execute_script(self._script_hit_counts_increment_on_cache_hit)
@@ -283,17 +284,17 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         )
         yield from advance_to_decode_step(r, 1)
         lock_refs = t.get_all_node_lock_refs()
-        assert (
-            lock_refs and max(lock_refs.values()) >= 1
-        ), f"expected a locked radix node while the req runs; got {lock_refs}"
+        assert lock_refs and max(lock_refs.values()) >= 1, (
+            f"expected a locked radix node while the req runs; got {lock_refs}"
+        )
 
         yield from run_until_finished(r)
         for _ in range(3):
             yield
         released = t.get_all_node_lock_refs()
-        assert released and all(
-            ref == 0 for ref in released.values()
-        ), f"radix nodes still locked after the req finished: {released}"
+        assert released and all(ref == 0 for ref in released.values()), (
+            f"radix nodes still locked after the req finished: {released}"
+        )
 
     def test_start_req_ignore_eos_runs_full_length(self):
         self.server.execute_script(self._script_ignore_eos_runs_full_length)
@@ -301,12 +302,14 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     @staticmethod
     def _script_ignore_eos_runs_full_length(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=6, ignore_eos=True)
-        yield from run_until_finished(r)
+        # Hold the req while it runs: once its last token is processed it may
+        # leave every scheduler set in the same step.
+        yield from advance_to_decode_step(r, 1)
         req = r.req
-        assert req is not None, "finished req vanished before its output could be read"
-        assert (
-            len(req.output_ids) == 6
-        ), f"ignore_eos must decode the full length; got {list(req.output_ids)!r}"
+        yield from run_until_finished(r)
+        assert len(req.output_ids) == 6, (
+            f"ignore_eos must decode the full length; got {list(req.output_ids)!r}"
+        )
 
     def test_start_req_priority_is_propagated(self):
         self.server.execute_script(self._script_priority_is_propagated)
@@ -392,9 +395,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from run_until_finished(r)
         for _ in range(5):
             yield
-        assert (
-            t.list_active_reqs() == []
-        ), "active reqs should drain to empty after finish"
+        assert t.list_active_reqs() == [], (
+            "active reqs should drain to empty after finish"
+        )
 
     def test_kv_pages_held_during_run_released_after(self):
         self.server.execute_script(self._script_kv_pages_set_then_released)
@@ -438,9 +441,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         t.flush_cache()
         yield
         after_free = t.engine_stats()["kv_pool_free"]
-        assert (
-            after_free >= during_free
-        ), f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
+        assert after_free >= during_free, (
+            f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
+        )
 
     def test_lock_refs_held_during_run_released_after(self):
         self.server.execute_script(self._script_lock_refs_held_then_released)
@@ -455,13 +458,13 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from advance_to_decode_step(r, 1)
-        assert (
-            r.lock_refs >= 1
-        ), f"radix lock_ref must be held mid-run; got {r.lock_refs}"
+        assert r.lock_refs >= 1, (
+            f"radix lock_ref must be held mid-run; got {r.lock_refs}"
+        )
         yield from run_until_finished(r)
-        assert (
-            r.lock_refs == 0
-        ), f"lock_refs must be released after finish; got {r.lock_refs}"
+        assert r.lock_refs == 0, (
+            f"lock_refs must be released after finish; got {r.lock_refs}"
+        )
 
     def test_batch_composition_shape_and_disjoint(self):
         self.server.execute_script(self._script_batch_composition)
@@ -477,9 +480,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             "chunked",
             "running",
         }, f"unexpected batch_composition keys: {comp!r}"
-        assert (
-            r.rid in comp["chunked"]
-        ), f"chunked req must be in 'chunked'; got {comp!r}"
+        assert r.rid in comp["chunked"], (
+            f"chunked req must be in 'chunked'; got {comp!r}"
+        )
         prefill, decode, chunked = (
             set(comp["prefill"]),
             set(comp["decode"]),
@@ -491,9 +494,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             and decode.isdisjoint(chunked)
         ), f"prefill/decode/chunked subsets must be disjoint; got {comp!r}"
         yield from run_until_finished(r)
-        assert (
-            t.batch_composition()["chunked"] == []
-        ), "no chunked req should remain after the req finishes"
+        assert t.batch_composition()["chunked"] == [], (
+            "no chunked req should remain after the req finishes"
+        )
 
     def test_chunks_done_zero_for_unchunked_prompt(self):
         self.server.execute_script(self._script_chunks_done_zero)
@@ -502,9 +505,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_chunks_done_zero(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r)
-        assert (
-            r.chunks_done == 0
-        ), f"prompt <= chunk must not chunk; got {r.chunks_done}"
+        assert r.chunks_done == 0, (
+            f"prompt <= chunk must not chunk; got {r.chunks_done}"
+        )
 
     def test_chunks_done_counts_two_chunks(self):
         self.server.execute_script(self._script_chunks_done_two)
@@ -513,9 +516,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_chunks_done_two(t: ScriptedContext):
         r = t.start_req(prompt_len=_CHUNK_SIZE + 2, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r)
-        assert (
-            r.chunks_done == 2
-        ), f"chunk_size+2 prompt -> 2 chunks; got {r.chunks_done}"
+        assert r.chunks_done == 2, (
+            f"chunk_size+2 prompt -> 2 chunks; got {r.chunks_done}"
+        )
 
     def test_chunks_done_scales_with_prompt(self):
         self.server.execute_script(self._script_chunks_done_five)
@@ -524,9 +527,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_chunks_done_five(t: ScriptedContext):
         r = t.start_req(prompt_len=5 * _CHUNK_SIZE, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r)
-        assert (
-            r.chunks_done == 5
-        ), f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
+        assert r.chunks_done == 5, (
+            f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
+        )
 
     def test_is_idle_reflects_engine_activity(self):
         self.server.execute_script(self._script_is_idle_reflects_activity)
@@ -552,22 +555,22 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_status_transitions(t: ScriptedContext):
-        assert (
-            t.status("no-such-rid") == "unknown"
-        ), "status of a never-seen rid must be 'unknown'"
+        assert t.status("no-such-rid") == "unknown", (
+            "status of a never-seen rid must be 'unknown'"
+        )
         r = t.start_req(
             prompt_len=_SHORT_PROMPT_LEN,
             max_new_tokens=_DECODE_MAX_NEW_TOKENS,
             ignore_eos=True,
         )
         yield from advance_to_decode_step(r, 1)
-        assert (
-            r.status == "running"
-        ), f"decoding req status should be running; got {r.status!r}"
+        assert r.status == "running", (
+            f"decoding req status should be running; got {r.status!r}"
+        )
         yield from run_until_finished(r)
-        assert (
-            r.status == "finished"
-        ), f"completed req status should be finished; got {r.status!r}"
+        assert r.status == "finished", (
+            f"completed req status should be finished; got {r.status!r}"
+        )
 
     def test_last_batch_forward_mode_extend_then_decode(self):
         self.server.execute_script(self._script_last_batch_forward_mode)
@@ -585,9 +588,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"got {t.last_batch_forward_mode!r}"
         )
         yield from advance_to_decode_step(r, 1)
-        assert (
-            t.last_batch_forward_mode == "DECODE"
-        ), f"decode batch mode should be DECODE; got {t.last_batch_forward_mode!r}"
+        assert t.last_batch_forward_mode == "DECODE", (
+            f"decode batch mode should be DECODE; got {t.last_batch_forward_mode!r}"
+        )
         yield from run_until_finished(r)
 
     def test_remaining_prompt_tokens_shrinks_to_zero(self):
@@ -603,9 +606,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"got {rem} (prompt={_LONG_PROMPT_LEN})"
         )
         yield from run_until_finished(r)
-        assert (
-            r.remaining_prompt_tokens == 0
-        ), f"finished req should have 0 remaining; got {r.remaining_prompt_tokens}"
+        assert r.remaining_prompt_tokens == 0, (
+            f"finished req should have 0 remaining; got {r.remaining_prompt_tokens}"
+        )
 
     def test_evict_radix_full_clears_tree_and_rejects_prefix(self):
         self.server.execute_script(self._script_evict_radix)
@@ -620,18 +623,18 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
         t.evict_radix(prefix_tokens=None)
         yield
-        assert (
-            not t.get_all_node_hit_counts()
-        ), "evict_radix(prefix_tokens=None) did not clear the radix tree"
+        assert not t.get_all_node_hit_counts(), (
+            "evict_radix(prefix_tokens=None) did not clear the radix tree"
+        )
 
         rejected = False
         try:
             t.evict_radix(prefix_tokens=[1, 2, 3])
         except AssertionError:
             rejected = True
-        assert (
-            rejected
-        ), "evict_radix must reject a non-None prefix (only full evict supported)"
+        assert rejected, (
+            "evict_radix must reject a non-None prefix (only full evict supported)"
+        )
 
     def test_warmup_radix_populates_prefix(self):
         self.server.execute_script(self._script_warmup_radix_populates_prefix)
@@ -643,13 +646,14 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from warmup_radix(t, [1] * (2 * _CHUNK_SIZE))
 
         r = t.start_req(prompt_len=2 * _CHUNK_SIZE + 1, max_new_tokens=1)
+        # Hold the req while it is visible: once its last token is processed it
+        # may leave every scheduler set in the same step.
+        yield from run_until(r, lambda h: h.req is not None)
+        req = r.req
         yield from run_until_finished(r)
-        assert (
-            r.req is not None
-        ), "finished req vanished before cached_tokens could be read"
-        assert r.req.cached_tokens > 0, (
+        assert req.cached_tokens > 0, (
             f"req with the warmed prefix should hit the radix cache; "
-            f"got cached_tokens={r.req.cached_tokens}"
+            f"got cached_tokens={req.cached_tokens}"
         )
 
     def test_exhaust_kv_creates_pressure_and_release_restores(self):
@@ -660,24 +664,24 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         stats = t.engine_stats()
         page = stats["page_size"]
         baseline = stats["kv_pool_free"]
-        assert (
-            baseline > 4 * page
-        ), f"need KV headroom to test pressure; baseline={baseline}"
+        assert baseline > 4 * page, (
+            f"need KV headroom to test pressure; baseline={baseline}"
+        )
 
         t.exhaust_kv(leave_pages=2)
         pressured = t.engine_stats()["kv_pool_free"]
-        assert (
-            pressured < baseline
-        ), f"exhaust_kv must reduce free KV; pressured={pressured} baseline={baseline}"
-        assert (
-            pressured <= 3 * page
-        ), f"exhaust_kv(leave_pages=2) left too much free KV; got {pressured} (page={page})"
+        assert pressured < baseline, (
+            f"exhaust_kv must reduce free KV; pressured={pressured} baseline={baseline}"
+        )
+        assert pressured <= 3 * page, (
+            f"exhaust_kv(leave_pages=2) left too much free KV; got {pressured} (page={page})"
+        )
 
         t._release_exhausted_pools()
         restored = t.engine_stats()["kv_pool_free"]
-        assert (
-            restored == baseline
-        ), f"release must restore the full pool; restored={restored} baseline={baseline}"
+        assert restored == baseline, (
+            f"release must restore the full pool; restored={restored} baseline={baseline}"
+        )
         yield
 
     def test_exhaust_row_pool_leaves_requested_free_rows(self):
@@ -692,12 +696,12 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from exhaust_row_pool(t, leave_rows=target_free)
 
         free_after = t.engine_stats()["req_pool_free"]
-        assert (
-            free_after <= target_free
-        ), f"exhaust_row_pool should leave <= {target_free} free rows; got {free_after}"
-        assert (
-            free_after < avail
-        ), f"exhaust_row_pool did not consume any rows; avail={avail} after={free_after}"
+        assert free_after <= target_free, (
+            f"exhaust_row_pool should leave <= {target_free} free rows; got {free_after}"
+        )
+        assert free_after < avail, (
+            f"exhaust_row_pool did not consume any rows; avail={avail} after={free_after}"
+        )
 
     def test_forward_ct_advances_once_per_yield(self):
         self.server.execute_script(self._script_forward_ct_advances_once_per_yield)
@@ -710,9 +714,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         r = t.start_req(
             prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=128, ignore_eos=True
         )
-        assert (
-            sched.forward_ct == before_no_yield
-        ), f"forward_ct moved without a yield: {before_no_yield} -> {sched.forward_ct}"
+        assert sched.forward_ct == before_no_yield, (
+            f"forward_ct moved without a yield: {before_no_yield} -> {sched.forward_ct}"
+        )
 
         yield from advance_to_decode_step(r, 1)
 
@@ -781,7 +785,6 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
 
 class TestScriptedRuntimeSession(CustomTestCase):
-
     def test_shutdown_is_idempotent(self):
         session = ScriptedHttpServer.start(**_ENGINE_KWARGS)
         session.shutdown()

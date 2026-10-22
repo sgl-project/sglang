@@ -1,3 +1,4 @@
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -6,8 +7,25 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
     GlmImageAR,
     GlmImageBeforeDenoisingStage,
+    GlmImageDecodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class GlmImageDenoiserDecodingStage(GlmImageDecodingStage):
+    """Run VAE decoding on the denoiser because this topology has no decoder worker."""
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+
+class GlmImageDenoiserPreparationStage(GlmImageBeforeDenoisingStage):
+    """Run DiT preparation on the denoiser because AR runs in the server head."""
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
 
 class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
@@ -24,6 +42,10 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
+        is_glm_distributed_mode = (
+            self._disagg_role == RoleType.DENOISER
+            and server_args.srt_encoder_url is not None
+        )
         self.add_stage(
             GlmImageAR(
                 processor=self.get_module("processor"),
@@ -32,8 +54,13 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             "glm_image_ar",
         )
 
+        before_denoising_stage_cls = (
+            GlmImageDenoiserPreparationStage
+            if is_glm_distributed_mode
+            else GlmImageBeforeDenoisingStage
+        )
         self.add_stage(
-            GlmImageBeforeDenoisingStage(
+            before_denoising_stage_cls(
                 vae=self.get_module("vae"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
@@ -50,7 +77,22 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        self.add_standard_decoding_stage()
+        if is_glm_distributed_mode:
+            self.add_stage(
+                GlmImageDenoiserDecodingStage(
+                    vae=self.get_module("vae"), pipeline=self
+                ),
+                "decoding_stage",
+            )
+        else:
+            self.add_stage_factory(
+                RoleType.DECODER,
+                lambda: GlmImageDecodingStage(
+                    vae=self.get_module("vae"),
+                    pipeline=self,
+                ),
+                "decoding_stage",
+            )
 
 
 EntryClass = [GlmImagePipeline]

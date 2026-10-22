@@ -6,10 +6,26 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#ifndef USE_ROCM
 #include <cub/cub.cuh>
+#else
+#include <hipcub/hipcub.hpp>
+#endif
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
+#include <bit>
+
+#ifdef USE_ROCM
+// The JIT build does not run hipify, so this file maps the CUDA spellings it
+// uses onto HIP itself. Deliberately local rather than in utils.cuh: that
+// header sits in nearly every kernel's dependency closure, which the build
+// cache is keyed on, so editing it rebuilds every JIT module.
+namespace cub = hipcub;
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#endif
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -529,7 +545,8 @@ struct MoeLoraAlignBlockSizeKernel {
 
       dim3 blockDim(num_thread + fill_threads);
       auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
-      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+      const auto fptr = std::bit_cast<const void*>(kernel);
+      RuntimeDeviceCheck(cudaFuncSetAttribute(fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
 
       LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
           kernel,
