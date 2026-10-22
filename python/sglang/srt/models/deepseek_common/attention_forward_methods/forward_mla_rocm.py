@@ -324,7 +324,7 @@ def rocm_absorb_v_bmm(
         # _bmm_buf is already (batch, heads, dim) contiguous
         if attn.o_proj.weight.dtype == torch.uint8:
             attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-        elif _is_block_scale_fp8(attn.o_proj):
+        elif _use_aiter_gfx95 and _is_block_scale_fp8(attn.o_proj):
             # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
             # reinterpret it with a stride swap, instead of relaying out a copy.
             # Falls back to the materialize (copy) path at M == 1 / non-gfx95.
@@ -351,7 +351,7 @@ def rocm_absorb_v_bmm(
     elif attn.o_proj.weight.dtype == torch.uint8:
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-    elif _is_block_scale_fp8(attn.o_proj):
+    elif _use_aiter_gfx95 and _is_block_scale_fp8(attn.o_proj):
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
         # reinterpret it with a stride swap, instead of relaying out a copy.
