@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -27,17 +26,27 @@ from sglang.srt.layers.pooler import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 
-logger = logging.getLogger(__name__)
+_NO_LM_HEAD_MSG = (
+    "Qwen3_5VLForSequenceClassification has no lm_head and cannot be "
+    "used as a draft/target model for speculative decoding"
+)
+
+
+def _get_num_labels(config) -> int:
+    # Same rule as llama.cpp's Qwen3_5SeqClsModel converter, so both sides agree.
+    id2label = getattr(config, "id2label", None)
+    if id2label:
+        return len(id2label)
+    return getattr(config, "num_labels", 2)
 
 
 class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
-    """Qwen3.5-VL fine-tuned as a sequence classifier.
+    """Qwen3.5-VL with lm_head replaced by a bias-free score head.
 
-    score.weight [num_labels, hidden_size] replaces lm_head; lm_head is unused.
-    Served with --is-embedding; /encode returns the raw classification logits.
+    Returns raw (unnormalized) logits of shape [num_labels] per request,
+    pooled at the last token.
     """
 
     def __init__(
@@ -47,12 +56,19 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        num_labels = getattr(config, "num_labels", 2)
-        self.score = nn.Linear(config.hidden_size, num_labels, bias=False)
-        # LAST-token pooling without L2 normalization — logits, not embeddings.
+        # The parent rebinds self.config to text_config; the composite config
+        # has no top-level hidden_size, but id2label/num_labels live on it.
+        self.score = nn.Linear(
+            self.config.hidden_size, _get_num_labels(config), bias=False
+        )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
-        # No lm_head in this checkpoint; clear the one built by the parent.
         self.lm_head = None
+
+    def get_embed_and_head(self):
+        raise NotImplementedError(_NO_LM_HEAD_MSG)
+
+    def set_embed_and_head(self, embed, head):
+        raise NotImplementedError(_NO_LM_HEAD_MSG)
 
     @torch.no_grad()
     def forward(
@@ -60,11 +76,12 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds=None,
         get_embedding: bool = True,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> EmbeddingPoolerOutput:
-        assert get_embedding, "Qwen3_5VLForSequenceClassification is only used for classification"
+        assert get_embedding, (
+            "Qwen3_5VLForSequenceClassification is only used for classification"
+        )
 
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
@@ -87,57 +104,17 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
-        return score_and_pool(self.score, self.pooler, hidden_states, forward_batch, input_ids)
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        return score_and_pool(
+            self.score, self.pooler, hidden_states, forward_batch, input_ids
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Materialize once so score.* can be intercepted before the parent loop,
-        # which would silently skip any key not in its own params_dict.
-        weights = list(weights)
-        params_dict = dict(self.named_parameters())
-
-        remaining = []
-        for name, loaded_weight in weights:
-            if name.startswith("lm_head"):
-                continue  # no lm_head in this checkpoint
-            if name.startswith("score."):
-                if name in params_dict:
-                    weight_loader = getattr(
-                        params_dict[name], "weight_loader", default_weight_loader
-                    )
-                    weight_loader(params_dict[name], loaded_weight)
-                else:
-                    logger.warning(f"score weight {name} not found in params_dict")
-                continue
-            remaining.append((name, loaded_weight))
-
-        return super().load_weights(remaining)
+        # score.* goes through the parent loader as-is; only drop a stray lm_head.
+        return super().load_weights(
+            (name, w) for name, w in weights if not name.startswith("lm_head")
+        )
 
 
 EntryClass = [Qwen3_5VLForSequenceClassification]
-
-
-# ---------------------------------------------------------------------------
-# Processor registry injection
-#
-# SGLang's multimodal processor registry (PROCESSOR_MAPPING in
-# sglang.srt.managers.multimodal_processor) maps model classes to processor
-# classes. It is built by import_processors(), which scans
-# sglang.srt.multimodal.processors — it does NOT scan sglang.srt.models.
-#
-# Because SGLang Engine uses spawn-mode multiprocessing, any registry
-# mutation made in the parent process is invisible to worker subprocesses.
-# Workers import sglang.srt.models (via import_model_classes) before they
-# call import_processors, so mutations made here at module-level survive:
-# import_processors only appends to PROCESSOR_MAPPING, never resets it.
-#
-# We register Qwen3_5VLForSequenceClassification against QwenVLImageProcessor
-# here so that config.json architectures: ["Qwen3_5VLForSequenceClassification"]
-# resolves to the correct VL processor in every worker process.
-# ---------------------------------------------------------------------------
-try:
-    from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING
-    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
-
-    PROCESSOR_MAPPING[Qwen3_5VLForSequenceClassification] = QwenVLImageProcessor
-except Exception as _e:
-    logger.warning(f"Could not register processor for Qwen3_5VLForSequenceClassification: {_e}")

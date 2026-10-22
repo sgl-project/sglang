@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import get_platform
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5VLForSequenceClassification",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
