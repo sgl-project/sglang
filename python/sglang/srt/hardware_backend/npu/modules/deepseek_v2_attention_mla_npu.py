@@ -567,7 +567,8 @@ def forward_dsa_prepare_npu(
 
 def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     """Lay this rank's per-request shards out at their padded send offsets."""
-    send = shards.new_empty((plan.send_rows, *shards.shape[1:]))
+    # Zeroed: no rank reads the pad rows, but they still cross the collective.
+    send = shards.new_zeros((plan.send_rows, *shards.shape[1:]))
     src = dst = 0
     for local_len, padded_len in zip(plan.local_lens, plan.padded_lens):
         send[dst : dst + local_len] = shards[src : src + local_len]
@@ -594,7 +595,7 @@ def _dcp_gather_extend_kv_npu(
     minutes. The keys travel separately because the operator takes them apart.
     """
     parallel = runtime_context.get_parallel()
-    plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
+    plan = forward_batch.npu_dcp_extend_gather
     if plan is None:
         plan = dcp_layout.plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
@@ -807,10 +808,11 @@ def npu_mla_preprocess(
         if (
             get_disagg().disaggregation_mode == "decode"
             and m.mla_preprocess.uses_mlaprolog()
+            and m.mla_preprocess.weight_quant_mode != 2
             and m.w_kc is not None
         ):
             m.w_kc.untyped_storage().resize_(0)
-    # mlaprolog does not require additional calculation of q_lora
+    # MLAProlog returns q_lora; BF16 indexers need it recomputed below.
     if m.mla_preprocess.uses_mlaprolog():
         (
             q_pe,
@@ -824,6 +826,19 @@ def npu_mla_preprocess(
         ) = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
+        if m.mla_preprocess.weight_quant_mode == 2 and m.indexer is not None:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUW8A8Int8DynamicLinearMethod,
+            )
+
+            if not isinstance(
+                getattr(m.indexer.wq_b.scheme, "kernel", None),
+                NPUW8A8Int8DynamicLinearMethod,
+            ):
+                # BF16 indexers need q_lora before INT8 quantization.
+                q = m.fused_qkv_a_proj_with_mqa(hidden_states)[0][..., : m.q_lora_rank]
+                q_lora = m.q_a_layernorm(q)
+                dynamic_scale = None
     else:
         if m.alt_stream is not None:
             mla_event = torch.npu.Event()
