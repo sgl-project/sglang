@@ -9,7 +9,6 @@ from typing import Iterator
 
 import numpy as np
 import torch
-from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -266,12 +265,16 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             rw, rh = round(iw * scale), round(ih * scale)
-            img = preprocess_image(
-                img,
-                device=self.device,
-                sizes=((rw, rh),),
-                crop=((rh - oh) // 2, (rw - ow) // 2, oh, ow),
-            ).contiguous().unsqueeze(2)
+            img = (
+                preprocess_image(
+                    img,
+                    device=self.device,
+                    sizes=((rw, rh),),
+                    crop=((rh - oh) // 2, (rw - ow) // 2, oh, ow),
+                )
+                .contiguous()
+                .unsqueeze(2)
+            )
             batch.height = oh
             batch.width = ow
             # TODO: should we store in a new field: pixel values?

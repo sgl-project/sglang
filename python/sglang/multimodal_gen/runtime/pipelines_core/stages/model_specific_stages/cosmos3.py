@@ -470,13 +470,21 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             for src in image_sources:
                 image = load_image(src)
                 scale = max(target_w / image.width, target_h / image.height)
-                width, height = math.ceil(scale * image.width), math.ceil(scale * image.height)
+                width, height = (
+                    math.ceil(scale * image.width),
+                    math.ceil(scale * image.height),
+                )
                 tensors.append(
                     preprocess_image(
                         image,
                         device=get_local_torch_device(),
                         sizes=((width, height),),
-                        crop=((height - target_h) // 2, (width - target_w) // 2, target_h, target_w),
+                        crop=(
+                            (height - target_h) // 2,
+                            (width - target_w) // 2,
+                            target_h,
+                            target_w,
+                        ),
                     )[0].contiguous()
                 )
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()

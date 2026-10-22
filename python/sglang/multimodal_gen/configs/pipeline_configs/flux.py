@@ -611,14 +611,23 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             multiple = self.vae_config.arch_config.vae_scale_factor * 2
             out_w, out_h = width // multiple * multiple, height // multiple * multiple
             # match Flux2ImageProcessor's resize-and-paste center, including odd sizes
-            resize_w = out_w if out_w / out_h > width / height else width * out_h // height
-            resize_h = out_h if out_w / out_h <= width / height else height * out_w // width
+            resize_w = (
+                out_w if out_w / out_h > width / height else width * out_h // height
+            )
+            resize_h = (
+                out_h if out_w / out_h <= width / height else height * out_w // width
+            )
             sizes.append((resize_w, resize_h))
             pixels = preprocess_image(
                 image,
                 device=get_local_torch_device(),
                 sizes=tuple(sizes),
-                crop=(resize_h // 2 - out_h // 2, resize_w // 2 - out_w // 2, out_h, out_w),
+                crop=(
+                    resize_h // 2 - out_h // 2,
+                    resize_w // 2 - out_w // 2,
+                    out_h,
+                    out_w,
+                ),
             )
             return pixels, (out_w, out_h)
         img = image

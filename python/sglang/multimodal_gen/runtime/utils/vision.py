@@ -133,7 +133,7 @@ def preprocess_image(
             mean=(0.5, 0.5, 0.5) if last else None,
             std=(0.5, 0.5, 0.5) if last else None,
         )
-    return pixels.permute(2, 0, 1).unsqueeze(0)
+    return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 
 # adapted from diffusers.utils import load_image
