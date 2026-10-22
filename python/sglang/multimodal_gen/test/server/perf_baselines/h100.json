@@ -3561,6 +3561,35 @@
             "estimated_full_test_time_s": 489.9,
             "warmup_peak_vram_mb": 14598.0
         },
+        "wan2_2_animate_2_14b_distilled_ref2v": {
+            "stages_ms": {
+                "WanAnimate2BeforeDenoisingStage": 7846.04,
+                "WanAnimate2DenoisingStage": 69260.73,
+                "WanAnimate2OutputStage": 0.08
+            },
+            "denoise_step_ms": {
+                "0": 23165.59,
+                "1": 3081.14,
+                "2": 4366.18,
+                "3": 4368.35,
+                "4": 4373.6,
+                "5": 4377.11,
+                "6": 4376.38,
+                "7": 4380.89,
+                "8": 4382.1,
+                "9": 4374.26
+            },
+            "expected_e2e_ms": 76924.33,
+            "expected_load_ms": 48892.73,
+            "expected_avg_denoise_ms": 6117.67,
+            "expected_median_denoise_ms": 4375.32,
+            "load_peak_vram_mb": 1776.0,
+            "runtime_peak_vram_mb": 36322.0,
+            "load_peak_allocated_mb": 1737.0,
+            "runtime_peak_allocated_mb": 25748.0,
+            "estimated_full_test_time_s": 439.9,
+            "warmup_peak_vram_mb": 14598.0
+        },
         "wan2_2_animate_2_14b_ref2v_cfg_parallel_2gpu": {
             "stages_ms": {
                 "WanAnimate2BeforeDenoisingStage": 5778.62,
