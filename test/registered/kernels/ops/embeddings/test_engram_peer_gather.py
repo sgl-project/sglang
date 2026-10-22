@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.distributed import parallel_state as ps
 from sglang.srt.layers.engram import FP8_BLOCK_SIZE, EngramEmbedding
+from sglang.srt.runtime_context import get_model
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
@@ -62,6 +63,8 @@ def test_lookup_reload_and_graph(group, empty_shards, id_dtype):
     with torch.device("cuda"):
         peer = EngramEmbedding(size, 256, 1, tuple(bounds))
     assert peer._peer_storage is not None
+    with torch.device("cuda"), get_model().override(load_format="dummy"):
+        assert EngramEmbedding(size, 256, 1, tuple(bounds))._peer_storage is None
     peer._load_rows(peer.weight, weight)
     peer._load_rows(peer.scale, scale)
     peer.finish_load("test")
