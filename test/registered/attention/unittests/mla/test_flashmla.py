@@ -6,8 +6,11 @@ import triton
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+    MLA_ATOL,
+    MLA_RTOL,
     MLAAttentionCase,
     build_mla_attention_fixture,
+    expected_mla_fixture_output,
     run_mla_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
@@ -435,6 +438,55 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             "branch (M16) reduces the slice width below this expected "
             "value for the configured page-boundary prefix lens.",
         )
+
+    # A draft step's query sits step + 1 tokens past the committed prefix
+    # `draft_forward` passes to every step as `seq_lens`. Prefixes around
+    # PAGE_SIZE make a dropped step count lose a page as well as keys.
+    DRAFT_STEP_CASE = MLAAttentionCase(
+        name="draft_step_decode_flashmla_page_boundary",
+        backend="flashmla",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        page_size=FLASHMLA_PAGE_SIZE,
+        prefix_lens=(62, 63, 64),
+    )
+
+    def _run_draft_step(self, step: int, *, graph_metadata: bool):
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLAMultiStepDraftBackend,
+        )
+
+        fixture = build_mla_attention_fixture(
+            self, self.DRAFT_STEP_CASE, **MLA_SHAPE_KWARGS
+        )
+        backend = FlashMLAMultiStepDraftBackend(
+            fixture.runner, topk=1, speculative_num_steps=step + 2
+        ).attn_backends[step]
+        batch = fixture.forward_batch
+        batch.seq_lens = batch.seq_lens - (step + 1)
+        batch.seq_lens_cpu = batch.seq_lens_cpu - (step + 1)
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        bs = batch.batch_size
+        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+            if graph_metadata:
+                _init_cuda_graph_capture_metadata(backend, bs, batch)
+                _init_cuda_graph_replay_metadata(backend, bs, batch)
+            else:
+                backend.init_forward_metadata(batch)
+            actual = fixture.actual_module(fixture.input_hidden, batch)
+        torch.testing.assert_close(
+            actual, expected_mla_fixture_output(fixture), atol=MLA_ATOL, rtol=MLA_RTOL
+        )
+
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
+    def test_draft_steps_attend_their_own_tokens(self):
+        """Each multi-step draft backend decodes over the committed prefix plus
+        its own and the earlier steps' draft tokens, eagerly and from graph
+        metadata; a step that reads only the committed prefix drops them."""
+        for step in range(3):
+            for graph_metadata in (False, True):
+                with self.subTest(step=step, graph_metadata=graph_metadata):
+                    self._run_draft_step(step, graph_metadata=graph_metadata)
 
 
 if __name__ == "__main__":

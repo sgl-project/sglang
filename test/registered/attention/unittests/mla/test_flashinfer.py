@@ -3,8 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_schedule
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+    MLA_ATOL,
+    MLA_RTOL,
     MLAAttentionCase,
+    build_mla_attention_fixture,
+    expected_mla_fixture_output,
     make_mla_cases,
     run_mla_attention_case,
 )
@@ -244,6 +250,66 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                     speculative_num_draft_tokens=num_draft_tokens,
                     **MLA_SHAPE_KWARGS,
                 )
+
+    # A draft step's query sits step + 1 tokens past the committed prefix
+    # `draft_forward` passes to every step as `seq_lens`. Prefixes around a
+    # page put the step's tokens across a page boundary.
+    DRAFT_STEP_CASE = MLAAttentionCase(
+        name="draft_step_decode_flashinfer_mla_page_boundary",
+        backend="flashinfer",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        page_size=16,
+        prefix_lens=(14, 15, 16),
+    )
+
+    def _run_draft_step(self, step: int, *, graph_metadata: bool):
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+            FlashInferMLAMultiStepDraftBackend,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        fixture = build_mla_attention_fixture(
+            self, self.DRAFT_STEP_CASE, **MLA_SHAPE_KWARGS
+        )
+        # The multi-step backend takes the index kernel's page size from the
+        # schedule config, which the mock runner does not publish.
+        with get_schedule().override(page_size=self.DRAFT_STEP_CASE.page_size):
+            draft_backend = FlashInferMLAMultiStepDraftBackend(
+                fixture.runner, topk=1, speculative_num_steps=step + 2
+            )
+        batch = fixture.forward_batch
+        batch.seq_lens = batch.seq_lens - (step + 1)
+        batch.seq_lens_cpu = batch.seq_lens_cpu - (step + 1)
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        # The multi-step backend lays out each step's reads from the draft
+        # positions, which start at the committed lengths.
+        batch.positions = batch.seq_lens.to(torch.int64)
+        batch.spec_info = EagleDraftInput()
+        bs = batch.batch_size
+        with torch.no_grad():
+            if graph_metadata:
+                draft_backend.init_cuda_graph_state(max_bs=bs, max_num_tokens=bs)
+                draft_backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                draft_backend.init_forward_metadata_out_graph(batch)
+            else:
+                draft_backend.init_forward_metadata(batch)
+            backend = draft_backend.attn_backends[step]
+            with forward_context(ForwardContext(attn_backend=backend)):
+                actual = fixture.actual_module(fixture.input_hidden, batch)
+        torch.testing.assert_close(
+            actual, expected_mla_fixture_output(fixture), atol=MLA_ATOL, rtol=MLA_RTOL
+        )
+
+    def test_draft_steps_attend_their_own_tokens(self):
+        """Each multi-step draft backend decodes over the committed prefix plus
+        its own and the earlier steps' draft tokens, eagerly and from graph
+        metadata. Planning only the committed prefix drops those tokens; a graph
+        plan doing so also misplaces later requests in the packed indices."""
+        for step in range(3):
+            for graph_metadata in (False, True):
+                with self.subTest(step=step, graph_metadata=graph_metadata):
+                    self._run_draft_step(step, graph_metadata=graph_metadata)
 
 
 if __name__ == "__main__":

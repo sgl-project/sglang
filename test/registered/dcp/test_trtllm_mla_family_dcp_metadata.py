@@ -2,7 +2,9 @@
 
 The rank-local KV-length and page-table plumbing lives on
 :class:`TRTLLMMLABackend`, so the same expectations are asserted for the base
-backend and for both subclasses that inherit it.
+backend and for both subclasses that inherit it. The multi-step draft backends
+they share with flashinfer_mla are admitted under DCP only where that plumbing
+exists.
 """
 
 import contextlib
@@ -12,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import flashinfer_mla_backend
 from sglang.srt.layers.attention import trtllm_mla_backend as backend_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -21,6 +24,8 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,6 +173,97 @@ class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
 
 
 class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
+    backend_cls = CuteDslMLABackend
+
+
+PAGE_SIZE = 64
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "the page-table kernel runs on CUDA")
+class _DraftStepLengthTests:
+    """Step i of a multi-step draft backend decodes over the committed prefix
+    `draft_forward` passes as `seq_lens`, plus its own and the earlier steps'
+    draft tokens; reading only the prefix drops those keys and, past a page
+    boundary, their page."""
+
+    backend_cls = None
+    STEP = 2
+
+    def _backend(self, bs: int):
+        backend, metadata = _make_backend(self.backend_cls, bs)
+        backend.speculative_step_id = self.STEP
+        backend.page_size = PAGE_SIZE
+        backend.req_to_token = torch.arange(
+            bs * 4 * PAGE_SIZE, dtype=torch.int32, device="cuda"
+        ).view(bs, -1)
+        backend.kv_index_translator = SimpleNamespace(is_translating=False)
+        return backend, metadata
+
+    def _assert_step_lengths(self, metadata, seq_lens: torch.Tensor):
+        expected = (seq_lens + self.STEP + 1).to(torch.int32)
+        torch.testing.assert_close(metadata.seq_lens_k, expected)
+        pages = (metadata.block_kv_indices >= 0).sum(dim=1).to(torch.int32)
+        torch.testing.assert_close(pages, (expected + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    def test_graph_replay_counts_the_step_tokens(self):
+        bs = 3
+        backend, metadata = self._backend(bs)
+        seq_lens = torch.tensor([61, 62, 64], dtype=torch.int64, device="cuda")
+        no_dcp = SimpleNamespace(dcp_enabled=False)
+        with patch.object(backend_module, "get_parallel", return_value=no_dcp):
+            backend._apply_cuda_graph_metadata(
+                plan=None,
+                bs=bs,
+                req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
+                seq_lens=seq_lens,
+                forward_mode=ForwardMode.DECODE,
+            )
+        self._assert_step_lengths(metadata, seq_lens)
+
+    def test_eager_metadata_counts_the_step_tokens(self):
+        bs = 3
+        backend, _ = self._backend(bs)
+        backend._kv_shard_pool = None
+        backend.max_context_len = 4 * PAGE_SIZE
+        seq_lens = torch.tensor([61, 62, 64], dtype=torch.int64, device="cuda")
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
+            kv_loc_plan=None,
+        )
+        no_dcp = SimpleNamespace(dcp_enabled=False)
+        with patch.object(backend_module, "get_parallel", return_value=no_dcp):
+            backend.init_forward_metadata(forward_batch)
+        metadata = forward_batch.decode_trtllm_mla_metadata
+        self._assert_step_lengths(metadata, seq_lens)
+        self.assertEqual(metadata.max_seq_len_k, 64 + self.STEP + 1)
+
+    def test_dcp_graph_replay_counts_the_step_tokens(self):
+        bs = 3
+        backend, metadata = self._backend(bs)
+        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
+
+        fill = _apply(
+            backend, bs=bs, seq_lens=seq_lens, forward_mode=ForwardMode.DECODE
+        )
+
+        expected_global = seq_lens + self.STEP + 1
+        torch.testing.assert_close(metadata.global_seq_lens_k, expected_global)
+        expected_local = get_dcp_lens(expected_global, DCP_SIZE, DCP_RANK).to(
+            torch.int32
+        )
+        torch.testing.assert_close(metadata.seq_lens_k, expected_local)
+        torch.testing.assert_close(fill.call_args.args[2], expected_local)
+
+
+class TestTRTLLMMLADraftStepLengths(_DraftStepLengthTests, CustomTestCase):
+    backend_cls = TRTLLMMLABackend
+
+
+class TestCuteDslMLADraftStepLengths(_DraftStepLengthTests, CustomTestCase):
     backend_cls = CuteDslMLABackend
 
 
@@ -596,6 +692,48 @@ class TestDcpDecodeLayout(CustomTestCase):
                 ]
                 self.assertEqual(sum(grew), 1, f"n={n}, global_len={global_len}")
                 self.assertEqual(grew[(global_len - 1) % n], 1)
+
+
+class _PastAdmission(Exception):
+    """Raised by the first step a multi-step draft backend takes past its
+    admission checks, before it allocates."""
+
+
+class TestMLADraftDecodeDcpAdmission(CustomTestCase):
+    """Under DCP each rank's MLA pool holds only its share of the rows, while
+    flashinfer_mla's draft steps plan the packed global indices unsharded, so
+    the draft factory refuses that backend before it allocates. The trtllm_mla
+    family builds rank-local draft metadata itself and is still admitted."""
+
+    def _create(self, backend: str):
+        runner = SimpleNamespace(
+            draft_attention_backend=backend,
+            use_mla_backend=True,
+            model_config=SimpleNamespace(hf_config=None),
+            req_to_token_pool=SimpleNamespace(size=4),
+        )
+        parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=DCP_SIZE)
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            patch.object(flashinfer_mla_backend, "get_parallel", return_value=parallel),
+            patch.object(
+                flashinfer_mla_backend,
+                "get_cuda_graph_max_batch_size",
+                side_effect=_PastAdmission,
+            ),
+        ):
+            DraftBackendFactory(
+                runner, topk=1, speculative_num_steps=3
+            ).create_decode_backend()
+
+    def test_flashinfer_mla_draft_is_refused_before_it_allocates(self):
+        with self.assertRaisesRegex(ValueError, "decode context parallelism"):
+            self._create("flashinfer")
+
+    def test_trtllm_mla_family_drafts_are_admitted(self):
+        for backend in ("trtllm_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend), self.assertRaises(_PastAdmission):
+                self._create(backend)
 
 
 if __name__ == "__main__":

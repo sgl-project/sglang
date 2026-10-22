@@ -217,12 +217,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
         backend: str = "trtllm-gen",
+        speculative_step_id: Optional[int] = None,
     ):
         super().__init__(
             model_runner,
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
+            speculative_step_id=speculative_step_id,
         )
 
         config = model_runner.model_config
@@ -636,6 +638,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+        elif step_tokens := self._draft_step_tokens(forward_mode):
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], step_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif metadata.seq_lens_k is not None:
             # Plain decode: int64 -> int32 downcast copy into the static
             # buffer (once per step, replacing the per-layer conversion).
@@ -699,7 +705,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
             local_seq_lens = metadata.seq_lens_k
         else:
-            seq_lens = seq_lens[:bs]
+            seq_lens = seq_lens[:bs] + self._draft_step_tokens(forward_mode)
             metadata.global_seq_lens_k.copy_(seq_lens)
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
             local_seq_lens = metadata.seq_lens_k
@@ -845,6 +851,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     self.forward_decode_metadata.seq_lens_k
                 )
             elif forward_batch.forward_mode.is_decode_or_idle():
+                step_tokens = self._draft_step_tokens(forward_batch.forward_mode)
+                if step_tokens:
+                    max_seq = max_seq + step_tokens
+                    seq_lens = seq_lens + step_tokens
                 # One int32 conversion per step; forward_decode reads it back
                 # so the per-layer .to(int32) in _run_decode_kernel stays a
                 # no-op (24 elementwise copies/step otherwise).
@@ -1771,6 +1781,9 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     # Per-step draft decode never reads seq_lens_cpu / seq_lens_sum; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
+    # Each step backend builds its rank-local DCP lengths and block table from
+    # the pool; trtllm_mla's own DCP + spec limit is refused at backend creation.
+    supports_dcp: bool = True
 
     def __init__(
         self,
@@ -1788,6 +1801,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
                 backend=backend,
+                speculative_step_id=i,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
