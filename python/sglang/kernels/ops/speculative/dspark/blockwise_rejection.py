@@ -415,9 +415,8 @@ def blockwise_rejection_triton(
     noise: RejectionNoise,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``candidates`` [bs, S] (column 0 is the root), ``target_logits`` [bs * S, V],
-    ``draft_logits`` [>= bs, S - 1, V'] pre-temperature or None for a one-hot draft.
-    Returns (correct_len int32, bonus int64, cap_trim_lens int32), each [bs]."""
+    """``draft_logits`` is pre-temperature, or None for a one-hot draft. Returns
+    (correct_len int32, bonus int64, cap_trim_lens int32), each [bs]."""
     bs, stride = candidates.shape
     target_vocab = target_logits.shape[-1]
     assert target_logits.stride(-1) == 1 and target_logits.shape[0] == bs * stride

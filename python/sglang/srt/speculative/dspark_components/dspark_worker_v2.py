@@ -371,9 +371,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._verify_epilogue = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
-        # Counter-based rejection draws from the server seed: every TP rank draws the
-        # same coins from the same logits, with no accept broadcast needed. The eager
-        # accept and the sampling-accept region share it.
+        # Counter-based draws from the server seed: every TP rank draws the same coins,
+        # so no accept broadcast is needed.
         self._rejection_noise = (
             make_rejection_noise(self.target_worker.random_seed, self.device)
             if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
@@ -672,9 +671,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         return None if epilogue is None else epilogue.deferred_commit
 
     def _wire_deferred_commit(self, commit) -> None:
-        """The draft side of SGLANG_DSPARK_DEFER_CONTEXT_KV: the proposer writes or
-        hands the staging to the draft graph, whose capture forks the write at its head
-        and whose first draft KV store joins it."""
+        """Draft side of SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft graph forks the
+        staged write at its head and its first KV store joins it."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
             DeepseekV4MultiStepBackend,
@@ -1379,9 +1377,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         return relay
 
     def _begin_simulated_step_ahead(self, *, bs: int, simulate_bonus_sampling_info):
-        """Before the draft launch: neither write depends on the draft. The sim bonus
-        buffers are read only by a folded verify accept, so a step that turns out
-        not fold-eligible ignores them."""
+        """Issued before the draft launch (neither write depends on it); a step that
+        turns out not fold-eligible ignores the sim bonus buffers."""
         executor = self._verify_executor
         executor.begin_simulated_step()
         epilogue = executor.verify_epilogue

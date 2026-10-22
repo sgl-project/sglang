@@ -105,17 +105,13 @@ class AttentionBackend(ABC):
         self.init_forward_metadata_in_graph(forward_batch)
 
     def glue_target_verify_metadata(self) -> str:
-        """Called once by a speculative target verify runner that would capture this
-        backend's ``init_forward_metadata_out_graph`` into its metadata glue graph:
-        "" accepts, otherwise the reason not to. Accept only a prep that reads runner
-        slots and the backend's own buffers, with python branches fixed per key."""
+        """Empty if the target verify prep may be captured into the metadata glue graph
+        (reads only runner slots and backend buffers), else the reason it may not."""
         return "the attention backend declares no host-free target verify prep"
 
     def glue_draft_metadata(self) -> str:
-        """Called once by a speculative draft runner that would capture this
-        backend's ``init_forward_metadata_out_graph`` into its metadata glue graph:
-        "" accepts (and prepares the backend for it), otherwise the reason not to.
-        Accept only a prep whose host inputs are constant per replay key."""
+        """Empty if the draft prep may be captured into the metadata glue graph (host
+        inputs constant per replay key), else the reason it may not."""
         return "the attention backend declares no host-free draft prep"
 
     def init_forward_metadata_out_graph(

@@ -564,9 +564,8 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # Static verify graphs of a batch in [MIN_BS, MAX_BS] (MAX_BS 0: no upper
-    # bound) run the greedy accept and its bookkeeping as one kernel. Off while
-    # the accept-site TP broadcast is selected (SGLANG_SPEC_TP_SYNC).
+    # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
+    # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(False)
     SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
     SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)

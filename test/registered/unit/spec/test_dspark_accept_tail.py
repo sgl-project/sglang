@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
@@ -100,13 +101,10 @@ class TestAcceptTailParity(CustomTestCase):
             draft_tokens=draft_tokens,
         )
 
-        for field in eager.__struct_fields__:
+        got, want = msgspec.structs.asdict(graph), msgspec.structs.asdict(eager)
+        for field, value in want.items():
             self.assertTrue(
-                torch.equal(
-                    getattr(graph, field).cpu().long(),
-                    getattr(eager, field).cpu().long(),
-                ),
-                field,
+                torch.equal(got[field].cpu().long(), value.cpu().long()), field
             )
         self.assertEqual(
             [site for site, _ in graph_sync.calls],
@@ -190,12 +188,10 @@ class TestFusedStaticAcceptTail(CustomTestCase):
                     separate = self._static_accept(
                         fused=False, tp_sync=_NoSiteTpSync(), **kw
                     )
-                    got, ref = fused.read_accept(BS), separate.read_accept(BS)
-                    for field in ref.__struct_fields__:
-                        self.assertTrue(
-                            torch.equal(getattr(got, field), getattr(ref, field)),
-                            field,
-                        )
+                    got = msgspec.structs.asdict(fused.read_accept(BS))
+                    ref = msgspec.structs.asdict(separate.read_accept(BS))
+                    for field, value in ref.items():
+                        self.assertTrue(torch.equal(got[field], value), field)
 
     def test_accept_site_broadcast_keeps_separate_ops(self):
         # Rank 0's results are broadcast between the ops; one kernel would skip it.

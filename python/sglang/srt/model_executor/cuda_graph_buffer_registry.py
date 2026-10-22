@@ -525,9 +525,8 @@ class CudaGraphBufferRegistry:
             slot.post_fill(slot.buffer, forward_batch, ctx)
 
     def copy_slots(self, sources: Dict[str, torch.Tensor]) -> None:
-        """Copy each source into the head of the same-named plain slot, as
-        ``fill_from`` does for an unpadded batch: no padding reset, no hooks, and no
-        copy for a source that already is the slot's view (written in place)."""
+        """``fill_from`` for an unpadded batch, by slot name: no padding reset or hooks,
+        and no copy for a source that already is the slot's view."""
         dsts: List[torch.Tensor] = []
         srcs: List[torch.Tensor] = []
         for name, src in sources.items():

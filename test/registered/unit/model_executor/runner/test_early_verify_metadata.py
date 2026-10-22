@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.early_verify_metadata import (
     STAGED_SLOTS,
     EarlyVerifyMetadata,
+    VerifyInputSources,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -159,7 +160,11 @@ def test_side_stream_work_is_visible_after_take():
         for _ in range(4):
             busy = busy @ busy.T / 2048  # the "draft", after the head
         early.stage(
-            glue=Glue(), key=KEY, registry=registry, sources=sources, after=head
+            glue=Glue(),
+            key=KEY,
+            registry=registry,
+            sources=VerifyInputSources(**sources),
+            after=head,
         )
         other = dict(sources, positions=sources["positions"].clone())
         if step == 1:

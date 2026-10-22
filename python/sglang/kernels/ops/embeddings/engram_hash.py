@@ -71,8 +71,7 @@ def engram_commit_history(
     gate: Optional[torch.Tensor] = None,
 ) -> None:
     """Update distinct live request slots with anchor + correct drafts, not bonus.
-    With ``live_rows`` and ``gate``, rows whose live entry is 0 are skipped, and all
-    rows when ``gate[0]`` is 0."""
+    Skips rows whose ``live_rows`` entry is 0, and all rows when ``gate[0]`` is 0."""
     bs = req_slots.numel()
     width = history.shape[1]
     if bs == 0 or width == 0:

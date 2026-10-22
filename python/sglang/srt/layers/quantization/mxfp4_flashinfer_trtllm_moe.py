@@ -464,11 +464,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Deferred finalize returns the permuted GEMM2 output plus the routing
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
-        # FlashInfer keys its tactic cache on the output shape and tunes finalized
-        # calls, so deferred calls pass that shape too (the deferred ABI ignores the
-        # allocation). Measured, not principled: at <= 32 rows the tactic tuned on
-        # dummy routing is slower than the default on real routing, so deferred
-        # calls there keep the (M, 0) placeholder key and the default tactic.
+        # FlashInfer keys its tactic cache on the output shape. At <= 32 rows the tuned
+        # tactic measured slower on real routing, so those keep the (M, 0) key.
         if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
             deferred_output_shape = num_tokens > 32
         else:

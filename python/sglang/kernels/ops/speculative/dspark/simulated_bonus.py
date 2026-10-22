@@ -150,9 +150,8 @@ def simulated_bonus_partials_graph(
     bs: int,
     rows_per_request: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT];
-    a consumer reduces them as ``simulated_bonus_select_partials``. ``correct_len``
-    may be a stride-0 view of one length shared by every request."""
+    """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT],
+    reduced by ``simulated_bonus_select_partials``. ``correct_len`` may be stride-0."""
     assert target_logits.stride(1) == 1
     assert correct_len.dim() == 1 and correct_len.shape[0] == bs
     device = target_logits.device

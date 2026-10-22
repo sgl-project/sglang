@@ -628,9 +628,8 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
-        # SGLANG_DSPARK_FUSED_ACCEPT_TAIL. With the accept-site broadcast selected, only
-        # simulate_fold's decisions (length, draw) are inputs the kernel can take
-        # broadcast; the greedy accept broadcasts derived lengths, so its ops stay separate.
+        # Under the accept-site broadcast the fused tail serves only simulate_fold,
+        # whose broadcast inputs (length, draw) the kernel can take.
         self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
             SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
         )
@@ -742,11 +741,8 @@ class DsparkVerifyEpilogue:
     def run_static(
         self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False
     ) -> bool:
-        """``accept(io, verify_lens=, gate=, gated=)`` fills the accept buffers and returns
-        the gated commit lengths (None when not ``gated``); the engram history, future
-        relay and KV commits follow, gated by ``gate``. ``kv_projected``: the deferred
-        commit's projection was already joined (by the verify graph this step replayed).
-        Returns whether the engram history was committed."""
+        """Run ``accept`` into the accept buffers, then the commits gated by ``gate``;
+        returns whether the engram history was committed."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
@@ -832,9 +828,8 @@ class DsparkVerifyEpilogue:
     def _static_accept_tail(
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool
     ) -> Optional[torch.Tensor]:
-        """The greedy ``_accept`` (and the gated commit lengths) in one launch. Under
-        simulate_fold the length and bonus are simulated, so the argmax is skipped and
-        the in-graph bonus's select runs inside the tail."""
+        """The greedy ``_accept`` and gated commit lengths in one launch; under
+        simulate_fold the argmax is skipped and the bonus select runs in the tail."""
         bs = candidates.shape[0]
         target_predict = bonus_in = bonus_parts = None
         if not self.simulate_fold:

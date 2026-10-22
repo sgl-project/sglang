@@ -1362,9 +1362,8 @@ class DeepseekV4AttnBackend(
         # block's extend lengths come from device constants, one per batch size.
         self.draft_metadata_glued = False
         self._draft_extend_lens: Dict[Tuple[int, ...], torch.Tensor] = {}
-        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: set only by the target verify runner
-        # that stages this metadata (enable_early_verify_metadata); the replay prep then
-        # builds the full metadata and the verify graph records none.
+        # Set by the target verify runner that stages this metadata early: the replay
+        # prep then builds the full metadata and the verify graph records none.
         self.builds_verify_metadata_early = False
         # Ids of the captured verify metadata built that way; the bucket keeps them alive.
         self._early_verify_metadata_ids: set = set()
@@ -1390,9 +1389,8 @@ class DeepseekV4AttnBackend(
         return ""
 
     def glue_draft_metadata(self) -> str:
-        # On FlashMLA without online c128 MTP, a request window or context
-        # parallelism, the DSpark draft block prep launches only device work whose
-        # host inputs follow from the batch size (its CPU lengths feed asserts).
+        # The draft block prep is host-free (host inputs follow from bs, CPU lengths
+        # feed only asserts) except in these cases.
         for bad, why in (
             (not self.is_dspark_draft, "not the DSpark draft runner"),
             (self.trtllm_attn, "trtllm-gen attention"),
@@ -2490,9 +2488,8 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
-        # Built in full by the replay prep (_install_early_verify_metadata), except the
-        # indexers' top-k plans, which the verify graph records as the in-graph upgrade
-        # does: the prep's copy of them diverged at long context.
+        # Replay prep built this in full except the indexer top-k plans, which the graph
+        # records like the in-graph upgrade (the prep's copy diverged at long context).
         if id(self.forward_metadata) in self._early_verify_metadata_ids:
             _replan_topk_in_graph(self.forward_metadata)
             return
@@ -2605,9 +2602,8 @@ class DeepseekV4AttnBackend(
         logger.info("Target verify metadata built outside the verify graph.")
 
     def _uses_early_verify_metadata(self, *, ragged_layout) -> bool:
-        """Whether this target verify prep builds the full metadata itself: only for
-        the variant the runner prepares (capture or replay) under
-        ``DSV41_EARLY_VERIFY_VARIANTS``; every other variant keeps its in-graph upgrade."""
+        """Whether this prep builds the full verify metadata: only for an early
+        variant; the others keep their in-graph upgrade."""
         if not self.builds_verify_metadata_early or ragged_layout is not None:
             return False
         from sglang.srt.model_executor.runner_utils.capture_mode import (
@@ -2625,10 +2621,8 @@ class DeepseekV4AttnBackend(
     def _install_early_verify_metadata(
         self, *, graph_key, raw_metadata: DSV4RawVerifyMetadata, out_cache_loc
     ) -> None:
-        """What ``init_forward_metadata_in_graph`` records for target verify, built
-        here and copied in place into the one metadata object the early variant's
-        verify graph of ``graph_key`` was captured with (its own bucket entry, beside
-        the Raw one the other variants upgrade in-graph)."""
+        """Build what ``init_forward_metadata_in_graph`` records for target verify and
+        copy it into the metadata the early variant's graph was captured with."""
         graph_key = (graph_key, "early")
         # Graph-backed, like the in-graph build it replaces: one indexer call per layer,
         # no free-memory row chunking (a chunked schedule would be rebound, not copied).

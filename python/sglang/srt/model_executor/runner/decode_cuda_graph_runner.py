@@ -25,7 +25,6 @@ Backend selection comes from cuda_graph_config.decode:
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import dataclasses
 import inspect
@@ -87,6 +86,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.early_verify_metadata import (
     STAGED_SLOTS,
     EarlyVerifyMetadata,
+    VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
@@ -563,7 +563,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._skips_prefilled_inputs = self._resolve_skips_prefilled_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._metadata_glue = MetadataGlueGraph(self.device)
-            atexit.register(self._log_draft_glue, " at shutdown")
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
@@ -1804,9 +1803,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _wants_early_verify_metadata(self) -> bool:
-        """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY for this runner, from facts fixed before
-        its buffers are shared: a static DSpark target verify on CUDA, no attention DP,
-        gathered buffer or two-batch overlap."""
+        """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY, from facts fixed before the buffers
+        are shared."""
         return (
             envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY.get()
             and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
@@ -1854,11 +1852,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         max_seq_len: Optional[int],
         after: torch.cuda.Event,
     ) -> bool:
-        """Called right after the draft graph's launch: stage this step's verify inputs
-        and replay their glue graph on a side stream that waits only for ``after`` (the
-        head). False (after ordering the current stream behind any earlier staging)
-        when the batch is padded, its variant is not early, or its glue graph is not
-        captured yet."""
+        """After the draft launch, stage the verify inputs and glue replay on a side
+        stream waiting on ``after``; False when this batch cannot be staged."""
         early = self._early_verify_metadata
         if early is None:
             return False
@@ -1880,12 +1875,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             glue=self._metadata_glue,
             key=key,
             registry=self.buffer_registry,
-            sources={
-                "positions": positions,
-                "out_cache_loc": out_cache_loc,
-                "req_pool_indices": req_pool_indices,
-                "seq_lens": seq_lens,
-            },
+            sources=VerifyInputSources(
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            ),
             after=after,
         )
         return True
@@ -1953,16 +1948,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         steps = glue.replays + glue.eager
         if steps >= self._draft_glue_logged + DRAFT_GLUE_LOG_EVERY:
             self._draft_glue_logged = steps
-            self._log_draft_glue("")
-
-    def _log_draft_glue(self, when: str) -> None:
-        logger.debug(
-            "%s glue: %d graph replays, %d eager (since warm-up)%s",
-            "target verify" if self._target_metadata_glue else "draft",
-            self._metadata_glue.replays,
-            self._metadata_glue.eager,
-            when,
-        )
+            logger.debug(
+                "%s glue: %d graph replays, %d eager (since warm-up)",
+                "target verify" if self._target_metadata_glue else "draft",
+                glue.replays,
+                glue.eager,
+            )
 
     def _glue_draft_inputs(self, fb_view) -> None:
         """The draft glue graph reads its inputs by address: out_cache_loc from the

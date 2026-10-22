@@ -41,13 +41,21 @@ from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGra
 
 logger = logging.getLogger(__name__)
 
-# input_ids is not staged: the draft graph may write it in place (mid fold).
-STAGED_SLOTS = frozenset({"positions", "out_cache_loc", "req_pool_indices", "seq_lens"})
+
+class VerifyInputSources(msgspec.Struct, frozen=True):
+    # input_ids is not staged: the draft graph may write it in place (mid fold).
+    positions: torch.Tensor
+    out_cache_loc: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+
+
+STAGED_SLOTS = frozenset(VerifyInputSources.__struct_fields__)
 
 
 class _StagedVerifyInputs(msgspec.Struct, frozen=True):
     key: Any
-    sources: Dict[str, torch.Tensor]
+    sources: VerifyInputSources
 
 
 class EarlyVerifyMetadata:
@@ -68,16 +76,17 @@ class EarlyVerifyMetadata:
         glue: MetadataGlueGraph,
         key,
         registry: CudaGraphBufferRegistry,
-        sources: Dict[str, torch.Tensor],
+        sources: VerifyInputSources,
         after: torch.cuda.Event,
     ) -> None:
         self.discard()
         self._stream.wait_event(after)
+        slot_sources = msgspec.structs.asdict(sources)
         with torch.cuda.stream(self._stream):
-            registry.copy_slots(sources)
+            registry.copy_slots(slot_sources)
             glue.replay(key)
             self._done.record()
-        for src in sources.values():
+        for src in slot_sources.values():
             src.record_stream(self._stream)
         self._staged = _StagedVerifyInputs(key=key, sources=sources)
         self.staged_ct += 1
@@ -97,10 +106,15 @@ class EarlyVerifyMetadata:
         if staged is None:
             return False
         self.discard()
+        src = staged.sources
         matches = staged.key == key and all(
-            getattr(forward_batch, name) is not None
-            and same_tensor_view(getattr(forward_batch, name), src)
-            for name, src in staged.sources.items()
+            cur is not None and same_tensor_view(cur, staged_src)
+            for cur, staged_src in (
+                (forward_batch.positions, src.positions),
+                (forward_batch.out_cache_loc, src.out_cache_loc),
+                (forward_batch.req_pool_indices, src.req_pool_indices),
+                (forward_batch.seq_lens, src.seq_lens),
+            )
         )
         if matches:
             self.taken_ct += 1

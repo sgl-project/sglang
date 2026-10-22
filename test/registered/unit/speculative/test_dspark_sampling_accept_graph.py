@@ -5,6 +5,7 @@ import contextlib
 import sys
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -182,8 +183,9 @@ def test_replay_equals_eager_at_same_seed(monkeypatch, bs):
         torch.cuda.manual_seed(1234 + step)
         out = graph.run(bs=bs, target_logits=io.logits)
         torch.cuda.synchronize()
+        got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
         for name in _FIELDS:
-            assert torch.equal(getattr(out, name), getattr(ref, name)), (step, name)
+            assert torch.equal(got[name], want[name]), (step, name)
     assert graph.num_replays == 3
 
 
@@ -204,8 +206,9 @@ def test_blockwise_replay_equals_eager_at_same_counter(monkeypatch, bs):
         ref = _eager_reference(io, sampler, bs, rejection_noise=ref_noise)
         out = graph.run(bs=bs, target_logits=io.logits)
         torch.cuda.synchronize()
+        got, want = msgspec.structs.asdict(out), msgspec.structs.asdict(ref)
         for name in _FIELDS:
-            assert torch.equal(getattr(out, name), getattr(ref, name)), (step, name)
+            assert torch.equal(got[name], want[name]), (step, name)
     assert graph.num_replays == 3
 
 

@@ -74,9 +74,8 @@ def sampling_accept_commit_lens(
     block_verification: bool,
     rejection_noise: Optional[RejectionNoise],
 ) -> Optional[torch.Tensor]:
-    """The eager sampling accept and finalize on static buffers: same kernels, same
-    generator draws, same TP sync site; results go to the epilogue's accept buffers.
-    Returns the gated commit lengths when ``gated``."""
+    """The eager sampling accept and finalize into the epilogue's static buffers;
+    returns the gated commit lengths when ``gated``."""
     bs, stride = io.candidates.shape
     params = draft_sampler.params
     draft_tokens = io.candidates[:, 1:]
