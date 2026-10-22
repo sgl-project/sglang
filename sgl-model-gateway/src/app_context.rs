@@ -336,6 +336,12 @@ impl AppContextBuilder {
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_secs)));
 
+        // reqwest defaults TCP_USER_TIMEOUT to 30 s, aborting sends to an engine that is slow to read.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            client_builder = client_builder.tcp_user_timeout(None);
+        }
+
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
