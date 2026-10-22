@@ -315,8 +315,7 @@ def _normalize_text(text: str) -> str:
 
 
 def cache_root() -> pathlib.Path:
-    configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
-    return pathlib.Path(configured).expanduser()
+    return pathlib.Path(envs.SGLANG_JIT_CACHE_DIR.get()).expanduser()
 
 
 def build_key_dir(*, module_name: str, build_key: str) -> pathlib.Path:

@@ -405,7 +405,7 @@ weights and per-row scales, so the choice is made per layer at load time:
 - `jit`: the `convrot_int8` ops in `sglang.kernels.ops.gemm.convrot_int8`,
   compiled by SGLang's JIT for the local GPU on first use (about a minute with
   `nvcc` on the machine; cached under `SGLANG_JIT_CACHE_DIR`, default
-  `~/.cache/sglang/jit`, for later runs). CC 9.0 (Hopper), 10.0 (B200, GB200)
+  `$SGLANG_CACHE_DIR/jit`, for later runs). CC 9.0 (Hopper), 10.0 (B200, GB200)
   and 12.0 / 12.1 (RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark); group
   size 64, 128, 256 or 512; output width a multiple of 8. CC 10.3 (B300,
   GB300) is refused on purpose: Blackwell Ultra cuts INT8 tensor-core

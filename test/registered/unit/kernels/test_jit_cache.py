@@ -515,6 +515,15 @@ def test_layout_is_readable_and_scoped_by_build_key():
     assert scope.parent.parent.name == cache._target_tag()
 
 
+def test_cache_root_follows_sglang_cache_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("SGLANG_JIT_CACHE_DIR", raising=False)
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path))
+    assert cache.cache_root() == tmp_path / "jit"
+
+    monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", str(tmp_path / "elsewhere"))
+    assert cache.cache_root() == tmp_path / "elsewhere"
+
+
 def test_module_name_is_derived_from_the_args():
     assert _spec().module_name == "sgl_kernel_jit_activation_bf16_t"
 
