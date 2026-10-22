@@ -1056,6 +1056,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
             # tables refreshed before each replay.
+            from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+                capture_layer_wait,
+            )
+
+            capture_layer_wait(layer.layer_id)
             layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
             return kda_extend_in_graph(
                 layer=layer,
