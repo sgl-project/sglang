@@ -240,7 +240,6 @@ def _local_expert_ids(layer, expert_id: int) -> List[int]:
     else:
         physical = metadata.logical_to_all_physical(layer.layer_id, expert_id)
         if expert_id < metadata.num_logical_experts:
-            # Same filter as FusedMoE.weight_loader; a fused shared id keeps its slot.
             physical = layer._local_routed_expert_ids(physical)
     local = (layer._map_global_expert_id_to_local_expert_id(p) for p in physical)
     return [i for i in local if 0 <= i < layer.num_local_experts]
