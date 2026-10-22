@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -576,10 +577,11 @@ class SchedulerDisaggregationPrefillMixin:
 
     def prepare_dsv41_encoder_only_req(self: Scheduler, req: Req) -> bool:
         """Shrink the prompt to the prefix the encoder-only prefill covers."""
-        if req.multimodal_inputs is not None:
+        unsupported = dsv41_encoder_only_unsupported(req)
+        if unsupported is not None:
             prepare_abort(
                 req,
-                "--dsv41-encoder-only-prefill supports text prompts only",
+                f"--dsv41-encoder-only-prefill does not support {unsupported}",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
             self.output_streamer.stream_output([req], req.return_logprob)
@@ -594,8 +596,6 @@ class SchedulerDisaggregationPrefillMixin:
 
     def send_dsv41_empty_handoff(self: Scheduler, req: Req) -> None:
         """Hand off a prompt that fits in one window: decode runs all of it."""
-        # The metadata row carries a handoff token; decode ignores it.
-        req.output_ids.append(0)
         self.disagg_prefill_inflight_queue.append(req)
         self.disagg_metadata_buffers.set_buf(req)
         state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
@@ -948,6 +948,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
+        encoder_only = get_disagg().dsv41_encoder_only_prefill
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -1009,8 +1010,11 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                # An encoder-only prefill samples nothing: decode samples the
+                # first token, and runs the grammar on it, after its tail extend.
+                if not encoder_only:
+                    req.output_ids.append(next_token_id)
+                if req.grammar is not None and not encoder_only:
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:

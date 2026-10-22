@@ -1,5 +1,6 @@
 """PD with --dsv41-encoder-only-prefill: encoder-only prefill, tail extend on decode."""
 
+import json
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -107,6 +108,52 @@ class TestDisaggregationDSV41EncoderOnlyPrefill(PDDisaggregationServerBase, GSM8
         # while earlier requests are still decoding.
         with ThreadPoolExecutor(len(PROMPT_LENS)) as pool:
             list(pool.map(self._generate, PROMPT_LENS))
+
+    def _post_decode(self, path, payload):
+        requests.post(
+            self.decode_url + path, json=payload, timeout=60
+        ).raise_for_status()
+
+    def test_retraction_rebootstraps_from_prefill(self):
+        # Retract mid-generation and drop decode's cache: prefill recomputes the
+        # prompt plus the emitted tokens, and decode replays the window again.
+        max_new_tokens = 256
+        rng = random.Random(0)
+        payload = {
+            "input_ids": [rng.randrange(1000, 20000) for _ in range(1000)],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+            "stream": True,
+        }
+        retracted = False
+        final = None
+        self._post_decode("/slow_down", {"forward_sleep_time": 0.02})
+        try:
+            with requests.post(
+                self.lb_url + "/generate", json=payload, stream=True, timeout=600
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                        continue
+                    final = json.loads(line[len(b"data: ") :])
+                    if not retracted and final["meta_info"]["completion_tokens"] >= 8:
+                        self._post_decode("/pause_generation", {"mode": "retract"})
+                        self._post_decode("/flush_cache", {})
+                        self._post_decode(
+                            "/continue_generation", {"torch_empty_cache": False}
+                        )
+                        retracted = True
+        finally:
+            self._post_decode("/slow_down", {"forward_sleep_time": 0.0})
+        self.assertTrue(retracted, "generation finished before the retraction")
+        meta = final["meta_info"]
+        self.assertGreaterEqual(meta["num_retractions"], 1)
+        self.assertEqual(meta["completion_tokens"], max_new_tokens)
+        self.assertEqual(meta["finish_reason"]["type"], "length")
 
 
 if __name__ == "__main__":

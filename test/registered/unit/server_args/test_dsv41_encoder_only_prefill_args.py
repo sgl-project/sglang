@@ -105,6 +105,8 @@ class TestDsv41EncoderOnlyPrefillArgs(CustomTestCase):
             _v41_config(model_type="deepseek_v4"),
             _v41_config(engram_layer_ids=[1, 20]),
             _v41_config(index_source_layer_ids=[2, 8, 14]),
+            # A c4 layer would hold a pending block at the split.
+            _v41_config(compress_ratios=[0, 0, 4] + [2] * 17 + [1] * 20 + [0] * 3),
         ):
             with self.subTest(config=config):
                 with self.assertRaises(ValueError):

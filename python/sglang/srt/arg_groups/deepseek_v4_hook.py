@@ -259,6 +259,13 @@ def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
         raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
     kv_sources = tuple(hf_config.kv_source_layer_ids)
     boundary = max(kv_sources)
+    # An even split leaves no pending compressor state only up to ratio 2; a
+    # c4 or c128 layer would need its partial block transferred.
+    target_ratios = hf_config.compress_ratios[: hf_config.num_hidden_layers]
+    if any(ratio not in (0, 1, 2) for ratio in target_ratios):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires compression ratios 0, 1 and 2 only"
+        )
     if (
         hf_config.compress_ratios[boundary] not in (1, 2)
         or boundary not in hf_config.index_source_layer_ids

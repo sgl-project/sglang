@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    DSV41_PREFIX_LEN_SLOT,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -59,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -823,14 +825,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             is_rebootstrap = True
 
         if get_disagg().dsv41_encoder_only_prefill and not is_retracted:
-            unsupported = None
-            if req.multimodal_inputs is not None:
-                unsupported = "multimodal prompts"
-            elif req.return_logprob and (
-                0 <= req.logprob_start_len < len(req.origin_input_ids)
-            ):
-                # Prefill computes no logits for the prefix it covers.
-                unsupported = "prompt logprobs"
+            unsupported = dsv41_encoder_only_unsupported(req)
             if unsupported is not None:
                 prepare_abort(
                     req,
@@ -2664,6 +2659,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if decode_req.req.dsv41_tail_start is not None:
             # Prefill sampled nothing; the tail extend here samples the next token.
             req = decode_req.req
+            covered = cached_tokens[DSV41_PREFIX_LEN_SLOT].item()
+            if covered != req.dsv41_tail_start:
+                # The tail extend would read KV prefill never wrote, or overwrite it.
+                prepare_abort(
+                    req,
+                    f"Encoder-only prefill covered {covered} prompt tokens, "
+                    f"decode expected {req.dsv41_tail_start}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
             if req.pd_rebootstrap_forced_output_id is not None:
                 # As in a collocated retraction, the re-prefill takes the emitted
                 # boundary token as input instead of resampling it.

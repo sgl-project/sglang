@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.utils import dsv41_encoder_prefix_len
+from sglang.srt.disaggregation.utils import (
+    dsv41_encoder_only_unsupported,
+    dsv41_encoder_prefix_len,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -141,6 +144,45 @@ class TestDsv41TailExtendSchedule(CustomTestCase):
         sched = _scheduler([], running, last_batch=running)
         self.assertIs(Mixin._merge_dsv41_tail_extend(sched, running), running)
         self.assertEqual(running.merge_batch.call_count, 1)
+
+
+class TestDsv41EncoderOnlyRequests(CustomTestCase):
+    @staticmethod
+    def _req(**fields):
+        values = dict(
+            multimodal_inputs=None,
+            input_embeds=None,
+            positional_embed_overrides=None,
+            return_logprob=False,
+            logprob_start_len=-1,
+            origin_input_ids=list(range(300)),
+            return_hidden_states=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            return_sampling_mask=False,
+        )
+        values.update(fields)
+        return SimpleNamespace(**values)
+
+    def test_peers_reject_what_the_prefix_cannot_serve(self):
+        self.assertIsNone(dsv41_encoder_only_unsupported(self._req()))
+        # Decode computes every output token's logprob.
+        self.assertIsNone(
+            dsv41_encoder_only_unsupported(
+                self._req(return_logprob=True, logprob_start_len=300)
+            )
+        )
+        for fields in (
+            {"return_logprob": True, "logprob_start_len": 0},
+            {"input_embeds": [[0.0]]},
+            {"return_hidden_states": True},
+            {"return_routed_experts": True},
+            {"return_sampling_mask": True},
+        ):
+            with self.subTest(**fields):
+                self.assertIsNotNone(
+                    dsv41_encoder_only_unsupported(self._req(**fields))
+                )
 
 
 if __name__ == "__main__":
