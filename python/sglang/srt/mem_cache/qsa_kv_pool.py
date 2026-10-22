@@ -45,6 +45,21 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
     )
 
 
+def qsa_pending_ring_size(compress_ratio: int, max_rows_per_request: int = 1) -> int:
+    """Pending-ring slots per request for forwards of up to ``max_rows_per_request``
+    rows each (speculative verify / draft extend; 1 for plain decode).
+
+    Every row stores its raw key before any group is compressed, and a group
+    completed by a row reaches back ``compress_ratio - 1`` positions, past the
+    forward's first row. Those members survive the forward's later stores only if
+    ``position % ring`` does not repeat over ``compress_ratio + rows - 1``
+    consecutive positions. Rounding up to a power of two gives servers with
+    different draft-token counts (2-5 at ratio 4) the same ring, which PD
+    pending-state transfer requires of prefill and decode."""
+    span = int(compress_ratio) + max(int(max_rows_per_request), 1) - 1
+    return 1 << (span - 1).bit_length()
+
+
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
@@ -95,6 +110,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
+        qsa_max_rows_per_request: int = 1,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -151,26 +167,32 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
         # Storage dtype of the compressed keys and the index Q (the GEMM operands).
         self.qsa_compressed_dtype = qsa_indexer_dtype
-        logger.info(
-            "QSA compressed indexer cache dtype: %s (pending ring %s)",
-            self.qsa_compressed_dtype,
-            self.index_state_dtype,
-        )
         state_size = size + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
         # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # only the members of groups still to be compressed must survive a
+        # forward, addressed as ``req_pool_idx * ring + position % ring``
+        # (qsa_pending_ring_size). Request slot 0 is never allocated, so rows
+        # [0, ring) are the inert dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        self.qsa_ring_size = qsa_pending_ring_size(
+            self.qsa_compress_ratio, qsa_max_rows_per_request
+        )
+        ring_slots = self.qsa_num_request_slots * self.qsa_ring_size
+        logger.info(
+            "QSA compressed indexer cache dtype: %s (pending ring %s, %d slots "
+            "per request)",
+            self.qsa_compressed_dtype,
+            self.index_state_dtype,
+            self.qsa_ring_size,
+        )
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -283,7 +305,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_ring_size,
         )
 
     def get_qsa_pending_state_layer_ids(self):

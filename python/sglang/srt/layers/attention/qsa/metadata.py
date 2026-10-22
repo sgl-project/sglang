@@ -241,19 +241,20 @@ def build_pending_ring_slots(
     sequence_lengths: torch.Tensor,
     logical_positions: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
     is_extend: bool,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
-    On extend, tokens before the pending tail dump into rows [0, ratio),
+    """Pending-ring slot ``req_pool_idx * ring_size + position % ring_size`` per token.
+    On extend, tokens before the pending tail dump into rows [0, ring_size),
     which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * ring_size + positions % ring_size
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % ring_size)
     return slots
 
 
@@ -263,6 +264,7 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
     requests = req_pool_indices.long()[sequence_ids]
@@ -274,7 +276,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * ring_size + positions % ring_size
 
 
 def build_rope_position_matrix(

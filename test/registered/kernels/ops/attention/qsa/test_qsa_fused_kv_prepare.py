@@ -447,7 +447,10 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
         UnquantizedKVCacheMethod,
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+    from sglang.srt.mem_cache.qsa_kv_pool import (
+        QSATokenToKVPool,
+        qsa_pending_ring_size,
+    )
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
@@ -456,6 +459,7 @@ def test_defer_expansion_metadata(mode_name, ratio, budget, monkeypatch):
     pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
     pool.full_kv_pool = storage
     pool.qsa_compress_ratio = ratio
+    pool.qsa_ring_size = qsa_pending_ring_size(ratio, 2)
     pool.qsa_block_topk = budget // ratio
     pool.qsa_compressed_page_size = 64 // ratio
     config = SimpleNamespace(

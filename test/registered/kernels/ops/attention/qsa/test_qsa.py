@@ -476,6 +476,8 @@ def test_qsa_cuda_graph_target_verify_ignores_capture_bucket_requests():
 def test_qsa_target_verify_rejects_branching_speculation():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     backend.compress_ratio = 4
+    # The 8-slot pending ring of a pool sized for 4 draft tokens.
+    backend.token_to_kv_pool = SimpleNamespace(qsa_ring_size=8)
     try:
         backend._require_chain_speculation(
             ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=2)
@@ -484,18 +486,18 @@ def test_qsa_target_verify_rejects_branching_speculation():
         assert "topk=1" in str(exc)
     else:
         raise AssertionError("QSA target verification must reject tree branches")
-    # The pending-group ring keys state by position % ratio: a verify window
-    # wider than the ratio would collide within one forward.
+    # Verify rows store their raw keys before compression: the ring must hold
+    # ratio + draft_tokens - 1 consecutive positions.
     try:
         backend._require_chain_speculation(
-            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=5)
+            ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=6)
         )
     except NotImplementedError as exc:
-        assert "compress ratio" in str(exc)
+        assert "pending index-key ring" in str(exc)
     else:
-        raise AssertionError("QSA must reject draft windows wider than the ratio")
+        raise AssertionError("QSA must reject windows the pending ring cannot hold")
     backend._require_chain_speculation(
-        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=4)
+        ForwardMode.TARGET_VERIFY, SimpleNamespace(topk=1, draft_token_num=5)
     )
 
 
@@ -863,6 +865,7 @@ class _FakeQSAPool:
     qsa_index_head_dim = 128
     qsa_compressed_page_size = 64
     qsa_compress_ratio = COMPRESS_RATIO
+    qsa_ring_size = 2 * COMPRESS_RATIO
     qsa_token_topk = TOKEN_TOPK
     qsa_block_topk = BLOCK_TOPK
 
@@ -992,7 +995,7 @@ class _DispatchIndexer:
 
 
 class _DispatchMetadata:
-    token_to_kv_pool = None
+    token_to_kv_pool = SimpleNamespace(qsa_ring_size=COMPRESS_RATIO)
     out_cache_loc = None
     compress_member_rows = None
     decode_logical_positions = None
@@ -1258,6 +1261,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
 
     class _Pool:
         qsa_compress_ratio = ratio
+        qsa_ring_size = 2 * ratio
         # compressed slots per full-KV page (page 64 tokens / ratio 4)
         qsa_compressed_page_size = full_page // ratio
         qsa_block_topk = 512
@@ -1426,6 +1430,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
 
     class _Pool:
         qsa_compress_ratio = ratio
+        qsa_ring_size = 2 * ratio
         qsa_compressed_page_size = full_page // ratio
         qsa_block_topk = 512
 
@@ -1575,7 +1580,9 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
     )
 
     pages, ratio, full_page = 129, 4, 64
-    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    pool = SimpleNamespace(
+        qsa_compress_ratio=ratio, qsa_ring_size=2 * ratio, qsa_compressed_page_size=16
+    )
     table = torch.arange(
         (bs + 2) * pages * full_page, dtype=torch.int32, device="cuda"
     ).reshape(bs + 2, -1)
