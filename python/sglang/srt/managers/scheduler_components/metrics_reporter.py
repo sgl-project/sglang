@@ -106,6 +106,12 @@ class PrefillStats:
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
+    # Unfinished running requests. Unless mixed chunk merges them into this
+    # batch, they wait for its prefill step; finished ones are only filtered
+    # out before the next decode, so num_running_reqs can overcount them.
+    # Under overlap, requests that finish on the decode step still in flight
+    # are not marked yet and count once.
+    num_waiting_decode_reqs: int = 0
 
     @classmethod
     def from_adder(
@@ -130,6 +136,9 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            num_waiting_decode_reqs=sum(
+                1 for req in running_reqs if not req.finished()
+            ),
         )
 
 
@@ -1313,11 +1322,19 @@ class SchedulerMetricsReporter:
         phase = _forward_pass_phase(prefill_tokens, decode_reqs)
 
         if forward_seconds is not None:
+            # Without mixed chunk, a prefill pass runs alone while the running
+            # decode batch waits for it.
+            waiting_decode_reqs = (
+                batch.prefill_stats.num_waiting_decode_reqs
+                if phase == "prefill_only" and batch.prefill_stats is not None
+                else 0
+            )
             self.metrics_collector.observe_forward_pass_interference(
                 duration_seconds=forward_seconds,
                 phase=phase,
                 prefill_tokens=prefill_tokens,
                 decode_reqs=decode_reqs,
+                waiting_decode_reqs=waiting_decode_reqs,
             )
         if schedule_to_result_seconds is not None:
             self.metrics_collector.observe_schedule_to_result_latency(

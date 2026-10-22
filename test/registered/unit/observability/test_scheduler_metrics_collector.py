@@ -149,6 +149,29 @@ class TestSchedulerMetricsCollector(unittest.TestCase):
         self.assertEqual(labels["decode_reqs_bucket"], "0")
         self.assertEqual(len(collector.decode_step_latency_seconds.observations), 0)
 
+    def test_prefill_only_with_waiting_decodes_observes_prefill_blocking(self):
+        collector = _make_collector()
+
+        collector.observe_forward_pass_interference(
+            duration_seconds=0.089,
+            phase="prefill_only",
+            prefill_tokens=3118,
+            decode_reqs=0,
+            waiting_decode_reqs=4,
+        )
+
+        # The forward-pass series still describes the work scheduled.
+        labels, _ = collector.forward_pass_duration_seconds.observations[0]
+        self.assertEqual(labels["phase"], "prefill_only")
+        self.assertEqual(labels["decode_reqs_bucket"], "0")
+        # The decode side records the wait.
+        self.assertEqual(len(collector.decode_step_latency_seconds.observations), 1)
+        labels, value = collector.decode_step_latency_seconds.observations[0]
+        self.assertEqual(value, 0.089)
+        self.assertEqual(labels["phase"], "prefill_blocking")
+        self.assertEqual(labels["co_scheduled_prefill_bucket"], "1k_4k")
+        self.assertEqual(labels["decode_reqs_bucket"], "2_4")
+
     def test_mixed_observes_decode_step_with_prefill_bucket(self):
         collector = _make_collector()
 

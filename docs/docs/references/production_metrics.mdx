@@ -263,8 +263,11 @@ because only one of them is forward time:
   stage's forward — a fraction of the full model's per-step device time, not
   the end-to-end pipeline latency.
 - `sglang:decode_step_latency_seconds`: The same measurement restricted to
-  passes that include decode requests. This approximates the delay active
-  decoding requests experience before the next decode step completes.
+  passes that include decode requests or that running decode requests waited
+  for. This approximates the delay active decoding requests experience before
+  the next decode step completes. Without `--enable-mixed-chunk` (the default),
+  a prefill pass runs alone while the running requests wait for it; that pass
+  is recorded here as `phase="prefill_blocking"`.
 - `sglang:schedule_to_result_latency_seconds`: Histogram of the wall-clock
   interval from the start of a batch's scheduling decision to the end of its
   result processing. Under overlap this span also covers the *next* batch's
@@ -276,13 +279,15 @@ because only one of them is forward time:
 Labels:
 
 - `phase`: Scheduling phase derived from scheduled prefill token and decode
-  request counts.
+  request counts. `sglang:decode_step_latency_seconds` uses `decode_only`,
+  `mixed`, and `prefill_blocking`.
 - `prefill_tokens_bucket`: Bucketed scheduled prefill token count for
   `sglang:forward_pass_duration_seconds` and
   `sglang:schedule_to_result_latency_seconds`.
 - `co_scheduled_prefill_bucket`: Bucketed scheduled prefill token count for
   `sglang:decode_step_latency_seconds`.
-- `decode_reqs_bucket`: Bucketed number of scheduled decode requests.
+- `decode_reqs_bucket`: Bucketed number of scheduled decode requests. For
+  `phase="prefill_blocking"`, the number of running requests that waited.
 
 Prefill token buckets are `0`, `1_1k`, `1k_4k`, `4k_16k`, `16k_64k`, and
 `64k_plus`. Decode request buckets are `0`, `1`, `2_4`, `5_8`, `9_16`,
@@ -370,14 +375,15 @@ histogram_quantile(
 )
 ```
 
-Mixed long-prefill p99:
+Long-prefill p99, whether decode ran in the same pass (`mixed`) or waited for
+it (`prefill_blocking`):
 
 ```promql
 histogram_quantile(
   0.99,
   sum by (le, co_scheduled_prefill_bucket) (
     rate(sglang:decode_step_latency_seconds_bucket{
-      phase="mixed",
+      phase=~"mixed|prefill_blocking",
       co_scheduled_prefill_bucket=~"16k_64k|64k_plus"
     }[1m])
   )
@@ -391,19 +397,21 @@ histogram_quantile(
   0.99,
   sum by (le, co_scheduled_prefill_bucket) (
     rate(sglang:decode_step_latency_seconds_bucket{
-      phase=~"decode_only|mixed"
+      phase=~"decode_only|mixed|prefill_blocking"
     }[5m])
   )
 )
 ```
 
-Decode steps per second. Note this counts only passes that carried decode
-requests — `decode_step_latency_seconds` skips prefill-only and idle steps — so
-it is decode-step throughput, not engine-step throughput:
+Decode steps per second. This counts only passes that carried decode requests
+(the filter drops `prefill_blocking` passes, and idle steps are never
+recorded), so it is decode-step throughput, not engine-step throughput:
 
 ```promql
 sum by (co_scheduled_prefill_bucket) (
-  rate(sglang:decode_step_latency_seconds_count[5m])
+  rate(sglang:decode_step_latency_seconds_count{
+    phase=~"decode_only|mixed"
+  }[5m])
 )
 ```
 
@@ -431,10 +439,12 @@ histogram_quantile(
 )
 ```
 
-If `sglang:decode_step_latency_seconds` p99 for `phase="mixed"` and
-`co_scheduled_prefill_bucket="16k_64k"` or `"64k_plus"` is repeatedly much
-higher than `phase="decode_only"`, long prefill co-scheduling is likely causing
-decode ITL/TPOT tail spikes. As a practical guide, mixed p99 within 1.2x of
+If `sglang:decode_step_latency_seconds` p99 for `phase=~"mixed|prefill_blocking"`
+and `co_scheduled_prefill_bucket="16k_64k"` or `"64k_plus"` is repeatedly much
+higher than `phase="decode_only"`, long prefill is likely causing decode
+ITL/TPOT tail spikes. Without mixed chunk, look at `prefill_blocking`: a
+prefill pass of a few thousand tokens can already pause every running stream.
+As a practical guide, mixed or prefill-blocking p99 within 1.2x of
 decode-only p99 is weak interference, repeated 1.5x or higher suggests tuning
 chunked prefill or mixed batching, and repeated 2x or higher suggests prefill
 throttling or prefill/decode disaggregation.

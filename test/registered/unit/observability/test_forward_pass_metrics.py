@@ -331,6 +331,60 @@ class TestForwardPassMetrics(unittest.TestCase):
             fpm_start_time=fpm_start_time,
         )
 
+    def _make_prefill_only_batch(self, num_waiting_decode_reqs):
+        return self._make_batch(
+            forward_mode=_FakeForwardMode(is_extend=True),
+            reqs=[_FakeReq(3118)],
+            prefill_stats=PrefillStats(
+                log_input_tokens=3118,
+                log_hit_tokens=0,
+                new_token_ratio=1.0,
+                num_running_reqs=types.SimpleNamespace(),
+                num_new_seqs=1,
+                num_waiting_decode_reqs=num_waiting_decode_reqs,
+            ),
+        )
+
+    def test_prefill_only_pass_reports_waiting_decode_requests(self):
+        for waiting in (0, 4):
+            with self.subTest(waiting=waiting):
+                metrics_collector = _CollectingMetricsCollector()
+                reporter = self._make_device_timed_reporter(metrics_collector)
+                batch = _launch(reporter, self._make_prefill_only_batch(waiting), 0.020)
+
+                reporter.observe_forward_pass_interference(batch)
+
+                observation = metrics_collector.forward_pass_interference[0]
+                self.assertAlmostEqual(observation["duration_seconds"], 0.020)
+                self.assertEqual(observation["phase"], "prefill_only")
+                self.assertEqual(observation["decode_reqs"], 0)
+                self.assertEqual(observation["waiting_decode_reqs"], waiting)
+
+    def test_waiting_decode_requests_exclude_finished_running_requests(self):
+        # Requests that finished on the last decode step stay in the running
+        # batch until the next decode filters them; they wait for nothing.
+        adder = types.SimpleNamespace(
+            log_input_tokens=3118,
+            log_replay_tokens=0,
+            log_hit_tokens=0,
+            reprocessed_log_input_tokens=0,
+            reprocessed_log_hit_tokens=0,
+            log_device_hit_tokens=0,
+            log_host_hit_tokens=0,
+            log_storage_hit_tokens=0,
+            new_token_ratio=1.0,
+            can_run_list=[_FakeReq(3118)],
+        )
+        running_reqs = [
+            types.SimpleNamespace(finished=lambda done=done: done)
+            for done in (False, False, True)
+        ]
+
+        stats = PrefillStats.from_adder(adder, running_reqs)
+
+        self.assertEqual(stats.num_running_reqs.total, 3)
+        self.assertEqual(stats.num_waiting_decode_reqs, 2)
+
     def _make_device_timed_reporter(self, metrics_collector, **reporter_kwargs):
         """Build a reporter whose forward timing comes from a fake device timer."""
         self.scheduler.enable_fpm = False

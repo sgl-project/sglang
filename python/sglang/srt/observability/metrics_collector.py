@@ -1314,6 +1314,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         phase: str,
         prefill_tokens: int,
         decode_reqs: int,
+        waiting_decode_reqs: int = 0,
     ) -> None:
         """Record one forward pass duration and its decode-side view.
 
@@ -1322,6 +1323,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         series are read as "how long did the model take on this pass", so
         folding scheduling or launch work into them would misattribute engine
         time to the forward.
+
+        `decode_reqs` counts decode requests scheduled in this pass and labels
+        the forward-pass series. `waiting_decode_reqs` counts running requests
+        that sat out a prefill-only pass; the decode-side series records that
+        pass as `prefill_blocking`, since those requests waited for all of it.
         """
         prefill_tokens_bucket = bucket_prefill_tokens(prefill_tokens)
         decode_reqs_bucket = bucket_decode_reqs(decode_reqs)
@@ -1333,10 +1339,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             decode_reqs_bucket=decode_reqs_bucket,
         ).observe(duration_seconds)
 
-        if decode_reqs <= 0:
+        if decode_reqs > 0:
+            decode_phase = "mixed" if prefill_tokens > 0 else "decode_only"
+        elif waiting_decode_reqs > 0 and prefill_tokens > 0:
+            decode_phase = "prefill_blocking"
+            decode_reqs_bucket = bucket_decode_reqs(waiting_decode_reqs)
+        else:
             return
 
-        decode_phase = "mixed" if prefill_tokens > 0 else "decode_only"
         self.decode_step_latency_seconds.labels(
             **self.labels,
             phase=decode_phase,
