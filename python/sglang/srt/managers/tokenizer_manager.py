@@ -660,6 +660,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_recovery_succeeded = None
         self.elastic_recovery_error = None
         self.elastic_active_rank_status = [True] * self.elastic_worker_count
+        self._elastic_reported_rank_status = list(self.elastic_active_rank_status)
+        self._elastic_membership_fences = {}
         self._elastic_recovery_lock = asyncio.Lock()
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
@@ -3789,11 +3791,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.elastic_active_rank_status = list(ranks.status)
+        status = list(ranks.status)
+        if len(status) != len(self.elastic_active_rank_status):
+            logger.warning(
+                "Ignoring Elastic EP active-rank update with status len=%d; expected=%d",
+                len(status),
+                len(self.elastic_active_rank_status),
+            )
+            return
+        self._elastic_reported_rank_status = list(status)
+        for rank in self._elastic_membership_fences:
+            status[rank] = False
+        self._apply_active_rank_status(status)
+
+    def _apply_active_rank_status(self, status: List[bool]) -> None:
+        self.elastic_active_rank_status = status
         active_rank_count = sum(self.elastic_active_rank_status)
         self.recover_elastic_ep_communicator.set_fan_out(active_rank_count)
         self.observe_elastic_ep_membership_communicator.set_fan_out(active_rank_count)
-        self._dispatch_to_scheduler(ranks)
+        self._dispatch_to_scheduler(
+            ActiveRanksOutput(status=list(self.elastic_active_rank_status))
+        )
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
         if msg.recovery_update:
@@ -3818,6 +3836,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if msg.terminal:
                 self.elastic_recovery_succeeded = msg.success
                 self.elastic_recovery_error = None if msg.success else msg.error
+                recovery_rank = self.elastic_recovery_rank_offset
+                recovery_fence = self._elastic_membership_fences.get(recovery_rank)
+                if (
+                    msg.success
+                    and recovery_fence is not None
+                    and recovery_fence[:3]
+                    == (
+                        self.elastic_instance_id,
+                        self.elastic_recovery_topology_generation,
+                        self.elastic_recovery_failed_allocation_incarnation,
+                    )
+                ):
+                    self._elastic_membership_fences.pop(recovery_rank, None)
+                    self.update_active_ranks(
+                        ActiveRanksOutput(
+                            status=list(self._elastic_reported_rank_status)
+                        )
+                    )
             return
         if not msg.operation_update:
             if msg.runtime_health is not None:
@@ -4111,6 +4147,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def observe_elastic_ep_membership(
         self, obj: ObserveElasticEPMembershipReqInput
     ) -> ObserveElasticEPMembershipReqOutput:
+        """Apply membership before admitting a recovery operation."""
+        async with self._elastic_recovery_lock:
+            return await self._observe_elastic_ep_membership_locked(obj)
+
+    async def _observe_elastic_ep_membership_locked(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
         """Fan out a CPU-only membership observation to schedulers."""
         if self.attn_replica_size != 1:
             return ObserveElasticEPMembershipReqOutput(
@@ -4125,6 +4168,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 accepted=False,
                 message="Membership observation rank is outside the active topology.",
             )
+        fence = (
+            obj.runtime_instance_id,
+            obj.topology_generation,
+            obj.failed_allocation_incarnation,
+        )
+        previous_fence = self._elastic_membership_fences.get(obj.rank)
+        if previous_fence is not None:
+            previous_epoch = previous_fence[3]
+            previous_identity = previous_fence[:3]
+            if previous_identity == fence and obj.membership_epoch == previous_epoch:
+                pass
+            elif (
+                previous_identity == fence and obj.membership_epoch > previous_epoch
+            ) or obj.topology_generation > previous_fence[1]:
+                pass
+            else:
+                return ObserveElasticEPMembershipReqOutput(
+                    accepted=False,
+                    message=(
+                        "Membership observation is stale or conflicts with the "
+                        "applied slot incarnation."
+                    ),
+                )
         survivor_ranks = {
             rank
             for rank, active in enumerate(self.elastic_active_rank_status)
@@ -4254,6 +4320,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 message="Survivors did not accept the same membership observation key.",
                 submission_id=submission_id,
             )
+        if not responses[0].accepted:
+            return responses[0]
+
+        # The scheduler quorum has durably applied this exact observation.
+        # Fence the local routing view and publish it to the DPC on the same
+        # ordered control channel used by the subsequent recovery request.
+        self._elastic_membership_fences[obj.rank] = (*fence, obj.membership_epoch)
+        status = list(self.elastic_active_rank_status)
+        status[obj.rank] = False
+        self._elastic_reported_rank_status = list(status)
+        self._apply_active_rank_status(status)
         return responses[0]
 
     def _record_membership_observation_progress(

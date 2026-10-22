@@ -115,6 +115,8 @@ def _manager() -> TokenizerManager:
     manager.elastic_recovery_succeeded = None
     manager.elastic_recovery_error = None
     manager.elastic_active_rank_status = [True] * manager.elastic_worker_count
+    manager._elastic_reported_rank_status = list(manager.elastic_active_rank_status)
+    manager._elastic_membership_fences = {}
     manager._elastic_recovery_lock = asyncio.Lock()
     manager.auto_create_handle_loop = MagicMock()
     manager.scale_elastic_ep_communicator = AsyncMock(
@@ -530,7 +532,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_recovery_traverses_real_zmq_control_route(self):
         manager = _manager()
         manager.elastic_worker_count = 2
-        manager.elastic_active_rank_status = [True, False]
+        manager.elastic_active_rank_status = [True, True]
 
         context = zmq.Context()
 
@@ -545,6 +547,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
 
         tokenizer_to_dpc, dpc_receiver = make_channel()
         dpc_to_scheduler, scheduler_receiver = make_channel()
+        dpc_to_failed_scheduler, failed_scheduler_receiver = make_channel()
         scheduler_to_tokenizer, tokenizer_receiver = make_channel()
 
         manager.send_to_scheduler = tokenizer_to_dpc
@@ -552,9 +555,11 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         del manager._dispatch_to_scheduler
 
         controller = DataParallelController.__new__(DataParallelController)
-        controller.workers = [dpc_to_scheduler, None]
-        controller.status = [True, False]
-        controller._active_workers = [0]
+        controller.workers = [dpc_to_scheduler, dpc_to_failed_scheduler]
+        controller.status = [True, True]
+        controller.dp_active = [True, True]
+        controller.max_dp_size = 2
+        controller._active_workers = [0, 1]
         controller.control_message_step = 1
         controller.init_dispatcher()
 
@@ -570,40 +575,109 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
 
         with get_parallel().override(num_dp_ranks=2):
             manager.init_request_dispatcher()
-        manager.recover_elastic_ep_communicator.set_fan_out(1)
+        manager.observe_elastic_ep_membership_communicator.set_fan_out(2)
+        manager.recover_elastic_ep_communicator.set_fan_out(2)
+        self.assertEqual(manager.elastic_active_rank_status, [True, True])
+        self.assertEqual(manager.observe_elastic_ep_membership_communicator._fan_out, 2)
 
-        state = SimpleNamespace(recovery_phase="restoring", recovery_succeeded=None)
+        # Report rank 1's failure while both ranks are still present. The
+        # tokenizer quorum and DPC route must both exclude the failed rank.
         try:
             with (
-                patch.object(ElasticEPStateManager, "instance", return_value=state),
-                patch.object(
-                    ElasticEPStateManager, "request_recovery", return_value=True
+                patch(
+                    "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
+                    return_value="observation-key",
                 ),
                 patch(
                     "sglang.srt.managers.scheduler.get_parallel",
                     return_value=SimpleNamespace(dp_rank=0),
                 ),
             ):
-                task = asyncio.create_task(
-                    manager.recover_elastic_ep(
-                        RecoverElasticEPReqInput(
-                            operation_id="recover-1",
-                            runtime_instance_id="ignored",
+                observation_task = asyncio.create_task(
+                    manager.observe_elastic_ep_membership(
+                        ObserveElasticEPMembershipReqInput(
+                            runtime_instance_id="runtime-1",
                             topology_generation=3,
-                            allocation_id="pod-uid-5",
-                            rank_offset=1,
+                            rank=1,
                             failed_allocation_incarnation="failed-pod-uid",
+                            membership_epoch=4,
                         )
                     )
                 )
+                await asyncio.sleep(0)
+                observation_request = sock_recv(dpc_receiver)
+                self.assertIsInstance(
+                    observation_request, ObserveElasticEPMembershipReqInput
+                )
+                self.assertEqual(
+                    manager.observe_elastic_ep_membership_communicator._result_fan_out,
+                    1,
+                )
+                controller._request_dispatcher(observation_request)
+                rank0_observation = sock_recv(scheduler_receiver)
+                self.assertEqual(rank0_observation.rank, 1)
+                self.assertEqual(
+                    rank0_observation.failed_allocation_incarnation,
+                    "failed-pod-uid",
+                )
+                with self.assertRaises(zmq.Again):
+                    sock_recv(failed_scheduler_receiver, flags=zmq.NOBLOCK)
+                observation_response = scheduler._request_dispatcher(rank0_observation)
+                scheduler.send_control_output(observation_response, rank0_observation)
+                while True:
+                    output = sock_recv(tokenizer_receiver)
+                    manager._result_dispatcher(output)
+                    if isinstance(output, ObserveElasticEPMembershipReqOutput):
+                        break
+                observation_result = await observation_task
+                self.assertTrue(observation_result.accepted)
+                self.assertEqual(observation_result.observation_key, "observation-key")
+
+            ranks = sock_recv(dpc_receiver)
+            self.assertIsInstance(ranks, ActiveRanksOutput)
+            self.assertEqual(ranks.status, [True, False])
+            with patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(elastic_ep_backend="nixl")
+                ),
+            ):
+                controller._request_dispatcher(ranks)
+            self.assertEqual(manager.elastic_active_rank_status, [True, False])
+            self.assertEqual(manager.recover_elastic_ep_communicator._fan_out, 1)
+            self.assertEqual(controller._active_workers, [0])
+
+            state = SimpleNamespace(recovery_phase="restoring", recovery_succeeded=None)
+            with (
+                patch.object(ElasticEPStateManager, "instance", return_value=state),
+                patch.object(
+                    ElasticEPStateManager,
+                    "request_recovery",
+                    return_value=True,
+                ) as request_recovery,
+                patch(
+                    "sglang.srt.managers.scheduler.get_parallel",
+                    return_value=SimpleNamespace(dp_rank=0),
+                ),
+            ):
+                recovery_request = RecoverElasticEPReqInput(
+                    operation_id="recover-1",
+                    runtime_instance_id="ignored",
+                    topology_generation=3,
+                    allocation_id="pod-uid-5",
+                    rank_offset=1,
+                    failed_allocation_incarnation="failed-pod-uid",
+                )
+                task = asyncio.create_task(manager.recover_elastic_ep(recovery_request))
                 await asyncio.sleep(0)
 
                 dpc_request = sock_recv(dpc_receiver)
                 self.assertIsInstance(dpc_request, RecoverElasticEPReqInput)
                 controller._request_dispatcher(dpc_request)
-
                 scheduler_request = sock_recv(scheduler_receiver)
                 self.assertIsInstance(scheduler_request, RecoverElasticEPReqInput)
+                with self.assertRaises(zmq.Again):
+                    sock_recv(failed_scheduler_receiver, flags=zmq.NOBLOCK)
                 scheduler_output = scheduler._request_dispatcher(scheduler_request)
                 scheduler.send_control_output(scheduler_output, scheduler_request)
 
@@ -618,12 +692,19 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     break
 
                 result = await task
+                retry = await manager.recover_elastic_ep(recovery_request)
+                request_recovery.assert_called_once()
+                with self.assertRaises(zmq.Again):
+                    sock_recv(dpc_receiver, flags=zmq.NOBLOCK)
+
         finally:
             for socket in (
                 tokenizer_to_dpc,
                 dpc_receiver,
                 dpc_to_scheduler,
                 scheduler_receiver,
+                dpc_to_failed_scheduler,
+                failed_scheduler_receiver,
                 scheduler_to_tokenizer,
                 tokenizer_receiver,
             ):
@@ -632,6 +713,8 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.recovery_phase, "restoring")
+        self.assertTrue(retry.success)
+        self.assertEqual(retry.operation_id, result.operation_id)
         self.assertEqual(result.submission_id, scheduler_request.submission_id)
         self.assertEqual(
             received_stages,
@@ -641,6 +724,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                 "scheduler_store_completed",
             ],
         )
+        self.assertIsNone(manager.recover_elastic_ep_communicator._result_event)
 
     async def test_membership_observation_uses_active_survivor_quorum(self):
         """The observation itself must exclude the newly failed rank."""
@@ -684,8 +768,53 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         result = await task
         self.assertTrue(result.accepted)
         self.assertEqual(result.observation_key, "observation-key")
-        self.assertEqual(manager.elastic_active_rank_status, [True, True])
+        self.assertEqual(manager.elastic_active_rank_status, [True, False])
+        self.assertEqual(manager.recover_elastic_ep_communicator._fan_out, 1)
+        manager._dispatch_to_scheduler.assert_called_once_with(
+            ActiveRanksOutput(status=[True, False])
+        )
         self.assertEqual(recovery_sent, [])
+
+    def test_membership_fence_masks_stale_status_until_replacement_succeeds(self):
+        manager = _manager()
+        manager.elastic_recovery_operation_id = "recover-1"
+        manager.elastic_recovery_topology_generation = 3
+        manager.elastic_recovery_rank_offset = 1
+        manager.elastic_recovery_failed_allocation_incarnation = "failed-pod-uid"
+        manager._elastic_membership_fences[1] = (
+            "runtime-1",
+            3,
+            "failed-pod-uid",
+            4,
+        )
+
+        # A scheduler report may include the replacement before its terminal
+        # recovery update. Keep the fixed slot fenced until that update proves
+        # the matching recovery operation succeeded.
+        manager.update_active_ranks(ActiveRanksOutput(status=[True, True, True, True]))
+        self.assertEqual(manager.elastic_active_rank_status, [True, False, True, True])
+        manager._dispatch_to_scheduler.assert_called_with(
+            ActiveRanksOutput(status=[True, False, True, True])
+        )
+
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=4,
+                operation_id="recover-1",
+                recovery_update=True,
+                recovery_phase="ready",
+                recovery_topology_generation=3,
+                recovery_rank_offset=1,
+                recovery_failed_allocation_incarnation="failed-pod-uid",
+            )
+        )
+
+        self.assertNotIn(1, manager._elastic_membership_fences)
+        self.assertEqual(manager.elastic_active_rank_status, [True, True, True, True])
+        manager._dispatch_to_scheduler.assert_called_with(
+            ActiveRanksOutput(status=[True, True, True, True])
+        )
 
     async def test_membership_observation_rejects_without_active_ranks(self):
         manager = _manager()
