@@ -106,6 +106,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
+    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -243,7 +244,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         fused_draft_sample=None,
         positions=None,
         draft_step: int = 0,
+        prefill: bool = False,
     ):
+        if prefill and (
+            not is_enabled(sampling_info.synthid_state) or sampling_info.is_all_greedy
+        ):
+            use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+            probs = renorm_draft_probs(logits, sampling_info, use_rejection_sampling)
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(
+                    probs,
+                    num_samples=1,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            return probs if use_rejection_sampling else None, None, topk_p, topk_index
         if (
             is_enabled(sampling_info.synthid_state)
             or synthid_sparse_output is not None
@@ -281,8 +298,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         draft_prob_token_ids: Optional[torch.Tensor],
         sampling_info,
     ):
-        if not is_enabled(sampling_info.synthid_state) or is_mixed(
-            sampling_info.synthid_state
+        if (
+            not is_enabled(sampling_info.synthid_state)
+            or sampling_info.is_all_greedy
+            or is_mixed(sampling_info.synthid_state)
         ):
             return draft_probs, draft_prob_token_ids
         return ensure_sparse_algo5_draft_probs(
@@ -1227,6 +1246,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             synthid_sparse_output,
             fused_draft_sample,
             positions=batch.seq_lens,
+            prefill=True,
         )
         draft_probs, draft_prob_token_ids = self._ensure_sparse_algo5_draft_probs(
             draft_probs,

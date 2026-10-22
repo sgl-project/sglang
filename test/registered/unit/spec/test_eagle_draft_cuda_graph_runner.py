@@ -681,6 +681,31 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                     torch.testing.assert_close(actual_probs, expected_probs)
                     torch.testing.assert_close(actual_tokens, expected_tokens)
 
+    def test_greedy_prefill_retains_public_unpinned_proposal_law(self):
+        """Pinning the initial greedy draft changes upstream's verify chunking."""
+        logits = torch.tensor([[2.0, 1.0, 0.0]])
+        for enabled in (False, True):
+            with (
+                self.subTest(watermarked=enabled),
+                get_context().override_server_args(
+                    speculative_use_rejection_sampling=True
+                ),
+            ):
+                worker = EagleDraftWorker.__new__(EagleDraftWorker)
+                worker.topk = 1
+                info = SimpleNamespace(
+                    synthid_state=object() if enabled else None,
+                    sampling_seed=None,
+                    temperatures=torch.tensor([[2.0]]),
+                    top_ks=torch.tensor([1]),
+                    is_all_greedy=True,
+                )
+                probs, token_ids, _, _ = worker._sample_draft_logits(
+                    logits, info, prefill=True
+                )
+                torch.testing.assert_close(probs, (logits / 2).softmax(-1))
+                self.assertIsNone(token_ids)
+
     def test_execute_leaves_graph_output_ownership_to_caller(self):
         backend = _RecordingDraftBackend()
         pooled_probs = torch.ones(CAPTURE_BS, NUM_STEPS, 8)
