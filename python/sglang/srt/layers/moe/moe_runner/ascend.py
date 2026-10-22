@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe import dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
@@ -68,9 +69,9 @@ if TYPE_CHECKING:
         AscendOpsCombineInput,
         AscendOpsDispatchOutput,
     )
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
@@ -130,8 +131,8 @@ class AscendRunnerCore(MoeRunnerCore):
             # activation step — run() skips it. Left None on purpose so that
             # reaching for it fails loudly instead of silently applying an
             # unfused swiglu to already-requantised activations. This holds
-            # for both dispatchers: ascend_tp gets its activation quant fused
-            # into routing, DeepEP dispatches bf16 and gmm1 quantises it
+            # for every transport: the no-A2A path gets its activation quant
+            # fused into routing, DeepEP dispatches bf16 and gmm1 quantises it
             # itself.
             self.activation = None
         elif (
@@ -173,7 +174,7 @@ class AscendRunnerCore(MoeRunnerCore):
                     limit=config.gemm1_clamp_limit,
                 )
         else:
-            # Non‑DeepEP (ascend_tp) path
+            # Non-DeepEP, no-A2A routing path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
                 inner = NPUSwigluQuant()
@@ -305,18 +306,88 @@ class AscendQuantInfo(MoeQuantInfo):
 # ---------------------------------------------------------------------------
 
 
-@register_pre_permute("ascend_tp", "ascend")
-def pre_permute_ascend_tp_to_ascend(
-    dispatch_output: AscendTPDispatchOutput,
+def _routing_layer(runner_config: MoeRunnerConfig):
+    """The layer the Ascend routing state lives on.
+
+    ``AscendRunnerCore`` reads ``config.layer`` for its kernels, so the permute
+    hooks can rely on it too; fail loudly instead of silently routing nothing.
+    """
+    layer = getattr(runner_config, "layer", None)
+    if layer is None:
+        raise RuntimeError(
+            "Ascend MoE routing requires runner_config.layer to be set."
+        )
+    return layer
+
+
+@register_pre_permute("standard", "ascend")
+def pre_permute_standard_to_ascend(
+    dispatch_output: StandardDispatchOutput,
     quant_info: AscendQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
+    """Sort tokens by expert and (optionally) quantize them in the same op.
+
+    The community dispatcher only carries the token batch plus the top-k
+    output, so the expert permutation and the fused activation quantization
+    belong to the runner's IO adaptation: token routing by expert is not a
+    communication concern.
+
+    ``npu_moe_init_routing_v2`` returns, besides the permuted rows, the row
+    mapping and the per-expert token counts the grouped matmuls need; both are
+    stashed on ``running_state`` for the post-permute, which replaces what the
+    dispatch half of the old Ascend dispatcher used to own.
+    """
+    # Imported here, not at module scope: ``topk`` pulls in eplb/observability/
+    # disaggregation, which imports ``configs.model_config`` while it is still
+    # initializing (model_config -> quantization -> ... -> this module).
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    topk_output = dispatch_output.topk_output
+    if not TopKOutputChecker.format_is_standard(topk_output):
+        raise NotImplementedError(
+            "Ascend MoE routing requires a standard top-k output, got "
+            f"{type(topk_output).__name__}."
+        )
+    if dispatch_output.hidden_states_pre_quant is not None:
+        raise NotImplementedError(
+            "Ascend MoE routing quantizes inside npu_moe_init_routing_v2 and "
+            "cannot consume a pre-quantized routed input."
+        )
+
+    layer = _routing_layer(runner_config)
+    hidden_states = dispatch_output.hidden_states
+    topk_weights = topk_output.topk_weights.to(hidden_states.dtype)
+    topk_ids = topk_output.topk_ids.to(torch.int32)
+    top_k = topk_weights.shape[-1]
+
+    init, finalize, group_list_type = ascend_dispatch.get_routing(layer)
+
+    (
+        permuted_hidden_states,
+        expanded_row_idx,
+        expert_tokens,
+        hidden_states_scale,
+    ) = init._init_routing(
+        hidden_states,
+        topk_ids,
+        runner_config.num_experts,
+        top_k,
+    )
+
+    running_state["ascend_routing"] = {
+        "finalize": finalize,
+        "expanded_row_idx": expanded_row_idx,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+    }
+
     return AscendRunnerInput(
-        hidden_states=dispatch_output.hidden_states,
-        hidden_states_scale=dispatch_output.hidden_states_scale,
-        expert_tokens=dispatch_output.expert_tokens,
-        group_list_type=dispatch_output.group_list_type,
+        hidden_states=permuted_hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        expert_tokens=expert_tokens,
+        group_list_type=group_list_type,
     )
 
 
@@ -391,16 +462,33 @@ def pre_permute_deepep_ll_to_ascend(
     )
 
 
-@register_post_permute("ascend", "ascend_tp")
-def post_permute_ascend_to_ascend_tp(
+@register_post_permute("ascend", "standard")
+def post_permute_ascend_to_standard(
     runner_output: AscendRunnerOutput,
     quant_info: AscendQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> AscendTPCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
+) -> StandardCombineInput:
+    """Scatter the expert outputs back and sum them with the router weights.
 
-    return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
+    ``npu_moe_finalize_routing`` turns the ``[T*top_k, H]`` grouped output back
+    into ``[T, H]``, doing the top-k weighted sum on the way. This replaces the
+    combine half of the old Ascend dispatcher; the community dispatcher's
+    combine is a passthrough for the no-A2A path.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+    )
+
+    state = running_state.pop("ascend_routing")
+    final_hidden_states = state["finalize"]._finalize_routing(
+        runner_output.hidden_states,
+        topk_weights=state["topk_weights"],
+        expanded_row_idx=state["expanded_row_idx"],
+        topk_ids=state["topk_ids"],
+    )
+
+    return StandardCombineInput(hidden_states=final_hidden_states)
 
 
 @register_post_permute("ascend", "ascend_ops")
