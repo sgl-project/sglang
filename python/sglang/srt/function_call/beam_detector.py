@@ -65,12 +65,13 @@ class BeamDetector(ResponseTemplateToolDetector):
 
         return StructuralTag.model_validate(tag)
 
-    def request_structural_tag(
+    def validate_structure_constraint_request(
         self,
-        tools: list[Tool],
         tool_choice: Any,
         parallel_tool_calls: bool,
         strict_requested: bool,
+        *,
+        tools: list[Tool],
         thinking_mode: bool = False,
     ):
         if tool_choice == "auto" and parallel_tool_calls and not strict_requested:
