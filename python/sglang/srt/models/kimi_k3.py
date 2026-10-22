@@ -99,8 +99,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -557,6 +557,10 @@ class KimiK3MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
@@ -2148,7 +2152,7 @@ class KimiK3DeltaAttention(nn.Module):
                 hidden_states
             )
 
-        if not forward_batch.forward_mode.is_decode():
+        if not forward_batch.logical_forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -2352,7 +2356,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate = self._compute_output_gate(gate_input)
-                    from sglang.kernels.ops.attention import mla_output_gate
+                    from sglang.kernels.ops.elementwise import mla_output_gate
 
                     if _is_hip and self._k3_gate_ptpc:
                         from sglang.srt.models.kimi_k3_rocm_ptpc import (
@@ -3897,8 +3901,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @property
     def start_layer(self) -> int:

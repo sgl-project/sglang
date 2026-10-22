@@ -27,35 +27,6 @@ import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 
 <Deployment config={config} agenticLink="agentic-long-context-deployment" />
 
-### SWA ratio calculator
-
-Enter the total **input + output tokens per request** to estimate `--swa-full-tokens-ratio` for Muse Spark Open's 2,048-token sliding window. Copy the flag into your launch command to balance the request capacity of the SWA and full-attention KV pools.
-
-import { museSparkSwaRatio } from "/src/snippets/_muse_spark_swa_ratio.jsx";
-import { MuseSparkSwaRatioCalculator } from "/src/snippets/_muse_spark_swa_ratio_calculator.jsx";
-
-<MuseSparkSwaRatioCalculator calculator={museSparkSwaRatio} />
-
-This is a **steady-state capacity estimate** for equal-length requests. Prefill peaks, page rounding, speculative decoding, and retained prefix caches can require additional capacity. Benchmark your workload before treating this value as a throughput optimum.
-
-<Accordion title="Formula and assumptions">
-
-For context length `L` and concurrency `C`, full attention retains `C × L` tokens, while SWA retains `C × min(L, 2048)` tokens. Balancing the two pools gives:
-
-```text Formula
-swa_full_tokens_ratio = min(1, 2048 / L)
-```
-
-Concurrency cancels when requests have the same length. For example, **100,000 tokens → 0.02048**; contexts up to 2,048 tokens use **1**. At zero tokens, the ratio is undefined, so the calculator does not emit a flag. The upper bound is **1,048,576 tokens (1M)**.
-
-The flag is the ratio of **SWA token capacity to full-attention token capacity**, independent of the number of layers. It is not the SWA share of KV memory: the 46 SWA layers and 16 full-attention layers have different aggregate bytes per token.
-
-For a mix of request lengths, size the pools for the aggregate retained tokens rather than a single representative request. The formula also excludes transient prefill allocations, cache retention, page alignment, and draft-model KV memory.
-
-When using **HiCache with DFLASH**, lowering the ratio increases the full-attention token capacity within a fixed cache budget. The draft cache can grow with it. Recheck host RAM usage and `--hicache-size` when applying the flag.
-
-</Accordion>
-
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
