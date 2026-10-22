@@ -889,7 +889,8 @@ class DeepseekV4HipRadixBackend(
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
-    low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
+    # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
+    low_ratio_prefill_graph = False
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
@@ -3491,11 +3492,6 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
-                raise NotImplementedError(
-                    "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
-                    "oracle) is not supported on HIP"
-                )
             # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
             assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (

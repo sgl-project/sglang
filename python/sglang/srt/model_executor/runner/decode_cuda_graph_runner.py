@@ -94,7 +94,7 @@ from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FA
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
-    _set_capture_lora_variant,
+    capture_lora_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -216,6 +216,11 @@ def build_replay_fb_view(
     )
 
 
+def _lora_backend_skips_inactive(model_runner) -> bool:
+    manager = model_runner.lora_manager
+    return manager is not None and manager.lora_backend.skip_inactive_dense_lora
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -237,7 +242,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        self.record_nolora_graph = record_nolora_graph
+        # Inactive dense LoRA batches replay a separate base-only graph.
+        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
+            model_runner
+        )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -394,7 +402,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+            self.model_runner.lora_manager.init_decode_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_req=self.captured_req_width,
             )
@@ -1187,11 +1195,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
         )
-        lora_variants = (
-            [("lora", True), ("nolora", False)]
-            if self.record_nolora_graph
-            else [(None, None)]
-        )
+        lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
         variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
@@ -1207,26 +1211,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                for attention_variant in attention_variants:
-                    _set_capture_attention_variant(attention_variant)
-                    self._set_profile_trace_tag(
-                        bs, stream_idx, variant_label, attention_variant
-                    )
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=get_parallel().tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
+            for variant_label in lora_variants:
+                with capture_lora_variant(variant_label):
+                    for attention_variant in attention_variants:
+                        _set_capture_attention_variant(attention_variant)
+                        self._set_profile_trace_tag(
+                            bs, stream_idx, variant_label, attention_variant
                         )
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=get_parallel().tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                            )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1269,6 +1273,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ForwardContext(attn_backend=attn_backend),
                     forward_batch=forward_batch,
                 ):
+                    if forward_batch.lora_ids is not None:
+                        self.model_runner.lora_manager.reset_routing_cache()
                     # Backends may gather live pool mappings into their static
                     # metadata here; these nodes run before any model KV reads.
                     attn_backend.init_forward_metadata_in_graph(forward_batch)
