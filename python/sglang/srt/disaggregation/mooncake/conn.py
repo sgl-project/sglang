@@ -75,7 +75,6 @@ from sglang.srt.runtime_context import (
     get_device,
     get_memory,
     get_observability,
-    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -953,8 +952,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         check.
         """
         if (
-            get_parallel().enable_cp_tp_group_sharing
-            and get_spec().speculative_algorithm == "DFLASH"
+            get_spec().speculative_algorithm == "DFLASH"
+            # Bootstrap runs concurrently with temporary draft TP scopes.
+            # Use the manager's captured target layout, not scoped CP flags.
+            and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
