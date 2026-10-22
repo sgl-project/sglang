@@ -523,6 +523,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
+        # Every step launch may end an idle stretch, before the model forward.
+        self.assertEqual(
+            scheduler.metrics_reporter.maybe_report_idle_end.call_count,
+            scheduler.forward_ct,
+        )
         if mode == ForwardMode.EXTEND:
             # A prefill is charged from the previous prefill's result, or from
             # its own launch when none applies -- the first one, or after a gap.
@@ -597,7 +602,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(
-            record_scheduler_active=Mock(), maybe_report_idle_stats=Mock()
+            record_scheduler_active=Mock(),
+            maybe_report_idle_stats=Mock(),
+            maybe_report_idle_end=Mock(),
         )
         scheduler.invariant_checker = Mock()
         scheduler.scripted_scheduler_hook = SimpleNamespace(
