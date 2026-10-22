@@ -356,7 +356,7 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
                 scheduler_profiles,
             )
 
@@ -584,7 +584,7 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
-        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
             canonical_profiles,
             validate_options,
         )
