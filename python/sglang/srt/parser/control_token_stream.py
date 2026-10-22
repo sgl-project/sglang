@@ -36,10 +36,10 @@ class MarkerSpan(msgspec.Struct, frozen=True):
     end: int
 
 
-def _log_once(reason: str) -> None:
-    if reason not in _logged_reasons:
-        _logged_reasons.add(reason)
-        logger.warning("%s; markers are matched as text.", reason)
+def _log_once(message: str) -> None:
+    if message not in _logged_reasons:
+        _logged_reasons.add(message)
+        logger.warning(message)
 
 
 def _resolve_control_ids(
@@ -162,7 +162,7 @@ class ControlTokenStream:
             if match_mode == "strict":
                 raise ParserMatchError(f"parser_match_mode=strict: {reason}")
             if tokenizer is not None:
-                _log_once(reason)
+                _log_once(f"{reason}; markers are matched as text.")
             return None
         return cls(
             tokenizer.backend_tokenizer,
@@ -212,10 +212,7 @@ class ControlTokenStream:
         """Record ``text`` as all of the parser's text, for one-shot parsing."""
         if self.consumed_len == 0:
             self.consume(text)
-            if self._strict and text and not self.output_ids:
-                raise ParserMatchError(
-                    "parser_match_mode=strict: output text has no output ids"
-                )
+            self.check_sourced()
         elif self.consumed_len != len(text) or not self._is_tail(text):
             self._lose_alignment("one-shot text is not the text parsed so far")
 
@@ -235,11 +232,31 @@ class ControlTokenStream:
     def match_at(self, kind: str, text: str, offset: int) -> Optional[MarkerSpan]:
         """The ``kind`` marker starting at ``offset`` of ``text``, which must
         end the consumed text."""
-        if not text.startswith(kind, offset):
-            return None
         if self.active and self._marker_at(self._tail_start(text) + offset) != kind:
             return None
+        if not text.startswith(kind, offset):
+            return None
         return MarkerSpan(kind, offset, offset + len(kind))
+
+    def check_sourced(self) -> None:
+        """Check, once all output is parsed, that the ids cover the parser text.
+        Ids decoding past the text are fine; stop text is trimmed from it."""
+        if not self._fed or not self._aligned:
+            return
+        rest = self._consumed_ahead
+        special = True
+        while rest and special:
+            special = next((s for s in self._special_texts if rest.startswith(s)), "")
+            rest = rest[len(special) :]
+        # A character whose bytes the decoder still holds reads as U+FFFD.
+        if not rest.rstrip("\ufffd"):
+            return
+        if self._strict:
+            raise ParserMatchError(
+                "Cannot match markers by output token id: "
+                "output text runs past its output ids"
+            )
+        _log_once("Output text runs past its output ids; no markers match in it.")
 
     def view(self, text: str) -> str:
         """``text``, which must end the consumed text, with every marker that
@@ -272,7 +289,7 @@ class ControlTokenStream:
             raise ParserMatchError(
                 "parser_match_mode=strict: output text has no output ids"
             )
-        _log_once("Parser text came without output ids")
+        _log_once("Parser text came without output ids; markers are matched as text.")
 
     def _defuse(self, text: str, start: int) -> str:
         literal = sorted(
@@ -392,7 +409,10 @@ class OutputIdsCursor:
     def __init__(self):
         self.started = False
         self.seen = 0
-        self._last_id: Optional[int] = None
+        self._seen_ids: List[int] = []
+        # The cumulative list last read; TokenizerManager extends one list per
+        # request, so the same list is trusted to keep the ids already seen.
+        self._source: Optional[List[int]] = None
 
     def advance(
         self, output_ids: List[int], *, cumulative: bool, total: Optional[int]
@@ -401,14 +421,18 @@ class OutputIdsCursor:
         the chunk's; ``total`` is the generated token count after the chunk.
         Raises ParserMatchError when the chunk does not continue the ids."""
         if cumulative:
-            # The list may have grown since ``total`` was counted; it shares
-            # storage with the request state, so only a shrink or rewrite is wrong.
-            if len(output_ids) < self.seen or (
-                self.seen and output_ids[self.seen - 1] != self._last_id
-            ):
+            # The shared list may have grown since ``total`` was counted, so
+            # it can run ahead of the count but not behind it.
+            if len(output_ids) < max(self.seen, total or 0):
                 raise ParserMatchError(
-                    "cumulative output ids do not extend the ids seen before"
+                    f"cumulative output ids stop at {len(output_ids)} of "
+                    f"{max(self.seen, total or 0)} tokens"
                 )
+            if output_ids is not self._source and (
+                output_ids[: self.seen] != self._seen_ids
+            ):
+                raise ParserMatchError("cumulative output ids change ids seen before")
+            self._source = output_ids
             new_ids = output_ids[self.seen :]
         else:
             new_ids = output_ids
@@ -419,6 +443,5 @@ class OutputIdsCursor:
                 )
         self.started = True
         self.seen += len(new_ids)
-        if new_ids:
-            self._last_id = new_ids[-1]
+        self._seen_ids.extend(new_ids)
         return new_ids

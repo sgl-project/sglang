@@ -4216,9 +4216,12 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.force_reasoning = True
         return tokenizer, ids_by_choice
 
-    def _glm_stream(self, tokenizer, ids_by_choice, *, incremental, garble=None):
+    def _glm_stream(
+        self, tokenizer, ids_by_choice, *, incremental, garble=None, unsourced=""
+    ):
         """Engine chunks of one token each, choices interleaved; ``garble``
-        rewrites the text of the token at that index of choice 0."""
+        rewrites the text of the token at that index of choice 0, and
+        ``unsourced`` is text appended to its last chunk without ids."""
 
         async def generate():
             sent = [""] * len(ids_by_choice)
@@ -4230,6 +4233,8 @@ class ServingChatTestCase(CustomTestCase):
                     delta = text[len(tokenizer.decode(ids[:i])) :]
                     if index == 0 and i == garble:
                         delta = "~" * len(delta)
+                    if index == 0 and i == len(ids) - 1:
+                        delta += unsourced
                     sent[index] += delta
                     yield {
                         "text": delta if incremental else sent[index],
@@ -4453,6 +4458,32 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(chunks[-1]["error"]["code"], 500)
         self.assertIn("output token id", chunks[-1]["error"]["message"])
         self.assertNotIn("~", json.dumps(chunks[:-1]))
+
+        for incremental in (True, False):
+            with self.subTest(unsourced_tail=True, incremental=incremental):
+                enter_override(
+                    self,
+                    get_context().override_server_args(
+                        incremental_streaming_output=incremental
+                    ),
+                )
+                self.tm.generate_request.return_value = self._glm_stream(
+                    tokenizer,
+                    ids_by_choice[:1],
+                    incremental=incremental,
+                    unsourced="UNBACKED",
+                )
+                chunks = self._parse_chunks(
+                    self._run_chat_stream(Mock(), stream_request)
+                )
+                self.assertEqual(chunks[-1]["error"]["code"], 500)
+                self.assertFalse(
+                    any(
+                        choice.get("finish_reason")
+                        for chunk in chunks[:-1]
+                        for choice in chunk["choices"]
+                    )
+                )
 
     def test_streaming_output_ids_incremental_accumulates_deltas(self):
         sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)

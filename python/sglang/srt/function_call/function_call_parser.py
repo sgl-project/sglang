@@ -273,6 +273,7 @@ class FunctionCallParser:
         """
         if not self.tools:
             return "", []
+        self.detector.check_output_ids_cover_text()
         sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
 

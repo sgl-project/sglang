@@ -145,6 +145,11 @@ class BaseReasoningFormatDetector:
         if self._control is not None:
             self._control.invalidate(reason)
 
+    def check_output_ids_cover_text(self) -> None:
+        """At the end of output, check the observed ids cover the parsed text."""
+        if self._control is not None:
+            self._control.check_sourced()
+
     def output_ids_of(self, text: str) -> Optional[List[int]]:
         """The observed output ids that decode to ``text``, the end of the text
         parsed so far, or None when unknown."""
@@ -305,9 +310,15 @@ class BaseReasoningFormatDetector:
         start_idx = (
             -1 if self.stripped_think_start else self._find_think_start(current_text)
         )
-        if start_idx > 0 and self._control is not None and self._control.active:
-            # Splicing it out would leave a buffer that no longer ends the parsed
-            # text, where ids cannot locate markers; detect_and_parse keeps it too.
+        if (
+            start_idx != -1
+            and self._control is not None
+            and self._control.active
+            and self._control.consumed_len - len(current_text) + start_idx > 0
+        ):
+            # Only a think start that begins the output is stripped, as in
+            # detect_and_parse; splicing out a later one would leave a buffer
+            # that no longer ends the parsed text, where ids cannot find markers.
             self.stripped_think_start = True
             self._in_reasoning = True
         elif start_idx != -1:
@@ -2596,6 +2607,7 @@ class ReasoningParser:
     def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: flush any detector-specific buffered state once
         the stream ends."""
+        self.detector.check_output_ids_cover_text()
         ret = self.detector.finish()
         self._locate_content(ret.normal_text)
         return ret.reasoning_text, ret.normal_text

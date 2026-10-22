@@ -76,6 +76,11 @@ class BaseFormatDetector(ABC):
         if self._control is not None:
             self._control.invalidate(reason)
 
+    def check_output_ids_cover_text(self) -> None:
+        """At the end of output, check the observed ids cover the parsed text."""
+        if self._control is not None:
+            self._control.check_sourced()
+
     def _find_marker(self, marker: str, text: str, start: int = 0) -> int:
         """Index of the first ``marker`` at or after ``start`` in ``text``, the
         end of the text parsed so far, or -1."""

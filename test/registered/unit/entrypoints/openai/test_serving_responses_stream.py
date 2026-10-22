@@ -958,6 +958,19 @@ class GlmOutputIdsTestCase(CustomTestCase):
                     self.EXPECTED,
                 )
 
+    def test_strict_unsourced_text_fails_the_response(self):
+        serving, tokenizer, ids = self._serving()
+        serving.parser_match_mode = "strict"
+        chunk = engine_chunk(tokenizer.decode(ids) + "UNBACKED", len(ids), finish=True)
+        chunk["output_ids"] = ids
+        payloads = event_payloads(
+            StreamFixture(
+                serving, self._request(stream=True), require_reasoning=True
+            ).run([chunk])
+        )
+        self.assertEqual(payloads[-1]["type"], "response.failed")
+        self.assertIn("output token id", payloads[-1]["response"]["error"]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()
