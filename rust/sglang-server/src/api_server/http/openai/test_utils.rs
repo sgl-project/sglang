@@ -151,12 +151,23 @@ pub(super) fn answering_app_state_with(
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     text: &'static str,
 ) -> Arc<super::AppState> {
+    answering_app_state_with_item(server_args, formatter, tokenizer, move |rid| {
+        chunk(rid, text, true)
+    })
+}
+
+/// [`answering_app_state_with`], answering each request with `answer(rid)`.
+pub(super) fn answering_app_state_with_item(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            let done = chunk(request.rid.as_str(), text, true);
-            request.sink.try_send(done).unwrap();
+            request.sink.try_send(answer(request.rid.as_str())).unwrap();
         }
     });
     let core = CoreHandle::new(
