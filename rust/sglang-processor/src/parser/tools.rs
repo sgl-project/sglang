@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use super::ChatToolCallDelta;
 use crate::ProcessorError;
+use crate::render::models::schema_types::normalize_json_schema_types;
 use crate::tool_call::{ToolDetector, tool_call_id, tool_detector};
 
 /// Collect top-level and dynamic system-message tools without moving their
@@ -302,21 +303,32 @@ pub async fn parse_tool_calls(
     Ok((calls.collect(), Some(normal)))
 }
 
-/// xgrammar's `deepseek_v4_1` tag for `required` and named choices, as SGLang
-/// builds it under a reasoning parser; `auto` stays unconstrained.
+/// xgrammar's `deepseek_v4_1` tag as SGLang builds it under a reasoning
+/// parser (which owns the think tokens, so no excludes): `required` and named
+/// choices, and `auto` once a tool is strict; otherwise `auto` is
+/// unconstrained.
 fn deepseek_v41_tag(
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Option<String> {
     let invoke = |tool: &ToolDefinition| {
-        let schema = tool.parameters.clone();
+        // xgrammar's `_get_function_parameters`: only a strict tool's schema
+        // constrains its arguments. `_validate_request` has normalized the
+        // schema types in place, as the prompt shows them.
+        let schema = match (tool.strict, tool.parameters.clone()) {
+            (Some(true), Some(mut schema)) => {
+                normalize_json_schema_types(&mut schema);
+                schema
+            }
+            _ => Value::Bool(true),
+        };
         serde_json::json!({
             "type": "tag",
             "begin": format!("<｜DSML｜ invoke name=\"{}\">\n", tool.name),
             "content": {
                 "type": "json_schema",
-                "json_schema": schema.unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                "json_schema": schema,
                 "style": "deepseek_v4_1_xml",
                 "any_order": false,
                 "max_whitespace_cnt": null
@@ -324,15 +336,37 @@ fn deepseek_v41_tag(
             "end": "</｜DSML｜ invoke>\n"
         })
     };
-    let calls = match tool_choice {
-        ToolChoice::Required => serde_json::json!({
+    let stop_after_first = parallel_tool_calls == Some(false);
+    let all_calls = || {
+        serde_json::json!({
             "type": "tags_with_separator",
             "tags": tools.iter().map(invoke).collect::<Vec<_>>(),
             "separator": "",
             "at_least_one": true,
-            "stop_after_first": parallel_tool_calls == Some(false)
-        }),
+            "stop_after_first": stop_after_first
+        })
+    };
+    let calls = match tool_choice {
+        ToolChoice::Required => all_calls(),
         ToolChoice::Named(name) => invoke(tools.iter().find(|tool| &tool.name == name)?),
+        ToolChoice::Auto if tools.iter().any(|tool| tool.strict == Some(true)) => {
+            let format = serde_json::json!({
+                "type": "triggered_tags",
+                "triggers": ["<｜DSML｜ calls>"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<｜DSML｜ calls>\n",
+                    "content": all_calls(),
+                    "end": "</｜DSML｜ calls>"
+                }],
+                "at_least_one": false,
+                "stop_after_first": stop_after_first,
+                "excludes": []
+            });
+            return Some(
+                serde_json::json!({"type": "structural_tag", "format": format}).to_string(),
+            );
+        }
         _ => return None,
     };
     let elements = [
@@ -372,27 +406,75 @@ mod tests {
         }
     }
 
-    /// `required` is xgrammar's `deepseek_v4_1` tag; `auto` adds no constraint.
+    /// The tags SGLang sends xgrammar for each choice, from
+    /// `FunctionCallParser(tools, "deepseekv41").get_structure_constraint`
+    /// with excludes stripped for the reasoning parser: a non-strict tool's
+    /// arguments are free (`json_schema: true`), and `auto` is constrained
+    /// only once a tool is strict.
     #[test]
     fn deepseek_v41_constraint_matches_xgrammar() {
-        let tools = [tool("get_weather", false)];
-        let auto = tool_constraint(Some("deepseekv41"), &ToolChoice::Auto, &tools, None);
-        assert_eq!(auto.unwrap(), None);
-        let required = tool_constraint(
-            Some("deepseekv41"),
-            &ToolChoice::Required,
-            &tools,
-            Some(false),
+        let tag = |choice: ToolChoice, tools: &[ToolDefinition], parallel: Option<bool>| {
+            match tool_constraint(Some("deepseekv41"), &choice, tools, parallel).unwrap() {
+                Some(ToolConstraint::StructuralTag(tag)) => {
+                    serde_json::from_str::<Value>(&tag).ok()
+                }
+                None => None,
+                other => panic!("expected a structural tag, got {other:?}"),
+            }
+        };
+        let python = |json: &str| serde_json::from_str::<Value>(json).ok();
+        let lenient = |name: &str| {
+            let mut tool = tool(name, false);
+            tool.strict = None;
+            tool
+        };
+
+        assert_eq!(tag(ToolChoice::Auto, &[lenient("get_weather")], None), None);
+        assert_eq!(
+            tag(ToolChoice::Required, &[lenient("get_weather")], Some(false)),
+            python(
+                r#"{"type":"structural_tag","format":{"type":"sequence","elements":[{"type":"const_string","value":"\n\n<｜DSML｜ calls>\n"},{"type":"tags_with_separator","tags":[{"type":"tag","begin":"<｜DSML｜ invoke name=\"get_weather\">\n","content":{"type":"json_schema","json_schema":true,"style":"deepseek_v4_1_xml","any_order":false,"max_whitespace_cnt":null},"end":"</｜DSML｜ invoke>\n"}],"separator":"","at_least_one":true,"stop_after_first":true},{"type":"const_string","value":"</｜DSML｜ calls>"}]}}"#
+            )
         );
-        let Some(ToolConstraint::StructuralTag(tag)) = required.unwrap() else {
+        let named = ToolChoice::Named("get_weather".into());
+        let tools = [tool("get_weather", false), tool("t", true)];
+        assert_eq!(
+            tag(named, &tools, Some(true)),
+            python(
+                r#"{"type":"structural_tag","format":{"type":"sequence","elements":[{"type":"const_string","value":"\n\n<｜DSML｜ calls>\n"},{"type":"tag","begin":"<｜DSML｜ invoke name=\"get_weather\">\n","content":{"type":"json_schema","json_schema":true,"style":"deepseek_v4_1_xml","any_order":false,"max_whitespace_cnt":null},"end":"</｜DSML｜ invoke>\n"},{"type":"const_string","value":"</｜DSML｜ calls>"}]}}"#
+            )
+        );
+        let tools = [tool("get_weather", true), lenient("t")];
+        assert_eq!(
+            tag(ToolChoice::Auto, &tools, None),
+            python(
+                r#"{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<｜DSML｜ calls>"],"tags":[{"type":"tag","begin":"<｜DSML｜ calls>\n","content":{"type":"tags_with_separator","tags":[{"type":"tag","begin":"<｜DSML｜ invoke name=\"get_weather\">\n","content":{"type":"json_schema","json_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"style":"deepseek_v4_1_xml","any_order":false,"max_whitespace_cnt":null},"end":"</｜DSML｜ invoke>\n"},{"type":"tag","begin":"<｜DSML｜ invoke name=\"t\">\n","content":{"type":"json_schema","json_schema":true,"style":"deepseek_v4_1_xml","any_order":false,"max_whitespace_cnt":null},"end":"</｜DSML｜ invoke>\n"}],"separator":"","at_least_one":true,"stop_after_first":false},"end":"</｜DSML｜ calls>"}],"at_least_one":false,"stop_after_first":false,"excludes":[]}}"#
+            )
+        );
+    }
+
+    /// A DB-style alias the prompt shows as `string` is `string` in a strict
+    /// tool's constraint too; xgrammar rejects `varchar`.
+    #[test]
+    fn deepseek_v41_constraint_normalizes_schema_types() {
+        let tools = [ToolDefinition {
+            name: "lookup".into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "varchar(255)"}, "n": {"type": "bigint"}}
+            })),
+            strict: Some(true),
+        }];
+        let named = ToolChoice::Named("lookup".into());
+        let Some(ToolConstraint::StructuralTag(tag)) =
+            tool_constraint(Some("deepseekv41"), &named, &tools, None).unwrap()
+        else {
             panic!("expected a structural tag");
         };
-        // xgrammar.get_model_structural_tag("deepseek_v4_1", ..., reasoning=False).
-        let xgrammar = r#"{"type": "structural_tag", "format": {"type": "sequence", "elements": [{"type": "const_string", "value": "\n\n<｜DSML｜ calls>\n"}, {"type": "tags_with_separator", "tags": [{"type": "tag", "begin": "<｜DSML｜ invoke name=\"get_weather\">\n", "content": {"type": "json_schema", "json_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}, "style": "deepseek_v4_1_xml", "any_order": false, "max_whitespace_cnt": null}, "end": "</｜DSML｜ invoke>\n"}], "separator": "", "at_least_one": true, "stop_after_first": true}, {"type": "const_string", "value": "</｜DSML｜ calls>"}]}}"#;
-        assert_eq!(
-            serde_json::from_str::<Value>(&tag).unwrap(),
-            serde_json::from_str::<Value>(xgrammar).unwrap()
-        );
+        let tag: Value = serde_json::from_str(&tag).unwrap();
+        let schema = &tag["format"]["elements"][1]["content"]["json_schema"];
+        assert_eq!(schema["properties"]["id"]["type"], "string");
+        assert_eq!(schema["properties"]["n"]["type"], "integer");
     }
 
     fn json_schema(constraint: Option<ToolConstraint>) -> serde_json::Value {
