@@ -15,8 +15,6 @@ from sglang.test.test_utils import (
 )
 
 register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
-# TEMP: dedicated suite so a PR-triggered run can exercise this case alone.
 register_npu_ci(est_time=400, suite="nightly-mmlu-npu-a3", nightly=True)
 
 
