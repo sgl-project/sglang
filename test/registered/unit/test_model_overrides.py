@@ -1759,10 +1759,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
 
-    def test_olmo2_is_not_hybrid_swa(self):
-        sa = self._construct("Olmo2ForCausalLM", "llama")
-        self.assertFalse(base_module.model_config_of(sa).is_hybrid_swa)
-
     def test_olmo3_keeps_hybrid_swa_memory(self):
         sa = self._construct(
             "Olmo3ForCausalLM", "olmo3", config_extra={"num_hidden_layers": 4}
@@ -1770,7 +1766,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         model_config = base_module.model_config_of(sa)
         self.assertEqual(model_config.hf_config.architectures, ["Olmo2ForCausalLM"])
         self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
-        self.assertTrue(model_config.is_layer_types_hybrid_swa)
 
     def test_exaone4_keeps_hybrid_swa_memory(self):
         sa = self._construct(

@@ -68,24 +68,19 @@ class TestHybridLayerIds(CustomTestCase):
             layer_types=(["sliding_attention"] * 3 + ["full_attention"]) * 2,
         )
         olmo3 = Olmo3Config(num_hidden_layers=8, sliding_window=4096)
+        # The full-attention layers each model's own code builds.
         cases = {
-            "Gemma2ForCausalLM": Gemma2Config(num_hidden_layers=6),
-            "Gemma3ForCausalLM": Gemma3TextConfig(num_hidden_layers=12),
-            "Cohere2ForCausalLM": Cohere2Config(num_hidden_layers=8),
-            "Exaone4ForCausalLM": exaone4_32b,
-            olmo3.architectures[0]: olmo3,
+            "Gemma2ForCausalLM": (Gemma2Config(num_hidden_layers=6), [1, 3, 5]),
+            "Gemma3ForCausalLM": (Gemma3TextConfig(num_hidden_layers=12), [5, 11]),
+            "Cohere2ForCausalLM": (Cohere2Config(num_hidden_layers=8), [3, 7]),
+            "Exaone4ForCausalLM": (exaone4_32b, [3, 7]),
+            olmo3.architectures[0]: (olmo3, [3, 7]),
         }
-        for architecture, config in cases.items():
+        for architecture, (config, full) in cases.items():
             with self.subTest(architecture=architecture):
                 self.assertTrue(is_hybrid_swa_model([architecture], config))
                 self.assertTrue(is_layer_types_hybrid_swa_model([architecture], config))
-                full = [
-                    i
-                    for i, kind in enumerate(config.layer_types)
-                    if kind == "full_attention"
-                ]
                 swa = [i for i in range(config.num_hidden_layers) if i not in full]
-                self.assertTrue(full and swa)
                 self.assertEqual(
                     get_hybrid_layer_ids([architecture], config), (swa, full)
                 )
