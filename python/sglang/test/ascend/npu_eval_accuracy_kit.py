@@ -75,9 +75,7 @@ class NPUGSM8KMixin(GSM8KMixin):
             "max_tokens": self.gsm8k_max_tokens if self.gsm8k_max_tokens else 7168,
         }
         limit = (
-            self.gsm8k_num_examples
-            if self.gsm8k_num_examples is not None
-            else 100000
+            self.gsm8k_num_examples if self.gsm8k_num_examples is not None else 100000
         )
         best = 0.0
         for attempt in range(_NPU_MAX_ACCURACY_ATTEMPTS):
