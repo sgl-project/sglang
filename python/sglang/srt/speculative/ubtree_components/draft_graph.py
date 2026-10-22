@@ -15,7 +15,7 @@ import torch
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
 from sglang.srt.models.dflash import DFlashDraftModel
