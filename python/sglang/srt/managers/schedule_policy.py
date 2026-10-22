@@ -1578,6 +1578,14 @@ class PrefillAdder:
             if extend_len <= 0:
                 return AddReqResult.OTHER
             max_new_tokens = 0
+        elif (
+            req.bidir_prefix_len >= 0
+            and chunk_tokens_limit is not None
+            and chunk_fit_tokens > chunk_tokens_limit
+        ):
+            # A block-bidirectional prompt cannot be split across chunks: the
+            # state block attends to all of itself. Wait for a batch it fits in.
+            return AddReqResult.OTHER
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
             if (
                 has_chunked_req

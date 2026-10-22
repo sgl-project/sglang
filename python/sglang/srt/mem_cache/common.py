@@ -240,6 +240,15 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    if (
+        req.bidir_prefix_len >= 0
+        and 0 < match_result.device_prefix_len < req.bidir_prefix_len
+    ):
+        # State tokens attend to the whole state block, so a partial hit on it
+        # is not a valid prefix; miss entirely rather than extend from it.
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )._replace(mamba_branching_seqlen=None, cache_protected_len=None)
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,

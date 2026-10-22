@@ -1433,6 +1433,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
+                obj.bidir_prefix_len is not None
+                and obj.bidir_prefix_len >= 0
+                and self.server_args.attention_backend not in (None, "triton")
+            ):
+                raise ValueError(
+                    "bidir_prefix_len (block-bidirectional attention) is only "
+                    "supported by the triton attention backend."
+                )
+            if (
                 obj.return_sampling_mask
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
@@ -1618,6 +1627,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                bidir_prefix_len=(
+                    obj.bidir_prefix_len if obj.bidir_prefix_len is not None else -1
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,

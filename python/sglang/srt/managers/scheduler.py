@@ -2937,6 +2937,7 @@ class Scheduler(
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
+                bidir_prefix_len=recv_req.bidir_prefix_len,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
