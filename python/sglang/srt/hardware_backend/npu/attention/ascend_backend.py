@@ -331,13 +331,7 @@ class AscendAttnBackend(AttentionBackend):
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
         )
-        # A DCP draft pool is replicated over the allocator's widened virtual
-        # address space, so its physical page is widened as well.  Attention
-        # block tables must use the pool page size, not the target scheduler's
-        # logical page size.
-        self.page_size = getattr(
-            model_runner.token_to_kv_pool, "page_size", model_runner.page_size
-        )
+        self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
