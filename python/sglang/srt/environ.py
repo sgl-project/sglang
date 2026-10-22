@@ -1741,9 +1741,6 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
-    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
-    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
