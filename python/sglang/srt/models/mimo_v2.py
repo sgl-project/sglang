@@ -69,6 +69,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.layers import unwrap_lora_layer
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -183,25 +184,31 @@ def load_mimo_v2_qkv_proj_weight(
         default_weight_loader(param, merged)
 
 
+def _attention_dims(config, layer_id):
+    """(num_heads, num_kv_heads, head_dim, v_head_dim) of a decoder layer."""
+    pattern = getattr(config, "hybrid_layer_pattern", None)
+    if pattern is not None and pattern[layer_id] == 1:
+        hd = config.swa_head_dim
+        return (
+            config.swa_num_attention_heads,
+            config.swa_num_key_value_heads,
+            hd,
+            getattr(config, "swa_v_head_dim", hd),
+        )
+    hd = config.head_dim
+    return (
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        hd,
+        getattr(config, "v_head_dim", hd),
+    )
+
+
 def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
     m = re.search(r"layers\.(\d+)\.", layer_name)
     if m is None:
         return None
-    layer_id = int(m.group(1))
-
-    pattern = getattr(config, "hybrid_layer_pattern", None)
-    is_swa = pattern is not None and pattern[layer_id] == 1
-
-    if is_swa:
-        nh = config.swa_num_attention_heads
-        nkv = config.swa_num_key_value_heads
-        hd = config.swa_head_dim
-        vhd = getattr(config, "swa_v_head_dim", hd)
-    else:
-        nh = config.num_attention_heads
-        nkv = config.num_key_value_heads
-        hd = config.head_dim
-        vhd = getattr(config, "v_head_dim", hd)
+    nh, nkv, hd, vhd = _attention_dims(config, int(m.group(1)))
 
     q_per_shard = (nh // ckpt_tp) * hd
     k_per_shard = max(1, nkv // ckpt_tp) * hd
@@ -1246,6 +1253,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        # Sliding-window and full layers differ in KV heads; V heads are narrower.
+        if module_name not in ("qkv_proj", "o_proj"):
+            return get_default_hidden_dim(module_name, self.config, layer_idx)
+        nh, nkv, hd, vhd = _attention_dims(self.config, layer_idx)
+        if module_name == "qkv_proj":
+            return self.config.hidden_size, (nh + nkv) * hd + nkv * vhd
+        return nh * vhd, self.config.hidden_size
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.model is not None, (
