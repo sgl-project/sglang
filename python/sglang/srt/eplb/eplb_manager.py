@@ -55,10 +55,12 @@ class EPLBManager:
         self._async_migrator = None
         self._async_job = None
         if get_exec().moe.eplb_async_rebalance:
-            from sglang.srt.eplb.eplb_async_migrator import AsyncExpertMigrator
+            from sglang.srt.eplb.eplb_async_migrator import (
+                AsyncExpertMigrator,
+                MooncakeExpertTransport,
+            )
 
-            self._async_migrator = AsyncExpertMigrator()
-            self._async_passes_per_layer = get_exec().moe.eplb_async_passes_per_layer
+            self._async_migrator = AsyncExpertMigrator(MooncakeExpertTransport())
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -199,6 +201,10 @@ class EPLBManager:
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
 
+    def on_model_loaded(self, model: nn.Module):
+        if self._async_migrator is not None:
+            self._async_migrator.prepare(model.routed_experts_weights_of_layer)
+
     def _rebalance_async(self):
         logger.info("[EPLBManager] rebalance start (async)")
         passes = 0
@@ -223,7 +229,7 @@ class EPLBManager:
         )
         self._async_job = job
 
-        while not self._async_migrator.poll_placement(job):
+        while not self._async_migrator.placement_ready(job):
             yield
             passes += 1
 
@@ -235,9 +241,11 @@ class EPLBManager:
 
         for layer_id in job.layer_ids:
             self._async_migrator.issue_layer(job, layer_id)
-            for _ in range(self._async_passes_per_layer):
+            while True:
                 yield
                 passes += 1
+                if self._async_migrator.layer_ready(job, layer_id):
+                    break
             self._async_migrator.install_layer(job, layer_id)
 
         self._async_job = None

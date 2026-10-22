@@ -16,7 +16,6 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import einops
-import msgspec
 import torch
 import torch.distributed
 from torch.distributed import P2POp
@@ -183,21 +182,6 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
-class LayerUpdatePlan(msgspec.Struct):
-    weight2buffer_copy_infos: List[Tuple[int, int]]
-    p2p_op_infos: List[Tuple[int, List[P2POp]]]
-    buffer2weight_copy_infos: List[Tuple[int, int]]
-    num_physical_experts: int
-    num_local_physical_experts: int
-    rank: int
-    output_logs: Optional[List[str]] = None
-
-    def local_expert_location(self, expert_location: int) -> int:
-        lo = self.rank * self.num_local_physical_experts
-        assert lo <= expert_location < lo + self.num_local_physical_experts
-        return expert_location % self.num_local_physical_experts
-
-
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -211,44 +195,6 @@ def update_expert_weights_single_layer(
     debug: bool = False,
     log_metrics: bool = False,
 ):
-    plan = plan_expert_weights_single_layer(
-        routed_experts_weights=routed_experts_weights,
-        temp_buffers=temp_buffers,
-        old_physical_to_logical_map=old_physical_to_logical_map,
-        new_physical_to_logical_map=new_physical_to_logical_map,
-        num_local_physical_experts=num_local_physical_experts,
-        num_gpu_per_node=num_gpu_per_node,
-        rank=rank,
-        missing_logical_experts_info=missing_logical_experts_info,
-        debug=debug,
-    )
-    execute_weight2buffer_copies(plan, routed_experts_weights, temp_buffers)
-    execute_p2p_ops(plan)
-    execute_buffer2weight_copies(plan, routed_experts_weights, temp_buffers)
-
-    if log_metrics:
-        _log_p2p_op_metrics(
-            plan.p2p_op_infos,
-            world_size=world_size,
-            num_gpu_per_node=num_gpu_per_node,
-            self_node_id=rank // num_gpu_per_node,
-        )
-
-    return plan.output_logs
-
-
-def plan_expert_weights_single_layer(
-    routed_experts_weights: List[torch.Tensor],
-    temp_buffers: List[torch.Tensor],
-    old_physical_to_logical_map: List[int],  # (num_physical_Experts,)
-    new_physical_to_logical_map: List[int],  # (num_physical_Experts,)
-    num_local_physical_experts: int,
-    num_gpu_per_node: int,
-    rank: int,
-    missing_logical_experts_info: Optional[List[int]] = None,
-    debug: bool = False,
-    group: Optional[torch.distributed.ProcessGroup] = None,
-) -> LayerUpdatePlan:
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -258,7 +204,7 @@ def plan_expert_weights_single_layer(
 
     if _LOG_INPUT:
         logger.info(
-            "plan_expert_weights_single_layer "
+            "update_expert_weights_single_layer "
             f"{[x.shape for x in routed_experts_weights]=} "
             f"{[x.shape for x in temp_buffers]=} "
             f"{old_physical_to_logical_map=} "
@@ -266,6 +212,7 @@ def plan_expert_weights_single_layer(
             f"{num_local_physical_experts=} "
             f"{num_gpu_per_node=} "
             f"{rank=} "
+            f"{world_size=} "
         )
 
     output_logs = [] if debug else None
@@ -280,32 +227,39 @@ def plan_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
-    plan = LayerUpdatePlan(
-        weight2buffer_copy_infos=[],
-        p2p_op_infos=[],
-        buffer2weight_copy_infos=[],
-        num_physical_experts=num_physical_experts,
-        num_local_physical_experts=num_local_physical_experts,
-        rank=rank,
-        output_logs=output_logs,
-    )
-
     def _entrypoint():
-        _handle_recv()
-        _create_isend_ops()
-        _filter_p2p_ops()
+        # List[Tuple[logical_expert_id, List[P2POp]]]
+        p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
+        # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
+        buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
-        if debug:
-            output_logs.append(f"p2p_op_infos={plan.p2p_op_infos}")
-            output_logs.append(
-                f"buffer2weight_copy_infos={plan.buffer2weight_copy_infos}"
+        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
+        _create_isend_ops(p2p_op_infos)
+        _filter_p2p_ops(p2p_op_infos)
+        _execute_p2p_ops(p2p_op_infos)
+        _execute_buffer2weight_copies(buffer2weight_copy_infos)
+
+        if log_metrics:
+            _log_p2p_op_metrics(
+                p2p_op_infos,
+                world_size=world_size,
+                num_gpu_per_node=num_gpu_per_node,
+                self_node_id=self_node_id,
             )
 
-    def _handle_recv():
-        for dst_expert_location in range(*local_expert_location_range):
-            _handle_recv_of_dst_expert_location(dst_expert_location)
+        if debug:
+            output_logs.append(f"{p2p_op_infos=}")
+            output_logs.append(f"{buffer2weight_copy_infos=}")
 
-    def _handle_recv_of_dst_expert_location(dst_expert_location: int):
+    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
+        for dst_expert_location in range(*local_expert_location_range):
+            _handle_recv_of_dst_expert_location(
+                dst_expert_location, buffer2weight_copy_infos, p2p_op_infos
+            )
+
+    def _handle_recv_of_dst_expert_location(
+        dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos
+    ):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
         # case 1: unchanged
@@ -319,10 +273,11 @@ def plan_expert_weights_single_layer(
         # case 2: same-gpu
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                plan.weight2buffer_copy_infos.append(
-                    (src_expert_location, dst_expert_location)
-                )
-                plan.buffer2weight_copy_infos.append(
+                for i in range(num_tensors):
+                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
+                        _get_tensor(routed_experts_weights, i, src_expert_location)
+                    )
+                buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
                 )
                 if debug:
@@ -336,7 +291,7 @@ def plan_expert_weights_single_layer(
             rank * num_local_physical_experts, dst_expert_location
         ):
             if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
-                plan.buffer2weight_copy_infos.append(
+                buffer2weight_copy_infos.append(
                     (src_expert_location, dst_expert_location)
                 )
                 if debug:
@@ -355,6 +310,8 @@ def plan_expert_weights_single_layer(
                 element_value=rank
             )
             _create_p2p_recv_and_buffer2weight_copy(
+                buffer2weight_copy_infos,
+                p2p_op_infos,
                 src_rank=chosen_src_rank,
                 logical_expert_id=logical_expert_id,
                 dst_expert_location=dst_expert_location,
@@ -371,6 +328,8 @@ def plan_expert_weights_single_layer(
             element_value=rank
         )
         _create_p2p_recv_and_buffer2weight_copy(
+            buffer2weight_copy_infos,
+            p2p_op_infos,
             src_rank=chosen_src_rank,
             logical_expert_id=logical_expert_id,
             dst_expert_location=dst_expert_location,
@@ -382,12 +341,14 @@ def plan_expert_weights_single_layer(
         return
 
     def _create_p2p_recv_and_buffer2weight_copy(
+        buffer2weight_copy_infos,
+        p2p_op_infos,
         *,
         logical_expert_id: int,
         src_rank: int,
         dst_expert_location: int,
     ):
-        plan.p2p_op_infos.append(
+        p2p_op_infos.append(
             (
                 logical_expert_id,
                 [
@@ -395,15 +356,14 @@ def plan_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
-                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
             )
         )
-        plan.buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
+        buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
-    def _create_isend_ops():
+    def _create_isend_ops(p2p_op_infos):
         handled_logical_expert_ids = set()
         for src_expert_location in range(*local_expert_location_range):
             logical_expert_id = old_physical_to_logical_map[src_expert_location]
@@ -413,10 +373,12 @@ def plan_expert_weights_single_layer(
             handled_logical_expert_ids.add(logical_expert_id)
 
             _create_isend_ops_of_logical_expert_id(
-                logical_expert_id, src_expert_location
+                logical_expert_id, src_expert_location, p2p_op_infos
             )
 
-    def _create_isend_ops_of_logical_expert_id(logical_expert_id, src_expert_location):
+    def _create_isend_ops_of_logical_expert_id(
+        logical_expert_id, src_expert_location, p2p_op_infos
+    ):
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = (
             _compute_comm_info(logical_expert_id=logical_expert_id)
         )
@@ -434,7 +396,7 @@ def plan_expert_weights_single_layer(
                 f"create_isend_ops_of_logical_expert_id {logical_expert_id=} {src_expert_location=} {same_node_dst_ranks=} {cross_node_dst_ranks=}"
             )
 
-        plan.p2p_op_infos.append(
+        p2p_op_infos.append(
             (
                 logical_expert_id,
                 [
@@ -444,7 +406,6 @@ def plan_expert_weights_single_layer(
                             routed_experts_weights, i, src_expert_location
                         ),
                         peer=dst_rank,
-                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -496,12 +457,12 @@ def plan_expert_weights_single_layer(
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
-    def _filter_p2p_ops():
+    def _filter_p2p_ops(p2p_op_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
             is_active = elastic_ep_state.active_ranks_cpu
-            for i, (logical_expert_id, ops) in enumerate(plan.p2p_op_infos):
+            for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
                 has_isend = any(op.op == torch.distributed.isend for op in ops)
                 has_irecv = any(op.op == torch.distributed.irecv for op in ops)
                 assert not (has_isend and has_irecv), (
@@ -510,69 +471,63 @@ def plan_expert_weights_single_layer(
                 )
 
                 if has_isend:
-                    plan.p2p_op_infos[i] = (
+                    p2p_op_infos[i] = (
                         logical_expert_id,
                         [op for op in ops if is_active[op.peer]],
                     )
                 elif has_irecv:
                     if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
-                        plan.p2p_op_infos[i] = (logical_expert_id, [])
+                        p2p_op_infos[i] = (logical_expert_id, [])
+
+    def _execute_p2p_ops(p2p_op_infos):
+        sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
+        p2p_ops = [op for _, ops in sorted_infos for op in ops]
+        if len(p2p_ops) == 0:
+            return
+
+        # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
+        # hangs on large rebalances. All ranks use the same expert_id ranges
+        # (based on num_physical_experts) so matching send/recv pairs land in
+        # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
+        batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
+        ops_by_expert = {eid: ops for eid, ops in sorted_infos}
+        for start in range(0, num_physical_experts, batch_chunk_size):
+            batch_ops = []
+            for eid in range(
+                start, min(start + batch_chunk_size, num_physical_experts)
+            ):
+                if eid in ops_by_expert:
+                    batch_ops.extend(ops_by_expert[eid])
+            if batch_ops:
+                reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                for req in reqs:
+                    req.wait()
+
+    def _execute_buffer2weight_copies(buffer2weight_copy_infos):
+        for (
+            temp_buffers_expert_location,
+            routed_experts_weights_expert_location,
+        ) in buffer2weight_copy_infos:
+            for i in range(num_tensors):
+                _get_tensor(
+                    routed_experts_weights, i, routed_experts_weights_expert_location
+                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
-        return tensors[tensor_index][plan.local_expert_location(expert_location)]
+        return tensors[tensor_index][_get_local_expert_location(expert_location)]
+
+    def _get_local_expert_location(expert_location: int) -> int:
+        assert (
+            local_expert_location_range[0]
+            <= expert_location
+            < local_expert_location_range[1]
+        )
+        return expert_location % num_local_physical_experts
 
     _entrypoint()
 
-    return plan
-
-
-def execute_weight2buffer_copies(
-    plan: LayerUpdatePlan,
-    routed_experts_weights: List[torch.Tensor],
-    temp_buffers: List[torch.Tensor],
-):
-    for src_expert_location, dst_expert_location in plan.weight2buffer_copy_infos:
-        for weight, buffer in zip(routed_experts_weights, temp_buffers, strict=True):
-            buffer[plan.local_expert_location(dst_expert_location)].copy_(
-                weight[plan.local_expert_location(src_expert_location)]
-            )
-
-
-def execute_p2p_ops(plan: LayerUpdatePlan):
-    sorted_infos = sorted(plan.p2p_op_infos, key=lambda info: info[0])
-    if sum(len(ops) for _, ops in sorted_infos) == 0:
-        return
-
-    # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
-    # hangs on large rebalances. All ranks use the same expert_id ranges
-    # (based on num_physical_experts) so matching send/recv pairs land in
-    # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
-    batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
-    ops_by_expert = {eid: ops for eid, ops in sorted_infos}
-    for start in range(0, plan.num_physical_experts, batch_chunk_size):
-        batch_ops = []
-        for eid in range(
-            start, min(start + batch_chunk_size, plan.num_physical_experts)
-        ):
-            if eid in ops_by_expert:
-                batch_ops.extend(ops_by_expert[eid])
-        if batch_ops:
-            reqs = torch.distributed.batch_isend_irecv(batch_ops)
-            for req in reqs:
-                req.wait()
-
-
-def execute_buffer2weight_copies(
-    plan: LayerUpdatePlan,
-    routed_experts_weights: List[torch.Tensor],
-    temp_buffers: List[torch.Tensor],
-):
-    for src_expert_location, dst_expert_location in plan.buffer2weight_copy_infos:
-        for weight, buffer in zip(routed_experts_weights, temp_buffers, strict=True):
-            weight[plan.local_expert_location(dst_expert_location)].copy_(
-                buffer[plan.local_expert_location(src_expert_location)]
-            )
+    return output_logs
 
 
 class _ChunkUtils:

@@ -787,8 +787,6 @@ def handle_eplb_and_dispatch(server_args: Any):
                 "--eplb-async-rebalance does not support elastic EP; its "
                 "post-scale rebalance reloads experts from disk between chunks."
             )
-        if cfg.eplb_async_passes_per_layer < 1:
-            raise ValueError("--eplb-async-passes-per-layer must be at least 1.")
         if cfg.eplb_rebalance_layers_per_chunk is not None:
             logger.warning(
                 "--eplb-rebalance-layers-per-chunk is ignored with "
