@@ -608,8 +608,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     return Ok(None);
                 }
                 let mut transfers = Vec::new();
-                // restore single node if host_value exists
-                if let Some(host_value) = node.try_host_value(MAMBA) {
+                // restore single node if host_value exists. A host-only
+                // checkpoint keeps no GPU slot on the node, so the request copy
+                // below is the only H->D.
+                if !self.mamba_host_only_checkpoint
+                    && let Some(host_value) = node.try_host_value(MAMBA)
+                {
                     transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
@@ -708,6 +712,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 }
             }
             CacheTransferPhase::LoadBack => {
+                // Host-only: the only transfer targets the request's slot,
+                // which must not become the node's value.
+                if self.mamba_host_only_checkpoint {
+                    return;
+                }
                 let Some(transfer) = transfers.first() else {
                     return;
                 };

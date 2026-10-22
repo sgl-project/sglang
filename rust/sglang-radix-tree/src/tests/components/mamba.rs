@@ -1700,6 +1700,94 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
     assert!(transfers[1].nodes_to_load.is_none());
 }
 
+fn host_only_params() -> CacheInitParams {
+    CacheInitParams {
+        page_size: 1,
+        enable_hicache: true,
+        mamba_cache_chunk_size: Some(256),
+        mamba_host_only_checkpoint: true,
+        ..CacheInitParams::default()
+    }
+}
+
+#[test]
+fn host_only_load_back_build_copies_into_the_request_slot_only() {
+    let mut tc = UnifiedTreeCore::new(host_only_params(), vec![FULL, MAMBA]);
+    let [a] = chain::<1>(&mut tc);
+    set_mamba_host(&mut tc, a, 8);
+    let component = MambaComponent::new(&host_only_params());
+    let transfers = component
+        .build_hicache_transfers(
+            &tc,
+            a,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64]).squeeze()),
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert!(
+        transfers[0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[3i64]))
+    );
+    assert!(transfers[0].nodes_to_load.is_none());
+    assert!(
+        component
+            .build_hicache_transfers(
+                &tc,
+                a,
+                CacheTransferPhase::LoadBack,
+                /* mamba_pool_idx = */ None,
+                /* host_indices = */ None,
+                /* token_ids = */ None,
+                /* prefetch_tokens = */ 0,
+                /* staging_tokens = */ 0,
+                /* last_hash = */ None,
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn host_only_load_back_commit_keeps_the_node_off_the_device_tier() {
+    let mut tc = UnifiedTreeCore::new(host_only_params(), vec![FULL, MAMBA]);
+    let [a] = chain::<1>(&mut tc);
+    set_mamba_host(&mut tc, a, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    let mut cache_actions = Vec::new();
+    tc.commit_hicache_transfers(
+        tc.arena.node(a).id,
+        CacheTransferPhase::LoadBack,
+        HashMap::from([(
+            MAMBA,
+            vec![PoolTransfer {
+                name: PoolName::Mamba,
+                host_indices: Some(Tensor::from_slice(&[8i64])),
+                device_indices: Some(Tensor::from_slice(&[3i64])),
+                ..Default::default()
+            }],
+        )]),
+        &mut cache_actions,
+        None,
+        None,
+    )
+    .expect("live test node");
+    assert!(tc.arena.node(a).try_device_value(MAMBA).is_none());
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(a)));
+    assert!(!tc.device_lru_list(MAMBA).in_list(Some(a)));
+    assert_eq!(tc.evictable_size_(MAMBA), 0);
+    assert!(cache_actions.is_empty());
+}
+
 #[test]
 fn backup_host_commit_stores_the_host_slot_once() {
     let mut tc = mamba_core(/* page_size = */ 1);

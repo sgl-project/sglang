@@ -1052,8 +1052,14 @@ class MambaComponent(TreeComponent):
             if cd.value is not None:
                 return None
 
-            # restore single node if host_value exists
-            if cd.host_value is not None and cd.value is None:
+            # restore single node if host_value exists. A host-only checkpoint
+            # keeps no GPU slot on the node, so the request copy below is the
+            # only H->D.
+            if (
+                cd.host_value is not None
+                and cd.value is None
+                and not self._mamba_host_only_checkpoint()
+            ):
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
@@ -1122,7 +1128,9 @@ class MambaComponent(TreeComponent):
                     cd.host_value = transfers[0].host_indices.clone()
 
         elif phase == CacheTransferPhase.LOAD_BACK:
-            if not transfers:
+            # Host-only: the only transfer targets the request's slot, which
+            # must not become the node's value.
+            if not transfers or self._mamba_host_only_checkpoint():
                 return
             transfer = transfers[0]
             if transfer.device_indices is not None:
