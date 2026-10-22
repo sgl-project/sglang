@@ -802,10 +802,12 @@ def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> N
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens:
-        output[:real_num_tokens].copy_(
-            layer._mega_core(
-                query[:real_num_tokens], attn_sink, forward_batch, get_attn_backend()
-            )
+        layer._mega_core(
+            query[:real_num_tokens],
+            attn_sink,
+            forward_batch,
+            get_attn_backend(),
+            out=output[:real_num_tokens],
         )
     output[real_num_tokens:].zero_()
 
@@ -1514,6 +1516,7 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         allow_mxfp8_output: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         data, scale = attn_backend.forward(
             q=q,
@@ -1545,7 +1548,7 @@ class MQALayer(MqaAttentionBase):
                 out=(y.view(rows, groups, -1), y_sf),
             )
             return y, y_sf
-        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32))
+        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
     def _get_npu_rope_position_cache(
         self,
