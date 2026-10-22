@@ -39,6 +39,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
 
+# Turn off torch.distributed's NCCL2 path in the torch nightly.
+ENV TORCH_DIST_USE_NCCL2=0
+
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -946,6 +949,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Point Triton at the CUDA 13.4 toolkit's ptxas instead of its bundled copy.
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
+
+# Turn off torch.distributed's NCCL2 path in the torch nightly.
+ENV TORCH_DIST_USE_NCCL2=0
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
