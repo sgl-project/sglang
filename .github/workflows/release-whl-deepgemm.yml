@@ -121,7 +121,7 @@ jobs:
           #   runner: 1-gpu-5090
           #   wheel_arch: x86_64
           - arch_label: sm100-aarch64
-            runner: 4-gpu-gb300
+            runner: 2-gpu-gb300
             wheel_arch: aarch64
             timeout: 180
     runs-on: ${{ matrix.runner }}
