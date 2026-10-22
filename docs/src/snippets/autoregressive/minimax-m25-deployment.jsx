@@ -36,7 +36,7 @@ export const MiniMaxM25Deployment = () => {
         ];
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
         if (values.hardware === 'xeon') {
-          return [{ id: 'tp6', label: 'TP=6', default: true, disabled: false }];
+          return [{ id: 'tp6', label: 'TP=6', default: true, disabled: true }];
         }
         return [
           {
@@ -339,11 +339,12 @@ export const MiniMaxM25Deployment = () => {
 
   const getUpdatedValues = (previous, optionName, value) => {
     if (isAscend(previous) && ['gpuCount', 'thinking', 'toolcall'].includes(optionName)) return previous;
+    if (previous.hardware === 'xeon' && optionName === 'gpuCount') return previous;
     const next = { ...previous, [optionName]: value };
     if (optionName === 'hardware' && value !== 'a3' && value !== 'a2') {
       const items = options.gpuCount.getDynamicItems(next);
       if (!items.some((item) => item.id === next.gpuCount && !item.disabled)) {
-        next.gpuCount = items.find((item) => item.default && !item.disabled).id;
+        next.gpuCount = (items.find((item) => item.default && !item.disabled) || items[0]).id;
       }
     }
     return next;

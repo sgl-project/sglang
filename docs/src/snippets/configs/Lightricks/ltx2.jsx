@@ -1,7 +1,7 @@
 export const config = (() => {
   const modelOf = (s) => "Lightricks/" + (s.model === "ltx2" ? "LTX-2" : "LTX-2.3");
   const plan = (s) => {
-    const gpus = Number(s.gpus_per_node);
+    const gpus = s.hw === "xeon" ? 1 : Number(s.gpus_per_node);
     const tp = gpus === 4 ? 2 : 1;
     const flags = [
       "--model-path " + modelOf(s),
@@ -104,7 +104,10 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 4, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
         verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw, device: hw === "h200" ? "resident" : "original" };
           const p = plan(s);

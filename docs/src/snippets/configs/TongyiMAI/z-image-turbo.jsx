@@ -36,7 +36,10 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 2, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
         verifiedRecipes: ["mi300x", "mi325x", "mi355x", "b200", "h200", "h100", "a2", "a3", "arc_b", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);

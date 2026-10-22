@@ -1,7 +1,7 @@
 export const config = (() => {
   const modelOf = () => "Lightricks/LTX-2.5-Diffusers";
   const plan = (s) => {
-    const gpus = Number(s.gpus_per_node);
+    const gpus = s.hw === "xeon" ? 1 : Number(s.gpus_per_node);
     const flags = [
       "--model-path " + modelOf(s),
       "--pipeline-class-name " + (s.pipeline === "two-stage" ? "LTX2TwoStagePipeline" : "LTX2Pipeline"),
@@ -149,7 +149,10 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 2, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
         verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
