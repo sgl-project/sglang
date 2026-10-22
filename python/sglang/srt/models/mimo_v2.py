@@ -1237,6 +1237,16 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    # The audio encoders also have `layers.<i>.*_proj` linears; LoRA adapts only
+    # the language model.
+    _lora_pattern = re.compile(
+        r"^model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)"
+        r"|mlp\.(?:gate_up_proj|down_proj|experts))$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.model is not None, (
             "get_input_embedding() is not available in encoder_only mode"
