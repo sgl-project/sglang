@@ -66,12 +66,3 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
-
-register_kernel(
-    KernelSpec(
-        op="embeddings.engram_peer_gather",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.embeddings.engram_peer_gather:engram_peer_gather",
-        capabilities=CUDA_ONLY,
-    )
-)

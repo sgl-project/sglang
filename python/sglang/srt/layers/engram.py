@@ -52,7 +52,13 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_platform,
+    get_serving,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -794,9 +800,8 @@ class EngramEmbedding(nn.Module):
     columns where they divide evenly (`shard_range`); with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
-    in every layout: a rank writes only its own row range. With
-    SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE, supported single-node NVLink groups
-    map each immutable HBM shard and fetch locally requested rows from its owner.
+    in every layout: a rank writes only its own row range. Supported single-node
+    NVLink groups map immutable HBM shards and read rows from their owner.
     """
 
     def __init__(
@@ -815,29 +820,10 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        self.peer_table = None
-        if (
-            envs.SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE.get()
-            and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
-        ):
-            from sglang.srt.layers.engram_peer import (
-                EngramPeerTable,
-                peer_table_supported,
-            )
-
-            group = get_parallel().tp_group
-            if peer_table_supported(group):
-                ranges = [
-                    shard_range(num_embeddings, column_bounds, rank, self.tp_size)
-                    for rank in range(self.tp_size)
-                ]
-                self.peer_table = EngramPeerTable(ranges, dim, FP8_BLOCK_SIZE, group)
-        if self.peer_table is not None:
-            self.weight = nn.Parameter(self.peer_table.weight, requires_grad=False)
-            self.scale = nn.Parameter(self.peer_table.scale, requires_grad=False)
-        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self._peer_storage = self._peer_handle = None
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
-        else:
+        elif not self._init_peer_table(num_embeddings, column_bounds):
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -888,14 +874,86 @@ class EngramEmbedding(nn.Module):
         if self.host_table is not None:
             self.host_table.dirty = True
 
+    def _init_peer_table(
+        self, num_embeddings: int, column_bounds: tuple[int, ...]
+    ) -> bool:
+        parallel, execution = get_parallel(), get_exec()
+        if (
+            not get_platform().is_sm100
+            or torch.empty(0).device.type != "cuda"
+            or self.tp_size != 4
+            or parallel.attn_dp_size != 1
+            or parallel.attn_cp_size != 1
+            or execution.features.enable_memory_saver
+            or execution.features.enable_weights_cpu_backup
+            or execution.offload.cpu_offload_gb > 0
+            or execution.offload.offload_group_size > 0
+        ):
+            return False
+        import torch.distributed._symmetric_memory as symm_mem
+
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+            can_use_custom_all_reduce_with_nvlink,
+        )
+
+        group = parallel.tp_group
+        device = torch.device("cuda", torch.cuda.current_device())
+        if not can_use_custom_all_reduce_with_nvlink(
+            group.cpu_group, device, [4], "EngramEmbedding"
+        ):
+            return False
+        ranges = [
+            shard_range(num_embeddings, column_bounds, rank, self.tp_size)
+            for rank in range(self.tp_size)
+        ]
+        # Rendezvous requires equal allocation sizes, including uneven shards.
+        capacity = max(1, max(end - start for start, end in ranges))
+        self._peer_scale_offset = capacity * self.dim
+        self._peer_storage = symm_mem.empty(
+            (capacity * (self.dim + self.dim // FP8_BLOCK_SIZE),),
+            device=device,
+            dtype=torch.uint8,
+        )
+        self.weight = nn.Parameter(
+            self._peer_storage[: self._peer_scale_offset]
+            .view(torch.float8_e4m3fn)
+            .view(capacity, self.dim)[: self.rows],
+            requires_grad=False,
+        )
+        self.scale = nn.Parameter(
+            self._peer_storage[self._peer_scale_offset :]
+            .view(torch.float8_e8m0fnu)
+            .view(capacity, self.dim // FP8_BLOCK_SIZE)[: self.rows],
+            requires_grad=False,
+        )
+        self._peer_bounds = torch.tensor(
+            [start for start, _ in ranges] + [ranges[-1][1]],
+            device=device,
+            dtype=torch.int64,
+        )
+        return True
+
     def finish_load(self, label: str):
         """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
-        if self.peer_table is not None:
-            assert self.weight.data_ptr() == self.peer_table.weight.data_ptr()
-            assert self.scale.data_ptr() == self.peer_table.scale.data_ptr()
-            self.peer_table.finish_load()
+        if self._peer_storage is not None:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            # Reload callers must quiesce readers before writing shared storage.
+            torch.cuda.synchronize()
+            group = get_parallel().tp_group
+            torch.distributed.barrier(group=group.cpu_group)
+            if self._peer_handle is None:
+                self._peer_handle = symm_mem.rendezvous(
+                    self._peer_storage, group.device_group
+                )
+                pointers = torch.tensor(
+                    self._peer_handle.buffer_ptrs,
+                    device=self.weight.device,
+                    dtype=torch.int64,
+                )
+                self._peer_ptrs = (pointers, pointers + self._peer_scale_offset)
 
     def forward(
         self,
@@ -904,9 +962,16 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        if self.peer_table is not None:
+        if self._peer_storage is not None:
             out = self._empty(indices)
-            self.peer_table.lookup(indices.reshape(-1), out.view(-1, self.dim))
+            engram_gather(
+                *self._peer_ptrs,
+                indices.reshape(-1),
+                out.view(-1, self.dim),
+                self.dim,
+                FP8_BLOCK_SIZE,
+                row_bounds=self._peer_bounds,
+            )
             return out
         if self._shared:
             if indices.shape[0] == 0:

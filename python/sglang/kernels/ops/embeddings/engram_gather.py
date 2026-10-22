@@ -25,12 +25,28 @@ def _engram_gather_kernel(
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    row_bounds,
+    TP_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
-    owned = (idx >= row_lo) & (idx < row_hi)
+    if TP_SIZE:
+        weight_address = tl.full((), 0, tl.int64)
+        scale_address = tl.full((), 0, tl.int64)
+        owned = tl.full((), False, tl.int1)
+        for rank in tl.static_range(TP_SIZE):
+            lower = tl.load(row_bounds + rank)
+            upper = tl.load(row_bounds + rank + 1)
+            match = (idx >= lower) & (idx < upper)
+            weight_address = tl.where(match, tl.load(w_ptr + rank), weight_address)
+            scale_address = tl.where(match, tl.load(s_ptr + rank), scale_address)
+            row_lo = tl.where(match, lower, row_lo)
+            owned |= match
+        w_ptr, s_ptr = weight_address, scale_address
+    else:
+        owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
     w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
@@ -47,20 +63,23 @@ def _engram_gather_kernel(
 
 
 def engram_gather(
-    weight_ptr: int,
-    scale_ptr: int,
+    weight_ptr: int | torch.Tensor,
+    scale_ptr: int | torch.Tensor,
     ids: torch.Tensor,
     out: torch.Tensor,
     dim: int,
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    row_bounds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
     ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
     [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
     may live in device or host memory. Ids outside the range produce zero rows.
+    With ``row_bounds``, the pointers are device arrays of mapped TP shard
+    addresses; each lookup reads directly from the immutable owning shard.
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
@@ -81,5 +100,7 @@ def engram_gather(
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            row_bounds=row_bounds,
+            TP_SIZE=0 if row_bounds is None else row_bounds.numel() - 1,
         )
     return out

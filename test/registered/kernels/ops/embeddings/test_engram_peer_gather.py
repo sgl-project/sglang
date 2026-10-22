@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from sglang.srt.distributed import parallel_state as ps
-from sglang.srt.environ import envs
 from sglang.srt.layers.engram import FP8_BLOCK_SIZE, EngramEmbedding
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -60,24 +59,16 @@ def test_lookup_reload_and_graph(group, empty_shards, id_dtype):
     )
     exponent[0] = 0
     scale = exponent.view(torch.float8_e8m0fnu)
-    with torch.device("cuda"), envs.SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE.override(
-        True
-    ):
+    with torch.device("cuda"):
         peer = EngramEmbedding(size, 256, 1, tuple(bounds))
-    assert peer.peer_table is not None
-    with torch.device("cuda"), envs.SGLANG_ENABLE_DSV41_ENGRAM_PEER_TABLE.override(
-        False
-    ):
-        baseline = EngramEmbedding(size, 256, 1, tuple(bounds))
-    for table in (peer, baseline):
-        table._load_rows(table.weight, weight)
-        table._load_rows(table.scale, scale)
-        table.finish_load("test")
+    assert peer._peer_storage is not None
+    peer._load_rows(peer.weight, weight)
+    peer._load_rows(peer.scale, scale)
+    peer.finish_load("test")
     ids = torch.tensor(
         [-1, 0, 1, size - 1, size, *bounds], device="cuda", dtype=id_dtype
     ).view(-1, 1)
     expected = _reference(weight, scale, ids)
-    torch.testing.assert_close(baseline(ids), expected, rtol=0, atol=0)
     torch.testing.assert_close(peer(ids), expected, rtol=0, atol=0)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -92,7 +83,7 @@ def test_lookup_reload_and_graph(group, empty_shards, id_dtype):
     ids.copy_(torch.randint(-1, size + 1, ids.shape, device="cuda", dtype=id_dtype))
     graph.replay()
     torch.testing.assert_close(actual, _reference(weight, scale, ids), rtol=0, atol=0)
-    # A zero-token DP/CP rank must not wait for other ranks' lookups.
+    # A zero-token rank must not wait for other ranks' lookups.
     local_ids = ids[: group.rank_in_group]
     torch.testing.assert_close(
         peer(local_ids, cp_all_tokens=True),
