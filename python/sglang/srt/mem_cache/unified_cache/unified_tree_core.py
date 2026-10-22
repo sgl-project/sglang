@@ -389,9 +389,10 @@ class UnifiedLRUList:
         return self.get_prev_no_host_lock(self.tail, check_id=False)
 
 
-# WALK (one node per step) -> COMMIT (leaf + commit hooks) -> TAIL (refresh + backup).
+# WALK -> OVERLAP (live nodes) -> COMMIT (leaf + hooks) -> TAIL (refresh + backup).
 class _InsertPhase(Enum):
     WALK = auto()
+    OVERLAP = auto()
     COMMIT = auto()
     TAIL = auto()
 
@@ -409,6 +410,8 @@ class _InsertWalkState(msgspec.Struct):
     total_prefix_length: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
+    overlap_node: Optional[UnifiedTreeNode] = None
+    overlap_prefix_len: int = 0
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
 
@@ -1234,6 +1237,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             flushed_len = len(state.pending_actions)
             if state.phase is _InsertPhase.WALK:
                 self._insert_walk_step(state)
+            elif state.phase is _InsertPhase.OVERLAP:
+                self._insert_overlap_step(state)
             elif state.phase is _InsertPhase.COMMIT:
                 self._insert_commit_step(state)
             elif state.phase is _InsertPhase.TAIL:
@@ -1301,48 +1306,64 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result=state.result,
                     cache_actions=step_actions,
                 )
-        else:
-            value_slice = state.value[:prefix_len]
-            consumed_from = prefix_len
-            # Let each component claim ownership of overlapping KV slots
-            for component in self.components:
-                comp_consumed_from = component.update_component_on_insert_overlap(
-                    node=node,
-                    prefix_len=prefix_len,
-                    total_prefix_len=state.total_prefix_length,
-                    value_slice=value_slice,
-                    params=state.params,
-                    result=state.result,
-                    cache_actions=step_actions,
-                )
-                consumed_from = min(consumed_from, comp_consumed_from)
+            self._finish_insert_walk_node(state, node, prefix_len)
+            return
+        state.overlap_node = node
+        state.overlap_prefix_len = prefix_len
+        state.phase = _InsertPhase.OVERLAP
+        # Finish ordinary overlaps now; resource barriers resume in OVERLAP.
+        self._insert_overlap_step(state)
 
-            dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
-            if dup_start < consumed_from:
-                # The duplicate slice may straddle this request's own eviction
-                # floor; below it only the full side is still ours to release.
-                dup = value_slice[dup_start:consumed_from]
-                abs_start = state.total_prefix_length + dup_start
-                swa_already_freed = min(
-                    max(
-                        state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start,
-                        0,
-                    ),
-                    dup.numel(),
-                )
-                if swa_already_freed > 0:
-                    step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
-                if swa_already_freed < dup.numel():
-                    step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
+    def _insert_overlap_step(self, state: _InsertWalkState) -> None:
+        """Claim overlapping slots after any backend-specific resource barrier."""
+        node = state.overlap_node
+        assert node is not None
+        prefix_len = state.overlap_prefix_len
+        value_slice = state.value[:prefix_len]
+        consumed_from = prefix_len
+        for component in self.components:
+            comp_consumed_from = component.update_component_on_insert_overlap(
+                node=node,
+                prefix_len=prefix_len,
+                total_prefix_len=state.total_prefix_length,
+                value_slice=value_slice,
+                params=state.params,
+                result=state.result,
+                cache_actions=state.pending_actions,
+            )
+            consumed_from = min(consumed_from, comp_consumed_from)
 
+        dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
+        if dup_start < consumed_from:
+            # Below the request's SWA eviction floor only FULL is still ours.
+            dup = value_slice[dup_start:consumed_from]
+            abs_start = state.total_prefix_length + dup_start
+            swa_already_freed = min(
+                max(state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start, 0),
+                dup.numel(),
+            )
+            if swa_already_freed > 0:
+                state.pending_actions.append(
+                    FreeDeviceKVFullOnly([dup[:swa_already_freed]])
+                )
+            if swa_already_freed < dup.numel():
+                state.pending_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
+        self._finish_insert_walk_node(state, node, prefix_len)
+
+    def _finish_insert_walk_node(
+        self, state: _InsertWalkState, node: UnifiedTreeNode, prefix_len: int
+    ) -> None:
         # Nodes this request already inserted were counted back then.
         node_end = state.total_prefix_length + prefix_len
         if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
-            step_actions.append(self._build_backup_kv_action(node))
+            state.pending_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
-        state.key = key[prefix_len:]
+        state.key = state.key[prefix_len:]
         state.value = state.value[prefix_len:]
+        state.overlap_node = None
+        state.overlap_prefix_len = 0
+        state.phase = _InsertPhase.WALK
 
     def _insert_commit_step(self, state: _InsertWalkState) -> None:
         """Create the tail leaf and run the component commit hooks."""
