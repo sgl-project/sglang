@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
-import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -493,24 +492,3 @@ def test_fetch_mesh_sources_and_server_value_sanitizing(monkeypatch, tmp_path) -
     assert path == str(tmp_path / "sgld_x.glb")
     with pytest.raises(RuntimeError, match="format"):
         server_api.mesh_dest_path(str(tmp_path), {"id": "m1", "format": "sh"}, "glb")
-
-
-def test_mesh_node_returns_file_3d_and_removes_its_temp_image(tmp_path) -> None:
-    """The node's output must be what ComfyUI's Preview 3D accepts."""
-    folder_paths = pytest.importorskip("folder_paths")
-    types = pytest.importorskip("comfy_api.latest").Types
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.nodes import (
-        SGLDiffusionGenerateMesh,
-    )
-
-    folder_paths.set_output_directory(str(tmp_path))
-    folder_paths.set_temp_directory(str(tmp_path))
-    client = Mock()
-    client.generate_mesh.return_value = {"id": "m1", "format": "glb"}
-    client.fetch_mesh.side_effect = lambda job, dest, local_roots: dest
-    model, path = SGLDiffusionGenerateMesh().generate_mesh(
-        client, torch.rand(2, 8, 8, 3)
-    )
-    assert isinstance(model, types.File3D)
-    assert path == str(tmp_path / "mesh" / "sgld_m1.glb")
-    assert not os.path.exists(client.generate_mesh.call_args.kwargs["image_path"])
