@@ -538,6 +538,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             _original_forward_mode=None,
             tbo_parent_token_range=None,
+            mixed_num_prefill_tokens=None,
         )
         for backend_choice, num_qo_tokens, builds in (
             ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False),
@@ -581,7 +582,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, mixed_num_prefill_tokens=None
+        )
         backend = self._make_prefill_backend(hisparse_coordinator=object())
 
         shared_read_ends = backend.resolve_prefill_shared_read_ends(
