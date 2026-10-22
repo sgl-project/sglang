@@ -528,12 +528,18 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
     )
 
 
+def _run_as_single_rank(test: unittest.TestCase) -> None:
+    # The transfer queue sizes its release collectives from the gloo group;
+    # these tests have no process group, so answer as one rank.
+    world_size = patch.object(dist, "get_world_size", return_value=1)
+    world_size.start()
+    test.addCleanup(world_size.stop)
+
+
 class TestResolveDeferredReleases(CustomTestCase):
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
@@ -855,9 +861,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def _pop(self, q):
         released = []
