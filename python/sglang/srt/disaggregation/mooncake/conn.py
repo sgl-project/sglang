@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from prometheus_client import Counter
 
@@ -72,6 +73,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_memory,
     get_observability,
     get_schedule,
@@ -557,6 +559,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -568,6 +571,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -790,7 +794,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         if pairs is None:
@@ -2503,6 +2506,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
+                if kv_chunk.indices_event is not None:
+                    kv_chunk.indices_event.synchronize()
+                    kv_chunk.indices_event = None
+                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -3070,6 +3078,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         wait_event: Optional[object] = None,
+        indices_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3110,6 +3119,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
+                indices_event=indices_event,
             )
         )
 
@@ -3235,12 +3245,15 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.init_time = time.time()
         self._init_trace_ctx()
 
+    supports_host_tensor_indices = True
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        indices_event: Optional[object] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -3259,6 +3272,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
+                indices_event=indices_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -3271,6 +3285,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
+                indices_event=indices_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

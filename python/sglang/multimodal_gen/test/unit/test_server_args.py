@@ -874,7 +874,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
                 "--component-quantizations.text_encoder",
-                "kitchen_int8",
+                "convrot_int8",
                 "--component-quantization-ignored-layers.text_encoder",
                 "model.layers.0",
                 "lm_head",
