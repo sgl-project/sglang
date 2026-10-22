@@ -49,7 +49,6 @@ from sglang.kernels.ops.lora.moe.virtual_experts import (
     _align_block_size_jit,
     _align_block_size_torch,
     _fused_virtual_topk_ids,
-    fused_sanitize_expert_ids,
 )
 
 
@@ -61,30 +60,39 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         cls.device = _require_accelerator_device()
 
     def test_negative_sentinels_preserved(self):
-        # Mix of valid topk_ids in [0, num_experts), -1 sentinels (typical
-        # post-EP-dispatch), and a synthetic -2 to ensure the fix doesn't
-        # depend on the exact -1 value.
+        """Virtual scratch IDs stay bounded without changing borrowed route metadata."""
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                self._check_remap_domain(dtype)
+
+    def _check_remap_domain(self, dtype):
+        num_experts, max_loras = 16, 4
+        wide = 2**40 if dtype == torch.int64 else 2**30
         topk_ids = torch.tensor(
             [
                 [3, -1],
-                [-1, 5],
+                [-3, 5],
                 [0, 7],
                 [-1, -1],
                 [2, 9],
                 [11, -2],
                 [-1, 4],
                 [6, -1],
+                [16, 17],
+                [wide, -wide],
+                [torch.iinfo(dtype).min, torch.iinfo(dtype).max],
+                [0, 15],
             ],
-            dtype=torch.int32,
+            dtype=dtype,
             device=self.device,
         )
         token_lora_mapping = torch.tensor(
-            [0, 1, 0, 2, -1, 1, 0, 1], dtype=torch.int32, device=self.device
+            [0, 1, 0, 2, -1, 1, 0, 1, 0, 1, 4, 5],
+            dtype=torch.int32,
+            device=self.device,
         )
-        num_experts = 16
-        max_loras = 4
-
         original_ids = topk_ids.clone()
+        original_mapping = token_lora_mapping.clone()
         providers = {"base": _fused_virtual_topk_ids}
         if is_cuda():
             from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
@@ -92,39 +100,24 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
             )
 
             providers["trtllm"] = trtllm_virtual_ids
-        for provider, remap in providers.items():
-            for shared_outer in (False, True):
-                with self.subTest(provider=provider, shared_outer=shared_outer):
-                    virtual_ids, _, _ = remap(
-                        topk_ids,
-                        token_lora_mapping,
-                        num_experts,
-                        shared_outer=shared_outer,
-                        max_loras=max_loras,
-                    )
-
-                    # Shared weights still follow each original route's validity,
-                    # including a dropped first slot followed by a live slot.
-                    for m in range(topk_ids.shape[0]):
-                        slot = token_lora_mapping[m].item()
-                        lora = max(slot, 0)
-                        for k in range(topk_ids.shape[1]):
-                            base = topk_ids[m, k].item()
-                            expected = base
-                            if provider == "trtllm" and slot < 0:
-                                expected = -1
-                            elif base >= 0:
-                                expected = (
-                                    lora if shared_outer else base + lora * num_experts
-                                )
-                            self.assertEqual(virtual_ids[m, k].item(), expected)
-                    torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
-
-                    enabled = torch.ones(
-                        max_loras * 2, device=self.device, dtype=torch.int32
-                    )[::2]
+        for (provider, remap), shared_outer, use_enabled in product(
+            providers.items(), (False, True), (False, True)
+        ):
+            with self.subTest(
+                provider=provider, shared_outer=shared_outer, enabled=use_enabled
+            ):
+                enabled = (
+                    torch.ones(max_loras * 2, device=self.device, dtype=torch.int32)[
+                        ::2
+                    ]
+                    if use_enabled
+                    else None
+                )
+                if enabled is not None:
                     enabled[1] = 0
-                    filtered, adapter_mask, _ = remap(
+
+                def run():
+                    return remap(
                         topk_ids,
                         token_lora_mapping,
                         num_experts,
@@ -132,19 +125,64 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                         max_loras=max_loras,
                         adapter_enabled=enabled,
                     )
-                    for m in range(topk_ids.shape[0]):
-                        slot = int(token_lora_mapping[m])
-                        active = slot >= 0 and bool(enabled[slot])
-                        self.assertEqual(bool(adapter_mask[m]), active)
-                        for k in range(topk_ids.shape[1]):
-                            base = int(topk_ids[m, k])
-                            expected = -1
-                            if active and base >= 0:
-                                expected = (
-                                    slot if shared_outer else base + slot * num_experts
+
+                virtual_ids, mask, virtual_experts = run()
+                graph = None
+                if is_cuda():
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        virtual_ids, mask, virtual_experts = run()
+                for state in ("mixed", "disabled", "inactive", "recovered"):
+                    topk_ids.copy_(original_ids)
+                    token_lora_mapping.copy_(original_mapping)
+                    if enabled is not None:
+                        enabled.fill_(1)
+                        enabled[1] = 0
+                    if state == "disabled":
+                        token_lora_mapping.fill_(-1)
+                        if enabled is not None:
+                            enabled.zero_()
+                    elif state == "inactive":
+                        topk_ids.fill_(-1)
+                    saved_ids, saved_mapping = (
+                        topk_ids.clone(),
+                        token_lora_mapping.clone(),
+                    )
+                    if graph is None:
+                        virtual_ids, mask, virtual_experts = run()
+                    else:
+                        graph.replay()
+                    expected = torch.full_like(topk_ids, -1)
+                    for row, slot in enumerate(saved_mapping.cpu().tolist()):
+                        active = 0 <= slot < max_loras and (
+                            enabled is None or bool(enabled[slot])
+                        )
+                        self.assertEqual(bool(mask[row]), active)
+                        for route, expert in enumerate(saved_ids[row].cpu().tolist()):
+                            if (
+                                active
+                                and expert >= 0
+                                and (shared_outer or expert < num_experts)
+                            ):
+                                expected[row, route] = (
+                                    slot
+                                    if shared_outer
+                                    else expert + slot * num_experts
                                 )
-                            self.assertEqual(int(filtered[m, k]), expected)
-                    torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(virtual_ids, expected, rtol=0, atol=0)
+                    self.assertTrue(
+                        bool(
+                            (
+                                (virtual_ids == -1)
+                                | ((virtual_ids >= 0) & (virtual_ids < virtual_experts))
+                            ).all()
+                        )
+                    )
+                    torch.testing.assert_close(topk_ids, saved_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        token_lora_mapping, saved_mapping, rtol=0, atol=0
+                    )
 
     @unittest.skipUnless(is_cuda(), "Merged LoRA alignment requires CUDA")
     def test_shared_outer_merged_alignment_skips_original_negative_routes(self):
@@ -254,6 +292,139 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                 actual = ep_ids.flatten()[live]
                 expected = torch.where(actual < 0, -1, actual)
                 self.assertTrue(bool((expected == ep_experts[index]).all()))
+
+    @unittest.skipUnless(is_cuda(), "Merged LoRA alignment requires CUDA")
+    def test_merged_alignment_raw_domains_on_replay(self):
+        """Raw integer extremes and missing adapters never become real weight IDs."""
+        from sglang.kernels.ops.lora.moe.trtllm_lora_temp.moe_lora_merged_align import (
+            moe_lora_merged_align,
+        )
+
+        num_experts, slots, block_size = 4, 3, 8
+        for dtype, shared_outer, use_enabled, fuse_scatter in product(
+            (torch.int32, torch.int64), (False, True), (False, True), (False, True)
+        ):
+            with self.subTest(
+                dtype=dtype,
+                shared=shared_outer,
+                enabled=use_enabled,
+                fused=fuse_scatter,
+            ):
+                wide = 2**40 if dtype == torch.int64 else 2**30
+                ids = torch.tensor(
+                    [
+                        [0, 1],
+                        [-3, 2],
+                        [4, 5],
+                        [wide, 0],
+                        [0, 1],
+                        [2, -1],
+                        [torch.iinfo(dtype).min, torch.iinfo(dtype).max],
+                    ],
+                    device=self.device,
+                    dtype=dtype,
+                )
+                mapping = torch.tensor(
+                    [0, 1, 2, 0, -1, slots, 1], device=self.device, dtype=torch.int32
+                )
+                original_ids, original_mapping = ids.clone(), mapping.clone()
+                enabled = (
+                    torch.ones(slots * 2, device=self.device, dtype=torch.int32)[::2]
+                    if use_enabled
+                    else None
+                )
+
+                def run():
+                    return moe_lora_merged_align(
+                        ids,
+                        mapping,
+                        num_experts,
+                        shared_outer,
+                        slots,
+                        block_size,
+                        do_skip=False,
+                        fuse_scatter=fuse_scatter,
+                        adapter_enabled=enabled,
+                        return_inactive_prefix_count=True,
+                    )
+
+                run()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    sorted_ids, experts, count, adapter_mask, virtual_experts = run()
+                for state in ("mixed", "disabled", "inactive", "recovered"):
+                    ids.copy_(original_ids)
+                    mapping.copy_(original_mapping)
+                    if enabled is not None:
+                        enabled.fill_(1)
+                        enabled[1] = 0
+                    if state == "disabled":
+                        mapping.fill_(-1)
+                        if enabled is not None:
+                            enabled.zero_()
+                    elif state == "inactive":
+                        ids.fill_(-1)
+                    saved_ids, saved_mapping = ids.clone(), mapping.clone()
+                    graph.replay()
+                    groups = {}
+                    for row, slot in enumerate(saved_mapping.cpu().tolist()):
+                        active = 0 <= slot < slots and (
+                            enabled is None or bool(enabled[slot])
+                        )
+                        self.assertEqual(bool(adapter_mask[row]), active)
+                        for route, expert in enumerate(saved_ids[row].cpu().tolist()):
+                            virtual = -1
+                            if (
+                                active
+                                and expert >= 0
+                                and (shared_outer or expert < num_experts)
+                            ):
+                                virtual = (
+                                    slot
+                                    if shared_outer
+                                    else expert + slot * num_experts
+                                )
+                            groups.setdefault(virtual, []).append(
+                                row * ids.shape[1] + route
+                            )
+                    expected_total = sum(
+                        ((len(group) + block_size - 1) // block_size) * block_size
+                        for group in groups.values()
+                    )
+                    expected_prefix = (
+                        len(groups.get(-1, [])) + block_size - 1
+                    ) // block_size
+                    self.assertEqual(
+                        count.cpu().tolist(), [expected_total, expected_prefix]
+                    )
+                    self.assertLessEqual(expected_total, sorted_ids.numel())
+                    expected_experts, offset = [], 0
+                    for expert, indices in sorted(groups.items()):
+                        padded = (
+                            (len(indices) + block_size - 1) // block_size
+                        ) * block_size
+                        actual = sorted_ids[offset : offset + padded].cpu()
+                        self.assertEqual(
+                            sorted(actual[actual < ids.numel()].tolist()), indices
+                        )
+                        self.assertTrue(
+                            bool((actual[actual >= ids.numel()] == ids.numel()).all())
+                        )
+                        expected_experts += [expert] * (padded // block_size)
+                        offset += padded
+                    self.assertEqual(
+                        experts[: expected_total // block_size].cpu().tolist(),
+                        expected_experts,
+                    )
+                    self.assertTrue(
+                        all(
+                            expert == -1 or 0 <= expert < virtual_experts
+                            for expert in expected_experts
+                        )
+                    )
+                    torch.testing.assert_close(ids, saved_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(mapping, saved_mapping, rtol=0, atol=0)
 
     @unittest.skipUnless(is_cuda(), "Stock virtual LoRA hook fixture requires CUDA")
     def test_gate_up_hook_uses_each_stacked_a_projection(self):
@@ -412,9 +583,8 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                 expected = base + max(lora, 0) * num_experts
                 self.assertEqual(virtual_ids[m, k].item(), expected)
 
-    def test_no_lora_token_does_not_shift_base(self):
-        """`token_lora_mapping[m] == -1` (no LoRA) keeps `safe_lora=0`,
-        so positive bases pass through unchanged and the row mask is False."""
+    def test_no_lora_token_has_no_virtual_expert(self):
+        """A missing adapter never occupies a virtual expert, including slot zero."""
         topk_ids = torch.tensor([[3, 5]], dtype=torch.int32, device=self.device)
         token_lora_mapping = torch.tensor([-1], dtype=torch.int32, device=self.device)
         num_experts = 16
@@ -422,8 +592,10 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         virtual_ids, mask, _ = _fused_virtual_topk_ids(
             topk_ids, token_lora_mapping, num_experts, False, max_loras=4
         )
-        self.assertEqual(virtual_ids[0, 0].item(), 3)
-        self.assertEqual(virtual_ids[0, 1].item(), 5)
+        torch.testing.assert_close(virtual_ids, torch.full_like(virtual_ids, -1))
+        torch.testing.assert_close(
+            topk_ids, torch.tensor([[3, 5]], device=self.device, dtype=torch.int32)
+        )
         self.assertFalse(bool(mask[0].item()))
 
 
@@ -441,6 +613,15 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
 
     def _align(self, topk_ids, block_size, num_experts):
         raise NotImplementedError
+
+    def _align_used(self, topk_ids, block_size, num_experts):
+        sorted_ids, experts, count = self._align(topk_ids, block_size, num_experts)
+        used = int(count[0])
+        self.assertGreaterEqual(used, 0)
+        self.assertEqual(used % block_size, 0)
+        self.assertLessEqual(used, sorted_ids.numel())
+        self.assertLessEqual(used // block_size, experts.numel())
+        return sorted_ids, experts[: used // block_size], count
 
     @staticmethod
     def _assigned_experts(expert_ids: torch.Tensor) -> list:
@@ -466,7 +647,7 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align_used(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = set(self._assigned_experts(expert_ids))
@@ -483,7 +664,7 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align_used(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
@@ -502,7 +683,7 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align_used(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
@@ -529,7 +710,7 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align_used(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
@@ -543,7 +724,7 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
         block_size = 16
         topk_ids = torch.empty((0, 2), dtype=torch.int32, device=self.device)
 
-        sorted_token_ids, expert_ids, num_post_padded = self._align(
+        sorted_token_ids, expert_ids, num_post_padded = self._align_used(
             topk_ids, block_size, num_experts
         )
 
@@ -566,15 +747,10 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
     "on that platform.",
 )
 class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
-    """Test the CUDA JIT kernel path (with fused_sanitize_expert_ids, as in
-    production)."""
+    """Test raw-ID CUDA alignment without a post-hoc expert-ID sanitizer."""
 
     def _align(self, topk_ids, block_size, num_experts):
-        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size_jit(
-            topk_ids, block_size, num_experts
-        )
-        expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
-        return sorted_token_ids, expert_ids, num_tokens_post_padded
+        return _align_block_size_jit(topk_ids, block_size, num_experts)
 
 
 if __name__ == "__main__":

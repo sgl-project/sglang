@@ -96,8 +96,14 @@ def moe_align_block_size(
                     block_size,
                     num_experts,
                     return_inactive_prefix_count=return_inactive_prefix_count,
+                    map_invalid_experts_to_sentinel=False,
                 )
-            return _align_block_size_jit(topk_ids, block_size, num_experts)
+            return _align_block_size_jit(
+                topk_ids,
+                block_size,
+                num_experts,
+                map_invalid_experts_to_sentinel=False,
+            )
     # ===== END TO BE REFACTORED ====
 
     if topk_ids.numel() < num_experts + 1:

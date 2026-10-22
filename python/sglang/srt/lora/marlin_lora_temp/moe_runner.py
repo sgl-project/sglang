@@ -567,7 +567,11 @@ def fused_experts_experimental_sgl_marlin_lora(
     # Start alignment after the side-stream fork. EP IDs are already localized;
     # the wrapper owns Marlin's extra sentinel bucket.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, E, return_inactive_prefix_count=not ep_active
+        topk_ids,
+        block_size_m,
+        E,
+        return_inactive_prefix_count=not ep_active,
+        map_invalid_experts_to_sentinel=False,
     )
 
     # A cached workspace can outlive its CUDA graph-private pool.

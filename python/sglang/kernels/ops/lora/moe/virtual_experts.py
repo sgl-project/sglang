@@ -31,16 +31,10 @@ def _fused_virtual_topk_ids_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
+    Map active slots and valid base experts to virtual weight indices.
 
-    For each (m, k):
-        lora_id = token_lora_mapping[m]
-        mask[m] = (lora_id >= 0)
-        safe_lora = max(lora_id, 0)
-        if shared_outer:
-            virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
-        else:
-            virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
+    Invalid slots or base experts map to -1. Shared weights accept any
+    nonnegative base expert and use the adapter slot as the weight index.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -51,9 +45,8 @@ def _fused_virtual_topk_ids_kernel(
     # k = offs % top_k  # not needed directly
 
     lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
-    mask_val = lora_id >= 0
+    mask_val = (lora_id >= 0) & (lora_id < NUM_SLOTS)
     if HAS_ADAPTER_ENABLED:
-        mask_val = mask_val & (lora_id < NUM_SLOTS)
         mask_val = mask_val & (
             tl.load(
                 adapter_enabled_ptr + lora_id * stride_enabled,
@@ -62,18 +55,16 @@ def _fused_virtual_topk_ids_kernel(
             )
             != 0
         )
-    safe_lora = tl.maximum(lora_id, 0)
+    safe_lora = tl.where(mask_val, lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
-    # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
-    # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
-    # a real virtual-expert slot belonging to another adapter and trigger OOB
-    # loads in downstream LoRA kernels.
-    expert = 0 if SHARED_OUTER else base
+    valid_base = base >= 0
+    if not SHARED_OUTER:
+        valid_base = valid_base & (base < num_experts_for_weight)
+    expert = 0 if SHARED_OUTER else tl.where(valid_base, base, 0)
     shifted = expert + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
-    if HAS_ADAPTER_ENABLED:
-        result = tl.where(mask_val & (base >= 0), shifted, -1)
+    # All align providers use one sentinel bucket; borrowed route IDs stay intact.
+    result = tl.where(mask_val & valid_base, shifted, -1)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -326,6 +317,8 @@ def _align_block_size_jit(
     block_size: int,
     num_experts: int,
     return_inactive_prefix_count: bool = False,
+    *,
+    map_invalid_experts_to_sentinel: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
 
@@ -337,7 +330,8 @@ def _align_block_size_jit(
     The JIT kernel uses a +1 offset convention: topk_ids are shifted by +1 so
     that the EP sentinel value (-1) maps to bucket 0. The kernel internally
     handles histogram, padded prefix-sum, expert_ids assignment, and token
-    scattering in just 2–3 CUDA kernel launches.
+    scattering in just 2–3 CUDA kernel launches. Out-of-range signed IDs share
+    the sentinel bucket; opt out only for IDs certified in [-1, num_experts).
     """
     assert num_experts <= 8191, (
         f"_align_block_size_jit supports at most 8191 experts "
@@ -346,7 +340,7 @@ def _align_block_size_jit(
 
     device = topk_ids.device
     flat_topk_ids = topk_ids.reshape(-1)
-    if flat_topk_ids.dtype == torch.int64:
+    if not map_invalid_experts_to_sentinel and flat_topk_ids.dtype == torch.int64:
         flat_topk_ids = flat_topk_ids.to(torch.int32)
     num_total_tokens = flat_topk_ids.numel()
 
@@ -412,6 +406,7 @@ def _align_block_size_jit(
         cumsum_buffer,
         True,  # pad_sorted_token_ids
         write_inactive_prefix_count=return_inactive_prefix_count,
+        map_invalid_experts_to_sentinel=map_invalid_experts_to_sentinel,
     )
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded

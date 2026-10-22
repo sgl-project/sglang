@@ -405,5 +405,96 @@ def test_moe_align_count_publication_bounds(
     assert count_backing.cpu().tolist() == [total, prefix]
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_experts", [8, 129, 1500])
+@pytest.mark.parametrize("write_inactive_prefix_count", [False, True])
+def test_moe_align_checked_ids_preserve_bounds_on_replay(
+    dtype, num_experts, write_inactive_prefix_count
+):
+    """Invalid signed IDs occupy sentinel blocks without touching adjacent storage."""
+    block_size, numel, poison = 8, 16, -100003
+    valid = torch.tensor([0, num_experts - 1, 1, 0] * 4, dtype=dtype)
+    invalid = [-1, -3, num_experts, 2 * num_experts]
+    invalid += [torch.iinfo(dtype).min, torch.iinfo(dtype).max]
+    if dtype == torch.int64:
+        invalid += [-(2**40), 2**40]
+    mixed = valid.clone()
+    mixed[2 : 2 + len(invalid)] = torch.tensor(invalid, dtype=dtype)
+    all_invalid = torch.tensor((invalid * numel)[:numel], dtype=dtype)
+    ids = valid.cuda()
+
+    def guarded(size):
+        backing = torch.full((size + 8,), poison, device="cuda", dtype=torch.int32)
+        return backing, backing[4 : 4 + size]
+
+    max_tokens = numel * block_size
+    buffers = [
+        guarded(max_tokens),
+        guarded(numel),
+        guarded(2 if write_inactive_prefix_count else 1),
+        guarded(num_experts + 2),
+    ]
+    sorted_ids, experts, counts, cumsum = [view for _, view in buffers]
+
+    def run(routes=ids):
+        moe_align_block_size(
+            routes,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            experts,
+            counts,
+            cumsum,
+            True,
+            write_inactive_prefix_count=write_inactive_prefix_count,
+            map_invalid_experts_to_sentinel=True,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for routes in (valid, mixed, all_invalid, valid):
+        ids.copy_(routes)
+        for _, view in buffers:
+            view.fill_(poison)
+        graph.replay()
+        torch.testing.assert_close(ids.cpu(), routes, rtol=0, atol=0)
+        groups = {}
+        for index, expert in enumerate(routes.tolist()):
+            expert = expert if 0 <= expert < num_experts else -1
+            groups.setdefault(expert, []).append(index)
+        total = sum(
+            ceil_div(len(group), block_size) * block_size for group in groups.values()
+        )
+        expected_counts = [total]
+        if write_inactive_prefix_count:
+            expected_counts.append(ceil_div(len(groups.get(-1, [])), block_size))
+        assert counts.cpu().tolist() == expected_counts
+        offset, expected_experts = 0, []
+        for expert, indices in sorted(groups.items()):
+            padded = ceil_div(len(indices), block_size) * block_size
+            group = sorted_ids[offset : offset + padded].cpu()
+            assert sorted(group[group < numel].tolist()) == indices
+            assert bool((group[group >= numel] == numel).all())
+            expected_experts += [expert] * (padded // block_size)
+            offset += padded
+        assert experts[: total // block_size].cpu().tolist() == expected_experts
+        assert bool((experts[total // block_size :] == poison).all())
+        for backing, _ in buffers:
+            assert bool((backing[:4] == poison).all())
+            assert bool((backing[-4:] == poison).all())
+
+    for _, view in buffers:
+        view.fill_(poison)
+    run(ids[:0])
+    assert counts.cpu().tolist() == ([0, 0] if write_inactive_prefix_count else [0])
+    assert bool((experts == poison).all())
+    for backing, _ in buffers:
+        assert bool((backing[:4] == poison).all())
+        assert bool((backing[-4:] == poison).all())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

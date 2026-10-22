@@ -51,10 +51,11 @@ namespace moe_lora_merged {
 template <bool HasAdapterEnabled>
 __device__ __forceinline__ bool
 adapter_is_enabled(int lora_id, const int32_t* adapter_enabled, int num_slots, int64_t enabled_stride) {
+  if (lora_id < 0 || lora_id >= num_slots) return false;
   if constexpr (HasAdapterEnabled) {
-    return lora_id >= 0 && lora_id < num_slots && adapter_enabled[lora_id * enabled_stride] != 0;
+    return adapter_enabled[lora_id * enabled_stride] != 0;
   }
-  return lora_id >= 0;
+  return true;
 }
 
 // Inline mirror of _fused_virtual_topk_ids_kernel (virtual_experts.py). Returns
@@ -79,23 +80,22 @@ __device__ __forceinline__ int compute_virtual_id(
   int m = static_cast<int>(i) / top_k;
   int lora_id = token_lora_mapping[m];
   bool mask_val = adapter_is_enabled<HasAdapterEnabled>(lora_id, adapter_enabled, num_slots, enabled_stride);
-  int safe_lora = lora_id > 0 ? lora_id : 0;
 
   scalar_t original_id = topk_ids[i];
-  if (original_id < 0) return -1;
-  int base = static_cast<int>(original_id);
+  if (!mask_val || original_id < 0) return -1;
+  if (!shared_outer && original_id >= num_experts_for_weight) return -1;
+  int base = shared_outer ? 0 : static_cast<int>(original_id);
   if (ep_local) {
     bool owned = base >= local_expert_offset && base < local_expert_offset + local_num_experts;
     base = owned ? base : -1;
   }
-  if (!mask_val || base < 0) return -1;
-  if (shared_outer) base = 0;
+  if (base < 0) return -1;
   // compact: dense LOCAL expert id in [0, local_num_experts) so the histogram
   // spans only local_num_experts buckets instead of the full global virtual
-  // space (337/385 empty under EP). Assumes max_loras==1 (safe_lora shift is 0;
+  // space (337/385 empty under EP). Assumes max_loras==1 (adapter shift is 0;
   // the wrapper guards). expert_ids is converted back to global at write time.
   if (compact) return base - local_expert_offset;
-  return base + safe_lora * num_experts_for_weight;
+  return base + lora_id * num_experts_for_weight;
 }
 
 template <typename scalar_t, bool HasAdapterEnabled>
@@ -224,7 +224,7 @@ __global__ void moe_align_block_size_kernel(
     if (!do_skip || vid >= 0) {
       atomicAdd(&shared_counts[vid + 1], 1);
     }
-    // token_lora_mask[m] = token_lora_mapping[m] >= 0, written once per row.
+    // Publish the same bounded adapter predicate used by both routing passes.
     if (static_cast<int>(i) % top_k == 0) {
       int m = static_cast<int>(i) / top_k;
       token_lora_mask[m] =

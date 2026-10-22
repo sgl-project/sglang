@@ -195,6 +195,7 @@ def _run_marlin_flow(
         marlin_zero_inactive_output=[],
         align_num_experts=[],
         align_inactive_prefix=[],
+        align_maps_invalid=[],
         schedule=[],
         zeroed=[],
         event_records=[],
@@ -308,6 +309,9 @@ def _run_marlin_flow(
         calls.align_num_experts.append(num_experts)
         calls.align_inactive_prefix.append(
             _kwargs.get("return_inactive_prefix_count", False)
+        )
+        calls.align_maps_invalid.append(
+            _kwargs.get("map_invalid_experts_to_sentinel", True)
         )
         return (
             torch.zeros(1, dtype=torch.int32),
@@ -451,6 +455,7 @@ def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
     assert calls.marlin_is_ep == [True, True]
     assert calls.marlin_sorted == [False, False]
     assert calls.align_inactive_prefix == [False]
+    assert calls.align_maps_invalid == [False]
     assert calls.marlin_inactive_prefix == [False, False]
 
     assert calls.marlin_zero_inactive_output == [True, True]
@@ -481,6 +486,7 @@ def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifeti
 
     assert calls.marlin_sorted == [True, True]
     assert calls.align_inactive_prefix == [True]
+    assert calls.align_maps_invalid == [False]
     assert calls.marlin_inactive_prefix == [True, True]
 
     # Capture records the LoRA stages even with no live adapter.

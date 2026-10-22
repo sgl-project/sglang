@@ -37,16 +37,10 @@ def _fused_virtual_topk_ids_kernel(
     ENABLE_PDL: tl.constexpr = False,
 ):
     """
-    Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
+    Map active slots and valid base experts to virtual weight indices.
 
-    For each (m, k):
-        lora_id = token_lora_mapping[m]
-        mask[m] = (lora_id >= 0)
-        safe_lora = max(lora_id, 0)
-        if shared_outer:
-            virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
-        else:
-            virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
+    Invalid slots or base experts map to -1. Shared weights accept any
+    nonnegative base expert and use the adapter slot as the weight index.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -62,9 +56,8 @@ def _fused_virtual_topk_ids_kernel(
     # k = offs % top_k  # not needed directly
 
     lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
-    mask_val = lora_id >= 0
+    mask_val = (lora_id >= 0) & (lora_id < NUM_SLOTS)
     if HAS_ADAPTER_ENABLED:
-        mask_val = mask_val & (lora_id < NUM_SLOTS)
         mask_val = mask_val & (
             tl.load(
                 adapter_enabled_ptr + lora_id * stride_enabled,
@@ -73,7 +66,7 @@ def _fused_virtual_topk_ids_kernel(
             )
             != 0
         )
-    safe_lora = tl.maximum(lora_id, 0)
+    safe_lora = tl.where(mask_val, lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
     if EP_LOCAL:
@@ -85,19 +78,13 @@ def _fused_virtual_topk_ids_kernel(
             base < local_expert_offset + local_num_experts
         )
         base = tl.where(owned, base, -1)
-    # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
-    # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
-    # a real virtual-expert slot belonging to another adapter and trigger OOB
-    # loads in downstream LoRA kernels.
-    expert = 0 if SHARED_OUTER else base
+    valid_base = base >= 0
+    if not SHARED_OUTER:
+        valid_base = valid_base & (base < num_experts_for_weight)
+    expert = 0 if SHARED_OUTER else tl.where(valid_base, base, 0)
     shifted = expert + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
-    if HAS_ADAPTER_ENABLED:
-        # The +1 histogram has one negative bucket, even when a caller uses
-        # another negative sentinel. Leave the borrowed original IDs untouched.
-        result = tl.where(mask_val & (base >= 0), shifted, -1)
-    else:
-        result = tl.where(mask_val, result, -1)
+    # All align providers use one sentinel bucket; borrowed route IDs stay intact.
+    result = tl.where(mask_val & valid_base, shifted, -1)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -125,8 +112,8 @@ def _fused_virtual_topk_ids(
 
     `local_num_experts` (< `num_experts`) enables the EP mask on the per-expert
     path: non-owned `topk_ids` slots are dropped to the -1 sentinel in-kernel.
-    The shared-outer path retains negative dropped routes but does not apply
-    the local expert range (its weights are shared by every owned expert).
+    The shared-outer path drops negative routes but does not apply the local
+    expert range (its weights are shared by every owned expert).
     """
     M, top_k = topk_ids.shape
     device = topk_ids.device

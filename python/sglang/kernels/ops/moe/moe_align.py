@@ -14,8 +14,13 @@ if TYPE_CHECKING:
 def _jit_moe_align_module(
     dtype: torch.dtype,
     write_inactive_prefix_count: bool = False,
+    map_invalid_experts_to_sentinel: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, write_inactive_prefix_count)
+    if map_invalid_experts_to_sentinel and dtype not in (torch.int32, torch.int64):
+        raise ValueError("Checked alignment requires int32 or int64 expert IDs")
+    args = make_cpp_args(
+        dtype, write_inactive_prefix_count, map_invalid_experts_to_sentinel
+    )
     return load_jit(
         "moe_align_block_size",
         *args,
@@ -37,12 +42,19 @@ def moe_align_block_size(
     pad_sorted_token_ids: bool = False,
     *,
     write_inactive_prefix_count: bool = False,
+    map_invalid_experts_to_sentinel: bool = False,
 ) -> None:
     """Align +1-offset buckets, optionally publishing a padded-token/block pair.
 
     ``write_inactive_prefix_count`` requires an aligned int32[2] count output.
+    IDs must be in ``[-1, num_experts - 2]`` unless
+    ``map_invalid_experts_to_sentinel`` maps other signed IDs into bucket zero.
     """
-    module = _jit_moe_align_module(topk_ids.dtype, write_inactive_prefix_count)
+    module = _jit_moe_align_module(
+        topk_ids.dtype,
+        write_inactive_prefix_count,
+        map_invalid_experts_to_sentinel,
+    )
     module.moe_align_block_size(
         topk_ids,
         num_experts,
