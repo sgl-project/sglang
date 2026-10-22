@@ -43,7 +43,7 @@ class LTX25PipelineConfig(LTX2PipelineConfig):
     # One checkpoint drives both T2V and image-conditioned generation, so this
     # must stay TI2V -- T2V rejects `--image-path` outright.
     task_type: ModelTaskType = ModelTaskType.TI2V
-    native_only_components = ("diffusion_decoder",)
+    native_only_components: tuple[str, ...] = ("diffusion_decoder",)
 
     dit_config: LTX25Config = field(default_factory=LTX25Config)
     vae_config: LTX25VideoVAEConfig = field(default_factory=LTX25VideoVAEConfig)
@@ -54,4 +54,18 @@ class LTX25PipelineConfig(LTX2PipelineConfig):
 
     default_sigmas: tuple[float, ...] | None = field(
         default_factory=lambda: LTX25_DISTILLED_SIGMA_VALUES
+    )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LTX25SamplingParams,
+        pipeline_config_cls=LTX25PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
+        model_detectors=[
+            lambda path: "ltx-2.5" in path.lower(),
+        ],
     )

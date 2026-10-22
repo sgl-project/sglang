@@ -60,7 +60,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 - **Page size other than 1 (HIP legacy) or 64 (CUDA)** — the DSA indexer
   hard-asserts the page size: HIP legacy at `dsa/dsa_indexer.py:547-548,
   724-725` (`assert page_size == 1`); CUDA at `dsa/dsa_indexer.py:550, 727,
-  946, 1095` and `dsa/index_buf_accessor.py:436` (`assert page_size == 64`).
+  946, 1095` and `kvcache/dsa_index_k_cache.py:436` (`assert page_size == 64`).
   The `dsa/transform_index.py:53, 79, 100, 121` helpers also assert
   `page_size == 1`.
 - **`Unsupported {forward_batch.forward_mode=}`** — `forward_extend`
@@ -73,7 +73,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
   `[sum(seq_lens), num_kv_heads, head_dim]`) to `module.attn(q, k, v,
   forward_batch, save_kv_cache=False)`, but `unified_attention_with_output`
   (`radix_attention.py:170-208`, which RadixAttention routes to under
-  piecewise CG) slices K to `forward_batch.num_token_non_padded_cpu` (=
+  piecewise CG) slices K to `forward_batch.global_num_token_non_padded_cpu` (=
   live extend-token count) on the per-token K convention used by
   Triton/FlashInfer/FA. The slice removes the prefix portion, so a
   piecewise CG run diverges from the eager DSA dense fallback by ~50%

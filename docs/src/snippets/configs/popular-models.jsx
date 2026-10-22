@@ -13,20 +13,71 @@
 
 export const popularModels = [
   {
-    name: "Qwen3.8-27B",
-    vendor: "Qwen",
-    href: "/cookbook/autoregressive/Qwen/Qwen3.8-27B",
-    logo: "/cards/logos/qwen.png",
+    name: "Muse Spark Open",
+    vendor: "Meta",
+    href: "/cookbook/autoregressive/Meta/MuseSparkOpen",
+    logo: "/cards/logos/meta.png",
     badge: "New",
-    tags: ["4 platforms", "Hybrid GDN", "BF16 / FP8 / NVFP4"],
+    tags: ["6 platforms", "SWA + full attention", "NVFP4 / MXFP4 / BF16 / INT4"],
     hero: {
       eyebrow: "Featured model \u00b7 New",
-      headline: "Meet Qwen3.8-27B on SGLang",
+      headline: "Meet Muse Spark Open on SGLang",
       blurb:
-        "A dense hybrid Gated Delta Networks model \u2014 48 GDN linear-attention layers interleaved with 16 full-attention, an in-checkpoint MTP head, and a native 262,144-token context. The cookbook covers single-GPU serving on H200 and RTX PRO 6000 / 5090.",
-      tags: ["Dense 27B", "262K context", "Single-GPU"],
-      cta: "Open the Qwen3.8-27B cookbook",
-      caption: "Qwen3.8-27B deployment guide",
+        "Meta's open Muse Spark model \u2014 a hybrid of 46 sliding-window (2,048-token) and 16 full-attention layers, with image and video input, DFlash V2 speculative decoding, and EPD / PD disaggregation. Recipes cover B300, GB300, B200, H200, AMD MI355X, and Intel Xeon, plus an SWA-ratio calculator for sizing the KV pools.",
+      tags: ["46 SWA + 16 full-attn layers", "Up to 1M context", "NVIDIA + AMD + Xeon"],
+      cta: "Open the Muse Spark Open cookbook",
+      caption: "Muse Spark Open deployment guide",
+    },
+  },
+  {
+    name: "DeepSeek-V4.1-Flash",
+    vendor: "DeepSeek",
+    href: "/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
+    logo: "/cards/logos/deepseek.png",
+    badge: "New",
+    tags: ["5 platforms", "Engram + DSpark", "FP8 dense / FP4 MoE"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet DeepSeek-V4.1 Flash on SGLang",
+      blurb:
+        "DeepSeek's sparse-attention Mixture-of-Experts model, served through SGLang's `dsv4` backend \u2014 pairing multi-ratio compressed KV pools behind FlashMLA with a learned sparse index that picks a top-512 candidate set per query, an mHC mixing stage, and Engram, an n-gram hash memory whose two fp8 tables are roughly 40% of the checkpoint. It ships DSpark, its own three-stage speculative draft. Recipes cover GB300, H200, B200, B300 and AMD MI350X.",
+      tags: ["384 experts / top-6", "Sparse index + Engram", "NVIDIA + AMD"],
+      cta: "Open the DeepSeek-V4.1 Flash cookbook",
+      caption: "DeepSeek-V4.1 Flash deployment guide",
+    },
+  },
+  {
+    name: "Qwen3.8-Flash-Next",
+    vendor: "Qwen",
+    href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
+    logo: "/cards/logos/qwen.png",
+    badge: "New",
+    tags: ["6 platforms", "GDN + QSA hybrid", "BF16 / FP8 / NVFP4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Qwen3.8-Flash-Next on SGLang",
+      blurb:
+        "Qwen's early preview of the Qwen4 architecture \u2014 176B total parameters with 6B active, three of every four layers Gated DeltaNet and the fourth global attention running Qwen Sparse Attention, over an ultra-sparse MoE with an in-checkpoint MTP head. The cookbook covers single-node TP4 serving on H200 / B200 / B300 / GB300 and TP8 on MI350X / MI355X.",
+      tags: ["176B / 6B active", "262K context", "Single-node"],
+      cta: "Open the Qwen3.8-Flash-Next cookbook",
+      caption: "Qwen3.8-Flash-Next deployment guide",
+    },
+  },
+  {
+    name: "GLM-5.3-Flash",
+    vendor: "Z.ai",
+    href: "/cookbook/autoregressive/GLM/GLM-5.3-Flash",
+    logo: "/cards/logos/glm.png",
+    badge: "New",
+    tags: ["9 platforms", "MLA + DSA + KDA hybrid", "Multimodal"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet GLM-5.3-Flash on SGLang",
+      blurb:
+        "Z.ai's natively multimodal Mixture-of-Experts model — 320B total parameters with 18B active, 45 text layers combining MLA, DSA sparse, and KDA linear attention, a 24-layer vision encoder for image and video input, and a native MTP draft layer for speculative decoding. Recipes cover H100 / H200 / B200 / B300 / GB200 / GB300 and AMD MI300X / MI325X / MI355X.",
+      tags: ["320B / 18B active", "1M context", "Text + image + video"],
+      cta: "Open the GLM-5.3-Flash cookbook",
+      caption: "GLM-5.3-Flash deployment guide",
     },
   },
   {
@@ -44,40 +95,6 @@ export const popularModels = [
       tags: ["Video + synced audio", "4–15 s at 24 fps", "8× B200 → 2× RTX 5090"],
       cta: "Open the MiniMax-H3 cookbook",
       caption: "MiniMax-H3 deployment guide",
-    },
-  },
-  {
-    name: "Kimi-K3",
-    vendor: "Moonshot AI",
-    href: "/cookbook/autoregressive/Moonshotai/Kimi-K3",
-    logo: "/cards/logos/moonshotai.png",
-    badge: "New",
-    tags: ["8 platforms", "PD disagg", "DSPARK"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet Kimi-K3 on SGLang",
-      blurb:
-        "SGLang natively implements and deeply optimizes K3's new architecture with fused KDA decode kernels, DP attention, MTP, PD disaggregation, and KDA-aware prefix caching. Kimi-K3 is supported on both NVIDIA and AMD GPUs.",
-      tags: ["2.8T parameters", "Fused KDA decode", "NVIDIA + AMD"],
-      cta: "Open the Kimi-K3 cookbook",
-      caption: "Kimi-K3 deployment guide",
-    },
-  },
-  {
-    name: "Inkling",
-    vendor: "Thinking Machines",
-    href: "/cookbook/autoregressive/ThinkingMachines/Inkling",
-    logo: "/cards/logos/thinkingmachines.png",
-    badge: "New",
-    tags: ["7 platforms", "NVFP4 / BF16", "MTP + DSpark"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet Inkling on SGLang",
-      blurb:
-        "Thinking Machines' open-weights Mixture-of-Experts model — 975B parameters, 41B active per token, a 1M-token context window, and native text, image, and audio input. The cookbook covers its MTP speculative-decoding path and long-context prefix caching on NVIDIA and AMD.",
-      tags: ["975B · 41B active", "1M context", "Text + image + audio"],
-      cta: "Open the Inkling cookbook",
-      caption: "Inkling deployment guide",
     },
   },
 ];

@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="full-1-npu-a3",
     nightly=True,
 )
 
@@ -80,9 +80,9 @@ class TestFimCompletion(CustomTestCase):
         assert response.id
         assert response.created
         assert response.object == "text_completion"
-        assert (
-            response.usage.prompt_tokens == num_prompt_tokens
-        ), f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        assert response.usage.prompt_tokens == num_prompt_tokens, (
+            f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        )
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 

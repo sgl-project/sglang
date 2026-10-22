@@ -26,6 +26,8 @@ _DTYPE_TO_STR = {
     torch.int64: "int64",
     torch.uint8: "uint8",
     torch.bool: "bool",
+    torch.complex64: "complex64",
+    torch.complex128: "complex128",
 }
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 
@@ -48,7 +50,7 @@ class TensorWrapper:
     """Expose a CPU-contiguous tensor's data buffer for zero-copy ZMQ send."""
 
     def __init__(self, tensor: torch.Tensor):
-        if tensor.is_cuda or tensor.is_npu:
+        if tensor.device.type != "cpu":
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -186,7 +188,11 @@ def unpack_tensors(
         buf = frame.buffer if hasattr(frame, "buffer") else bytes(frame)
         dtype = str_to_dtype(desc.dtype)
         # clone() to own the memory (decouple from ZMQ buffer lifetime)
-        tensor = torch.frombuffer(buf, dtype=dtype).reshape(desc.shape).clone()
+        tensor = (
+            torch.empty(desc.shape, dtype=dtype)
+            if 0 in desc.shape
+            else torch.frombuffer(buf, dtype=dtype).reshape(desc.shape).clone()
+        )
         if device != "cpu" and device != torch.device("cpu"):
             tensor = tensor.to(device)
 

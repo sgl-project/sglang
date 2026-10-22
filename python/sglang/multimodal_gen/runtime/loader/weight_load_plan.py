@@ -11,6 +11,9 @@ class WeightLoadPlan:
     checkpoint_load_device: torch.device
     # Device required while running process_weights_after_loading; None means unchanged.
     weight_postprocess_device: torch.device | None = None
+    # mps layerwise loading retains compatible safetensors tensors as CPU-backed
+    # parameters instead of materializing a second unified-memory copy
+    mps_layerwise_cpu_staging: bool = False
     # Delay final CPU placement until after device-side weight postprocessing.
     defer_cpu_placement: bool = False
     # keep the complete mapped checkpoint state dict on the load device
@@ -24,6 +27,7 @@ class WeightLoadPlan:
         needs_device_weight_postprocess: bool,
         component_starts_on_cpu: bool,
         load_full_state_dict_on_device: bool = False,
+        mps_layerwise_cpu_staging: bool = False,
     ) -> "WeightLoadPlan":
         # if on-device weight postprocessing is required, load directly to device to speedup loading
         weight_postprocess_device = (
@@ -36,4 +40,5 @@ class WeightLoadPlan:
                 needs_device_weight_postprocess and component_starts_on_cpu
             ),
             load_full_state_dict_on_device=load_full_state_dict_on_device,
+            mps_layerwise_cpu_staging=mps_layerwise_cpu_staging,
         )
