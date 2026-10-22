@@ -136,6 +136,7 @@ def test_customized_info_failure_is_request_local(
         req.output_ids.append(2)
         req.customized_info = payload
         req.disagg_kv_sender = Mock()
+        req.disagg_kv_sender.supports_host_tensor_indices = False
         req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
         req.time_stats = Mock()
         scheduler.disagg_prefill_inflight_queue.append(req)
