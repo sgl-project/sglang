@@ -1,0 +1,106 @@
+LIM / GLM-5.2 W4A8 / 217 分case性能报告，整理日期2026-10-22
+
+数据集口径必须先明确：本报告已有性能数据均来自自定义仓库清单/校验码retrieval提示，经GLM tokenizer和chat模板构造并冻结token IDs。
+这些输入既不是sglang benchmark的random，也不是random-ids。经HTTP input_ids发送仅说明接口形式，不决定数据集类型。
+用户期望沿用的random基准目前没有本报告对应的已采结果；下列旧结果不得更名为random结果。
+当前仓库random从ShareGPT文本取样并按长度重复/截断；random-ids按随机词表偏移构造整数ID序列。二者会影响内容、MoE路由和缓存局部性。
+
+已测结果：同batch下LIM C4096相对普通同策略卸载参考的TPOT加速约2.18–2.41倍，但相对全HBM仍慢约2.47–2.63倍；设备HBM采样峰值中位数降低约11.64%–12.23%。
+64K容量场景中，在约相同的设备HBM采样水位，已测配置从全HBM B3变为LIM B12；decode TPS增加24.85%，单请求有效TPOT增加220.38%。
+包含prefill的整批吞吐没有同步获益：无本任务CPU分析重叠的LIM轮次比全HBM中位值低约23.00%。
+
+模型与术语
+测试机217，GLM-5.2-w4a8，16 Ascend A3 die，TP16/EP16，DeepEP auto；W4A8权重，主KV/index KV均BF16。
+全HBM原始LI：主KV与index KV全部在设备HBM，原始npu_lightning_indexer在整个可见序列选TopK；attention仍是稀疏attention。
+LI reference：Host保存全量主KV、HBM保留resident cache；原始LI选prefix TopK，并追加完整visible tail。
+原生LIM：采用相同prefix+tail策略，原生fused_lightning_indexer_manage计算索引及缓存计划；copy与SFA仍是独立操作。
+K=2048是选取的TopK个数；C=2048/4096是每请求每层主KV的HBM resident token容量；index KV仍在HBM。
+当前Q1卸载路径最多追加128个tail token，选取范围与原始全可见序列TopK不同。C还参与进入卸载路径的阈值。
+标准kernel实现b5a45667efb377b0312108c01bbd0a730c1f9e78；正常库SHA256 ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8。
+
+A. 同batch / C容量矩阵：2026-10-21历史实测
+本组全部runtime611760f18007a63781f42c666fe9a296e96b6fa8，page128，graph capture batch16，MTP关闭。
+每case预热1轮，正式测量3轮，以下为保留全部正式轮次后的中位数。这里B是实际请求并发，不是graph capture batch。
+输入为自定义retrieval；输出固定长度、ignore_eos。TPOT取单请求首token之后的生成耗时/后续token数，batch内再取中位数。
+TTFT为首token时延。整批output TPS=所有请求输出token数/整批wall time，含prefill；B1时就是单请求output TPS。
+
+| 输入token | 输出token | B | 路径 | C | TPOT ms | TTFT s | 整批output TPS | HBM MiB/die |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8192 | 128 | 1 | 全HBM原始LI | — | 47.976 | 3.177 | 13.808 | 54333.0 |
+| 8192 | 128 | 1 | LI reference | 4096 | 285.830 | 3.415 | 3.223 | 47980.0 |
+| 8192 | 128 | 1 | 原生LIM | 4096 | 118.510 | 3.410 | 6.933 | 47686.5 |
+| 8192 | 128 | 1 | 原生LIM | 2048 | 123.423 | 3.386 | 6.715 | 44633.0 |
+| 32768 | 512 | 1 | 全HBM原始LI | — | 48.273 | 12.532 | 13.763 | 57031.0 |
+| 32768 | 512 | 1 | LI reference | 4096 | 285.721 | 13.614 | 3.208 | 50682.0 |
+| 32768 | 512 | 1 | 原生LIM | 4096 | 127.061 | 13.666 | 6.514 | 50390.5 |
+| 32768 | 512 | 1 | 原生LIM | 2048 | 135.411 | 13.558 | 6.187 | 47337.5 |
+| 8192 | 128 | 4 | 全HBM原始LI | — | 49.727 | 12.417 | 27.327 | 57031.0 |
+| 8192 | 128 | 4 | LI reference | 4096 | 269.340 | 13.299 | 10.778 | 50682.0 |
+| 8192 | 128 | 4 | 原生LIM | 4096 | 123.482 | 13.306 | 17.639 | 50392.5 |
+| 8192 | 128 | 4 | 原生LIM | 2048 | 134.488 | 13.226 | 16.891 | 47339.5 |
+
+| case | C4096相对LI reference的TPOT加速 | 相对全HBM的TPOT变化 | 相对全HBM的HBM节省 | 相对全HBM的整批TPS变化 |
+| --- | --- | --- | --- | --- |
+| 8192→128 / B1 | 2.41× | +147.02% | 12.23% | -49.79% |
+| 8192→128 / B4 | 2.18× | +148.32% | 11.64% | -35.45% |
+| 32768→512 / B1 | 2.25× | +163.21% | 11.64% | -52.67% |
+
+| case | C4096降到C2048减少HBM MiB/die | TPOT变化 | C2048相对全HBM的HBM节省 |
+| --- | --- | --- | --- |
+| 8192→128 / B1 | 3053.5 | +4.15% | 17.85% |
+| 8192→128 / B4 | 3053.0 | +8.91% | 16.99% |
+| 32768→512 / B1 | 3053.0 | +6.57% | 17.00% |
+
+HBM是16个die在各接受窗口内的整设备采样峰值，再取中位数；包含权重、预分配池、graph和workspace，不是纯KV净占用或allocator精确水位。
+历史矩阵各case顺序运行，allocator保留可能影响后续水位；不得将HBM差额全部当成某一个buffer释放量。
+
+B. 长输入/容量场景：2026-10-22独立计时
+输入为16000/64000 token，输出512 token的自定义retrieval，非random。两轮独立计时均保留；profile请求和精度采集另行运行。
+基线runtime611760f1，LIM runtime8961cc36（含host callback启动修复）；标准kernel二进制相同。不是严格同runtime、同batch的单变量算子对照。
+ctx66048、page128、chunked-prefill4096、graph16、radix关闭、mem-fraction-static0.82、MTP关闭。
+基线实际token pool204800；LIM C4096实际index pool859136。LIM用节省的主KV预算容纳更多index token和请求。
+
+| 输入 | 输出 | B | 路径 | 轮次 | 满batch decode TPS | 有效TPOT ms | 整批耗时s | 整批output TPS | HBM MiB/die | 整批CPU重叠 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 16000 | 512 | 12 | 全HBM原始LI | r1 | 219.404 | 54.694 | 117.430 | 52.321 | 59961.0 | 无 |
+| 16000 | 512 | 12 | 全HBM原始LI | r2 | 217.802 | 55.096 | 116.226 | 52.863 | 59961.0 | 无 |
+| 64000 | 512 | 3 | 全HBM原始LI | r1 | 59.157 | 50.712 | 126.518 | 12.141 | 59961.0 | 无 |
+| 64000 | 512 | 3 | 全HBM原始LI | r2 | 59.074 | 50.784 | 126.403 | 12.152 | 59961.0 | 无 |
+| 64000 | 512 | 12 | 原生LIM | r1 | 73.450 | 163.377 | 672.310 | 9.139 | 59993.5 | prefill有CPU分析重叠 |
+| 64000 | 512 | 12 | 原生LIM | r2 | 74.167 | 161.796 | 656.930 | 9.353 | 59993.5 | 无 |
+
+同64000输入：decode TPS中位数 59.116→73.809（+24.85%）；有效TPOT 50.748→162.587ms（+220.38%）。
+整批无CPU重叠对比：全HBM两轮中位12.146TPS；LIM仅r2一轮9.353TPS（-23.00%）。
+该容量对比使用不同B、不同pool，不是同batch加速比。B3不是经饱和搜索得到的硬件最大并发。16000/B12基线只作短上下文参照。
+满batch decode窗口在所有请求至少输出10 token后开始、首请求结束前截止，排除prefill和drain；有效TPOT=1000×B/decode TPS。
+六个decode窗口均通过占用审计且无本任务CPU分析重叠；LIM r1的prefill有CPU分析重叠，因此整批耗时单独标记。
+容量模式的设备HBM观测几乎相同，不代表没有省主KV；这里将节省预算用于扩大index池和实际batch。对应Host KV静态buffer预算约1.47TiB/16 rank，不是DRAM峰值实测。
+
+C. Profiling解释：当前H2D是否被掩盖
+2026-10-22三组profile，每组16 rank、10个完整decode图；以下为rank0数据，profile与独立计时分开。
+
+| profile case | 实际B | 图跨度中位ms | LI/LIM累计ms/step | 五类copy累计ms/step | SFA累计ms/step |
+| --- | --- | --- | --- | --- | --- |
+| baseline-64k-b3-r2 | 3 | 51.270 | 1.524 | 0.000 | 7.306 |
+| baseline-16k-b12-r2 | 12 | 54.125 | 1.665 | 0.000 | 7.392 |
+| lim-64k-b12-c4096-nativegraph | 12 | 148.175 | 12.459 | 39.197 | 6.797 |
+
+LIM 64000/B12中，copy与消费SFA同在物理stream75；10步区间交集为0ms，当前这条copy→SFA链没有实现消费attention掩盖。
+五类copy累计39.197ms/step，其中miss H2D 23.704、resident→selected D2D 12.670、new-token D2H 0.755、short-row H2D 0.963、tail H2D 1.105ms/step。
+以上是累计NPU任务时长，不能直接相加或从TPOT相减当成可回收时延；通信任务跨度包含等待。
+CopySFA、SharedCopy、C8和MTP未接入本轮。优先优化点是miss H2D及resident→selected中转，再验证跨层预取/融合的真实收益。
+补充64K/B1最后一个IndexShare owner诊断：126个稳态样本，prefix TopK命中率85.849%；不代表全部21个owner的平均命中率。
+
+覆盖范围与报告使用边界
+已有case：8192→128/B1、8192→128/B4、32768→512/B1（历史C2048/C4096矩阵）；16000→512/B12基线、64000→512/B3基线和B12 LIM。
+未补采random矩阵、LIM 16000/B12、64000同batch基线/LIM配对、输出2048、C8192/C12288完整计时和最大吞吐饱和点。没有结果的组合不填估算值。
+精度请配套读取LIM_ACCURACY_217_REPORT.txt，最新数据不支持“通用精度无损”的结论。
+
+来源与复现
+历史同batch数据：LIM_NATIVE_217_RESULTS.txt（2026-10-21/runtime611760f1）；各数值取已发表三轮中位数，未假称本次重算原始三轮。
+长输入计时和profile：LIM_ARTICLE_217_PROFILE.txt、LIM_ARTICLE_PROFILE_GUIDE.txt，以及article-validation-summary.json。
+完整新精度：LIM_PRECISION_217_RESULTS.txt。所有源报告仍保留原日期和配置。
+本地已验证article摘要SHA256 5c0ead39d693d13c8b18cbf59e2d42de3fd00fa4819bed9546e8a044ac1d6edf
+远端article根：/home/y00970600/personal/hisparse-lim-article-profile-217-20261022/
+远端native历史根：/home/y00970600/personal/hisparse-lim-native-217-20261021/
+数据集定义源码：python/sglang/benchmark/datasets/random.py；自定义retrieval生成：benchmark/hisparse/bench_lim_model.py（早期）及article证据中的可配置客户端。

@@ -1,0 +1,98 @@
+LIM / GLM-5.2 W4A8 / 217 精度报告，整理日期2026-10-22
+
+结论：最新32题自定义长提示任务得分为全HBM29/32、LI reference29/32、原生LIM30/32，未观察到本组答对数下降。
+同策略LI reference→LIM仍有非零logits分布差异；32K边界组mean KL=0.13769843、p99=4.51716358，尚未建立数值等价或通用质量无损结论。
+性能报告的random/random-ids是负载生成方式；这里的答题质量使用GSM8K自定义子集，边界数值诊断使用固定retrieval提示。不同数据来源分别标记。
+
+模型与术语
+测试机217，GLM-5.2-w4a8，16 Ascend A3 die，TP16/EP16，DeepEP auto；W4A8权重，主KV/index KV均BF16。
+全HBM原始LI：主KV与index KV全部在设备HBM，原始npu_lightning_indexer在整个可见序列选TopK；attention仍是稀疏attention。
+LI reference：Host保存全量主KV、HBM保留resident cache；原始LI选prefix TopK，并追加完整visible tail。
+原生LIM：采用相同prefix+tail策略，原生fused_lightning_indexer_manage计算索引及缓存计划；copy与SFA仍是独立操作。
+K=2048是选取的TopK个数；C=2048/4096是每请求每层主KV的HBM resident token容量；index KV仍在HBM。
+当前Q1卸载路径最多追加128个tail token，选取范围与原始全可见序列TopK不同。C还参与进入卸载路径的阈值。
+标准kernel实现b5a45667efb377b0312108c01bbd0a730c1f9e78；正常库SHA256 ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8。
+
+A. 最新统一runtime验证：2026-10-22/runtime8961cc3689aa9ba4f476ee133f29fb43eb5dc51c
+TP16/EP16、graph16、max-running-requests16、ctx36864、token pool147456、page128、unchunked prefill、radix关闭、seed42、MTP关闭、K2048/C4096。
+所有正式capture/自由答题窗口均通过有前后覆盖的NPU进程扫描核验；不采纳其他NPU任务干扰的首份baseline-main-a1。
+
+| case | 输入/输出 | 客户端并发 | 每模式份数 | 用途 |
+| --- | --- | --- | --- | --- |
+| GSM8K自由答题 | 6507–6589输入；自然停止，最多512输出 | 4 | 1 | 32题40-shot自定义子集 |
+| 固定历史主测试 | 相同32题输入；每条512预测位置 | 16 | 2 | 首轮+重复，比较完整词表logits |
+| 32K边界数值诊断 | 32767/32768/32895/32896输入；每条128位置 | 1 | 1 | 原生chat retrieval提示的块边界检查 |
+
+| 路径 | C | 答对/总数 | 答对率 | 触及512上限 |
+| --- | --- | --- | --- | --- |
+| 全HBM原始LI | — | 29/32 | 90.625% | 0 |
+| LI reference | 4096 | 29/32 | 90.625% | 0 |
+| 原生LIM | 4096 | 30/32 | 93.750% | 0 |
+
+本组不是标准GSM8K榜单评测，32题不足以建立精度提升或总体质量等价。Decimal归一化后分数不变。
+基线和LI reference错题为gsm8k-12/13/15；LIM错题为12/13。第15题gold=125，三路径分别回答29/96/125。
+
+B. 主测试完整词表KL：每行16384个相同历史位置
+KL方向为p_reference || p_candidate，CPU float64。先保存未改动的完整词表logits，再force相同continuation IDs；不使用force后的API logprob冒充原始概率。
+固定历史采满512位置并ignore_eos，包含自由答题自然停止后的延续；它是数值诊断，与自由生成得分分别报告。
+
+| reference → candidate | mean KL | p99 KL | max KL | Top1一致率 | 整向量逐位一致位置比例 |
+| --- | --- | --- | --- | --- | --- |
+| 全HBM-main-a2 → 全HBM-repeat-a1 | 0.00842651 | 0.17121563 | 1.61088135 | 98.279% | 18.750% |
+| LI reference-main-a1 → LI reference-repeat-a1 | 0.00671625 | 0.14758153 | 1.98562673 | 98.517% | 40.625% |
+| 全HBM-main-a2 → LI reference-main-a1 | 0.01011665 | 0.18067442 | 2.01791404 | 97.742% | 0.043% |
+| 原生LIM-main-a1 → 原生LIM-repeat-a1 | 0.01036212 | 0.18240875 | 1.78293569 | 97.821% | 1.483% |
+| 全HBM-main-a2 → 原生LIM-main-a1 | 0.01050684 | 0.18644351 | 1.56977138 | 97.729% | 0.061% |
+| LI reference-main-a1 → 原生LIM-main-a1 | 0.01028256 | 0.18419464 | 2.18401910 | 97.797% | 0.061% |
+
+同模式重复已经非零；不能用一次跨模式KL直接归因到缓存错误，也不能把两个KL相减得到“LIM净误差”。
+全HBM重复有26条、LI reference重复有19条从prefill step0开始不同；分别有6/13条完整512位置逐位相同。
+LIM重复18条从step0开始不同；其余14条prefill最后输出相同，但12条在step3、1条在step87、1条在step120出现差异，完整512位置逐位相同为0/32。
+因此，LIM差异不能全部归为prefill最后输出波动；最后logits相同也不保证各层KV状态相同。
+
+C. 32K边界组：每行4×128=512个位置
+
+| reference → candidate | mean KL | p99 KL | max KL | Top1一致率 |
+| --- | --- | --- | --- | --- |
+| 全HBM-boundary-a1 → LI reference-boundary-a1 | 0.06806639 | 1.39569787 | 9.38738671 | 97.4609% |
+| 全HBM-boundary-a1 → 原生LIM-boundary-a1 | 0.13789043 | 4.55565362 | 9.91980816 | 95.1172% |
+| LI reference-boundary-a1 → 原生LIM-boundary-a1 | 0.13769843 | 4.51716358 | 9.33487506 | 95.3125% |
+
+| 同策略输入长度 | mean KL | p99 KL | max KL | Top1一致率 |
+| --- | --- | --- | --- | --- |
+| 32767 | 0.18452188 | 7.31148857 | 9.33487506 | 93.7500% |
+| 32768 | 0.03125171 | 0.27885463 | 0.64188897 | 96.0938% |
+| 32895 | 0.30701157 | 6.47040211 | 8.22495165 | 92.9688% |
+| 32896 | 0.02800853 | 0.34555637 | 1.66044253 | 98.4375% |
+
+同策略四条边界输入的prefill最后输出logits全部逐位相同，均从第一个decode位置开始非逐位相同。
+首次decode差异很小：mean KL 2.63327957e-07、max 4.99423865e-07、Top1一致率100%；较大差异出现在后续位置。
+边界组未做同模式重复；不能套用6.5K主测试的重复差异作32K噪声基线。未将这些数值直接定性为KV搬错或页边界bug。
+
+D. C2048/C4096历史补充：2026-10-21/runtime611760f1
+以下是旧runtime下同一32题自定义长提示任务的历史单轮分数，独立保留，不与上面新runtime结果合并。
+
+| 历史路径 | C | 答对/总数 | 触及512上限 |
+| --- | --- | --- | --- |
+| 全HBM原始LI | — | 30/32 | 0 |
+| LI reference | 4096 | 28/32 | 0 |
+| 原生LIM | 4096 | 30/32 | 0 |
+| 原生LIM | 2048 | 28/32 | 0 |
+
+历史reference→LIM C4096/C2048 mean KL分别为0.00961504/0.01028223；reference自身重复0.00613559。没有本轮统一runtime的C2048复测。
+C不改变K；这些长输入都进入卸载路径，但阈值附近改变C可能改变路径/选择策略，不能泛称跨C质量等价。
+
+E. 精度结论与尚未完成的定位
+已证实：本组任务得分未下降；最新99,840份有效完整词表向量的输入/输出历史及步号已逐项核验，所有原始张量已逐文件SHA256校验归档。
+未建立：LIM与同策略参考的端到端数值等价、标准完整GSM8K或代码/长上下文任务质量等价。64K有独占性能数据，但此前64K精度诊断含外部AFS占用扫描，不纳入本报告正式精度结论。
+下一定位入口：固定同层Q/K/weights输入，对比TopK集合与排序、逐位核对selected KV，再比较SFA输入/输出；覆盖新页进入、miss回填、padding和请求复用。
+本轮没有捕获真实模型上述中间张量oracle，不能确定当前差异来自TopK数值、KV路由、搬运或SFA中的哪一项。
+当前覆盖BF16主KV/index KV、Q1、无MTP；C8、MTP及完整random性能矩阵不在已验证结果内。
+
+来源与证据
+完整最新报告：LIM_PRECISION_217_RESULTS.txt，含逐题答案、实际processor行数、同prefill子集和每位置明细位置。
+历史补充：LIM_NATIVE_217_RESULTS.txt；性能：LIM_PERFORMANCE_217_REPORT.txt。
+最新precision-summary.json SHA256 e53e4948ea3228db113b904acd2e7d5e180c9b0cc822125bc2d71bf4a4561151
+compact证据：lim-precision-217-evidence-20261022.tar.gz，19525441 bytes，SHA256 8cd2fc12d835cf5024938c70f60ff3db28317745e28a6baa93b9f58c0b43a75e。
+本地已校验compact全部659文件哈希，并从逐位置KL记录复算9组标量汇总，差值全部为0；完整原始词表KL在217计算，未声称在本机全量重算。
+完整raw logits与逐张量清单保留于217：/home/y00970600/personal/hisparse-lim-precision-217-20261022/archives/及results/。
