@@ -291,6 +291,7 @@ def _prefill_graph_replay(*, any_context, seq_len):
     backend._build_forward_metadata = build_full
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
+    backend._snapshot_low_ratio_k_slots = lambda forward_batch: None
     backend._prefill_graph_replays_any_context = lambda: any_context
     capture = object.__new__(DSV4Metadata)
     capture.prefill_graph_tail = True
@@ -310,7 +311,9 @@ def _prefill_graph_replay(*, any_context, seq_len):
             backend,
             capture,
             SimpleNamespace(
-                seq_lens_cpu=torch.tensor([seq_len]), max_seq_len_override=1 << 20
+                seq_lens_cpu=torch.tensor([seq_len]),
+                max_seq_len_override=1 << 20,
+                forward_mode=ForwardMode.EXTEND,
             ),
         )
     return seen

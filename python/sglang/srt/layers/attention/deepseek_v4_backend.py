@@ -3132,6 +3132,11 @@ class DeepseekV4AttnBackend(
             if capture_metadata.prefill_graph_tail
             else None
         )
+        if (
+            self.low_ratios
+            and metadata_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self._snapshot_low_ratio_k_slots(metadata_batch)
 
     def _prefill_graph_tail_metadata(
         self, forward_batch: ForwardBatch, max_seq_len: int
@@ -3834,7 +3839,7 @@ class DeepseekV4AttnBackend(
         if k_slots is not None:
             k_slots = k_slots[layer.compress_ratio]
         else:
-            # Graph-captured metadata carries no snapshot.
+            # No snapshot, e.g. the prefill graph's capture pass.
             k_slots = prefill_k_slots(
                 req_to_token=self.req_to_token,
                 req_pool_indices=forward_batch.req_pool_indices,
