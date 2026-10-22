@@ -5201,6 +5201,10 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker.prefetches
+                )
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
                 # Singleton PD polls no longer yield through a collective.
@@ -5338,6 +5342,9 @@ class Scheduler(
                         idle &= tc.buffer_pipeline.is_idle()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
+
+            if self.enable_unified_cache_external_linker:
+                idle &= not self.tree_cache.linker.prefetches
 
         return idle
 

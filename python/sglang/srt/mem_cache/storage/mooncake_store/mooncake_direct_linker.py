@@ -146,7 +146,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
-        self.prefetch_future: Future[bool] | None = None
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -227,11 +226,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
-        if (
-            self.load_mode != "prefetch"
-            or not self.load_thread.is_alive()
-            or (self.prefetch_future is not None and not self.prefetch_future.done())
-        ):
+        if self.load_mode != "prefetch" or not self.load_thread.is_alive():
             return None
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
@@ -241,7 +236,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         ready_event = device_module.Event()
         ready_event.record()
-        future = self.prefetch_future = Future()
+        future = Future()
         self.load_queue.put((future, expanded, ready_event))
         return future
 
@@ -482,7 +477,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads.clear()
         # Both load modes must stop writing before any destination is recycled.
         self.load_queue.join()
-        self.prefetch_future = None
         self.offload_queue.join()
         self.broadcast_loads.clear()
         while True:

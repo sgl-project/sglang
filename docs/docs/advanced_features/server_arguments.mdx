@@ -2152,7 +2152,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linker-load-mode`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache load mode for the unified cache external linker. Prefetch loads all layers before request admission and currently requires Mooncake, Full/SWA cache components, and PP=1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache load mode for the unified cache external linker. Prefetch stages full-layer reads for multiple queued requests and uses `--hicache-storage-prefetch-policy` to control admission waits. It currently requires Mooncake, Full/SWA cache components, and PP=1.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`layer_wise`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>layer_wise</code>, <code>prefetch</code></td>
     </tr>

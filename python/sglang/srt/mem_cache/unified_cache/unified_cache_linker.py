@@ -26,6 +26,7 @@ A failed prefetch falls back to recomputation without entering a forward.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -242,6 +243,9 @@ class _ExternalCachePrefetch:
     anchor_lock: DecLockRefParams
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
     future: Future[bool] | None = None
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+    discard: bool = False
 
 
 class _PendingOffload(NamedTuple):
@@ -290,7 +294,7 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        self.prefetches: dict[str, _ExternalCachePrefetch] = {}
+        self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
         self.prefetch_attempts: dict[str, CacheRequestHandle] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
@@ -371,14 +375,15 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def prefetch(self, req: Req) -> None:
-        """Load one queued request; publish only after all ranks succeed."""
+        """Stage a queued request; publish only after all ranks succeed."""
         request = req.cache_request_handle
-        if self.is_prefetching(request):
+        previous = self.prefetch_attempts.get(req.rid)
+        if previous == request:
             return
-        if self.prefetch_attempts.get(req.rid) == request:
-            return
+        if previous is not None:
+            self._cancel_prefetch(previous)
         self.prefetch_attempts[req.rid] = request
-        if self.cache.disable or self.prefetches:
+        if self.cache.disable or request in self.prefetches:
             return
         req.init_next_round_input(self.cache, cow_mamba=False)
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
@@ -419,8 +424,10 @@ class UnifiedCacheLinkerWrapper:
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
             [],
+            timeout_s=self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
-        self.prefetches[req.rid] = state
+        self.prefetches[request] = state
         try:
             for component in self._components:
                 transfer = component.build_external_linker_transfer(
@@ -438,41 +445,86 @@ class UnifiedCacheLinkerWrapper:
         accepted = torch.tensor([state.future is not None], dtype=torch.int)
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
         if not accepted.item():
-            self._finish_prefetch(req.rid, publish=False)
+            self._cancel_prefetch(request)
+            self.check_prefetch_events()
 
-    def is_prefetching(self, request: CacheRequestHandle) -> bool:
-        state = self.prefetches.get(request.rid)
-        if state is not None and state.request != request:
-            self._finish_prefetch(request.rid, publish=False)
+    def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        state = self.prefetches.get(request)
+        if state is None or state.discard:
+            return True
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
             return False
-        return state is not None
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                int(
+                    state.wait_started is not None
+                    and now - state.wait_started > state.timeout_s
+                ),
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if state.wait_started is None:
+                    state.wait_started = now
+                return False
+        # Consume any fully completed read before stopping. Running reads keep
+        # their private slots until every rank has stopped writing to them.
+        self.check_prefetch_events()
+        self._cancel_prefetch(request)
+        return True
+
+    def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
+        state = self.prefetches.get(request)
+        if state is not None:
+            state.discard = True
+            if state.future is not None:
+                state.future.cancel()
+
+    def prefetch_size(self, pool: PoolName) -> int:
+        """Device slots still owned by prefetch, including discarded writes."""
+        return sum(
+            len(transfer.device_indices)
+            for state in self.prefetches.values()
+            for _, transfer in state.component_transfers
+            if transfer.name == pool and transfer.device_indices is not None
+        )
 
     def check_prefetch_events(self) -> None:
-        for rid in list(self.prefetches):
-            future = self.prefetches[rid].future
+        if not self.prefetches:
+            return
+        pending = list(self.prefetches.items())
+        progress = []
+        for _, state in pending:
+            future = state.future
+            done = future is None or future.done()
+            landed = False
             try:
-                landed = (
-                    future.result() if future is not None and future.done() else None
-                )
+                if done and future is not None and not future.cancelled():
+                    landed = future.result() is True
             except Exception:
                 logger.warning("Mooncake prefetch failed", exc_info=True)
-                landed = False
-            verdict = torch.tensor(
-                [landed is not None, landed is True], dtype=torch.int
-            )
-            self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
-            if verdict[0].item():
-                self._finish_prefetch(rid, publish=bool(verdict[1].item()))
+            progress.append([done, landed and not state.discard])
+        # Keep the same operation order on every rank, including discarded
+        # reads. Local cancellation must not change collective participation.
+        verdicts = torch.tensor(progress, dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MIN)
+        for (request, _), (done, landed) in zip(pending, verdicts.tolist()):
+            if done:
+                self._finish_prefetch(request, publish=bool(landed))
 
-    def _finish_prefetch(self, rid: str, *, publish: bool) -> None:
-        state = self.prefetches.pop(rid, None)
+    def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
+        state = self.prefetches.pop(request, None)
         if state is None:
             return
-        self.hit_markers.pop(rid, None)
-        # Quiesce the worker even on cancellation or a peer rank's failure.
+        # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
+            assert state.future.done()
             try:
-                state.future.result()
+                publish = (
+                    publish and not state.future.cancelled() and state.future.result()
+                )
             except Exception:
                 logger.warning("Mooncake prefetch failed", exc_info=True)
                 publish = False
@@ -765,8 +817,8 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
-        for rid in list(self.prefetches):
-            self._finish_prefetch(rid, publish=False)
+        for request in list(self.prefetches):
+            self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
         self.prefetch_attempts.clear()
         self.inflight_load_rids.clear()
@@ -782,10 +834,12 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 
-    def release_request(self, rid: str) -> None:
+    def release_request(self, request: CacheRequestHandle) -> None:
+        rid = request.rid
         self.hit_markers.pop(rid, None)
-        self.prefetch_attempts.pop(rid, None)
-        self._finish_prefetch(rid, publish=False)
+        if self.prefetch_attempts.get(rid) == request:
+            self.prefetch_attempts.pop(rid)
+        self._cancel_prefetch(request)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
@@ -794,8 +848,8 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
-        for rid in list(self.prefetches):
-            self._finish_prefetch(rid, publish=False)
+        for request in list(self.prefetches):
+            self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
         self.prefetch_attempts.clear()
         self.inflight_load_rids.clear()

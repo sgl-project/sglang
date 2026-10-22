@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     EvictParams,
     InitLoadBackParams,
     InsertParams,
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
@@ -191,7 +193,6 @@ class TestMooncakePrefetch(CustomTestCase):
     def _linker(self, read):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.load_mode = "prefetch"
-        linker.prefetch_future = None
         linker.num_layers = 2
         linker.layer_done_counter = LayerWiseLoadCounter(2)
         linker.gc_frozen = True
@@ -228,9 +229,9 @@ class TestMooncakePrefetch(CustomTestCase):
         self.addCleanup(stop)
         return linker, buffers
 
-    def _prefetch(self, linker, synchronize=lambda: None):
+    def _prefetch(self, linker, synchronize=lambda: None, indices=(4, 5)):
         transfer = PoolTransfer(
-            name=PoolName.KV, keys=["page"], device_indices=torch.tensor([4, 5])
+            name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
         )
         event = SimpleNamespace(record=lambda: None, synchronize=synchronize)
         with patch.object(
@@ -288,7 +289,6 @@ class TestMooncakePrefetch(CustomTestCase):
                 release.set()
             reset.result(timeout=5)
         assert future.result(timeout=5)
-        assert linker.prefetch_future is None
         assert linker.layer_done_counter.producer_index == -1
         for layer, buffer in enumerate(buffers):
             assert buffer[4:6].tolist() == [[layer + 1] * 2] * 2
@@ -309,9 +309,37 @@ class TestMooncakePrefetch(CustomTestCase):
                 assert torch.any(buffers[0])
                 assert not torch.any(buffers[1])
 
+    def test_queued_cancel_does_not_affect_running_or_later_device_writes(self):
+        """A canceled queue entry must neither write nor steal another completion."""
+        waiting, release = threading.Event(), threading.Event()
+
+        def synchronize():
+            waiting.set()
+            assert release.wait(5)
+
+        def read(keys, pointers, sizes):
+            for ptrs, lengths in zip(pointers, sizes):
+                for pointer, size in zip(ptrs, lengths):
+                    ctypes.memset(pointer, 1, size)
+            return [sum(lengths) for lengths in sizes]
+
+        linker, buffers = self._linker(read)
+        self.addCleanup(release.set)
+        running = self._prefetch(linker, synchronize)
+        assert waiting.wait(5)
+        canceled = self._prefetch(linker, indices=(2, 3))
+        later = self._prefetch(linker, indices=(6, 7))
+        assert canceled.cancel() and not running.cancel()
+        release.set()
+        assert running.result(timeout=5) and later.result(timeout=5)
+        assert canceled.cancelled()
+        for buffer in buffers:
+            assert not torch.any(buffer[:4])
+            assert buffer[4:].tolist() == [[1, 1]] * 4
+
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False):
+    def _fixture(self, *, swa=False, policy="wait_complete"):
         cfg = CacheConfig(
             page_size=2,
             components=(ComponentType.FULL,) + ((ComponentType.SWA,) if swa else ()),
@@ -326,25 +354,53 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         if swa:
             backend.pools[PoolName.SWA] = object()
         backend.load_mode = "prefetch"
-        backend.prefetch = MagicMock(return_value=Future())
+        backend.prefetch_futures = []
+
+        def submit(transfers):
+            future = Future()
+            backend.prefetch_futures.append(future)
+            return future
+
+        backend.prefetch = MagicMock(side_effect=submit)
         backend.lookup = MagicMock(wraps=backend.lookup)
         backend.restorable = [1, 2, 3]
-        cache.init_cache_linker(backend)
+        with get_context().override_server_args(
+            hicache_storage_prefetch_policy=policy,
+            hicache_storage_backend_extra_config=(
+                '{"prefetch_timeout_base":1,"prefetch_timeout_per_ki_token":512}'
+            ),
+        ):
+            cache.init_cache_linker(backend)
         self.addCleanup(cache.linker.close)
-        future = backend.prefetch.return_value
-        self.addCleanup(lambda: None if future.done() else future.set_result(False))
+        self.addCleanup(
+            lambda: [
+                f.set_result(False) for f in backend.prefetch_futures if not f.done()
+            ]
+        )
+        return cache, backend, self._request(), allocator
+
+    def _request(self, rid="prefetch", start=1, attempt=0):
         req = Req(
-            rid="prefetch",
+            rid=rid,
             origin_input_text=None,
-            origin_input_ids=array("q", range(1, 8)),
+            origin_input_ids=array("q", range(start, start + 7)),
             sampling_params=SamplingParams(max_new_tokens=1),
         )
-        return cache, backend, req, allocator
+        req.cache_request_handle = CacheRequestHandle(rid, attempt)
+        return req
 
     def _match(self, cache, req):
         return cache.match_prefix(
             MatchPrefixParams(key=RadixKey(req.origin_input_ids[:-1]))
         )
+
+    def _assert_balanced(self, cache, allocator):
+        full = getattr(allocator, "full_attn_allocator", allocator)
+        free = full.available_size()
+        assert free + cache.full_evictable_size() + cache.full_protected_size() == 32
+        if ComponentType.SWA in cache.components:
+            free = allocator.swa_attn_allocator.available_size()
+            assert free + cache.swa_evictable_size() + cache.swa_protected_size() == 32
 
     def _enqueue(self, cache, req):
         # Exercise the real scheduler hook without simulating its entire loop.
@@ -364,7 +420,8 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         assert not cache.check_prefetch_progress(req.cache_request_handle)
         assert self._match(cache, req).device_prefix_len == 0
         assert allocator.full_to_swa_index_mapping[loaded].tolist() == [0] * 6
-        backend.prefetch.return_value.set_result(True)
+        self._assert_balanced(cache, allocator)
+        backend.prefetch_futures[-1].set_result(True)
         cache.check_hicache_events()
         result = self._match(cache, req)
         assert cache.check_prefetch_progress(req.cache_request_handle)
@@ -374,7 +431,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             allocator.translate_loc_from_full_to_swa(loaded[-2:]),
             transfers[PoolName.SWA].device_indices,
         )
-        cache.linker.release_request(req.rid)
+        cache.linker.release_request(req.cache_request_handle)
         assert self._match(cache, req).device_prefix_len == 6
         assert allocator.full_attn_allocator.available_size() == 26
         assert allocator.swa_attn_allocator.available_size() == 30
@@ -389,13 +446,13 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             with self.subTest(outcome=outcome):
                 cache, backend, req, allocator = self._fixture(swa=True)
                 self._enqueue(cache, req)
-                backend.prefetch.return_value.set_result(outcome != "local-failure")
+                backend.prefetch_futures[-1].set_result(outcome != "local-failure")
 
                 def reduce(verdict, op, outcome=outcome):
                     if outcome == "peer-failure":
-                        verdict[1] = 0
+                        verdict[..., 1] = 0
                     elif outcome == "peer-pending":
-                        verdict[0] = 0
+                        verdict[..., 0] = 0
 
                 cache._all_reduce_attn_groups = reduce
                 cache.linker.check_prefetch_events()
@@ -410,6 +467,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert allocator.swa_attn_allocator.available_size() == (
                     30 if pending else 32
                 )
+                self._assert_balanced(cache, allocator)
                 if pending:
                     cache._all_reduce_attn_groups = lambda value, op: None
                     cache.linker.check_prefetch_events()
@@ -418,7 +476,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                     assert cache.linker.load_back(req) == (0, req.last_node)
                 cache.sanity_check()
 
-    def test_cancel_waits_for_writer_before_releasing_private_slots_and_anchor(self):
+    def test_cancel_retains_private_slots_and_anchor_until_writer_stops(self):
         cache, backend, req, allocator = self._fixture()
         prefix = allocator.alloc(2)
         cache.insert(
@@ -428,34 +486,126 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         )
         req.init_next_round_input(cache)
         cache.linker.prefetch(req)
-        anchor = req.last_node
-        future = backend.prefetch.return_value
-        waiting = threading.Event()
-        original_result = future.result
-
-        def wait_for_writer(timeout=None):
-            waiting.set()
-            return original_result(timeout=timeout)
-
-        with (
-            patch.object(future, "result", wait_for_writer),
-            ThreadPoolExecutor(max_workers=1) as executor,
+        anchor, handle = req.last_node, req.cache_request_handle
+        future = backend.prefetch_futures[-1]
+        assert future.set_running_or_notify_cancel()
+        with patch.object(
+            future, "result", side_effect=AssertionError("writer is running")
         ):
-            worker = executor.submit(cache.linker.release_request, req.rid)
-            try:
-                assert waiting.wait(5)
-                assert not worker.done()
-                assert allocator.available_size() == 26
-                assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 1
-            finally:
-                future.set_result(False)
-            worker.result(timeout=5)
-        assert not cache.linker.prefetches
-        assert not cache.linker.prefetch_attempts
+            cache.linker.release_request(handle)
+            cache.linker.check_prefetch_events()
+        assert cache.check_prefetch_progress(handle)
+        assert handle in cache.linker.prefetches
+        assert allocator.available_size() == 26
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 1
+        self._enqueue(cache, self._request())
+        assert cache.linker.prefetches[handle].future is future
+        assert len(backend.prefetch_futures) == 1
+        cache.linker.release_request(handle)
+        self._assert_balanced(cache, allocator)
+        future.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert not cache.linker.prefetches and not cache.linker.prefetch_attempts
         assert allocator.available_size() == 30
         assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+        self._assert_balanced(cache, allocator)
         assert self._match(cache, req).device_prefix_len == 2
         cache.evict(EvictParams(num_tokens=2))
+        assert allocator.available_size() == 32
+        cache.sanity_check()
+
+    def test_admission_policy_and_timeout_begin_at_first_blocked_poll(self):
+        """Stopping admission cannot recycle an in-flight writer's private slots."""
+        for policy, outcome in (
+            ("best_effort", "queued"),
+            ("best_effort", "running"),
+            ("best_effort", "ready"),
+            ("wait_complete", "running"),
+            ("timeout", "local"),
+            ("timeout", "peer"),
+        ):
+            with self.subTest(policy=policy, outcome=outcome):
+                cache, backend, req, allocator = self._fixture(swa=True, policy=policy)
+                self._enqueue(cache, req)
+                handle, future = req.cache_request_handle, backend.prefetch_futures[-1]
+                if outcome != "queued":
+                    assert future.set_running_or_notify_cancel()
+                if outcome == "ready":
+                    future.set_result(True)
+                state = cache.linker.prefetches[handle]
+                assert state.wait_started is None and state.timeout_s == 4
+                clock = SimpleNamespace(now=1000.0, peer=False, verdicts=[])
+
+                def reduce(verdict, op, clock=clock):
+                    if op == torch.distributed.ReduceOp.MAX:
+                        clock.verdicts.append(verdict.item())
+                        if clock.peer:
+                            verdict.fill_(1)
+
+                cache._all_reduce_attn_groups = reduce
+                with patch(
+                    "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time",
+                    SimpleNamespace(perf_counter=lambda clock=clock: clock.now),
+                ):
+                    assert cache.check_prefetch_progress(handle) == (
+                        policy == "best_effort"
+                    )
+                    if policy == "timeout":
+                        assert state.wait_started == 1000.0
+                        clock.now, clock.peer = 1000.1, outcome == "peer"
+                        assert cache.check_prefetch_progress(handle) == clock.peer
+                        if not clock.peer:
+                            clock.now = 1004.1
+                            assert cache.check_prefetch_progress(handle)
+                        assert clock.verdicts[-1] == (outcome == "local")
+                    elif policy == "wait_complete":
+                        clock.now = 10000.0
+                        assert not cache.check_prefetch_progress(handle)
+                assert allocator.available_size() == 26
+                self._assert_balanced(cache, allocator)
+                if not future.done():
+                    future.set_result(True)
+                cache.linker.check_prefetch_events()
+                assert cache.check_prefetch_progress(handle)
+                hit = policy == "wait_complete" or outcome == "ready"
+                assert self._match(cache, req).device_prefix_len == (6 if hit else 0)
+                assert allocator.available_size() == (26 if hit else 32)
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_out_of_order_completions_isolate_rids_and_reused_attempts(self):
+        cache, backend, old, allocator = self._fixture()
+        other, new = self._request("other", start=11), self._request(attempt=1)
+        for req in (old, other, new):
+            self._enqueue(cache, req)
+            assert backend.prefetch_futures[-1].set_running_or_notify_cancel()
+        first, second, third = backend.prefetch_futures
+        new_slots = backend.prefetch.call_args.args[0][0].device_indices.clone()
+        cache.linker.release_request(old.cache_request_handle)
+        assert len(cache.linker.prefetches) == 3 and allocator.available_size() == 14
+        self._assert_balanced(cache, allocator)
+        assert cache.linker.prefetch_attempts[new.rid] == new.cache_request_handle
+        third.set_result(True)
+        cache.linker.check_prefetch_events()
+        result = self._match(cache, new)
+        assert torch.equal(
+            cache.path_device_indices(result.last_device_node), new_slots
+        )
+        assert not cache.check_prefetch_progress(other.cache_request_handle)
+        first.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert old.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
+        assert cache.prefetch_loaded_tokens_by_reqid[new.cache_request_handle] == 6
+        self._assert_balanced(cache, allocator)
+        assert torch.equal(
+            cache.path_device_indices(result.last_device_node), new_slots
+        )
+        second.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert not cache.linker.prefetches
+        assert self._match(cache, other).device_prefix_len == 6
+        assert allocator.available_size() == 20
+        cache.evict(EvictParams(num_tokens=12))
         assert allocator.available_size() == 32
         cache.sanity_check()
 
@@ -1495,7 +1645,7 @@ def test_release_request_cancels_queued_load():
     linker.queued_loads["rid"] = [object()]
     wrapper.private_load_indices["rid"] = torch.arange(4)
 
-    wrapper.release_request("rid")
+    wrapper.release_request(CacheRequestHandle("rid", 0))
 
     assert wrapper.hit_markers == {}
     assert wrapper.inflight_load_rids == []

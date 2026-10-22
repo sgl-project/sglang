@@ -404,6 +404,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if cache_linker.load_mode == "prefetch":
+            self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+            (
+                _,
+                _,
+                self.prefetch_timeout_base,
+                timeout_per_ki_token,
+                _,
+            ) = HybridCacheController.parse_storage_backend_extra_config(
+                get_memory().hicache_storage_backend_extra_config
+            )
+            self.prefetch_timeout_per_page = (
+                self.page_size / 1024 * timeout_per_ki_token
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -1122,7 +1136,7 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.linker.load_mode == "prefetch"
             and req.finished()
         ):
-            self.linker.release_request(req.rid)
+            self.linker.release_request(req.cache_request_handle)
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -2367,7 +2381,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
-            return not self.linker.is_prefetching(request)
+            return self.linker.check_prefetch_progress(request)
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -2749,7 +2763,7 @@ class UnifiedRadixCache(BasePrefixCache):
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
-            self.linker.release_request(rid)
+            self.linker.release_request(request)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
@@ -3785,13 +3799,15 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.evictable_size()
 
     def protected_size(self) -> int:
-        return self.tree_core.protected_size()
+        return self.full_protected_size()
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
     def full_protected_size(self) -> int:
-        return self.tree_core.full_protected_size()
+        return self.tree_core.full_protected_size() + (
+            self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0
+        )
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
@@ -3800,7 +3816,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.mamba_evictable_size()
 
     def swa_protected_size(self) -> int:
-        return self.tree_core.swa_protected_size()
+        return self.tree_core.swa_protected_size() + (
+            self.linker.prefetch_size(PoolName.SWA) if self.linker is not None else 0
+        )
 
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()
