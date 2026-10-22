@@ -1,5 +1,3 @@
-"""HiCache load-back, admission and branching tests for UnifiedRadixCache."""
-
 import unittest
 from array import array
 from dataclasses import replace
@@ -239,7 +237,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._load_back_node(cache, node)
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
         self.assertIsNotNone(node_device_value(cache, node, ComponentType.FULL))
-        # Gather the whole reloaded prefix via match (a leaf may be split).
         loaded_indices = cache.path_device_indices(
             match_prefix(cache, base).last_device_node
         )
@@ -287,7 +284,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
         self.assertEqual(result.swa_branching_seqlen % self.cfg.page_size, 0)
 
-        # Simulate forward producing fresh SWA KV at the branching point.
         self._insert(
             cache,
             allocator,
@@ -606,7 +602,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(new_node, match.last_device_node)
         self.assertIsNone(node_device_value(cache, leaf, ComponentType.FULL))
         self.assertIsNone(node_device_value(cache, leaf, ComponentType.MAMBA))
-        # A failed load-back must roll back the pre-allocated mamba slot.
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -630,10 +625,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         self._apply_match_to_req(req, match)
 
-        # Simulate a request without its own mamba slot so load-back allocates one.
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
             loaded_len, _ = cache.init_load_back(
                 InitLoadBackParams(
@@ -668,7 +661,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         self._apply_match_to_req(req, match)
 
-        # Simulate a request without its own mamba slot so load-back allocates one.
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # No device room and eviction frees nothing -> load-back bails after the
@@ -796,9 +788,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         adder.add_one_req(req, False, None)
 
-        # The load pins 12 FULL slots, leaving 8 free. Rechecking the original
-        # 18-token demand would reject and scheduler cleanup would free the CoW
-        # destination even though the queued H2D still targets it.
+        # Rechecking the original 18-token demand would reject, and scheduler
+        # cleanup would free the CoW destination while the queued H2D targets it.
         self.assertEqual(adder.can_run_list, [req])
         self.assertEqual(req.prefix_len, 12)
         self.assertEqual(req.kv.cache_protected_len, 12)
@@ -819,7 +810,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.skipTest("chain too short")
         leaf = chain[-1]
 
-        # Stamp the node's mamba state so the host backup carries it.
         node_mamba_indices = node_device_value(cache, leaf, ComponentType.MAMBA).clone()
         self._fill_mamba_state(req_to_token_pool, node_mamba_indices, marker=11)
         expected_temporal, expected_conv = self._snapshot_mamba_state(
@@ -869,28 +859,23 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
-        # device value still present -> nothing to prepare even though host-backed
         self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
         self.assertIsNone(req.kv.mamba_pool_idx)
 
         cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
-        # a request that already owns a slot -> nothing to prepare
         req_owned = self._make_req(req_to_token_pool)
         self.assertIsNone(
             comp.prepare_load_back(leaf, req=req_owned).allocated_mamba_slot
         )
 
-        # no request -> nothing to prepare
         self.assertIsNone(comp.prepare_load_back(leaf, req=None).allocated_mamba_slot)
 
-        # fresh request + host-only mamba -> allocates and publishes onto req
         prep = comp.prepare_load_back(leaf, req=req)
         self.assertIsNotNone(prep.allocated_mamba_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(prep.allocated_mamba_slot[0]))
 
-        # node without host-backed mamba -> nothing to prepare
         req2 = self._make_req(req_to_token_pool)
         req_to_token_pool.mamba_allocator.free(req2.kv.mamba_pool_idx.unsqueeze(0))
         req2.kv.mamba_pool_idx = None
@@ -954,9 +939,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
         self._simulate_backup_tree(cache)
 
-        # Tombstone every chain node on the device side without going through
-        # the tree-wide eviction loop. This isolates build_hicache_transfers
-        # from LRU and cascade ordering.
+        # Tombstone every chain node directly, bypassing the eviction loop.
         for n in chain:
             cache.tree_core.set_component_device_value_raw(n, ComponentType.FULL, None)
             cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
@@ -970,7 +953,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         xfer = transfers[0]
         self.assertEqual(xfer.name, PoolName.SWA)
         self.assertEqual(len(xfer.nodes_to_load), expected_pages)
-        # host_indices must cover exactly the expected suffix tokens (>= sw).
         self.assertEqual(int(xfer.host_indices.numel()), expected_pages * ps)
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
@@ -985,17 +967,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         "window must span past the leaf to reach the pin",
     )
     def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
-        """A second load-back must not claim nodes pinned by an in-flight one.
-
-        commit_load_back republishes Full device values before the DMA acks, so
-        a later anchor can claim just the still-host-only SWA window of a
-        pinned node and hit the commit pin assert. The spec build must degrade
-        to an empty spec instead (the caller recomputes).
-        """
+        """A second load-back must not claim nodes pinned by an in-flight one;
+        the spec build degrades to empty (caller recomputes)."""
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        # commit_load_back pins its source nodes only under write-back; run the
-        # scenario in that mode so the foreign-pin path is reachable.
+        # commit_load_back pins its source nodes only under write-back.
         cache.is_write_back = True
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -1025,7 +1001,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(kv_xfer.nodes_to_load, [])
         self.assertEqual(comp_xfers, {})
 
-        # After the ack unpins, the same spec builds fully.
         cache.tree_core.finish_load_back(a)
         kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
         self.assertEqual(kv_xfer.nodes_to_load, [b])
@@ -1037,11 +1012,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         "SWA-only path keeps the chain construction simple",
     )
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
-        """A load-back that restores SWA must:
-        (1) bring each tombstoned window node's SWA value back to device
-            (host LRU -> device LRU),
-        (2) map every restored Full slot to its new SWA slot, so SWA reads via
-            translate_loc_from_full_to_swa return the restored slots."""
+        """A SWA load-back restores each tombstoned window node's SWA to device
+        and maps restored Full slots to their SWA slots."""
         ps = self.cfg.page_size
         window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()

@@ -1,5 +1,3 @@
-"""HiCache device <-> host backup, demotion and eviction tests for UnifiedRadixCache."""
-
 import unittest
 from array import array
 from dataclasses import replace
@@ -153,8 +151,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
-        """Write-back eviction will keep freeing device KV when the host pool
-        is exhausted and host eviction cannot free space to prevent OOM."""
+        """Write-back eviction keeps freeing device KV when the host pool is full."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
 
@@ -174,7 +171,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
 
-        # The chain is gone entirely: no device hit, no host hit.
         m = match_prefix(cache, seq)
         self.assertEqual(m.device_prefix_len, 0)
         self.assertEqual(m.host_hit_length, 0)
@@ -182,9 +178,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_write_back_drop_respects_pins_then_frees_subtree(self):
-        """The host-pressure drop fallback must decline while any node in the
-        unbacked subtree is host-pinned, then reclaim the whole subtree --
-        including a demoted child's host backup -- once unpinned."""
+        """The host-pressure drop fallback declines while any node in the unbacked
+        subtree is host-pinned, then reclaims the whole subtree once unpinned."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         host_pool = cache.cache_controller.mem_pool_host
@@ -212,13 +207,11 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         # From here every backup fails (controller.write returns None), so
         # each evict() attempts the drop fallback on the parent.
         with mock.patch.object(cache.cache_controller, "write", return_value=None):
-            # Pinned subtree root: drop declines, chain stays intact.
             parent_lock_params = cache.inc_host_lock_ref(parent).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
             cache.dec_host_lock_ref(parent, parent_lock_params)
 
-            # Pinned host-only descendant: drop declines as well.
             child_lock_params = cache.inc_host_lock_ref(child).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
@@ -226,7 +219,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             self.assertEqual(m.device_prefix_len, len(parent_seq))
             cache.dec_host_lock_ref(child, child_lock_params)
 
-            # Unpinned: the subtree drops and the child's host slots return.
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(parent_seq))
         self.assertEqual(host_pool.available_size(), baseline_host)
@@ -239,8 +231,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         lambda cfg: cfg == CacheConfig(), "single Full page-size-1 ownership regression"
     )
     def test_hicache_split_preserves_inflight_full_host_pin(self):
-        """A split prefix keeps an outstanding storage backup's host ownership."""
-
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         host_pool = cache.cache_controller.mem_pool_host
@@ -261,8 +251,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(node_host_lock_ref(cache, split_parent, ComponentType.FULL), 1)
         self.assertEqual(node_host_lock_ref(cache, leaf, ComponentType.FULL), 1)
 
-        # Before the fix the prefix had host_lock_ref == 0 and these slots were
-        # reclaimed while the storage thread could still be reading them.
+        # The prefix must hold a host lock, else these slots are reclaimed while
+        # the storage thread still reads them.
         self.assertEqual(cache.evict_host(len(split_host)), 0)
 
         # A lock acquired after the split covers only the suffix and gets a new
@@ -288,7 +278,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     def test_hicache_split_preserves_inflight_swa_host_pin(self):
-        """A split SWA host segment stays pinned and releases without leaks."""
         expected_cfg = CacheConfig(
             page_size=1,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -316,9 +305,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             lock_params.get_lock_uuid(ComponentType.SWA, lock_host=True)
         )
 
-        # Diverge inside the locked SWA window. The leaf handle stays on the
-        # suffix while the lock boundary and copied host refs move to the new
-        # prefix, so neither half may be reclaimed by component host eviction.
+        # Diverging inside the locked SWA window moves the lock boundary and copied
+        # host refs to the new prefix; neither half may be reclaimed.
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6, 9, 10])
         split_parent = node_parent(cache, leaf)
         self.assertNotEqual(split_parent, parent_before_split)
@@ -334,9 +322,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
-        """The tree op defers a write-back victim's demote: it returns a BackupKV
-        without freeing device, and _demote requires a completed backup, so a
-        failed backup leaves the node recoverable on device."""
+        """The tree op defers a write-back victim's demote, so a failed backup
+        leaves the node recoverable on device."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         ct = ComponentType.FULL
@@ -349,7 +336,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertFalse(cache.tree_core.is_backuped(node))
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
 
-        # Tree op defers: returns a BackupKV and leaves the node on device (no demote).
         leaf_result = cache.tree_core.evict_device_leaf(node, is_write_back=True)
         self.assertIsNotNone(leaf_result.backup_kv)
         cache._free_values(leaf_result.device_frees, leaf_result.host_frees)
@@ -366,7 +352,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_partial_match_splits_evicted_backed_up_node(self):
-        """Partial matches on host-only nodes must keep the host prefix usable."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         ps = self.cfg.page_size
         seq = self._make_seq(1, 4)
@@ -399,7 +384,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             self.assertNotEqual(split_parent, cache.root_node_handle())
             self.assertTrue(cache.tree_core.is_full_device_evicted(split_parent))
             self.assertTrue(cache.tree_core.is_backuped(split_parent))
-            # root -> split_parent keys reconstruct expected_prefix
             prefix_tokens: list[int] = []
             chain = []
             cur = split_parent
@@ -409,7 +393,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             for n in reversed(chain):
                 prefix_tokens.extend(node_token_ids(cache, n))
             self.assertEqual(prefix_tokens, expected_prefix)
-            # the diverged suffix stays as evicted+backuped descendant(s)
             suffix_tokens: list[int] = []
             cur = split_parent
             while children := node_children(cache, cur):
@@ -458,7 +441,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertFalse(cache.tree_core.is_backuped(node))
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
 
-        # Backup failure falls back to dropping the unlocked subtree.
         with mock.patch.object(cache, "_execute_and_commit_kv_backup", return_value=0):
             result = cache.evict(EvictParams(num_tokens=len(seq)))
 
@@ -472,7 +454,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         lambda cfg: not cfg.has_mamba, "SWA-only path keeps the split setup simple"
     )
     def test_hicache_write_through_offloads_swa_split_leaf(self):
-
         ps = self.cfg.page_size
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
@@ -500,7 +481,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     def test_hicache_evict_to_host_updates_aux_lru(self):
-        """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [
             ct
             for ct in (ComponentType.MAMBA, ComponentType.SWA)
@@ -531,9 +511,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_mamba
     def test_hicache_write_back_internal_mamba_evict_demotes_state(self):
-        """write_back: an internal node's tombstoned mamba state is demoted
-        to host, keeping the node a valid match boundary so the KV beneath
-        it stays servable."""
+        """write_back: an internal node's tombstoned mamba state is demoted to host,
+        keeping the node a valid match boundary."""
         cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
             "write_back"
         )
@@ -613,8 +592,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         # The backed parent stops the Full backup chain, while the SWA window
         # reaches the unbacked grandparent and marks it under the anchor's ack.
         insert(3 * page)
-        # Queue the asynchronous window backup explicitly: write-back insertion
-        # no longer publishes it, but Mamba eviction must still respect its ack.
+        # Queue the asynchronous window backup explicitly; Mamba eviction must
+        # respect its ack.
         cache._execute_and_commit_kv_backup(BackupKV(node_ids=[anchor]))
         self.assertEqual(
             cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
@@ -641,7 +620,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_mamba
     def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
-        """Non-write_back policies keep the legacy tombstone-and-drop."""
+        """Non-write_back policies tombstone and drop."""
         cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
 
         cache.evict(EvictParams(num_tokens=0, mamba_num=10))
@@ -650,15 +629,14 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(
             m.device_prefix_len,
             0,
-            "write_through keeps the legacy drop: frontier capped at root",
+            "write_through keeps the drop: frontier capped at root",
         )
         cache.sanity_check()
 
     @requires_swa
     def test_hicache_write_back_internal_swa_evict_demotes_kv(self):
-        """write_back: an internal node's tombstoned SWA KV is demoted to
-        host, keeping the node a valid match boundary so the KV beneath it
-        stays servable instead of losing a window of matchable prefix."""
+        """write_back: an internal node's tombstoned SWA KV is demoted to host,
+        keeping the node a valid match boundary."""
         cache, req_to_token_pool, seq_a, seq_b = self._build_internal_swa_fixture(
             "write_back"
         )
@@ -744,7 +722,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             ComponentType.MAMBA: "mamba_pool_host",
         }
         for ct in cache.tree_components:
-            # set by the hicache assembler for every enabled component
             pool = getattr(cache, host_pool_attr[ct])
             if pool is None:
                 continue
@@ -752,7 +729,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             evicted = cache.evict_host(pool.size, ct)
             if evicted == 0:
                 continue
-            # the drain must return every freed host value to the pool
             self.assertGreater(pool.available_size(), available_before)
 
     @requires_full_mamba_ps1
@@ -868,9 +844,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         """A host-backed SWA tombstone inside the trailing sliding window stops
         the device match before it: the Full-backed tail from the tombstone on
         is a host hit, and the tombstone's own SWA counts in
-        ``swa_host_hit_length``. A tombstone outside the window, or a chain
-        fully on device, leaves the whole match on device.
-        """
+        ``swa_host_hit_length``."""
         ps = self.cfg.page_size
         window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
         for name, victim in (
@@ -929,8 +903,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
     )
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not
-        release later load-back/request locks after the tombstone is restored.
-        """
+        release later load-back/request locks after the tombstone is restored."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -963,10 +936,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
     def test_hicache_full_temp_lock_covers_evicted_anchor_and_mirrors_on_release(
         self,
     ):
-        """Segment locks count the evicted anchor too (no skip receipts), so
-        a value restored mid-hold stays correctly attributed: each release
-        takes back exactly its own ref regardless of interleaved holders.
-        """
+        """Segment locks count the evicted anchor too (no skip receipts), so a value
+        restored mid-hold stays correctly attributed."""
         ps = self.cfg.page_size
         if 3 * ps > self.cfg.kv_size // 2:
             self.skipTest("kv_size too small")
@@ -1002,8 +973,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
     )
     def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a Mamba tombstone must not
-        release later load-back/request locks after the tombstone is restored.
-        """
+        release later load-back/request locks after the tombstone is restored."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
@@ -1080,7 +1050,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         "SWA boundary splits deepen the chain non-deterministically",
     )
     def test_build_backup_kv_action_orders_ancestors_first(self):
-        """write-through backs up unbacked ancestors parent-first; write-back only the leaf."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
 
         top_seq = self._make_seq(1, 1)
@@ -1099,11 +1068,9 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertFalse(cache.tree_core.is_backuped(mid))
         self.assertFalse(cache.tree_core.is_backuped(top))
 
-        # write-through: every unbacked ancestor, top-most first, child last
         write_through = cache.tree_core.build_backup_node_ids(leaf, write_back=False)
         self.assertEqual(write_through, [top, mid, leaf])
 
-        # write-back: only the eviction victim, even with unbacked ancestors
         write_back = cache.tree_core.build_backup_node_ids(leaf, write_back=True)
         self.assertEqual(write_back, [leaf])
 
@@ -1112,7 +1079,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
     @requires_swa
     @requires_hicache
     def test_write_back_defers_swa_window_backup_until_eviction(self):
-        """Reinserting backed Full nodes must not publish freshly recovered SWA."""
         ps = self.cfg.page_size
         if self.cfg.sliding_window_size <= 2 * ps:
             self.skipTest("window must span past the leaf and its parent to reach c")
@@ -1144,7 +1110,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             self.assertIsNotNone(node_device_value(cache, node, ComponentType.SWA))
             self.assertIsNone(node_host_value(cache, node, ComponentType.SWA))
 
-        # Two requests in one batch finish at t1 and t2; neither ack drains.
         with mock.patch.object(
             cache,
             "_execute_and_commit_kv_backup",
@@ -1158,7 +1123,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
             self.assertIsNone(node_host_value(cache, node, ComponentType.SWA))
         self.assertEqual(cache.cache_controller.write_queue, [])
-        # Write-back defers the unbacked Full prefix to eviction.
         self.assertFalse(cache.tree_core.is_backuped(c))
         self.assertFalse(cache.tree_core.is_backuped(d))
 
