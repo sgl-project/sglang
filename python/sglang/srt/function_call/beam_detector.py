@@ -14,7 +14,6 @@ from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 class BeamDetector(ResponseTemplateToolDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
     constrains_every_turn = True
-    forwards_unknown_tools = True
     # Unheld, Beam's arguments drift from their schemas.
     strict_arguments = True
 
@@ -56,7 +55,6 @@ class BeamDetector(ResponseTemplateToolDetector):
             # The tag then covers the output from its first token.
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
-            undeclared_names=tool_choice == "auto" and self.admits_undeclared_tools(),
             # Beam also writes arguments sorted by name.
             sorted_arguments=True,
             strict_arguments=self.strict_arguments,

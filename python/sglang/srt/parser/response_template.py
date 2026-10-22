@@ -620,7 +620,6 @@ class ResponseTemplateReasoningDetector:
         tools: list[dict[str, Any]],
         parallel_tool_calls: bool = True,
         message_start: bool = False,
-        undeclared_names: bool = False,
     ) -> dict[str, Any] | None:
         """A structural tag for JSON framed as the answer, after the reasoning
         or, at the `message_start`, from the first token, or `None` to apply the
@@ -694,7 +693,6 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
     response_template: dict | None = None
     constrains_every_turn = False
-    forwards_unknown_tools = False
     strict_arguments = False
 
     def __init__(
@@ -746,11 +744,6 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             for event in adapter.parse(text)
         )
 
-    def admits_undeclared_tools(self) -> bool:
-        """Whether automatic calls may name undeclared tools, which parsing
-        then forwards."""
-        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-
     def _to_tool_call(
         self, value: Any, tool_indices: dict[str, int]
     ) -> tuple[str, str] | None:
@@ -768,7 +761,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         if name not in tool_indices:
             logger.warning("Model attempted to call undefined function: %s", name)
-            if not self.admits_undeclared_tools():
+            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return None
 
         if not isinstance(arguments, str):
@@ -883,7 +876,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         ordered_parts: list[str | ToolCallItem] = []
 
         def on_open(name: str) -> bool:
-            if name not in tool_indices and not self.admits_undeclared_tools():
+            if name not in tool_indices and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return False
             self._emit_tool_name(name, pending_calls)
             ordered_parts.append(pending_calls[-1])

@@ -1178,34 +1178,6 @@ class ServingChatTestCase(CustomTestCase):
                             expected,
                         )
 
-    def test_json_answer_admits_calls_to_undeclared_tools(self):
-        """Before a JSON answer, calls must not be held to the declared tools."""
-        self._use_delimited_response_template("beam")
-        fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
-        valid = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
-        answer = '<think>Hm</think><answer>{"a": 1}'
-        adapted, _ = self._convert_rendered_as("<assistant>", **fields)
-        grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
-        for text, admitted in (
-            (valid, True),
-            (valid.replace("get_weather", "delete_all"), True),
-            (answer, True),
-        ):
-            with self.subTest(text=text):
-                self.assertIs(_is_grammar_accept_string(grammar, text), admitted)
-        for text, token, expected in (
-            (valid, 7, ("Hm", "", [("get_weather", {"city": "Paris"})])),
-            (answer, 2, ("Hm", '{"a": 1}', [])),
-        ):
-            for stream in (False, True):
-                with self.subTest(text=text, stream=stream):
-                    self.assertEqual(
-                        self._served(
-                            self._stopped_on_token(text, token), stream, **fields
-                        ),
-                        expected,
-                    )
-
     def test_json_answer_holds_strict_calls_and_their_count(self):
         """Calls instead of a JSON answer must keep the strictness and count the tools
         ask for."""
@@ -1217,7 +1189,7 @@ class ServingChatTestCase(CustomTestCase):
         for fields, text, admitted in (
             ({"tools": [strict]}, call, True),
             ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
-            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), True),
+            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
             ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
             (
                 {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},

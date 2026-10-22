@@ -237,6 +237,29 @@ class TestBeamResponseTemplate(CustomTestCase):
                 self.assertEqual([call.name for call in calls], [name])
                 self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
 
+    def test_undeclared_tool_calls_follow_the_forwarding_setting(self):
+        command = _parameter("command", "pwd")
+        generation = _continuation_call(
+            "bash", command, terminator="<|end|>"
+        ) + _full_call("Bash", command)
+        for forward, names in ((False, ["bash"]), (True, ["bash", "Bash"])):
+            for stream in (False, True):
+                with self.subTest(forward=forward, stream=stream):
+                    with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(forward):
+                        parser = FunctionCallParser(
+                            tools=[_tool("bash", {"command": {"type": "string"}})],
+                            tool_call_parser="beam",
+                            prefix=PREFIX,
+                        )
+                        if stream:
+                            calls = []
+                            for char in generation:
+                                calls += parser.parse_stream_chunk(char)[1]
+                        else:
+                            calls = parser.parse_non_stream(generation)[1]
+
+                    self.assertEqual([call.name for call in calls if call.name], names)
+
     def test_forced_tool_calls_use_template_grammar(self):
         """Forced calls after the reasoning follow the template grammar, which
         accepts only calls the parser reads back."""
@@ -607,23 +630,13 @@ class TestBeamResponseTemplate(CustomTestCase):
             with self.subTest(text=text):
                 self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 
-    def test_automatic_calls_hold_declared_arguments_beside_any_other_name(self):
+    def test_automatic_calls_hold_declared_arguments_and_names(self):
         """At any strict level, declared arguments are held where they can be,
-        while calls may name undeclared tools with any arguments."""
+        and calls name declared tools only."""
         count = _tool("set_count", {"count": {"type": "integer"}})
         unheld = _tool("find", {"q": {"type": "string"}})
         unheld.function.parameters["minProperties"] = 1
         any_arguments = _parameter("x", "1") + _parameter("x", "y")
-        cases = [
-            (_continuation_call("get_weather", _parameter("city", "P")), True),
-            (_continuation_call("get_weather", _parameter("town", "P")), False),
-            (_continuation_call("set_count", _parameter("count", "1")), True),
-            (_continuation_call("set_count", _parameter("count", "x")), False),
-            (_continuation_call("find", any_arguments), True),
-            (_continuation_call("search_files", any_arguments), True),
-            (_continuation_call("set_coun", any_arguments), True),
-            (_continuation_call("set_counts", any_arguments), True),
-        ]
 
         for level in (ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER):
             with envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value):
@@ -633,7 +646,15 @@ class TestBeamResponseTemplate(CustomTestCase):
                     tools=parser.structural_tag_tools(), tool_choice="auto"
                 )
             grammar = Grammar.from_structural_tag(tag.model_dump_json())
-            for text, expected in cases:
+            for text, expected in [
+                (_continuation_call("get_weather", _parameter("city", "P")), True),
+                (_continuation_call("get_weather", _parameter("town", "P")), False),
+                (_continuation_call("set_count", _parameter("count", "1")), True),
+                (_continuation_call("set_count", _parameter("count", "x")), False),
+                (_continuation_call("find", any_arguments), not level),
+                (_continuation_call("search_files", any_arguments), False),
+                (_continuation_call("set_counts", any_arguments), False),
+            ]:
                 with self.subTest(level=level, text=text):
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 

@@ -268,37 +268,6 @@ def _call_opener(
     return before + name + after
 
 
-def _other_names(pattern: str, names: list[str]) -> str | None:
-    """A regex for the names `pattern` matches besides `names`, or `None` if
-    `pattern` is no negatable character class repeated."""
-    if not names:
-        return pattern
-    match = re.fullmatch(r"\\([wS])\+|\[\^((?:\\.|[^\]\\])+)\]\+", pattern)
-    if match is None:
-        return None
-    negated = {"w": r"\W", "S": r"\s"}[match[1]] if match[1] else match[2]
-
-    def other(chars: set[str]) -> str:
-        return f"[^{negated}{''.join(map(_class_escape, sorted(chars)))}]"
-
-    trie: dict[str, dict] = {}
-    for name in names:
-        node = trie
-        for char in name:
-            node = node.setdefault(char, {})
-        node[""] = {}
-
-    def rest(node: dict[str, dict], first: bool) -> str:
-        """The rest of a name past `node` that ends on none of `names`."""
-        branches = [other(set(node) - {""}) + other(set()) + "*"]
-        branches += [
-            _escape(char) + rest(child, False) for char, child in node.items() if char
-        ]
-        return f"(?:{'|'.join(branches)})" + ("" if first or "" in node else "?")
-
-    return rest(trie, True)
-
-
 def _thinking_format(
     thinking: ResponseTemplateField,
     message_start: list[str] | None,
@@ -1006,7 +975,6 @@ def tool_call_structural_tag(
     answer_format: dict[str, Any] | None = None,
     message_start: list[str] | None = None,
     grammar_requires_reasoning: bool = False,
-    undeclared_names: bool = False,
     sorted_arguments: bool = False,
     strict_arguments: bool = False,
 ) -> dict[str, Any] | None:
@@ -1014,12 +982,10 @@ def tool_call_structural_tag(
 
     An `answer` field lets the model answer instead, in `answer_format` if
     given; without tools, only the answer is derived. `strict_arguments`
-    holds the arguments of every tool as strict where they can be. With
-    `undeclared_names`, calls may also name any other tool the template can
-    spell, with any arguments, where its name pattern lets the grammar tell
-    held tools apart. Strict `xml-inline` arguments come in declared order,
-    or also alphabetical with `sorted_arguments`. Raises `ValueError` for
-    names the template cannot encode."""
+    holds the arguments of every tool as strict where they can be. Strict
+    `xml-inline` arguments come in declared order, or also alphabetical with
+    `sorted_arguments`. Raises `ValueError` for names the template cannot
+    encode."""
     if not tools and answer is not None:
 
         def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
@@ -1035,7 +1001,7 @@ def tool_call_structural_tag(
     closer_literals = _closers(field)
     if opener is None or closer_literals is None:
         return None
-    arguments, held = [], []
+    arguments = []
     for tool in tools:
         function = tool["function"]
         # Like the generic JSON schema, a tool without parameters takes none.
@@ -1052,7 +1018,6 @@ def tool_call_structural_tag(
             except ValueError:
                 if strict:
                     raise
-        held.append(tool_arguments is not None)
         if tool_arguments is None and not strict:
             tool_arguments = _arguments_format(
                 field, parameters, strict=False, sorted_arguments=sorted_arguments
@@ -1066,15 +1031,6 @@ def tool_call_structural_tag(
         if not re.fullmatch(opener[1], name):
             raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
         names.append(_escape(name))
-    if undeclared_names:
-        others = _other_names(
-            opener[1], [tool["function"]["name"] for tool, h in zip(tools, held) if h]
-        )
-        loose = _arguments_format(field, {}, strict=False, sorted_arguments=False)
-        if others is not None and loose is not None:
-            # Calls to tools that are not held all take the same arguments.
-            names = [name for name, h in zip(names, held) if h] + [f"(?:{others})"]
-            arguments = [args for args, h in zip(arguments, held) if h] + [loose]
     closers = _const_strings(closer_literals) if closer_literals else None
 
     def call(start: list[str] | None) -> dict[str, Any]:
