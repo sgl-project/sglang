@@ -1,4 +1,4 @@
-"""GLM CP2/BCG prefill -> TP2 DFlash2 decode, including eager fallbacks."""
+"""GLM CP2/BCG prefill -> TP2 DFlash2 decode, with padding and cached prefixes."""
 
 import unittest
 
@@ -64,6 +64,14 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase):
             "--cuda-graph-backend-prefill",
             "breakable",
             "--cuda-graph-bs-prefill",
+            "2",
+            "4",
+            "8",
+            "16",
+            "32",
+            "64",
+            "128",
+            "256",
             "512",
             "1024",
             "2048",
@@ -116,20 +124,19 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase):
         self.assertGreater(count, 0)
         return (filler * ((count + len(filler) - 1) // len(filler)))[:count] + suffix
 
-    def test_exact_bucket_fallback_chunk_and_prefix(self):
-        # Short repeats can race with prefix checkpoint publication. Assert
-        # their path against the reported cache hit; cold requests and the
-        # repeated long request have fixed replay/fallback expectations.
+    def test_padding_chunk_and_prefix_replay(self):
         outputs = []
         cases = (
-            (512, True, True),
-            (512, False, None),
-            (512, False, None),
-            (513, True, False),
-            (16421, True, True),
-            (16421, False, False),
+            (257, True),
+            (257, False),
+            (512, True),
+            (513, True),
+            (513, False),
+            (16421, True),
+            (16421, False),
+            (16423, False),
         )
-        for length, cold_cache, expect_graph in cases:
+        for length, cold_cache in cases:
             if cold_cache:
                 for url in (self.prefill_url, self.decode_url):
                     requests.post(
@@ -152,22 +159,44 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase):
             self.assertGreater(output["meta_info"]["spec_verify_ct"], 0)
             graph_passes = self._prefill_graph_passes() - before
             cached_tokens = output["meta_info"]["cached_tokens"]
-            if expect_graph is None:
-                expect_graph = cached_tokens == 0
             print(
                 f"PD smoke: length={length}, cached_tokens={cached_tokens}, "
                 f"graph_passes={graph_passes}"
             )
-            if expect_graph:
+            # A one-token suffix cannot activate CP2. All other text shapes
+            # fit a bucket, including padded prefills with cached prefixes.
+            if length - cached_tokens >= self.prefill_tp_size:
                 self.assertGreater(graph_passes, 0, f"length={length}")
             else:
                 self.assertEqual(graph_passes, 0, f"length={length}")
-            if not cold_cache and length == 16421:
+            if not cold_cache and length >= 16421:
                 self.assertGreater(cached_tokens, 0)
             outputs.append(output)
         self.assertEqual(outputs[0]["text"], outputs[1]["text"])
         for process in (self.process_prefill, self.process_decode):
             self.assertIsNone(process.poll())
+
+    def test_uneven_batched_padding_replay(self):
+        for url in (self.prefill_url, self.decode_url):
+            requests.post(
+                url + "/flush_cache", params={"timeout": 30}, timeout=60
+            ).raise_for_status()
+        before = self._prefill_graph_passes()
+        lengths = [257, 513, 1027]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "input_ids": [self._prompt(length) for length in lengths],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+            timeout=600,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for length, output in zip(lengths, response.json(), strict=True):
+            self.assertIn("739391", output["text"])
+            self.assertEqual(output["meta_info"]["prompt_tokens"], length)
+            self.assertGreater(output["meta_info"]["spec_verify_ct"], 0)
+        self.assertGreater(self._prefill_graph_passes(), before)
 
     def _prefill_graph_passes(self):
         response = requests.get(self.prefill_url + "/metrics", timeout=30)

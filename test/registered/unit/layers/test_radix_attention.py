@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -24,6 +25,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
     prefill_graph_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -136,6 +138,40 @@ def test_extra_kwargs_and_exception_restore():
     assert batch.out_cache_loc is original[0] and batch.positions is original[1]
     assert batch._attn_output is sentinel
     assert aux[0].shape == (4,)
+
+
+@pytest.mark.parametrize("rank,logical", [(0, 3), (1, 2)])
+def test_interleave_graph_clears_local_padding_with_global_kv(rank, logical):
+    layer = RadixAttention(2, 3, 1.0, 2, 0)
+    batch = make_batch(tokens=5, rows=8)
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.attn_cp_metadata = InterleaveContextParallelMetadata(
+        total_seq_lens=5,
+        per_rank_actual_token=[4, 4],
+        per_rank_logical_token=[3, 2],
+        graph_num_tokens=8,
+    )
+    q = torch.zeros(4, 2, 3)
+    kv = torch.zeros(8, 2, 3)
+
+    def attention(q, k, v, actual_layer, live_batch, save_kv_cache, **kwargs):
+        # Eager attention consumes valid local Q and global ordered KV rows.
+        assert q.shape[0] == logical
+        assert k.shape[0] == v.shape[0] == 5
+        assert live_batch.out_cache_loc.shape[0] == live_batch.positions.shape[0] == 5
+        return torch.full_like(q, 3)
+
+    with (
+        get_parallel().override(attn_cp_rank=rank, attn_cp_size=2),
+        attention_scope(batch, SimpleNamespace(forward=attention), raw_num_tokens=5),
+        patch(
+            "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
+            return_value=True,
+        ),
+    ):
+        output = layer(q, kv, kv, batch)
+    assert torch.all(output[:logical] == 3)
+    assert torch.all(output[logical:] == 0)
 
 
 @pytest.mark.parametrize("tokens", [0, 2])
