@@ -20,7 +20,6 @@ from sglang.srt.observability.trace import (
     TraceThreadInfo,
     extract_trace_headers,
     get_global_trace_level,
-    get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -35,9 +34,6 @@ try:
     _has_otel = True
 except ImportError:
     _has_otel = False
-
-# Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "_get_host_id")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -74,14 +70,6 @@ class TestTraceFunctions(unittest.TestCase):
         finally:
             get_resources().trace_level = orig
 
-    def test_get_global_tracing_enabled(self):
-        self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
-
-    def test_get_cur_time_ns(self):
-        ts = mod.get_cur_time_ns()
-        self.assertIsInstance(ts, int)
-        self.assertGreater(ts, 0)
-
 
 class TestTraceNullContext(unittest.TestCase):
     def test_null_object_pattern(self):
@@ -99,45 +87,6 @@ class TestSpanAttributes(unittest.TestCase):
     def test_constants_exist(self):
         self.assertEqual(SpanAttributes.GEN_AI_LATENCY_E2E, "gen_ai.latency.e2e")
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
-
-
-# __get_host_id
-class TestGetHostId(unittest.TestCase):
-    def test_from_machine_id_file(self):
-        with (
-            patch("os.path.exists", return_value=True),
-            patch(
-                "builtins.open",
-                unittest.mock.mock_open(read_data="abc123\n"),
-            ),
-        ):
-            self.assertEqual(_get_host_id(), "abc123")
-
-    def test_from_machine_id_file_error(self):
-        """Falls back to MAC address when file read fails."""
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("builtins.open", side_effect=IOError("read error")),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_from_mac_address(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0x112233445566),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_unknown_fallback(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0),
-        ):
-            self.assertEqual(_get_host_id(), "unknown")
 
 
 @unittest.skipUnless(_has_otel, "opentelemetry not installed")
@@ -165,6 +114,13 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
 
 
 class TestProcessTracingInit(unittest.TestCase):
+    def setUp(self):
+        self.orig_initialized = mod.opentelemetry_initialized
+        mod.opentelemetry_initialized = False
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self.orig_initialized
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported

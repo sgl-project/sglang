@@ -83,19 +83,6 @@ def _jit_fused_add_rmsnorm_module(
     )
 
 
-@cache_once
-def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
-    return load_jit(
-        "qknorm_across_heads",
-        *args,
-        cuda_files=["elementwise/qknorm_across_heads.cuh"],
-        cuda_wrappers=[
-            ("qknorm_across_heads", f"QKNormAcrossHeadsKernel<{args}>::run")
-        ],
-    )
-
-
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
@@ -155,25 +142,3 @@ def fused_add_rmsnorm(
 ) -> None:
     module = _jit_fused_add_rmsnorm_module(input.dtype, cast_x_before_out_mul)
     module.fused_add_rmsnorm(input, residual, weight, eps)
-
-
-@debug_kernel_api
-def fused_inplace_qknorm_across_heads(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> None:
-    """
-    Fused inplace QK normalization across all heads.
-
-    Args:
-        q: Query tensor of shape [batch_size, num_heads * head_dim]
-        k: Key tensor of shape [batch_size, num_heads * head_dim]
-        q_weight: Query weight tensor of shape [num_heads * head_dim]
-        k_weight: Key weight tensor of shape [num_heads * head_dim]
-        eps: Epsilon for numerical stability
-    """
-    module = _jit_qknorm_across_heads_module(q.dtype)
-    module.qknorm_across_heads(q, k, q_weight, k_weight, eps)
