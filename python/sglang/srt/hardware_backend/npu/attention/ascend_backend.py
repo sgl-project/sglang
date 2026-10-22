@@ -349,7 +349,6 @@ class AscendAttnBackend(AttentionBackend):
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
         dense_mla = self.use_mla and not self.use_dsa
-        self.dense_mla_dcp_deployment = dense_mla and parallel.dcp_enabled
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
         if self.use_mla:
@@ -443,7 +442,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if (
             not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
-            and not self.dense_mla_dcp_deployment
+            and not (dense_mla and parallel.dcp_enabled)
             and not self.dsa_dcp_target
         ):
             assert not self.is_hybrid_swa, (
@@ -862,8 +861,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.speculative_num_draft_tokens is not None:
             graph_context_len += self.speculative_num_draft_tokens
         total_context_len = graph_context_len + self.page_size - 1
-        dense_mla_dcp_graph = self.dense_mla_dcp_target
-        if dense_mla_dcp_graph:
+        if self.dense_mla_dcp_target:
             cycle_size = self.page_size * self.dcp_size
             max_local_context_len = (
                 graph_context_len // cycle_size * self.page_size
@@ -1104,7 +1102,6 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
-        dense_mla_dcp_graph = self.dense_mla_dcp_target
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1164,14 +1161,14 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
         effective_seq_lens = seq_lens[:bs]
-        if dense_mla_dcp_graph:
+        if self.dense_mla_dcp_target:
             effective_seq_lens = effective_seq_lens.to(torch.int64)
         if forward_mode.is_target_verify():
             effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
 
-        if dense_mla_dcp_graph:
+        if self.dense_mla_dcp_target:
             cycle_size = self.page_size * self.dcp_size
             max_local_len = max_len // cycle_size * self.page_size + min(
                 self.page_size,
@@ -2824,10 +2821,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        dense_mla_dcp_target_verify = (
-            self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify()
-        )
-        if dense_mla_dcp_target_verify:
+        if self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify():
             # Keep the full query shape, including graph padding rows.
             num_tokens = q.shape[0]
             query_len = int(forward_batch.spec_info.draft_token_num)
