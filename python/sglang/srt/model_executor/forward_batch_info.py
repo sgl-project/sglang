@@ -785,6 +785,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the paged pool.
     npu_dcp_extend_gather: Optional[DcpExtendGatherPlan] = None
     npu_dcp_extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Whether that extend may drop the operator's causal crop; cached by
+    # `dcp_crop_free_extend` for the forward.
+    npu_dcp_crop_free: Optional[bool] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
