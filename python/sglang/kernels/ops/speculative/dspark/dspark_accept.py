@@ -276,6 +276,11 @@ except ImportError:
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        logits = kwargs.get("logits", args[0] if args else None)
+        if _is_npu and logits.device.type == "npu":
+            from sglang.kernels.ops.sampling.renorm import softmax_temp_triton
+
+            return softmax_temp_triton(*args, **kwargs)
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
@@ -682,6 +687,16 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
+    if (
+        _is_npu
+        and logits.device.type == "npu"
+        and logits.ndim == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+    ):
+        from sglang.kernels.ops.sampling.renorm import row_argmax
+
+        return row_argmax(logits)
     # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
     # off the memory the reduction touches. The fused kernel does not reproduce
     # torch.argmax's NaN selection, hence the opt-in.

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.sampling.renorm import markov_sample_step
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
@@ -28,15 +29,8 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils.common import is_npu, is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
-
-if is_npu():
-    from sgl_kernel_npu.sample import markov_sample_step
-else:
-    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
-
-    markov_sample_step = MarkovSampleStep.execute
 
 if TYPE_CHECKING:
     from sglang.srt.models.dspark import BaseDSparkMarkovHead
