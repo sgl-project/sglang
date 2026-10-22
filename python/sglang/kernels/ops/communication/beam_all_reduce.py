@@ -14,22 +14,29 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _module(world_size: int, hidden_size: int, topk: int):
+def _module(world_size: int, hidden_size: int, cluster: int, topk: int):
     return load_jit(
         "beam_all_reduce_norm",
         str(world_size),
         str(hidden_size),
+        str(cluster),
         str(topk),
         cuda_files=["distributed/beam_all_reduce.cuh"],
         cuda_wrappers=[
             (
                 "run",
-                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {topk}>::run",
+                f"BeamAllReduceNorm<{world_size}, {hidden_size}, {cluster}, {topk}>::run",
             )
         ],
         # Round every multiply and add separately, as the unfused norm does.
         extra_cuda_cflags=["--fmad=false"],
     )
+
+
+def _cluster_size(world_size: int, rows: int) -> int:
+    # Measured on 8xH200: 5-CTA clusters are faster at TP8 up to 16 rows; one CTA
+    # per row is faster at TP2 and TP4.
+    return 5 if world_size == 8 and rows <= 16 else 1
 
 
 def beam_all_reduce_norm(
@@ -60,7 +67,12 @@ def beam_all_reduce_norm(
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual) if next_weight is not None else None
     if branch.shape[0]:
-        _module(comm.world_size, branch.shape[-1], topk).run(
+        _module(
+            comm.world_size,
+            branch.shape[-1],
+            _cluster_size(comm.world_size, branch.shape[0]),
+            topk,
+        ).run(
             comm,
             branch,
             residual,
