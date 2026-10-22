@@ -443,11 +443,6 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
@@ -747,7 +742,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,
-                ctx=ctx,
+                is_ref2va=ctx.is_ref2va,
+                latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
                 server_args=server_args,
                 device=device,
             )
@@ -1049,7 +1045,8 @@ def _maybe_prepare_vsa_h3_step_metadata(
     *,
     model: Any,
     packed: Mapping[str, torch.Tensor],
-    ctx: _FullLoopContext,
+    is_ref2va: bool,
+    latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
@@ -1061,7 +1058,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
-    if ctx.is_ref2va:
+    if is_ref2va:
         raise NotImplementedError(
             "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
             "reference-block layout is not tiled yet. Use --attention-backend "
@@ -1102,7 +1099,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     def build(step_index: int):
         return builder.build(
             current_timestep=step_index,
-            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            raw_latent_shape=latent_shape,
             patch_size=patch_size,
             VSA_sparsity=sparsity,
             prefix_segments=(text_len, cond_rows, audio_rows),

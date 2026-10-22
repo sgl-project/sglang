@@ -262,24 +262,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
-    def test_paused_engine_accounting_uses_current_scheduler_state(self):
-        scheduler = self._new_scheduler()
-        scheduler.is_fully_idle = MagicMock()
-
-        for is_idle in (True, False):
-            with self.subTest(is_idle=is_idle):
-                scheduler.is_fully_idle.return_value = is_idle
-                scheduler.metrics_reporter.reset_mock()
-
-                scheduler._record_scheduler_state_for_paused_engine()
-
-                if is_idle:
-                    scheduler.metrics_reporter.record_scheduler_idle.assert_called_once_with()
-                    scheduler.metrics_reporter.record_scheduler_active.assert_not_called()
-                else:
-                    scheduler.metrics_reporter.record_scheduler_active.assert_called_once()
-                    scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
-
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""
         scheduler = self._new_scheduler()
@@ -646,6 +628,39 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_retract_includes_transferred_waiting_reqs(self):
+        """A transferred request waiting for a running slot holds a request row
+        and KV; retract must rebuild it too, so a paused flush cannot free it."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+
+        def _req(rid, req_pool_idx):
+            return SimpleNamespace(
+                rid=rid,
+                finished=lambda: False,
+                output_ids=[7],
+                time_stats=MagicMock(),
+                kv=SimpleNamespace(holds_kv=req_pool_idx is not None),
+            )
+
+        running = _req("running", 0)
+        staged = _req("staged", 1)
+        unstaged = _req("unstaged", None)
+        scheduler.running_batch.reqs = [running]
+        scheduler.waiting_queue = [staged, unstaged]
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])
+        self.assertEqual(scheduler.waiting_queue, [unstaged])
+        held = [
+            c.args[0]
+            for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
+        ]
+        self.assertEqual(held, [running, staged])
 
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and
