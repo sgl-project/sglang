@@ -697,12 +697,13 @@ class MultiTokenizerRouter:
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
-                # ranks internally). Skip for abort mode which drains via polling.
-                if not (
-                    isinstance(recv_obj, PauseGenerationReqInput)
-                    and recv_obj.mode == "abort"
-                ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
+                # ranks internally). Abort mode must reach the scheduler too:
+                # with multiple tokenizer workers, a request can slip past a
+                # worker's pause gate while the pause is being broadcast, and
+                # only the scheduler's pending-abort gate can guarantee such a
+                # late request is aborted instead of being scheduled against
+                # the KV-cache release that follows the pause.
+                await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
             await async_sock_send(self.send_to_scheduler, recv_obj)
@@ -881,7 +882,10 @@ class TokenizerWorker(TokenizerManager):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
-        # (router also handles forwarding to scheduler for non-abort modes)
+        # (the router also forwards the pause to the scheduler, which parks
+        # the engine once every in-flight request has drained; this poll only
+        # waits for the originator's own in-flight requests to finish their
+        # aborts).
         self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 

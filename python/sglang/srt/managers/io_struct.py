@@ -1928,6 +1928,12 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
     abort: Abort and return all requests currently being processed.
+            The scheduler also parks once every in-flight request has drained
+            (a request that slips past a tokenizer worker's pause gate — only
+            possible with --tokenizer-worker-num > 1 — is aborted instead of
+            being scheduled), so the KV-cache release / weight update that
+            follows the pause cannot race a late request. Generation resumes
+            after continue_generation.
 
     in_place: Pause the scheduler's event_loop from performing inference;
             only non-inference requests (e.g., control commands) will be handled.
