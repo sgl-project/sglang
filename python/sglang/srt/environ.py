@@ -1101,6 +1101,10 @@ class Envs:
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
+    # GLM-5.3-Flash on CUDA: quantize the checkpoint's BF16 KDA projections to FP8
+    # on load (per-channel weights, per-token activations). Any of o_proj and the
+    # fused input projection qkv_proj, f_a_proj, g_a_proj (together; b_proj rides along).
+    SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES = EnvTuple(tuple())
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
     # since the block-scale MoE kernel lacks SwiGLU-OAI
@@ -1113,7 +1117,7 @@ class Envs:
     # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
     # default CUTLASS path. Only takes effect on a GPU with a matching
     # dtype=fp8_w8a8_channelwise config JSON under
-    # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
+    # kernels/ops/gemm/configs/ (currently L40S and H200), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
