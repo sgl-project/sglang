@@ -330,6 +330,14 @@ class AscendOpsDispatcher(BaseDispatcher):
         if _debug_rank0():
             valid = int(expert_token_nums.sum())
             row_amax = expand_x.float().abs().amax(dim=1)
+            deq = ""
+            if dynamic_scales.dim() == 1:
+                # Reconstruct the dispatched values from the int8 payload and its
+                # per-token scale: valid rows must recover the input magnitude.
+                deq_row_amax = (
+                    expand_x.float() * dynamic_scales.float().unsqueeze(1)
+                ).abs().amax(dim=1)
+                deq = f"deq_row_amax={deq_row_amax[:8].tolist()} "
             print(
                 f"[ascend_ops dispatch] {self._dispatch_path} "
                 f"tokens={num_tokens} padded={padded_bs} qmode={quant_mode} "
@@ -337,6 +345,7 @@ class AscendOpsDispatcher(BaseDispatcher):
                 f"{hidden_states.float().abs().amax(dim=1)[:8].tolist()} "
                 f"etoks={expert_token_nums.tolist()} "
                 f"expand_x={tuple(expand_x.shape)}:{expand_x.dtype} "
+                f"{deq}"
                 f"row_amax={row_amax[:24].tolist()} "
                 f"scales={dynamic_scales[:24].tolist()}",
                 flush=True,

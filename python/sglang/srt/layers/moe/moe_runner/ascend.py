@@ -84,6 +84,39 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
 )
 
+_DEBUG_STAGES: set = set()
+
+
+def _debug_tensor(
+    name: str, t: Optional[torch.Tensor], expert_tokens: torch.Tensor
+) -> None:
+    """Print one tensor stage of the first MoE layer on global rank 0.
+
+    ``SGLANG_ASCEND_OPS_DEBUG`` is shared with the dispatcher diagnostics. Each
+    stage prints at most once per process, so the whole run costs a handful of
+    device syncs instead of one per layer (which is enough to trip the HCCL
+    execute timeout across 61 layers).
+    """
+    if t is None or not envs.SGLANG_ASCEND_OPS_DEBUG.get():
+        return
+    if name in _DEBUG_STAGES:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    _DEBUG_STAGES.add(name)
+
+    rows = int(expert_tokens.sum())
+    x = t.float()
+    amax = x.abs().amax(dim=1) if x.dim() > 1 else x.abs()
+    print(
+        f"[ascend_ops runner] {name} {tuple(t.shape)}:{t.dtype} "
+        f"valid_rows={rows} row_amax={amax[:8].tolist()} "
+        f"head={x.flatten()[:8].tolist()}",
+        flush=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
@@ -222,6 +255,9 @@ class AscendRunnerCore(MoeRunnerCore):
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
+        _debug_tensor("w13_in", x, expert_tokens)
+        _debug_tensor("w13_in_scale", runner_input.hidden_states_scale, expert_tokens)
+
         w13_kernel = self.config.layer.w13_kernel
 
         if _uses_fused_gmm1(w13_kernel, self.config):
@@ -246,6 +282,7 @@ class AscendRunnerCore(MoeRunnerCore):
                 weight_prefix="w13",
                 group_list_type=group_list_type,
             )
+            _debug_tensor("w13_out", hidden_states, expert_tokens)
 
             # --- Activation ---
             # Grouped-row activations require dispatch metadata.
@@ -268,6 +305,9 @@ class AscendRunnerCore(MoeRunnerCore):
                     hidden_states
                 )
 
+        _debug_tensor("act_out", hidden_states, expert_tokens)
+        _debug_tensor("act_scale", pertoken_scale, expert_tokens)
+
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
@@ -278,6 +318,7 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
+        _debug_tensor("w2_out", hidden_states, expert_tokens)
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
