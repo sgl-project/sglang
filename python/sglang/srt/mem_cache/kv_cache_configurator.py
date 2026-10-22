@@ -97,6 +97,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
 from sglang.srt.runtime_context import (
     attention_backends,
+    draft_attn_tp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -1143,7 +1144,11 @@ class KVCacheConfigurator:
         profile = draft_kv_profile(
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
-            attn_tp_size=get_parallel().attn_tp_size,
+            attn_tp_size=(
+                draft_attn_tp_size()
+                if self.spec_algorithm.is_dflash()
+                else get_parallel().attn_tp_size
+            ),
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
@@ -2630,6 +2635,8 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         # DCP allocation is in the global virtual loc space.
                         # The target attention path localizes these locs when
