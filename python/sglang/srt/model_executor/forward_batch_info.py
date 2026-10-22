@@ -1299,6 +1299,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         token_type_ids gates on presence, not is_prefill_only: a missing
         tensor makes bert/roberta silently fall back to zeros.
         """
+        if self.forward_mode.is_extend() and any(
+            r.bidir_prefix_len >= 0 for r in batch.reqs
+        ):
+            self.bidir_prefix_lens = [r.bidir_prefix_len for r in batch.reqs]
         if self.is_prefill_only:
             if batch.model_config.is_matryoshka and any(
                 r.dimensions is not None for r in batch.reqs
@@ -1337,9 +1341,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
                     for r in batch.reqs
                 ]
-
-            if any(r.bidir_prefix_len >= 0 for r in batch.reqs):
-                self.bidir_prefix_lens = [r.bidir_prefix_len for r in batch.reqs]
 
             if any(r.decision_layout is not None for r in batch.reqs):
                 self.decision_layouts = [r.decision_layout for r in batch.reqs]
