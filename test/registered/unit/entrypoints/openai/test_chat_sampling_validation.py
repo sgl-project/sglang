@@ -71,7 +71,11 @@ class TestChatSamplingValidation(CustomTestCase):
 
     def test_invalid_sampling_bounds_return_400(self):
         """Out-of-range requests previously passed validation and reached serving."""
-        for field, values in (("n", (-1, 0, MAX_N + 1)),):
+        for field, values in (
+            ("n", (-1, 0, MAX_N + 1)),
+            ("top_logprobs", (-1,)),
+            ("temperature", (-0.1,)),
+        ):
             for value in values:
                 with self.subTest(field=field, value=value):
                     response = self._post(**{field: value}, logprobs=True)
@@ -86,6 +90,42 @@ class TestChatSamplingValidation(CustomTestCase):
                     response.json(),
                     {"n": n, "top_logprobs": top_logprobs, "temperature": None},
                 )
+
+    def test_temperature_boundaries_and_defaults_are_accepted(self):
+        for params in (
+            {"temperature": None},
+            {"temperature": 0.0},
+        ):
+            with self.subTest(params=params):
+                response = self._post(**params)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["temperature"], params.get("temperature")
+                )
+
+    def test_temperature_infinity_returns_400(self):
+        """An infinite temperature must be rejected now that temperature has no cap."""
+        response = self.client.post(
+            "/v1/chat/completions",
+            content=(
+                '{"model":"test-model",'
+                '"messages":[{"role":"user","content":"Hello"}],'
+                '"temperature":Infinity}'
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self._assert_validation_error(response, "temperature")
+
+    def test_openai_limits_are_deliberately_not_enforced(self):
+        """The engine applies these values as expected, so they must not 400."""
+        for params in (
+            {"temperature": 3.0},
+            {"logprobs": True, "top_logprobs": 50},
+            {"top_logprobs": 3},
+            {"logit_bias": {"1": -1000, "2": 1e4}},
+        ):
+            with self.subTest(params=params):
+                self.assertEqual(self._post(**params).status_code, 200)
 
 
 if __name__ == "__main__":

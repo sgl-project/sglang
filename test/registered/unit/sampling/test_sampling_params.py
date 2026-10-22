@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import msgspec
 
 from sglang.srt.sampling.sampling_params import (
+    LOGIT_BIAS_ABS_MAX,
     MAX_LEN,
     MAX_N,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
@@ -321,11 +322,65 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_logit_bias_token_id_at_vocab_size_raises(self):
+        """The first id past the vocabulary must be rejected, not the last one."""
+        with self.assertRaises(ValueError):
+            self._make(logit_bias={str(self.VOCAB_SIZE): 1.0}).verify(self.VOCAB_SIZE)
+
     def test_logit_bias_valid_tokens(self):
         """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    def test_logit_bias_value_types(self):
+        """Non-finite, non-numeric and bool bias values must fail admission."""
+        for value in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "abc",
+            None,
+            True,
+            1 << 2000,
+            -(1 << 2000),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_native_range_is_not_capped(self):
+        """Native /generate accepts any finite bias; only OpenAI requests cap it.
+
+        An int bias is a valid JSON number, so the type guard must not narrow to
+        float.
+        """
+        self._make(logit_bias={"0": -1e4, "1": 5, "31999": 1e4}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_beyond_overflow_bound_is_rejected(self):
+        """A bias that overflows after the temperature division must fail admission."""
+        for value in (1e39, -1e39, 3e38, 1.1 * LOGIT_BIAS_ABS_MAX):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+        self._make(
+            logit_bias={"0": LOGIT_BIAS_ABS_MAX, "1": -LOGIT_BIAS_ABS_MAX}
+        ).verify(self.VOCAB_SIZE)
+
+    def test_stop_token_id_bounds(self):
+        """Invalid native stop IDs must fail before minimum-token penalization."""
+        for min_new_tokens in (0, 1):
+            for token_id in (-1, self.VOCAB_SIZE, self.VOCAB_SIZE + 1):
+                with self.subTest(min_new_tokens=min_new_tokens, token_id=token_id):
+                    with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+                        self._make(
+                            stop_token_ids=[token_id], min_new_tokens=min_new_tokens
+                        ).verify(self.VOCAB_SIZE)
+
+        self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1], min_new_tokens=1).verify(
+            self.VOCAB_SIZE
+        )
+
+    # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""
         self._make(sampling_seed=None).verify(self.VOCAB_SIZE)

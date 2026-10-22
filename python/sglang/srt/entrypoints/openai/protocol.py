@@ -875,9 +875,12 @@ class ChatCompletionRequest(PDRoutingFields):
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
     )
     frequency_penalty: float = 0.0
+    # NOTE: OpenAI limits (temperature <= 2, top_logprobs <= 20, logit_bias in
+    # [-100, 100], top_logprobs requires logprobs) are deliberately not enforced:
+    # SGLang applies these values correctly and existing clients rely on that.
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
-    top_logprobs: Optional[int] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
@@ -895,7 +898,7 @@ class ChatCompletionRequest(PDRoutingFields):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])

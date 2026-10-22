@@ -37,7 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
-from sglang.srt.sampling.sampling_params import MAX_N
+from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -508,6 +508,19 @@ class TestChatCompletionRequest(unittest.TestCase):
             renderer_handles_response_format=True,
         )
         self.assertNotIn("json_schema", sampling_params)
+
+    def test_chat_stop_token_id_bounds_are_validated(self):
+        """Chat stop_token_ids must reach SamplingParams validation."""
+        for token_id in (-1, 32, 33):
+            with self.subTest(token_id=token_id):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stop_token_ids=[token_id],
+                    min_tokens=1,
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+                    sampling_params.verify(vocab_size=32)
 
 
 class TestAudioContentParts(unittest.TestCase):

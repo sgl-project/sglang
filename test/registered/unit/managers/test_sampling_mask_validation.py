@@ -44,6 +44,31 @@ class TestSamplingMaskValidation(CustomTestCase):
         )
         self.manager._validate_one_request(req, req.input_ids)
 
+    def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
+        """A malformed or oversized candidate count must not reach the scheduler."""
+        self.manager.model_config.vocab_size = 32
+        for top_logprobs_num, return_logprob, accepted in (
+            (None, True, True),
+            (0, True, True),
+            (32, True, True),
+            (33, True, False),
+            (-3, True, False),
+            ([33], True, False),
+            (33, False, True),
+        ):
+            with self.subTest(top_logprobs_num=top_logprobs_num, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    top_logprobs_num=top_logprobs_num,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "top_logprobs"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):
             def __call__(self, logits, custom_param_list=None):
