@@ -40,6 +40,8 @@ def _install_comfy_stubs() -> None:
     comfy_api.input = comfy_api_input
     sys.modules.setdefault("comfy_api", comfy_api)
     sys.modules.setdefault("comfy_api.input", comfy_api_input)
+    # Fake mp4s cannot be probed: force the SGLDVideoInput fallback.
+    sys.modules["comfy_api.input_impl"] = None
 
     comfy = types.ModuleType("comfy")
     comfy.model_detection = types.ModuleType("comfy.model_detection")
@@ -55,28 +57,11 @@ def _install_comfy_stubs() -> None:
         setattr(comfy_utils, name, lambda *a, **k: None)
     comfy.utils = comfy_utils
 
-    class InterruptProcessingException(Exception):
-        pass
-
-    def throw_exception_if_processing_interrupted():
-        if comfy.model_management.interrupted:
-            raise InterruptProcessingException()
-
-    comfy.model_management.interrupted = False
-    comfy.model_management.InterruptProcessingException = InterruptProcessingException
-    comfy.model_management.throw_exception_if_processing_interrupted = (
-        throw_exception_if_processing_interrupted
+    comfy_utils.ProgressBar = mock.Mock
+    comfy.model_management.throw_exception_if_processing_interrupted = lambda: None
+    comfy.model_management.InterruptProcessingException = type(
+        "InterruptProcessingException", (Exception,), {}
     )
-
-    class ProgressBar:
-        def __init__(self, total):
-            self.values = []
-            comfy_utils.last_progress_bar = self
-
-        def update_absolute(self, value, total=None, preview=None):
-            self.values.append(value)
-
-    comfy_utils.ProgressBar = ProgressBar
 
     comfy_model_patcher = types.ModuleType("comfy.model_patcher")
 
@@ -409,20 +394,17 @@ def test_video_node_uses_resolved_size_and_comfy_progress_and_cancel():
         captured.update(kwargs)
         return {"file_path": "/tmp/x.mp4", "size": "1280x704"}
 
-    with mock.patch.object(client, "generate_video", fake_generate_video):
+    with (
+        mock.patch.object(client, "generate_video", fake_generate_video),
+        mock.patch.object(NODES.comfy.utils, "ProgressBar") as pbar,
+    ):
         video, _ = NODES.SGLDiffusionGenerateVideo().generate_video(
             sgld_client=client, positive_prompt="a cat", width=1280, height=720
         )
     assert video.get_dimensions() == (1280, 704)
-    captured["progress_callback"](55)
-    assert sys.modules["comfy.utils"].last_progress_bar.values == [55]
-    mm = sys.modules["comfy.model_management"]
-    mm.interrupted = True
-    try:
-        with pytest.raises(mm.InterruptProcessingException):
-            captured["check_interrupt"]()
-    finally:
-        mm.interrupted = False
+    mm = NODES.comfy.model_management
+    assert captured["check_interrupt"] is mm.throw_exception_if_processing_interrupted
+    assert captured["progress_callback"] is pbar.return_value.update_absolute
 
 
 def _capture_video_request(**kwargs):
