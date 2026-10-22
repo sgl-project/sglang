@@ -12,7 +12,9 @@ const run = new (Object.getPrototypeOf(async function () {}).constructor)(
   'github', 'context', 'core', 'process', 'require', script,
 );
 
-async function check({ snapshot = [], live = [], lint = 'success', event = 'pull_request' } = {}) {
+async function check({
+  snapshot = [], live = [], lint = 'success', event = 'pull_request', jobsError, warnings = [],
+} = {}) {
   const failures = [];
   let labelReads = 0;
   let jobReads = 0;
@@ -35,6 +37,7 @@ async function check({ snapshot = [], live = [], lint = 'success', event = 'pull
     },
     paginate: async () => {
       jobReads++;
+      if (jobsError) throw jobsError;
       return [{ name: 'model-test', status: 'completed', conclusion: 'failure', steps: [] }];
     },
   };
@@ -43,7 +46,8 @@ async function check({ snapshot = [], live = [], lint = 'success', event = 'pull
     payload: event === 'pull_request'
       ? { pull_request: { number: 42, head: { sha: 'head' }, labels: labels(snapshot) } }
       : {},
-  }, { info: () => {}, setFailed: message => failures.push(message) },
+  }, { info: () => {}, warning: message => warnings.push(message),
+       setFailed: message => failures.push(message) },
      { env: { GITHUB_WORKSPACE: WORKSPACE } }, require);
   return { failures, labelReads, jobReads };
 }
@@ -73,4 +77,12 @@ test('non-PR events retain associated-PR label lookup', async () => {
 test('scheduled runs remain exempt', async () => {
   assert.deepEqual(await check({ event: 'schedule' }),
     { failures: [], labelReads: 0, jobReads: 0 });
+});
+
+test('a jobs-list 502 after retries warns and runs the shard', async () => {
+  const warnings = [];
+  const jobsError = Object.assign(new Error('Server Error'), { status: 502 });
+  assert.deepEqual(await check({ jobsError, warnings }),
+    { failures: [], labelReads: 1, jobReads: 1 });
+  assert.match(warnings[0], /after 3 retries \(HTTP 502: Server Error\)/);
 });
