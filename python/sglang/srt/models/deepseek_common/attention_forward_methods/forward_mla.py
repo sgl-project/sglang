@@ -55,6 +55,7 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
     is_in_prefill_graph_scope,
@@ -98,10 +99,9 @@ def bcg_dcp_extend_kv_gather(
     k_pe: torch.Tensor,
 ) -> None:
     """Assemble the DCP extend KV buffer; an eager break under breakable graphs.
-    Reads the live batch from the forward context: replay re-supplies the capture-time arg."""
-    context = get_tc_piecewise_forward_context()
-    if context is not None:
-        forward_batch = context.forward_batch
+    Under a prefill graph, read the live batch: replay re-supplies the capture-time arg."""
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
     if metadata.dcp_extend_prefix_lens_sum == 0:
         # No prefix KV on any DCP rank: skip the collective.

@@ -20,9 +20,8 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    set_tc_piecewise_forward_context,
-)
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -70,6 +69,7 @@ def _runner(dcp_active):
     runner.max_num_tokens = 32
     runner.capture_num_tokens = [8]
     runner.max_context_size = None
+    runner.max_seq_len = None
     runner.backend = SimpleNamespace()
     runner.prefill_backend_name = Backend.BREAKABLE
     runner.has_mha_companion_layers = False
@@ -108,7 +108,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
                 get_kv_buffer_shape=lambda: (torch.Size([64, 1, 6]), None)
             ),
             init_forward_metadata=lambda batch: None,
-            prepare_prefill_shared_read_snapshot=lambda batch, num_qo_tokens: None,
+            resolve_prefill_shared_read_ends=lambda batch, **kwargs: None,
         )
         runner.model_runner = SimpleNamespace(
             attn_backend=attn_backend,
@@ -139,13 +139,7 @@ class TestDcpExtendGatherBreak(unittest.TestCase):
         live_batch.attn_dcp_metadata = _metadata(8)
         k_nope = torch.ones((8, 1, KV_LORA_RANK))
         k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
-        with set_tc_piecewise_forward_context(
-            live_batch,
-            attention_layers=[],
-            quant_config=None,
-            moe_layers=[],
-            moe_fusions=[],
-        ):
+        with set_forward_batch(live_batch), prefill_graph_scope(full_graph=False):
             # Replay re-supplies the capture-time batch as the argument.
             bcg_dcp_extend_kv_gather(
                 None, None, capture_batch, KV_LORA_RANK, k_nope, k_pe
