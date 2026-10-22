@@ -320,7 +320,7 @@ Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 Pruned BF16 / FP8 files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
 are the usual loader inputs. GGUF goes in `SGLDOptions.transformer_weights_path`.
 On a 24 GB card put the 32B CLIP on CPU and enable DiT layerwise offload; use
-`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT.
+`convrot_int8` or GGUF rather than the full unpruned BF16 DiT.
 
 ### Singularity hybrid weights
 
@@ -2189,10 +2189,10 @@ Same card, 50-step run. Speedup is vs BF16+FA. PSNR is vs same-tree INT8+FA (Spe
 | Config | e2e | vs BF16+FA | PSNR mean / min |
 | --- | ---: | ---: | ---: |
 | BF16 + FlashAttention | 1008.6 s | 1.00× | — |
-| `kitchen_int8` + FA | 718.5 s | 1.40× | — |
-| `kitchen_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
-| `kitchen_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
-| `kitchen_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
+| `convrot_int8` + FA | 718.5 s | 1.40× | — |
+| `convrot_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
+| `convrot_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
+| `convrot_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
 
 Prefer FA + `11 / 5 / 1.0` when the bar is FA-like. Sage / hybrid + Spectrum is faster; quality then follows the attention backend, not the skip schedule.
 

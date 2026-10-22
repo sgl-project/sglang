@@ -1320,7 +1320,7 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
         arguments.pipeline_config.dit_config.arch_config.qkv_checkpoint_grouped is False
     )
     assert all(not parameter.requires_grad for parameter in loaded.parameters())
-    arguments.quantization = "kitchen_int8"
+    arguments.quantization = "convrot_int8"
     with pytest.raises(ValueError, match="per-layer metadata"):
         spec.load_comfyui_transformer(pipeline, arguments)
     arguments.quantization = None
