@@ -267,13 +267,18 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
+@functools.lru_cache(maxsize=None)
+def _split_kv_min_topk() -> int:
+    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
+
+    return SPLIT_KV_MIN_TOPK
+
+
 def _flashmla_v41_splits_kv(
     indices: torch.Tensor, extra_indices: Optional[torch.Tensor]
 ) -> bool:
-    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
-
     extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
-    return indices.shape[-1] + extra_topk >= SPLIT_KV_MIN_TOPK
+    return indices.shape[-1] + extra_topk >= _split_kv_min_topk()
 
 
 def _low_ratio_source_projections(
@@ -1389,6 +1394,19 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_state_slot_offset=online_c128_state_slot_offset,
+        )
+
+    @functools.cached_property
+    def _swa_interleaved(self) -> bool:
+        return self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+
+    @functools.cached_property
+    def _flash_mla_with_kvcache(self):
+        from sglang.kernels.ops.attention import flash_mla_interface
+
+        return functools.partial(
+            flash_mla_interface.flash_mla_with_kvcache,
+            use_legacy=not self._swa_interleaved,
         )
 
     def init_forward_metadata_indexer(
@@ -4135,19 +4153,13 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                interleaved = token_to_kv_pool.get_swa_key_layout().is_interleaved
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
-                    from sglang.kernels.ops.attention import flash_mla_interface
-
-                    flash_mla_with_kvcache = functools.partial(
-                        flash_mla_interface.flash_mla_with_kvcache,
-                        use_legacy=not interleaved,
-                    )
+                    flash_mla_with_kvcache = self._flash_mla_with_kvcache
 
                 if self.is_dsv41 and (
-                    not interleaved
+                    not self._swa_interleaved
                     or _flashmla_v41_splits_kv(swa_page_indices, extra_indices)
                 ):
                     _maybe_precompute_flashmla_sched_meta(
