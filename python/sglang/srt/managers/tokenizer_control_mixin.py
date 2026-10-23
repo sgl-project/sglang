@@ -976,7 +976,6 @@ class TokenizerControlMixin:
     async def get_hicache_l3_cache_layout(
         self: TokenizerManager,
     ) -> List[Dict[Any, Any]]:
-        """Collect external L3 layout envelopes from all DP schedulers."""
         self.auto_create_handle_loop()
         req = GetHiCacheL3LayoutReq()
         responses: List[

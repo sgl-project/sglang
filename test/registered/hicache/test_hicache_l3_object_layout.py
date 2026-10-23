@@ -112,7 +112,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         return scheduler
 
     def test_physical_primary_and_components_match_actual_write_keys(self):
-        """Primary KV and SWA/Mamba objects must not disappear from the router view."""
         store = self._store(registered=(PoolName.SWA, PoolName.MAMBA, PoolName.INDEXER))
         store.mem_pool_host = self._host_pool()
         mamba = store.registered_pools[PoolName.MAMBA]
@@ -170,7 +169,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
 
     def test_handler_and_startup_share_enabled_and_disabled_envelopes(self):
-        """Calling the real handler must serialize both availability branches."""
         store = self._store(registered=(PoolName.SWA,))
         for hierarchical, backend, pp_size, mla in (
             (True, store, 1, True),
@@ -261,7 +259,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 self.assertIn("window", layout["reason"])
 
     def test_draft_swa_rank_sharding_is_independent_of_mla_primary(self):
-        """An MLA primary must not advertise rank-sharded draft SWA as global."""
         for pool_type, enabled, suffixes in (
             (
                 MHATokenToKVPoolHost,
@@ -366,7 +363,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         self.assertEqual([entry["pool"] for entry in pools], ["deepseek_v4_c4"])
 
     def test_current_dsv4_pools_match_registered_write_objects(self):
-        """New compressed, rope and scale pools must survive layout discovery."""
         names = tuple(
             name for name in PoolName if name.value.startswith("deepseek_v4_")
         )
@@ -551,7 +547,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         return controller
 
     def test_process_replies_reach_parent_init_info(self):
-        """The process handshake must preserve all DP replies, not only server_info."""
         store = self._store(registered=(PoolName.INDEXER,))
         reply = self._scheduler(store).get_init_info()
         controller = self._controller(dp_controller.DataParallelController)
@@ -608,7 +603,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
 
     def test_startup_aggregation_keeps_sources_and_prelaunched_pids(self):
-        """L3 propagation must not drop main's startup phases or local publishers."""
         controller = self._controller(dp_controller.DataParallelController)
         reply = self._scheduler(
             self._store(registered=(PoolName.INDEXER,))
@@ -738,7 +732,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         return controller.get_init_info()["hicache_object_layout"]
 
     def test_pp_stage_replies_merge_into_one_complete_layout(self):
-        """Each PP stage reports its own suffixes; the merge must cover all stages."""
         stages = (self._stage_store(0), self._stage_store(1))
         for replicas in (stages, stages * 2):
             with self.subTest(replies=len(replicas)):
@@ -753,7 +746,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
 
     def test_missing_or_conflicting_pp_stages_are_unavailable(self):
-        """A layout that cannot cover every stage must never be advertised."""
         layout = self._merged(self._stage_store(0))
         self.assertFalse(layout["enabled"])
         self.assertIn("Incomplete", layout["reason"])
@@ -835,7 +827,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         self.assertEqual(layout, startup)
 
     def test_ray_actor_replies_reach_engine_init_info(self):
-        """Ray actor replies must survive both controller and parent handshakes."""
         ray = ModuleType("ray")
         ray.remote = lambda cls: cls
         ray.get = lambda refs: refs

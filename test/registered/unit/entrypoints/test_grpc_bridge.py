@@ -176,7 +176,6 @@ class TestEngineStateNotifications(CustomTestCase):
 
 class TestServerInfoSchedulerFields(CustomTestCase):
     def test_scheduler_info_fields_reach_json_info(self):
-        # scheduler_info is spread into json_info, same as HTTP /server_info.
         handle = RuntimeHandle.__new__(RuntimeHandle)
         handle.tokenizer_manager = SimpleNamespace(
             server_args=ServerArgs(model_path="dummy"),
