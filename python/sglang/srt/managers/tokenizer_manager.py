@@ -1615,10 +1615,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            validate_positional_embed_overrides(
-                obj.positional_embed_overrides,
-                hidden_size=self.model_config.hidden_size,
-            )
+            if obj.positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    obj.positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
+                )
 
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
@@ -1676,10 +1677,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
-            validate_positional_embed_overrides(
-                positional_embed_overrides,
-                hidden_size=self.model_config.hidden_size,
-            )
+            if positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
+                )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text=input_text,
