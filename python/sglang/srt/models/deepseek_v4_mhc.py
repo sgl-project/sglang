@@ -30,14 +30,20 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -47,6 +53,34 @@ _is_xpu = is_xpu()
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
+FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
+
+
+def fused_mxfp8_rows(rows: int) -> bool:
+    """Batches the fused MXFP8 producers cover: decode and verify, and prefill
+    (a prefill graph captures with the extend flag cleared, so its scope counts)."""
+    fwd = get_forward()
+    if rows <= 0 or fwd.sp_active:
+        return False
+    if fwd.is_extend_in_batch or is_in_prefill_graph_scope():
+        return True
+    return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
+
+
+def empty_deepgemm_mxfp8_pair(
+    rows: int, cols: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
+    scales = create_per_token_group_quant_fp8_output_scale(
+        (rows, cols),
+        device,
+        32,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    return data, scales
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -100,10 +134,11 @@ class HcNormed(NamedTuple):
 
 
 class HcQuantized(NamedTuple):
-    """Normed, and already swizzled for the sublayer's first projection."""
+    """Normed, and already quantized for the sublayer's first projection."""
 
     rows: torch.Tensor
-    swizzled: Mxfp8SwizzledInput
+    # An Mxfp8SwizzledInput (FlashInfer 128x4) or a DeepGEMM-packed (fp8, scale) pair.
+    pair: Tuple[torch.Tensor, torch.Tensor]
 
 
 HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
@@ -203,6 +238,7 @@ class HcNextBoundary(NamedTuple):
     accepts_mxfp8: bool
     norm_fusable: bool
     hc: Optional[HcSubLayer] = None
+    accepts_mxfp8_deepgemm: bool = False
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -215,7 +251,11 @@ def is_deferred_finalize(routed) -> bool:
 
 
 def make_boundary(
-    norm: RMSNorm, *, accepts_mxfp8: bool, hc: Optional[HcSubLayer] = None
+    norm: RMSNorm,
+    *,
+    accepts_mxfp8: bool,
+    hc: Optional[HcSubLayer] = None,
+    accepts_mxfp8_deepgemm: bool = False,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -231,6 +271,7 @@ def make_boundary(
             and norm.weight.is_contiguous()
         ),
         hc=hc,
+        accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
     )
 
 
@@ -394,8 +435,8 @@ def combine(
     whatever the previous post left in ``state.input``."""
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
-        assert quantized is not None
-        quantized.append(shortcut.swizzled)
+        if quantized is not None:
+            quantized.append(shortcut.pair)
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
         return shortcut.rows
@@ -617,6 +658,9 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
+        y_fp8 = y_sf = None
+        if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
+            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
         updated, normalized, stats = mhc_mega_boundary(
             y,
             residual,
@@ -631,7 +675,11 @@ def _post_fusion(
             next_hc.cfg.eps,
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
+            y_fp8=y_fp8,
+            y_gemm_sf=y_sf,
         )
+        if y_fp8 is not None:
+            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

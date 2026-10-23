@@ -204,6 +204,7 @@ def create_unified_radix_cache(
             register_layer_transfer_counter=(
                 ctx.tp_worker.register_hicache_layer_transfer_counter
             ),
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         cache.attach_cache_linker(
             get_memory().unified_cache_external_linker_backend,

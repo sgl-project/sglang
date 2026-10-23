@@ -62,6 +62,7 @@ class CacheLinkerAttachment:
         server_args: Any,
         params: CacheInitParams,
         register_layer_transfer_counter: Callable[[Optional[object]], None],
+        forward_stream: Optional[torch.cuda.Stream] = None,
     ):
         self._cache = cache
         self._server_args = server_args
@@ -69,6 +70,7 @@ class CacheLinkerAttachment:
         self._kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         # The forward worker's load-consumer hook, wired beside the KV pool's.
         self._register_layer_transfer_counter = register_layer_transfer_counter
+        self._forward_stream = forward_stream
         self.storage_backend: Optional[str] = None
         self.storage_backend_extra_config: Optional[str] = None
 
@@ -96,6 +98,7 @@ class CacheLinkerAttachment:
                 self._params,
                 components=set(cache.components),
                 storage_backend_extra_config=storage_backend_extra_config,
+                forward_stream=self._forward_stream,
             )
         except Exception as e:
             logger.exception("Failed to build the %s external linker.", storage_backend)

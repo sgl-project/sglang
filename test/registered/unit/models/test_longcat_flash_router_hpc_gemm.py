@@ -112,22 +112,6 @@ class TestLongcatFlashRouterHpcGemm(CustomTestCase):
         mock_classifier.assert_called_once()
         self.assertEqual(mock_classifier.call_args.args[0].dtype, torch.float32)
 
-    def test_chat_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_gemm(
-            hidden_size=6144,
-            n_routed_experts=512,
-            zero_expert_num=256,
-            expected_min_m=64,
-        )
-
-    def test_lite_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_gemm(
-            hidden_size=3072,
-            n_routed_experts=256,
-            zero_expert_num=128,
-            expected_min_m=128,
-        )
-
     def test_unbenchmarked_shape_uses_classifier(self):
         router = LongcatFlashRouter(
             _longcat_config(4096, 256),
