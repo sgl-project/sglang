@@ -34,24 +34,14 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 _TAG_BITS = 23
 _VAL_BITS = 40
 _TAG_MASK = (1 << _TAG_BITS) - 1
 _VAL_MASK = (1 << _VAL_BITS) - 1
-
-
-def edge_shm_sync_enabled() -> bool:
-    return os.environ.get("SGLANG_Q35MF_EDGE_SHM_SYNC", "0") == "1"
-
-
-def _multihost_enabled() -> bool:
-    return os.environ.get("SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST", "0") == "1"
-
-
-def _leader_tcp_enabled() -> bool:
-    return os.environ.get("SGLANG_Q35MF_EDGE_MULTIHOST_TCP", "0") == "1"
 
 
 class ShmTagExchange:
@@ -232,7 +222,11 @@ class HierTagExchange:
         )
         # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
         self.link = None
-        if self.is_leader and len(self.members) == 2 and _leader_tcp_enabled():
+        if (
+            self.is_leader
+            and len(self.members) == 2
+            and envs.SGLANG_Q35MF_EDGE_MULTIHOST_TCP.get()
+        ):
             self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
@@ -270,11 +264,11 @@ def get_shm_exchange(
     """Collective on first call per (group, kind): every rank of the group must call it
     at the same point. Returns None (stock path) when disabled, or when the group spans
     hosts and the caller did not opt in with multihost=True."""
-    if group is None or not edge_shm_sync_enabled():
+    if group is None:
         return None
     key = (id(group), kind)
     if key not in _EXCHANGES:
-        if dist.get_world_size(group) <= 1:
+        if not envs.SGLANG_Q35MF_EDGE_SHM_SYNC.get() or dist.get_world_size(group) <= 1:
             _EXCHANGES[key] = None
         else:
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -289,7 +283,7 @@ def get_shm_exchange(
                 )
             elif (
                 multihost
-                and _multihost_enabled()
+                and envs.SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST.get()
                 and dist.get_world_size() == dist.get_world_size(group)
             ):
                 # Only when this group is the whole default group, so the subgroup

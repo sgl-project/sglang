@@ -1499,6 +1499,13 @@ class Envs:
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(False)
+    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
+    # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
+    SGLANG_Q35MF_EDGE_SHM_SYNC = EnvBool(False)
+    # With SGLANG_Q35MF_EDGE_SHM_SYNC, a group across hosts exchanges per host and only
+    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
+    SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(False)
+    SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

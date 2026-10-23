@@ -1,6 +1,5 @@
 """Unit tests for srt/managers/scheduler_components/shm_tag_exchange.py."""
 
-import os
 import sys
 import unittest
 from contextlib import nullcontext
@@ -14,6 +13,7 @@ import torch
 import torch.distributed
 import torch.multiprocessing
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils import stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,7 +65,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     )
     try:
         with (
-            patch.dict(os.environ, {"SGLANG_Q35MF_EDGE_SHM_SYNC": "1"}),
+            envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True),
             # macOS caps POSIX shared-memory names at 30 bytes;
             # elsewhere keep the prefix the CI stale-shm sweep reclaims.
             (
