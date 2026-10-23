@@ -20,6 +20,37 @@ fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, ke
 }
 
 #[test]
+fn rotation_phase_counts_the_prefix_pages() {
+    let mut core = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    );
+    core.insert(&InsertParams {
+        rotation_base: Some(2),
+        ..insert_params(&vec![1, 2, 3], &[10, 11, 12])
+    });
+    let probe = vec![1, 2, 4, 5];
+    core.insert(&InsertParams {
+        rotation_base: Some(2),
+        ..insert_params(&probe, &[10, 11, 13, 14])
+    });
+
+    for (tokens, expected) in [(vec![1, 2], 2), (vec![1, 2, 3], 4), (probe.clone(), 4)] {
+        let node = core
+            .match_prefix(&match_params(&tokens))
+            .last_device_node_id;
+        assert_eq!(core.rotation_phase_of(node).unwrap(), Some(expected));
+    }
+    assert_eq!(
+        core.rotation_phase_of(core.root_node_handle(None)).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn component_size_adjustment_tracks_changed_backing_through_locks_and_eviction() {
     let mut core = core();
     let root = core.arena.root();
