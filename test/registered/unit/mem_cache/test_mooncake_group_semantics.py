@@ -79,6 +79,8 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.remove_all_calls = []
+            self.remove_all_result = 0
             self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
@@ -103,6 +105,13 @@ def _fake_store_class():
         def batch_is_exist(self, keys):
             self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
+
+        def remove_all(self, force=False):
+            self.remove_all_calls.append(force)
+            if force and self.remove_all_result >= 0:
+                self.objects.clear()
+                self.existing_keys.clear()
+            return self.remove_all_result
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -276,6 +285,33 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_clear_forces_mooncake_remove_all(self):
+        store, fake_store = _make_store(enable_group_semantics=False)
+        fake_store.objects["leased_page"] = b"kv"
+
+        store.clear()
+
+        self.assertEqual(fake_store.remove_all_calls, [True])
+        self.assertEqual(fake_store.objects, {})
+
+    def test_clear_accepts_positive_removed_count(self):
+        store, fake_store = _make_store(enable_group_semantics=False)
+        fake_store.objects["leased_page"] = b"kv"
+        fake_store.remove_all_result = 1
+
+        store.clear()
+
+        self.assertEqual(fake_store.objects, {})
+
+    def test_clear_propagates_mooncake_remove_all_failure(self):
+        store, fake_store = _make_store(enable_group_semantics=False)
+        fake_store.remove_all_result = -1
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Failed to clear Mooncake storage backend"
+        ):
+            store.clear()
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
