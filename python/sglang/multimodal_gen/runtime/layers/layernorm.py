@@ -521,6 +521,21 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
     def forward_cuda(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.forward_native(inputs)
 
+    def forward_npu(self, inputs: torch.Tensor) -> torch.Tensor:
+        device = inputs.device
+        weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
+        bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
+        # Use LayerNorm with autocast disabled to avoid explicit full-tensor FP32 conversions.
+        # It matches the accuracy and performance for bf16.
+        with torch.autocast(device_type=inputs.device.type, enabled=False):
+            return F.layer_norm(
+                inputs,
+                self.normalized_shape,
+                weight,
+                bias,
+                self.eps,
+            )
+
     def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
         def matches_input(param: torch.Tensor | None) -> bool:
             return param is None or (
