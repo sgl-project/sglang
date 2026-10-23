@@ -990,6 +990,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return {}
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
+        host_index_cache = {} if is_set and len(buffer_requests) > 1 else None
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,
@@ -1001,6 +1002,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if exist_result is not None
                     else None
                 ),
+                host_index_cache=host_index_cache,
             )
             all_ptrs.extend(pool_ptrs)
             all_sizes.extend(pool_sizes)
@@ -1050,6 +1052,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs: List[str],
         key_multiplier: int,
         exist_states: Optional[List[int]],
+        host_index_cache: Optional[dict[int, torch.Tensor]] = None,
     ) -> Tuple[List[Any], List[Any]]:
         # Only pages the store is missing need per-layer addresses. Zero
         # placeholders keep result and group offsets aligned for the rest.
@@ -1067,6 +1070,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ]
             if not missing_pages:
                 return [0] * len(key_strs), [0] * len(key_strs)
+            if host_index_cache is not None and isinstance(host_pool, DevicePoolEntry):
+                # Direct-linker physical pools often share one logical index
+                # tensor. Copy it only once for this offload, after the ready
+                # events, and only if a pool actually has missing pages.
+                # buffer_requests keeps the source tensors alive for this call.
+                identity = id(host_indices)
+                if identity not in host_index_cache:
+                    host_index_cache[identity] = host_indices.detach().to(
+                        device="cpu", dtype=torch.int64
+                    )
+                host_indices = host_index_cache[identity]
             if len(missing_pages) * key_multiplier < len(key_strs):
                 # Metadata generation consumes CPU indices anyway, so select
                 # the logical pages there rather than uploading a new index.

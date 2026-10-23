@@ -276,6 +276,89 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_direct_pools_share_indices_only_within_one_offload(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            DevicePoolEntry,
+        )
+
+        class CopyCountingIndices:
+            def __init__(self, values):
+                self.values = values
+                self.copies = 0
+
+            def __len__(self):
+                return len(self.values)
+
+            def detach(self):
+                return self
+
+            def to(self, **kwargs):
+                self.copies += 1
+                return self.values.to(**kwargs).clone()
+
+        store, backend = _make_store(is_mla_model=True)
+        names = [PoolName.INDEXER, PoolName.DEEPSEEK_V4_C4]
+        buffers = [torch.empty((4, 8), dtype=torch.uint8) for _ in names]
+        for name, buffer in zip(names, buffers):
+            store.registered_pools[name] = DevicePoolEntry(
+                name=name,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[[buffer]],
+                layer_mapping={0: 0},
+                page_size=2,
+                rows_are_pages=True,
+            )
+        indices = CopyCountingIndices(torch.tensor([0, 1, 2, 3]))
+        transfers = [
+            PoolTransfer(name=name, keys=["p0", "p1"], host_indices=indices)
+            for name in names
+        ]
+        # Each pool misses a different page of the same logical index tensor.
+        backend.existing_keys.update(["p0__indexer", "p1__deepseek_v4_c4"])
+        store.batch_set_v2(transfers)
+        self.assertEqual(indices.copies, 1)
+        call = backend.batch_put_calls[-1]
+        self.assertEqual(call["keys"], ["p1__indexer", "p0__deepseek_v4_c4"])
+        self.assertEqual(
+            call["ptrs"], [buffers[0].data_ptr() + 8, buffers[1].data_ptr()]
+        )
+        self.assertEqual(call["sizes"], [8, 8])
+
+        # All-hit requests must not copy indices or issue another write.
+        store.batch_set_v2(transfers)
+        self.assertEqual(indices.copies, 1)
+        self.assertEqual(len(backend.batch_put_calls), 1)
+
+        # The next offload must observe a changed source, not the prior snapshot.
+        indices.values.add_(4)
+        backend.existing_keys.clear()
+        store.batch_set_v2(transfers)
+        self.assertEqual(indices.copies, 2)
+        self.assertEqual(
+            backend.batch_put_calls[-1]["ptrs"],
+            [b.data_ptr() + offset for b in buffers for offset in (16, 24)],
+        )
+
+        # Distinct views sharing storage must retain their own index ranges.
+        values = torch.tensor([0, 1, 2, 3, 4, 5])
+        first = CopyCountingIndices(values[:4])
+        second = CopyCountingIndices(values[2:])
+        transfers[0].host_indices = first
+        transfers[1].host_indices = second
+        backend.existing_keys.clear()
+        store.batch_set_v2(transfers)
+        self.assertEqual((first.copies, second.copies), (1, 1))
+        self.assertEqual(
+            backend.batch_put_calls[-1]["ptrs"],
+            [
+                buffers[0].data_ptr(),
+                buffers[0].data_ptr() + 8,
+                buffers[1].data_ptr() + 8,
+                buffers[1].data_ptr() + 16,
+            ],
+        )
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
