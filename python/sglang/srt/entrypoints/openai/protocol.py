@@ -600,8 +600,8 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
-    content_hash: Optional[str] = None
     max_long_side_pixel: Optional[int] = None
+    content_hash: Optional[str] = None
 
     @field_validator("detail", mode="before")
     @classmethod
