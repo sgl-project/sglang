@@ -138,6 +138,10 @@ def check_quantized_moe_compatibility(
     moe_ep_size: int,
     moe_dp_size: int,
 ) -> None:
+    from sglang.srt.model_loader.utils import (
+        supports_quantized_moe_partial_block_shards,
+    )
+
     if (
         quantization_config := getattr(
             model_config.hf_config, "quantization_config", None
@@ -168,6 +172,7 @@ def check_quantized_moe_compatibility(
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
             and not _use_aiter
+            and not supports_quantized_moe_partial_block_shards(model_config)
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
