@@ -350,7 +350,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         KernelBackend.TRITON,
         "rope.flux3_video_qknorm_rope_triton:flux3_video_qknorm_rope",
         _CUDA,
-        "Bit-exact FLUX 3 video VAE QK RMSNorm + rotate-half RoPE, head dim 64.",
     ),
     (
         "diffusion.interleaved_rope_fp64",
