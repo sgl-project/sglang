@@ -31,6 +31,45 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Direct linker prefetch
+
+Mooncake's external linker defaults to `--linker-load-mode layer_wise`. To
+enable full-layer prefetch, use these flags alongside your Mooncake storage
+configuration:
+
+```bash
+--enable-unified-cache-external-linker \
+--linker-load-mode prefetch \
+--linker-prefetch-policy timeout
+```
+
+Keep Mooncake connection settings in `--hicache-storage-backend-extra-config`.
+
+Prefetch starts when the scheduler enqueues a request through
+`_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV
+into the radix tree after all attention ranks confirm success.
+Failed reads release the slots and fall back to recomputation. It currently
+supports Full/SWA components, requires PP=1, reads on every attention TP rank,
+and allows multiple requests in flight through the existing load thread.
+Admission can select later ready requests while others are still loading.
+
+Select the linker admission policy with `--linker-prefetch-policy`:
+
+- `best_effort`: use completed KV when the request reaches admission; otherwise
+  stop waiting and recompute.
+- `wait_complete`: keep the request waiting until every rank finishes the load.
+- `timeout` (default): wait up to `prefetch_timeout_base` plus the requested token
+  count / 1024 times `prefetch_timeout_per_ki_token`, starting at the first
+  blocked admission poll. The defaults are 1 second and 0.25 seconds per 1024
+  tokens. Set these through `--hicache-storage-backend-extra-config`.
+
+Only complete, successful full-layer reads are published. Stopping the wait
+cancels queued reads; a running Store read retains its private slots until all
+ranks stop writing, then releases them without publishing. Those slots continue
+to consume GPU capacity during cleanup. Reset and shutdown also drain the load
+thread before freeing slots. Layer-wise queues, counters, and MLA broadcast are
+unchanged.
+
 ## Install Mooncake
 
 **Method 1: with pip**

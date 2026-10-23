@@ -25,6 +25,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
