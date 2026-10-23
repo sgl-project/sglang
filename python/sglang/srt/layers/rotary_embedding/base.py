@@ -67,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
+    from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -565,6 +565,8 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
+        elif self.head_size != self.rotary_dim:
+            return self.forward_native(positions, query, key)
         else:
             self._match_cos_sin_cache_dtype(query)
             # Use fallback kernel of 'rotary_embedding'.

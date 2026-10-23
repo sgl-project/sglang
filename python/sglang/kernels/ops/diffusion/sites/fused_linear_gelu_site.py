@@ -138,6 +138,9 @@ def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
         return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False
+    if torch.compiler.is_compiling():
+        # dynamo guards on the cache's size, so reading it recompiles per linear
+        return _input_independent_ok(linear)
     verdict = _VERDICTS.get(linear)
     if verdict is None:
         verdict = _VERDICTS[linear] = _input_independent_ok(linear)

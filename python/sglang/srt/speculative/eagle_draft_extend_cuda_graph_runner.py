@@ -307,7 +307,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -481,7 +482,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return ret
 
         with forward_context(
-            ForwardContext(attn_backend=self.draft_extend_attn_backend)
+            ForwardContext(attn_backend=self.draft_extend_attn_backend),
+            forward_batch=forward_batch,
         ):
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True

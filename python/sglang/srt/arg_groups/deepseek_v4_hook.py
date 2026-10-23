@@ -36,7 +36,7 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
-        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
     return "flashmla_mega"
@@ -250,7 +250,7 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 
@@ -294,7 +294,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
             ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             # Decode receives the last SWA window from prefill and never replays.
             ("PD decode", cfg.disaggregation_mode == "decode"),

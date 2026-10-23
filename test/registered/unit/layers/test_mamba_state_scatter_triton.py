@@ -22,6 +22,7 @@ try:
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
+        scatter_mamba_states_after_mtp_verify,
     )
 
     _FUSED_IMPORT_ERROR = None
@@ -30,12 +31,14 @@ except Exception as e:  # pragma: no cover
     fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
+    scatter_mamba_states_after_mtp_verify = None
     _FUSED_IMPORT_ERROR = e
 
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import get_device_module
 from sglang.test.test_utils import CustomTestCase
@@ -537,6 +540,30 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
 
     def test_multi_type_with_track_set(self):
         self._run(num_types=2, n2=4)
+
+
+@unittest.skipUnless(
+    DEVICE is not None,
+    f"verify scatter needs one of {TRITON_DEVICES}",
+)
+class TestScatterAfterVerifyZeroWidthConv(CustomTestCase):
+    def test_zero_width_conv_pool(self):
+        """A model without conv state (Lightning attention) must commit an MTP verify."""
+        caches = MambaPool.SpeculativeState(
+            conv=[torch.empty(2, 8, 0, 0, dtype=torch.bfloat16, device=DEVICE)],
+            temporal=torch.empty(2, 8, 0, device=DEVICE),
+            intermediate_ssm=torch.empty(2, 2, 3, 0, device=DEVICE),
+            intermediate_conv_window=[
+                torch.empty(2, 2, 3, 0, 0, dtype=torch.bfloat16, device=DEVICE)
+            ],
+        )
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches=caches,
+            state_indices_tensor=torch.tensor([1, 5], device=DEVICE),
+            last_correct_step_indices=torch.tensor([0, 2], device=DEVICE),
+            mamba_track_indices=None,
+            mamba_steps_to_track=None,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
