@@ -79,5 +79,17 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "ascend"
 
+    def get_graph_runner_cls(self) -> type:
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+            NPUGraphRunner,
+        )
+
+        return NPUGraphRunner
+
+    def get_piecewise_backend_cls(self) -> type:
+        from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
+
+        return NPUPiecewiseBackend
+
     def get_dispatch_key_name(self) -> str:
         return "npu"
