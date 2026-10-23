@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
+    QKVParallelLinearWithLoRA,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -226,6 +227,37 @@ def test_composed_pair_shards_correctly_under_mock_tp():
     torch.testing.assert_close(
         torch.cat(stitched, dim=-1), expected, rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_qkv_layer_shards_fused_lora_b(tp_size):
+    """QKV LoRA must accept a fused B, shard q, and replicate GQA kv heads."""
+    a_list, b_list = _make_ab_lists([2, 3, 1])
+    a_2d, b_2d, fused_alpha = stack_or_compose_fused_lora(a_list, b_list, 4)
+    x = torch.randn(5, IN_DIM)
+    delta = _reference_delta(x, a_list, b_list, 4)
+    q_size = OUTPUT_SIZES[0] // tp_size
+    for tp_rank in range(tp_size):
+        base = _FakeMergedLinear(
+            OUTPUT_SIZES,
+            IN_DIM,
+            weight=torch.zeros(q_size + 4, IN_DIM),
+        )
+        # 4 q heads, 1 kv head replicated across ranks, head_size 2: rows [8, 2, 2].
+        base.total_num_heads, base.total_num_kv_heads, base.head_size = 4, 1, 2
+        base.num_heads, base.num_kv_heads = 4 // tp_size, 1
+        base.num_kv_head_replicas = tp_size
+        layer = QKVParallelLinearWithLoRA(base)
+        layer.lora_rank = fused_alpha
+        layer.lora_alpha = fused_alpha
+        layer.set_lora_weights(a_2d, b_2d, merge_weights=False)
+        with patch(_TP_RANK_PATCH, return_value=tp_rank):
+            out, _ = layer.forward(x)
+        expected = torch.cat(
+            (delta[..., tp_rank * q_size : (tp_rank + 1) * q_size], delta[..., 8:]),
+            dim=-1,
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_mis_sized_fused_lora_b_is_rejected():
