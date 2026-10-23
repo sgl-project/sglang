@@ -1268,6 +1268,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
+            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
