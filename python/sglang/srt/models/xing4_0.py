@@ -44,18 +44,18 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layer_boundary import (
     AttentionInputs,
-    ProducerReduction,
+    SumGroup,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
-    make_stages,
+    is_dense_ffn_fully_dp,
 )
-from sglang.srt.layers.layer_boundary.ops import attn_tp_all_reduce
+from sglang.srt.layers.layer_boundary.ops import attn_tp_all_reduce, sum_output
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -405,23 +405,19 @@ class Xing4_0DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 alt_stream=alt_stream,
                 is_deepseek_v4=False,
+                reduce_results=False,
             )
         else:
-            from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
-
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = deepseek_v2.DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
+                parallel_group="replicated" if is_dense_ffn_fully_dp() else "tp",
+                reduce_results=False,
+                allow_fused_down=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -437,30 +433,9 @@ class Xing4_0DecoderLayer(nn.Module):
             self.ffn_hc = mHCModule(config, config.num_hidden_layers)
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1)
 
-        self._stage_enters_stack = (layer_id) == 0
-        self._stage_terminal = (layer_id) == config.num_hidden_layers - 1
-        self._stage_previous_sparse = is_previous_layer_sparse
-        self._stage_next_sparse = is_next_layer_sparse
-
-        # KTEPWrapperMethod returns a TP-local partial: GPU expert partitions
-        # are present on their respective ranks, while the complete CPU-expert
-        # contribution exists only on TP rank 0.  Declare such an FFN output as
-        # TAIL_AFTER_SUM so the boundary never defers its post-experts
-        # all-reduce to a later layer; the CPU contribution is then counted
-        # exactly once inside the MoE's own collective.
-        self.is_kt_moe = isinstance(self.mlp, deepseek_v2.DeepseekV2MoE) and isinstance(
-            self.mlp.experts.quant_method, KTEPWrapperMethod
-        )
-        ffn_reduction = (
-            ProducerReduction.TAIL_AFTER_SUM
-            if self.is_kt_moe
-            else ProducerReduction.EXIT_SCOPED
-        )
-
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -469,18 +444,10 @@ class Xing4_0DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
-                    next_layer_sparse=self._stage_next_sparse,
-                    reduction=ffn_reduction,
+                    next_layer_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=self._stage_previous_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-            )
-            if not self._stage_enters_stack
-            else None,
-            terminal=self._stage_terminal,
         )
 
     def forward(
@@ -576,15 +543,20 @@ class Xing4_0DecoderLayer(nn.Module):
             hidden_states = aggregated_hidden_states.reshape(-1, C)
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-            with get_forward().scoped(
-                fuse_mlp_allreduce=False,
-                mlp_reduce_scatter=False,
-            ):
+            with get_forward().scoped(mlp_reduce_scatter=False):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
+
+            # Complete the MLP output's partial sum over the TP group (the MLP
+            # and MoE are built with reduce_results=False): the fused mhc_post
+            # mixing below consumes the full contribution, so this branch
+            # never defers the reduction to a stage boundary.
+            hidden_states = sum_output(
+                hidden_states, SumGroup.TP, forward_batch, may_quantize=False
+            )
 
             hidden_states = hidden_states.reshape(S, B, C)
 
@@ -679,10 +651,27 @@ class Xing4_0DecoderLayer(nn.Module):
         return hidden_states, topk_indices
 
     def _is_layer_sparse(self, layer_id: int) -> bool:
+        return self._config_is_layer_sparse(self.config, layer_id)
+
+    @classmethod
+    def _config_is_layer_sparse(cls, config, layer_id: int) -> bool:
         return (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
+        )
+
+    @classmethod
+    def stage_facts(cls, config, layer_id: int):
+        """The stages a layer of this class declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._config_is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._config_is_layer_sparse(config, layer_id + 1),
+            ),
         )
 
     def op_comm_prepare_attn(
@@ -717,7 +706,7 @@ class Xing4_0DecoderLayer(nn.Module):
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_boundary.finish_complete_output(
+        hidden_states = self.ffn_boundary.complete_now(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -773,6 +762,7 @@ class Xing4_0Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Xing4_0DecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:
