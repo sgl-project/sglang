@@ -136,8 +136,9 @@ class BeamGroup:
 
     def decode_slot_budget(self) -> Optional[int]:
         """Unallocated decode slots needed to finish, for fixed-length (trie)
-        groups that never stop early; None defers to the generic estimate."""
-        if not self.device_history:
+        groups that never stop early; None defers to the generic estimate,
+        also once the group has retired."""
+        if not self.device_history or self.retired:
             return None
         generated_floor = max(self.num_committed, 1)
         remaining_steps = max(self.max_new_tokens - generated_floor, 0)

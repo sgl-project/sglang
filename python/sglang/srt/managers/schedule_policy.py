@@ -770,9 +770,7 @@ class PrefillAdder:
     @staticmethod
     def _beam_decode_token_budget(req: Req) -> Optional[int]:
         group = req.beam_group
-        if group is None or group.retired:
-            return None
-        return group.decode_slot_budget()
+        return None if group is None else group.decode_slot_budget()
 
     def _decode_token_budget_for_admission(self, req: Req, normal_budget: int) -> int:
         beam_budget = self._beam_decode_token_budget(req)

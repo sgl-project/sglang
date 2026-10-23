@@ -232,6 +232,8 @@ class TestBeamGroup(CustomTestCase):
         self.assertEqual(group.decode_slot_budget(), 4)
         group.num_committed = 3
         self.assertEqual(group.decode_slot_budget(), 0)
+        group.retired = True
+        self.assertIsNone(group.decode_slot_budget())
 
     def test_device_history_matches_backpointer_history(self):
         groups = [
