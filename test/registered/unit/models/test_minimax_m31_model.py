@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.arg_groups.model_overrides.minimax_m3 import _minimax_m3_overrides
 from sglang.srt.configs.minimax_vl import (
@@ -42,7 +43,7 @@ NVFP4 = SimpleNamespace(
 
 def draft_config():
     """A small DSpark draft in the layout of the released checkpoint's dspark/ folder."""
-    return MiniMaxM3VLConfig.from_dict(
+    config = MiniMaxM3VLConfig.from_dict(
         {
             "architectures": ["DSparkMiniMaxDraftModel"],
             "quantization_config": {"quant_method": "minimax_m3_nvfp4"},
@@ -64,6 +65,9 @@ def draft_config():
             },
         }
     )
+    # from_dict keeps text_config a dict; tests set draft fields as attributes.
+    config.text_config = PretrainedConfig(**config.text_config)
+    return config
 
 
 def server_args(**kwargs):

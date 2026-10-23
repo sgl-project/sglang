@@ -16,6 +16,7 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     _map_muse_target_layer_ids,
     _resolve_dflash_draft_cell_size,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import published_topology
 
@@ -79,7 +80,9 @@ def test_draft_kv_budget_matches_attention_sharding(
     ):
         assert (
             _resolve_dflash_draft_cell_size(
-                draft_model_config=draft, draft_num_layers=5
+                draft_model_config=draft,
+                draft_num_layers=5,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
             )
             == 5 * local_kv_heads * (128 + 128) * element_bytes
         )

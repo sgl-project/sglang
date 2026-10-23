@@ -228,7 +228,7 @@ def test_transfer_prefix_must_be_in_range_and_page_aligned():
 
 @pytest.mark.parametrize("length,prefix", [(256, 256), (385, 128)])
 def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
-    sender = Mock()
+    sender = Mock(supports_host_tensor_indices=False)
     sender.should_send_kv_chunk.return_value = True
     sender.get_max_transfer_tokens.return_value = None
     scheduler = SimpleNamespace(
