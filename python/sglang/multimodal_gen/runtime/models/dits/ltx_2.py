@@ -1250,16 +1250,21 @@ class LTX2TransformerBlock(nn.Module):
         indices: slice,
     ) -> tuple[torch.Tensor, ...]:
         num_ada_params = int(scale_shift_table.shape[0])
-        ada_values = (
-            scale_shift_table[indices]
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[
-                :, :, indices, :
-            ]
-        ).unbind(dim=2)
-        return [t.squeeze(2) for t in ada_values]
+        table = scale_shift_table[indices].to(
+            device=timestep.device, dtype=timestep.dtype
+        )
+        temb = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[
+            :, :, indices, :
+        ]
+        # value-major, so every returned [B, T, D] is contiguous and the modulate
+        # kernels take it without a copy (a [B, T, k, D] slice is strided for B > 1)
+        ada_values = torch.empty(
+            (table.shape[0], *temb.shape[:2], temb.shape[-1]),
+            dtype=temb.dtype,
+            device=temb.device,
+        )
+        torch.add(table[:, None, None, :], temb.permute(2, 0, 1, 3), out=ada_values)
+        return list(ada_values.unbind(0))
 
     def forward(
         self,
@@ -1433,62 +1438,40 @@ class LTX2TransformerBlock(nn.Module):
         norm_audio_hidden_states = self.rms_norm(audio_hidden_states, self.norm_eps)
 
         # Compute combined ada params
-        video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[
-            :4, :
-        ]
-        video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
-
-        video_ca_scale_shift_table = (
-            video_per_layer_ca_scale_shift[None, None, :, :].to(
-                dtype=temb_ca_scale_shift.dtype, device=temb_ca_scale_shift.device
-            )
-            + temb_ca_scale_shift.reshape(
-                batch_size, temb_ca_scale_shift.shape[1], 4, -1
-            )
-        ).unbind(dim=2)
-        video_ca_gate = (
-            video_per_layer_ca_gate[None, None, :, :].to(
-                dtype=temb_ca_gate.dtype, device=temb_ca_gate.device
-            )
-            + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
-
         (
             video_a2v_ca_scale,
             video_a2v_ca_shift,
             video_v2a_ca_scale,
             video_v2a_ca_shift,
-        ) = [t.squeeze(2) for t in video_ca_scale_shift_table]
-        a2v_gate = video_ca_gate[0].squeeze(2)
-
-        audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[
-            :4, :
-        ]
-        audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
-
-        audio_ca_scale_shift_table = (
-            audio_per_layer_ca_scale_shift[None, None, :, :].to(
-                dtype=temb_ca_audio_scale_shift.dtype,
-                device=temb_ca_audio_scale_shift.device,
-            )
-            + temb_ca_audio_scale_shift.reshape(
-                batch_size, temb_ca_audio_scale_shift.shape[1], 4, -1
-            )
-        ).unbind(dim=2)
-        audio_ca_gate = (
-            audio_per_layer_ca_gate[None, None, :, :].to(
-                dtype=temb_ca_audio_gate.dtype, device=temb_ca_audio_gate.device
-            )
-            + temb_ca_audio_gate.reshape(batch_size, temb_ca_audio_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
-
+        ) = self.get_ada_values(
+            self.video_a2v_cross_attn_scale_shift_table[:4],
+            batch_size,
+            temb_ca_scale_shift,
+            slice(None),
+        )
+        (a2v_gate,) = self.get_ada_values(
+            self.video_a2v_cross_attn_scale_shift_table[4:],
+            batch_size,
+            temb_ca_gate,
+            slice(None),
+        )
         (
             audio_a2v_ca_scale,
             audio_a2v_ca_shift,
             audio_v2a_ca_scale,
             audio_v2a_ca_shift,
-        ) = [t.squeeze(2) for t in audio_ca_scale_shift_table]
-        v2a_gate = audio_ca_gate[0].squeeze(2)
+        ) = self.get_ada_values(
+            self.audio_a2v_cross_attn_scale_shift_table[:4],
+            batch_size,
+            temb_ca_audio_scale_shift,
+            slice(None),
+        )
+        (v2a_gate,) = self.get_ada_values(
+            self.audio_a2v_cross_attn_scale_shift_table[4:],
+            batch_size,
+            temb_ca_audio_gate,
+            slice(None),
+        )
 
         # A2V
         mod_norm_hidden_states = _ltx2_modulate(
@@ -1508,9 +1491,9 @@ class LTX2TransformerBlock(nn.Module):
                 skip_sequence_parallel_override=audio_replicated_for_sp,
             )
             if a2v_cross_attn_perturbation_mask is not None:
-                a2v_attn_hidden_states = (
-                    a2v_attn_hidden_states * a2v_cross_attn_perturbation_mask
-                )
+                # the 0/1 mask commutes with the gate, so scale the [B, T, D] gate
+                # instead of the attention output
+                a2v_gate = a2v_gate * a2v_cross_attn_perturbation_mask
             hidden_states = residual_gate_add(
                 hidden_states, a2v_attn_hidden_states, a2v_gate
             )
@@ -1534,9 +1517,7 @@ class LTX2TransformerBlock(nn.Module):
                 context_replicated_prefix_len=video_memory_prefix_len,
             )
             if v2a_cross_attn_perturbation_mask is not None:
-                v2a_attn_hidden_states = (
-                    v2a_attn_hidden_states * v2a_cross_attn_perturbation_mask
-                )
+                v2a_gate = v2a_gate * v2a_cross_attn_perturbation_mask
             audio_hidden_states = residual_gate_add(
                 audio_hidden_states, v2a_attn_hidden_states, v2a_gate
             )
