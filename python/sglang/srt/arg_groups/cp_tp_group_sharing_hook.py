@@ -81,15 +81,19 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
-    elif cfg.disaggregation_mode != "null" and not (
-        cfg.disaggregation_mode == "prefill"
-        and cfg.disaggregation_transfer_backend == "mooncake"
-        and cfg.speculative_algorithm == "DFLASH"
-        and cfg.pp_size == cfg.dp_size == cfg.ep_size == 1
-    ):
-        raise ValueError(
-            "GLM CP/TP-sharing PD supports Mooncake DFLASH prefill with DP=PP=EP=1."
-        )
+    elif model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration":
+        if cfg.disaggregation_mode != "null":
+            unsupported |= {
+                "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+                "disaggregation-transfer-backend != mooncake": (
+                    cfg.disaggregation_transfer_backend != "mooncake"
+                ),
+                "speculative-algorithm != DFLASH": cfg.speculative_algorithm
+                != "DFLASH",
+                "pp-size > 1": cfg.pp_size > 1,
+                "dp-size > 1": cfg.dp_size > 1,
+                "ep-size > 1": view.ep_size > 1,
+            }
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

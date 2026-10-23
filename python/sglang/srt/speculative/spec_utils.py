@@ -732,7 +732,6 @@ def draft_pp_context():
         yield
 
 
-@contextmanager
 def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
@@ -741,13 +740,22 @@ def draft_tp_context(owns_attention: bool):
     target's TP placement. Enter it from outside any draft scope.
     """
     if not owns_attention:
-        yield
-        return
+        return contextlib.nullcontext()
     parallel = get_parallel()
     group = getattr(parallel, f"{draft_attn_parallel_group()}_group")
+    tp_context = patch_tensor_parallel_group(group, owns_attention=True)
+    if parallel.enable_prefill_cp:
+        return _draft_without_cp(tp_context)
+    return tp_context
+
+
+@contextmanager
+def _draft_without_cp(tp_context):
     with (
-        patch_tensor_parallel_group(group, owns_attention=True),
-        parallel.override(enable_prefill_cp=False, enable_cp_tp_group_sharing=False),
+        tp_context,
+        get_parallel().override(
+            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+        ),
         disable_cp_strategy(),
     ):
         yield

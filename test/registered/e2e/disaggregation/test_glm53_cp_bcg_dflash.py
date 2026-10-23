@@ -6,12 +6,13 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import popen_with_error_check, try_cached_model
 
-register_cuda_ci(est_time=900, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-gb300")
 
 COMMON_ARGS = [
     "--dsa-prefill-backend",
@@ -44,7 +45,16 @@ COMMON_ARGS = [
 ]
 
 
-class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase):
+class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
+
     prefill_tp_size = 2
     decode_tp_size = 2
     decode_base_gpu_id = 2

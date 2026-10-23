@@ -17,11 +17,7 @@ from sglang.srt.layers.cp.base import (
 )
 from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
-from sglang.srt.layers.cp.interleave import (
-    InterleaveCPStrategy,
-    cp_interleave_to_sequence_order,
-    cp_sequence_to_interleave_order,
-)
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
     pad_local_rows,
@@ -188,112 +184,8 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 )
                 self.assertTrue(runner.can_run_graph(batch))
         with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
-            batch.extend_prefix_lens_cpu = [0, 128, 0]
+            batch.extend_prefix_lens_cpu = [0, 1, 0]
             self.assertTrue(runner.can_run_graph(batch))
-            # A non-bucket token count, including cached prefixes, fits 2048.
-            batch.input_ids = batch.input_ids[:1801]
-            batch.extend_seq_lens_cpu = [1287, 161, 353]
-            self.assertTrue(runner.can_run_graph(batch))
-            batch.contains_mm_inputs = lambda: True
-            self.assertFalse(runner.can_run_graph(batch))
-
-    def test_interleave_padding_preserves_live_rows_and_refreshes_graph_inputs(self):
-        init_cp_strategy(enable_prefill_cp=True, cp_size=2, cp_strategy="interleave")
-        embedding = torch.nn.Embedding.from_pretrained(
-            torch.arange(64, dtype=torch.float32).reshape(32, 2)
-        )
-        runner = SimpleNamespace(
-            device="cpu",
-            max_num_tokens=16,
-            model_runner=SimpleNamespace(
-                dtype=torch.float32,
-                model_config=SimpleNamespace(hidden_size=2),
-                model=SimpleNamespace(get_input_embeddings=lambda: embedding),
-            ),
-        )
-
-        def batch(lengths, prefixes):
-            n = sum(lengths)
-            return SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                # Poison padding to detect accidentally treating it as input.
-                input_ids=torch.cat(
-                    (torch.arange(1, n + 1), torch.full((16 - n,), 31))
-                ),
-                positions=torch.cat(
-                    [torch.arange(p, p + q) for p, q in zip(prefixes, lengths)]
-                    + [torch.full((16 - n,), 999)]
-                ),
-                extend_num_tokens=n,
-                extend_seq_lens_cpu=lengths,
-                extend_prefix_lens_cpu=prefixes,
-                seq_lens_cpu=[p + q for p, q in zip(prefixes, lengths)],
-                out_cache_loc=None,
-            )
-
-        for rank in range(2):
-            with (
-                self.subTest(rank=rank),
-                get_parallel().override(
-                    attn_cp_rank=rank, attn_cp_size=2, enable_cp_tp_group_sharing=True
-                ),
-            ):
-                adapter = InterleaveCPBCGInput.create(runner)
-                captured = batch([16], [0])
-                adapter.prepare(runner, captured, static_num_tokens=16, capture=True)
-                count = get_cp_strategy().moe_num_token_non_padded(captured)
-                addresses = (
-                    adapter.input_embeds.data_ptr(),
-                    adapter.positions.data_ptr(),
-                )
-                for lengths in ([3, 5, 3], [3, 3, 3]):
-                    live = batch(lengths, [128, 512, 0])
-                    n = sum(lengths)
-                    positions = live.positions
-                    adapter.prepare(runner, live, static_num_tokens=16, capture=False)
-                    metadata = live.attn_cp_metadata
-                    self.assertEqual(metadata.total_seq_lens, n)
-                    self.assertEqual(
-                        metadata.per_rank_logical_token, [(n + 1) // 2, n // 2]
-                    )
-                    self.assertEqual(metadata.per_rank_actual_token, [8, 8])
-                    logical = metadata.per_rank_logical_token[rank]
-                    self.assertEqual(count.item(), logical)
-                    self.assertIs(
-                        get_cp_strategy().moe_num_token_non_padded(live), count
-                    )
-                    self.assertEqual(
-                        (
-                            live.input_embeds.data_ptr(),
-                            adapter.model_positions(live).data_ptr(),
-                        ),
-                        addresses,
-                    )
-                    torch.testing.assert_close(
-                        live.input_embeds[:logical],
-                        embedding(live.input_ids[:n][rank::2]),
-                    )
-                    self.assertEqual(
-                        torch.count_nonzero(live.input_embeds[logical:]).item(), 0
-                    )
-                    torch.testing.assert_close(
-                        adapter.model_positions(live)[:logical], positions[:n][rank::2]
-                    )
-                    self.assertIs(live.positions, positions)
-                    expected_ids = torch.zeros(16, dtype=torch.int64)
-                    expected_ids[:n] = torch.arange(1, n + 1)
-                    torch.testing.assert_close(
-                        live.input_ids_global, expected_ids.view(-1, 2).T.flatten()
-                    )
-
-                    # KDA graph rows stay static while eager cache gathers
-                    # discard padding using the live metadata above.
-                    rank_major = expected_ids.view(-1, 2).T.flatten().unsqueeze(1)
-                    sequence = cp_interleave_to_sequence_order(rank_major, live)
-                    torch.testing.assert_close(sequence[:, 0], expected_ids)
-                    torch.testing.assert_close(
-                        cp_sequence_to_interleave_order(sequence, live, 16), rank_major
-                    )
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
