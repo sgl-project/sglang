@@ -1810,5 +1810,32 @@ class TestShardSendFilter(CustomTestCase):
             self.assertEqual(skips, expect_skip)
 
 
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestRotationPhase(_TreeCoreBackendCase):
+    """The backup's host start class: rotation base + the node's first
+    position-page, read host-side (the device value is on the GPU)."""
+
+    def _phase(self, tree, tokens):
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        return tree.tree_core.rotation_phase_of(node)
+
+    def test_phase_counts_the_pages_above_the_node(self):
+        tree = _unified_tree()
+        _insert(tree, list(range(12)), rotation_base=2)
+        # Split the 3-page node after 2 pages and hang a 1-page sibling there.
+        probe = list(range(8)) + [99, 98, 97, 96]
+        _insert(tree, probe, rotation_base=2)
+        self.assertEqual(self._phase(tree, list(range(8))), 2)
+        self.assertEqual(self._phase(tree, list(range(12))), 2 + 2)
+        self.assertEqual(self._phase(tree, probe), 2 + 2)
+
+    def test_unsharded_nodes_have_no_phase(self):
+        tree = _unified_tree()
+        _insert(tree, list(range(8)))
+        self.assertIsNone(self._phase(tree, list(range(8))))
+
+
 if __name__ == "__main__":
     unittest.main()
