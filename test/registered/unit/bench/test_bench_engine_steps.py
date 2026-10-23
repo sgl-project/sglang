@@ -1,10 +1,16 @@
+import asyncio
 import importlib.util
+import json
+import sys
+import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -16,7 +22,7 @@ bench = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench)
 
 
-class TestStepWindow(CustomTestCase):
+class TestStepWindow(unittest.TestCase):
     def test_window_spans_whole_steps(self):
         # 30 steps of 100 ms with two completions each; a 1 s stall precedes step 3,
         # and step 10 reports late, so its group merges into step 11's and the step
@@ -37,8 +43,13 @@ class TestStepWindow(CustomTestCase):
         with self.assertRaises(SystemExit):
             bench.group_window([(1.0, 10)], 0.2, 0.9)
 
+    def test_empty_or_invalid_window_fails(self):
+        for groups, lo, hi in (([], 0.2, 0.9), ([(1, 1)], 0.9, 0.2)):
+            with self.assertRaises(SystemExit):
+                bench.group_window(groups, lo, hi)
 
-class TestLogSteps(CustomTestCase):
+
+class TestLogSteps(unittest.TestCase):
     def test_prefill_and_decode_lines(self):
         t0 = datetime(2026, 10, 22, 10, 0, 5).timestamp()
         stamp = "[2026-10-22 10:00:0{} {}] "
@@ -77,6 +88,184 @@ class TestLogSteps(CustomTestCase):
         self.assertEqual(got["accept_len"], 2.5)
         got = bench.log_steps(lines, "decode", t0, t0 + 2, 63)
         self.assertEqual((got["ms_per_step_per_rank"], got["sizes_seen"]), ({}, [64]))
+
+    def test_cross_check_requires_all_ranks_and_fixed_batch(self):
+        def check(ranks, sizes=(64,), coverage=0.9):
+            return bench.check_logs(
+                dict(
+                    ms_per_step_per_rank=ranks,
+                    sizes_seen=list(sizes),
+                    coverage=coverage,
+                ),
+                {"ms_per_step": 100},
+                64,
+                2,
+            )
+
+        self.assertTrue(check({0: 100, 1: 100})["agree"])
+        self.assertFalse(check({0: 100})["agree"])
+        self.assertFalse(check({0: 100, 1: 100}, coverage=0.7)["agree"])
+        self.assertFalse(check({0: 100, 1: 100}, sizes=(32, 64))["agree"])
+        self.assertFalse(check({0: 90, 1: 90})["agree"])
+        self.assertFalse(check({}, sizes=(), coverage=0)["agree"])
+
+
+class TestWorkloadGuards(unittest.TestCase):
+    def test_gpu_denominator(self):
+        self.assertEqual(bench.gpu_count(dict(tp_size=4, dp_size=1), 1), 4)
+        self.assertEqual(bench.gpu_count(dict(tp_size=2, dp_size=4), 4), 8)
+        self.assertEqual(
+            bench.gpu_count(dict(tp_size=8, pp_size=2, dp_size=1, attn_dp_size=4), 4),
+            16,
+        )
+        self.assertEqual(
+            bench.gpu_count(
+                dict(tp_size=8, pp_size=2, dp_size=4, enable_dp_attention=True), 4
+            ),
+            16,
+        )
+        self.assertEqual(bench.gpu_count({}, 4, explicit=8), 8)
+        with self.assertRaises(SystemExit):
+            bench.gpu_count({}, 4)
+        with self.assertRaises(SystemExit):
+            bench.gpu_count(dict(tp_size=8, dp_size=1, attn_dp_size=4), 2)
+
+    def test_cache_requires_exact_suffix(self):
+        self.assertEqual(
+            bench.check_cache(dict(prompt_tokens=128, cached_tokens=96), 32), 32
+        )
+        for cached in (0, 112):
+            with self.assertRaisesRegex(RuntimeError, "expected 32"):
+                bench.check_cache(dict(prompt_tokens=128, cached_tokens=cached), 32)
+
+    def test_transport_closes_if_guard_fails(self):
+        transport = Mock()
+        argv = ["bench", "prefill", "--dp", "1", "--base-url", "http://localhost"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(bench, "HttpTransport", return_value=transport),
+            patch.object(bench, "run_benchmark", side_effect=RuntimeError("guard")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "guard"):
+                bench.main()
+        transport.finish.assert_called_once()
+
+    def test_cli_rejects_invalid_workload(self):
+        common = ["bench", "prefill", "--dp", "1", "--base-url", "http://localhost"]
+        for extra in (
+            ["--new-tokens", "0"],
+            ["--num-gpus", "0"],
+            ["--timeout", "nan"],
+            ["--context", "1"],
+            ["--tokens-per-step", "1000"],
+            ["--lo", "0.9", "--hi", "0.2"],
+        ):
+            with patch.object(sys, "argv", common + extra):
+                with self.assertRaises(SystemExit):
+                    bench.main()
+
+    def test_prefill_timeout_cancels_pending_requests(self):
+        cancelled = []
+
+        class StalledTransport:
+            async def generate(self, *args):
+                try:
+                    await asyncio.Event().wait()
+                    yield None
+                finally:
+                    cancelled.append(True)
+
+        args = SimpleNamespace(tokens_per_step=1, new_tokens=1, dp=1, timeout=0.01)
+        with self.assertRaises(asyncio.TimeoutError):
+            asyncio.run(
+                bench.batch(args, StalledTransport(), lambda rank: [], 2, {}, [])
+            )
+        self.assertEqual(len(cancelled), 2)
+
+    def test_prefill_record_uses_server_gpu_count(self):
+        class Transport:
+            def __init__(self):
+                self.count = 0
+                self.closed = False
+
+            def server_info(self):
+                return dict(tp_size=4, dp_size=1)
+
+            def flush_cache(self):
+                return None
+
+            async def generate(self, ids, params, rank, stream):
+                self.count += 1
+                stamp = 1000 + (self.count // 2) * 0.1
+                yield (
+                    stamp,
+                    dict(prompt_tokens=8, cached_tokens=7, prefill_finished_time=stamp),
+                )
+
+            def run(self, coro):
+                return asyncio.run(coro)
+
+            def finish(self):
+                self.closed = True
+
+        transport = Transport()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = [
+                "bench",
+                "prefill",
+                "--dp",
+                "1",
+                "--base-url",
+                "http://localhost",
+                "--context",
+                "8",
+                "--new-tokens",
+                "1",
+                "--tokens-per-step",
+                "2",
+                "--requests",
+                "80",
+                "--warmup-steps",
+                "1",
+                "--out",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(bench, "HttpTransport", return_value=transport),
+                patch.object(bench, "environment", return_value={}),
+            ):
+                bench.main()
+            record = json.loads(output.read_text())
+        self.assertTrue(transport.closed)
+        self.assertEqual(record["workload"]["num_gpus"], 4)
+        self.assertAlmostEqual(record["result"]["tok_s_per_gpu"], 5)
+
+    def test_decode_does_not_count_metadata_only_chunks_as_steps(self):
+        class Transport:
+            async def generate(self, *args):
+                for count in range(1, 10000):
+                    meta = dict(
+                        prompt_tokens=8, cached_tokens=7, completion_tokens=count
+                    )
+                    await asyncio.sleep(0.002)
+                    yield time.time(), meta
+                    await asyncio.sleep(0.002)
+                    yield time.time(), meta
+
+        args = SimpleNamespace(
+            dp=1,
+            batch_per_rank=1,
+            new_tokens=1,
+            output_len=10000,
+            timeout=2,
+            warmup_steps=0,
+            measure_steps=5,
+            profile_steps=0,
+        )
+        result = asyncio.run(bench.decode(args, Transport(), lambda rank: []))
+        self.assertEqual(result["tokens"], 5)
 
 
 if __name__ == "__main__":
