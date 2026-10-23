@@ -143,7 +143,12 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
 def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     from sglang.srt.entrypoints.openai.serving_inkling import InklingChatEncodingAdapter
 
-    return InklingChatEncodingAdapter(tokenizer=ctx.tokenizer)
+    return InklingChatEncodingAdapter(
+        tokenizer=ctx.tokenizer,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
+    )
 
 
 def _build_deepseek_recipe(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
