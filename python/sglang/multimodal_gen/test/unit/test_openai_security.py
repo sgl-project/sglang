@@ -382,7 +382,7 @@ def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
     )
     target = tmp_path / "image.png"
     target.mkdir()
-    with pytest.raises(OSError):
+    with pytest.raises(Exception, match="directory"):
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
     assert not list(target.iterdir())
     assert not list(part_dir.iterdir())
