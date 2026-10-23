@@ -128,6 +128,8 @@ class GatedResidual(HyperConnectionBase):
     ):
         super().__init__(config, use_mix, use_combine, role)
 
+        self._packed_sum_weights = False
+
         norm_dim = (
             self.config.hidden_size * self.hc_count
             if self.config.hc_per_branch_norm
@@ -237,7 +239,7 @@ class GatedResidual(HyperConnectionBase):
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    ):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -315,6 +317,14 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
+    def mix_prepared(self, residual, prepared_input=None):
+        return self.mix(residual, normalized_input=prepared_input)
+
+    def combine_and_prepare(self, block_output, residuals, next_norm=None):
+        if not isinstance(next_norm, GroupedGemmaRMSNorm):
+            next_norm = None
+        return self.combine_and_normalize(block_output, residuals, next_norm)
+
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
@@ -353,8 +363,8 @@ class GatedResidual(HyperConnectionBase):
     def combine(
         self,
         block_output: torch.Tensor,
-        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
-    ) -> torch.Tensor:
+        residuals,
+    ):
         hyper_input, hyper_input_normed, partials = residuals
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (

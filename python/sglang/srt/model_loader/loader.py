@@ -308,13 +308,28 @@ def _initialize_model(
     return model
 
 
-def post_load_weights(model: nn.Module) -> None:
+def post_load_weights(model: nn.Module, *, weights_preprocessed: bool = False) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
-    if hasattr(model, "post_load_weights"):
-        model.post_load_weights()
+    # Native cache/IPC imports already contain processed parameters. Only invoke
+    # a model's explicit view-rebinding hook; never repeat checkpoint transforms.
+    hook_name = (
+        "post_load_weights_from_preprocessed"
+        if weights_preprocessed
+        else "post_load_weights"
+    )
+    hook = getattr(model, hook_name, None)
+    if hook is not None:
+        hook()
+    validate_model_weights(model)
+
+
+def validate_model_weights(model: nn.Module) -> None:
+    validate = getattr(model, "validate_weight_update", None)
+    if validate is not None:
+        validate()
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -1023,6 +1038,7 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         DefaultModelLoader.load_weights_only(model, weights, target_device)
+        validate_model_weights(model)
         DefaultModelLoader.postprocess_weights(model, target_device)
 
     @staticmethod
@@ -2543,6 +2559,8 @@ class PreshardedModelLoader(DefaultModelLoader):
 
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
+
+            post_load_weights(model, weights_preprocessed=True)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

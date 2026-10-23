@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -12,6 +13,7 @@ from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
     post_load_weights,
+    validate_model_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import (
@@ -311,10 +313,20 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
+        begin = getattr(self.get_model(), "begin_weight_update", None)
+        if begin is not None:
+            begin()
+
+    def validate_weight_update(self: WeightUpdater) -> None:
+        validate_model_weights(self.get_model())
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
+        self.validate_weight_update()
+        finish = getattr(self.get_model(), "end_weight_update", None)
+        if finish is not None:
+            finish(force=run_post_load)
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
@@ -372,6 +384,7 @@ class WeightUpdater:
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
+            _model_post_direct_load(self.get_model(), force=True)
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -424,7 +437,13 @@ class WeightUpdater:
 
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
-            worker.update_weights_from_ipc(recv_req.zmq_handles)
+            # Checkpoint-engine may invoke model.load_weights for several IPC
+            # buckets. Finalize the merged parameters only after the whole call.
+            update_context = getattr(
+                self.get_model(), "weight_update_context", nullcontext
+            )
+            with update_context():
+                worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
@@ -433,10 +452,38 @@ class WeightUpdater:
             return False, str(e)
 
 
+def _model_post_direct_load(model, *, force=False):
+    # Optional model-owned cache refresh. Other models retain direct-copy
+    # semantics, without checkpoint postprocessing or optional backend imports.
+    post_load = getattr(model, "post_load_weights_from_direct", None)
+    if post_load is not None:
+        post_load(force=force)
+
+
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
+    # Merged parameters can explicitly expose checkpoint aliases to the loader
+    # without registering overlapping parameters or duplicating their storage.
+    for name, parameter in tuple(params_dict.items()):
+        aliases = getattr(parameter, "weight_loader_aliases", ())
+        if aliases:
+            if not name.endswith(aliases[0]):
+                raise ValueError("Weight-loader alias does not match its parameter")
+            prefix = name[: -len(aliases[0])]
+            for alias in aliases[1:]:
+                key = prefix + alias
+                if key in params_dict and params_dict[key] is not parameter:
+                    raise ValueError(f"Conflicting weight-loader alias: {key}")
+                params_dict[key] = parameter
     for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
+        param = params_dict[name]
+        # Only HC opts in: arbitrary weight_loaders may reshard an already
+        # rank-local direct tensor. Other parameters keep the original copy.
+        loader = getattr(param, "hc_weight_loader", default_weight_loader)
+        loader(param, tensor)
+    # Refresh complete pairs; incomplete pairs stay dirty until a later bucket.
+    # Refresh HC layouts in place so existing captured graphs see the new weights.
+    _model_post_direct_load(model)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

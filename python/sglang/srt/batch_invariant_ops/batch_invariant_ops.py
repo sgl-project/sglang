@@ -787,7 +787,9 @@ def bmm_batch_invariant(a, b, *, out=None):
             },
             torch.float16: {
                 "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
+                # FP32 output doubles the epilogue staging footprint. Keep it
+                # within SM100 shared-memory limits without changing K ordering.
+                "BLOCK_SIZE_N": 128 if c.dtype == torch.float32 else 256,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 8,
                 "num_stages": 3,
