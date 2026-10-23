@@ -620,6 +620,8 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
+    prompt_encoder_urls: str | None = None
+    image_encoder_urls: str | None = None
     denoiser_urls: str | None = None
     decoder_urls: str | None = None
     encoder_tp: int | None = None
