@@ -15,10 +15,6 @@ if TYPE_CHECKING:
 # bumped on any breaking change to the contracts in this module
 MONOKERNEL_API_VERSION = 1
 
-# the backend sgl-amd-mono registers its specs under
-BACKEND = "amd"
-FLAG = "--enable-amd-monokernel"
-
 
 class Feature(enum.Enum):
     """SGLang features refused unless a spec lists them."""

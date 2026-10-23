@@ -37,20 +37,17 @@ def print_deprecated_warning(message: str):
 #          names the replacement;
 #   * an old boolean whose field survives, possibly renamed
 #       -> `DeprecatedStoreTrueAction`;
-#   * an old boolean replaced by one *value* of a new valued flag, or an old
-#     valued flag whose one accepted value became a boolean
-#       -> `DeprecatedStoreConstAction` with `const_value=` (plus `nargs=None`
-#          and `choices=` for the latter);
+#   * an old boolean replaced by one *value* of a new valued flag
+#       -> `DeprecatedStoreConstAction` with `const_value=`;
 #   * an old valued flag replaced by a renamed valued flag
 #       -> `DeprecatedAliasStoreAction`.
 #
-# The second and third have registrations today (`--disable-cuda-graph`,
-# `--enable-dp-attention`; `--monokernel-backend`). The other two are kept
-# because the shapes recur -- this package has retired flags of every one of
-# them -- and the fiddly parts (`nargs=0` on a boolean, where the const goes,
-# warn-and-continue versus `parser.error`) are what a reimplementation gets
-# wrong. Pass `new_flag=` so the warning tells the operator what to switch to;
-# that pointer is the whole point.
+# Only the second has registrations today (`--disable-cuda-graph`,
+# `--enable-dp-attention`). The other three are kept because the shapes recur
+# -- this package has retired flags of every one of them -- and the fiddly
+# parts (`nargs=0` on a boolean, where the const goes, warn-and-continue versus
+# `parser.error`) are what a reimplementation gets wrong. Pass `new_flag=` so the warning tells the
+# operator what to switch to; that pointer is the whole point.
 
 
 class DeprecatedAction(argparse.Action):
@@ -105,9 +102,7 @@ class DeprecatedStoreConstAction(argparse.Action):
 
     The bool-to-enum migration: the operator passes no value, and the action
     writes the fixed one `const_value` names onto the new field. `nargs=0`
-    because the old spelling took no argument. With `nargs=None` and
-    `choices=`, it retires a valued flag whose one accepted value became a
-    boolean the same way.
+    because the old spelling took no argument.
     """
 
     def __init__(

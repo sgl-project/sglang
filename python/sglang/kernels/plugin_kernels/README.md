@@ -10,28 +10,32 @@ device.
 
 ## Layout
 
-The code is split at the kernel/runtime boundary.
+The code is split at the kernel/runtime boundary, one directory per contract.
 
 ```
 kernels/plugin_kernels/      # what a plugin implements; imports nothing from srt
-  <hardware>/spec.py         #   registration, API version, requirements,
+  <contract>/spec.py         #   registration, API version, requirements,
                              #   capabilities and widths, build/forward contract
-  <hardware>/<model>/        #   thin wrappers around the library's kernels
+  <contract>/<model>/        #   thin wrappers around a library's kernels
 srt/kernel_plugins/          # SGLang's integration
-  <hardware>/binding.py      #   startup checks, weight observation, TP agreement,
+  <contract>/binding.py      #   startup checks, weight observation, TP agreement,
                              #   CUDA graph coverage, forward dispatch and fallback,
                              #   and the runtime state handed to the plugin
 ```
 
-| Hardware | Server flag | Library |
+| Contract | Server flag | Libraries |
 | --- | --- | --- |
-| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
-| `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
+| `megakernel/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `monokernel/` | `--monokernel-backend <name>` | `amd`: [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono); `msa`: [MiniMax-AI/MSA](https://github.com/MiniMax-AI/MSA) |
+
+A monokernel library registers its specs under a backend name, and
+`--monokernel-backend` selects one, so libraries for different hardware share
+the contract.
 
 ## How a plugin runs
 
 A library registers its specs through the `sglang.srt.plugins` entry point.
-With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
+With its server flag set, `srt/kernel_plugins/<contract>/binding.py`:
 - checks the spec against the resolved configuration at argument resolution,
   before the weights load, and stops the server listing every reason it cannot
   serve;
@@ -40,14 +44,14 @@ With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
   runs the model's own forward.
 
 The kernels stay in their libraries, which import the contract from
-`sglang.kernels.plugin_kernels.<hardware>` and, in their tests, the integration
-from `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
-`test/registered/unit/kernel_plugins/<hardware>/`.
+`sglang.kernels.plugin_kernels.<contract>` and, in their tests, the integration
+from `sglang.srt.kernel_plugins.<contract>`. Unit tests are in
+`test/registered/unit/kernel_plugins/<contract>/`.
 
 ## Operators
 
 An external kernel exposed as an operator registers into its logical group
 (`ops/<group>/__init__.py`) with `KernelSpec(op="<group>.<name>",
 backend=KernelBackend.PLUGIN,
-target="sglang.kernels.plugin_kernels.<hardware>.<model>.<module>:<function>")`;
+target="sglang.kernels.plugin_kernels.<contract>.<model>.<module>:<function>")`;
 callers import the `ops.<group>` facade.
