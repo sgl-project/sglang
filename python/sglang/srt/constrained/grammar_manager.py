@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent import futures
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -116,7 +117,16 @@ class GrammarManager:
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+                # As with running requests: a timeout's SLA message is a 503,
+                # any other abort is a deliberate stop without an error status.
+                if recv_req.abort_message:
+                    req.set_finish_with_abort(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                else:
+                    req.set_finish_with_abort(
+                        "Aborted by AbortReq.", status_code=None, err_type=None
+                    )
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params

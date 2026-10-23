@@ -1286,28 +1286,35 @@ class TestAnthropicServing(unittest.TestCase):
 
     def test_stream_upstream_error_envelope_is_forwarded(self):
         """OpenAI handler streaming-error JSON must surface real type/message."""
-        upstream_error = {
-            "error": {
-                "object": "error",
-                "message": "context length exceeded",
-                "type": "BadRequestError",
-                "code": 400,
-            }
-        }
-        serving = self._serving(
-            [
-                _chunk([_choice({"role": "assistant"})]),
-                f"data: {json.dumps(upstream_error)}\n\n",
-            ]
-        )
-        events = asyncio.run(
-            _collect_anthropic_events(serving, self._anthropic_request())
-        )
-        err = next(e for e in events if e["type"] == "error")
-        self.assertEqual(err["error"]["type"], "invalid_request_error")
-        self.assertEqual(err["error"]["message"], "context length exceeded")
-        # message_stop must still close the stream
-        self.assertEqual(events[-1]["type"], "message_stop")
+        for upstream_type, anthropic_type in (
+            ("invalid_request_error", "invalid_request_error"),
+            ("service_unavailable_error", "overloaded_error"),
+            ("server_error", "api_error"),
+            (["not", "a", "string"], "api_error"),
+        ):
+            with self.subTest(upstream_type=upstream_type):
+                upstream_error = {
+                    "error": {
+                        "message": "context length exceeded",
+                        "type": upstream_type,
+                        "param": None,
+                        "code": None,
+                    }
+                }
+                serving = self._serving(
+                    [
+                        _chunk([_choice({"role": "assistant"})]),
+                        f"data: {json.dumps(upstream_error)}\n\n",
+                    ]
+                )
+                events = asyncio.run(
+                    _collect_anthropic_events(serving, self._anthropic_request())
+                )
+                err = next(e for e in events if e["type"] == "error")
+                self.assertEqual(err["error"]["type"], anthropic_type)
+                self.assertEqual(err["error"]["message"], "context length exceeded")
+                # message_stop must still close the stream
+                self.assertEqual(events[-1]["type"], "message_stop")
 
     def test_stream_parse_failure_closes_open_content_block(self):
         """Unparsable mid-stream chunk must still close any open content_block."""
@@ -1654,11 +1661,11 @@ class TestAnthropicServing(unittest.TestCase):
     def test_stop_reason_content_filter_falls_back_with_warning(self):
         """Unmapped OpenAI finish_reasons default to 'end_turn' + log a warning.
 
-        ``content_filter`` and ``abort`` have no entry in STOP_REASON_MAP
-        because Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
+        ``content_filter`` has no entry in STOP_REASON_MAP because
+        Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
         stop_sequence/tool_use) has no perfect target. The fallback must
         produce a spec-valid stop_reason and a WARNING so operators don't
-        silently lose the safety/abort signal.
+        silently lose the safety signal.
         """
         import logging
 

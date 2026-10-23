@@ -122,9 +122,27 @@ pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReas
     })
 }
 
+/// A non-streamed choice's `finish_reason`: a natural stop that produced tool
+/// calls is reported as `tool_calls`, as in Python; a length or an aborted
+/// turn keeps its own reason.
+pub(super) fn tool_call_finish_reason(
+    output: &CoreOutput,
+    has_tool_calls: bool,
+) -> Option<OpenAIFinishReason> {
+    let kind = output
+        .finish_reason
+        .as_ref()
+        .and_then(|reason| reason.kind_name());
+    if has_tool_calls && kind == Some("stop") {
+        Some(OpenAIFinishReason::ToolCalls)
+    } else {
+        chat_finish_reason(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
+    use super::{chat_delta, chat_finish_reason, parse_chat_tool_calls, tool_call_finish_reason};
     use crate::api_server::core::CoreOutput;
     use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
     use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
@@ -416,6 +434,30 @@ mod tests {
         assert_eq!(
             chat_finish_reason(&output(serde_json::json!({"type": "content_filter"}))),
             Some(OpenAIFinishReason::ContentFilter)
+        );
+        // Only a natural stop becomes `tool_calls`.
+        for (finish, expected) in [
+            (
+                serde_json::json!({"type": "stop"}),
+                OpenAIFinishReason::ToolCalls,
+            ),
+            (
+                serde_json::json!({"type": "abort"}),
+                OpenAIFinishReason::Stop,
+            ),
+            (
+                serde_json::json!({"type": "length", "length": 8}),
+                OpenAIFinishReason::Length,
+            ),
+        ] {
+            assert_eq!(
+                tool_call_finish_reason(&output(finish), true),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            tool_call_finish_reason(&output(serde_json::json!({"type": "stop"})), false),
+            Some(OpenAIFinishReason::Stop)
         );
         // Unknown kinds (including a bare abort) fall back to `stop`.
         assert_eq!(

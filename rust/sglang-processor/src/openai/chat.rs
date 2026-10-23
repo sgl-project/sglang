@@ -13,8 +13,8 @@ use super::request::{
     format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
-    stream_error_event, unary_reply,
+    Payload, Reply, StreamState, abort_error, error_reply, malformed_output_reply, meta_u64, now,
+    openai_finish_reason, stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
@@ -843,6 +843,13 @@ impl ChatResponder {
         for item in &mut ret {
             self.report_prompt_tokens(&mut item["meta_info"]);
         }
+        // One choice aborted with an error status fails the whole request.
+        if let Some((code, message)) = ret
+            .iter()
+            .find_map(|item| abort_error(&item["meta_info"]["finish_reason"]))
+        {
+            return Some(error_reply(message, code));
+        }
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
             let meta = &item["meta_info"];
@@ -850,7 +857,7 @@ impl ChatResponder {
                 json!({"content": self.token_logprobs(&meta["output_token_logprobs"], &meta["output_top_logprobs"])})
             });
             let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
+                return Some(malformed_output_reply());
             };
             let mut text = text.to_owned();
             let mut reasoning = String::new();
@@ -892,7 +899,7 @@ impl ChatResponder {
                 "index": index,
                 "message": message,
                 "logprobs": logprobs,
-                "finish_reason": finish_reason.get("type"),
+                "finish_reason": finish_reason.get("type").map(openai_finish_reason),
                 "matched_stop": finish_reason.get("matched"),
             }));
         }
@@ -959,18 +966,10 @@ impl ChatResponder {
         }
 
         let mut events = Vec::new();
-        if let Some(finish_type) = &finish_type {
-            // An abort carrying a status is an error; Python checks for an
-            // `HTTPStatus`, which `/generate` serializes as its integer.
-            if finish_type == "abort"
-                && let Some(code) = finish_reason["status_code"].as_u64()
-                && let Some(name) = http_status_name(code)
-            {
-                let message = finish_reason["message"]
-                    .as_str()
-                    .unwrap_or("Generation aborted.");
+        if finish_type.is_some() {
+            if let Some((code, message)) = abort_error(&finish_reason) {
                 self.stream.stopped = true;
-                return vec![stream_error_event(message, name, code as u16)];
+                return vec![stream_error_event(message, code)];
             }
             self.finish_reasons.push((index, finish_reason.clone()));
         }
@@ -1088,7 +1087,7 @@ impl ChatResponder {
                 let tool_calls = self.has_tool_calls.contains(&index);
                 chunk["choices"][0]["finish_reason"] = match reason["type"].as_str() {
                     Some("stop") if tool_calls => "tool_calls".into(),
-                    _ => reason["type"].clone(),
+                    _ => openai_finish_reason(&reason["type"]),
                 };
                 chunk["choices"][0]["matched_stop"] =
                     reason.get("matched").cloned().unwrap_or(Value::Null);
@@ -1320,5 +1319,85 @@ mod tests {
             .collect();
         assert!(created.len() > 1, "{events:?}");
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+
+    fn responder(stream: bool, n: u64) -> ChatResponder {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+            "n": n,
+        });
+        lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap()
+        .1
+    }
+
+    fn item(finish: Value) -> Value {
+        json!({"text": "a", "output_ids": [2], "meta_info": {
+            "id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1,
+        }})
+    }
+
+    /// An abort without an error status is reported as "stop"; one with a
+    /// status is an error with that status, even when another choice finished.
+    #[test]
+    fn unary_abort_is_stop_or_an_error() {
+        let reply = responder(false, 1)
+            .unary(
+                item(json!({"type": "abort", "message": "Abort before prefill"}))
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert!(body["choices"][0]["matched_stop"].is_null());
+
+        let ret = json!([
+            item(json!({"type": "stop"})),
+            item(json!({"type": "abort", "message": "Encoder timed out", "status_code": 504})),
+        ]);
+        let reply = responder(false, 2)
+            .unary(ret.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(reply.status, 504);
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"error": {
+                "message": "Encoder timed out",
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }})
+        );
+    }
+
+    #[test]
+    fn stream_abort_without_status_finishes_with_stop() {
+        let mut responder = responder(true, 1);
+        let mut events = Vec::new();
+        for frame in [
+            item(Value::Null).to_string(),
+            item(json!({"type": "abort", "message": "Abort before prefill"})).to_string(),
+            "[DONE]".into(),
+        ] {
+            events.extend(responder.stream_data(frame.as_bytes()).unwrap());
+        }
+        let reasons: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .map(|chunk| chunk["choices"][0]["finish_reason"].clone())
+            .filter(|reason| !reason.is_null())
+            .collect();
+        assert_eq!(reasons, [json!("stop")], "{events:?}");
     }
 }

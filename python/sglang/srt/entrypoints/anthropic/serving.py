@@ -61,9 +61,9 @@ logger = logging.getLogger(__name__)
 
 # Map OpenAI finish reasons to Anthropic stop reasons. Only the four
 # values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
-# on the wire; ``content_filter`` and ``abort`` have no perfect mapping
-# so they fall through to the ``end_turn`` default with a WARNING at the
-# call site so operators don't lose the safety/abort signal in logs.
+# on the wire; ``content_filter`` has no perfect mapping so it falls
+# through to the ``end_turn`` default with a WARNING at the call site so
+# operators don't lose the safety signal in logs.
 STOP_REASON_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",
@@ -81,6 +81,15 @@ ERROR_TYPE_MAP = {
     502: "api_error",
     503: "overloaded_error",
     504: "api_error",
+}
+
+OPENAI_TO_ANTHROPIC_ERROR_TYPE = {
+    "invalid_request_error": "invalid_request_error",
+    "authentication_error": "authentication_error",
+    "permission_error": "permission_error",
+    "rate_limit_error": "rate_limit_error",
+    "service_unavailable_error": "overloaded_error",
+    "server_error": "api_error",
 }
 
 
@@ -971,8 +980,8 @@ class AnthropicServing:
             """Detect an OpenAI handler streaming-error envelope.
 
             ``OpenAIServingChat.create_streaming_error_response`` emits
-            ``data: {"error": {"object":"error","message":"...",
-            "type":"BadRequestError","code":400}}``; the regular
+            ``data: {"error": {"message":"...","type":"invalid_request_error",
+            "param":null,"code":null}}``; the regular
             ChatCompletionStreamResponse validator rejects it. Pull the
             type/message out so the Anthropic client sees the real
             failure instead of a generic 'Stream processing error'.
@@ -987,10 +996,10 @@ class AnthropicServing:
             if not isinstance(err, dict):
                 return None
             upstream_message = err.get("message") or "Upstream error"
-            code = err.get("code")
+            upstream_type = err.get("type")
             error_type = (
-                ERROR_TYPE_MAP.get(code, "api_error")
-                if isinstance(code, int)
+                OPENAI_TO_ANTHROPIC_ERROR_TYPE.get(upstream_type, "api_error")
+                if isinstance(upstream_type, str)
                 else "api_error"
             )
             return error_type, str(upstream_message)

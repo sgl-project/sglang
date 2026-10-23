@@ -264,6 +264,34 @@ def should_include_usage(
     return include_usage, continuous_usage_stats
 
 
+def abort_error_status(finish_reason: dict[str, Any] | None) -> int | None:
+    """The HTTP status of an abort that carries an error status, else None.
+
+    ``status_code`` is an ``HTTPStatus`` in-process but a plain int after
+    msgpack IPC, so any int in the 4xx/5xx range counts.
+    """
+    if not finish_reason or finish_reason.get("type") != "abort":
+        return None
+    status = finish_reason.get("status_code")
+    if isinstance(status, int) and not isinstance(status, bool):
+        if 400 <= status < 600:
+            return int(status)
+    return None
+
+
+def to_openai_finish_reason(finish_reason_type: str | None) -> str | None:
+    """Map an engine finish reason onto OpenAI's finish_reason values.
+
+    An abort without an error status (``/abort_request``,
+    ``pause_generation(mode="abort")``, session replacement) is a deliberate stop
+    whose partial output is the result, so it is reported as "stop"; OpenAI
+    defines no "abort". Aborts with an error status never reach a choice.
+    """
+    if finish_reason_type == "abort":
+        return "stop"
+    return finish_reason_type
+
+
 def process_routed_experts_from_ret(
     ret_item: dict[str, Any],
     request: ChatCompletionRequest | CompletionRequest,
