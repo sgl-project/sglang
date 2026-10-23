@@ -286,19 +286,21 @@ void topk_softmax_kernel_impl(
 
 template <typename scalar_t>
 inline float router_dot_fp32_accum(
-    const scalar_t* __restrict__ hidden_states, const float* __restrict__ router_weight, int64_t hidden_dim) {
+    const scalar_t* __restrict__ hidden_states,
+    const float* __restrict__ router_weight,
+    int64_t hidden_dim) {
   using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = fVec::size();
-
-  fVec acc_vec = fVec(0.f);
+  constexpr int64_t kVecSize = fVec::size() * 2;
+  fVec acc0 = fVec(0.f);
+  fVec acc1 = fVec(0.f);
   int64_t k = 0;
   for (; k <= hidden_dim - kVecSize; k += kVecSize) {
-    fVec x_vec = load_float_vec(hidden_states + k);
-    fVec w_vec = fVec::loadu(router_weight + k);
-    acc_vec += x_vec * w_vec;
+    auto [x0, x1] = load_float_vec2(hidden_states + k);
+    auto [w0, w1] = load_float_vec2(router_weight + k);
+    acc0 += x0 * w0;
+    acc1 += x1 * w1;
   }
-
-  float acc = vec_reduce_sum(acc_vec);
+  float acc = vec_reduce_sum(acc0 + acc1);
   for (; k < hidden_dim; ++k) {
     acc += static_cast<float>(hidden_states[k]) * router_weight[k];
   }
