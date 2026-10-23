@@ -127,8 +127,33 @@ class LagunaMoEGate(nn.Module):
             requires_grad=False,
         )
         self._flydsl_router = _load_flydsl_router()
+        # [3 * num_experts, hidden] bf16, built after weight loading when
+        # SGLANG_OPT_LAGUNA_ROUTER_BF16X3 is set.
+        self.weight_bf16x3: Optional[torch.Tensor] = None
+
+    def build_bf16x3(self):
+        # W == P0 + P1 + P2; stack along N so one bf16 GEMM reads the input once.
+        parts, rest = [], self.weight.data
+        for _ in range(3):
+            part = rest.to(torch.bfloat16)
+            parts.append(part)
+            rest = rest - part.float()
+        self.weight_bf16x3 = torch.cat(parts, dim=0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 64 is laguna_router_gemv_gfx1250.MAXM_V2. Above that the GEMV
+        # returns None and the caller used to fall back to F.linear.
+        if (
+            self.weight_bf16x3 is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] > 64
+        ):
+            from aiter.tuned_gemm import tgemm
+
+            out = tgemm.mm(
+                hidden_states, self.weight_bf16x3, None, otype=torch.float32
+            )
+            return out.view(-1, 3, self.weight.shape[0]).sum(1)
         if self._flydsl_router is not None:
             logits = self._flydsl_router(hidden_states, self.weight)
             if logits is not None:
@@ -928,6 +953,11 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+
+        if envs.SGLANG_OPT_LAGUNA_ROUTER_BF16X3.get():
+            for layer in self.model.layers:
+                if isinstance(layer, LagunaDecoderLayer) and layer.is_layer_sparse:
+                    layer.mlp.gate.build_bf16x3()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
