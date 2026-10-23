@@ -30,8 +30,10 @@
  **************************************************************************************************/
 
 // Native SM120 NVFP4 MMA operand layout follows NVIDIA CUTLASS mma_sm120.hpp
-// and mma_traits_sm120.hpp, distributed under BSD-3-Clause. Exact installed-source hashes are recorded in the research
-// task history/moe-mtp-native-upstream.json.
+// and mma_traits_sm120.hpp, distributed under BSD-3-Clause. Public reference
+// copies at CUTLASS v4.8.0:
+// https://github.com/NVIDIA/cutlass/blob/098de2a652cf8f00fd70b2df54051c7eccbb855a/include/cute/arch/mma_sm120.hpp
+// https://github.com/NVIDIA/cutlass/blob/098de2a652cf8f00fd70b2df54051c7eccbb855a/include/cute/atom/mma_traits_sm120.hpp
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/type.cuh>

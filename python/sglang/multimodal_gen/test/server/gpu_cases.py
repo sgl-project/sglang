@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
     WAN_2_2_ANIMATE_2_14B_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
@@ -64,6 +65,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
+    DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
@@ -475,6 +477,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         WAN_2_2_ANIMATE_2_14B_sampling_params,
         # The DiT forward takes a per-clip conditioning container and runs forward_ref,
         # so the raw-component harness contract does not apply.
+        run_perf_check=True,
+        run_component_accuracy_check=False,
+    ),
+    # Distilled checkpoint on the same inputs and server layout: 10 steps at guidance
+    # 1.0, so the denoiser runs the single-forward path (no unconditional batch).
+    DiffusionTestCase(
+        "wan2_2_animate_2_14b_distilled_ref2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
+            modality="video",
+            dit_layerwise_offload=True,
+            text_encoder_cpu_offload=True,
+            extras=["--layerwise-offload-components", "transformer"],
+        ),
+        WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
         run_perf_check=True,
         run_component_accuracy_check=False,
     ),
@@ -1646,43 +1663,40 @@ if current_platform.is_hip():
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
+# scheduling estimates use full-process H100 CI medians, rounded up to 10s
 STANDALONE_FILE_EST_TIMES = {
     "bcg-diffusion": {
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
-        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
+        "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
-        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
-        # Raise if CI reports a higher measured time.
-        "../single_test_file/test_disagg_server.py": 600.0,
-        "../single_test_file/test_ar_models.py": 600.0,
+        "../single_test_file/test_disagg_server.py": 780.0,
+        "../single_test_file/test_ar_models.py": 120.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
-        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
-        "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
+        "../single_test_file/test_ipc_a2a_multi_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
-        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
-        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
-        # padded for cold-cache CI.
-        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 40.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 30.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 100.0,
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 70.0,
         # zimage server startup dominates; six short requests after warmup
-        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        "../single_test_file/test_dp_serving_2_gpu.py": 60.0,
         # one capture plus three replays on a 32K-element exchange
-        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
-        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
         # no model load; two small all-to-alls
-        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
-        "../unit/test_async_output_save.py": 30.0,
-        "../unit/test_kandinsky6_sequence_parallel.py": 150.0,
-        "../unit/test_kandinsky6_sr_sequence_parallel.py": 150.0,
-        "../unit/test_qwen_image21_distributed.py": 90.0,
+        "../unit/test_async_output_save.py": 20.0,
+        "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }
 

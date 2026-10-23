@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{info, loads, metrics, native_api, openai};
+use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
-use crate::api_server::core::CoreHandle;
+use crate::api_server::core::{CoreHandle, HiCacheManager};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
@@ -69,6 +69,7 @@ pub async fn serve(
     // which point `serve` stops accepting and its in-flight handlers are
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
+    hicache_manager: Arc<HiCacheManager>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
@@ -97,8 +98,9 @@ pub async fn serve(
     //
     // No body limit, matching the Python server.
     let mut app = router
-        .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(state);
+        .with_state(state)
+        .merge(hicache::routes(hicache_manager))
+        .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
         app = http_layer(app);
     }

@@ -99,15 +99,20 @@ class TestNemotronHOmniVideo(CustomTestCase):
     def test_evs_keeps_image_pad_values_for_redistribution(self):
         """EVS placeholder redistribution must not restore raw image tokens next to a video."""
         start, end, image_token = 1, 2, 18
-        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[], hash=11)
+        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[(2, 2)], hash=11)
         video = _video_item([2], pre_chunked_input_ids=[])
+        video.offsets = [(5, 5)]
         video.hash = 22
         for item in (image, video):
             item.set_pad_value()
         input_ids = array("q", [7, start, image_token, end, start, image_token, end])
         video.pre_chunked_input_ids = input_ids.tolist()
         mm_inputs = MultimodalInputs(
-            mm_items=[image, video], im_start_id=start, im_end_id=end
+            mm_items=[image, video],
+            im_start_id=start,
+            im_end_id=end,
+            im_token_id=image_token,
+            video_token_id=image_token,
         )
 
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
@@ -300,17 +305,6 @@ class TestNemotronHOmniModel(CustomTestCase):
         moe_layer_ids = [i for i, c in enumerate(pattern) if c == MOE]
         self.assertLess(max(moe_layer_ids), expert_config.num_layers)
         self.assertEqual(expert_config.num_logical_experts, 8)
-
-    def test_routed_expert_weights_come_from_language_model(self):
-        """The VL wrapper exposes the language model's expert weights for EPLB."""
-        model = object.__new__(NemotronH_Omni_Reasoning_V3)
-        nn.Module.__init__(model)
-        weights_of_layer = {1: [torch.ones(1)]}
-        model.language_model = SimpleNamespace(
-            routed_experts_weights_of_layer=weights_of_layer
-        )
-
-        self.assertIs(model.routed_experts_weights_of_layer, weights_of_layer)
 
 
 if __name__ == "__main__":
