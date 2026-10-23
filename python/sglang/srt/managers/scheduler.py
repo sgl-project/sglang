@@ -2228,6 +2228,15 @@ class Scheduler(
             self._event_loop_should_restart = False
             raise role_switch.PdRoleSwitchRestart()
 
+    def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
+        """Report a request the scheduler ends outside the output stream
+        (aborted while queued, preempted, retracted or rejected)."""
+        if self.rust_server is not None:
+            # The zmq tokenizer socket is not consumed in Rust mode.
+            self.rust_server.push_abort(abort_req, req)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
         if self.rust_server is not None:
@@ -3083,7 +3092,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3483,7 +3492,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return False
         return True
 
@@ -3526,7 +3535,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(
                 req_to_abort,
                 finished_reason={
@@ -3767,7 +3776,7 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -4458,7 +4467,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
+                self.send_abort_output(
                     _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
@@ -5584,7 +5593,7 @@ class Scheduler(
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_abort_output(
                 _make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -5612,9 +5621,7 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
-                )
+                self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -5677,9 +5684,7 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
+                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted

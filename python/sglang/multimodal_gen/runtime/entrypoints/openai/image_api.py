@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import io
 import os
 import time
 from typing import List, Optional
@@ -73,13 +74,8 @@ def _resolve_image_output_format(
     return sampling_params_cls.default_image_output_format()
 
 
-def _read_b64_for_paths(paths: list[str]) -> list[str]:
-    """Read and base64-encode each file. Must be called before cloud upload deletes them."""
-    result = []
-    for path in paths:
-        with open(path, "rb") as f:
-            result.append(base64.b64encode(f.read()).decode("utf-8"))
-    return result
+def _b64_encode_images(images: list[bytes]) -> list[str]:
+    return [base64.b64encode(image).decode("utf-8") for image in images]
 
 
 async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
@@ -181,7 +177,7 @@ def _build_image_response_kwargs(
 ) -> dict:
     """Build ImageResponse data list.
 
-    For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
+    For b64_json: uses b64_list, the base64 of the returned image bytes.
     For url: uses cloud_url or fallback_url.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
@@ -246,15 +242,15 @@ def _build_image_response_kwargs(
 
 
 def _get_response_resize(
-    sampling_params: SamplingParams, output_path: str | None = None
+    sampling_params: SamplingParams, output_image_bytes: bytes | None = None
 ) -> str | None:
     """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
     if not isinstance(sampling_params, GlmImageSamplingParams):
         return None
 
-    if output_path is not None:
+    if output_image_bytes is not None:
         try:
-            with Image.open(output_path) as output_image:
+            with Image.open(io.BytesIO(output_image_bytes)) as output_image:
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
@@ -303,6 +299,10 @@ async def generations(
         raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
     )
 
+    # responses carry the encoded bytes; files are written only to persist or upload them
+    write_output_files = (
+        server_args.output_path is not None or cloud_storage.is_enabled()
+    )
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = _build_request_sampling_params(
             request_id,
@@ -315,6 +315,8 @@ async def generations(
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             num_frames=1,
             seed=request.seed,
             generator_device=request.generator_device,
@@ -362,11 +364,10 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )
@@ -496,6 +497,10 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
+        # responses carry the encoded bytes; files are written only to persist or upload them
+        write_output_files = (
+            server_args.output_path is not None or cloud_storage.is_enabled()
+        )
         prompt = await maybe_enhance_prompt(
             raw_request,
             prompt,
@@ -512,6 +517,8 @@ async def edits(
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             image_path=input_paths,
             seed=seed,
             generator_device=generator_device,
@@ -544,11 +551,10 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )
