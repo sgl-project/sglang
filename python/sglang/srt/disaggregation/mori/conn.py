@@ -603,8 +603,20 @@ class MoriKVManager(CommonKVManager):
             self._staging_outstanding[room] -= 1
             if self._staging_outstanding[room] <= 0:
                 self._staging_outstanding.pop(room)
-                targets = self._deferred_ack_targets.pop(room, None)
+                if room not in self._deferred_ack_poisoned_rooms:
+                    targets = self._deferred_ack_targets.pop(room, None)
         self._send_abort_acks(room, targets)
+
+    def _poison_failed_transfer(
+        self, room: int, statuses: List[TransferStatus]
+    ) -> None:
+        # Failed() makes no claim on what the write still puts into the decode's
+        # pages, so the room never acks and decode falls back to its timeout.
+        if self.enable_deferred_decode_kv_release and any(
+            status.Failed() for status in statuses
+        ):
+            with self._abort_ack_lock:
+                self.poison_deferred_ack_room(room)
 
     def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> bool:
         room = kv_chunk.room
@@ -633,6 +645,7 @@ class MoriKVManager(CommonKVManager):
         if not is_quiescent:
             # The drainer now owns the decrement.
             return False
+        self._poison_failed_transfer(room, statuses)
         if self._should_skip_transfer(room):
             return True
         if failure_reason is not None:
@@ -733,6 +746,7 @@ class MoriKVManager(CommonKVManager):
         for status in statuses:
             if status.InProgress():
                 status.Wait()
+        self._poison_failed_transfer(kv_chunk.room, statuses)
         self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:
@@ -941,6 +955,8 @@ class MoriKVManager(CommonKVManager):
             return
 
         with self._abort_ack_lock:
+            if bootstrap_room in self._deferred_ack_poisoned_rooms:
+                return
             if self._staging_outstanding.get(bootstrap_room, 0) > 0:
                 self.register_deferred_ack_target(bootstrap_room, ack_target)
                 return
