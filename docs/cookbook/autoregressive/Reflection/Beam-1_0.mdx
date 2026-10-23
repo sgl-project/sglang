@@ -18,7 +18,7 @@ For host setup, see [Install SGLang with Docker](/docs/get-started/install#metho
 
 </Accordion>
 
-Select your hardware, strategy, and quantization to generate the Docker command.
+Select your hardware, strategy, and quantization to generate the `sglang serve` command.
 
 - **Low-Latency** uses TP with the [DFlash2 drafter](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2) at block size 8.
 - **High-Throughput** disables DFlash2. H200 BF16 uses TP8 with an automatic static memory fraction; the other recipes use TP + DPA. Blackwell NVFP4 also enables EP and FlashInfer MegaMoE.
