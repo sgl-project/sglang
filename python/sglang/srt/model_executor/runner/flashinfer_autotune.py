@@ -175,6 +175,8 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # Retune caches created before FlashInfer's default tactic joined the race.
+    model_key_parts.append("candidate_selection=v2_default")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))

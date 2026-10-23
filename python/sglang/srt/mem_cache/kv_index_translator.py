@@ -67,8 +67,9 @@ from typing import Dict, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
+    spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
@@ -304,6 +305,9 @@ class KVIndexTranslator:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         width: int,
+        positions_out: Optional[torch.Tensor] = None,
+        anchor_src: Optional[torch.Tensor] = None,
+        anchor_out: Optional[torch.Tensor] = None,
     ) -> KVLocPlan:
         """Gather one fixed-width speculative window, translating at its producer.
 
@@ -341,6 +345,9 @@ class KVIndexTranslator:
             full_out=writes.get(IdSpaceKind.FULL),
             swa_out=writes.get(IdSpaceKind.SLIDING_WINDOW),
             page_size=self.page_size,
+            positions_out=positions_out,
+            anchor_src=anchor_src,
+            anchor_out=anchor_out,
         )
         return self.plan(
             req_pool_indices=req_pool_indices,
@@ -538,14 +545,28 @@ class KVIndexTranslator:
         kv_start_idx: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         token_mapping: Optional[torch.Tensor] = None,
+        num_token_blocks: Optional[int] = 1,
+        kv_lens_sum: Optional[int] = None,
     ) -> bool:
         """Fill ``out``'s CSR rows with the ``kind`` ids a paged wrapper plans
         over; return whether they are physical. Packed from the plan's table
         once a table reader has had it built, else gathered and translated
         straight into ``out``. ``False`` means still-VIRTUAL full-attention ids
         (a static pool, or DCP) for the caller to finish; a static SWA pool can
-        fuse its full->swa table into the gather as ``token_mapping``."""
+        fuse its full->swa table into the gather as ``token_mapping``.
+        ``num_token_blocks`` tiles each request's gather over that many
+        programs (any count is correct); ``None`` sizes it here with
+        ``spec_kv_index_token_blocks`` from ``kv_lens_sum``, the batch's
+        host-int length sum (an upper bound on the longest row; ``None``
+        falls back to the table width). The packed-table build path has its
+        own parallelism and ignores the count."""
         bs = int(seq_lens.numel())
+        if num_token_blocks is None:
+            num_token_blocks = spec_kv_index_token_blocks(
+                table_width=self.req_to_token.size(1),
+                kv_lens_sum=kv_lens_sum,
+                batch_size=bs,
+            )
         if self._reads_translated(kind) and not plan.has_read_table(kind, reader=self):
             assert plan.is_read_by(self), (
                 "a translating reader must read through the plan of its own "
@@ -576,7 +597,7 @@ class KVIndexTranslator:
         )
         assert src.v2p is None, "pack_read_stream: a table-less translating read"
         assert token_mapping is None or not src.is_translated
-        create_flashinfer_kv_indices_triton[(bs,)](
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             src.ids,
             src.row_ids[:bs],
             seq_lens,
@@ -585,6 +606,7 @@ class KVIndexTranslator:
             out,
             src.row_stride,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             token_mapping=token_mapping,
         )
         return src.is_translated or token_mapping is not None
