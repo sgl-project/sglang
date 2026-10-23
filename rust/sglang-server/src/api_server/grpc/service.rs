@@ -2,6 +2,7 @@
 //! `api.v1` messages and the shared core.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::Stream;
@@ -10,7 +11,7 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::{CoreHandle, HealthStatus};
+use crate::api_server::core::{CoreHandle, HealthStatus, HiCacheManager};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -40,10 +41,15 @@ struct AdapterConfig {
 pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
+    hicache_manager: Arc<HiCacheManager>,
 }
 
 impl GrpcService {
-    pub(crate) fn new(core: CoreHandle, server_args: &ServerArgs) -> Self {
+    pub(crate) fn new(
+        core: CoreHandle,
+        server_args: &ServerArgs,
+        hicache_manager: Arc<HiCacheManager>,
+    ) -> Self {
         Self {
             core,
             config: AdapterConfig {
@@ -56,6 +62,7 @@ impl GrpcService {
                 has_tokenizer: !server_args.skip_tokenizer_init,
                 generation_policy: server_args.into(),
             },
+            hicache_manager,
         }
     }
 
@@ -67,6 +74,7 @@ impl GrpcService {
         response_timeout: Duration,
     ) -> Self {
         Self {
+            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &ServerArgs::default())),
             core,
             config: AdapterConfig {
                 preferred_sampling_params,
@@ -163,6 +171,49 @@ impl SglangService for GrpcService {
         info::server_info(server_info)
             .map(Response::new)
             .map_err(Status::internal)
+    }
+
+    async fn get_hi_cache_storage(
+        &self,
+        _request: Request<api::GetHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStatus>, Status> {
+        Ok(Response::new(self.hicache_manager.status().await))
+    }
+
+    async fn attach_hi_cache_storage(
+        &self,
+        request: Request<api::AttachHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        let output = self
+            .hicache_manager
+            .attach(request.into_inner())
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(output))
+    }
+
+    async fn detach_hi_cache_storage(
+        &self,
+        _request: Request<api::DetachHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        let output = self
+            .hicache_manager
+            .detach()
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(output))
+    }
+
+    async fn clear_hi_cache_storage(
+        &self,
+        _request: Request<api::ClearHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        let output = self
+            .hicache_manager
+            .clear()
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(output))
     }
 
     async fn list_models(
@@ -792,6 +843,114 @@ mod tests {
         assert_eq!(error.code(), Code::Unavailable);
         let probe = stalled.next_generation().await;
         assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
+    }
+
+    /// Check gRPC validation, scheduler results, and the configuration returned by GET.
+    #[tokio::test]
+    async fn hicache_controls_preserve_results_and_configuration() {
+        let h = Harness::new(8, false, Duration::from_secs(5));
+        let service = &h.service;
+        let initial = service
+            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(initial, api::HiCacheStatus::default());
+        let error = service
+            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(h.intake_rx.is_empty());
+
+        for success in [false, true] {
+            let response = hicache_reply(
+                &h,
+                "AttachHiCacheStorageReqInput",
+                success,
+                service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
+                    hicache_storage_backend: Some("file".into()),
+                    hicache_write_policy: Some("write_through".into()),
+                    ..Default::default()
+                })),
+            )
+            .await;
+            assert_eq!(response.success, success);
+            assert_eq!(response.message, "backend detail");
+        }
+        for success in [false, true] {
+            let response = hicache_reply(
+                &h,
+                "ClearHiCacheReqInput",
+                success,
+                service.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
+            )
+            .await;
+            assert_eq!(response.success, success);
+            assert!(response.message.is_empty());
+        }
+        for success in [false, true] {
+            let response = hicache_reply(
+                &h,
+                "DetachHiCacheStorageReqInput",
+                success,
+                service.detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {})),
+            )
+            .await;
+            assert_eq!(response.success, success);
+            assert_eq!(response.message, "backend detail");
+        }
+        let status = service
+            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status,
+            api::HiCacheStatus {
+                hicache_write_policy: Some("write_through".into()),
+                ..Default::default()
+            }
+        );
+    }
+
+    // Drive the RPC and a simulated scheduler reply together, checking the request tag.
+    async fn hicache_reply(
+        h: &Harness,
+        tag: &str,
+        success: bool,
+        call: impl std::future::Future<
+            Output = Result<tonic::Response<api::HiCacheStorageResponse>, tonic::Status>,
+        >,
+    ) -> api::HiCacheStorageResponse {
+        let scheduler = async {
+            let TmEvent::Intake { request, admission } = h.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected control intake");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected control request");
+            };
+            let wire: serde_json::Value =
+                rmp_serde::from_slice(&control.encode().unwrap()).unwrap();
+            assert_eq!(wire[0], tag);
+            request
+                .sink
+                .try_send(ResponseItem::Control(bytes::Bytes::from(
+                    rmp_serde::to_vec_named(
+                        &serde_json::json!({"success": success, "message": "backend detail"}),
+                    )
+                    .unwrap(),
+                )))
+                .unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (response, ()) = tokio::join!(call, scheduler);
+            response.unwrap().into_inner()
+        })
+        .await
+        .expect("HiCache RPC did not finish")
     }
 
     #[tokio::test]

@@ -12,7 +12,6 @@ extra-K softmax reference. Compressor math correctness (i.e. verifying the
 gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
-import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -20,13 +19,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-_FLASH_MLA_AVAILABLE = (
-    importlib.util.find_spec("sgl_kernel") is not None
-    and importlib.util.find_spec("sgl_kernel.flash_mla") is not None
-)
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
@@ -46,13 +38,13 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-@unittest.skipIf(not _FLASH_MLA_AVAILABLE, "flash_mla is required for DSV4 SWA")
 class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     CASES = make_dsv4_cases("dsv4")
     CUDA_GRAPH_DECODE_CASES = (
@@ -669,6 +661,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.prefill_candidates = object.__new__(DenseBlocksBackend)
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.low_ratios = ()
+        backend.has_c4 = backend.has_c128 = True
         calls = []
 
         def fake_build_forward_metadata(
@@ -723,12 +716,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
 
-    def test_sparse_prefill_workspace_reuses_and_grows(self):
+    def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-            SparsePrefillWorkspace,
+            SparsePrefillKVBuffer,
         )
 
-        workspace = SparsePrefillWorkspace(torch.device("cpu"))
+        workspace = SparsePrefillKVBuffer(torch.device("cpu"))
         first = workspace.get(3)
         reused = workspace.get(2)
         grown = workspace.get(7)

@@ -1960,6 +1960,9 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            # A prefill that a later request reaches again starts with no
+            # misses; a kept count would drop it at its first missed heartbeat.
+            self.heartbeat_failures.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = list(
                 self.addr_to_rooms_tracker.get(failed_bootstrap_addr, [])

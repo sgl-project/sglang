@@ -21,11 +21,17 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
+def _run_as_single_rank(test: unittest.TestCase) -> None:
+    # The transfer queue sizes its release collectives from the gloo group;
+    # these tests have no process group, so answer as one rank.
+    world_size = patch("torch.distributed.get_world_size", return_value=1)
+    world_size.start()
+    test.addCleanup(world_size.stop)
+
+
 class TestDecodeQueueCleanup(CustomTestCase):
     def setUp(self):
-        world_size = patch("torch.distributed.get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
         # The code under test reads its config from the bags.
         reset_context()
         self.addCleanup(reset_context)
@@ -125,9 +131,7 @@ def _gated_decode_req(poll, restore_status):
 class TestDecodeHiCacheRestoreGate(CustomTestCase):
     def setUp(self):
         super().setUp()
-        world_size = patch("torch.distributed.get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def test_gate_folds_restore_outcome_into_terminal_poll_only(self):
         cases = [

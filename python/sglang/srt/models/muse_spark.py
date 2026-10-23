@@ -30,6 +30,10 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
+from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
+    router_gemv_cute,
+    router_gemv_cute_eligible,
+)
 from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
 from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
     FusedPostNormResidualPreNorm,
@@ -111,9 +115,13 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
         super().__init__(config, **kwargs)
         self.use_fp32_output = True
 
-    def _compute_lm_head(self, hidden_states, lm_head, embedding_bias=None):
+    def _compute_lm_head(
+        self, hidden_states, lm_head, embedding_bias=None, *, out=None
+    ):
         if not hasattr(lm_head, "weight"):
-            return super()._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            return super()._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=out
+            )
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
         if use_intel_amx_backend(lm_head):
             # ParallelLMHead swaps in PackWeightMethod on CPU+AMX, which repacks
@@ -126,10 +134,16 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 True,
             ).to(output_dtype)
         else:
+            if out is not None and out.shape != (
+                hidden_states.shape[0],
+                lm_head.weight.shape[0],
+            ):
+                out = None
             logits = torch.mm(
                 hidden_states.to(lm_head.weight.dtype),
                 lm_head.weight.T,
                 out_dtype=output_dtype,
+                out=out,
             )
         if embedding_bias is not None:
             logits = logits + embedding_bias
@@ -231,6 +245,9 @@ class MuseSpark1xRouter(nn.Module):
         return acc
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+        if router_gemv_cute_eligible(hidden_states, self.weight):
+            return router_gemv_cute(hidden_states, self.weight)
         return F.linear(hidden_states, self.weight)
 
 
