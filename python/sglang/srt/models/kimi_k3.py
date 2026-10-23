@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import math
 import os
 import re
 from array import array
@@ -3741,6 +3742,31 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 features, device=device, dtype=target_dtype
             )
 
+        from sglang.srt.multimodal.mm_utils import iter_frame_bounded_image_batches
+
+        max_frames = envs.SGLANG_K3_VISION_MAX_FRAMES_PER_BATCH.get()
+        encode_owned = None
+        if max_frames > 0:
+
+            def encode_owned(indices):
+                outputs = []
+                for group in iter_frame_bounded_image_batches(
+                    indices, grid_thw_list, max_frames
+                ):
+                    pixels = materialize_item_features(group)
+                    grids = [grid_thw_list[index] for index in group]
+                    output = self.vision_tower(
+                        pixels,
+                        grid_hw=torch.tensor(grids, device=device),
+                        grid_thw_list=grids,
+                        max_seqlen=max(math.prod(grid) for grid in grids),
+                    )
+                    outputs.append(
+                        torch.cat(output, dim=0) if isinstance(output, list) else output
+                    )
+                    del pixels
+                return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 
@@ -3754,11 +3780,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 # gather length must ignore t.
                 pool_temporal_dimension=True,
                 pass_grid_thw_list=True,
-                load_local_pixel_values=materialize_item_features,
+                load_local_pixel_values=materialize_item_features
+                if encode_owned is None
+                else None,
+                encode_local_items=encode_owned,
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
             )
             return self.mm_projector(image_embeds)
+
+        if encode_owned is not None:
+            return self.mm_projector(encode_owned(list(range(len(items)))))
 
         pixel_values = materialize_item_features(list(range(len(items))))
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
