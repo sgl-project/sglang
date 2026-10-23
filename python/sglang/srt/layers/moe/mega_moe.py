@@ -415,9 +415,11 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
+    jit_pre_dispatch = mma_type not in ("nvfp4xnvfp4", "mxf4xmxf4")
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
-        topk_weights_in = topk_weights_in * routed_scaling_factor
+        if not jit_pre_dispatch:
+            topk_weights_in = topk_weights_in * routed_scaling_factor
 
     mega_kwargs = {"recipe": (1, 1, 32)}
     if mma_type == "nvfp4xnvfp4":
@@ -486,6 +488,7 @@ def run_mega_routed_experts(
             ),
             shared_block_m=shared_block_m,
             copy_topk=not routing_in_buffer,
+            topk_weight_scale=routed_scaling_factor,
         )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
