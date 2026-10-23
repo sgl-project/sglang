@@ -14,12 +14,10 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -181,23 +179,10 @@ def _use_rocm_triton_softmax_topk(
     )
 
 
-_use_aiter_topk_gating = envs.SGLANG_ROCM_USE_AITER_TOPK_GATING.get()
+_use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
 
 # Above this, topk_gating is slower than fused_topk on GPU time.
 _AITER_TOPK_GATING_MAX_ROWS = 4096
-
-
-@lru_cache(maxsize=1)
-def _aiter_topk_gating_renormalizes_softmax() -> bool:
-    # aiter before #4460 ignores need_renorm for softmax; JIT builds make the
-    # version string unreliable, so probe the signature.
-    try:
-        from aiter import topk_gating
-
-        params = inspect.signature(topk_gating).parameters
-        return "need_renorm" in params and "score_func" in params
-    except (AttributeError, ImportError, TypeError, ValueError):
-        return False
 
 
 def _use_aiter_topk_gating_softmax(
@@ -223,7 +208,6 @@ def _use_aiter_topk_gating_softmax(
         and correction_bias is None
         and num_fused_shared_experts == 0
         and packed_out is None
-        and _aiter_topk_gating_renormalizes_softmax()
     )
 
 
