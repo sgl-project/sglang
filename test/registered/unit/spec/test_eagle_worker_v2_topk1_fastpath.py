@@ -183,6 +183,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
             torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
             None,
+            None,
         )
         tree_result = (
             torch.empty((0,), dtype=torch.bool, device=DEVICE),
@@ -207,6 +208,8 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.cuda_graph_runner = SimpleNamespace(
                     execute=MagicMock(return_value=graph_result)
                 )
+                worker.cuda_graph_runner_watermark_off = None
+                worker.cuda_graph_runner_watermark_mixed = None
                 worker.draft_runner = SimpleNamespace(canary_manager=None)
                 worker.topk = 1
                 worker.speculative_num_steps = 1
@@ -236,6 +239,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     ),
                 )
                 batch = SimpleNamespace(
+                    sampling_info=SimpleNamespace(synthid_state=None),
                     spec_info=draft_input,
                     forward_mode=ForwardMode.DECODE,
                     seq_lens_sum=1,

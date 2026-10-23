@@ -1528,6 +1528,8 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
         future_map.hidden_states_buf = None
         future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
+        future_map.draft_prob_token_ids_buf = None
+        future_map.request_proposal_relay = None
         future_map.dsa_topk_indices_buf = None
         future_indices = torch.tensor([2, 3], dtype=torch.int64)
         spec_input = future_map.make_staged_spec_input(future_indices)
@@ -2039,6 +2041,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         future_map.topk_index_buf = None
         future_map.hidden_states_buf = None
         future_map.draft_probs_buf = None
+        future_map.draft_prob_token_ids_buf = None
 
         future_map._maybe_init_forward_bufs(
             RelayPayload(bonus_tokens=torch.zeros((2,), dtype=torch.int64))

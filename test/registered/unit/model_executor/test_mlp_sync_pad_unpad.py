@@ -142,6 +142,8 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
     def test_draft_only_gate_does_not_disable_draft_extend_graph(self):
         draft_runner = object.__new__(EAGLEDraftCudaGraphRunner)
+        draft_runner.synthid_mixed = False
+        draft_runner.synthid_watermark = None
         draft_extend_runner = object.__new__(EAGLEDraftExtendCudaGraphRunner)
         for runner in (draft_runner, draft_extend_runner):
             runner.require_mlp_tp_gather = False
@@ -151,6 +153,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             runner.max_bs = 8
 
         forward_batch = SimpleNamespace(
+            sampling_info=None,
             spec_info=SimpleNamespace(num_tokens_per_req=1),
             batch_size=1,
             seq_lens=torch.ones(1),
