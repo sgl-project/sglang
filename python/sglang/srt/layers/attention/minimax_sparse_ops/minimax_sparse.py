@@ -392,6 +392,7 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
+            packed_queries=packed_queries,
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
