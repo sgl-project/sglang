@@ -202,7 +202,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         page_ids = page_ids.to(device=table.device, dtype=table.dtype).view(-1)
         old = table[req_pool_idx, : page_ids.numel()].clone()
         changed = old != page_ids
-        print(f"==Coverage test==")
         self.release_c128_pages(old[changed])
         self.retain_c128_pages(page_ids[changed])
         table[req_pool_idx, : page_ids.numel()] = page_ids
