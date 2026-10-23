@@ -402,8 +402,9 @@ export const config = {
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
-    // gfx950 build; the generic image is CUDA-only.
-    mi355x:  "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261014",
+    // gfx950 build; the generic image is CUDA-only. Same tag as the AMD
+    // nightly performance config for this checkpoint.
+    mi355x:  "lmsysorg/sglang-rocm:v0.5.22-rocm724-mi35x-20261021",
   },
 
   github: {
@@ -1054,8 +1055,13 @@ export const config = {
       // encoder). SGLANG_USE_AITER selects the AITER MXFP4 GEMM, attention,
       // norm and rope kernels; the ROCm image sets it, a bare-pip host does
       // not. The flags follow the AMD nightly performance config for this
-      // checkpoint at TP1. Accuracy on this card is still being run, so the
-      // whole envelope reports in-progress.
+      // checkpoint at TP1, plus the breakable prefill CUDA graph: on HIP the
+      // prefill graph is off unless a backend is set
+      // (cuda_graph_config.default_prefill_backend), and turning it on was
+      // measured at +9.5% image throughput (-16% TTFT) at TP1 and +2.5% at
+      // TP2. It was accuracy-checked (GSM8K, MMMU) but is not bit-exact
+      // against eager prefill. The full GSM8K run for this exact cell is
+      // still outstanding, so the envelope reports in-progress.
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", nodes: "single" },
       verified: false,
       verificationStatus: "in-progress",
@@ -1070,6 +1076,7 @@ export const config = {
         "--mem-fraction-static 0.9",
         "--attention-backend aiter",
         "--chunked-prefill-size 16384",
+        "--cuda-graph-backend-prefill breakable",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
