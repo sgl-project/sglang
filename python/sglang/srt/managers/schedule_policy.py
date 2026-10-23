@@ -1226,27 +1226,15 @@ class PrefillAdder:
         )
         if not fits:
             return AddReqResult.NO_TOKEN
-        beam_budget = self._beam_decode_token_budget(req)
-        if (
-            beam_budget is not None
-            and paged_input + beam_budget > self.rem_total_tokens
-        ):
-            return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            beam_budget = self._beam_decode_token_budget(r)
-            if beam_budget is None:
-                new_token_ratio = (
-                    1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-                )
-                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                    r.output_ids
-                )
-            else:
-                tokens_left = beam_budget
+            new_token_ratio = (
+                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            )
+            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                r.output_ids
+            )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
-            if beam_budget is not None:
-                tokens_occupied += r.beam_group.extra_uncached_tokens()
 
             if tokens_left <= 0:
                 return
@@ -1327,9 +1315,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_len,
-                self._decode_token_budget_for_admission(
-                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                ),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
@@ -1355,7 +1341,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 trunc_len,
-                self._decode_token_budget_for_admission(req, 0),
+                0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
