@@ -1,9 +1,9 @@
-"""Process checkpoint lifecycle of one scheduler.
+"""Process checkpoint state of one scheduler.
 
-An external orchestrator (for example ai-dynamo/snapshot) captures the whole
-process once it is prepared, restores it elsewhere or keeps it, and resumes
-it. The scheduler goes running -> preparing -> prepared -> running any number
-of times, or ends in failed. Repeated calls are no-ops.
+An external orchestrator captures the whole process once it is prepared,
+restores it elsewhere or keeps it, and resumes it. The scheduler goes
+running -> preparing -> prepared -> running any number of times, or ends in
+failed. Repeated calls are no-ops.
 
 The tokenizer pauses generation as /pause_generation does before preparing,
 and continues it after resuming, so clients see a paused server in between.
@@ -12,7 +12,7 @@ Weights stay on the GPU. Resume brings the KV cache back.
 """
 
 import logging
-from typing import Callable, Set
+from typing import Any, Callable, List, Set
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.managers.io_struct import (
@@ -27,29 +27,34 @@ from sglang.srt.managers.io_struct import (
 logger = logging.getLogger(__name__)
 
 
-class SchedulerCheckpointLifecycle:
+class SchedulerCheckpointManager:
     def __init__(
         self,
         *,
         enable_memory_saver: bool,
+        pp_size: int,
         offload_tags: Set[str],
         is_engine_paused: Callable[[], bool],
         is_fully_idle: Callable[..., bool],
         release_memory_occupation: Callable[[ReleaseMemoryOccupationReqInput], None],
         resume_memory_occupation: Callable[[ResumeMemoryOccupationReqInput], None],
+        all_gather_object: Callable[[Any], List[Any]],
     ) -> None:
         self._enable_memory_saver = enable_memory_saver
+        self._pp_size = pp_size
         # Live view of the memory regions released through the admin API.
         self._offload_tags = offload_tags
         self._is_engine_paused = is_engine_paused
         self._is_fully_idle = is_fully_idle
         self._release_memory_occupation = release_memory_occupation
         self._resume_memory_occupation = resume_memory_occupation
+        # Over the TP ranks of this DP rank.
+        self._all_gather_object = all_gather_object
         self.state = CheckpointState.RUNNING
         self._error = ""
 
     def handle(self, recv_req: CheckpointReqInput) -> CheckpointReqOutput:
-        # STATE reports whether PREPARE would be refused; repeats are no-ops.
+        # STATE reports whether PREPARE would be refused. Repeats are no-ops.
         success, message = True, ""
         if self.state == CheckpointState.FAILED:
             success = False
@@ -72,6 +77,11 @@ class SchedulerCheckpointLifecycle:
             if not self._enable_memory_saver:
                 success = False
                 message = "Preparing for a checkpoint requires --enable-memory-saver"
+            elif self._pp_size > 1:
+                success = False
+                message = (
+                    "Preparing for a checkpoint does not support pipeline parallelism"
+                )
             elif self._offload_tags:
                 success = False
                 message = f"Memory is already released: {sorted(self._offload_tags)}"
@@ -81,15 +91,18 @@ class SchedulerCheckpointLifecycle:
                 success = False
                 message = (
                     "Cannot drain a retract pause while requests wait on grammar, "
-                    "KV transfer or HiCache work; use mode=abort"
+                    "KV transfer or HiCache work. Use mode=abort"
                 )
             elif recv_req.req_type == CheckpointReqType.PREPARE:
                 logger.info("Preparing for a process checkpoint")
                 self.state = CheckpointState.PREPARING
                 self.check_pending()
-        return CheckpointReqOutput(
+        out = CheckpointReqOutput(
             success=success, message=message or self._error, state=self.state
         )
+        # Only the first TP rank replies to the tokenizer, so it reports them all.
+        # Every TP rank handles this request in the same scheduler iteration.
+        return CheckpointReqOutput.merge(self._all_gather_object(out))
 
     def check_pending(self) -> None:
         """Finish preparing once the drain is complete."""

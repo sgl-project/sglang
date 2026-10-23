@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.managers.io_struct import CheckpointState
-from sglang.srt.managers.scheduler_components.checkpoint_lifecycle import (
-    SchedulerCheckpointLifecycle,
+from sglang.srt.managers.scheduler_components.checkpoint_manager import (
+    SchedulerCheckpointManager,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -13,41 +13,62 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _server(*drained, release_error=None):
-    """A tokenizer over one real scheduler lifecycle per DP rank. `drained`
-    says whether each rank goes idle; pause, continue and the KV cache
-    release are recorded in `calls`."""
+def _server(*drained, tp_size=1, release_error=None):
+    """A tokenizer over real scheduler checkpoint managers, `tp_size` per DP
+    rank. `drained` says whether each DP rank goes idle, and the last TP rank
+    of each fails its KV cache release with `release_error`. Pause, continue
+    and the KV cache release are recorded in `calls`."""
     calls = []
     engine_paused = [False]
 
     async def pause_generation(obj):
         calls.append("pause")
-        # Abort only holds requests in the tokenizer; retract pauses the scheduler.
+        # Abort only holds requests in the tokenizer. Retract pauses the scheduler.
         engine_paused[0] = obj.mode == "retract"
 
     async def continue_generation(obj):
         calls.append("continue")
         engine_paused[0] = False
 
-    def release(req):
-        if release_error is not None:
-            raise release_error
-        calls.append("release")
+    def release(fails):
+        def release_memory_occupation(req):
+            if fails and release_error is not None:
+                raise release_error
+            calls.append("release")
+
+        return release_memory_occupation
+
+    # TP ranks of a DP rank handle each request in turn, the first one last,
+    # and see every output gathered so far.
+    gathered = []
+
+    def all_gather_object(out):
+        gathered.append(out)
+        return list(gathered)
 
     ranks = [
-        SchedulerCheckpointLifecycle(
+        SchedulerCheckpointManager(
             enable_memory_saver=True,
+            pp_size=1,
             offload_tags=set(),
             is_engine_paused=lambda: engine_paused[0],
             is_fully_idle=MagicMock(return_value=idle),
-            release_memory_occupation=release,
+            release_memory_occupation=release(fails=tp_rank == tp_size - 1),
             resume_memory_occupation=lambda req: calls.append("resume_kv"),
+            all_gather_object=all_gather_object,
         )
         for idle in drained
+        for tp_rank in range(tp_size)
     ]
 
     async def checkpoint_communicator(obj):
-        return [rank.handle(obj) for rank in ranks]
+        # Only the first TP rank of each DP rank replies.
+        replies = []
+        for dp_rank in range(len(drained)):
+            gathered.clear()
+            tp_ranks = ranks[dp_rank * tp_size : (dp_rank + 1) * tp_size]
+            replies.append([rank.handle(obj) for rank in reversed(tp_ranks)][-1])
+        return replies
 
     tokenizer = SimpleNamespace(
         auto_create_handle_loop=lambda: None,
@@ -71,7 +92,7 @@ def _resume(tokenizer):
     return asyncio.run(TokenizerControlMixin.checkpoint_resume(tokenizer))
 
 
-class TestCheckpointLifecycle(unittest.TestCase):
+class TestCheckpointManager(unittest.TestCase):
     def test_prepare_releases_kv_cache_only_after_pause_and_drain(self):
         """A request scheduled after the KV cache is released runs without one,
         so generation is paused first and the release waits for the drain.
@@ -102,7 +123,7 @@ class TestCheckpointLifecycle(unittest.TestCase):
         self.assertEqual([r.state for r in ranks], [CheckpointState.RUNNING] * 2)
 
     def test_resume_continues_only_the_pause_of_its_cycle(self):
-        """Orchestrators redeliver resume; a repeat must not lift a pause a user
+        """Orchestrators redeliver resume. A repeat must not lift a pause a user
         started after the cycle ended."""
         tokenizer, ranks, calls = _server(True, True)
         _prepare(tokenizer)
@@ -124,6 +145,21 @@ class TestCheckpointLifecycle(unittest.TestCase):
         out = _resume(tokenizer)
         self.assertFalse(out.success)
         self.assertEqual(calls, ["pause"])
+
+    def test_failure_on_a_tp_rank_that_does_not_reply_is_reported(self):
+        """Only the first TP rank of a DP rank replies to the tokenizer. If
+        another one fails to release its KV cache, the server must not report
+        prepared, or it would be captured with that KV cache."""
+        tokenizer, ranks, calls = _server(
+            True, tp_size=2, release_error=RuntimeError("oom")
+        )
+
+        out = _prepare(tokenizer)
+        self.assertEqual(
+            [r.state for r in ranks], [CheckpointState.PREPARED, CheckpointState.FAILED]
+        )
+        self.assertEqual(out.state, CheckpointState.FAILED)
+        self.assertIn("oom", out.message)
 
 
 if __name__ == "__main__":
