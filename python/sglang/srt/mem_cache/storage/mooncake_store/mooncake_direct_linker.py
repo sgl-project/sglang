@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -366,6 +367,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
+            batches = {
+                name: (keys, np.asarray(locations, dtype=np.int64))
+                for name, (keys, locations) in batches.items()
+            }
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():

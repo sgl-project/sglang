@@ -1,9 +1,11 @@
 """Unit tests for external-linker device pool assembly."""
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -15,6 +17,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _with_packed_draft_mapping,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -160,71 +163,140 @@ class TestDevicePoolGroup(CustomTestCase):
         self.assertEqual(resolved[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
 
 
+def _deepseek_v4_group():
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4LayerItem,
+        DeepSeekV4TokenToKVPool,
+    )
+
+    def state_pool():
+        return SimpleNamespace(
+            ring_size=2,
+            kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((8, 3))),
+        )
+
+    kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+    kvcache._unified_kv = False
+    kvcache.start_layer = 1
+    kvcache.end_layer = 4
+    kvcache.swa_page_size = 2
+    kvcache.swa_kv_pool = SimpleNamespace(
+        page_size=2,
+        kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
+    )
+    kvcache.c4_kv_pool = SimpleNamespace(
+        kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],
+        bytes_per_page_padded=5,
+    )
+    kvcache.c4_indexer_kv_pool = SimpleNamespace(
+        index_k_with_scale_buffer=[
+            torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
+        ]
+    )
+    kvcache.c128_kv_pool = SimpleNamespace(
+        kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)],
+        bytes_per_page_padded=11,
+    )
+    kvcache.layer_mapping = [
+        DeepSeekV4LayerItem(0, -1),
+        DeepSeekV4LayerItem(4, 0),
+        DeepSeekV4LayerItem(128, 0),
+        DeepSeekV4LayerItem(4, 1),
+    ]
+    kvcache.compress_state_pools = [None, state_pool(), None, state_pool()]
+    kvcache.indexer_compress_state_pools = [
+        None,
+        state_pool(),
+        None,
+        state_pool(),
+    ]
+    draft_swa_buffers = [
+        torch.zeros((8, 13), dtype=torch.uint8),
+        torch.zeros((8, 17), dtype=torch.uint8),
+    ]
+
+    group = resolve_hybrid_device_pool_group(
+        kvcache=kvcache,
+        page_size=2,
+        params=SimpleNamespace(
+            mtp_draft_device_pools=(
+                SimpleNamespace(
+                    swa_kv_pool=SimpleNamespace(kv_buffer=draft_swa_buffers)
+                ),
+            )
+        ),
+        components={ComponentType.FULL, ComponentType.SWA},
+    )
+    return group
+
+
+def _deepseek_v41_group():
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4LayerItem,
+        DeepSeekV4TokenToKVPool,
+    )
+
+    def index_pool(layers, rows, width):
+        return SimpleNamespace(
+            page_size=2,
+            index_k_with_scale_buffer=None,
+            index_k_payload_buffer=[
+                torch.arange(rows * width, dtype=torch.uint8).reshape(rows, width)
+                for _ in range(layers)
+            ],
+            index_k_scale_buffer=[
+                torch.zeros((rows, 2), dtype=torch.uint8) for _ in range(layers)
+            ],
+        )
+
+    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+    pool._unified_kv = False
+    pool.start_layer, pool.end_layer = 1, 7
+    pool.swa_page_size = 8
+    pool.swa_kv_pool = SimpleNamespace(
+        page_size=8,
+        kv_buffer=[torch.zeros((5, 3), dtype=torch.uint8) for _ in range(6)],
+    )
+    pool.c4_kv_pool = pool.c128_kv_pool = pool.c4_indexer_kv_pool = None
+    pool.sources_by_ratio = {1: [4], 2: [2, 6]}
+    pool.kv_pools = {
+        1: SimpleNamespace(kv_buffer=[torch.zeros((5, 7), dtype=torch.uint8)]),
+        2: SimpleNamespace(
+            kv_buffer=[torch.zeros((5, 11), dtype=torch.uint8) for _ in range(2)]
+        ),
+    }
+    pool.index_pools = {1: index_pool(1, 23, 4), 2: index_pool(2, 13, 6)}
+    pool.layer_mapping = [
+        DeepSeekV4LayerItem(ratio, layer)
+        for ratio, layer in [
+            (0, -1),
+            (0, -1),
+            (2, 0),
+            (2, 0),
+            (1, 0),
+            (1, 0),
+            (2, 1),
+        ]
+    ]
+    pool.compress_state_pools = [None] * 7
+    pool.indexer_compress_state_pools = [None] * 7
+    draft = SimpleNamespace(
+        swa_kv_pool=SimpleNamespace(
+            kv_buffer=[torch.zeros((5, 13), dtype=torch.uint8) for _ in range(2)]
+        )
+    )
+    group = resolve_hybrid_device_pool_group(
+        kvcache=pool,
+        page_size=8,
+        params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
+        components={ComponentType.FULL, ComponentType.SWA},
+    )
+    return group, pool
+
+
 class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_deepseek_v4_maps_sparse_sidecars(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4LayerItem,
-            DeepSeekV4TokenToKVPool,
-        )
-
-        def state_pool():
-            return SimpleNamespace(
-                ring_size=2,
-                kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((8, 3))),
-            )
-
-        kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        kvcache._unified_kv = False
-        kvcache.start_layer = 1
-        kvcache.end_layer = 4
-        kvcache.swa_page_size = 2
-        kvcache.swa_kv_pool = SimpleNamespace(
-            page_size=2,
-            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
-        )
-        kvcache.c4_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],
-            bytes_per_page_padded=5,
-        )
-        kvcache.c4_indexer_kv_pool = SimpleNamespace(
-            index_k_with_scale_buffer=[
-                torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
-            ]
-        )
-        kvcache.c128_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)],
-            bytes_per_page_padded=11,
-        )
-        kvcache.layer_mapping = [
-            DeepSeekV4LayerItem(0, -1),
-            DeepSeekV4LayerItem(4, 0),
-            DeepSeekV4LayerItem(128, 0),
-            DeepSeekV4LayerItem(4, 1),
-        ]
-        kvcache.compress_state_pools = [None, state_pool(), None, state_pool()]
-        kvcache.indexer_compress_state_pools = [
-            None,
-            state_pool(),
-            None,
-            state_pool(),
-        ]
-        draft_swa_buffers = [
-            torch.zeros((8, 13), dtype=torch.uint8),
-            torch.zeros((8, 17), dtype=torch.uint8),
-        ]
-
-        group = resolve_hybrid_device_pool_group(
-            kvcache=kvcache,
-            page_size=2,
-            params=SimpleNamespace(
-                mtp_draft_device_pools=(
-                    SimpleNamespace(
-                        swa_kv_pool=SimpleNamespace(kv_buffer=draft_swa_buffers)
-                    ),
-                )
-            ),
-            components={ComponentType.FULL, ComponentType.SWA},
-        )
+        group = _deepseek_v4_group()
 
         self.assertEqual(group.num_layers, 3)
         self.assertTrue(group.rank_replicated)
@@ -260,66 +332,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(offsets, [[3, 22]])
 
     def test_deepseek_v41_shared_kv_and_split_indexer_pages(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4LayerItem,
-            DeepSeekV4TokenToKVPool,
-        )
-
-        def index_pool(layers, rows, width):
-            return SimpleNamespace(
-                page_size=2,
-                index_k_with_scale_buffer=None,
-                index_k_payload_buffer=[
-                    torch.arange(rows * width, dtype=torch.uint8).reshape(rows, width)
-                    for _ in range(layers)
-                ],
-                index_k_scale_buffer=[
-                    torch.zeros((rows, 2), dtype=torch.uint8) for _ in range(layers)
-                ],
-            )
-
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool._unified_kv = False
-        pool.start_layer, pool.end_layer = 1, 7
-        pool.swa_page_size = 8
-        pool.swa_kv_pool = SimpleNamespace(
-            page_size=8,
-            kv_buffer=[torch.zeros((5, 3), dtype=torch.uint8) for _ in range(6)],
-        )
-        pool.c4_kv_pool = pool.c128_kv_pool = pool.c4_indexer_kv_pool = None
-        pool.sources_by_ratio = {1: [4], 2: [2, 6]}
-        pool.kv_pools = {
-            1: SimpleNamespace(kv_buffer=[torch.zeros((5, 7), dtype=torch.uint8)]),
-            2: SimpleNamespace(
-                kv_buffer=[torch.zeros((5, 11), dtype=torch.uint8) for _ in range(2)]
-            ),
-        }
-        pool.index_pools = {1: index_pool(1, 23, 4), 2: index_pool(2, 13, 6)}
-        pool.layer_mapping = [
-            DeepSeekV4LayerItem(ratio, layer)
-            for ratio, layer in [
-                (0, -1),
-                (0, -1),
-                (2, 0),
-                (2, 0),
-                (1, 0),
-                (1, 0),
-                (2, 1),
-            ]
-        ]
-        pool.compress_state_pools = [None] * 7
-        pool.indexer_compress_state_pools = [None] * 7
-        draft = SimpleNamespace(
-            swa_kv_pool=SimpleNamespace(
-                kv_buffer=[torch.zeros((5, 13), dtype=torch.uint8) for _ in range(2)]
-            )
-        )
-        group = resolve_hybrid_device_pool_group(
-            kvcache=pool,
-            page_size=8,
-            params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
-            components={ComponentType.FULL, ComponentType.SWA},
-        )
+        group, pool = _deepseek_v41_group()
         self.assertEqual(
             set(group.entry_map),
             {
@@ -822,6 +835,198 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 params=SimpleNamespace(),
                 components={ComponentType.FULL, ComponentType.SWA},
             )
+
+
+def _reference_layer_range_meta(entry, locations, layer):
+    """Per-row loop the vectorized builder must reproduce exactly."""
+    mapped = entry.layer_mapping.get(layer)
+    if mapped is None:
+        return None
+    buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+    items = []
+    for component, offsets in zip(entry.buffer_meta, entry._component_offsets):
+        for buffer_index in buffer_indices:
+            base_ptr, row_stride, size = component[buffer_index]
+            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+    ptrs, sizes, offsets = [], [], []
+    for row in locations:
+        row_ptrs = [base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items]
+        row_sizes = [size for _, _, size, _ in items]
+        row_offsets = [offset for _, _, _, offset in items]
+        if entry.packed:
+            ptrs.append(row_ptrs)
+            sizes.append(row_sizes)
+            offsets.append(row_offsets)
+        else:
+            ptrs.extend([[value] for value in row_ptrs])
+            sizes.extend([[value] for value in row_sizes])
+            offsets.extend([[value] for value in row_offsets])
+    return ptrs, sizes, offsets
+
+
+class TestPreparedLayerRangeMeta(CustomTestCase):
+    def _entries(self):
+        def buffers(widths, rows=9):
+            return [torch.zeros((rows, width), dtype=torch.uint8) for width in widths]
+
+        entries = list(_deepseek_v4_group().entries)
+        entries += _deepseek_v41_group()[0].entries
+        k, v = buffers((3, 5)), buffers((7, 11))
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[[*k, *v]],
+                layer_mapping={0: (0, 2), 1: (1, 3)},
+                page_size=2,
+                rows_are_pages=False,
+            )
+        )
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[buffers((13, 17, 19))],
+                layer_mapping=_with_packed_draft_mapping(
+                    {0: 0, 1: 1}, target_device_layer_num=2, draft_layer_num=1
+                ),
+                page_size=2,
+                rows_are_pages=True,
+            )
+        )
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.MAMBA,
+                indices_from_pool=PoolName.MAMBA,
+                device_pool=None,
+                components=[buffers((4, 6)), buffers((8, 10)), buffers((12, 14))],
+                layer_mapping={0: 1, 2: 0},
+                page_size=1,
+                rows_are_pages=True,
+            )
+        )
+        for packed in (True, False):
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[buffers((3, 5)), buffers((7, 11))],
+                    layer_mapping={0: 0, 2: 1},
+                    page_size=2,
+                    rows_are_pages=False,
+                    packed=packed,
+                )
+            )
+        return entries
+
+    def test_matches_per_row_reference_for_every_pool_and_layer(self):
+        entries = self._entries()
+        self.assertIn(PoolName.DEEPSEEK_V4_C4_STATE, {e.name for e in entries})
+        self.assertIn(PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, {e.name for e in entries})
+        for entry_index, entry in enumerate(entries):
+            row_count = min(buffer.shape[0] for buffer in entry.kv_buffer)
+            rows = [*reversed(range(row_count)), 0, row_count - 1]
+            for layer in range(max(entry.layer_mapping) + 2):
+                for locations in (rows, np.asarray(rows, dtype=np.int64), []):
+                    with self.subTest(
+                        entry=entry_index,
+                        name=entry.name,
+                        layer=layer,
+                        kind=type(locations).__name__,
+                        rows=len(locations),
+                    ):
+                        got = entry.get_prepared_layer_range_meta(locations, layer)
+                        want = _reference_layer_range_meta(
+                            entry, list(locations), layer
+                        )
+                        self.assertEqual(got, want)
+                        if got is not None:
+                            self.assertTrue(
+                                all(
+                                    type(value) is int
+                                    for part in got
+                                    for item in part
+                                    for value in item
+                                )
+                            )
+
+    def test_reference_check_detects_a_wrong_row(self):
+        for entry_index, entry in enumerate(self._entries()):
+            row_count = min(buffer.shape[0] for buffer in entry.kv_buffer)
+            rows = list(range(row_count))
+            shifted = rows[:-1] + [0]
+            for layer in entry.layer_mapping:
+                with self.subTest(entry=entry_index, name=entry.name, layer=layer):
+                    got = entry.get_prepared_layer_range_meta(rows, layer)
+                    self.assertNotEqual(
+                        got, _reference_layer_range_meta(entry, shifted, layer)
+                    )
+                    self.assertEqual(
+                        got[1:], _reference_layer_range_meta(entry, shifted, layer)[1:]
+                    )
+
+    def test_mooncake_layer_wise_load_sends_reference_ranges(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        group = _deepseek_v4_group()
+        calls = []
+        store = SimpleNamespace(
+            batch_get_session_start=lambda keys: [0] * len(keys),
+            batch_get_session_end=lambda keys: None,
+            batch_get_into_multi_buffer_ranges=lambda keys, ptrs, sizes, offsets: (
+                calls.append((keys, ptrs, sizes, offsets))
+                or [sum(item) for item in sizes]
+            ),
+        )
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.pools = group.entry_map
+        linker.num_layers = group.num_layers
+        linker.layer_done_counter = Mock()
+        linker.session_executor = ThreadPoolExecutor(max_workers=len(group.entries))
+        self.addCleanup(linker.session_executor.shutdown)
+        linker.storage = SimpleNamespace(
+            store=store,
+            _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+            _tag_keys=lambda keys: keys,
+        )
+
+        requests, rows = [[], []], {}
+        for entry in group.entries:
+            row_count = min(buffer.shape[0] for buffer in entry.kv_buffer)
+            pages = list(reversed(range(row_count)))
+            rows[entry.name] = pages
+            for request, half in zip(requests, (pages[::2], pages[1::2])):
+                request.append(
+                    PoolTransfer(
+                        name=entry.name,
+                        keys=[f"{entry.name}-{page}" for page in half],
+                        host_indices=torch.tensor(
+                            [page * 2 + offset for page in half for offset in (0, 1)]
+                        ),
+                    )
+                )
+
+        linker.load_layer_wise(7, requests)
+
+        linker.layer_done_counter.fail.assert_not_called()
+        self.assertEqual(
+            linker.layer_done_counter.complete.call_args_list,
+            [call(7, layer) for layer in range(group.num_layers)],
+        )
+        expected = []
+        for layer in range(group.num_layers):
+            for entry in group.entries:
+                locations = rows[entry.name][::2] + rows[entry.name][1::2]
+                meta = _reference_layer_range_meta(entry, locations, layer)
+                if meta is not None:
+                    keys = [f"{entry.name}-{page}" for page in locations]
+                    expected.append((keys, *meta))
+        self.assertEqual(calls, expected)
 
 
 if __name__ == "__main__":
