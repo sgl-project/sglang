@@ -22,7 +22,7 @@ on:
           - gfx942-rocm720
           - gfx950-rocm720
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 11 * * *'  # an hour after ROCm 10, ahead of the 12:00 UTC MILES builds
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels

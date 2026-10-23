@@ -224,6 +224,20 @@ def test_operator_and_test_groups_agree():
         assert actual <= groups, actual - groups
 
 
+def test_agent_kernels_register_their_backend():
+    """Agent-generated kernels are listed by backend, so directory and backend must agree."""
+    agent_backends = {
+        "sglang.kernels.kda_kernels.": KernelBackend.KDA,
+        "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
+    }
+    for spec in K.registry.all_specs():
+        expected = next(
+            (b for p, b in agent_backends.items() if spec.target.startswith(p)), None
+        )
+        if expected is not None or spec.backend in agent_backends.values():
+            assert spec.backend is expected, spec
+
+
 def test_inventory_targets_survive_module_moves():
     """Moving a module without its lazy target otherwise breaks only on first call."""
     root = Path(K.__file__).resolve().parents[3] / "python"
@@ -340,6 +354,7 @@ def _module_defines(module: str, attr: str) -> bool:
         ("communication.matmul_reduce_scatter", {"cute_dsl"}),
         ("elementwise.row_sum", {"jit"}),
         ("gemm.muse_spark_router_gemm", {"jit"}),
+        ("gemm.muse_spark_router_gemv", {"cute_dsl"}),
         ("layernorm.muse_spark_norm_gate", {"torch", "jit", "helion", "triton"}),
         ("layernorm.muse_spark_norm_residual", {"torch", "jit", "triton"}),
         ("layernorm.muse_spark_rmsnorm_nvfp4_quant", {"torch", "jit", "helion"}),
