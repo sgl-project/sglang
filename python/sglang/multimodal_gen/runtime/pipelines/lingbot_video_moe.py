@@ -73,7 +73,7 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_decoding_stage()
 
     def _maybe_add_refiner_stages(self, server_args: ServerArgs) -> None:
-        """Hook for the two-pass subclass; the single-pass pipeline adds nothing."""
+        # Overridden by the two-pass subclass; the single-pass pipeline adds nothing.
         return None
 
 

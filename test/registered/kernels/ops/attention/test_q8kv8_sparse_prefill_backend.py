@@ -16,12 +16,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+    cast_q_fp8_for_q8kv8_prefill,
+    q8kv8_padded_num_heads,
     sparse_mla_q8kv8_prefill_fwd,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -34,6 +32,10 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+    set_k_and_s_torch,
+)
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -95,6 +97,9 @@ class _TokenToKVPool:
     def get_swa_key_layout(self) -> KVLayout:
         return KVLayout.V4
 
+    def get_swa_key_page_size(self) -> int:
+        return self.swa_kv_pool.page_size
+
     def get_extra_key_layout(self, layer_id: int) -> KVLayout:
         _ = layer_id
         return KVLayout.V4
@@ -127,7 +132,7 @@ def _make_v4_paged_kv_cache(
     k_bf16 = (torch.randn(total_slots, 512, device=device) * 0.25).to(torch.bfloat16)
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16)
     loc = torch.arange(total_slots, dtype=torch.int32, device=device)
-    SetKAndS.torch(_Pool(page_size), quant_k_cache, loc, pack)
+    set_k_and_s_torch(quant_k_cache, loc, pack, page_size)
     return quant_k_cache
 
 
@@ -232,9 +237,10 @@ def _make_sparse_prefill_case(
     attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
     # position + 1 of the five query rows: seq_lens [96, 144], extend [3, 2]
     core_attn_metadata = SimpleNamespace(
+        request_window_layout=None,
         seq_lens_casual=torch.tensor(
             [94, 95, 96, 143, 144], dtype=torch.int32, device=device
-        )
+        ),
     )
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
 
@@ -439,6 +445,8 @@ def _patched_sparse_kernels(
     q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
     q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
+    q8_mod.q8kv8_padded_num_heads = q8kv8_padded_num_heads
+    q8_mod.cast_q_fp8_for_q8kv8_prefill = cast_q_fp8_for_q8kv8_prefill
 
     old_modules = {
         name: sys.modules.get(name)
@@ -715,6 +723,141 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
                 atol=1e-2,
                 rtol=1e-2,
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("ratio", [0, 1, 2, 4, 128])
+@pytest.mark.parametrize("scenario", ["first", "next", "replay", "tail", "large"])
+def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
+    from sgl_kernel.flash_mla import (
+        FlashMLASchedMeta,
+        flash_mla_with_kvcache,
+    )
+
+    from sglang.srt.mem_cache.dsv41_request_window import window_layout
+    from sglang.srt.runtime_context import get_platform
+
+    if not get_platform().is_blackwell:
+        pytest.skip("paged FlashMLA reference requires Blackwell")
+
+    device = torch.device("cuda")
+    starts = [0, 0] if scenario in ("first", "large") else [400, 900]
+    lens = [5000, 13] if scenario == "large" else [19, 13]
+    if scenario == "tail":
+        lens = [128, 128]
+    req = torch.cat([torch.full((n,), r, device=device) for r, n in zip([2, 5], lens)])
+    pos = torch.cat(
+        [torch.arange(s, s + n, device=device) for s, n in zip(starts, lens)]
+    )
+    floor = None
+    if scenario in ("replay", "tail"):
+        floor = torch.cat(
+            [torch.full((n,), s, device=device) for s, n in zip(starts, lens)]
+        )
+    layout = window_layout(req, pos, floor=floor, num_groups=2)
+    seq = torch.tensor(
+        [s + n for s, n in zip(starts, lens)], device=device, dtype=torch.int32
+    )
+    lengths = torch.tensor(lens, device=device, dtype=torch.int32)
+    batch, _ = _make_forward_batch_and_mapping(device)
+    batch.seq_lens = seq
+    batch.seq_lens_cpu = seq.cpu()
+    batch.extend_seq_lens = lengths
+    batch.extend_seq_lens_cpu = lens
+    batch.req_pool_indices = torch.tensor([2, 5], device=device, dtype=torch.int32)
+
+    page_size = 288
+    swa = _make_v4_paged_kv_cache(
+        total_slots=layout.size, page_size=page_size, seed=13, device=device
+    )
+    c_max = max(int(seq.max()) // max(ratio, 1), 1)
+    blocks = (c_max + page_size - 1) // page_size
+    extra = _make_v4_paged_kv_cache(
+        total_slots=2 * blocks * page_size, page_size=page_size, seed=17, device=device
+    )
+    pool = _TokenToKVPool(
+        swa_key_buffer=swa,
+        full_to_swa_index_mapping=None,
+        page_size=page_size,
+        extra_key_buffer=extra,
+    )
+    backend = _make_backend(device, None)
+    backend.token_to_kv_pool = pool
+    if scenario == "tail":
+        backend.forward_metadata.late_layer_tail = SimpleNamespace(
+            extend_seq_lens=lengths, extend_seq_lens_cpu=lens
+        )
+        batch.extend_seq_lens = lengths + 100
+        batch.extend_seq_lens_cpu = [n + 100 for n in lens]
+    group = torch.repeat_interleave(torch.arange(2, device=device), lengths.long())
+    page_table = group[:, None] * blocks + torch.arange(blocks, device=device)[None, :]
+    k = ((c_max + 63) // 64) * 64 if ratio == 128 else 128
+    raw = (
+        torch.arange(k, device=device, dtype=torch.int32)[None, :]
+        .expand(pos.numel(), -1)
+        .contiguous()
+    )
+    extra_lens = ((pos + 1) // max(ratio, 1)).clamp_max(k).int()
+    extra_ids = raw + group[:, None] * blocks * page_size
+    extra_ids = torch.where(raw < extra_lens[:, None], extra_ids, -1).int()
+    core = SimpleNamespace(
+        seq_lens_casual=pos.int() + 1,
+        request_window_layout=layout,
+        page_table=page_table.int(),
+        sparse_raw_indices=lambda _: raw,
+        sparse_page_indices=lambda _: extra_ids,
+    )
+    torch.manual_seed(11)
+    q = torch.randn(pos.numel(), 1, 64, 512, device=device, dtype=torch.bfloat16) * 0.1
+    sink = torch.zeros(64, device=device)
+    actual = backend._forward_prefill_sparse(
+        q=q,
+        layer_id=0,
+        compress_ratio=ratio,
+        forward_batch=batch,
+        token_to_kv_pool=pool,
+        core_attn_metadata=core,
+        attn_sink=sink,
+    )
+    cache = backend.forward_metadata.sparse_prefill_cache
+    if ratio:
+        _, combined, combined_lens = cache.layer_inputs(ratio, core, page_size)
+        n_compressed = 2 * c_max
+    else:
+        combined, combined_lens = cache.c0_combined_indices, cache.c0_combined_lens
+        n_compressed = 0
+        extra_lens = torch.zeros_like(extra_lens)
+    for i in [0, lens[0] - 1, lens[0], pos.numel() - 1]:
+        c = int(extra_lens[i])
+        w = int(layout.lengths[i])
+        assert int(combined_lens[i]) == c + w
+        if c:
+            torch.testing.assert_close(combined[i, :c], raw[i, :c] + group[i] * c_max)
+        torch.testing.assert_close(
+            combined[i, c : c + w], layout.indices[i, :w] + n_compressed
+        )
+    kwargs = {}
+    if ratio:
+        kwargs.update(
+            extra_k_cache=extra.view(-1, page_size, 1, 584),
+            extra_indices_in_kvcache=extra_ids[:, None, :],
+            extra_topk_length=extra_lens,
+        )
+    expected, _ = flash_mla_with_kvcache(
+        q=q,
+        k_cache=swa.view(-1, page_size, 1, 584),
+        head_dim_v=512,
+        block_table=None,
+        cache_seqlens=None,
+        tile_scheduler_metadata=FlashMLASchedMeta(),
+        softmax_scale=backend.softmax_scale,
+        is_fp8_kvcache=True,
+        indices=layout.indices[:, None, :],
+        topk_length=layout.lengths,
+        attn_sink=sink,
+        **kwargs,
+    )
+    torch.testing.assert_close(actual, expected.squeeze(1), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

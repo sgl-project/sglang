@@ -832,6 +832,7 @@ mod tests {
                 sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Detokenize {
                     token_ids: vec![1, 2],
+                    skip_special_tokens: true,
                 },
             })
             .unwrap();

@@ -76,15 +76,14 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
 
     def check_pipeline_config(self) -> None:
         super().check_pipeline_config()
-        if self.rewriter_auto_negative and not self.has_rewriter:
+        if self.rewriter_auto_negative and not self._has_rewriter():
             raise ValueError(
                 "rewriter_auto_negative needs a rewriter backend: set rewriter_url "
                 "to serve one, or rewriter_model_path and rewriter_adapter_path to "
                 "load it in this process."
             )
 
-    @property
-    def has_rewriter(self) -> bool:
+    def _has_rewriter(self) -> bool:
         return self.rewriter_url is not None or self.rewriter_model_path is not None
 
     def supports_dynamic_batching(self) -> bool:

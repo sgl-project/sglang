@@ -45,14 +45,14 @@ class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
             )
 
         pixel = preprocess_condition_image(
-            image, int(batch.height), int(batch.width)
+            image, height=int(batch.height), width=int(batch.width)
         ).to(get_local_torch_device())
         generator = batch.generator
         if isinstance(generator, list):
             generator = generator[0] if generator else None
         batch.extra[VLM_IMAGE_KEY] = pixel_to_vlm_image(pixel)
         batch.extra[COND_LATENT_KEY] = self._encode_cond_latent(
-            pixel, server_args, generator
+            pixel, server_args, generator=generator
         )
         return batch
 
@@ -83,8 +83,8 @@ class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
                 if isinstance(latent_dist, AutoencoderKLOutput):
                     latent_dist = latent_dist.latent_dist
 
-        # The reference samples the posterior rather than taking its mode, which also
-        # advances the generator before the noise draw.
+        # The reference samples the posterior rather than taking its mode,
+        # which also advances the generator before the noise draw.
         cond_latent = self.retrieve_latents(
             latent_dist, generator, sample_mode="sample"
         ).float()

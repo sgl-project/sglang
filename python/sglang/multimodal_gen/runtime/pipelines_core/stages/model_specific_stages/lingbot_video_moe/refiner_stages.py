@@ -6,12 +6,16 @@ import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.denoising import (
     LingBotVideoDenoisingStage,
@@ -44,13 +48,21 @@ logger = init_logger(__name__)
 class LingBotVideoRefinerUpscaleStage(DecodingStage):
     """Decode the base pass, resize to the refiner resolution, and re-encode."""
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        # Every rank denoises the refiner latents, so none may skip the re-encode.
+        return StageParallelismType.REPLICATED
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         config = server_args.pipeline_config
         height, width = config.refiner_height, config.refiner_width
-        # The inherited component_uses declares residency at the decode precision.
-        vae_dtype = resolve_decode_precision(server_args, self.component_name)
-        generators = _refiner_generators(batch, get_local_torch_device())
+        # The inherited component_uses declares residency at the default precision.
+        quality = batch.sampling_params.quality
+        vae_dtype = resolve_decode_precision(
+            server_args, self.component_name, quality=quality
+        )
+        generators = _refiner_generators(batch, device=get_local_torch_device())
 
         with self.use_declared_component(
             component_name=self.component_name, module=self.vae
@@ -61,17 +73,22 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
             self.vae.use_tiling = True
             try:
                 # Only the decode half has a fast path; the re-encode has none.
-                with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
+                with use_vae_fast_path(vae, quality_allows(quality, "lossless")):
                     pixels = self.decode(
                         batch.latents, server_args, vae_dtype=vae_dtype
                     )
-                upscaled = resize_video_pixels(pixels, height, width)
+                upscaled = resize_video_pixels(pixels, height=height, width=width)
                 latents = self._encode(
                     upscaled, server_args, vae_dtype=vae_dtype, generators=generators
                 )
                 if batch.extra.get(COND_LATENT_KEY) is not None:
                     batch.extra[COND_LATENT_KEY] = self._encode_condition_frame(
-                        batch, server_args, height, width, vae_dtype, generators
+                        batch,
+                        server_args,
+                        height=height,
+                        width=width,
+                        vae_dtype=vae_dtype,
+                        generators=generators,
                     )
             finally:
                 self.vae.use_tiling = was_tiling
@@ -121,6 +138,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         self,
         batch: Req,
         server_args: ServerArgs,
+        *,
         height: int,
         width: int,
         vae_dtype: torch.dtype,
@@ -129,7 +147,11 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         image = batch.condition_image
         if isinstance(image, list):
             image = image[0]
-        pixel = preprocess_condition_image(image, height, width)
+        # Crop at the base geometry, then resize like the clip to keep its framing.
+        base_pixel = preprocess_condition_image(
+            image, height=int(batch.height), width=int(batch.width)
+        )
+        pixel = resize_video_pixels(base_pixel, height=height, width=width)
         latents = self._encode(
             pixel, server_args, vae_dtype=vae_dtype, generators=generators
         )
@@ -195,7 +217,7 @@ def _zero_negative_conditioning(batch: Req) -> None:
 
 
 def _refiner_generators(
-    batch: Req, device: torch.device
+    batch: Req, *, device: torch.device
 ) -> list[torch.Generator] | None:
     # The reference reseeds for the second pass rather than continuing the base stream.
     if not batch.seeds:

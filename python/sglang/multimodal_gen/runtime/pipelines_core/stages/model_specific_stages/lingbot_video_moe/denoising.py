@@ -36,8 +36,8 @@ class LingBotVideoDenoisingStage(DenoisingStage):
         seq_len,
         reserved_frames_mask,
     ):
-        # The DiT is trained on the timestep round-tripped through its own dtype as a
-        # sigma, quantizing 991 to 992. The scale-back must stay in that dtype:
+        # The DiT is trained on the timestep round-tripped through its own dtype,
+        # which quantizes 991 to 992. The scale-back must stay in that dtype;
         # upcasting first lands on 992.1875 and shifts every step.
         if target_dtype in (torch.bfloat16, torch.float16):
             sigma = (t_device.float() / NUM_TRAIN_TIMESTEPS).to(target_dtype)

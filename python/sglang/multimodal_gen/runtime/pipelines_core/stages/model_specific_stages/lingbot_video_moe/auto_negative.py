@@ -24,8 +24,7 @@ _ROOT = "universal_negative"
 
 
 def _hint_pattern(*hints: str) -> re.Pattern:
-    """Match any hint as a whole word, so "knight" does not read as "night"."""
-
+    # Whole words only, so "knight" does not read as "night".
     alternatives = "|".join(re.escape(hint) for hint in hints)
     return re.compile(rf"(?<![a-z0-9])(?:{alternatives})(?![a-z0-9])")
 
@@ -108,12 +107,7 @@ _FORCED_DELETIONS = (
 
 
 def categorized_negative(negative_prompt: str) -> dict | None:
-    """The negative prompt as categories of terms, or None if it is free text.
-
-    Only the shipped shape can be pruned: a term kept by category, in order. A
-    request may send anything, so the schema is checked before it is indexed.
-    """
-
+    # A request may send any negative, so the shipped schema is checked before indexing.
     parsed = parse_caption(negative_prompt)
     if not isinstance(parsed, dict):
         return None
@@ -178,8 +172,8 @@ class LingBotVideoAutoNegativeStage(PipelineStage):
         return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        # supports_dynamic_batching() turns merging off for this config, so the
-        # prompt is one caption and the negative it prunes belongs to it.
+        # supports_dynamic_batching() turns merging off for this config,
+        # so the prompt is one caption and the negative it prunes belongs to it.
         default = categorized_negative(batch.negative_prompt)
         if default is None:
             # A free-text negative has no categories to prune.
@@ -188,9 +182,13 @@ class LingBotVideoAutoNegativeStage(PipelineStage):
         mode = resolve_mode(batch)
         image = condition_image(batch) if mode == "ti2v" else None
         raw = self.backend.generate(
-            build_prune_prompt(caption, mode, default), image, use_lora=False
+            build_prune_prompt(caption=caption, mode=mode, default=default),
+            image=image,
+            use_lora=False,
         )
-        negative = prune_negative(default, parse_caption(raw), caption)
+        negative = prune_negative(
+            default=default, pruned=parse_caption(raw), caption=caption
+        )
         batch.negative_prompt = json.dumps(
             negative, ensure_ascii=False, separators=(",", ":")
         )

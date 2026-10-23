@@ -202,7 +202,7 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         # get_topk reads req_to_token IDs; attention may have rebound the write
-        # loc to kernel-facing IDs, which are neither stable nor the same space.
+        # loc to physical IDs, which are neither stable nor the same space.
         out_cache_loc = forward_batch.out_cache_loc_virtual
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc

@@ -39,7 +39,6 @@ PROMPT_TEMPLATE = (
     "<|im_start|>assistant\n"
 )
 IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
-VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
@@ -194,22 +193,22 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
         if self.encode_text_only:
             if images is None:
                 return batch
-            # The refiner DiT has no image path, so it needs the caption without vision
-            # tokens; its negative branch is zeroed, hence positive-only.
+            # The refiner DiT has no image path, so it takes the caption alone;
+            # its negative branch is zeroed, so only the positive is encoded.
             batch.extra[TEXT_ONLY_EMBEDS_KEY] = self._encode_prompt(
-                batch.prompt, device, dtype, None
+                batch.prompt, device=device, dtype=dtype, images=None
             )
             return batch
 
         prompt_embeds, prompt_mask = self._encode_prompt(
-            batch.prompt, device, dtype, images
+            batch.prompt, device=device, dtype=dtype, images=images
         )
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_attention_mask = prompt_mask
 
         if batch.do_classifier_free_guidance:
             negative_embeds, negative_mask = self._encode_prompt(
-                batch.negative_prompt, device, dtype, images
+                batch.negative_prompt, device=device, dtype=dtype, images=images
             )
             batch.negative_prompt_embeds = [negative_embeds]
             batch.negative_attention_mask = negative_mask
