@@ -63,6 +63,7 @@ class DSANPUIndexerMixin:
         layer_id: int,
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
+        tree_verify: bool = False,
     ) -> torch.Tensor:
         # DSA prefill CP metadata is Ascend-local and is first consumed by this
         # indexer (before the attention backend's forward_extend), so prepare it
@@ -233,6 +234,9 @@ class DSANPUIndexerMixin:
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
+        # EAGLE topk>1: the tree path scores the (tiny) draft block with the
+        # pre-quantised index key, so keep a bf16 reference before quantisation.
+        k_for_tree = k
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
@@ -309,6 +313,20 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
+            if tree_verify:
+                return self._build_tree_topk_indices(
+                    q=q,
+                    weights=weights,
+                    k_bf16=k_for_tree,
+                    pool=pool,
+                    layer_id=layer_id,
+                    block_table=block_table,
+                    actual_seq_lengths_q=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    forward_batch=forward_batch,
+                    use_quant_indexer=use_quant_indexer,
+                )
+
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
@@ -351,6 +369,191 @@ class DSANPUIndexerMixin:
             )
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices[0].squeeze(1)
+
+    def _run_lightning_indexer(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        pool,
+        layer_id: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        sparse_count: int,
+        use_quant_indexer: bool,
+        sparse_mode: int = 3,
+    ) -> torch.Tensor:
+        """Fused lightning indexer with a caller-chosen key length / width.
+
+        The tree path uses ``sparse_mode=0`` over a prefix-only key range:
+        mode 3 is right-down causal and aligns the query block to the END of the
+        key range, so shrinking the key range from P+N to P would silently clip
+        the last N-1 prefix tokens.
+        """
+        key_len = actual_seq_lengths_key.to(device=q.device, dtype=torch.int32)
+        query = q.view(-1, self.n_heads, self.head_dim)
+
+        if use_quant_indexer:
+            query, query_scale = _quantize_npu_indexer_activation(
+                query, pool.indexer_hadamard_128, pool.dtype
+            )
+            out = torch_npu.npu_quant_lightning_indexer(
+                query=query,
+                key=pool.get_index_k_buffer(layer_id),
+                weights=weights,
+                query_dequant_scale=query_scale,
+                key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                actual_seq_lengths_key=key_len,
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=sparse_count,
+                sparse_mode=sparse_mode,
+                query_quant_mode=0,
+                key_quant_mode=0,
+            )
+            return out.squeeze(1)
+
+        out = torch_npu.npu_lightning_indexer(
+            query=query,
+            key=pool.get_index_k_buffer(layer_id),
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+            actual_seq_lengths_key=key_len,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=sparse_count,
+            sparse_mode=sparse_mode,
+        )
+        return out[0].squeeze(1)
+
+    def _build_tree_topk_indices(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        k_bf16: torch.Tensor,
+        pool,
+        layer_id: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        forward_batch: ForwardBatch,
+        use_quant_indexer: bool,
+    ) -> torch.Tensor:
+        """Sparse indices that respect the EAGLE draft-tree topology.
+
+        ``row_r = [ ancestors(r) | prefix top-(K-A) | -1 padding ]`` — see
+        ``hardware_backend/npu/attention/tree_sparse_indices.py`` for why the
+        order matters (SFA truncates the tail under its causal budget, and
+        ``-1`` terminates the scan).
+        """
+        from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
+            ancestor_width_for,
+            draft_ancestor_ids_batched,
+            gather_tree_blocks,
+            merge_tree_sparse_indices,
+        )
+        from sglang.srt.runtime_context import get_spec
+
+        spec = forward_batch.spec_info
+        if spec is None or getattr(spec, "custom_mask", None) is None:
+            raise RuntimeError("tree_verify=True requires spec_info.custom_mask")
+
+        n = int(spec.draft_token_num)
+        total = int(q.shape[0])
+        if n <= 1 or total % n:
+            raise ValueError(
+                f"tree verify geometry mismatch: total_tokens={total}, N={n}"
+            )
+        bs = total // n
+
+        topk = int(self.index_topk)
+        steps = int(
+            getattr(spec, "spec_steps", None)
+            or get_spec().speculative_num_steps
+            or 0
+        )
+        a = ancestor_width_for(steps, n)
+        prefix_width = topk - a
+        if prefix_width <= 0:
+            raise ValueError(
+                f"index_topk={topk} is too small for ancestor_width={a}"
+            )
+
+        prefix_lens = (
+            actual_seq_lengths_kv.to(device=q.device, dtype=torch.int32) - n
+        )
+        if prefix_lens.numel() and int(prefix_lens.min()) < 0:
+            raise ValueError(
+                "prefix length underflow: KV length smaller than the draft block"
+            )
+
+        # (1) lightning top-k over the prefix only, leaving A slots for ancestors.
+        prefix_idx = self._run_lightning_indexer(
+            q=q,
+            weights=weights,
+            pool=pool,
+            layer_id=layer_id,
+            block_table=block_table,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_key=prefix_lens,
+            sparse_count=prefix_width,
+            use_quant_indexer=use_quant_indexer,
+            sparse_mode=0,
+        )
+        if prefix_idx.shape[0] != total:
+            raise RuntimeError(
+                f"prefix indexer returned {prefix_idx.shape[0]} rows, "
+                f"expected {total}"
+            )
+        if prefix_idx.shape[1] < prefix_width:
+            raise RuntimeError(
+                f"prefix indexer returned width {prefix_idx.shape[1]}, "
+                f"expected at least {prefix_width}"
+            )
+        if prefix_idx.shape[1] > prefix_width:
+            raise RuntimeError(
+                "prefix indexer rounded sparse_count up; the ordering contract "
+                "(score vs position) must be settled before truncating"
+            )
+
+        # (2) score the draft block only: N <= 64 nodes, so this stays tiny.
+        q_tree = q.reshape(bs, n, self.n_heads, self.head_dim).float()
+        k_tree = (
+            k_bf16.reshape(total, self.head_dim)
+            .view(bs, n, self.head_dim)
+            .float()
+        )
+        w_tree = weights.reshape(bs, n, self.n_heads).float()
+
+        scores = torch.empty((bs, n, n), dtype=torch.float32, device=q.device)
+        chunk = max(1, min(bs, 8))
+        for start in range(0, bs, chunk):
+            end = min(start + chunk, bs)
+            dots = torch.einsum(
+                "bthd,bjd->bthj", q_tree[start:end], k_tree[start:end]
+            )
+            scores[start:end] = (
+                dots.relu() * w_tree[start:end].unsqueeze(-1)
+            ).sum(dim=-2)
+            del dots
+
+        # (3) ancestors from the mask the tree kernel already produced.
+        visible_blocks = gather_tree_blocks(spec.custom_mask, prefix_lens, n)
+        ancestor_ids = draft_ancestor_ids_batched(scores, visible_blocks, a)
+
+        # (4) ancestors first, then the prefix block (no sorting).
+        return merge_tree_sparse_indices(
+            prefix_idx,
+            ancestor_ids.reshape(total, -1),
+            prefix_lens,
+            n,
+            topk,
+        )
 
     def do_npu_cp_balance_indexer(
         self,

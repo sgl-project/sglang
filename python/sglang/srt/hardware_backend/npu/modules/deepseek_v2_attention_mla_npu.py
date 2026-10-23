@@ -491,6 +491,12 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+    # EAGLE topk>1: the draft block is a tree, so the indexer must only offer KV
+    # the node is allowed to see (prefix + its own ancestors).
+    tree_verify = (
+        forward_batch.forward_mode.is_target_verify()
+        and int(getattr(forward_batch.spec_info, "tree_topk", 1)) > 1
+    )
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -500,6 +506,7 @@ def forward_dsa_prepare_npu(
             m.layer_id,
             input_on_attn_tp_slices,
             dynamic_scale,
+            tree_verify=tree_verify,
         )
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
