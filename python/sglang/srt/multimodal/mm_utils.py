@@ -41,7 +41,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel, get_platform
 from sglang.srt.utils import flatten_nested_list
 
 
@@ -415,6 +415,23 @@ def process_images(images, image_processor, model_cfg):
     if all(x.shape == new_images[0].shape for x in new_images):
         new_images = np.stack(new_images, axis=0)
     return new_images
+
+
+def hip_dp_encoder_batches_vit() -> bool:
+    """Whether ROCm encodes the images of all requests in one ViT call.
+
+    ROCm otherwise encodes one request at a time (see
+    ``mm_schedule._batch_vit_across_requests``). Under the DP encoder,
+    ``run_dp_sharded_mrope_vision_model`` splits the images of one ViT call
+    across the attention-TP ranks, so a single-image request runs on one rank
+    while the others wait. A cross-request batch is what gives the DP encoder
+    work to split. With one attention-TP rank there is nothing to split.
+    """
+    return (
+        get_platform().is_hip
+        and get_mm().mm_enable_dp_encoder
+        and get_parallel().attn_tp_size > 1
+    )
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py

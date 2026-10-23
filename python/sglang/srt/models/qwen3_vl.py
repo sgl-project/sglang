@@ -77,6 +77,7 @@ from sglang.srt.models.utils import (
     compute_cu_seqlens_from_grid_numpy,
 )
 from sglang.srt.multimodal.mm_utils import (
+    hip_dp_encoder_batches_vit,
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
@@ -1438,6 +1439,40 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         return pad_mm_tokens(input_ids, mm_inputs)
+
+    def precompile_kernels_after_loading(self) -> None:
+        if self.visual is not None and hip_dp_encoder_batches_vit():
+            self._warm_up_vision_tower()
+
+    def _warm_up_vision_tower(self) -> None:
+        """Run the vision tower on dummy images on this rank and discard the output.
+
+        With batched ViT under the DP encoder, a non-zero rank otherwise runs its
+        first ViT call inside the first served image burst, paying the
+        torch.compile of the rotary kernel and lazy kernel loads there. Two grid
+        sizes cover the static and the dynamic-shape compile; the last call has
+        enough images to take the vectorized position-embedding path.
+        """
+        patch_embed = self.visual.patch_embed
+        patch_dim = (
+            patch_embed.in_channels
+            * patch_embed.temporal_patch_size
+            * patch_embed.patch_size**2
+        )
+        grids = (
+            [[1, 32, 32]],
+            [[1, 48, 64]],
+            [[1, 32, 32]] * _VECTORIZED_VL_POS_EMBED_MIN_IMAGES,
+        )
+        with torch.no_grad():
+            for grid in grids:
+                pixel_values = torch.zeros(
+                    sum(t * h * w for t, h, w in grid),
+                    patch_dim,
+                    device=self.visual.device,
+                    dtype=self.visual.dtype,
+                )
+                self.visual(pixel_values, grid_thw=torch.tensor(grid))
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
