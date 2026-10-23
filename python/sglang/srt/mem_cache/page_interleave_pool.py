@@ -31,9 +31,10 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   ``ceil(prefix_pages / N)`` pages with the (never referenced) trash page —
   a *regular* in-place allgather, owner-major output, no reorder pass.
 - Symmetric gather scratch (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``,
-  single-node shard groups): both slots are carved out of one ``ncclMemAlloc``
-  buffer registered as a symmetric window. Every rank carves the same offsets,
-  because CE addresses a peer's buffer by the local offset into the window.
+  NCCL >= 2.31.2, single-node shard groups): both slots are carved out of one
+  ``ncclMemAlloc`` buffer registered as a symmetric window. Every rank carves
+  the same offsets, because CE addresses a peer's buffer by the local offset
+  into the window.
   The dedicated gather communicator requests ``NCCL_CTA_POLICY_ZERO``
   for eligible copy-engine transfers. Leave the global ``NCCL_CTA_POLICY``
   unset so forward-pass communicators retain their default policy.
@@ -106,10 +107,10 @@ _NUM_SCRATCH_SLOTS = 2
 # NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h. NCCL checks it only at the window
 # base; starting every slot tensor on it is a conservative choice.
 _SCRATCH_ALIGN_BYTES = 4096
-# NCCL 2.28 added copy-engine collectives, but before 2.29.2 a comm without
-# symmetric memory returns a local-registration handle instead of a NULL
-# window, so the window would not tell whether the copy-engine path is live.
-_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 22902
+# NCCL 2.31.2 fixes internal CE synchronization buffer initialization and the
+# two-rank multicast-team setup race (upstream commit 430afbc). Zeroing our
+# scratch cannot initialize NCCL's internal buffers.
+_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 23102
 
 
 def _symmetric_scratch_supported(

@@ -45,9 +45,11 @@ def _release_nccl_window_buffer(
 ) -> None:
     # Queued communication or computation may still be touching the buffer.
     torch.cuda.synchronize(comm.device)
-    if window is not None:
-        comm.deregister_comm_window(window)
-    comm.nccl.ncclMemFree(ptr)
+    try:
+        if window is not None:
+            comm.deregister_comm_window(window)
+    finally:
+        comm.nccl.ncclMemFree(ptr)
 
 
 def allocate_symmetric_buffer(
@@ -63,32 +65,32 @@ def allocate_symmetric_buffer(
     """
     with torch.cuda.device(comm.device):
         ptr = comm.nccl.ncclMemAlloc(nbytes)
-        window = comm.register_comm_window_raw(ptr, nbytes)
-        # NCCL >= 2.29.2 returns NULL when the comm has no symmetric memory
-        # support, usually because NCCL runs without cuMem (ncclMemAlloc is
-        # then a cudaMalloc); 2.28.x returns a local-registration handle.
-        window = window if window.value else None
-        if window is not None and comm.nccl.has_function(
-            "ncclGetLsaMultimemDevicePointer"
-        ):
-            # Workaround for NCCL 2.29.7+ with NVLS on a 2-rank comm (fixed
-            # upstream by NCCL commit 430afbc, after 2.30.7): the multicast
-            # team is built lazily inside the first CE collective's sync
-            # (ncclDevrGetLsaTeamPtrMC) with no barrier after binding, so a
-            # fast rank's ready flag can miss a peer and both hang. Build the
-            # team now (the multicast address is not needed) and barrier.
-            # Larger comms, and older NCCL without this API, build the team
-            # during window registration behind a barrier already.
-            comm.nccl.ncclGetLsaMultimemDevicePointer(window, 0)
-            torch.distributed.barrier(group=comm.group)
-        owner = _NcclMemOwner(ptr, nbytes)
-        release = weakref.finalize(
-            owner, _release_nccl_window_buffer, comm, ptr, window
-        )
-        # The process teardown reclaims the memory; NCCL may already be gone.
-        release.atexit = False
-        buf = torch.as_tensor(owner)
-    buf.zero_()
+        window = None
+        release = None
+        try:
+            window = comm.register_comm_window_raw(ptr, nbytes)
+            # NCCL >= 2.29.2 returns NULL when the comm has no symmetric memory
+            # support, usually because NCCL runs without cuMem (ncclMemAlloc is
+            # then a cudaMalloc); 2.28.x returns a local-registration handle.
+            window = window if window.value else None
+            owner = _NcclMemOwner(ptr, nbytes)
+            release = weakref.finalize(
+                owner, _release_nccl_window_buffer, comm, ptr, window
+            )
+            # The process teardown reclaims the memory; NCCL may already be gone.
+            release.atexit = False
+            buf = torch.as_tensor(owner)
+            buf.zero_()
+        except BaseException:
+            try:
+                if release is None:
+                    _release_nccl_window_buffer(comm, ptr, window)
+                else:
+                    # Calling the finalizer also disables later GC cleanup.
+                    release()
+            except Exception:
+                logger.exception("Failed to release NCCL buffer after setup failure")
+            raise
     return buf, window is not None
 
 

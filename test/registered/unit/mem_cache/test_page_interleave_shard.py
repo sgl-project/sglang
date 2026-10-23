@@ -34,10 +34,10 @@ allocation hangs on:
 
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
 on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
-symmetric window, its zero-kernel launch, its release, and the cross-node
-fallback (``TestPageInterleaveZeroSmGatherMultiGpu``), the window allocation
-on NCCL without the multicast-pointer API
-(``TestSymmetricBufferWithoutMultimemApi``), and byte-exact DSA indexer
+symmetric window, its zero-kernel launch, its release, the cross-node
+fallback, and direct comparisons against ordinary NCCL on 2 and 4 ranks
+(``TestPageInterleaveZeroSmGatherMultiGpu``), window allocation and ownership
+(``TestSymmetricBufferLifetime``), and byte-exact DSA indexer
 keys, scales, and latent KV on 2 and 4 ranks (``TestPageInterleaveIndexer``),
 including dequantized MLA reads from packed FP8 scratch.
 GPU tests skip when too few CUDA devices are visible, so the same file runs
@@ -53,7 +53,7 @@ import tempfile
 import unittest
 import unittest.mock
 from array import array
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -64,10 +64,15 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    _release_nccl_window_buffer,
     allocate_symmetric_buffer,
 )
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+    NCCL_CTA_POLICY_ZERO,
+    NCCLLibrary,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -92,10 +97,12 @@ from sglang.srt.mem_cache.page_interleave import (
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
+    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
     _symmetric_scratch_layout,
+    _symmetric_scratch_supported,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -261,6 +268,36 @@ class TestPageShardScratchSizing(CustomTestCase):
 
 
 class TestZeroSmScratchLayout(CustomTestCase):
+    def test_requires_nccl_with_copy_engine_race_fix(self):
+        self.assertEqual(_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION, 23102)
+        for version in (22902, 23007, 23101, 23102):
+            with (
+                self.subTest(version=version),
+                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                    return_value=True,
+                ),
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+                ) as library,
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                    return_value=[True, True],
+                ) as same_node,
+            ):
+                library.return_value.ncclGetRawVersion.return_value = version
+                self.assertEqual(
+                    _symmetric_scratch_supported(
+                        memory_saver_enabled=False,
+                        custom_mem_pool=None,
+                        shard_group=SimpleNamespace(cpu_group=object()),
+                    ),
+                    version >= _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
+                )
+                if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+                    same_node.assert_not_called()
+
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
         """Both slots share one symmetric window: every tensor must start on
         NCCL's 4 KiB window alignment and no two tensors may overlap."""
@@ -282,22 +319,90 @@ class TestZeroSmScratchLayout(CustomTestCase):
         self.assertLessEqual(spans[-1][1], nbytes)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
-class TestSymmetricBufferWithoutMultimemApi(CustomTestCase):
-    def test_older_nccl_skips_the_multicast_team_build(self):
-        """NCCL before 2.29.2 registers windows but does not export
-        ncclGetLsaMultimemDevicePointer; it builds the multicast team during
-        registration instead. The allocation helper must not call it."""
-        lib = NCCLLibrary()
-        self.assertEqual(
-            lib.has_function("ncclGetLsaMultimemDevicePointer"),
-            lib.ncclGetRawVersion() >= 22902,
+class TestSymmetricBufferFailureCleanup(CustomTestCase):
+    @contextmanager
+    def _fixture(self):
+        comm = SimpleNamespace(
+            device=torch.device("cuda:0"),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=unittest.mock.Mock(return_value=1234),
+                ncclMemFree=unittest.mock.Mock(),
+            ),
+            register_comm_window_raw=unittest.mock.Mock(
+                return_value=ctypes.c_void_p(5678)
+            ),
+            deregister_comm_window=unittest.mock.Mock(),
         )
-        self.assertFalse(lib.has_function("ncclNoSuchSymbol"))
+        with (
+            unittest.mock.patch("torch.cuda.device", return_value=nullcontext()),
+            unittest.mock.patch("torch.cuda.synchronize"),
+            unittest.mock.patch("torch.as_tensor") as as_tensor,
+        ):
+            yield comm, as_tensor
 
-        def unbound(window, offset):
-            raise AssertionError("ncclGetLsaMultimemDevicePointer is not exported")
+    def test_registration_failure_frees_allocation(self):
+        with self._fixture() as (comm, as_tensor):
+            comm.register_comm_window_raw.side_effect = RuntimeError("register failed")
+            with self.assertRaisesRegex(RuntimeError, "register failed"):
+                allocate_symmetric_buffer(comm, 8192)
+            gc.collect()
+            as_tensor.assert_not_called()
+            comm.deregister_comm_window.assert_not_called()
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
 
+    def test_tensor_setup_failures_release_once(self):
+        for operation in ("wrap", "zero"):
+            with (
+                self.subTest(operation=operation),
+                self._fixture() as (comm, as_tensor),
+            ):
+                if operation == "wrap":
+                    as_tensor.side_effect = RuntimeError("wrap failed")
+                else:
+                    as_tensor.return_value.zero_.side_effect = RuntimeError(
+                        "zero failed"
+                    )
+                with self.assertRaisesRegex(RuntimeError, f"{operation} failed"):
+                    allocate_symmetric_buffer(comm, 8192)
+                # Drop Mock's saved owner reference as well: a registered
+                # finalizer must not run a second time after eager cleanup.
+                as_tensor.reset_mock()
+                gc.collect()
+                comm.deregister_comm_window.assert_called_once()
+                self.assertEqual(
+                    comm.deregister_comm_window.call_args.args[0].value, 5678
+                )
+                comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+    def test_cleanup_failure_preserves_setup_error_without_double_free(self):
+        with self._fixture() as (comm, as_tensor):
+            as_tensor.side_effect = RuntimeError("wrap failed")
+            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
+            with (
+                self.assertLogs(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator",
+                    level="ERROR",
+                ),
+                self.assertRaisesRegex(RuntimeError, "wrap failed"),
+            ):
+                allocate_symmetric_buffer(comm, 8192)
+            as_tensor.reset_mock()
+            gc.collect()
+            comm.deregister_comm_window.assert_called_once()
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+    def test_deregister_failure_still_frees_allocation(self):
+        with self._fixture() as (comm, _):
+            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
+            with self.assertRaisesRegex(RuntimeError, "deregister failed"):
+                _release_nccl_window_buffer(comm, 1234, ctypes.c_void_p(5678))
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferLifetime(CustomTestCase):
+    def test_zeroed_buffer_deregisters_before_free(self):
+        """The allocation needs only window registration and memory ownership."""
         released = []
 
         def free(ptr):
@@ -309,8 +414,6 @@ class TestSymmetricBufferWithoutMultimemApi(CustomTestCase):
             nccl=SimpleNamespace(
                 ncclMemAlloc=torch.cuda.caching_allocator_alloc,
                 ncclMemFree=free,
-                has_function=lambda name: name != "ncclGetLsaMultimemDevicePointer",
-                ncclGetLsaMultimemDevicePointer=unbound,
             ),
             register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
             deregister_comm_window=lambda window: released.append(
@@ -1806,6 +1909,19 @@ def _run_zero_sm_mla(rank, world, port):
         for tensor in slot.tensors.values()
     )
     view = pool._slots[1].tensors["kv"]
+    # Deregistration can allocate a CUDA stream whose driver storage persists.
+    # Account for that separately from the backing allocation being released.
+    comm = pool.kv_gather_comm
+    deregister = comm.deregister_comm_window
+    taken_by_deregister = []
+
+    def measured_deregister(window):
+        free_before = torch.cuda.mem_get_info()[0]
+        deregister(window)
+        taken = free_before - torch.cuda.mem_get_info()[0]
+        taken_by_deregister.append(max(taken, 0))
+
+    comm.deregister_comm_window = measured_deregister
     torch.cuda.synchronize()
     torch.distributed.barrier()
     free_with_pool = torch.cuda.mem_get_info()[0]
@@ -1813,13 +1929,16 @@ def _run_zero_sm_mla(rank, world, port):
     gc.collect()
     torch.distributed.barrier()
     free_with_view = torch.cuda.mem_get_info()[0]
+    assert not taken_by_deregister, "window deregistered under a live view"
     # A peer's window maps this buffer until that peer deregisters too.
     del view
     gc.collect()
     torch.distributed.barrier()
     free_released = torch.cuda.mem_get_info()[0]
+    assert len(taken_by_deregister) == 1, "window not deregistered exactly once"
     assert free_with_view - free_with_pool < scratch_bytes, "freed under a live view"
-    assert free_released - free_with_view >= scratch_bytes, "window buffer leaked"
+    freed = free_released - free_with_view + taken_by_deregister[0]
+    assert freed >= scratch_bytes, "window buffer leaked"
 
 
 def _run_cross_node_mla(rank, world, port):
@@ -1833,17 +1952,143 @@ def _run_cross_node_mla(rank, world, port):
     assert any("nccl" in name.lower() for name in activity)
 
 
+def _run_zero_sm_allgather_comparison(rank, world, init_method):
+    """Compare the pool's in-place window contract with ordinary NCCL."""
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        backend="gloo", rank=rank, world_size=world, init_method=init_method
+    )
+    device = torch.device(f"cuda:{rank}")
+    group = torch.distributed.group.WORLD
+    zero_sm = PyNcclCommunicator(group, device, cta_policy=NCCL_CTA_POLICY_ZERO)
+    ordinary = PyNcclCommunicator(group, device)
+    assert zero_sm.available and ordinary.available
+    max_send_bytes = 1 << 20
+
+    for dtype in (torch.uint8, torch.bfloat16, torch.float32):
+        # Both alternating slots start inside the window, rather than at its
+        # base. The input is each rank's slice of the registered receive view,
+        # exactly as in _prefetch_layer; its offset also changes with payload.
+        offsets, nbytes = _symmetric_scratch_layout(
+            {
+                "padding": ((4096,), torch.uint8),
+                "output": ((world * max_send_bytes // dtype.itemsize,), dtype),
+            },
+            num_slots=2,
+        )
+        buffer, registered = allocate_symmetric_buffer(zero_sm, nbytes)
+        assert registered, "comparison requires a real symmetric window"
+        slots = [
+            buffer[slot["output"] : slot["output"] + world * max_send_bytes].view(dtype)
+            for slot in offsets
+        ]
+        assert all(slot["output"] > 0 for slot in offsets)
+
+        def compare(slot_index, send_bytes, generation, graph=None):
+            count = send_bytes // dtype.itemsize
+            output = slots[slot_index][: world * count]
+            send = output[rank * count : (rank + 1) * count]
+            output.zero_()
+            values = (
+                (torch.arange(count, device=device, dtype=torch.int32) * 17)
+                + rank * 29
+                + generation * 31
+            ) % 251
+            send.copy_(values)
+            reference_input = send.clone()
+            reference = torch.empty_like(output)
+            if graph is None:
+                with zero_sm.change_state(enable=True):
+                    zero_sm.all_gather(output, send)
+            else:
+                graph.replay()
+            # Use the same loaded NCCL library for the ordinary baseline,
+            # with torch allocations and the default communicator policy.
+            with ordinary.change_state(enable=True):
+                ordinary.all_gather(reference, reference_input)
+            _assert_bytes(
+                output,
+                reference,
+                f"rank {rank}, {dtype}, {send_bytes} B, generation {generation}",
+            )
+
+        for send_bytes in (256, 16 << 10, max_send_bytes):
+            for generation in range(6):
+                compare(generation % 2, send_bytes, generation)
+
+        # Profile only the CE call: the ordinary baseline deliberately issues
+        # an NCCL kernel and must not contaminate the zero-SM assertion.
+        output = slots[1]
+        count = max_send_bytes // dtype.itemsize
+        send = output[rank * count : (rank + 1) * count]
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            with zero_sm.change_state(enable=True):
+                zero_sm.all_gather(output, send)
+            torch.cuda.synchronize()
+        activity = [
+            event.name
+            for event in prof.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert not any("nccl" in name.lower() for name in activity), activity
+        assert any("PtoP" in name for name in activity), activity
+
+        # Replay the same registered addresses with fresh contributions. A
+        # comparison only at capture time would miss stale peer data on replay.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with zero_sm.change_state(enable=True):
+                zero_sm.all_gather(output, send)
+        for generation in (7, 8, 9):
+            compare(1, max_send_bytes, generation, graph=graph)
+        del graph, send, output
+        slots.clear()
+        del buffer
+        gc.collect()
+        torch.distributed.barrier()
+
+    torch.cuda.synchronize()
+    torch.distributed.destroy_process_group()
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
 )
 class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
+    def _require_patched_nccl(self):
+        # Gate on the library used by PyNccl, which may differ from torch's.
+        if NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+            self.skipTest("the symmetric gather scratch needs NCCL >= 2.31.2")
+
+    def _compare_allgather(self, world):
+        if torch.cuda.device_count() < world:
+            self.skipTest(f"copy-engine allgather comparison needs {world} GPUs")
+        self._require_patched_nccl()
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
+            tempfile.TemporaryDirectory(prefix="sglang-zero-sm-gather-") as tmp,
+        ):
+            mp.spawn(
+                _run_zero_sm_allgather_comparison,
+                args=(world, f"file://{tmp}/rendezvous"),
+                nprocs=world,
+                join=True,
+            )
+
+    def test_copy_engine_matches_ordinary_allgather_two_gpu(self):
+        self._compare_allgather(2)
+
+    def test_copy_engine_matches_ordinary_allgather_four_gpu(self):
+        self._compare_allgather(4)
+
     def test_copy_engine_window_gather_and_release(self):
         """The zero-SM pool registers its scratch as a symmetric window, still
         assembles the canonical prefix, and frees the window buffer only once
         the pool and every scratch view are gone."""
-        # The library the pool gates on, which may differ from torch's NCCL.
-        if NCCLLibrary().ncclGetRawVersion() < 22902:
-            self.skipTest("the symmetric gather scratch needs NCCL >= 2.29.2")
+        self._require_patched_nccl()
         # Clear the global override before spawning: only the dedicated
         # gather communicator requests ZERO. cuMem enables window registration.
         with (
