@@ -50,6 +50,7 @@ def test_nomas_offline_two_events(tmp_path):
             }
         )
 
+    assert result is not None, "Nomas offline generation failed; inspect worker logs"
     video_path = Path(result.output_file_path)
     assert get_video_frame_count(str(video_path)) == 240
     frames = extract_key_frames_from_video(video_path.read_bytes())

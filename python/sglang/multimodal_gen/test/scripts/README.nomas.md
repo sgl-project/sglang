@@ -19,7 +19,45 @@ The default diffusion unit suite collects these tests. Tests requiring a
 fixture, upstream source or additional GPUs skip when those are unavailable;
 real-weight HTTP/WebSocket checks below were manual H200 runs, not CI results.
 
-## Validation scope
+## Real-weight offline CI
+
+The 1-GPU diffusion suite registers `single_test_file/test_nomas_offline.py` as
+one standalone case. It calls the public `DiffGenerator` API directly and does
+not start an HTTP or WebSocket server. The model ID is `tencent/Hy-Nomas`, using
+the built-in pinned HF overlay; no local model path or Nomas-PE is required.
+
+The checked-in `single_test_file/fixtures/nomas_two_events.json` fixes two
+120-frame structured events at 352×640, 24 fps, eight steps, guidance 1 and seed
+42. Text encoding uses 1280 tokens. The test checks all 240 output frames exist
+and compares frames 0, 120 and 239 using the shared CI CLIP/SSIM/PSNR/mean-error
+checks. These are SGLang regression goldens, not official-implementation accuracy
+evidence. No performance gate is configured.
+
+From the repository root, generate the three PNGs with the same test entry point:
+
+```bash
+SGLANG_GEN_GT=1 SGLANG_GT_OUTPUT_DIR=/path/to/gt \
+python -m pytest -q -s \
+  python/sglang/multimodal_gen/test/single_test_file/test_nomas_offline.py
+```
+
+Run normal consistency mode against that directory:
+
+```bash
+SGLANG_CONSISTENCY_GT_DIR=/path/to/gt \
+python -m pytest -q -s \
+  python/sglang/multimodal_gen/test/single_test_file/test_nomas_offline.py
+```
+
+Unset `SGLANG_GEN_GT` for validation. Without `SGLANG_CONSISTENCY_GT_DIR`, normal
+CI loads the pinned `ci-data-diffusion` revision. The server-only
+`gen_diffusion_ci_outputs` utility is not used for this standalone offline case.
+
+## Earlier implementation validation
+
+The following results were recorded on the experimental implementation at
+`c2149db83acf43c5f914f03229a4d44c4ff6cb91`, before integration with current
+SGLang main. They do not establish that the new offline CI case passes.
 
 The existing H200 validation uses PyTorch 2.14.1+cu130, Transformers 5.19.0,
 Diffusers 0.37.0, FlashAttention 2.8.3.post2 built against that environment,

@@ -43,23 +43,22 @@ The model directory holds `tokenizer/`, `text_encoder/` (Qwen2_5_VLForConditiona
 
 Each request plans its events, generates them in order with a request-local KV cache, decodes once and returns one video. Model-specific fields go through the Python API:
 
+From the repository root, use the checked-in two-event request (240 frames at
+352×640, eight steps, seed 42):
+
 ```python
+import json
+from pathlib import Path
+
 from sglang.multimodal_gen import DiffGenerator
 
+request = json.loads(Path(
+    "python/sglang/multimodal_gen/test/single_test_file/fixtures/nomas_two_events.json"
+).read_text())
 with DiffGenerator.from_pretrained(model_path="tencent/Hy-Nomas") as generator:
-    result = generator.generate({
-        "prompt": "event request",
-        "num_frames": 49, "height": 704, "width": 1280,
-        "num_inference_steps": 8, "guidance_scale": 1.0, "seed": 42,
-        "prompt_format": "json",
-        "segments": [
-            {"frames": 17, "caption": first_event_json},
-            {"frames": 32, "caption": second_event_json},
-        ],
-        "norm_extrinsics": poses,  # optional, [(ceil(49/4)-1)*4+1, 4, 4]
-        "save_output": True,
-    })
+    result = generator.generate({**request, "save_output": True})
 ```
+
 
 | Field | Meaning |
 | --- | --- |
