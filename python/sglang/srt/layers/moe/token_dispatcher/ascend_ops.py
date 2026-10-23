@@ -30,7 +30,11 @@ from sglang.srt.layers.dp_attention import (
     get_is_extend_in_batch,
 )
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUFinalizeRouting
-from sglang.srt.hardware_backend.npu.moe.init_routing import NPUMoEInitRouting_v2
+from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
+    NPUMoEInitRouting_v2,
+    _normalize_mxfp_scale,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -114,6 +118,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         # Prefill communication is scoped to TP; decode routing is scoped to EP.
         parallel = get_parallel()
         self.tp_group = parallel.tp_group.device_group
+        self.attn_tp_size = parallel.attn_tp_size
         self.ep_coordinator = parallel.moe_ep_group
         self.ep_group = self.ep_coordinator.device_group
         self.ep_size = self.ep_coordinator.world_size
@@ -133,13 +138,13 @@ class AscendOpsDispatcher(BaseDispatcher):
         self._allgather_state: Optional[dict[str, Any]] = None
         if self.ascend_ops_config.prefill == "allgather":
             if not (
-                parallel.tp_size == parallel.moe_ep_size == parallel.attn_dp_size
-                and parallel.attn_tp_size == 1
+                parallel.tp_size == parallel.moe_ep_size
+                and parallel.attn_cp_size == 1
                 and self.num_local_experts * self.ep_size == self.num_experts
                 and not moe_runner_config.num_fused_shared_experts
             ):
                 raise ValueError(
-                    "NPU AllGather currently requires TP=EP=Attention DP, "
+                    "NPU AllGather requires TP=EP, Attention CP=1, "
                     "contiguous expert placement and no fused shared experts"
                 )
         self._init_routing = NPUMoEInitRouting_v2(quant_mode=-1)
@@ -445,20 +450,27 @@ class AscendOpsDispatcher(BaseDispatcher):
         group = self._dispatch_group
         input_dtype = hidden_states.dtype
         quant_mode = self._routing_quant_mode()
-        if quant_mode not in (-1, 1):
-            raise NotImplementedError("NPU AllGather supports BF16 and INT8 routing")
+        if quant_mode not in (-1, 1, MXFP8_QUANT_MODE):
+            raise NotImplementedError(
+                "NPU AllGather supports BF16, INT8 and MXFP8 routing"
+            )
         world_size = dist.get_world_size(group)
-        # Attention TP is one: scheduler counts include the actual DP padding.
-        # Reuse CPU metadata to avoid a device count collective and D2H per layer.
+        # The MoE boundary already splits each DP shard across attention TP.
+        # Mirror tensor_split using CPU counts, including scheduler padding.
         sizes = get_dp_global_num_tokens()
         if sizes is None:
             raise RuntimeError("NPU AllGather requires scheduler DP token counts")
+        row_sizes = []
+        for rows in sizes:
+            base, extra = divmod(rows, self.attn_tp_size)
+            row_sizes.extend(
+                base + (rank < extra) for rank in range(self.attn_tp_size)
+            )
         if (
-            len(sizes) != world_size
-            or sizes[dist.get_rank(group)] != hidden_states.shape[0]
+            len(row_sizes) != world_size
+            or row_sizes[dist.get_rank(group)] != hidden_states.shape[0]
         ):
             raise ValueError("NPU AllGather input rows disagree with DP token counts")
-        row_sizes = list(sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
             raise RuntimeError("NPU prefill requires at least one global token")
@@ -483,9 +495,27 @@ class AscendOpsDispatcher(BaseDispatcher):
                 dim=0,
             )
 
-        # Gather before quantization. For INT8 routing, init_routing quantizes
-        # the grouped rows and returns their per-token scales.
+        scales = None
+        if quant_mode == MXFP8_QUANT_MODE:
+            import torch_npu
+
+            # Quantize local rows once, then gather MXFP8 payload and scales.
+            if hidden_states.shape[0] > 0:
+                hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
+                    hidden_states, dst_type=torch.float8_e4m3fn
+                )
+                scales = _normalize_mxfp_scale(scales).view(torch.uint8)
+            else:
+                hidden_states = hidden_states.new_empty(
+                    (0, self.hidden_size), dtype=torch.float8_e4m3fn
+                )
+                scales = hidden_states.new_empty(
+                    (0, (self.hidden_size + 63) // 64, 2), dtype=torch.uint8
+                )
+
         hidden_states = gather_rows(hidden_states)
+        if scales is not None:
+            scales = gather_rows(scales)
         topk_weights = gather_rows(topk_weights.float())
         topk_ids = gather_rows(topk_ids.to(torch.int32))
         local_ids = topk_ids - self.ep_rank * self.num_local_experts
@@ -496,9 +526,26 @@ class AscendOpsDispatcher(BaseDispatcher):
         # corrupt valid expert counts even when the routing weight is zero.
         # num_local_experts is just beyond the valid local expert ID range.
         local_ids = local_ids.masked_fill(~is_local, self.num_local_experts)
-        x, row_idx, expert_tokens, scales = self._init_routing_tokens(
-            hidden_states, local_ids, self.num_local_experts, quant_mode
-        )
+        if scales is not None:
+            # Already MXFP8: reorder payload and scales without requantizing.
+            x, row_idx, expert_tokens, scales = torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                local_ids,
+                active_num=local_ids.numel(),
+                expert_num=self.num_local_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                row_idx_type=0,
+                active_expert_range=[0, self.num_local_experts],
+                quant_mode=-1,
+                scale=scales,
+                x_dtype=torch.float8_e4m3fn,
+            )
+            scales = _normalize_mxfp_scale(scales)
+        else:
+            x, row_idx, expert_tokens, scales = self._init_routing_tokens(
+                hidden_states, local_ids, self.num_local_experts, quant_mode
+            )
         # Grouped GEMM and activation use device counts, so keep the capacity.
         # If any route is dropped, the final capacity row is unused. Combine
         # zeros unused rows on device before this sentinel is read by finalize.
