@@ -91,11 +91,32 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
+def _parse_local_buffer_size(value: Any) -> int:
+    message = (
+        "Mooncake local_buffer_size must be a positive integer in bytes or a GB string"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(message)
+    try:
+        size = _parse_global_segment_size(value)
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    if size <= 0:
+        raise ValueError(message)
+    return size
+
+
 def _normalize_tenant_id(value) -> str:
     if value is None:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _parse_replica_count(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Mooncake {name} must be an integer")
+    return value
 
 
 @dataclass
@@ -410,6 +431,82 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            self.local_buffer_size = _parse_local_buffer_size(
+                extra_config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
+                if extra_config
+                else DEFAULT_LOCAL_BUFFER_SIZE
+            )
+            self.replica_num = _parse_replica_count(
+                "replica_num",
+                extra_config.get("replica_num", 1) if extra_config else 1,
+            )
+            self.dfs_replica_num = _parse_replica_count(
+                "dfs_replica_num",
+                extra_config.get("dfs_replica_num", 0) if extra_config else 0,
+            )
+            if self.replica_num < 0:
+                raise ValueError("Mooncake replica_num must be non-negative")
+            if self.dfs_replica_num not in (0, 1):
+                raise ValueError("Mooncake dfs_replica_num must be 0 or 1")
+            if self.replica_num + self.dfs_replica_num == 0:
+                raise ValueError("Mooncake requires at least one memory or DFS replica")
+            if self.dfs_replica_num > 0 and self.config.tenant_id != DEFAULT_TENANT_ID:
+                raise ValueError(
+                    "Mooncake DFS replicas currently require tenant_id='default'"
+                )
+            if self.dfs_replica_num > 0 and not self.config.standalone_storage:
+                if not self.config.enable_ssd_offload:
+                    raise ValueError(
+                        "Mooncake DFS replicas in embedded mode require "
+                        "enable_ssd_offload=true"
+                    )
+                if os.getenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR") != (
+                    "distributed_storage_backend"
+                ):
+                    raise ValueError(
+                        "Mooncake DFS replicas in embedded mode require "
+                        "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR="
+                        "distributed_storage_backend"
+                    )
+                if not isinstance(
+                    self.config.ssd_offload_path, str
+                ) or not os.path.isabs(self.config.ssd_offload_path):
+                    raise ValueError(
+                        "Mooncake DFS replicas in embedded mode require an "
+                        "absolute ssd_offload_path"
+                    )
+
+            self._use_custom_replica_config = (
+                self.replica_num != 1 or self.dfs_replica_num != 0
+            )
+            if self._use_custom_replica_config:
+                if self._replicate_config_cls is None:
+                    raise RuntimeError(
+                        "The installed Mooncake package does not expose "
+                        "ReplicateConfig. Please upgrade Mooncake to configure "
+                        "HiCache replicas."
+                    )
+                replicate_config = self._replicate_config_cls()
+                unsupported_fields = [
+                    name
+                    for name, value, default in (
+                        ("replica_num", self.replica_num, 1),
+                        ("dfs_replica_num", self.dfs_replica_num, 0),
+                    )
+                    if value != default and not hasattr(replicate_config, name)
+                ]
+                if unsupported_fields:
+                    raise RuntimeError(
+                        "The installed Mooncake package does not support "
+                        f"ReplicateConfig.{', ReplicateConfig.'.join(unsupported_fields)}. "
+                        "Please upgrade Mooncake to configure HiCache replicas."
+                    )
+                logger.info(
+                    "Using Mooncake replication config: replica_num=%d, "
+                    "dfs_replica_num=%d",
+                    self.replica_num,
+                    self.dfs_replica_num,
+                )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -481,7 +578,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.local_buffer_size,
                     self.config.client_server_address,
                 )
             else:
@@ -546,7 +643,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.local_buffer_size,
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
@@ -695,7 +792,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         retry_delay = 1.0  # seconds
 
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            if self._use_custom_replica_config:
+                ret = self.store.put(
+                    warmup_key, warmup_value, self._new_replicate_config()
+                )
+            else:
+                ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
             logger.warning(
@@ -754,6 +856,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
+
+    def _new_replicate_config(self, group_ids: Optional[List[str]] = None):
+        """Build a request-scoped config without mutating ``self.config``."""
+        replicate_config = self._replicate_config_cls()
+        if self.replica_num != 1:
+            replicate_config.replica_num = self.replica_num
+        if self.dfs_replica_num != 0:
+            replicate_config.dfs_replica_num = self.dfs_replica_num
+        if group_ids is not None:
+            replicate_config.group_ids = list(group_ids)
+        return replicate_config
 
     def _make_group_id(self, logical_key: str) -> str:
         return f"sglang-hicache:{logical_key}"
@@ -1465,24 +1578,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
     ) -> List[int]:
-        config = None
+        request_group_ids = None
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
                 raise ValueError(
                     "Mooncake group_ids length must match key_strs length: "
                     f"{len(group_ids)} != {len(key_strs)}"
                 )
-            config = self._replicate_config_cls()
-            config.group_ids = group_ids
+            request_group_ids = group_ids
+
+        replicate_config = None
+        if self._use_custom_replica_config or request_group_ids is not None:
+            replicate_config = self._new_replicate_config(request_group_ids)
 
         if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
+            if replicate_config is None:
+                replicate_config = self._new_replicate_config()
             return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
+                key_strs, buffer_ptrs, buffer_sizes, replicate_config
             )
-        elif config is not None:
+        elif replicate_config is not None:
             return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
+                key_strs, buffer_ptrs, buffer_sizes, replicate_config
             )
         else:
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
