@@ -1,5 +1,7 @@
 """SM90 component CI for Humming FP8 DeepEP dispatch and fused SiLU quant."""
 
+import json
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -34,6 +36,185 @@ class TestHummingFp8Dispatch(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         if get_device_sm() != 90:
             raise unittest.SkipTest("Humming FP8 dispatch requires SM90")
+
+    def test_indexed_two_gemms_with_different_m_tiles(self):
+        from humming.config import GemmType
+        from humming.device import current_device
+        from humming.schema import HummingInputSchema, HummingWeightSchema
+        from humming.tune.candidate import (
+            DeviceProfile,
+            ScheduleCandidate,
+            TuningProblem,
+            analyze_candidate,
+        )
+        from humming.utils.weight import dequantize_weight
+
+        torch.manual_seed(42)
+        num_experts, hidden_size, intermediate_size = 4, 512, 256
+        num_tokens, top_k = 128, 2
+        layer = torch.nn.Module()
+        layer.hidden_size = hidden_size
+        layer.intermediate_size_per_partition = intermediate_size
+        layer.params_dtype = torch.bfloat16
+        layer.register_buffer(
+            "locks", torch.zeros(2048, dtype=torch.int32, device="cuda")
+        )
+        weight_schema = HummingWeightSchema(
+            b_dtype="float4e2m1", bs_dtype="float8e8m0", weight_scale_group_size=32
+        )
+        input_schema = HummingInputSchema(
+            a_dtype="float8e4m3",
+            input_scale_group_size=128,
+            input_scale_dtype="float32",
+        )
+        reference_weights = {}
+        for sublayer, shape_n, shape_k in (
+            ("w13", intermediate_size * 2, hidden_size),
+            ("w2", hidden_size, intermediate_size),
+        ):
+            weights = torch.randn(
+                num_experts, shape_n, shape_k, device="cuda", dtype=torch.bfloat16
+            )
+            weights /= math.sqrt(shape_k)
+            tensors = weight_schema.quant_tensor(weights, weight_schema, torch.bfloat16)
+            reference_weights[sublayer] = dequantize_weight(
+                tensors["weight"],
+                tensors.get("weight_scale"),
+                tensors.get("zero_point"),
+                tensors.get("weight_scale_2"),
+                weight_schema.b_dtype,
+                packed=True,
+            )
+            for name, tensor in tensors.items():
+                layer.register_parameter(
+                    f"{sublayer}_{name}",
+                    torch.nn.Parameter(tensor, requires_grad=False),
+                )
+            humming_runner.HummingMethod.prepare_layer_meta(
+                layer=layer,
+                shape_n=shape_n,
+                shape_k=shape_k,
+                weight_schema=weight_schema,
+                input_schema=input_schema,
+                num_experts=num_experts,
+                torch_dtype=torch.bfloat16,
+                sublayer_name=sublayer,
+                tensors=tensors,
+            )
+            humming_runner.HummingMethod.transform_humming_layer(
+                layer, sublayer_name=sublayer
+            )
+
+        runner = humming_runner.HummingRunnerCore(
+            MoeRunnerConfig(
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size,
+                top_k=top_k,
+                params_dtype=torch.bfloat16,
+                activation="silu",
+                gate_up_interleaved=False,
+            )
+        )
+        runner.layer = layer
+        compute_config = {"gemm_type": "indexed", "use_f16_accum": False}
+        configs = {
+            "compute_config": compute_config,
+            "compute_config_str": json.dumps(compute_config),
+        }
+        device_profile = DeviceProfile(
+            name=current_device.name,
+            sm_version=current_device.sm_version,
+            num_sms=current_device.sm_count,
+            max_smem_size=current_device.max_smem_size,
+            max_threads_per_sm=current_device.max_threads_per_sm,
+            max_registers_per_sm=current_device.max_registers_per_sm,
+        )
+        # Fix distinct legal M tiles: heuristics may choose the same tile on H100.
+        for sublayer, block_m in (("w13", 32), ("w2", 48)):
+            selected = {
+                "mma_type": "wgmma",
+                "block_shape": (block_m, 128, 128),
+                "warp_shape": (block_m, 32, 128),
+                "num_stages": 3,
+                "use_warp_spec": True,
+                "use_tma": True,
+                "use_tma_c": False,
+                # Direct output gives deterministic eager/graph comparisons.
+                "use_stream_k": False,
+            }
+            problem = TuningProblem(
+                layer_config=layer.humming_metas[sublayer],
+                shape_m=num_tokens * top_k,
+                gemm_type=GemmType.INDEXED,
+                device=device_profile,
+            )
+            candidate = ScheduleCandidate.from_config(sublayer, selected)
+            analysis = analyze_candidate(problem, candidate)
+            self.assertTrue(analysis.legal, analysis.rejection_reasons)
+            selected.update(use_tma_a=False, use_tma_as=False, use_tma_as2=False)
+            tuning = [[0, 1 << 30, selected]]
+            configs[f"{sublayer}_tuning_config"] = tuning
+            configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
+        runner.humming_gemm_configs["indexed"] = configs
+        inputs = torch.randn(
+            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        topk_ids = torch.randint(
+            num_experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
+        )
+        topk_ids[0] = -1
+        topk_ids[1, 1] = -1
+        topk_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda"), dim=-1
+        )
+
+        def quantize_reference(values):
+            grouped = values.float().reshape(*values.shape[:-1], -1, 128)
+            scales = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 448.0
+            return (
+                (grouped / scales).to(torch.float8_e4m3fn).float() * scales
+            ).reshape_as(values)
+
+        quantized_inputs = quantize_reference(inputs)
+        reference = torch.zeros_like(inputs, dtype=torch.float32)
+        for expert in range(num_experts):
+            tokens, slots = torch.where(topk_ids == expert)
+            gate_up = (
+                quantized_inputs[tokens] @ reference_weights["w13"][expert].T
+            ).to(torch.bfloat16)
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                torch.bfloat16
+            )
+            down_input = quantize_reference(activated)
+            down_output = (down_input @ reference_weights["w2"][expert].T).to(
+                torch.bfloat16
+            )
+            reference.index_add_(
+                0, tokens, down_output.float() * topk_weights[tokens, slots, None]
+            )
+        reference = reference.to(torch.bfloat16)
+
+        def assert_matches_reference(output):
+            self.assertTrue(torch.isfinite(output).all().item())
+            relative_error = (
+                output.float() - reference.float()
+            ).norm() / reference.float().norm()
+            self.assertLess(relative_error.item(), 0.035)
+            self.assertEqual(torch.count_nonzero(output[0]).item(), 0)
+
+        actual = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+        assert_matches_reference(actual)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            captured = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+        for _ in range(2):
+            graph.replay()
+            assert_matches_reference(captured)
+            torch.testing.assert_close(captured, actual, rtol=0, atol=0)
 
     def test_fp8_dispatch_preserves_group_scales(self):
         from sglang.srt.layers.quantization import humming_utils
@@ -99,6 +280,8 @@ class TestHummingFp8Dispatch(CustomTestCase):
                 "w13": SimpleNamespace(
                     a_dtype=humming_runner.dtypes.float8e4m3,
                     input_scale_group_size=128,
+                    input_quant_mode=humming_runner.InputQuantizationMode.DynamicGroup,
+                    as_dtype=humming_runner.dtypes.float32,
                 )
             },
         )
@@ -169,6 +352,8 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         "w2": SimpleNamespace(
                             a_dtype=humming_runner.dtypes.float8e4m3,
                             input_scale_group_size=128,
+                            input_quant_mode=humming_runner.InputQuantizationMode.DynamicGroup,
+                            as_dtype=humming_runner.dtypes.float32,
                         )
                     }
                 )
@@ -199,10 +384,13 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         side_effect=run_poisoned_kernel,
                     ) as fused_silu,
                 ):
-                    down_input, down_scale = runner._grouped_masked_act_quant(
-                        gate_up, expert_num_tokens, buffers
+                    down_input, down_scale, down_scale_2 = (
+                        runner._grouped_masked_act_quant(
+                            gate_up, expert_num_tokens, buffers
+                        )
                     )
 
+                self.assertIsNone(down_scale_2)
                 fused_silu.assert_called_once()
                 fallback_activation.assert_not_called()
                 call = fused_silu.call_args

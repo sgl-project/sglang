@@ -7,8 +7,9 @@ import sys
 import unittest
 import warnings
 from contextlib import ExitStack
+from unittest.mock import patch
 
-from sglang.srt.environ import _DeprecatedEnv, envs
+from sglang.srt.environ import _DeprecatedEnv, envs, redirect_third_party_caches
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -97,6 +98,30 @@ class TestEnvField(unittest.TestCase):
             warnings.simplefilter("always")
             self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
         self.assertIn("Invalid value", str(caught[0].message))
+
+
+class TestThirdPartyCaches(unittest.TestCase):
+    def test_humming_caches_follow_sglang_cache_dir(self):
+        with patch.dict(os.environ), envs.SGLANG_CACHE_DIR.override("~/sglang-test"):
+            os.environ.pop("HUMMING_CACHE_DIR", None)
+            os.environ.pop("HUMMING_TMP_DIR", None)
+            redirect_third_party_caches()
+
+            base = os.path.expanduser("~/sglang-test/humming")
+            self.assertEqual(
+                os.environ["HUMMING_CACHE_DIR"], os.path.join(base, "cache")
+            )
+            self.assertEqual(os.environ["HUMMING_TMP_DIR"], os.path.join(base, "tmp"))
+
+    def test_humming_cache_overrides_are_preserved(self):
+        overrides = {
+            "HUMMING_CACHE_DIR": "/custom/humming-cache",
+            "HUMMING_TMP_DIR": "/custom/humming-tmp",
+        }
+        with patch.dict(os.environ, overrides):
+            redirect_third_party_caches()
+            for key, value in overrides.items():
+                self.assertEqual(os.environ[key], value)
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):

@@ -1,14 +1,18 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
 from humming.layer import HummingInputSchema, HummingMethod
-from humming.schema import BaseWeightSchema
+from humming.schema import BaseWeightSchema, HummingWeightSchema
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_exec
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 
 def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
@@ -18,8 +22,8 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
     keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
     ignored_layers: list[str] = []
     for key in keys:
-        ignored_layers = config.get(key, []) or []
-        if not ignored_layers:
+        if key in config:
+            ignored_layers = config[key] or []
             break
 
     if any(module_name in prefix for module_name in ignored_layers):
@@ -70,14 +74,32 @@ def configure_humming_deepep_dispatch(layer: torch.nn.Module) -> bool:
 
 
 def make_humming_deepep_input_schema(
-    sublayer_name: str, shape_k: int
+    sublayer_name: str,
+    shape_k: int,
+    *,
+    weight_schema: HummingWeightSchema | None = None,
+    param_dtype: torch.dtype | None = None,
 ) -> HummingInputSchema:
     if shape_k % 128 != 0:
         raise ValueError(
             f"Humming FP8 dispatch requires {sublayer_name} K={shape_k} "
             "to be divisible by 128."
         )
-    return HummingInputSchema(a_dtype="float8e4m3", input_scale_group_size=128)
+    input_schema = HummingInputSchema(
+        a_dtype="float8e4m3",
+        input_scale_group_size=128,
+        input_scale_dtype="float32",
+        input_quant_mode="dynamic_group",
+    )
+    if weight_schema is not None and not input_schema.is_compatible_with(
+        weight_schema, param_dtype
+    ):
+        raise ValueError(
+            f"Humming FP8 dispatch is incompatible with {sublayer_name} weights "
+            "on this device: it requires FP8 inputs with FP32 group-128 scales. "
+            "Use --deepep-dispatcher-output-dtype=bf16."
+        )
+    return input_schema
 
 
 def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
@@ -107,7 +129,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
 
     for sublayer_name in shape_config:
         # Step 1: convert weight to humming standard format
-        tensors: dict[str, torch.Tensor] = dict(
+        checkpoint_tensors: dict[str, torch.Tensor] = dict(
             (key.removeprefix(sublayer_name + "_"), value)
             for key, value in layer.state_dict().items()
             if key.startswith(sublayer_name + "_")
@@ -120,30 +142,37 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             shape_n_stacks = [shape_n // 2] * 2
 
         weight_schema_new, tensors = weight_schema.convert_humming(
-            tensors=tensors,
+            tensors=checkpoint_tensors,
             shape_n_stacks=shape_n_stacks,
             shape_k_stacks=shape_k_stacks,
             num_experts=layer.num_local_experts,
             param_dtype=layer.params_dtype,
         )
+        tensors = tensors.copy()
+        tensors.pop("input_scale", None)
+        tensors.pop("input_scale_2", None)
 
         layer.weight_schemas[sublayer_name] = weight_schema_new
-        sub_input_schema = input_schema
         if use_deepep_fp8_dispatch:
-            sub_input_schema = make_humming_deepep_input_schema(sublayer_name, shape_k)
+            sub_input_schema = make_humming_deepep_input_schema(
+                sublayer_name,
+                shape_k,
+                weight_schema=weight_schema_new,
+                param_dtype=layer.params_dtype,
+            )
+        else:
+            sub_input_schema, input_tensors = input_schema.convert_humming(
+                tensors=checkpoint_tensors,
+                shape_n_stacks=shape_n_stacks,
+                shape_k_stacks=shape_k_stacks,
+                num_experts=layer.num_local_experts,
+                param_dtype=layer.params_dtype,
+            )
+            tensors.update(input_tensors)
         layer.input_schemas[sublayer_name] = sub_input_schema
 
-        for name, _ in list(layer.named_parameters()):
-            if not name.startswith(sublayer_name + "_"):
-                continue
-            delattr(layer, name)
-
-        for name, tensor in tensors.items():
-            name = f"{sublayer_name}_{name}"
-            param = torch.nn.Parameter(tensor, requires_grad=False)
-            setattr(layer, name, param)
-
-        # Step 2: transform weight (humming standard format) for forwarding
+        # Preparing integer activations can replace E0Mx weight tensors. Register
+        # the resulting tensors only after this conversion has completed.
         HummingMethod.prepare_layer_meta(
             layer=layer,
             shape_n=shape_n,
@@ -156,8 +185,20 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             num_experts=layer.num_local_experts,
             torch_dtype=layer.params_dtype,
             sublayer_name=sublayer_name,
+            tensors=tensors,
         )
 
+        for name, _ in list(layer.named_parameters()):
+            if not name.startswith(sublayer_name + "_"):
+                continue
+            delattr(layer, name)
+
+        for name, tensor in tensors.items():
+            name = f"{sublayer_name}_{name}"
+            param = torch.nn.Parameter(tensor, requires_grad=False)
+            setattr(layer, name, param)
+
+        # Step 2: transform weight (humming standard format) for forwarding
         HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
 
     if not hasattr(layer, "locks"):
