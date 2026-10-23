@@ -1088,14 +1088,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
-        effective_seq_lens = seq_lens[:bs]
-        if self.dense_mla_dcp_target:
-            effective_seq_lens = effective_seq_lens.to(torch.int64)
-        if forward_mode.is_target_verify():
-            effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
-
         if self.dense_mla_dcp_target:
             # Use the existing Host lengths for table bounds without a device readback.
             _, block_tables = self._get_kv_lens_and_block_tables(
@@ -1175,6 +1167,12 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        effective_seq_lens = seq_lens[:bs]
+        if forward_mode.is_target_verify():
+            effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
