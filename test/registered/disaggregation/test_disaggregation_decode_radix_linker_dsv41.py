@@ -24,7 +24,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import is_in_ci, try_cached_model
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 PAGE_SIZE = 256
