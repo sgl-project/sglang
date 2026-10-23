@@ -110,8 +110,18 @@ def add_weight_versions_to_meta_info(
 # ======================================================================
 # OpenAI-compatible endpoints
 # ======================================================================
-def build_endpoint_weight_version_metadata(meta_info: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = {"weight_version": meta_info["weight_version"]}
-    if "weight_versions" in meta_info:
-        metadata["weight_versions"] = meta_info["weight_versions"]
-    return metadata
+def build_endpoint_weight_version_sglext_fields(
+    meta_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Weight-version fields for the ``sglext`` block of OpenAI-compatible responses.
+
+    These live under ``sglext`` rather than ``metadata``: the OpenAI spec
+    reserves ``metadata`` for flat string-to-string maps, and span objects
+    break clients that validate responses against that schema.
+    """
+    fields: Dict[str, Any] = {}
+    if (weight_version := meta_info.get("weight_version")) is not None:
+        fields["weight_version"] = weight_version
+    if (weight_versions := meta_info.get("weight_versions")) is not None:
+        fields["weight_versions"] = weight_versions
+    return fields

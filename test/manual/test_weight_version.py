@@ -1,4 +1,4 @@
-"""weight_version: /model_info, /update_weight_version, and generate/OpenAI metadata."""
+"""weight_version: /model_info, /update_weight_version, and generate/OpenAI sglext."""
 
 import unittest
 
@@ -70,9 +70,9 @@ class TestWeightVersion(CustomTestCase):
         )
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("metadata", data)
-        self.assertIn("weight_version", data["metadata"])
-        self.assertEqual(data["metadata"]["weight_version"], "test_version_1.0")
+        self.assertIn("sglext", data)
+        self.assertIn("weight_version", data["sglext"])
+        self.assertEqual(data["sglext"]["weight_version"], "test_version_1.0")
 
         request_data = {
             "model": self.model,
@@ -83,9 +83,9 @@ class TestWeightVersion(CustomTestCase):
         response = requests.post(f"{self.base_url}/v1/completions", json=request_data)
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("metadata", data)
-        self.assertIn("weight_version", data["metadata"])
-        self.assertEqual(data["metadata"]["weight_version"], "test_version_1.0")
+        self.assertIn("sglext", data)
+        self.assertIn("weight_version", data["sglext"])
+        self.assertEqual(data["sglext"]["weight_version"], "test_version_1.0")
 
         update_data = {
             "new_version": "updated_version_2.0",
@@ -122,7 +122,7 @@ class TestWeightVersion(CustomTestCase):
         response = requests.post(f"{self.base_url}/v1/chat/completions", json=chat_data)
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["metadata"]["weight_version"], "updated_version_2.0")
+        self.assertEqual(data["sglext"]["weight_version"], "updated_version_2.0")
 
         update_data = {"new_version": "final_version_3.0", "abort_all_requests": True}
         response = requests.post(
@@ -151,7 +151,7 @@ class TestWeightVersion(CustomTestCase):
             response.json()["meta_info"]["weight_version"], "final_version_3.0"
         )
 
-        # Check OpenAI chat metadata
+        # Check OpenAI chat sglext
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             json={
@@ -163,7 +163,7 @@ class TestWeightVersion(CustomTestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            response.json()["metadata"]["weight_version"], "final_version_3.0"
+            response.json()["sglext"]["weight_version"], "final_version_3.0"
         )
 
         print("All weight_version functionality tests passed!")
