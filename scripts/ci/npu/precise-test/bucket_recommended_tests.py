@@ -35,9 +35,12 @@ classified:
     test_case   a registered / NPU-regression test file -> recommended as a
                 whole file (any touched test is worth running)
     test_infra  test/** and python/sglang/{,multimodal_gen/}test/** helpers,
-                conftest.py, case configs -> not judgeable
-    ci_infra    .github/**, scripts/**, dependency manifests -> not judgeable
-    ignored     docs/examples/... -> cannot affect tests
+                conftest.py, case configs -> not judged, and NOT a full-run
+                trigger: the rest of the diff decides which suites run
+    ci_infra    only _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml,
+                npu_ci_install_dependency.sh): the non-test paths that trigger
+                this workflow and shape its environment/selection logic
+    ignored     docs/examples/other CI files -> cannot affect tests
 
 Precision mode stays ON for judgeable PRs even when EVERY bucket is empty.
 A recommended test that no scheduled suite contains (a base-a CPU unit test, a
@@ -47,7 +50,7 @@ not evidence that the suites must run in full. This is what keeps a PR that
 only edits a CPU unit test from re-running the whole a3 matrix.
 
 A full run is reserved for signals that genuinely defeat the baseline:
-non-judgeable paths above, a missing changed-file list (test_selector.py
+the ci_infra paths above, a missing changed-file list (test_selector.py
 failed), and the multimodal baseline safety gate.
 
 Diffusion (multimodal_gen) suites are enumerated from the NPU diffusion case
@@ -147,8 +150,7 @@ def normalize_rel(path: str) -> str:
 
 # A changed test file that test_selector.py recommends unconditionally. Kept
 # in sync with its _get_test_files_from_pr_diff() patterns; used here to tell
-# "test case" changes apart from test infrastructure, which the coverage
-# baseline cannot judge.
+# "test case" changes apart from test infrastructure.
 _TEST_CASE_RE = re.compile(
     r"^(?:"
     r"test/registered(?:/.+)?/test_\w+\.py"
@@ -157,15 +159,14 @@ _TEST_CASE_RE = re.compile(
     r")$"
 )
 
-# Changes under these roots cannot be judged by the coverage baseline: they are
-# test/CI infrastructure that can alter the behavior of any test below them.
-_CI_INFRA_PREFIXES = (".github/", "scripts/")
-_CI_INFRA_FILES = {
-    "python/pyproject.toml",
+# The only changes that force a full run. They are exactly the non-test paths
+# that trigger this workflow's paths filter and shape its environment or its
+# selection logic, so their effect cannot be judged from the coverage baseline
+# (and a selector change must not be validated by the selector's own output).
+_FULL_RUN_PATHS = {
+    ".github/workflows/pr-test-npu.yml",
     "python/pyproject_npu.toml",
-    "python/setup.py",
-    "pyproject.toml",
-    "setup.py",
+    "scripts/ci/npu/npu_ci_install_dependency.sh",
 }
 # Test trees that are imported by tests but are not test cases themselves.
 _TEST_INFRA_PREFIXES = (
@@ -180,21 +181,19 @@ def classify_changed_path(path: str) -> str:
 
     product     : coverage baseline judges which tests are affected
     test_case   : touched test file, recommended as a whole file
-    test_infra  : test helpers/conftest/configs -> not judgeable
-    ci_infra    : workflows/CI scripts/dependency manifests -> not judgeable
-    ignored     : docs, examples, ... -> cannot affect tests
+    test_infra  : test helpers/conftest/configs -> not judged, no full run
+    ci_infra    : one of _FULL_RUN_PATHS -> full run
+    ignored     : docs, examples, other CI files -> cannot affect tests
     """
     p = path.strip().replace("\\", "/").removeprefix("./")
+    if p in _FULL_RUN_PATHS:
+        return "ci_infra"
     if _TEST_CASE_RE.match(p):
         return "test_case"
     if p.startswith(_TEST_INFRA_PREFIXES):
         return "test_infra"
     if p.startswith("python/sglang/"):
         return "product"
-    if p.startswith(_CI_INFRA_PREFIXES) or p in _CI_INFRA_FILES:
-        return "ci_infra"
-    if os.path.basename(p).startswith("requirements") and p.endswith(".txt"):
-        return "ci_infra"
     return "ignored"
 
 
@@ -437,11 +436,13 @@ def write_github_summary(
     decision: str = "",
     decision_reason: str = "",
     non_judgeable: list | None = None,
+    test_infra_changes: list | None = None,
     unknown_recommended: list | None = None,
 ) -> None:
     """Append a markdown section with the recommendation results to every
     target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
     non_judgeable = non_judgeable or []
+    test_infra_changes = test_infra_changes or []
     unknown_recommended = unknown_recommended or []
     lines = []
     lines.append("### Recommended tests from coverage")
@@ -454,20 +455,25 @@ def write_github_summary(
             "Precision mode **on** — a3 suites run only the bucketed subset below."
         )
     elif skip_all_suites and not force_full:
-        lines.append(
-            "**All suites skipped**: the judgeable changes affect no test and "
-            "no test-infrastructure change was found."
-        )
+        lines.append("**All suites skipped**: the judgeable changes affect no test.")
     else:
         lines.append("Precision mode **off** — suites run in full.")
     if non_judgeable:
         lines.append("")
         lines.append(
-            "**Full run forced — changes the coverage baseline cannot judge** "
-            "(test/CI infrastructure):"
+            "**Full run forced — pipeline configuration changed** "
+            "(not judgeable from coverage):"
         )
         lines.append("")
         lines.extend(f"- `{p}`" for p in non_judgeable)
+    if test_infra_changes:
+        lines.append("")
+        lines.append(
+            "**Test-infrastructure changes (not judged; no full-run fallback)** "
+            "— suites are decided by the rest of the diff:"
+        )
+        lines.append("")
+        lines.extend(f"- `{p}`" for p in test_infra_changes)
     lines.append("")
     lines.append(
         f"Recommended **{len(raw_entries)}** test cases "
@@ -582,8 +588,9 @@ def main():
         default="",
         help="pr_changed_files.txt written by test_selector.py. Every path is "
         "classified (product / test_case / test_infra / ci_infra / ignored); "
-        "non-judgeable infrastructure changes force a full run, and a missing "
-        "or empty file also forces a full run",
+        "only the ci_infra paths (pr-test-npu.yml, pyproject_npu.toml, "
+        "npu_ci_install_dependency.sh) force a full run, and a missing or "
+        "empty file also forces a full run",
     )
     parser.add_argument(
         "--github-output",
@@ -623,10 +630,9 @@ def main():
         print(f"::warning::Recommended file not found: {rec_file}")
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
 
-    # Classify every changed path. Test/CI infrastructure cannot be judged by
-    # the coverage baseline; the decision itself is taken after pool
-    # enumeration, because the multimodal test tree needs the case config to
-    # tell a runnable case file from shared fixtures (see diffusion_infra).
+    # Classify every changed path. Only the three ci_infra paths force a full
+    # run; test infrastructure (conftest/helpers/case configs) is listed for
+    # the report but does not change the run/skip decision.
     changed_files: list[str] = []
     if args.changed_files:
         cf = Path(args.changed_files)
@@ -636,7 +642,10 @@ def main():
             ]
     changed_classes = {p: classify_changed_path(p) for p in changed_files}
     non_judgeable = sorted(
-        p for p, kind in changed_classes.items() if kind in ("test_infra", "ci_infra")
+        p for p, kind in changed_classes.items() if kind == "ci_infra"
+    )
+    test_infra_changes = sorted(
+        p for p, kind in changed_classes.items() if kind == "test_infra"
     )
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
@@ -729,20 +738,6 @@ def main():
                 f"Suite {job} (diffusion {suite}): {pool.size} cases, "
                 f"{len(tokens)} recommended"
             )
-
-        # A test_*.py under the multimodal test tree that the NPU case config
-        # does not list is shared infrastructure (fixtures, helpers such as
-        # test_server_common.py), not a runnable case. It can change every
-        # diffusion case, so it must not be mistaken for a touched test file.
-        diffusion_infra = sorted(
-            p
-            for p in changed_files
-            if changed_classes.get(p) == "test_case"
-            and p.startswith(DIFFUSION_TEST_PREFIX)
-            and p not in all_pool
-        )
-        if diffusion_infra:
-            non_judgeable = sorted(set(non_judgeable) | set(diffusion_infra))
 
     if not changed_files:
         # test_selector.py writes this file on every PR run; missing/empty
@@ -838,6 +833,7 @@ def main():
             decision=decision,
             decision_reason=decision_reason,
             non_judgeable=non_judgeable,
+            test_infra_changes=test_infra_changes,
             unknown_recommended=unknown_recommended,
         )
 
