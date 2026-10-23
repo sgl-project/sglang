@@ -20,12 +20,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.cp.padding import (
-    attention_output_tokens as attention_output_tokens,
-)
-from sglang.srt.layers.cp.padding import (
-    attention_query_tokens as attention_query_tokens,
-)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 
 if TYPE_CHECKING:
@@ -36,6 +30,19 @@ if TYPE_CHECKING:
 def _zero_padded_tokens(output, actual_tokens):
     if actual_tokens is not None:
         output[actual_tokens:].zero_()
+
+
+def attention_query_tokens(forward_batch, tokens):
+    # Import at call time: the CP package also imports RadixAttention.
+    from sglang.srt.layers.cp.padding import attention_query_tokens as cp_query_tokens
+
+    return cp_query_tokens(forward_batch, tokens)
+
+
+def attention_output_tokens(forward_batch, tokens):
+    from sglang.srt.layers.cp.padding import attention_output_tokens as cp_output_tokens
+
+    return cp_output_tokens(forward_batch, tokens)
 
 
 @contextmanager
