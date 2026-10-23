@@ -153,11 +153,11 @@ def _should_use_channels_last_3d(
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
+    # Wan's spatial-parallel decode exchanges halos in either layout
+    if isinstance(pipeline_config, WanT2V480PConfig):
+        return True
     if (
-        isinstance(
-            pipeline_config,
-            (WanT2V480PConfig, LTX2PipelineConfig, Cosmos3Config),
-        )
+        isinstance(pipeline_config, (LTX2PipelineConfig, Cosmos3Config))
         and server_args.num_gpus == 1
     ):
         return True

@@ -683,7 +683,9 @@ class TestVAELoader(unittest.TestCase):
             (QwenImagePipelineConfig, 1, "vae", True),
             (WanT2V480PConfig, 1, "video_vae", True),
             (FastWan2_2_TI2V_5B_Config, 1, "video_vae", True),
-            (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
+            # Wan's spatial-parallel decode runs channels_last too
+            (Wan2_2_I2V_A14B_Config, 2, "video_vae", True),
+            (WanT2V480PConfig, 4, "video_vae", True),
             (LTX2PipelineConfig, 1, "video_vae", True),
             (LTX2PipelineConfig, 2, "video_vae", False),
             (Cosmos3Config, 1, "vae", True),
