@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.topk import (
     fused_shared_expert_weight,
     is_routed_scaling_factor_fused_in_topk,
 )
+from sglang.srt.model_loader.utils import supports_quantized_moe_partial_block_shards
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
@@ -138,10 +139,6 @@ def check_quantized_moe_compatibility(
     moe_ep_size: int,
     moe_dp_size: int,
 ) -> None:
-    from sglang.srt.model_loader.utils import (
-        supports_quantized_moe_partial_block_shards,
-    )
-
     if (
         quantization_config := getattr(
             model_config.hf_config, "quantization_config", None
