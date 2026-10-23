@@ -59,6 +59,17 @@ def run(output_path):
         envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
     ):
         case = FrameworkCase("lim", fixture, args)
+        prefill = SimpleNamespace(
+            req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64, device="npu"),
+            seq_lens=torch.tensor([3, 0, 5], dtype=torch.int64, device="npu"),
+            req_pool_indices_cpu=torch.tensor([2, 0, 1], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3, 0, 5], dtype=torch.int64),
+        )
+        for layer_id in range(args.layers):
+            nope, rope = case.manager.get_forward_kv(layer_id, prefill)
+            actual = torch.cat((nope, rope), dim=-1).cpu()
+            expected = torch.cat((fixture.host[2, :3], fixture.host[1, :5])) + layer_id
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for route in (0, 1, 0):
             result = case.step(route)
             torch.npu.synchronize()
@@ -139,6 +150,7 @@ def run(output_path):
             "attention_cpu_oracle": "pass",
             "graph_reset_padding_and_reuse": "pass",
             "mixed_fallback_to_graph": "pass",
+            "prefill_ragged_gather": "pass",
             "operator_calls": counts,
         }
         output_path.write_text(json.dumps(record, indent=2) + "\n")

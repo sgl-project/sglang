@@ -5,12 +5,57 @@ from unittest import mock
 
 import pytest
 import torch
-
 from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner as mod
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestCopySFAGraphAdmission(CustomTestCase):
+    def test_copy_sfa_padded_graph_rejects_short_rows_before_replay(self):
+        """A captured fixed-window graph must not consume short request KV."""
+        runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.require_mlp_tp_gather = False
+        runner.require_mlp_sync = False
+        runner.disable_padding = False
+        runner.max_bs = 8
+        runner.enable_pdmux = False
+        runner.enable_lora = False
+        runner.record_nolora_graph = False
+        runner.is_encoder_decoder = False
+        runner.enable_two_batch_overlap = False
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+        )
+        batch = SimpleNamespace(
+            replace_embeds=None,
+            spec_info=None,
+            batch_size=1,
+            forward_mode=ForwardMode.DECODE,
+        )
+        with mod.envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True):
+            for lengths, expected in (
+                (None, False),
+                ([11], False),
+                ([2047], False),
+                ([2048], True),
+                ([2049], True),
+                ([0, 2048], True),
+                ([2048, 120], False),
+            ):
+                with self.subTest(lengths=lengths):
+                    batch.seq_lens_cpu = (
+                        None if lengths is None else torch.tensor(lengths)
+                    )
+                    batch.batch_size = 1 if lengths is None else len(lengths)
+                    self.assertEqual(runner.can_run_graph(batch), expected)
+        with mod.envs.SGLANG_NPU_ENABLE_COPY_SFA.override(False):
+            batch.seq_lens_cpu = torch.tensor([11])
+            self.assertTrue(runner.can_run_graph(batch))
 
 
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():

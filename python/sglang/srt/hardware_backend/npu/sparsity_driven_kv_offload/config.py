@@ -26,6 +26,15 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
+def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
+    """Fixed-window Copy-SFA graphs require every live row to contain 2048 KV."""
+    if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
+        return True
+    return seq_lens_cpu is not None and not any(
+        0 < int(length) < 2048 for length in seq_lens_cpu.tolist()
+    )
+
+
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,

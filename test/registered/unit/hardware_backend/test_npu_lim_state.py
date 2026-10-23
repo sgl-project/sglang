@@ -9,6 +9,9 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
+    prepare_prefill_gather_rows,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     resolve_sparse_kv_budget,
 )
@@ -23,6 +26,28 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
+    def test_prefill_gather_shape_ignores_padding_and_checks_host_bounds(self):
+        # Host row order and total must match the ragged KV payload, including
+        # interior padding. Device-side nonzero would require a stream sync.
+        keep, total = prepare_prefill_gather_rows(
+            torch.tensor([3, -1, 1, 0]), torch.tensor([4, 2, 3, 0]), 4, 8
+        )
+        self.assertEqual(keep.tolist(), [0, 2])
+        self.assertEqual(total, 7)
+        keep, total = prepare_prefill_gather_rows(
+            torch.tensor([0, -1]), torch.tensor([0, 3]), 4, 8
+        )
+        self.assertEqual((keep.numel(), total), (0, 0))
+        for requests, lengths, error in (
+            ([4], [1], "outside sparse pool"),
+            ([1], [9], "exceeds sparse context"),
+        ):
+            with self.subTest(requests=requests, lengths=lengths):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    prepare_prefill_gather_rows(
+                        torch.tensor(requests), torch.tensor(lengths), 4, 8
+                    )
+
     def test_copy_sfa_packs_native_miss_stride_and_masks_interior_padding(self):
         batch, top_k = 3, 2048
         ints = lambda *shape: torch.empty(*shape, dtype=torch.int32)

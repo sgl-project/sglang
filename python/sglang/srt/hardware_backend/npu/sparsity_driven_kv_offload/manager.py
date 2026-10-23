@@ -19,6 +19,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     fill_request_block_table,
+    prepare_prefill_gather_rows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_budget,
@@ -956,11 +957,17 @@ class SparseKVCacheManager:
                 f"{int(seq_lens.numel())}."
             )
 
-        valid_reqs = (seq_lens > 0) & (req_ids >= 0)
-        req_ids = req_ids[valid_reqs].contiguous()
-        seq_lens = seq_lens[valid_reqs].contiguous()
-
-        if int(seq_lens.numel()) == 0:
+        keep_cpu, total_tokens = prepare_prefill_gather_rows(
+            forward_batch.req_pool_indices_cpu,
+            forward_batch.seq_lens_cpu,
+            self.size,
+            self.max_context_len,
+        )
+        if forward_batch.req_pool_indices_cpu.numel() != req_ids.numel():
+            raise RuntimeError(
+                "Prefill CPU and device metadata must have matching sizes"
+            )
+        if total_tokens == 0:
             empty_nope = torch.empty(
                 (0, self.head_num, self.kv_lora_rank),
                 dtype=self.store_dtype,
@@ -973,17 +980,11 @@ class SparseKVCacheManager:
             )
             return empty_nope, empty_pe
 
-        if bool((req_ids >= self.size).any().item()):
-            raise RuntimeError(
-                f"get_forward_kv got req id outside sparse pool size {self.size}."
-            )
-        if bool((seq_lens > self.max_context_len).any().item()):
-            raise RuntimeError(
-                "get_forward_kv got seq_len larger than max_context_len "
-                f"{self.max_context_len}."
-            )
+        if keep_cpu.numel() != req_ids.numel():
+            keep = keep_cpu.to(device=device, dtype=torch.long, non_blocking=True)
+            req_ids = req_ids.index_select(0, keep)
+            seq_lens = seq_lens.index_select(0, keep)
 
-        total_tokens = int(seq_lens.sum().item())
         kv_cat = torch.empty(
             (total_tokens, self.head_num, self.head_dim),
             dtype=self.store_dtype,

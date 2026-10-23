@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -27,6 +26,63 @@ register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def test_copy_sfa_short_context_vote_forces_both_dp_ranks_eager(self):
+        """Short and long replicas must share graph admission before collectives."""
+        long_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, seq_lens_cpu=torch.tensor([4096])
+        )
+        short_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, seq_lens_cpu=torch.tensor([128])
+        )
+        with envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True):
+            votes = [
+                dp_attn._local_decode_cuda_graph_vote(
+                    local_batch=batch, disable_cuda_graph=False
+                )
+                for batch in (long_batch, short_batch)
+            ]
+            infos = [
+                dp_attn.MLPSyncBatchInfo(
+                    num_dp_ranks=2,
+                    tp_size=1,
+                    cp_size=1,
+                    num_tokens=1,
+                    num_tokens_for_logprob=1,
+                    can_run_decode_cuda_graph=vote,
+                    can_run_draft_cuda_graph=True,
+                    can_run_prefill_cuda_graph=False,
+                    is_extend_in_batch=False,
+                    local_can_run_tbo=True,
+                    local_forward_mode=ForwardMode.DECODE.value,
+                )
+                for vote in votes
+            ]
+            rows = torch.stack([info._get_local_tensor("cpu") for info in infos])
+            with (
+                dp_attn.get_parallel().override(
+                    tp_group=SimpleNamespace(
+                        active_ranks_cpu=torch.ones(2, dtype=torch.int64)
+                    )
+                ),
+                patch.object(
+                    dp_attn,
+                    "exchange_sync_rows",
+                    side_effect=lambda output, local, group: output.copy_(
+                        rows.flatten()
+                    ),
+                ),
+            ):
+                for info in infos:
+                    info.all_gather(device="cpu", group=object())
+                    self.assertFalse(info.can_run_decode_cuda_graph)
+                    self.assertEqual(info.global_num_tokens, [1, 1])
+            self.assertEqual(votes, [True, False])
+            self.assertTrue(
+                dp_attn._local_decode_cuda_graph_vote(
+                    local_batch=None, disable_cuda_graph=False
+                )
+            )
+
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
