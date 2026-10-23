@@ -688,6 +688,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
             extend_seq_lens=torch.tensor([rows], dtype=torch.int32),
             extend_seq_lens_cpu=[rows],
             req_pool_indices=torch.tensor([1]),
+            mixed_num_prefill_rows=None,
         )
         core = SimpleNamespace(
             request_window_layout=layout, seq_lens_casual=torch.arange(1, rows + 1)

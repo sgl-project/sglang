@@ -9,10 +9,16 @@ spec seq_lens convention zeroed the tail's qo len - a hard crash on
 flashinfer, silent kv-span truncation elsewhere), unwritten relay rows
 read as tail inputs, and stale schedule-time tail state under overlap.
 Chunked prefill is set small so eval prompts span multiple chunks and
-mixing actually engages.
+mixing actually engages. The DSPARK cell also runs with
+SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION=1, where running requests draft and
+verify inside the mixed step instead.
 """
 
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported, kill_process_tree
@@ -32,7 +38,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=196, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=290, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3MixedChunk(
@@ -92,6 +98,7 @@ DSPARK_DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
 class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
     model = DSPARK_TARGET_MODEL
+    extra_args = ()
 
     gsm8k_num_questions = 200
     gsm8k_accuracy_thres = 0.80
@@ -126,6 +133,7 @@ class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
                 "--page-size",
                 "1",
                 "--cuda-graph-backend-prefill=disabled",
+                *cls.extra_args,
             ],
         )
 
@@ -133,6 +141,66 @@ class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
+
+
+class TestDSparkVerifyMergedMixedChunk(TestDSparkMixedChunk):
+    extra_args = ("--enable-metrics",)
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.override(True):
+            super().setUpClass()
+
+    def _generate(self, text, *, return_sampling_mask, max_new_tokens):
+        payload = {
+            "text": text,
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_k": 8,
+                "top_p": 0.9,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+            "return_sampling_mask": return_sampling_mask,
+        }
+        if return_sampling_mask:
+            payload["sampling_logprobs_mode"] = "support"
+        response = requests.post(f"{self.base_url}/generate", json=payload, timeout=120)
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        if return_sampling_mask:
+            masks = output["meta_info"]["output_token_sampling_mask"]
+            self.assertEqual(len(masks), len(output["output_ids"]))
+        return output
+
+    def test_sampling_mask_with_chunked_prefill(self):
+        # A multi-chunk prefill arriving while a request decodes must return
+        # masks for whichever side asked: prefill only, running only, or both.
+        long_prompt = "The quick brown fox jumps over the lazy dog. " * 60
+        for prefill_mask, running_mask in ((True, False), (False, True), (True, True)):
+            with self.subTest(prefill_mask=prefill_mask, running_mask=running_mask):
+                with ThreadPoolExecutor(2) as pool:
+                    running = pool.submit(
+                        self._generate,
+                        "Count from one to two hundred:",
+                        return_sampling_mask=running_mask,
+                        max_new_tokens=256,
+                    )
+                    time.sleep(1)
+                    prefill = pool.submit(
+                        self._generate,
+                        long_prompt,
+                        return_sampling_mask=prefill_mask,
+                        max_new_tokens=8,
+                    )
+                    prefill.result()
+                    running.result()
+
+    def test_zz_verify_merged_steps_ran(self):
+        # Runs after the eval, whose concurrent requests mix prefill chunks
+        # with running (verifying) requests.
+        metrics = requests.get(f"{self.base_url}/metrics", timeout=30).text
+        self.assertRegex(metrics, r"sglang:mixed_verify_steps_total(\{[^}]*\})? [1-9]")
 
 
 if __name__ == "__main__":
