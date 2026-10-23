@@ -178,9 +178,29 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?;
     // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
     // never tokenize: a multimodal text prompt passes through the pool first.
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> =
+        dyn_tokenizer.as_ref().map(|t| {
+            let tokenizer_config = tokenizer::resolve_model_file(
+                &cfg.server_args.tokenizer_path,
+                cfg.server_args.revision.as_deref(),
+                "tokenizer_config.json",
+            );
+            let special_tokens_map = tokenizer::resolve_model_file(
+                &cfg.server_args.tokenizer_path,
+                cfg.server_args.revision.as_deref(),
+                "special_tokens_map.json",
+            );
+            let tokenizer = tokenizer::DynamoTokenizer::new(
+                t.clone(),
+                tokenizer_config.as_deref(),
+                special_tokens_map.as_deref(),
+            );
+            Arc::new(if cfg.server_args.tokenizer_bos_token_id_resolved {
+                tokenizer.with_resolved_bos_token_id(cfg.server_args.tokenizer_bos_token_id)
+            } else {
+                tokenizer
+            }) as _
+        });
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
