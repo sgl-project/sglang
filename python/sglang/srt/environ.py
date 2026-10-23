@@ -1716,6 +1716,9 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # 0 keeps the synchronous lookup; positive sizes must be multiples of 128.
+    SGLANG_DSV41_ENGRAM_PREFETCH_CHUNK_SIZE = EnvInt(0)
+    SGLANG_DSV41_ENGRAM_PREFETCH_LAYERS = EnvInt(1)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

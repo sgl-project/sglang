@@ -87,6 +87,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram_prefetch import EngramPrefetcher
 from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -854,6 +855,30 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
+
+
+@eager_on_graph
+def bcg_deepseek_v4_engram_prefetch(
+    hash_ids: torch.Tensor,
+    prefetch: EngramPrefetcher,
+    layer_ids: tuple,
+    cp_all_tokens: bool,
+) -> torch.Tensor:
+    batch = get_tc_piecewise_forward_context().forward_batch
+    prefetch.begin(hash_ids, batch, layer_ids=layer_ids, cp_all_tokens=cp_all_tokens)
+    return hash_ids
+
+
+@eager_on_graph
+def bcg_deepseek_v4_engram_apply(
+    x: torch.Tensor,
+    hash_ids: torch.Tensor,
+    engram: Engram,
+    prefetch: EngramPrefetcher,
+    cp_all_tokens: bool,
+) -> torch.Tensor:
+    batch = get_tc_piecewise_forward_context().forward_batch
+    return engram(x, hash_ids, batch, prefetch=prefetch, cp_all_tokens=cp_all_tokens)
 
 
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
@@ -3701,9 +3726,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=functools.partial(hc_boundary.stages, config)
-            if _is_cuda
-            else None,
+            stage_facts=(
+                functools.partial(hc_boundary.stages, config) if _is_cuda else None
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3738,6 +3763,15 @@ class DeepseekV4Model(nn.Module):
             self.use_fused_mhc_post_pre = (
                 is_cross_layer_mhc_fusion_enabled()
                 or _is_fused_mhc_post_pre_enabled_xpu()
+            )
+
+        self.engram_prefetch = None
+        prefetch_chunk = envs.SGLANG_DSV41_ENGRAM_PREFETCH_CHUNK_SIZE.get()
+        if prefetch_chunk:
+            self.engram_prefetch = EngramPrefetcher(
+                [layer.engram for layer in self.layers if layer.engram is not None],
+                prefetch_chunk,
+                envs.SGLANG_DSV41_ENGRAM_PREFETCH_LAYERS.get(),
             )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
@@ -3862,6 +3896,32 @@ class DeepseekV4Model(nn.Module):
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
+        try:
+            return DeepseekV4Model._forward_layers_hc_pre_from_prev_impl(
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                input_ids,
+                input_ids_global,
+                capture_dspark,
+                dspark_aux_hidden_states,
+            )
+        finally:
+            prefetch = getattr(self, "engram_prefetch", None)
+            if prefetch is not None:
+                prefetch.finish()
+
+    def _forward_layers_hc_pre_from_prev_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
@@ -3930,6 +3990,29 @@ class DeepseekV4Model(nn.Module):
             )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
+        prefetch = getattr(self, "engram_prefetch", None)
+        prefetch_boundary = self.end_layer
+        if prefetch is not None:
+            # The phase split must be identical on EXTEND/IDLE/DECODE DP
+            # peers, even when only some ranks actually compact their rows.
+            if self.late_layer_start is not None:
+                prefetch_boundary = self.late_layer_start
+            layer_ids = tuple(
+                self.layers[j].engram.layer_hash_index
+                for j in range(self.start_layer, prefetch_boundary)
+                if self.layers[j].engram is not None
+            )
+            if is_in_breakable_cuda_graph():
+                hash_ids = bcg_deepseek_v4_engram_prefetch(
+                    hash_ids, prefetch, layer_ids, cp_extend
+                )
+            else:
+                prefetch.begin(
+                    hash_ids,
+                    forward_batch,
+                    layer_ids=layer_ids,
+                    cp_all_tokens=cp_extend,
+                )
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
@@ -4057,14 +4140,39 @@ class DeepseekV4Model(nn.Module):
                         else None
                     )
             engram = self.layers[i].engram
+            if prefetch is not None and i == prefetch_boundary:
+                # The tail switch above changed both token rows and DP counts.
+                layer_ids = tuple(
+                    self.layers[j].engram.layer_hash_index
+                    for j in range(i, self.end_layer)
+                    if self.layers[j].engram is not None
+                )
+                if is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_prefetch(
+                        hash_ids, prefetch, layer_ids, cp_extend
+                    )
+                else:
+                    prefetch.begin(
+                        hash_ids,
+                        forward_batch,
+                        layer_ids=layer_ids,
+                        cp_all_tokens=cp_extend,
+                    )
             if engram is not None:
                 before_engram = state.residual
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    cp_all_tokens=cp_extend,
-                )
+                layer_hashes = hash_ids[:, engram.layer_hash_index]
+                if prefetch is not None and is_in_breakable_cuda_graph():
+                    hidden_states = bcg_deepseek_v4_engram_apply(
+                        state.residual, layer_hashes, engram, prefetch, cp_extend
+                    )
+                else:
+                    hidden_states = engram(
+                        state.residual,
+                        layer_hashes,
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                        prefetch=prefetch,
+                    )
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0

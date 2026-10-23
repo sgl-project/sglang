@@ -15,7 +15,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import numpy as np
@@ -57,6 +57,9 @@ from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.engram_prefetch import EngramPrefetcher
 
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
@@ -879,17 +882,7 @@ class EngramEmbedding(nn.Module):
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         if self._shared:
-            if indices.shape[0] == 0:
-                return self._empty(indices)
-            out = self._empty(indices)
-            engram_gather(
-                *self._table_ptrs(),
-                indices.reshape(-1),
-                out.view(-1, self.dim),
-                self.dim,
-                FP8_BLOCK_SIZE,
-            )
-            return out
+            return self.gather_local_rows(indices, self._empty(indices))
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
@@ -940,15 +933,22 @@ class EngramEmbedding(nn.Module):
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
+        return self.gather_local_rows(indices, self._empty(indices))
+
+    def gather_local_rows(
+        self, indices: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Read into caller-owned storage, without cross-rank communication."""
+        if not self._shared and self.rows == 0:
+            return out.zero_()
         engram_gather(
             *self._table_ptrs(),
-            indices.reshape(-1),
+            indices if indices.ndim <= 2 else indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
             FP8_BLOCK_SIZE,
-            row_lo=self.row_start,
-            row_hi=self.row_start + self.rows,
+            row_lo=0 if self._shared else self.row_start,
+            row_hi=self.weight.shape[0] if self._shared else self.row_start + self.rows,
         )
         return out
 
@@ -1064,8 +1064,29 @@ class Engram(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         *,
         cp_all_tokens: bool = False,
+        prefetch: Optional[EngramPrefetcher] = None,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        if prefetch is not None:
+            out = torch.empty_like(x)
+            end = 0
+            for block in range(prefetch.num_chunks):
+                with prefetch.chunk(self.layer_hash_index, block) as (rows, emb):
+                    if rows.stop > rows.start:
+                        kv, _ = self.wkv(emb.flatten(-2))
+                        out[rows] = engram_gate(
+                            x[rows],
+                            kv,
+                            self.q_weight,
+                            self.k_weight,
+                            self.eps,
+                            self.clamp_value,
+                        )
+                    end = rows.stop
+            # DP graph padding is not present in SUM_LEN's gathered segments.
+            out[end:].copy_(x[end:])
+            prefetch.end_layer(self.layer_hash_index)
+            return out
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
