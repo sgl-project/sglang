@@ -554,6 +554,46 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prof, plain)
         self.assertEqual(profile_record["final_completions"], [400, 400])
 
+    async def test_completions_survive_scoring_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "completions.json"
+            args = self.args(profile_steps=0, prefill_completions=str(path))
+            with patch.object(
+                bench, "group_window", side_effect=SystemExit("rejected")
+            ):
+                with self.assertRaisesRegex(SystemExit, "rejected"):
+                    await bench.prefill(args, self.transport(args), lambda r: [])
+            record = json.loads(path.read_text())
+            self.assertTrue(record["requests_drained"])
+            self.assertEqual(len(record["completions"]), 800)
+            self.assertEqual(record["validation"], "not_evaluated")
+
+    async def test_partial_completions_survive_request_failure(self):
+        async def fail_batch(args, tp, prompt, count, params, done, label, **kw):
+            if label == "measured":
+                done.append((1.0, 0.9, 1, 0))
+                raise RuntimeError("request failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "completions.json"
+            args = self.args(prefill_completions=str(path))
+            with patch.object(bench, "batch", side_effect=fail_batch):
+                with self.assertRaisesRegex(RuntimeError, "request failed"):
+                    await bench.prefill(args, None, lambda r: [])
+            record = json.loads(path.read_text())
+            self.assertFalse(record["requests_drained"])
+            self.assertEqual(record["completions"], [[1.0, 0.9, 1, 0]])
+
+    async def test_completion_dump_does_not_change_result(self):
+        plain_args = self.args(profile_steps=0)
+        plain = await bench.prefill(
+            plain_args, self.transport(plain_args), lambda r: []
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args(profile_steps=0, prefill_completions=tmp + "/samples.json")
+            recorded = await bench.prefill(args, self.transport(args), lambda r: [])
+        self.assertEqual(recorded, plain)
+
     async def test_delayed_ack_cannot_silently_profile_the_drain(self):
         args = self.args()
         tp = self.transport(args)

@@ -14,6 +14,8 @@ records the server.
 
 Prefill profiling starts after every rank warms up in a separate request burst;
 its JSON control bounds are not the captured step range, which comes from the trace.
+--prefill-completions saves raw measured completions before scoring, including
+partial completions on request failure. This diagnostic file is not a valid result.
 
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
@@ -465,9 +467,34 @@ async def prefill(args, tp, prompt):
     n_warmup = args.warmup_steps * per_step
     await batch(args, tp, prompt, n_warmup, params, [], "warmup", check_prefix=True)
     done = []
-    await batch(
-        args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
-    )
+    drained = False
+    try:
+        await batch(
+            args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
+        )
+        drained = True
+    finally:
+        # Write only after all timed tasks are joined, never in the timed path.
+        # Preserve evidence before any scoring guard can reject the run.
+        if path := getattr(args, "prefill_completions", None):
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "phase": "measured_prefill",
+                        "requests_drained": drained,
+                        "validation": "not_evaluated",
+                        "columns": [
+                            "arrival_time_s",
+                            "scheduler_time_s",
+                            "new_tokens",
+                            "rank",
+                        ],
+                        "completions": done,
+                    },
+                    f,
+                )
+                f.write("\n")
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
     # The window comes from all completions; steps from each rank's own ends, since
@@ -617,8 +644,18 @@ OPTIONS = [  # flag, type, default, help
     ("--timeout", float, 600, "seconds a stalled server gets before the run fails"),
     ("--seed", int, 0, "seed of the random ids"),
     ("--out", str, None, "write the JSON record here"),
+    (
+        "--prefill-completions",
+        str,
+        None,
+        "save raw prefill completions before validation",
+    ),
 ]
-WORKLOAD = [flag[2:].replace("-", "_") for flag, *_ in OPTIONS if flag != "--out"]
+WORKLOAD = [
+    flag[2:].replace("-", "_")
+    for flag, *_ in OPTIONS
+    if flag not in ("--out", "--prefill-completions")
+]
 
 
 def main():
