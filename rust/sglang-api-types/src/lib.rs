@@ -4,8 +4,7 @@
 //! regenerated output with the .proto change.
 //!
 //! Module paths mirror the proto packages: `api::v1` is `sglang.api.v1` (the
-//! HTTP/gRPC contract, with schema-driven JSON serde), `runtime::v1` is
-//! `sglang.runtime.v1` (the gRPC bridge's protocol types, prost + tonic only).
+//! HTTP/gRPC contract, with schema-driven JSON serde).
 
 mod ext;
 
@@ -16,13 +15,5 @@ pub mod api {
         include!("generated/sglang.api.v1.rs");
         include!("generated/sglang.api.v1.serde.rs");
         include!("generated/sglang.api.v1.tonic.rs");
-    }
-}
-
-pub mod runtime {
-    #[allow(clippy::all)]
-    pub mod v1 {
-        include!("generated/sglang.runtime.v1.rs");
-        include!("generated/sglang.runtime.v1.tonic.rs");
     }
 }

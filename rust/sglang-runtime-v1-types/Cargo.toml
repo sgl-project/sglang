@@ -1,0 +1,20 @@
+[package]
+name = "sglang-runtime-v1-types"
+description = "Generated bindings for the deprecated sglang.runtime.v1 gRPC bridge: prost structs, tonic services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Internal to this repository; removed together with sglang.runtime.v1.
+publish = false
+
+# No [package.metadata.sglang]: not a Python extension; wheel builds skip it.
+
+[lib]
+name = "sglang_runtime_v1_types"
+crate-type = ["rlib"]
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }

@@ -14,7 +14,6 @@ crate-type = ["rlib"]
 [dependencies]
 bytes = { workspace = true }
 prost = { workspace = true }
-prost-types = { workspace = true }
 serde = { workspace = true }
 # preserve_order: raw_json passthrough (custom_params, internal_states, an
 # unknown finish reason) re-serializes through serde_json::Value, and the
