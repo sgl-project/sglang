@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MaterializedOutput,
     save_materialized_output,
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
 
 def _frame(channels: int) -> np.ndarray:
@@ -200,8 +202,9 @@ def test_dynamic_batch_split_keeps_each_requests_image_bytes():
 
 @pytest.mark.parametrize("endpoint", ["generations", "edits"])
 @pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("error", [None, "output save failed"])
 def test_b64_response_is_the_returned_bytes(
-    monkeypatch, tmp_path, endpoint, persistent
+    monkeypatch, tmp_path, endpoint, persistent, error
 ):
     output_path = str(tmp_path / "outputs") if persistent else None
     monkeypatch.setattr(
@@ -222,18 +225,25 @@ def test_b64_response_is_the_returned_bytes(
 
     monkeypatch.setattr(image_api, "_build_request_sampling_params", build)
     monkeypatch.setattr(
-        image_api, "prepare_request", lambda **_: SimpleNamespace(extra={})
+        image_api, "prepare_request", lambda **_: Req(sampling_params=SamplingParams())
+    )
+    monkeypatch.setattr(
+        openai_utils,
+        "get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
     )
     png = BytesIO()
     Image.fromarray(_frame(3)).save(png, format="PNG")
     png = png.getvalue()
 
-    async def generate(_client, _batch):
+    async def generate(_batches):
         # no file exists at the returned path; the response must not need one
         path = os.path.join(captured["output_path"], captured["output_file_name"])
-        return [path], OutputBatch(output_image_bytes=[png])
+        return OutputBatch(
+            output_file_paths=[path], output_image_bytes=[png], error=error
+        )
 
-    monkeypatch.setattr(image_api, "process_generation_batch", generate)
+    monkeypatch.setattr(async_scheduler_client, "forward", generate)
     app = FastAPI()
     app.include_router(image_api.router)
     with TestClient(app) as client:
@@ -249,6 +259,11 @@ def test_b64_response_is_the_returned_bytes(
                 files={"image": ("reference.png", png, "image/png")},
             )
 
+    if error:
+        assert response.status_code == 500, response.text
+        assert error in response.text
+        assert "b64_json" not in response.json()
+        return
     assert response.status_code == 200, response.text
     (item,) = response.json()["data"]
     assert base64.b64decode(item["b64_json"]) == png

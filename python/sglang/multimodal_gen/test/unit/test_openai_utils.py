@@ -4,7 +4,10 @@ import asyncio
 import io
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
+import torch
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
@@ -19,9 +22,51 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _save_upload_to_path,
     _validate_positive_int,
     build_sampling_params,
+    process_generation_batch,
     request_field_value,
     request_model_kwargs,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"output": [torch.zeros(3, 8, 8)]},
+        {"output_file_paths": ["partial.png"], "output_image_bytes": [b"partial"]},
+        {"raw_frame_batches": [b"partial"]},
+    ],
+    ids=["empty", "tensor", "encoded", "raw-frames"],
+)
+def test_generation_rejects_errors_before_publishing_partial_output(
+    monkeypatch, tmp_path, payload
+):
+    monkeypatch.setattr(
+        openai_utils,
+        "get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
+    )
+    batch = Req(
+        sampling_params=SamplingParams(
+            prompt="test", output_path=str(tmp_path), output_file_name="retry.png"
+        )
+    )
+    recovered = OutputBatch(output_file_paths=["recovered.png"])
+    client = SimpleNamespace(
+        forward=AsyncMock(
+            side_effect=[OutputBatch(error="output save failed", **payload), recovered]
+        )
+    )
+
+    async def run():
+        with pytest.raises(RuntimeError, match="output save failed"):
+            await process_generation_batch(client, batch)
+        assert list(tmp_path.iterdir()) == []
+        paths, result = await process_generation_batch(client, batch)
+        assert paths == ["recovered.png"] and result is recovered
+
+    asyncio.run(run())
 
 
 def test_request_fields_preserve_falsy_values_and_extra_precedence():
