@@ -574,8 +574,9 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        dense_mla_dcp_partial = (
-            self.dense_mla_dcp_target and self.uses_dcp_partial_attention(forward_batch)
+        dense_mla_dcp_partial = self.dense_mla_dcp_target and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         )
         spec_algorithm = forward_batch.spec_algorithm
         if self.needs_cpu_seq_lens or dense_mla_dcp_partial:
