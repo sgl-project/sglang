@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
@@ -152,8 +153,16 @@ def _check_folded_topology(rank, rendezvous):
     assert ps.get_cfg_sequence_parallel_group() is None
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="ROCm builds query GPU 0 while importing sglang, which fails with the "
+    "GPUs hidden for these CPU workers",
+)
 def test_stage_without_cfg_shards_over_cfg_ranks(tmp_path, monkeypatch):
-    # gloo ranks on CPU: keep the CUDA-IPC all-to-all off on GPU runners too
+    # gloo ranks on CPU: hide the GPUs so no communicator binds rank 1 to a
+    # device a 1-GPU runner lacks, and keep the CUDA-IPC all-to-all off
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
     monkeypatch.setenv("SGLANG_DIFFUSION_IPC_A2A", "0")
     rendezvous = (tmp_path / "rendezvous").as_uri()
     mp.spawn(_check_folded_topology, args=(rendezvous,), nprocs=2)
