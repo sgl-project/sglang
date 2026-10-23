@@ -238,7 +238,8 @@ class GenerateReqInput:
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. When omitted, selected mode is used if
+    # the full sampling support; support mode also returns each sampled token's logprob
+    # in output_token_sampling_selected_logprobs. When omitted, selected mode is used if
     # return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
@@ -267,6 +268,9 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
+    # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
+    return_outputs_via_store: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -434,6 +438,15 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        # TODO(guapisolo): support batch, n>1 (deleting the others' stored objects
+        # when a sub-request fails), and beam search; RL sends one prompt per request.
+        if self.return_outputs_via_store and (
+            not self.is_single or self._sampling_params_beam_width() > 1
+        ):
+            raise ValueError(
+                "return_outputs_via_store supports one prompt with n=1 "
+                "and no beam search."
+            )
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -1002,6 +1015,7 @@ class GenerateReqInput:
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
+            return_outputs_via_store=self.return_outputs_via_store,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -1663,8 +1677,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
-    # straight to TokenizerManager, which encodes on demand.
+    # BatchStrOutput unless --output-store-backend is set (see routed_experts_raw);
+    # on the skip_tokenizer_init path the scheduler sends this straight to
+    # TokenizerManager, which encodes on demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
@@ -1762,7 +1777,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
-    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
+    # tokenizer hot path; None with --output-store-backend (see routed_experts_raw).
+    # Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: Optional[List[Optional[str]]]
 
@@ -1821,6 +1837,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Unencoded routed_experts / indexer_topk, sent instead of the base64 fields when
+    # --output-store-backend is set; TokenizerManager encodes them per request.
+    routed_experts_raw: Optional[List[Optional[torch.Tensor]]] = None
+    indexer_topk_raw: Optional[List[Optional[torch.Tensor]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

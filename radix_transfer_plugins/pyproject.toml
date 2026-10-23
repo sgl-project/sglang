@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radix-transfer-plugins"
+version = "0.1.0"
+description = "Output store shared by SGLang and its readers: stash schemas, refs, codecs, and storage backends"
+requires-python = ">=3.10"
+# Backend libraries (for example Mooncake) are not listed: the runtime image provides them.
+dependencies = ["msgspec", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["radix_transfer_plugins*"]

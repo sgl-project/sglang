@@ -148,6 +148,20 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
+    output_store_backend: A[
+        str,
+        "Storage backend (a radix_transfer_plugins backend name) for the routed "
+        "experts, indexer top-k, and sampling masks of requests that set "
+        "return_outputs_via_store; their responses carry meta_info.output_store_ref "
+        "instead of the arrays. 'none' disables it.",
+    ] = "none"
+    output_store_backend_extra_config: A[
+        Optional[str],
+        "JSON object with the --output-store-backend config. For mooncake: "
+        "master_server_address, local_hostname, local_buffer_size, key_prefix, and "
+        "optionally protocol, metadata_server, device_name, replica_num. "
+        "MOONCAKE_* env vars are not read.",
+    ] = None
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",

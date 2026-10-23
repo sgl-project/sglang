@@ -1201,8 +1201,9 @@ class SchedulerBatchResultProcessor:
         masks = output.next_token_sampling_mask_idx[i]
         logprobs = output.next_token_sampling_logprobs[i]
         if not isinstance(masks, list):
-            req.sampling_mask_rows.append(masks, logprobs)
-            return
+            # One row per step; a prefill that finishes at finished_len 0
+            # (max_new_tokens=0) still sampled, and its row must not be returned.
+            masks, logprobs = [masks], [logprobs]
         # Speculative rows carry one support per accepted token; drop the ones
         # past finished_len, as output_ids is trimmed there.
         step_start = len(req.output_ids) - accept_len
