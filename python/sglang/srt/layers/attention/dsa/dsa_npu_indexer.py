@@ -332,7 +332,12 @@ class DSANPUIndexerMixin:
                     else weights
                 )
 
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                if envs.SGLANG_NPU_INDEXER_INT8.get():
+                    quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
+                else:
+                    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
+
+                topk_indices = quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=op_weights,
