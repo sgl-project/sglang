@@ -323,9 +323,15 @@ void fused_moe_router_kernel_impl(
   const bool use_softcap = moe_softcapping != 0.0f;
   const bool use_correction_bias = correction_bias != nullptr;
 
+
+  constexpr int64_t kMaxExperts = 64;
+  TORCH_CHECK(
+    num_experts <= kMaxExperts && topk <= kMaxExperts,
+    "fused_moe_router_cpu: num_experts/topk exceed stack capacity");
+
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
-    std::vector<float> logits(num_experts);
-    std::vector<elem_t> queue(num_experts);
+    alignas(64) float logits[kMaxExperts];
+    alignas(64) int32_t sel[kMaxExperts];
 
     for (int64_t token = begin; token < end; ++token) {
       float max_logit = -std::numeric_limits<float>::infinity();
