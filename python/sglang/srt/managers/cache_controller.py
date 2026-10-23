@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -370,9 +370,10 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
-        # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards (see start_loading).
+        # Set by the scheduler to the forward stream; gate load-back H2D and
+        # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
+        self.write_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -529,6 +530,10 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    # A subclass whose attach continues registering host pools after super()
+    # returns fires on_host_pools_registered() itself, once.
+    _registers_host_pools_after_super_attach = False
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -577,6 +582,8 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            if not self._registers_host_pools_after_super_attach:
+                self.storage_backend.on_host_pools_registered()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -838,6 +845,15 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
+
+        if self.write_fence_stream is not None:
+            # The copy may read KV a forward is still writing: under overlap
+            # scheduling a finished request is cached while the next forward
+            # writes its last token, and an evicted SWA page can belong to an
+            # unfinished checkpoint. Later forwards still overlap with the copy.
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                self.write_fence_stream
+            )
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -1317,6 +1333,10 @@ class HiCacheController:
             self.prefetch_hits_sync_groups,
         )
         return int(hit_count.item())
+
+    def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
+        """Advance the backend's prefix context past omitted pages."""
+        return prefix_keys + hash_values if prefix_keys is not None else None
 
     def write_storage(
         self,

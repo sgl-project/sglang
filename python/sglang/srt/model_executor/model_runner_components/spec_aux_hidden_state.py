@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.runtime_context import (
+    draft_attn_tp_size,
     get_model,
     get_parallel,
     get_spec,
@@ -44,6 +45,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # DeepSeek-V4 DSpark draft stages (DeepseekV4ForCausalLMDSpark.num_stages); a
+    # bundled head inherits the target's num_hidden_layers, so that overcounts.
+    dspark_num_stages: Optional[int] = None
     # The draft checkpoint read in draft mode, and its KV layer count, for
     # every drafting algorithm: the fused-draft placement's input. A private
     # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
@@ -219,6 +223,9 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+                # Dense DSpark drafts build num_hidden_layers stages instead.
+                if is_deepseek_v4(draft_model_config.hf_config):
+                    config.dspark_num_stages = len(target_layer_ids)
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
@@ -228,6 +235,7 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
+            spec_algorithm=spec_algorithm,
         )
 
 
@@ -235,6 +243,7 @@ def _resolve_dflash_draft_cell_size(
     *,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
+    spec_algorithm: SpeculativeAlgorithm,
 ) -> int | None:
     """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
 
@@ -263,8 +272,11 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            # The draft pool shards KV heads like the target pool (by attention TP).
-            tp_size=get_parallel().attn_tp_size,
+            tp_size=(
+                draft_attn_tp_size()
+                if spec_algorithm.is_dflash()
+                else get_parallel().attn_tp_size
+            ),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

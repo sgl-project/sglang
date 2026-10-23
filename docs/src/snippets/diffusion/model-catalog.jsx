@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
       name: "HunyuanImage-3.0",
       modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
       cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
@@ -30,6 +36,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "black-forest-labs/FLUX.2-klein-base-9B",
       ],
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
+    },
+    {
+      name: "FLUX.3 Image",
+      modelIds: ["black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
     },
     {
       name: "Qwen-Image",
@@ -180,7 +191,10 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Wan-Animate-2",
-      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      modelIds: [
+        "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+        "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+      ],
       cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
@@ -286,6 +300,30 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Multiview-AV",
+      modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Sim-Auto",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
     },
     {
       name: "FLUX 3 Action",

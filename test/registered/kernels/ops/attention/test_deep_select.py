@@ -79,10 +79,13 @@ def _check_topk(
                 assert torch.all(row_values[~valid] == value_fill), f"row {r}"
 
 
-@pytest.mark.parametrize("rows,width", [(4, 8192), (200, 30000)])
+# (8, 300_000) and (40, 1_000_000) take the cluster kernel: a slice that fits its window, and one that streams
+@pytest.mark.parametrize(
+    "rows,width", [(4, 8192), (200, 30000), (8, 300_000), (40, 1_000_000)]
+)
 def test_topk_matches_reference(rows, width):
     input = _make_input(rows, width, torch.bfloat16)
-    values, indices = topk(input, 512)
+    values, indices = topk(input, 512, return_value=True)
     assert indices.dtype == torch.int32
     _check_topk(input, 512, indices, values=values)
 
@@ -99,7 +102,7 @@ def test_sorted_index_int64():
 
 def test_sorted_values_fp32():
     input = _make_input(8, 20000, torch.float32)
-    values, indices = topk(input, 1024, sorted=True)
+    values, indices = topk(input, 1024, sorted=True, return_value=True)
     expected = torch.topk(input, 1024)
     torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -113,7 +116,12 @@ def test_variable_row_end():
     input = _make_input(len(ends), width, torch.bfloat16)
     end = torch.tensor(ends, dtype=torch.int32, device="cuda")
     values, indices = topk(
-        input, k, end=end, idx_oob_fill_value=-1, value_oob_fill_value=-5.0
+        input,
+        k,
+        end=end,
+        idx_oob_fill_value=-1,
+        value_oob_fill_value=-5.0,
+        return_value=True,
     )
     _check_topk(input, k, indices, end=end, values=values, idx_fill=-1, value_fill=-5.0)
 
@@ -126,11 +134,31 @@ def test_caller_output_and_index_offset():
     output = backing[:, :k]
     offset = torch.randint(0, 1 << 20, (rows,), dtype=torch.int32, device="cuda")
 
-    values, indices = topk(input, k, output_idx=output, output_idx_offset=offset)
+    values, indices = topk(
+        input, k, output_idx=output, output_idx_offset=offset, return_value=True
+    )
 
     assert indices.data_ptr() == output.data_ptr()
     assert torch.all(backing[:, k:] == -7), "wrote past the output row"
     _check_topk(input, k, indices, values=values, offset=offset)
+
+
+@pytest.mark.parametrize(
+    "rows,width,nan_col",
+    [(3, 8192, 100), (3, 300_000, 5), (3, 1_000_000, 999_990), (3, 1_000_000, 500_000)],
+)
+def test_nan_row_selects_index_zero(rows, width, nan_col):
+    """Without abort, a row holding a NaN selects index 0 (plus its offset) in every
+    slot instead of an out-of-range sentinel; the other rows are unaffected."""
+    k = 512
+    input = _make_input(rows, width, torch.bfloat16)
+    input[1, nan_col] = float("nan")
+    offset = torch.randint(0, 1 << 20, (rows,), dtype=torch.int32, device="cuda")
+    values, indices = topk(input, k, output_idx_offset=offset, return_value=True)
+    assert torch.all(indices[1] == offset[1])
+    assert torch.equal(values[1], input[1, :1].expand(k))
+    keep = torch.tensor([0, 2], device="cuda")
+    _check_topk(input[keep], k, indices[keep], values=values[keep], offset=offset[keep])
 
 
 def _random_page_table(rows: int, width: int, page_size: int):
@@ -148,6 +176,7 @@ def _random_page_table(rows: int, width: int, page_size: int):
 @pytest.mark.parametrize(
     "k,rows,width,with_end",
     [
+        (512, 4, 64, True),
         (2048, 150, 33000, True),
         (1024, 2, 600_000, False),
     ],
@@ -161,7 +190,7 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
         end = torch.randint(
             1, width + 1, (rows,), dtype=torch.int32, device="cuda", generator=g
         )
-        end[0] = k // 2
+        end[0] = min(k // 2, width)
     table, inverse = _random_page_table(rows, width, page_size)
 
     slots = topk_page_transform(
