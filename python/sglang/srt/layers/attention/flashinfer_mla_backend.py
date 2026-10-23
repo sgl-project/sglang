@@ -32,6 +32,7 @@ from sglang.srt.layers.dcp import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -56,7 +57,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashinfer_mla_backend import (
         FlashInferMlaAttnBackend,
     )
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -209,6 +209,22 @@ class FlashInferMhaChunkKVRunner:
         return o
 
 
+def _planned_causal(model: torch.nn.Module) -> bool:
+    """The mask the paged MLA wrappers fix when they plan a batch, from the
+    attn_type every attention layer of the model declares."""
+    causal = {
+        module.attn_type != AttentionType.ENCODER_ONLY
+        for module in model.modules()
+        if isinstance(module, RadixAttention)
+    }
+    if len(causal) > 1:
+        raise ValueError(
+            "FlashInfer MLA plans one mask per batch, but the model mixes "
+            "ENCODER_ONLY and causal attention layers."
+        )
+    return causal != {False}
+
+
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -234,15 +250,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        # Planned per batch, so every layer must share it: False only for a
-        # bidirectional DFlash MLA draft.
-        self.causal = True
-        if model_runner.model_config.is_dflash_mla_draft:
-            from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_causal
-
-            self.causal = is_dflash_mla_draft_causal(
-                model_runner.model_config.hf_config
-            )
+        self.causal = _planned_causal(model_runner.model)
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -755,7 +763,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=self.causal,
+                causal=layer.attn_type != AttentionType.ENCODER_ONLY,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )

@@ -29,7 +29,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -44,9 +44,8 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
-    get_dflash_layer_attention_params,
+    get_dflash_layer_types,
     is_dense_head_weight,
-    is_dflash_mla_draft_config,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
@@ -156,6 +155,43 @@ def candidate_topk(
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    text_config = config.get_text_config()
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
+
+
+def _get_dflash_layer_attention_params(
+    config, layer_id: int
+) -> Tuple[int, AttentionType]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1, AttentionType.ENCODER_ONLY
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
+    raise ValueError(
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
+    )
+
+
 _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
     {"rope_dim", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
 )
@@ -250,7 +286,7 @@ class DFlashAttention(nn.Module):
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
         )
-        self.sliding_window_size, self.attn_type = get_dflash_layer_attention_params(
+        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
         draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
@@ -429,9 +465,22 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             # The draft pool is not DCP-sharded, but the target MLA layer
             # would gather across DCP ranks.
             raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
-        sliding_window_size, attn_type = get_dflash_layer_attention_params(
+        sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        if sliding_window_size > -1:
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            # The other MLA backends ignore a layer's sliding window.
+            draft_attention_backend = resolve_draft_worker_attention_backend()
+            if draft_attention_backend != "triton":
+                raise ValueError(
+                    "DFLASH mla sliding_attention layers require "
+                    "--speculative-draft-attention-backend triton, "
+                    f"got {draft_attention_backend!r}."
+                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
@@ -461,20 +510,21 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             self.fused_qkv_a_proj_with_mqa.weight.weight_loader = (
                 self._load_fused_a_proj_shard
             )
-        kv_b_proj_loader = self.kv_b_proj.weight.weight_loader
-
-        def load_kv_b_proj(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-            kv_b_proj_loader(param, loaded_weight)
-            self.absorb_kv_b_proj()
-
-        self.kv_b_proj.weight.weight_loader = load_kv_b_proj
 
     def _load_fused_a_proj_shard(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: Optional[int] = None,
     ) -> None:
-        rows = param.data.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
-        )[shard_id]
+        # None is the already-fused weight, as for stacked linear loaders.
+        rows = (
+            param.data
+            if shard_id is None
+            else param.data.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+            )[shard_id]
+        )
         if rows.shape != loaded_weight.shape:
             raise ValueError(
                 f"DFLASH mla fused a_proj shard {shard_id} expects "
@@ -674,6 +724,7 @@ class DFlashDecoderLayer(nn.Module):
         self,
         config,
         layer_id: int,
+        attention_cls: type[nn.Module],
         attention_conv: Optional[DFlashGroupedConv] = None,
         mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
@@ -685,13 +736,6 @@ class DFlashDecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         attention_prefix = f"{prefix}.self_attn" if prefix else ""
-        attention_cls = self.attention_cls
-        if is_dflash_mla_draft_config(config):
-            if attention_cls is not DFlashAttention:
-                raise ValueError(
-                    f"{type(self).__name__} does not support mla draft attention."
-                )
-            attention_cls = DFlashMLAAttention
         self.self_attn = attention_cls(
             config=config,
             layer_id=layer_id,
@@ -772,12 +816,18 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.rms_norm_eps = rms_norm_eps
-        if is_dflash_mla_draft_config(config):
-            # No fused qkv_proj to slice; context KV goes through project_context_kv().
-            self.supports_fused_context_kv = False
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
+        attention_cls = self.decoder_layer_cls.attention_cls
+        if draft_config.is_mla:
+            if attention_cls is not DFlashAttention:
+                raise ValueError(
+                    f"{type(self).__name__} does not support mla draft attention."
+                )
+            attention_cls = DFlashMLAAttention
+            # No fused qkv_proj to slice; context KV goes through write_context_kv().
+            self.supports_fused_context_kv = False
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
@@ -808,6 +858,7 @@ class DFlashDraftModel(nn.Module):
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
+                    attention_cls=attention_cls,
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
@@ -1077,6 +1128,14 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+        self.post_load_weights()
+
+    def post_load_weights(self) -> None:
+        """Derive weights the forward reads from loaded ones; loaders that bypass
+        load_weights call this directly."""
+        if self.draft_config.is_mla:
+            for layer in self.layers:
+                layer.self_attn.absorb_kv_b_proj()
 
 
 class DFlashLagunaAttention(DFlashAttention):

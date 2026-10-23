@@ -95,7 +95,6 @@ class TestDFlashMLABackends(unittest.TestCase):
             hidden_size=HIDDEN,
             context_len=CAPACITY,
         )
-        model_config.is_dflash_mla_draft = True
         model_config.hf_config = model_config.hf_text_config = config
         model_config.qk_nope_head_dim = NOPE
         model_config.head_dim = NOPE + ROPE
@@ -131,11 +130,16 @@ class TestDFlashMLABackends(unittest.TestCase):
             speculative_num_draft_tokens=BLOCK,
             speculative_num_steps=BLOCK - 1,
         )
+        return runner
+
+    def _make_backend(self, backend_name, runner, module):
+        # Backends read the mask from the attn_type of the model's layers.
+        runner.model = module
         backend = ATTENTION_BACKENDS[backend_name](runner)
         # Normally stamped by ModelRunner, which this fixture bypasses.
         backend.prefill_attention_backend_str = backend_name
         backend.decode_attention_backend_str = backend_name
-        return runner, backend
+        return backend
 
     def _check(self, backend_name, *, causal):
         torch.manual_seed(20261016)
@@ -155,7 +159,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             layer_types=["full_attention"],
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
-        runner, backend = self._make_runner(backend_name, config)
+        runner = self._make_runner(backend_name, config)
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
         # an FP32 table that Module.to would round to BF16.
@@ -170,6 +174,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                 else:
                     param.normal_(std=1 / math.sqrt(param.shape[-1]))
         module.absorb_kv_b_proj()
+        backend = self._make_backend(backend_name, runner, module)
 
         def make_inputs(prefix_lens):
             current = MLAAttentionCase(

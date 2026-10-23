@@ -219,6 +219,8 @@ class MockModelRunner:
         self.dtype = config["dtype"]
         self.kv_cache_dtype = config["kv_cache_dtype"]
         self.page_size = config["page_size"]
+        # FlashInfer MLA __init__ scans model.modules() for the layers' attn_type.
+        self.model = torch.nn.Module()
 
         # Server args stub - needed by attention backends
         self.server_args = get_server_args()
@@ -230,7 +232,6 @@ class MockModelRunner:
             {
                 "context_len": config["context_len"],
                 "attention_arch": AttentionArch.MLA,
-                "is_dflash_mla_draft": False,
                 "num_attention_heads": config["num_attention_heads"],
                 "kv_lora_rank": config["kv_lora_rank"],
                 "qk_nope_head_dim": config["qk_nope_head_dim"],

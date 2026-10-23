@@ -14,7 +14,6 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
@@ -531,29 +530,20 @@ def _parse_optional_int(
     return parsed
 
 
-def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
-    """One attention mode per draft layer.
+def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
+    """Whether every draft layer uses MLA attention.
 
     SpecForge exports the scalar ``dflash_config.attention_mode``; per-layer
     ``attention_modes`` lists come from forks that mix modes. Default is gqa.
     """
-    dflash_cfg = _get_dflash_config(draft_hf_config)
-    num_hidden_layers = _parse_optional_int(
-        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
-        field_name="DFLASH draft num_hidden_layers",
-        min_value=1,
-    )
-    if num_hidden_layers is None:
-        raise ValueError("DFLASH attention modes require config.num_hidden_layers.")
     if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
         raise ValueError(
             "DFLASH dflash_config sets both attention_mode and attention_modes; "
             "set only one."
         )
-
     raw_modes = dflash_cfg.get("attention_modes")
     if raw_modes is None:
-        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * num_hidden_layers
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")]
     elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
         num_hidden_layers
     ):
@@ -562,25 +552,20 @@ def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
             f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
         )
 
-    modes = tuple(str(mode).lower() for mode in raw_modes)
-    unsupported = set(modes) - _DFLASH_ATTENTION_MODES
+    modes = {str(mode).lower() for mode in raw_modes}
+    unsupported = modes - _DFLASH_ATTENTION_MODES
     if unsupported:
         raise ValueError(
             f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
             f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
         )
-    return modes
-
-
-def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
-    modes = get_dflash_attention_modes(draft_hf_config)
     if "mla" not in modes:
         return False
     # The draft KV pool has a single per-layer row layout.
-    if any(mode != "mla" for mode in modes):
+    if modes != {"mla"}:
         raise ValueError(
             "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
-            f"got attention modes {list(modes)}."
+            f"got attention modes {list(raw_modes)}."
         )
     return True
 
@@ -598,12 +583,6 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
         raise ValueError(f"DFLASH mla draft config is missing {missing}.")
     if _cfg_get(text_config, "attention_bias", False):
         raise ValueError("DFLASH mla drafts do not support attention_bias.")
-    draft_cfg = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
-    if draft_cfg.attention_sink_bias or draft_cfg.attention_value_scale is not None:
-        raise ValueError(
-            "DFLASH mla drafts support neither attention_sink_bias nor "
-            "attention_value_scale."
-        )
     rope = (
         _cfg_get(text_config, "rope_parameters")
         or _cfg_get(text_config, "rope_scaling")
@@ -615,56 +594,6 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
             f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
             f"got {rope_type!r}."
         )
-
-
-def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
-    if is_causal is None:
-        return default
-    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
-
-
-def get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> Tuple[int, AttentionType]:
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
-
-    layer_type = layer_types[layer_id]
-    if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(
-            config, default=AttentionType.ENCODER_ONLY
-        )
-    if layer_type == "sliding_attention":
-        sliding_window_size = get_dflash_attention_sliding_window_size(config)
-        assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
-        )
-    raise ValueError(
-        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
-    )
-
-
-def is_dflash_mla_draft_causal(draft_hf_config: Any) -> bool:
-    """The one causality of a full-attention MLA draft, for backends that fix
-    it when they plan a batch."""
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types is not None and "sliding_attention" in layer_types:
-        raise ValueError(
-            "DFLASH mla sliding_attention layers require "
-            "--speculative-draft-attention-backend triton."
-        )
-    _, attn_type = get_dflash_layer_attention_params(draft_hf_config, layer_id=0)
-    return attn_type == AttentionType.DECODER
 
 
 @dataclass(frozen=True)
@@ -688,6 +617,7 @@ class DFlashDraftConfig:
     emb_dim: Optional[int]
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
+    is_mla: bool = False
 
     @property
     def is_domino(self) -> bool:
@@ -875,6 +805,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             )
         attention_value_scale = float(raw_attention_value_scale)
 
+    is_mla = _parse_dflash_is_mla(dflash_cfg, num_hidden_layers)
+    if is_mla and (attention_sink_bias or attention_value_scale is not None):
+        raise ValueError(
+            "DFLASH mla drafts support neither attention_sink_bias nor "
+            "attention_value_scale."
+        )
+
     projector_type = dflash_cfg.get(
         "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
     )
@@ -961,6 +898,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
+        is_mla=is_mla,
     )
 
 

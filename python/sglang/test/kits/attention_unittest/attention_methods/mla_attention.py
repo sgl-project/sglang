@@ -163,7 +163,6 @@ class TinyMLAModelConfig:
         context_len: int,
     ):
         self.attention_arch = AttentionArch.MLA
-        self.is_dflash_mla_draft = False
         self.context_len = context_len
         self.hidden_size = hidden_size
         self.num_attention_heads = num_heads
@@ -244,6 +243,9 @@ class MockMLAModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        # FlashInfer MLA __init__ scans model.modules() for the layers' attn_type;
+        # this mock declares none.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)

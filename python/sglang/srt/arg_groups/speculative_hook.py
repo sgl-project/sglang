@@ -836,9 +836,9 @@ def _keep_mla_dspark_draft_off_trtllm_mha(server_args: ServerArgs) -> None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend != "trtllm_mha":
         return
-    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
-    if not is_dflash_mla_draft_config(_load_draft_hf_config(cfg)):
+    if not parse_dflash_draft_config(draft_hf_config=_load_draft_hf_config(cfg)).is_mla:
         return
     # trtllm_mha implies CUDA, where flashinfer serves MLA drafts.
     logger.warning("DSpark MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
@@ -911,7 +911,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import (
             get_dflash_layer_types,
-            is_dflash_mla_draft_config,
+            parse_dflash_draft_config,
         )
 
         draft_hf_config = _load_draft_hf_config(cfg)
@@ -926,7 +926,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if is_dflash_mla_draft_config(draft_hf_config):
+        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
             # trtllm_mha serves only MHA/GQA layers; the fallback is the default
             # MLA draft backend.
             fallback_backend = get_fallback_backend()

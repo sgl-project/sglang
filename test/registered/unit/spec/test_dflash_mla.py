@@ -18,13 +18,14 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
-    is_dflash_mla_draft_config,
+    parse_dflash_draft_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
@@ -194,11 +195,12 @@ class TestDFlashMLA(CustomTestCase):
             {"attention_modes": ["mla"] * 2},
         ):
             config = {"num_hidden_layers": 2, "dflash_config": dflash_config}
-            self.assertTrue(is_dflash_mla_draft_config(config))
-        self.assertFalse(is_dflash_mla_draft_config({"num_hidden_layers": 2}))
+            self.assertTrue(parse_dflash_draft_config(draft_hf_config=config).is_mla)
+        config = {"num_hidden_layers": 2}
+        self.assertFalse(parse_dflash_draft_config(draft_hf_config=config).is_mla)
         with self.assertRaisesRegex(ValueError, "mix mla"):
-            is_dflash_mla_draft_config(
-                {
+            parse_dflash_draft_config(
+                draft_hf_config={
                     "num_hidden_layers": 2,
                     "dflash_config": {"attention_modes": ["mla", "gqa"]},
                 }
@@ -225,7 +227,18 @@ class TestDFlashMLA(CustomTestCase):
                 (KV_LORA + ROPE) * 2,
             )
 
-    def test_specforge_checkpoint_loads_and_absorbs(self):
+    def test_every_load_path_absorbs_kv_b_proj(self):
+        """The absorbed forward reads w_kc / w_vc, so every load path must derive
+        them: SpecForge's split checkpoint, an already-fused export, and loaders
+        that bypass load_weights (dummy, sharded state) and call post_load_weights."""
+
+        def assert_absorbed(attn):
+            w_kc, w_vc = attn.kv_b_proj.weight.view(HEADS, NOPE + VDIM, KV_LORA).split(
+                [NOPE, VDIM], dim=1
+            )
+            torch.testing.assert_close(attn.w_kc, w_kc, rtol=0, atol=0)
+            torch.testing.assert_close(attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0)
+
         for q_lora_rank, q_keys in SPECFORGE_KEYS.items():
             with self.subTest(q_lora_rank=q_lora_rank):
                 model = DFlashDraftModel(Qwen3Config(**_export_fields(q_lora_rank)))
@@ -243,15 +256,40 @@ class TestDFlashMLA(CustomTestCase):
                     torch.testing.assert_close(
                         param, checkpoint[f"layers.0.self_attn.{name}"], rtol=0, atol=0
                     )
-                w_kc, w_vc = (
-                    checkpoint["layers.0.self_attn.kv_b_proj.weight"]
-                    .view(HEADS, NOPE + VDIM, KV_LORA)
-                    .split([NOPE, VDIM], dim=1)
-                )
-                torch.testing.assert_close(attn.w_kc, w_kc, rtol=0, atol=0)
-                torch.testing.assert_close(
-                    attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0
-                )
+                assert_absorbed(attn)
+
+                fused = {
+                    f"layers.0.self_attn.{name}": torch.randn_like(param)
+                    for name, param in attn.named_parameters()
+                }
+                model.load_weights(fused.items())
+                for name, param in attn.named_parameters():
+                    torch.testing.assert_close(
+                        param, fused[f"layers.0.self_attn.{name}"], rtol=0, atol=0
+                    )
+                assert_absorbed(attn)
+
+                with torch.no_grad():
+                    attn.kv_b_proj.weight.normal_()
+                post_load_weights(model)
+                assert_absorbed(attn)
+
+    def test_sliding_layers_require_triton(self):
+        """Only triton applies an MLA layer's sliding window; the other MLA
+        backends would silently attend over the full context."""
+        config = Qwen3Config(
+            **_export_fields(),
+            layer_types=["sliding_attention"],
+            use_sliding_window=True,
+            sliding_window=4,
+        )
+        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
+        with patch(resolve, return_value="flashinfer"):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
+        with patch(resolve, return_value="triton"):
+            attn = DFlashMLAAttention(config, layer_id=0)
+        self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
 
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
