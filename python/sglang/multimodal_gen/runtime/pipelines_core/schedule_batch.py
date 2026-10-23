@@ -316,6 +316,12 @@ class Req:
         object.__setattr__(self, name, value)
 
     @property
+    def needs_negative_cond(self) -> bool:
+        return self.do_classifier_free_guidance or (
+            self.rollout and self.rollout_return_neg_cond_kwargs
+        )
+
+    @property
     def batch_size(self):
         # Determine batch size
         if isinstance(self.prompt, list):

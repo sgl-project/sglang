@@ -402,6 +402,16 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         self.assertEqual(kwargs["rollout_sde_step_indices"], [0, 2])
         self.assertEqual(kwargs["rollout_return_step_indices"], [1, 3])
 
+    def test_neg_cond_request_forwarded(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(rollout_return_neg_cond_kwargs=True)
+        )
+        self.assertTrue(kwargs["rollout_return_neg_cond_kwargs"])
+
     def test_step_index_filters_default_dropped_as_none(self):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
             _build_sampling_kwargs,

@@ -87,6 +87,8 @@ class RolloutRequest(BaseModel):
     rollout_debug_mode: bool = True
 
     rollout_return_denoising_env: bool = False
+    # put the negative cond in denoising_env even when the request runs no CFG
+    rollout_return_neg_cond_kwargs: bool = False
     rollout_return_dit_trajectory: bool = False
 
     # 0-indexed denoising-loop step filters. None = all steps.
