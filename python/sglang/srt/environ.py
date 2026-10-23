@@ -1134,6 +1134,14 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Triton warps per program for the XPU LayerNorm+modulate kernels. Layout
+    # only, the bit-exact result does not depend on it; 4 measured fastest on
+    # Arc Pro B70.
+    SGLANG_XPU_LN_MOD_NUM_WARPS = EnvInt(4)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
