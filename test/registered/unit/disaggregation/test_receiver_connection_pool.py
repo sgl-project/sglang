@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 
 import msgspec
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
@@ -364,6 +365,20 @@ class TestReceiverControlMessages(CustomTestCase):
             [frames[-1] for _, frames in sent],
             [struct.pack("<ii", 11, 13), b"", struct.pack("<ii", 11, 13)],
         )
+
+    def test_failed_metadata_send_drops_cached_bootstrap_infos(self):
+        """A failed metadata send must make the next request refetch prefill
+        bootstrap infos instead of reusing the stale cached ones."""
+        receiver, _ = self._make_receiver("mooncake")
+        receiver.kv_mgr.failure_lock = threading.Lock()
+        receiver.kv_mgr.failure_records = {}
+        receiver._connect_to_bootstrap_server = Mock(side_effect=zmq.ZMQError())
+        receiver.invalidate_cached_bootstrap_infos = Mock()
+
+        receiver.send_metadata(np.array([2], dtype=np.int32), aux_index=9)
+
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        receiver.invalidate_cached_bootstrap_infos.assert_called_once()
 
 
 class TestCommonReceiverLifecycle(CustomTestCase):

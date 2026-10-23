@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -3170,7 +3170,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             self._run_one_probe_pass()
 
-    def build_receiver_registration_message(self) -> Callable[[], List[bytes]]:
+    def build_receiver_registration_message(self) -> List[bytes]:
         session_id = self.get_session_id()
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
@@ -3210,7 +3210,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        return lambda: [
+        return [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3245,14 +3245,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Callable[[bool], List[bytes]]:
-        session_id = self.get_session_id()
-        return lambda is_dummy: [
+    ) -> List[bytes]:
+        return [
             str(bootstrap_room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
-            session_id.encode("ascii"),
+            self.get_session_id().encode("ascii"),
             kv_indices.tobytes() if not is_dummy else b"",
             str(aux_index).encode("ascii") if not is_dummy else b"",
             pack_int_lists(state_indices, "i")

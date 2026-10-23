@@ -9,7 +9,6 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import (
-    Callable,
     Dict,
     List,
     Literal,
@@ -609,7 +608,7 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
-    def build_receiver_registration_message(self) -> Callable[[], List[bytes]]:
+    def build_receiver_registration_message(self) -> List[bytes]:
         raise NotImplementedError
 
     def build_receiver_metadata_message(
@@ -621,8 +620,9 @@ class CommonKVManager(BaseKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Callable[[bool], List[bytes]]:
+    ) -> List[bytes]:
         raise NotImplementedError
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
@@ -2760,11 +2760,11 @@ class CommonKVReceiver(BaseKVReceiver):
         if not self.bootstrap_infos:
             return True
 
-        build_message = self.kv_mgr.build_receiver_registration_message()
+        message = self.kv_mgr.build_receiver_registration_message()
         for bootstrap_info in self.bootstrap_infos:
             if not self._send_bootstrap_message(
                 bootstrap_info=bootstrap_info,
-                build_message=build_message,
+                message=message,
                 operation="_register_kv_args",
             ):
                 return False
@@ -2774,16 +2774,14 @@ class CommonKVReceiver(BaseKVReceiver):
         self,
         *,
         bootstrap_info: dict,
-        build_message: Callable[[], List[bytes]],
+        message: List[bytes],
         operation: Literal["_register_kv_args", "send_metadata"],
     ) -> bool:
         try:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
-                sock.send_multipart(build_message())
+                sock.send_multipart(message)
         except zmq.ZMQError:
-            if operation == "send_metadata":
-                self.invalidate_cached_bootstrap_infos()
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"{operation} to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
@@ -2821,22 +2819,23 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        encode_message = self.kv_mgr.build_receiver_metadata_message(
-            bootstrap_room=self.bootstrap_room,
-            required_dst_info_num=self.required_dst_info_num,
-            kv_indices=kv_indices,
-            aux_index=aux_index,
-            state_indices=state_indices,
-            decode_prefix_len=decode_prefix_len,
-            device_kv_indices=device_kv_indices,
-        )
         for bootstrap_info in self.bootstrap_infos:
-            is_dummy = bootstrap_info["is_dummy"]
+            message = self.kv_mgr.build_receiver_metadata_message(
+                bootstrap_room=self.bootstrap_room,
+                required_dst_info_num=self.required_dst_info_num,
+                kv_indices=kv_indices,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                decode_prefix_len=decode_prefix_len,
+                is_dummy=bootstrap_info["is_dummy"],
+                device_kv_indices=device_kv_indices,
+            )
             if not self._send_bootstrap_message(
                 bootstrap_info=bootstrap_info,
-                build_message=lambda: encode_message(is_dummy),
+                message=message,
                 operation="send_metadata",
             ):
+                self.invalidate_cached_bootstrap_infos()
                 return
 
         self.init_time = time.time()

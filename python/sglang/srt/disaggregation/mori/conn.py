@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from queue import Full, Queue
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -2049,7 +2049,7 @@ class MoriKVManager(CommonKVManager):
 
         return result_statuses
 
-    def build_receiver_registration_message(self) -> Callable[[], List[bytes]]:
+    def build_receiver_registration_message(self) -> List[bytes]:
         engine_desc_blob = self.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.aux_mem_descs)
@@ -2070,7 +2070,7 @@ class MoriKVManager(CommonKVManager):
         dcp_size = str(self.dcp_size).encode("ascii")
         dcp_rank = str(self.dcp_rank).encode("ascii")
 
-        return lambda: [
+        return [
             MORI_GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -2100,39 +2100,41 @@ class MoriKVManager(CommonKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Callable[[bool], List[bytes]]:
-        kv_indices_bytes = (
-            np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
-        )
-        aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
-        normalized_state = _normalize_state_indices_per_component(state_indices)
-
+    ) -> List[bytes]:
+        if is_dummy:
+            kv_indices_bytes = aux_bytes = state_bytes = b""
+        else:
+            kv_indices_bytes = (
+                np.asarray(kv_indices, dtype=np.int32).tobytes()
+                if kv_indices.size
+                else b""
+            )
+            aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
+            normalized_state = _normalize_state_indices_per_component(state_indices)
+            state_bytes = (
+                _pack_state_indices(normalized_state)
+                if normalized_state is not None
+                else b""
+            )
         decode_prefix_bytes = (
             str(int(decode_prefix_len)).encode("ascii")
             if decode_prefix_len is not None and decode_prefix_len > 0
             else b""
         )
-
-        def encode_message(is_dummy: bool) -> List[bytes]:
-            if not is_dummy and normalized_state is not None:
-                state_bytes = _pack_state_indices(normalized_state)
-            else:
-                state_bytes = b""
-            return [
-                MORI_GUARD,
-                str(bootstrap_room).encode("ascii"),
-                self.local_ip.encode("ascii"),
-                str(self.rank_port).encode("ascii"),
-                self.engine_desc.key.encode("ascii"),
-                kv_indices_bytes if not is_dummy else b"",
-                aux_bytes if not is_dummy else b"",
-                state_bytes,
-                str(required_dst_info_num).encode("ascii"),
-                decode_prefix_bytes,
-            ]
-
-        return encode_message
+        return [
+            MORI_GUARD,
+            str(bootstrap_room).encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            self.engine_desc.key.encode("ascii"),
+            kv_indices_bytes,
+            aux_bytes,
+            state_bytes,
+            str(required_dst_info_num).encode("ascii"),
+            decode_prefix_bytes,
+        ]
 
 
 class MoriKVSender(CommonKVSender):

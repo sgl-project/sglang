@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -3415,7 +3415,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=bootstrap_thread_guarded).start()
 
-    def build_receiver_registration_message(self) -> Callable[[], List[bytes]]:
+    def build_receiver_registration_message(self) -> List[bytes]:
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
         )
@@ -3454,7 +3454,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_item_len = 0
             dst_num_slots = 0
 
-        return lambda: [
+        return [
             GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3491,31 +3491,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Callable[[bool], List[bytes]]:
-        def encode_message(is_dummy: bool) -> List[bytes]:
-            packed_state_indices = (
-                pack_int_lists(
-                    [(idx if idx is not None else []) for idx in state_indices], "i"
-                )
-                if not is_dummy and state_indices is not None
-                else b""
+    ) -> List[bytes]:
+        packed_state_indices = (
+            pack_int_lists(
+                [(idx if idx is not None else []) for idx in state_indices], "i"
             )
-            return [
-                GUARD,
-                str(bootstrap_room).encode("ascii"),
-                self.local_ip.encode("ascii"),
-                str(self.rank_port).encode("ascii"),
-                self.agent.name.encode("ascii"),
-                kv_indices.tobytes() if not is_dummy else b"",
-                str(aux_index).encode("ascii"),
-                str(required_dst_info_num).encode("ascii"),
-                packed_state_indices,
-                str(decode_prefix_len or 0).encode("ascii"),
-                str(int(is_dummy)).encode("ascii"),
-            ]
-
-        return encode_message
+            if not is_dummy and state_indices is not None
+            else b""
+        )
+        return [
+            GUARD,
+            str(bootstrap_room).encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            self.agent.name.encode("ascii"),
+            kv_indices.tobytes() if not is_dummy else b"",
+            str(aux_index).encode("ascii"),
+            str(required_dst_info_num).encode("ascii"),
+            packed_state_indices,
+            str(decode_prefix_len or 0).encode("ascii"),
+            str(int(is_dummy)).encode("ascii"),
+        ]
 
 
 class NixlKVSender(CommonKVSender):
