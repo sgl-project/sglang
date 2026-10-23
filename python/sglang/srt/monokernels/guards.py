@@ -102,7 +102,10 @@ def monokernel_disable_reasons(
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
     spec, why = find_spec(
-        backend=cfg.monokernel_backend, architectures=hf_config.architectures, isa=isa
+        backend=cfg.monokernel_backend,
+        architectures=hf_config.architectures,
+        isa=isa,
+        model_type=getattr(hf_config, "model_type", None),
     )
     if spec is None:
         return None, [why]
