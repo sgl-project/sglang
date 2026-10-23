@@ -437,6 +437,97 @@
         }
       },
       "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "backend with absent optional policies",
+      "input": {
+        "hicache_storage_backend": "file"
+      },
+      "canonical": "{\"hicache_storage_backend\":\"file\"}"
+    },
+    {
+      "type": "HiCacheStatus",
+      "name": "unset configuration is emitted as null",
+      "input": {},
+      "canonical": "{\"hicache_storage_backend\":null,\"hicache_storage_backend_extra_config\":null,\"hicache_storage_prefetch_policy\":null,\"hicache_write_policy\":null}"
+    },
+    {
+      "type": "HiCacheStorageResponse",
+      "name": "scheduler rejection with message",
+      "input": {
+        "success": false,
+        "message": "scheduler is not idle"
+      },
+      "canonical": "{\"success\":false,\"message\":\"scheduler is not idle\"}"
+    },
+    {
+      "type": "ClearHiCacheStorageRequest",
+      "name": "empty clear request",
+      "input": {},
+      "canonical": "{}"
+    },
+    {
+      "type": "DetachHiCacheStorageRequest",
+      "name": "empty detach request",
+      "input": {},
+      "canonical": "{}"
+    },
+    {
+      "type": "GetHiCacheStorageRequest",
+      "name": "empty status request",
+      "input": {},
+      "canonical": "{}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "all attach options",
+      "input": {
+        "hicache_storage_backend": "file",
+        "hicache_storage_backend_extra_config_json": "{}",
+        "hicache_storage_prefetch_policy": "timeout",
+        "hicache_write_policy": "write_through"
+      },
+      "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"{}\",\"hicache_storage_prefetch_policy\":\"timeout\",\"hicache_write_policy\":\"write_through\"}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "empty backend is validated by the scheduler",
+      "input": {
+        "hicache_storage_backend": ""
+      },
+      "canonical": "{\"hicache_storage_backend\":\"\"}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "all optional fields explicitly null",
+      "input": {
+        "hicache_storage_backend": "file",
+        "hicache_storage_backend_extra_config_json": null,
+        "hicache_storage_prefetch_policy": null,
+        "hicache_write_policy": null
+      },
+      "canonical": "{\"hicache_storage_backend\":\"file\"}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "unknown fields ignored",
+      "input": {
+        "hicache_storage_backend": "file",
+        "unknown_option": true
+      },
+      "canonical": "{\"hicache_storage_backend\":\"file\"}"
+    },
+    {
+      "type": "AttachHiCacheStorageRequest",
+      "name": "empty optional strings preserved",
+      "input": {
+        "hicache_storage_backend": "file",
+        "hicache_storage_backend_extra_config_json": "",
+        "hicache_storage_prefetch_policy": "",
+        "hicache_write_policy": ""
+      },
+      "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
     }
   ]
 }

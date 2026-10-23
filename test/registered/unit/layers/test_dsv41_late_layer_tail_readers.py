@@ -332,5 +332,56 @@ class TestPrefillGraphReplayContext(CustomTestCase):
                 )
 
 
+class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
+    """An eager low-ratio break inside the prefill graph's late-layer tail must read
+    the hoisted rows of the tail, not rows rebuilt from the whole extend."""
+
+    def _run(self, hoisted_req, hoisted_pos, positions):
+        backend = object.__new__(deepseek_v4_backend.DeepseekV4AttnBackend)
+        backend.tail_source_kv_layer_id = None
+        backend.forward_metadata = SimpleNamespace(
+            low_ratio_req_indices=hoisted_req, low_ratio_pos_i64=hoisted_pos
+        )
+        backend._low_ratio_compress = MagicMock()
+        backend._low_ratio_index_topk = MagicMock()
+        # Two requests extend 4 and 6 tokens; the tail keeps their last 2 and 3.
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            encoder_swa_replay=False,
+            req_pool_indices=torch.tensor([7, 9]),
+            extend_seq_lens=torch.tensor([4, 6]),
+        )
+        layer = SimpleNamespace(layer_id=21, compressor=object(), indexer=object())
+        with (
+            patch.object(deepseek_v4_backend, "dsa_use_prefill_cp", return_value=False),
+            patch.object(
+                deepseek_v4_backend.DeepseekV4AttnBackend,
+                "_low_ratio_in_prefill_graph",
+                return_value=False,
+            ),
+        ):
+            backend.forward_low_ratio_sources(
+                layer=layer,
+                x=torch.zeros(positions.shape[0], 4),
+                q_lora=torch.zeros(positions.shape[0], 4),
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        compress_args = backend._low_ratio_compress.call_args.args
+        index_args = backend._low_ratio_index_topk.call_args.args
+        return compress_args[2], compress_args[3], index_args[3], index_args[4]
+
+    def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
+        # Bucket of 8 rows, the 5 live tail rows first.
+        hoisted_req = torch.tensor([7, 7, 9, 9, 9, 0, 0, 0])
+        hoisted_pos = torch.tensor([2, 3, 3, 4, 5, 0, 0, 0])
+        positions = hoisted_pos[:5].clone()
+        req, pos, index_req, index_pos = self._run(hoisted_req, hoisted_pos, positions)
+        self.assertEqual(req.tolist(), [7, 7, 9, 9, 9])
+        self.assertEqual(pos.tolist(), [2, 3, 3, 4, 5])
+        self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
+        self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
+
+
 if __name__ == "__main__":
     unittest.main()

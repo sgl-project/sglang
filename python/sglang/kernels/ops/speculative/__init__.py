@@ -54,5 +54,12 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="speculative.pack_verify_mask_into",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",
+    )
+)
 
 __all__ = []
