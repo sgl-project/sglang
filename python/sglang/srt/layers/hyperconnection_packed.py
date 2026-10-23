@@ -97,6 +97,8 @@ class PackedGatedResidual(GatedResidual):
     def __init__(self, config, role: Optional[str] = None):
         HyperConnectionBase.__init__(self, config, True, True, role)
         c, h, lowrank = self.hc_count, self.hidden_size, config.hc_lowrank
+        if lowrank <= 0 or lowrank % 64:
+            raise ValueError("packed HC requires a positive hc_lowrank aligned to 64")
         npad = ((lowrank + c + 7) // 8) * 8
         self._packed_sum_weights = True
         self._deterministic_hc = _deterministic_inference()
@@ -458,7 +460,8 @@ def create_gated_residual(config, use_mix=True, use_combine=True, role=None):
         and 0 < h <= 16384
         and h % 512 == 0
         and lowrank > 0
-        and lowrank % 8 == 0
+        # Small-T Down keeps Inject in a separate, CTA-aligned alpha-only tile.
+        and lowrank % 64 == 0
         and lowrank + c <= ((lowrank + 127) // 128) * 128
         and config.params_dtype in (torch.bfloat16, torch.float16)
         and torch.cuda.is_available()

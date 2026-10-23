@@ -291,36 +291,8 @@ _EPILOGUE_MODES = (
     "none",
     "silu",
     "gate",
-    "silu_aux_direct",
     "silu_aux_alpha_only",
 )
-
-#: Public selector names for packed-aux epilogues.
-_SILU_AUX_IMPLS = {
-    "direct": "silu_aux_direct",
-    "alpha_only": "silu_aux_alpha_only",
-}
-
-
-def resolve_splitk_dense_silu_aux_impl(
-    aux_impl: str,
-    aux_start: int,
-    aux_width: int,
-    n: int,
-    tactic: SplitKTactic,
-) -> str:
-    """Resolve the requested packed-aux epilogue to its executable policy."""
-    if aux_impl not in _SILU_AUX_IMPLS:
-        raise ValueError(
-            f"aux_impl must be one of {tuple(_SILU_AUX_IMPLS)}, got {aux_impl!r}"
-        )
-    if aux_impl == "alpha_only" and (
-        aux_start + aux_width != n or aux_start % tactic.mma_m != 0
-    ):
-        # A mixed or non-trailing tile may contain useful ordinary output.
-        return "direct"
-    return aux_impl
-
 
 #: Named barrier for the gate epilogue's SMEM staging round-trip.
 _GATE_BARRIER_ID = 7
@@ -382,7 +354,7 @@ class SplitKDenseGemmKernel:
         if reset_sum and (not raw_rms or epilogue_mode != "gate"):
             raise ValueError("next-sum reset requires a raw gate epilogue")
         if raw_rms and epilogue_mode != "gate":
-            if epilogue_mode not in _SILU_AUX_IMPLS.values():
+            if epilogue_mode != "silu_aux_alpha_only":
                 raise ValueError("raw RMS requires a gate or packed-aux epilogue")
             if epilogue_group != 4 or tactic.split_k % epilogue_group:
                 raise ValueError("raw Down requires C=4 and branch-aligned split-K")
@@ -417,10 +389,7 @@ class SplitKDenseGemmKernel:
             if raw_sum:
                 # Include the FP32 gate tile and its allocator alignment.
                 self.launch_smem_bytes = gate_smem
-        if epilogue_mode in (
-            "silu_aux_direct",
-            "silu_aux_alpha_only",
-        ):
+        if epilogue_mode == "silu_aux_alpha_only":
             if has_bias:
                 raise ValueError("silu_aux epilogues do not support bias")
             if epilogue_aux_start < 0 or epilogue_aux_width <= 0:
@@ -1014,9 +983,7 @@ class SplitKDenseGemmKernel:
             if cutlass.const_expr(self.has_bias):
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
-            if cutlass.const_expr(
-                self.epilogue_mode in ("silu_aux_direct", "silu_aux_alpha_only")
-            ):
+            if cutlass.const_expr(self.epilogue_mode == "silu_aux_alpha_only"):
                 # Identity coordinates use rAcc's TMEM->RMEM partition;
                 # each epilogue thread maps its registers to the correct output indices.
                 cAux_epi = cute.flat_divide(
@@ -1059,7 +1026,7 @@ class SplitKDenseGemmKernel:
                     rD.store(rAcc.load().to(c_dtype))
                     # Preserve TMEM coordinates; the copy predicates tails.
                     cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
-            elif cutlass.const_expr(self.epilogue_mode in ("silu", "silu_aux_direct")):
+            elif cutlass.const_expr(self.epilogue_mode == "silu"):
                 scaled = rAcc.load() * self.epilogue_scale
                 rAcc.store(scaled * _sigmoid_f32(scaled))
                 rD.store(rAcc.load().to(c_dtype))
@@ -1366,10 +1333,7 @@ def _make_compile_repr_tensors(
             _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
             *extra,
         )
-    if epilogue_mode in (
-        "silu_aux_direct",
-        "silu_aux_alpha_only",
-    ):
+    if epilogue_mode == "silu_aux_alpha_only":
         extra = ()
         if raw_rms:
             extra = (
@@ -1523,10 +1487,7 @@ def _get_compiled_splitk_kernel(
     if epilogue_mode == "gate":
         wrapper = _bmm_gate_raw if raw_rms else _bmm_gate
         compiled = cute_ext.compile(wrapper, kernel, *compile_tensors, stream)
-    elif epilogue_mode in (
-        "silu_aux_direct",
-        "silu_aux_alpha_only",
-    ):
+    elif epilogue_mode == "silu_aux_alpha_only":
         wrapper = _bmm_silu_aux_raw if raw_rms else _bmm_silu_aux
         compiled = cute_ext.compile(wrapper, kernel, *compile_tensors, stream)
     elif has_bias:
@@ -1688,7 +1649,6 @@ def run_splitk_dense_silu_aux(
     tactic: SplitKTactic,
     scale: float,
     aux_start: int,
-    aux_impl: str = "direct",
     *,
     sum_sq=None,
     rms_eps=1e-6,
@@ -1696,9 +1656,8 @@ def run_splitk_dense_silu_aux(
 ):
     """Run a packed SiLU GEMM and emit final FP32 values for an N slice.
 
-    ``direct`` stores the full packed projection to ``out`` after SiLU as a
-    fallback for non-aligned auxiliary slices. Eligible ``alpha_only`` calls
-    leave the trailing auxiliary slice of ``out`` untouched. In both modes, ``aux`` receives
+    The auxiliary slice must be trailing and start at a CTA tile boundary.
+    Its portion of ``out`` is left untouched. ``aux`` receives
     ``2 * sigmoid(scale * raw)`` directly from the FP32 accumulators before
     any output cast.
     Raw callers provide read-only ``sum_sq``. Inverse RMS is computed locally;
@@ -1735,10 +1694,8 @@ def run_splitk_dense_silu_aux(
         raise ValueError(
             f"aux slice [{aux_start}:{aux_start + aux_width}] exceeds N={n}"
         )
-    effective_aux_impl = resolve_splitk_dense_silu_aux_impl(
-        aux_impl, aux_start, aux_width, n, tactic
-    )
-    epilogue_mode = _SILU_AUX_IMPLS[effective_aux_impl]
+    if aux_start + aux_width != n or aux_start % tactic.mma_m:
+        raise ValueError("aux slice must be trailing and aux_start aligned to mma_m")
     cute_tensors = _to_cute_swap(a, b, out, None, branch_packed=branch_packed)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,
@@ -1746,7 +1703,7 @@ def run_splitk_dense_silu_aux(
         use_pdl=pdl,
         has_bias=False,
         leading_dims=cute_tensors[4],
-        epilogue_mode=epilogue_mode,
+        epilogue_mode="silu_aux_alpha_only",
         epilogue_scale=scale,
         epilogue_aux_start=aux_start,
         epilogue_aux_width=aux_width,

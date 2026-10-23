@@ -418,10 +418,10 @@ class TestHCSumState(CustomTestCase):
     @torch.no_grad()
     def test_numerics_dispatch_and_empty(self):
         for dtype in (torch.bfloat16, torch.float16):
-            # L=320 uses alpha-only; L=288 also exercises the direct epilogue.
+            # Both shapes use a CTA-aligned, trailing alpha-only Inject tile.
             for h, lowrank, tokens in (
                 (2560, 320, (0, 1, 8, 16, 24, 25, 80)),
-                (2048, 288, (3, 25)),
+                (2048, 192, (3, 25)),
             ):
                 checkpoint = _checkpoint(h, lowrank, dtype)
                 layer = _layer(h, lowrank, dtype)
@@ -763,7 +763,7 @@ class TestHCSumState(CustomTestCase):
 
     @torch.no_grad()
     def test_checkpoint_round_trip_and_shared_storage(self):
-        h, lowrank = 512, 8
+        h, lowrank = 512, 64
         for dtype in (torch.bfloat16, torch.float16):
             checkpoint = _checkpoint(h, lowrank, dtype)
             checkpoint["hc_norm.weight"][0] = -1
@@ -798,7 +798,7 @@ class TestHCSumState(CustomTestCase):
 
     @torch.no_grad()
     def test_initial_weight_loaders_and_reload_rejection(self):
-        h, lowrank = 512, 8
+        h, lowrank = 512, 64
         for dtype in (torch.bfloat16, torch.float16):
             checkpoint = _checkpoint(h, lowrank, dtype)
             layer = _layer(h, lowrank, dtype)
@@ -830,7 +830,7 @@ class TestHCSumState(CustomTestCase):
 
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 
-        h, lowrank, dtype = 512, 8, torch.bfloat16
+        h, lowrank, dtype = 512, 64, torch.bfloat16
         checkpoint = _checkpoint(h, lowrank, dtype)
         source = _HCSequential(_layer(h, lowrank, dtype))
         source[0].load_state_dict(checkpoint)
@@ -888,8 +888,8 @@ class TestHCSumState(CustomTestCase):
         )
         from sglang.srt.utils.offloader import _get_resident_parameter_ids
 
-        layer = _layer(512, 8, torch.bfloat16)
-        layer.load_state_dict(_checkpoint(512, 8, torch.bfloat16))
+        layer = _layer(512, 64, torch.bfloat16)
+        layer.load_state_dict(_checkpoint(512, 64, torch.bfloat16))
         group = object()
         exporter = WeightExporter(
             tp_rank=0,
@@ -939,7 +939,7 @@ class TestHCSumState(CustomTestCase):
         # allocate an RMS copy and leave the Graph bound to stale storage.
         invalid["hc_norm.weight"] = invalid["hc_norm.weight"].T.contiguous().T
         self.assertFalse(invalid["hc_norm.weight"].is_contiguous())
-        fresh = _layer(512, 8, torch.bfloat16, meta=True)
+        fresh = _layer(512, 64, torch.bfloat16, meta=True)
         with self.assertRaisesRegex(ValueError, "RMS parameter must be contiguous"):
             fresh.load_state_dict(invalid, assign=True)
 

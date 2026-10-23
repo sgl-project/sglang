@@ -6,9 +6,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.hyperconnection import HyperConnectionConfig
+from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sglang.srt.layers.hyperconnection_packed import (
     PackedGatedResidual,
+    create_gated_residual,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
@@ -63,6 +64,27 @@ class TestTensorUpdateRank(unittest.TestCase):
 
 
 class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
+    def test_packed_lowrank_selection(self):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            for lowrank in (8, 288, 64, 192, 320):
+                with self.subTest(lowrank=lowrank):
+                    config = HyperConnectionConfig(
+                        hidden_size=512,
+                        hc_lowrank=lowrank,
+                        hc_per_branch_norm=True,
+                        params_dtype=torch.bfloat16,
+                    )
+                    layer = create_gated_residual(config)
+                    if lowrank % 64:
+                        self.assertIs(type(layer), GatedResidual)
+                        with self.assertRaisesRegex(ValueError, "aligned to 64"):
+                            PackedGatedResidual(config)
+                    else:
+                        self.assertIsInstance(layer, PackedGatedResidual)
+
     def _updater(self, model):
         return WeightUpdater(
             tp_rank=0,
@@ -91,7 +113,7 @@ class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
                 model.hc = PackedGatedResidual(
                     HyperConnectionConfig(
                         hidden_size=512,
-                        hc_lowrank=8,
+                        hc_lowrank=64,
                         hc_per_branch_norm=True,
                         params_dtype=torch.bfloat16,
                     )
@@ -107,7 +129,7 @@ class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
         model = torch.nn.Module()
         model.hc = PackedGatedResidual(
             HyperConnectionConfig(
-                hidden_size=512, hc_lowrank=8, hc_per_branch_norm=True
+                hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
             )
         )
         with torch.no_grad():
@@ -206,7 +228,7 @@ class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
                 )
                 model.hc = PackedGatedResidual(
                     HyperConnectionConfig(
-                        hidden_size=512, hc_lowrank=8, hc_per_branch_norm=True
+                        hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
                     )
                 )
                 model.hc._hc_weights_ready = True

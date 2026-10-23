@@ -45,7 +45,7 @@ def prepare_raw_hc_weights_from_batched(weights, up, *, norm_weight_permuted):
         or not 0 < h <= 16384
         or h % 512
         or lowrank <= 0
-        or lowrank % 8
+        or lowrank % 64
         or lowrank + c > pad_lowrank(lowrank)
         or matrix.ndim != 3
         or matrix.shape[:2] != (c, h)
@@ -120,7 +120,6 @@ def hc_mix_raw(
         down_tactic,
         1.0 / c,
         lowrank,
-        "alpha_only",
         sum_sq=sum_sq,
         rms_eps=rms_eps,
         branch_packed=True,
