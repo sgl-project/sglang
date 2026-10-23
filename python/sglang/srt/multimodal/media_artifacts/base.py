@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
 import numpy as np
+import requests
 import torch
 from PIL import Image
 
@@ -43,6 +44,33 @@ from sglang.srt.multimodal.cache import (
     snapshot_media,
 )
 from sglang.srt.utils import load_image
+
+
+def _media_fetch_error(
+    source: Any, error: requests.exceptions.RequestException
+) -> ValueError:
+    """Build the client error for a media URL that could not be downloaded.
+
+    ValueError maps to HTTP 400. The message names the URL and a short reason
+    instead of the requests/urllib3 text, which carries connection-pool and
+    socket internals.
+    """
+    url = getattr(source, "url", source)
+    if isinstance(url, Mapping):
+        url = url.get("url")
+    if isinstance(error, requests.exceptions.Timeout):
+        reason = "timed out"
+    elif (
+        isinstance(error, requests.exceptions.HTTPError) and error.response is not None
+    ):
+        reason = f"HTTP {error.response.status_code}"
+    elif isinstance(error, requests.exceptions.TooManyRedirects):
+        reason = "too many redirects"
+    elif isinstance(error, requests.exceptions.ConnectionError):
+        reason = "connection failed"
+    else:
+        reason = "request failed"
+    return ValueError(f"Failed to fetch media URL {url}: {reason}")
 
 
 @runtime_checkable
@@ -173,7 +201,10 @@ class MediaArtifactCacheMixin:
             raise NotImplementedError(
                 f"{modality.name.lower()} artifact identity requires a model adapter"
             )
-        return snapshot_media(source)
+        try:
+            return snapshot_media(source)
+        except requests.exceptions.RequestException as error:
+            raise _media_fetch_error(source, error) from error
 
     def prepare_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]

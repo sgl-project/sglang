@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import numbers
 import os
 import pickle
 import signal
@@ -1352,6 +1353,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if max_new_tokens is not None and (
+            isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int)
+        ):
+            # Reject before the length arithmetic below, which would raise a
+            # TypeError (HTTP 500) for e.g. a string.
+            raise ValueError(
+                "max_new_tokens must be an integer, got "
+                f"{type(max_new_tokens).__name__} {max_new_tokens!r}."
+            )
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
@@ -1390,6 +1400,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
+            self._validate_input_ids_in_vocab(obj)
             self._validate_token_ids_logprob(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
@@ -1508,6 +1519,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.dimensions > self.model_config.hidden_size:
             raise ValueError(
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
+            )
+
+    def _validate_input_ids_in_vocab(self, obj: GenerateReqInput) -> None:
+        """Reject client-supplied prompt ids outside [0, vocab_size).
+
+        Out-of-range ids would otherwise reach the embedding gather. Ids from
+        the tokenizer or a multimodal processor are not checked. Requests with
+        input_embeds or positional embed overrides are skipped, since their
+        placeholder ids are replaced before the embedding lookup.
+        """
+        input_ids = obj.input_ids
+        if (
+            not input_ids
+            or obj.input_embeds is not None
+            or obj.positional_embed_overrides is not None
+        ):
+            return
+        # Check every id, not just min/max: [1, 2.5, 3] has integer extremes.
+        # bool is an Integral subclass but never a valid token id.
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, numbers.Integral)
+            for token_id in input_ids
+        ):
+            raise ValueError("input_ids must be integers.")
+        min_id, max_id = min(input_ids), max(input_ids)
+        vocab_size = self.model_config.vocab_size
+        if min_id < 0 or max_id >= vocab_size:
+            bad_id = min_id if min_id < 0 else max_id
+            raise ValueError(
+                f"input_ids contains out-of-vocabulary token id {bad_id}; "
+                f"valid range is [0, {vocab_size})."
             )
 
     def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:

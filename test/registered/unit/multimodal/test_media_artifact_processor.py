@@ -1,11 +1,16 @@
 import asyncio
 import base64
+import http.server
 import io
+import socket
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Optional
+from unittest import mock
 
+import requests
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -286,6 +291,66 @@ class TestMediaArtifactProcessor(CustomTestCase):
                 )
         finally:
             processor.close()
+
+
+class _NotFoundHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_error(404)
+
+    def log_message(self, *args):
+        pass
+
+
+def _closed_port_url() -> str:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}/x.png"
+
+
+class TestMediaArtifactFetchErrors(CustomTestCase):
+    """A media URL the server cannot fetch is a client error (issue #1266)."""
+
+    def _assert_fetch_rejected(self, url, reason, prepare="prepare_media_artifacts"):
+        processor = _Processor()
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(getattr(processor, prepare)([url]))
+        finally:
+            processor.close()
+        self.assertEqual(
+            str(ctx.exception), f"Failed to fetch media URL {url}: {reason}"
+        )
+
+    def test_connection_refused_names_url_without_internals(self):
+        url = _closed_port_url()
+        for prepare in (
+            "prepare_media_artifacts",
+            "prepare_media_artifacts_without_cache",
+        ):
+            with self.subTest(prepare=prepare):
+                self._assert_fetch_rejected(url, "connection failed", prepare)
+
+    def test_http_error_status_is_reported(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NotFoundHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/missing.png"
+            self._assert_fetch_rejected(url, "HTTP 404")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_timeout_is_reported(self):
+        session = mock.create_autospec(requests.Session, instance=True)
+        session.get.side_effect = requests.exceptions.ConnectTimeout(
+            "HTTPConnectionPool(host='10.255.255.1', port=80): Max retries exceeded"
+        )
+        with mock.patch(
+            "sglang.srt.utils.common.get_mm_http_session", return_value=session
+        ):
+            self._assert_fetch_rejected("http://10.255.255.1/x.png", "timed out")
 
 
 if __name__ == "__main__":

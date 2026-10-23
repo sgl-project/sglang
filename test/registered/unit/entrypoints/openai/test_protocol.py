@@ -793,6 +793,23 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
+    def test_n_must_be_at_least_one(self):
+        """n=0 must be a validation error, not a range()/division crash."""
+        messages = [{"role": "user", "content": "Hello"}]
+        for n in (0, -1):
+            for name, build in (
+                ("chat", lambda: ChatCompletionRequest(messages=messages, n=n)),
+                ("completion", lambda: CompletionRequest(prompt="Hello", n=n)),
+            ):
+                with self.subTest(request=name, n=n):
+                    with self.assertRaises(ValidationError) as ctx:
+                        build()
+                    (error,) = ctx.exception.errors()
+                    self.assertEqual(error["loc"], ("n",))
+                    self.assertEqual(
+                        error["msg"], "Input should be greater than or equal to 1"
+                    )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
