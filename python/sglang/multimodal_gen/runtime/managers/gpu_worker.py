@@ -547,9 +547,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         residency_hint = (
             f" Components that can remain on GPU: {can_stay_resident}. "
-            "Make it explicit with --component-residency <name>=resident; "
-            "--performance-mode auto with server warmup applies safe "
-            "adjustments automatically."
+            "Make it explicit with --component-residency <name>=resident."
             if can_stay_resident
             else ""
         )
