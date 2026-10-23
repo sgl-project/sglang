@@ -100,7 +100,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "--speculative-draft-model-path",
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
     "--speculative-draft-model-quantization",
-    "modelslim",
+    "fp8",
     "--speculative-draft-attention-backend",
     "ascend",
     "--speculative-num-draft-tokens",
@@ -111,6 +111,8 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
+    "--quantization",
+    "fp8",
 ]
 
 DEEPSEEK_V4_FLASH_FP8_4P_GENERATION_CONFIG_MAX = {
