@@ -8,15 +8,14 @@ import torch
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.mm_utils import hip_dp_encoder_batches_vit
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.runtime_context import get_platform, get_schedule
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
-_is_hip = is_hip()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
 host_offload_event: Optional[torch.cuda.Event] = None
@@ -538,6 +537,21 @@ def _assemble_per_image_chunk(
     ]
 
 
+def _batch_vit_across_requests() -> bool:
+    """Whether chunked prefill encodes the images of all requests in one ViT call.
+
+    CUDA batches across requests. NPU and XPU keep one ViT call per request, and
+    so does ROCm, where one large cross-request batch regressed CI (#32415),
+    except when the DP encoder has more than one rank to split the batch over.
+    """
+    platform = get_platform()
+    if platform.is_npu or platform.is_xpu:
+        return False
+    if platform.is_hip:
+        return hip_dp_encoder_batches_vit()
+    return True
+
+
 def _get_chunked_prefill_embedding(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -560,6 +574,7 @@ def _get_chunked_prefill_embedding(
     per_image_requests = []  # batched ViT encoding
     full_path_requests = []  # per-request encoding (EVS etc.)
     all_chunks: List[Tuple[int, torch.Tensor]] = []
+    batch_vit = _batch_vit_across_requests()
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -595,9 +610,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+            if batch_vit:
+                per_image_requests.append(req_info)
+            else:
                 chunk_slices = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
@@ -606,8 +621,6 @@ def _get_chunked_prefill_embedding(
                     device,
                 )
                 all_chunks.extend((i, chunk) for chunk in chunk_slices)
-            else:
-                per_image_requests.append(req_info)
         else:
             full_path_requests.append(req_info)
 

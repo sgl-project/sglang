@@ -2649,6 +2649,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return loaded_params
 
     def precompile_kernels_after_loading(self) -> None:
+        super().precompile_kernels_after_loading()
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
 
         if precompile_splitk_tactics():

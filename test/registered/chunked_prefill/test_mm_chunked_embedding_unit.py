@@ -22,7 +22,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -100,6 +100,13 @@ def _make_items():
         )
         for i, offset in enumerate(ITEM_OFFSETS)
     ]
+
+
+def _encode_per_request(request, per_request: bool) -> None:
+    # ROCm without the DP encoder keeps one ViT call per request.
+    platform_override = override_platform(is_hip=per_request)
+    platform_override.install()
+    request.addfinalizer(platform_override.restore)
 
 
 def _run_by_item_chunks(encoder):
@@ -199,9 +206,9 @@ def test_tensor_cache_entries_own_storage(per_request):
 @pytest.mark.parametrize("per_request", [False, True])
 @pytest.mark.parametrize("cache_bytes", [0, 6 * HIDDEN * 4])
 def test_tensor_encoder_chunks_survive_cache_pressure(
-    monkeypatch, per_request, cache_bytes
+    request, per_request, cache_bytes
 ):
-    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    _encode_per_request(request, per_request)
     mm_schedule.init_mm_embedding_cache(cache_bytes)
     items = _make_items()
     chunk, _ = mm_schedule._get_chunked_prefill_embedding(
@@ -341,10 +348,8 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
 
 
 @pytest.mark.parametrize("per_request", [False, True])
-def test_multi_offset_audio_item_is_chunked_and_cached_per_item(
-    monkeypatch, per_request
-):
-    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+def test_multi_offset_audio_item_is_chunked_and_cached_per_item(request, per_request):
+    _encode_per_request(request, per_request)
     mm_schedule.init_mm_embedding_cache(1 << 30)
     history_offsets = [(2, 3), (6, 7), (10, 11)]
     new_offsets = [(14, 15), (18, 19)]
@@ -396,9 +401,9 @@ def test_multi_offset_audio_item_is_chunked_and_cached_per_item(
 @pytest.mark.parametrize("num_requests", [1, 2])
 @pytest.mark.parametrize("num_items", [1, 2])
 def test_cached_audio_items_concatenate_once_in_request_order(
-    monkeypatch, per_request, num_requests, num_items
+    monkeypatch, request, per_request, num_requests, num_items
 ):
-    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
+    _encode_per_request(request, per_request)
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = []
     expected_slices = []
