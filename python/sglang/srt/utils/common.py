@@ -4109,6 +4109,14 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # the trim saves. With uniform buckets the per-tier fan-in is exact.
             # Scoped to the opt-in gate so the default path is untouched.
             return True
+        elif (
+            get_moe_a2a_backend().is_megamoe()
+            and envs.SGLANG_OPT_USE_AITER_MEGA_SMALL_M.get()
+        ):
+            # The small-input and main MegaMoE kernels share no protocol state, so
+            # every EP rank must pick the same one per step; the choice is baked
+            # into a captured graph by its DP-synchronized bucket.
+            return True
         else:
             return (
                 get_parallel().moe_dense_tp_size

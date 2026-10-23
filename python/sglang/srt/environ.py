@@ -1040,6 +1040,13 @@ class Envs:
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
+    # Run MegaMoE calls whose DP-global max fits the aiter small-input runtimes
+    # through forward_small_m (needs AITER_MEGA_SMALL_M=1).
+    SGLANG_OPT_USE_AITER_MEGA_SMALL_M = EnvBool(False)
+    # Run extend steps through the aiter large-input path (needs AITER_MEGA_LARGE_M=1).
+    SGLANG_OPT_USE_AITER_MEGA_LARGE_M = EnvBool(False)
+    # Extend steps whose DP-global max is below this stay on the main path.
+    SGLANG_OPT_AITER_MEGA_LARGE_M_MIN_TOKENS = EnvInt(1024)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
