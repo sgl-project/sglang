@@ -178,3 +178,13 @@ for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
         )
     )
 del _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.silu_mul_fp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.silu_mul_fp8:silu_mul_fp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)

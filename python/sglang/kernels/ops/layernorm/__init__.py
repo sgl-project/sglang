@@ -113,3 +113,13 @@ for _op, _target, _backends in (
             )
         )
 del _op, _target, _backends, _bk
+
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.layernorm_modulate_fp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.layernorm_modulate_fp8:layernorm_modulate_fp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)

@@ -69,6 +69,8 @@ _is_cuda = current_platform.is_cuda()
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
+_NORM_FP8_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation + FP8")
+_SILU_MUL_FP8_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul + FP8 quantization")
 _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE")
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_ROPE_CUDA_FUSION = BitExactFusionGate(
@@ -338,6 +340,175 @@ def _stacked_rows(a, b):
     return a.as_strided((2 * a.shape[0], a.shape[1]), (a.shape[1], 1))
 
 
+def _can_use_dynamic_fp8_projection(layer, x):
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+
+    return (
+        type(layer.quant_method) is Fp8LinearMethod
+        and layer.quant_method.cutlass_fp8_supported
+        and not layer.quant_method.use_marlin
+        and not layer.quant_method.block_quant
+        and layer.bias is None
+        and layer.tp_size == 1
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+        and layer.weight.is_cuda
+        and layer.weight.device == x.device
+        and layer.weight.dtype is torch.float8_e4m3fn
+        and layer.weight.ndim == 2
+        and layer.weight.shape[0] == x.shape[-1]
+        and layer.weight.stride(0) == 1
+        and layer.weight.t().is_contiguous()
+        and layer.weight_scale.numel() == layer.weight.shape[1]
+        and layer.input_scale is None
+    )
+
+
+def _shared_fp8_projections(x, layers, *, norm_scale=None):
+    """Quantize sibling projections' common input once, keeping each GEMM.
+
+    SM89 measurements favor this over a wider packed GEMM. Keeping the same
+    GEMM shapes also preserves the separate projections' BF16 results and
+    avoids a persistent packed-weight allocation. Unsupported layers retain
+    their normal forwards, including LoRA, hooks and static activation scales.
+    """
+    if (
+        not _is_cuda
+        or torch.compiler.is_compiling()
+        or not x.is_cuda
+        or x.dtype is not torch.bfloat16
+        or x.ndim < 2
+        or x.numel() == 0
+        or any(type(layer) is not ColumnParallelLinear for layer in layers)
+        or layers[0].weight.dtype is not torch.float8_e4m3fn
+    ):
+        return None
+    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
+    from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+    if any(
+        layer.gather_output or not _can_use_dynamic_fp8_projection(layer, x)
+        for layer in layers
+    ):
+        return None
+    if torch.cuda.get_device_capability(x.device) != (8, 9):
+        return None
+    if norm_scale is None:
+        quantized, scale = sglang_per_token_quant_fp8(
+            x.reshape(-1, x.shape[-1]).contiguous()
+        )
+    else:
+        from sglang.kernels.ops.layernorm.layernorm_modulate_fp8 import (
+            layernorm_modulate_fp8,
+        )
+
+        norm, modulation = norm_scale
+        quantized, scale = layernorm_modulate_fp8(x, modulation.squeeze(1), norm.eps)
+        quantized = quantized.view(-1, x.shape[-1])
+        if not _NORM_FP8_FUSION.verified:
+            reference = sglang_per_token_quant_fp8(
+                apply_modulation(x, norm, modulation).view(-1, x.shape[-1])
+            )
+            quantized, scale = _NORM_FP8_FUSION.accept_or_fallback(
+                (quantized, scale),
+                reference,
+                equal=lambda a, b: (
+                    torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8))
+                    and torch.equal(a[1], b[1])
+                ),
+                logger=logger,
+            )
+    return tuple(
+        apply_fp8_linear(
+            input=quantized,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=scale,
+            cutlass_fp8_supported=True,
+            pre_quant_output_dtype=x.dtype,
+        ).view(*x.shape[:-1], layer.weight.shape[1])
+        for layer in layers
+    )
+
+
+def _modulation_fp8_projections(x, norm, scale, module):
+    # Only enable the measured image shape. Prefixes, hooks, custom norms and
+    # compiled execution keep the ordinary module call with normalized input.
+    if (
+        torch.compiler.is_compiling()
+        or type(module) not in (QwenImage21Attention, QwenImage21FeedForward)
+        or module._forward_pre_hooks
+        or module._forward_hooks
+        or type(norm) is not nn.LayerNorm
+        or norm.elementwise_affine
+        or norm._forward_pre_hooks
+        or norm._forward_hooks
+        or norm.normalized_shape != (4096,)
+        or x.shape != (1, 4096, 4096)
+        or not x.is_contiguous()
+        or scale.shape != (1, 1, 4096)
+        or scale.dtype is not torch.bfloat16
+        or scale.device != x.device
+        or scale.stride(-1) != 1
+        or not _NORM_FP8_FUSION.can_attempt_once()
+    ):
+        return None
+    layers = (
+        (module.to_q, module.to_k, module.to_v)
+        if type(module) is QwenImage21Attention
+        else (module.gate_layer, module.proj)
+    )
+    return _shared_fp8_projections(x, layers, norm_scale=(norm, scale))
+
+
+def _silu_mul_fp8_projection(gate, up, layer):
+    """Fuse the image MLP producer and down-projection quantization on SM89.
+
+    Keep the initial dispatch restricted to the measured 1024-square, TP1
+    image shape. Small prefix batches retain the existing forward, including
+    the quantizer's small-batch behavior for zero rows.
+    """
+    if (
+        not _is_cuda
+        or torch.compiler.is_compiling()
+        or type(layer) is not RowParallelLinear
+        or layer.weight.dtype is not torch.float8_e4m3fn
+        or not gate.is_cuda
+        or gate.dtype is not torch.bfloat16
+        or up.dtype is not torch.bfloat16
+        or gate.shape != up.shape
+        or gate.shape[-1] != 12288
+        or gate.numel() // gate.shape[-1] != 4096
+        or not gate.is_contiguous()
+        or not up.is_contiguous()
+        or gate.device != up.device
+        or not _SILU_MUL_FP8_FUSION.can_attempt_once()
+    ):
+        return None
+    from sglang.kernels.ops.activation.silu_mul_fp8 import silu_mul_fp8
+    from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+    if not _can_use_dynamic_fp8_projection(
+        layer, gate
+    ) or torch.cuda.get_device_capability(gate.device) != (8, 9):
+        return None
+    quantized, scale = silu_mul_fp8(
+        gate.view(-1, gate.shape[-1]), up.view(-1, up.shape[-1])
+    )
+    output = apply_fp8_linear(
+        input=quantized,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        input_scale=scale,
+        cutlass_fp8_supported=True,
+        pre_quant_output_dtype=gate.dtype,
+    ).view(*gate.shape[:-1], layer.weight.shape[1])
+    if _SILU_MUL_FP8_FUSION.verified:
+        return output
+    reference = layer(nn.functional.silu(gate) * up)[0]
+    return _SILU_MUL_FP8_FUSION.accept_or_fallback(output, reference, logger=logger)
+
+
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
@@ -421,7 +592,7 @@ class QwenImage21FeedForward(nn.Module):
         self.pack_gate_up_weights()
         return module
 
-    def forward(self, x):
+    def forward(self, x, *, projected_gate_up=None):
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -429,7 +600,15 @@ class QwenImage21FeedForward(nn.Module):
             return comfy_kitchen_swiglu_mlp(
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
-        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        shared = projected_gate_up
+        if shared is None:
+            shared = _shared_fp8_projections(x, (self.gate_layer, self.proj))
+        gate, value = (
+            shared if shared is not None else (self.gate_layer(x)[0], self.proj(x)[0])
+        )
+        projected = _silu_mul_fp8_projection(gate, value, self.out)
+        if projected is not None:
+            return projected
         fused = None
         if (
             _is_cuda
@@ -569,6 +748,11 @@ class QwenImage21Attention(nn.Module):
         return module
 
     def project_qkv(self, x):
+        shared = _shared_fp8_projections(x, (self.to_q, self.to_k, self.to_v))
+        if shared is not None:
+            return tuple(
+                part.unflatten(-1, (self.heads, self.head_dim)) for part in shared
+            )
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
@@ -794,10 +978,22 @@ class QwenImage21Attention(nn.Module):
                 )
         return out, prefix_output
 
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, *, projected_qkv=None
+    ):
         # batch target projections while retaining each sample's unpadded prefix
-        packed = self._project_qkv_packed(x, layouts, caches)
-        if packed is not None:
+        packed = (
+            None
+            if projected_qkv is not None
+            else self._project_qkv_packed(x, layouts, caches)
+        )
+        if projected_qkv is not None:
+            q, k, v = (
+                value.unflatten(-1, (self.heads, self.head_dim))
+                for value in projected_qkv
+            )
+            k_out = v_out = None
+        elif packed is not None:
             q, k, v, k_out, v_out = packed
         else:
             buffers = self._project_kv_into_buffers(x, layouts, caches)
@@ -864,20 +1060,48 @@ class QwenImage21TransformerBlock(nn.Module):
             else None
             for state, cache in zip(prefix_states, caches, strict=True)
         ]
-        attention, prefix_attentions = self.attn(
-            apply_modulation(hidden_states, self.img_norm1, scale1),
-            ropes,
-            prefixes,
-            layouts,
-            caches,
-            prefix_pad,
-        )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
-        hidden_states = residual_gate_add(
+        projected_qkv = _modulation_fp8_projections(
             hidden_states,
-            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
-            gate2,
+            self.img_norm1,
+            scale1,
+            self.attn,
         )
+        attention_input = (
+            hidden_states
+            if projected_qkv is not None
+            else apply_modulation(hidden_states, self.img_norm1, scale1)
+        )
+        if projected_qkv is None:
+            attention, prefix_attentions = self.attn(
+                attention_input, ropes, prefixes, layouts, caches, prefix_pad
+            )
+        else:
+            attention, prefix_attentions = self.attn(
+                attention_input,
+                ropes,
+                prefixes,
+                layouts,
+                caches,
+                prefix_pad,
+                projected_qkv=projected_qkv,
+            )
+        hidden_states = residual_gate_add(hidden_states, attention, gate1)
+        projected_gate_up = _modulation_fp8_projections(
+            hidden_states,
+            self.img_norm2,
+            scale2,
+            self.img_mlp,
+        )
+        mlp_input = (
+            hidden_states
+            if projected_gate_up is not None
+            else apply_modulation(hidden_states, self.img_norm2, scale2)
+        )
+        if projected_gate_up is None:
+            mlp_output = self.img_mlp(mlp_input)
+        else:
+            mlp_output = self.img_mlp(mlp_input, projected_gate_up=projected_gate_up)
+        hidden_states = residual_gate_add(hidden_states, mlp_output, gate2)
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
