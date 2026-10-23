@@ -1,6 +1,5 @@
 import enum
 import logging
-from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -30,7 +29,6 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
-    NORM_READOUT,
     Fp8Input,
     NormQuantReadout,
 )
@@ -121,128 +119,6 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
-
-
-class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
-    """MoE block that can consume the fused AR+norm+quant tuple.
-
-    With ``Fp8Input.TUPLE_AND_BF16`` declared on the FFN stage the boundary
-    hands down ``(bf16, fp8, scale)``. Where the fp8 goes depends on whether
-    the shared expert was fused into the routed experts:
-
-      * fusion off -- the separate shared expert's FP8 ``gate_up_proj`` takes
-        ``(fp8, scale)``;
-      * fusion on  -- the routed experts take it via ``pre_quant_input``,
-        which covers every expert rather than just the shared one.
-
-    The router gate, the shared-expert gate and the MoE's own bf16 inputs are
-    untouched. Subclassing keeps ``qwen2_moe.py``, shared by several models,
-    byte-identical to upstream.
-    """
-
-    def forward(
-        self,
-        hidden_states,
-        forward_batch: Optional[ForwardBatch] = None,
-        defer_finalize: bool = False,
-    ) -> torch.Tensor:
-        if not isinstance(hidden_states, tuple):
-            return super().forward(hidden_states, forward_batch, defer_finalize)
-
-        hs_bf16, hs_fp8, hs_scale = hidden_states
-        shared = getattr(self, "shared_expert", None)
-        restore = []
-
-        if shared is not None:
-            if not _linear_accepts_fp8_tuple(getattr(shared, "gate_up_proj", None)):
-                return super().forward(hs_bf16, forward_batch, defer_finalize)
-            original = self._forward_shared_experts
-
-            def shared_with_fp8(hidden, apply_gate: bool = True):
-                # Gates stay on bf16; only the FP8 projection sees (fp8, scale).
-                shared_output = self.shared_expert((hs_fp8, hs_scale))
-                if self.shared_expert_gate is not None and apply_gate:
-                    shared_output = (
-                        torch.sigmoid(self.shared_expert_gate(hidden)) * shared_output
-                    )
-                return shared_output
-
-            self._forward_shared_experts = shared_with_fp8
-            restore.append(("_forward_shared_experts", original))
-        elif _routed_experts_accept_pre_quant(self):
-            # The runner declines the hand-off (wrong quant layout, router
-            # weights pre-applied) by ignoring pre_quant_input, so this is safe
-            # to offer unconditionally once the backend is known to read it.
-            experts = self.experts
-            for name in ("forward", "forward_deferred_finalize"):
-                bound = getattr(experts, name, None)
-                if bound is None:
-                    continue
-                restore.append((name, bound, experts))
-                setattr(
-                    experts,
-                    name,
-                    partial(bound, pre_quant_input=(hs_fp8, hs_scale)),
-                )
-        else:
-            return super().forward(hs_bf16, forward_batch, defer_finalize)
-
-        try:
-            return super().forward(hs_bf16, forward_batch, defer_finalize)
-        finally:
-            for entry in restore:
-                if len(entry) == 2:
-                    setattr(self, entry[0], entry[1])
-                else:
-                    setattr(entry[2], entry[0], entry[1])
-
-
-def _routed_experts_accept_pre_quant(mlp) -> bool:
-    """Whether the routed-expert runner can take caller-quantized activations.
-
-    Always False for now. The plumbing works -- FusedMoE.pre_quant_input reaches
-    the runner and the aiter standard pre-permute can forward it -- but aiter's
-    heuristic then selects an asm kernel that this gfx950 build does not carry:
-
-        fmoe_fp8_blockscale_g1u1 failed: get_heuristic_kernel not find kernel
-        gfx950_..._fmoe_bf16_blockscaleBf16_g1u1_vs_pf2_silu_16x128
-
-    aiter's own mori path carries an upscale fallback for exactly this class of
-    gap. Until a build ships that kernel, declining keeps the fp8 unproduced
-    rather than produced and discarded, which measured as a net regression.
-    """
-    return False
-
-
-def _moe_accepts_fp8_tuple(mlp) -> bool:
-    """True when this MLP can consume (bf16, fp8, scale) somewhere downstream.
-
-    Two shapes, depending on shared-expert fusion:
-      * fusion off -- a separate ``shared_expert`` whose FP8 ``gate_up_proj``
-        takes ``(fp8, scale)`` directly;
-      * fusion on  -- no separate shared expert, so the fp8 goes to the routed
-        experts via ``pre_quant_input``.
-    """
-    if not isinstance(mlp, Qwen3NextSparseMoeBlock):
-        return False
-    shared = getattr(mlp, "shared_expert", None)
-    if shared is not None:
-        return _linear_accepts_fp8_tuple(getattr(shared, "gate_up_proj", None))
-    return _routed_experts_accept_pre_quant(mlp)
-
-
-def _ffn_read(mlp, is_layer_sparse: bool):
-    """The FFN stage's read declaration.
-
-    ``declare_ffn`` defaults to ``NORM_READOUT``, and ``NormQuantReadout`` is
-    not a drop-in substitute for it: on an empty batch the former keeps the
-    previous residual while the latter returns ``hidden_states`` as the
-    residual. Install the quantized read only when the fp8 will actually be
-    consumed, so every other backend and model keeps the stock behaviour.
-    """
-    if not (_use_aiter and is_layer_sparse and _moe_accepts_fp8_tuple(mlp)):
-        return NORM_READOUT
-    return NormQuantReadout(fp8_input=Fp8Input.TUPLE_AND_BF16)
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -687,7 +563,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         if self.is_layer_sparse:
-            self.mlp = Qwen3NextSparseMoeBlock(
+            self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -714,8 +590,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         # Declare the fused AR+RMSNorm+per-group-quant read only when the
         # consuming projection can take the (fp8, scale) pair; otherwise the
         # boundary keeps the plain AR+RMSNorm path.
-        # Same gate _ffn_read uses: only the aiter path can serve a
-        # quantized read, so every other backend keeps the plain tensor.
+        # Only the aiter path can serve a quantized read, so every other
+        # backend keeps the plain tensor.
         accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(
             self.linear_attn.in_proj_qkvz
         )
@@ -732,7 +608,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
-                    read=_ffn_read(self.mlp, self.is_layer_sparse),
                 ),
                 self.post_attention_layernorm,
             ),
@@ -860,7 +735,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         is_next_layer_sparse = True
 
         if self.is_layer_sparse:
-            self.mlp = Qwen3NextSparseMoeBlock(
+            self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -891,8 +766,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         # Declare the fused AR+RMSNorm+per-group-quant read only when the
         # consuming projection can take the (fp8, scale) pair; otherwise the
         # boundary keeps the plain AR+RMSNorm path.
-        # Same gate _ffn_read uses: only the aiter path can serve a
-        # quantized read, so every other backend keeps the plain tensor.
+        # Only the aiter path can serve a quantized read, so every other
+        # backend keeps the plain tensor.
         accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
@@ -907,7 +782,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
-                    read=_ffn_read(self.mlp, self.is_layer_sparse),
                 ),
                 self.post_attention_layernorm,
             ),
