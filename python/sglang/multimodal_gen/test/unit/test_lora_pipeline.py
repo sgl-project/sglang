@@ -1,10 +1,13 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from prometheus_client import CollectorRegistry
 
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
@@ -283,6 +286,43 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     assert pipeline.loaded_adapter_alphas["adapter"] == 8
     assert layer.lora_rank == 1
     assert layer.lora_alpha == 8
+
+
+def _rank0_download_fails(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        pipeline = _make_pipeline(_make_layer())
+        pipeline.server_args.lora_path = None
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.maybe_download_lora",
+                side_effect=(
+                    OSError("404 org/typo")
+                    if rank == 0
+                    else AssertionError("rank 1 must not download")
+                ),
+            ),
+            pytest.raises(OSError if rank == 0 else RuntimeError, match="404 org/typo"),
+        ):
+            pipeline.load_lora_adapter("org/typo", "typo", rank=rank)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank0_download_failure_raises_on_every_rank(tmp_path):
+    """A failed rank-0 LoRA download must fail every rank, not hang the others."""
+    mp.spawn(
+        _rank0_download_fails,
+        args=(f"file://{tmp_path / 'rendezvous'}",),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_lora_tree_url_selects_one_pinned_weight(tmp_path):

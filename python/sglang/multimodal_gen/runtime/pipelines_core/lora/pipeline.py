@@ -987,14 +987,28 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Only rank 0 downloads to avoid race conditions where other ranks
         # try to load incomplete downloads
+        download_error = None
         if rank == 0:
-            lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
+            try:
+                lora_local_path = maybe_download_lora(
+                    lora_path, weight_name=weight_name
+                )
+            except Exception as e:
+                download_error = e
         else:
             lora_local_path = None
 
-        # Synchronize all ranks after download completes
+        # Synchronize all ranks after download completes. Share rank 0's
+        # failure so the other ranks raise too instead of waiting forever.
         if dist.is_initialized():
-            dist.barrier()
+            status = [None if download_error is None else repr(download_error)]
+            dist.broadcast_object_list(status, src=0)
+            if rank != 0 and status[0] is not None:
+                raise RuntimeError(
+                    f"Failed to download LoRA {lora_path} on rank 0: {status[0]}"
+                )
+        if download_error is not None:
+            raise download_error
 
         # Non-rank-0 workers now download (will hit cache since rank 0 completed)
         if rank != 0:
