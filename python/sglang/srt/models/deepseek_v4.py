@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
@@ -3887,7 +3888,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
+        dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4035,7 +4036,8 @@ class DeepseekV4Model(nn.Module):
                                 ),
                             )
                         )
-                        dspark_aux_hidden_states.extend(aux)
+                        if capture_dspark:
+                            dspark_aux_hidden_states.extend(aux)
                         residual_batch.clear(forward_batch)
                         bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
                         return residual, pre, tail
@@ -4062,7 +4064,8 @@ class DeepseekV4Model(nn.Module):
                         capture_dspark=capture_dspark,
                         dp_rows=tail_graph_dp_rows,
                     )
-                    dspark_aux_hidden_states.extend(aux)
+                    if capture_dspark:
+                        dspark_aux_hidden_states.extend(aux)
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
@@ -4076,7 +4079,8 @@ class DeepseekV4Model(nn.Module):
                     capture_dspark=capture_dspark,
                     dp_rows=tail_graph_dp_rows,
                 )
-                dspark_aux_hidden_states.extend(aux)
+                if capture_dspark:
+                    dspark_aux_hidden_states.extend(aux)
                 residual_batch.clear(forward_batch)
                 return residual, pre, None
             if late_dp_counts is not None and i == self.late_layer_start:
@@ -4109,7 +4113,7 @@ class DeepseekV4Model(nn.Module):
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(mhc_stream_mean(aux))
+                mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
             ctx = (
                 nullcontext()
@@ -4348,7 +4352,11 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        dspark_aux_hidden_states = (
+            AuxHiddenStatePacker(len(self.dspark_layers_to_capture))
+            if capture_dspark
+            else None
+        )
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4452,7 +4460,9 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(mhc_stream_mean(completed))
+                    mhc_stream_mean(
+                        completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
+                    )
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
@@ -4492,7 +4502,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
 
         return hidden_states, pre_hc_head
 
@@ -4847,7 +4857,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
                 if aux_hidden_states is not None:
-                    aux_hidden_states = [a[:n] for a in aux_hidden_states]
+                    aux_hidden_states = aux_hidden_states[:n]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu

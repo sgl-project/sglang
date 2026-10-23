@@ -2763,14 +2763,23 @@ def mhc_combine(
     return y
 
 
-def mhc_stream_mean(x: torch.Tensor) -> torch.Tensor:
-    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``."""
+def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
+    into ``out`` when given."""
     m, hc, h = x.shape
     # The in-order fp32 sum matches torch's CUDA reduction for 4 streams (the mHC
     # width) over rows of whole 1024-element blocks; it differs for some other widths.
-    if _is_hip or x.device.type != "cuda" or hc != 4 or h % 1024 or x.stride(2) != 1:
-        return x.mean(dim=1)
-    y = torch.empty((m, h), dtype=x.dtype, device=x.device)
+    if (
+        _is_hip
+        or x.device.type != "cuda"
+        or hc != 4
+        or h % 1024
+        or x.stride(2) != 1
+        or (out is not None and out.stride(1) != 1)
+    ):
+        y = x.mean(dim=1)
+        return y if out is None else out.copy_(y)
+    y = torch.empty((m, h), dtype=x.dtype, device=x.device) if out is None else out
     block_h = 1024
     _mhc_stream_mean_kernel[(m, triton.cdiv(h, block_h))](
         x,
