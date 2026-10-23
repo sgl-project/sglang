@@ -872,56 +872,49 @@ class HybridCacheController(BaseHiCacheController):
         write_back_jit: bool = True,
     ) -> list[L2Transfer]:
         anchor = self.mem_pool_host.anchor_entry
+        pools = [(anchor, host_indices, device_indices)] if host_indices.numel() else []
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is None or transfer.device_indices is None:
+                raise ValueError(f"Unresolved L2 transfer for {transfer.name}.")
+            pools.append(
+                (
+                    self.mem_pool_host.entry_map[transfer.name],
+                    transfer.host_indices,
+                    transfer.device_indices,
+                )
+            )
+
+        sharded = isinstance(anchor.host_pool, PageInterleaveHostPoolMixin)
+        local_indices = {}
         transfers = []
-        if host_indices.numel() > 0:
-            transfers.append(
-                L2Transfer(
-                    host_pool=anchor.host_pool,
-                    device_pool=anchor.device_pool,
-                    host_indices=host_indices,
-                    device_indices=device_indices,
-                    layer_mapper=anchor.layer_mapper,
-                )
-            )
-        for pool_transfer in pool_transfers or []:
-            if (
-                pool_transfer.host_indices is None
-                or pool_transfer.device_indices is None
-            ):
-                raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
-            entry = self.mem_pool_host.entry_map[pool_transfer.name]
-            transfers.append(
-                L2Transfer(
-                    host_pool=entry.host_pool,
-                    device_pool=entry.device_pool,
-                    host_indices=pool_transfer.host_indices,
-                    device_indices=pool_transfer.device_indices,
-                    layer_mapper=entry.layer_mapper,
-                )
-            )
-        if isinstance(anchor.host_pool, PageInterleaveHostPoolMixin):
-            local_transfers = []
-            for transfer in transfers:
-                # KV-derived indexer pools use the anchor's ownership even
-                # though their host payload has its own packed byte layout.
-                host, device = anchor.host_pool.owned_rows(
-                    transfer.host_indices, transfer.device_indices
-                )
+        for entry, host, device in pools:
+            if sharded:
+                # KV-derived indexers share the anchor's ownership. Reuse the
+                # gather when pools reference the same logical index tensors.
+                key = (id(host), id(device))
+                if key not in local_indices:
+                    local_indices[key] = anchor.host_pool.owned_rows(host, device)
+                host, device = local_indices[key]
                 if host.numel() == 0:
                     continue
                 host, device = self._move_pool_indices(
-                    transfer.host_pool,
+                    entry.host_pool,
                     host,
                     device,
                     write_back_jit=write_back_jit,
                     logical_indices=False,
                 )
-                local_transfers.append(
-                    transfer._replace(host_indices=host, device_indices=device)
+            transfers.append(
+                L2Transfer(
+                    host_pool=entry.host_pool,
+                    device_pool=entry.device_pool,
+                    host_indices=host,
+                    device_indices=device,
+                    layer_mapper=entry.layer_mapper,
                 )
-            # Empty owners must still submit an empty operation: the L2 engine
-            # publishes the same completion events/ACKs on every rank.
-            return local_transfers
+            )
+        # Empty owners still submit an empty operation, publishing the same
+        # completion events and ACKs as the other ranks.
         return transfers
 
     def _l2_load_transfers(
@@ -930,14 +923,9 @@ class HybridCacheController(BaseHiCacheController):
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        if isinstance(
-            self.mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPoolMixin
-        ):
-            transfers = self._l2_transfers(
-                host_indices, device_indices, pool_transfers, write_back_jit=False
-            )
-        else:
-            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(
+            host_indices, device_indices, pool_transfers, write_back_jit=False
+        )
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }

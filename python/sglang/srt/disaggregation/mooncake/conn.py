@@ -3335,20 +3335,15 @@ class MooncakeKVSender(CommonKVSender):
             # The queued state remains logical and is filtered by the worker.
             # Account only for this sender's pages, including all target/draft
             # indexer buffers represented by the DSA component's item lengths.
-            state_types = getattr(
-                getattr(self.kv_mgr, "kv_args", None), "state_types", []
-            )
-            metric_state_indices = list(metric_state_indices)
-            for i, st in enumerate(state_types):
-                if st == StateType.DSA and i < len(metric_state_indices):
-                    indices = metric_state_indices[i]
-                    if indices is not None:
-                        metric_state_indices[i], _ = filter_kv_indices_for_shard_rank(
-                            kv_indices=np.asarray(indices, dtype=np.int32),
-                            index_slice=slice(0, len(indices)),
-                            shard_rank=self.kv_mgr.kv_shard_rank,
-                            shard_size=self.kv_mgr.kv_shard_size,
-                        )
+            metric_state_indices = list(state_indices)
+            for i, (st, indices) in enumerate(
+                zip(self.kv_mgr.kv_args.state_types, state_indices)
+            ):
+                if st == StateType.DSA and indices is not None:
+                    pages = np.asarray(indices, dtype=np.int32)
+                    metric_state_indices[i] = pages[
+                        pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
+                    ]
         super()._record_transfer_indices(kv_indices, metric_state_indices)
 
 

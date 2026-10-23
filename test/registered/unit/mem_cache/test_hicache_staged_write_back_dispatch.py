@@ -228,8 +228,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mem_pool_device_allocator = mock.Mock()
-        controller._l2_transfers.side_effect = lambda *args: (
-            HybridCacheController._l2_transfers(controller, *args)
+        controller._l2_transfers.side_effect = lambda *args, **kwargs: (
+            HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
