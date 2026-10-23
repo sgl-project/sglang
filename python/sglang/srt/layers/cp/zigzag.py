@@ -38,6 +38,10 @@ from typing import Any, List, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    paused_background_transfers,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -315,7 +319,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        gathered = self._all_gather_reorganized(x, forward_batch)
+        # Hidden-state gathers (Qwen4-Exp's GDN entry, PLE and exit gathers)
+        # yield NVLink to a background transfer in flight (the KV-shard prefix
+        # gather); the chunk-KV gathers below do not: they precede the read of
+        # the slot being gathered.
+        gathered = self._all_gather_reorganized(
+            x, forward_batch, pause_background_transfers=True
+        )
         chunks = torch.split(
             gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
         )
@@ -457,7 +467,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             latent_full[..., kv_lora_rank:],
         )
 
-    def _all_gather_reorganized(self, x: torch.Tensor, forward_batch):
+    def _all_gather_reorganized(
+        self, x: torch.Tensor, forward_batch, pause_background_transfers: bool = False
+    ):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         max_len = max(per_rank_token)
@@ -485,7 +497,15 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 device=x.device,
                 dtype=x.dtype,
             )
-        group.all_gather_into_tensor(gathered, x)
+        # Only the collective is paused: an allocation inside the pause could
+        # free cached blocks, and cudaFree's device sync would wait on the
+        # paused transfer before this stream issues the resume.
+        with (
+            paused_background_transfers(Link.NVLINK)
+            if pause_background_transfers
+            else nullcontext()
+        ):
+            group.all_gather_into_tensor(gathered, x)
 
         chunks = torch.split(gathered, [max_len] * self.cp_size, dim=0)
         return torch.cat(

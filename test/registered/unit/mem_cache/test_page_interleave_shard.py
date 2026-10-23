@@ -37,16 +37,28 @@ allocation hangs on:
    tokens, each token stored on exactly one rank.
 
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
-on 2 ranks (``TestPageInterleaveGatherMultiGpu``), and byte-exact DSA indexer
+on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
+symmetric window, its zero-kernel launch, its release, and the cross-node
+fallback (``TestPageInterleaveZeroSmGatherMultiGpu``), the window allocation
+on NCCL without the multicast-pointer API
+(``TestSymmetricBufferWithoutMultimemApi``), the gated multicast and unicast
+push gathers (``TestPageInterleaveSymmetricGatherMultiGpu``), the
+all-reduce brackets that pause them (``TestAllReduceLeafBrackets``,
+``TestAllReduceUnderInFlightTransferMultiGpu``), and byte-exact DSA indexer
 keys, scales, and latent KV on 2 and 4 ranks (``TestPageInterleaveIndexer``),
 including dequantized MLA reads from packed FP8 scratch.
 GPU tests skip when too few CUDA devices are visible, so the same file runs
 in both CPU and CUDA CI suites.
 """
 
+import ctypes
+import gc
+import math
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from array import array
@@ -64,6 +76,16 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators import gated_transfer
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    TransferGate,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    allocate_symmetric_buffer,
+)
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -95,6 +117,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _symmetric_scratch_layout,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -102,6 +125,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import (
@@ -251,12 +275,81 @@ class TestPageShardScratchSizing(CustomTestCase):
                     if use_mla
                     else PageInterleaveMHATokenToKVPool
                 )
-                tensors = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
+                specs = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
                 actual = 2 * sum(
-                    tensor.numel() * tensor.element_size()
-                    for tensor in tensors.values()
+                    math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
                 self.assertEqual(estimated, actual)
+                # The zero-SM buffer adds at most one window alignment per tensor.
+                _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
+                self.assertGreaterEqual(symmetric_bytes, estimated)
+                self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
+
+
+class TestZeroSmScratchLayout(CustomTestCase):
+    def test_slot_tensors_are_window_aligned_and_disjoint(self):
+        """Both slots share one symmetric window: every tensor must start on
+        NCCL's 4 KiB window alignment and no two tensors may overlap."""
+        rows = 13 * 16  # neither row width below fills a whole 4 KiB block
+        specs = {
+            "kv": ((rows, 1, 576), torch.bfloat16),
+            "index_k": ((rows // 16, 16 * 132), torch.uint8),
+        }
+        offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=2)
+        spans = sorted(
+            (slot[name], slot[name] + math.prod(shape) * dtype.itemsize)
+            for slot in offsets
+            for name, (shape, dtype) in specs.items()
+        )
+        self.assertEqual(len(spans), 4)
+        self.assertTrue(all(start % 4096 == 0 for start, _ in spans))
+        for (_, end), (next_start, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(end, next_start)
+        self.assertLessEqual(spans[-1][1], nbytes)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferWithoutMultimemApi(CustomTestCase):
+    def test_older_nccl_skips_the_multicast_team_build(self):
+        """NCCL before 2.29.2 registers windows but does not export
+        ncclGetLsaMultimemDevicePointer; it builds the multicast team during
+        registration instead. The allocation helper must not call it."""
+        lib = NCCLLibrary()
+        self.assertEqual(
+            lib.has_function("ncclGetLsaMultimemDevicePointer"),
+            lib.ncclGetRawVersion() >= 22902,
+        )
+        self.assertFalse(lib.has_function("ncclNoSuchSymbol"))
+
+        def unbound(window, offset):
+            raise AssertionError("ncclGetLsaMultimemDevicePointer is not exported")
+
+        released = []
+
+        def free(ptr):
+            released.append(("free", ptr))
+            torch.cuda.caching_allocator_delete(ptr)
+
+        comm = SimpleNamespace(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
+                ncclMemFree=free,
+                has_function=lambda name: name != "ncclGetLsaMultimemDevicePointer",
+                ncclGetLsaMultimemDevicePointer=unbound,
+            ),
+            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
+            deregister_comm_window=lambda window: released.append(
+                ("deregister", window.value)
+            ),
+        )
+        buf, registered = allocate_symmetric_buffer(comm, 8192)
+        self.assertTrue(registered)
+        self.assertEqual(int(buf.count_nonzero()), 0)
+        ptr = buf.data_ptr()
+        del buf
+        gc.collect()
+        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1704,6 +1797,7 @@ def _run_mla(rank, world, port):
     torch.distributed.barrier()
     if rank == 0:
         print("PASS: MLA page-interleave shard (attn-TP axis)")
+    return pool, req_to_token, prefix_len, seq_len
 
 
 def _run_mha(rank, world, port):
@@ -1806,6 +1900,7 @@ def _run_mha(rank, world, port):
     torch.distributed.barrier()
     if rank == 0:
         print("PASS: MHA page-interleave shard (attn-CP axis)")
+    return pool, req_to_token, prefix_len, seq_len
 
 
 @unittest.skipIf(
@@ -1823,6 +1918,421 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+
+def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
+    """Names of the GPU kernels and copies one sharded batch's gathers issue."""
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        pool.begin_shard_extend(
+            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
+        )
+        for layer_id in range(_GATHER_LAYER_NUM):
+            pool.get_key_buffer(layer_id)
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
+def _run_zero_sm_mla(rank, world, port):
+    pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
+    assert pool._use_symmetric_scratch and pool._scratch_window_registered
+
+    # NCCL picks copy engines per collective, so a windowed gather can still
+    # land on ring or symmetric SM kernels; only the launched work tells.
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"gather ran on NCCL SM kernels: {nccl_kernels}"
+    assert any("PtoP" in name for name in activity), "no peer copy-engine copy"
+
+    scratch_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for slot in pool._slots
+        for tensor in slot.tensors.values()
+    )
+    view = pool._slots[1].tensors["kv"]
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    free_with_pool = torch.cuda.mem_get_info()[0]
+    del pool
+    gc.collect()
+    torch.distributed.barrier()
+    free_with_view = torch.cuda.mem_get_info()[0]
+    # A peer's window maps this buffer until that peer deregisters too.
+    del view
+    gc.collect()
+    torch.distributed.barrier()
+    free_released = torch.cuda.mem_get_info()[0]
+    assert free_with_view - free_with_pool < scratch_bytes, "freed under a live view"
+    assert free_released - free_with_view >= scratch_bytes, "window buffer leaked"
+
+
+def _run_cross_node_mla(rank, world, port):
+    with unittest.mock.patch(
+        "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+        lambda pg, source_rank: [r == source_rank for r in range(world)],
+    ):
+        pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
+    assert not pool._use_symmetric_scratch and not pool._scratch_window_registered
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert any("nccl" in name.lower() for name in activity)
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
+)
+class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
+    def test_copy_engine_window_gather_and_release(self):
+        """The zero-SM pool registers its scratch as a symmetric window, still
+        assembles the canonical prefix, and frees the window buffer only once
+        the pool and every scratch view are gone."""
+        # The library the pool gates on, which may differ from torch's NCCL.
+        if NCCLLibrary().ncclGetRawVersion() < 22902:
+            self.skipTest("the symmetric gather scratch needs NCCL >= 2.29.2")
+        # Clear the global override before spawning: only the dedicated
+        # gather communicator requests ZERO. cuMem enables window registration.
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+        ):
+            mp.spawn(
+                _run_zero_sm_mla,
+                args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+    def test_cross_node_group_keeps_sm_gather(self):
+        """A shard group spanning nodes keeps the torch scratch and the SM
+        allgather, even with cuMem on."""
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+        ):
+            mp.spawn(
+                _run_cross_node_mla,
+                args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+
+class _InFlightGate(TransferGate):
+    """An NVLink gate with chunks in flight that records its pauses."""
+
+    def __init__(self):
+        self.link, self.device_index = Link.NVLINK, 0
+        self._lock = threading.Lock()
+        self._maybe_pending, self._runs = True, 0
+        self._pause_depth, self._pause_stream, self._pause_thread = 0, None, None
+        self.calls = []
+
+    def has_pending(self):
+        return True
+
+    def pause(self, stream):
+        self.calls.append("pause")
+
+    def resume(self, stream):
+        self.calls.append("resume")
+
+
+class TestAllReduceLeafBrackets(CustomTestCase):
+    """The large all-reduces of a sharded prefill pause an in-flight
+    background transfer around the communication call only."""
+
+    def setUp(self):
+        self.gate = _InFlightGate()
+        for owner, attr, value in (
+            (gated_transfer, "_gates", [self.gate]),
+            (torch.cuda, "current_stream", lambda device=None: "stream"),
+            (torch.cuda, "is_current_stream_capturing", lambda: False),
+        ):
+            patcher = unittest.mock.patch.object(owner, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _comm(self):
+        gate = self.gate
+
+        class Comm:
+            disabled = False
+            seen = []
+
+            def all_reduce(self, tensor):
+                self.seen.append(list(gate.calls))
+
+            def outplace_all_reduce(self, tensor, out):
+                self.seen.append(list(gate.calls))
+                return out
+
+            @contextmanager
+            def change_state(self, enable=None):
+                yield
+
+        return Comm()
+
+    def test_in_place_all_reduce_pauses_around_the_call(self):
+        comm = self._comm()
+        group = SimpleNamespace(pynccl_comm=comm, torch_symm_mem_comm=None)
+        GroupCoordinator._all_reduce_in_place(group, torch.ones(4))
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_pynccl_out_of_place_allocates_before_the_pause(self):
+        comm = self._comm()
+        group = SimpleNamespace(
+            pynccl_comm=comm,
+            ca_comm=None,
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        allocated_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            allocated_paused.append(self.gate._pause_depth)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            out = GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "pynccl")
+        self.assertEqual(out.shape, (4,))
+        self.assertEqual(allocated_paused, [0])
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_custom_all_reduce_reserves_its_output_before_the_pause(self):
+        """Custom all-reduce allocates its output inside the call; a block of
+        that size is cached before the pause so that allocation cannot reach
+        cudaMalloc / cudaFree inside the bracket."""
+        gate = self.gate
+        seen = []
+
+        class CustomAllReduce:
+            disabled = False
+
+            def custom_all_reduce(self, tensor):
+                seen.append(list(gate.calls))
+                return tensor.clone()
+
+        group = SimpleNamespace(
+            pynccl_comm=None,
+            ca_comm=CustomAllReduce(),
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        reserved_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            reserved_paused.append(gate._pause_depth)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [0])
+        self.assertEqual(seen, [["pause"]])
+        self.assertEqual(gate.calls, ["pause", "resume"])
+
+        # Nothing in flight: no reservation, no pause.
+        gate._maybe_pending = False
+        gate.calls.clear()
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [0])
+        self.assertEqual(gate.calls, [])
+
+
+def _run_all_reduce_under_in_flight_transfer(rank, world, port):
+    """A real TP all-reduce (through GroupCoordinator, with whatever path it
+    picks) pauses and resumes an NVLink gate whose chain is in flight."""
+    from sglang.srt.distributed.device_communicators.gated_transfer import (
+        CU_STREAM_WAIT_VALUE_EQ,
+        CudaDriver,
+        TransferChain,
+        copy_tensor_chunks,
+        get_transfer_gate,
+    )
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    _dist_init(rank, world, port, attn_cp_size=1)
+    group = get_tp_group()
+    x = torch.full((4 << 20,), float(rank + 1), device="cuda")
+    expected = torch.full_like(x, float(sum(range(1, world + 1))))
+    torch.testing.assert_close(group.all_reduce(x.clone()), expected)  # warm up
+    gate = get_transfer_gate(Link.NVLINK)
+    chain = TransferChain(rank, gate)
+    # In flight: the first chunk waits for a host-released word, not the gate.
+    blocker = torch.zeros(1, dtype=torch.int32).pin_memory()
+    src = torch.ones(2 << 20, dtype=torch.uint8, device="cuda")
+    dst = torch.zeros_like(src)
+    ops = copy_tensor_chunks(dst, src, 1 << 20)
+    first = ops[0]
+
+    def held(stream):
+        drv = CudaDriver.get()
+        drv.check(
+            drv.wait32(
+                stream.cuda_stream, blocker.data_ptr(), 1, CU_STREAM_WAIT_VALUE_EQ
+            ),
+            "blocker",
+        )
+        first(stream)
+
+    ops[0] = held
+    done = torch.cuda.Event()
+    torch.cuda.synchronize()
+    chain.run(ops, torch.cuda.current_stream(), done=done)
+    pauses = gate._seq
+    y = group.all_reduce(x.clone())
+    assert gate._seq == pauses + 1, f"[rank {rank}] the all-reduce did not pause"
+    assert gate._pause_depth == 0 and gate._pause_thread is None
+    blocker[0] = 1  # host only: nothing waits on the GPU before the release
+    deadline = time.monotonic() + 30
+    while not done.query():
+        assert time.monotonic() < deadline, f"[rank {rank}] transfer hung"
+        time.sleep(0.005)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, expected)
+    assert torch.equal(dst, src) and gate.word() == 0
+    # Opened by the bracket's stream-ordered resume, not a watchdog rescue.
+    assert gate.forced_opens == 0, f"[rank {rank}] the watchdog opened the gate"
+    # Drained: the next all-reduce pauses nothing.
+    group.all_reduce(x.clone())
+    assert gate._seq == pauses + 1
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+
+@unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 CUDA devices")
+class TestAllReduceUnderInFlightTransferMultiGpu(CustomTestCase):
+    def test_all_reduce_pauses_an_in_flight_transfer(self):
+        mp.spawn(
+            _run_all_reduce_under_in_flight_transfer,
+            args=(_GATHER_WORLD, 29815),
+            nprocs=_GATHER_WORLD,
+            join=True,
+        )
+
+
+def _run_symmetric_mha(rank, world, port, mode, paused, expect_push, skipped):
+    # _run_mha checks the gathered prefix whichever transport runs it.
+    pool, req_to_token, prefix_len, seq_len = _run_mha(rank, world, port)
+    if not expect_push:
+        # The window cannot reach every rank this way: the pool falls back
+        # to the ungated NCCL allgather.
+        assert pool._sym_gather is None, f"[rank {rank}] {mode} did not fall back"
+        assert pool._gather_chain.gate is None
+        assert "NCCL allgather" in pool._gather_transport_name()
+        torch.distributed.barrier()
+        return
+    if pool._sym_gather is None:
+        if rank == 0:
+            skipped.put(f"no {mode} push on this host (NVLS or LSA reach)")
+        torch.distributed.barrier()
+        return
+    assert pool._sym_gather.chain is pool._gather_chain
+    gate = pool._gather_chain.gate
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"{mode} gather launched NCCL kernels: {nccl_kernels}"
+    if not paused:
+        assert gate is None, f"[rank {rank}] the {mode} gather is gated"
+        torch.distributed.barrier()
+        return
+    # Drained: the forward's brackets no longer pause anything.
+    assert gate is not None and not gate.has_pending()
+
+    # A gather enqueued while one rank is paused completes on no rank until
+    # that rank resumes: every rank's read waits for it. The pause is flipped
+    # from the host: GPU work queued behind a parked gate can share its
+    # hardware queue.
+    cpu_group = get_parallel().attn_cp_group.cpu_group
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    prefix_rows = pool.translate_loc_to_scratch(req_to_token[0, :prefix_len].long())
+    expected = pool.get_key_buffer(pool.start_layer)[prefix_rows].clone()
+    slot = pool._slots[pool.start_layer % 2]
+    slot.tensors["k"].zero_()
+    # Drain the next layer's prefetch first: a paused gather would hang a
+    # device-wide sync.
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=cpu_group)
+    if rank == 0:
+        gate._word.value = 3
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    if rank == 0:
+        # Held by its own pause. A peer's chunks drain; its read then waits
+        # for this rank's copies, which no pause on the peer can help.
+        assert gate.has_pending()
+    got = pool.get_key_buffer(pool.start_layer)[prefix_rows]
+    read = torch.cuda.Event()
+    read.record()
+    time.sleep(0.2)
+    stalled = not read.query()
+    # Host-only barrier: a device-wide sync here would wait on rank 0's gather.
+    torch.distributed.barrier(group=cpu_group)
+    if rank == 0:
+        gate.force_open()
+    read.synchronize()
+    assert stalled, f"[rank {rank}] {mode} read finished while rank 0 was paused"
+    _check(rank, f"{mode} k after resume", got, expected)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
+)
+class TestPageInterleaveSymmetricGatherMultiGpu(CustomTestCase):
+    def _spawn(self, mode, port, *, paused=True, nvls=None, expect_push=True):
+        """The push transport assembles the same K/V prefix without NCCL
+        kernels; paused, a paused rank holds every rank's read until resumed.
+        A window that cannot reach every rank falls back to the NCCL gather."""
+        # The library the pool gates on, which may differ from torch's NCCL.
+        if NCCLLibrary().ncclGetRawVersion() < 22902:
+            self.skipTest("the symmetric gather scratch needs NCCL >= 2.29.2")
+        # The window needs cuMem, the multicast VA NVLS; the ranks inherit
+        # both. Unicast runs with NVLS off, as the engine sets it.
+        if nvls is None:
+            nvls = mode == "multicast"
+        skipped = mp.get_context("spawn").SimpleQueue()
+        with (
+            temp_set_env(
+                NCCL_CUMEM_ENABLE="1",
+                NCCL_NVLS_ENABLE=str(int(nvls)),
+                NCCL_CTA_POLICY=None,
+            ),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.override(mode),
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(paused),
+        ):
+            mp.spawn(
+                _run_symmetric_mha,
+                args=(_GATHER_WORLD, port, mode, paused, expect_push, skipped),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+        if not skipped.empty():
+            self.skipTest(skipped.get())
+
+    def test_pausable_multicast_gather(self):
+        self._spawn("multicast", 29813)
+
+    def test_pausable_unicast_gather(self):
+        self._spawn("unicast", 29814)
+
+    def test_ungated_unicast_gather(self):
+        self._spawn("unicast", 29816, paused=False)
+
+    def test_multicast_without_nvls_falls_back(self):
+        self._spawn("multicast", 29817, nvls=False, expect_push=False)
 
 
 # =============================================================================

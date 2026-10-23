@@ -46,6 +46,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    background_transfers_pending,
+    paused_background_transfers,
+)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -248,6 +253,18 @@ def reg_all_to_all_single(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._all_to_all_single(output, input)
+
+
+def _paused_allocating_all_reduce(input_: torch.Tensor):
+    """Bracket an out-of-place all-reduce whose communicator allocates its
+    output inside the call. A block of that size is allocated and freed on
+    the current stream first, so the call's own allocation is served from the
+    caching allocator and cannot reach cudaMalloc / cudaFree, whose device
+    sync would wait on the paused background transfer."""
+    if not background_transfers_pending(Link.NVLINK):
+        return nullcontext()
+    torch.empty_like(input_)
+    return paused_background_transfers(Link.NVLINK)
 
 
 class GroupCoordinator:
@@ -782,7 +799,8 @@ class GroupCoordinator:
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
-                self.pynccl_comm.all_reduce(input_)
+                with paused_background_transfers(Link.NVLINK):
+                    self.pynccl_comm.all_reduce(input_)
                 return input_
 
         if self._can_use_flashinfer_allreduce(input_):
@@ -1052,37 +1070,49 @@ class GroupCoordinator:
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
-            out = ca_comm.custom_all_reduce(input_)
+            with _paused_allocating_all_reduce(input_):
+                out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
-            out = qr_comm.quick_all_reduce(input_)
+            with _paused_allocating_all_reduce(input_):
+                out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
-            out = torch_symm_mem_comm.all_reduce(input_)
+            with _paused_allocating_all_reduce(input_):
+                out = torch_symm_mem_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
-            out = pymscclpp_comm.all_reduce(input_)
+            with _paused_allocating_all_reduce(input_):
+                out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
+            # Allocate before the bracket: an allocation inside it can reach
+            # a device sync that waits on the paused background transfer.
+            out = torch.empty_like(input_)
             with pynccl_comm.change_state(enable=True):
-                out = pynccl_comm.outplace_all_reduce(input_)
+                with paused_background_transfers(Link.NVLINK):
+                    pynccl_comm.outplace_all_reduce(input_, out)
         assert out is not None
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_reduce(input_)
-        elif (
-            torch_symm_mem_comm is not None
-            and not torch_symm_mem_comm.disabled
-            and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
-        ):
-            torch_symm_mem_comm.all_reduce(input_, out=input_)
-        else:
-            torch.distributed.all_reduce(input_, group=self.device_group)
+        # The all-reduces of a sharded prefill (the MoE output sums) yield
+        # NVLink to a background transfer in flight (the KV-shard prefix
+        # gather); so do the out-of-place paths above and flashinfer's launch.
+        with paused_background_transfers(Link.NVLINK):
+            if pynccl_comm is not None and not pynccl_comm.disabled:
+                pynccl_comm.all_reduce(input_)
+            elif (
+                torch_symm_mem_comm is not None
+                and not torch_symm_mem_comm.disabled
+                and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+            ):
+                torch_symm_mem_comm.all_reduce(input_, out=input_)
+            else:
+                torch.distributed.all_reduce(input_, group=self.device_group)
 
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1

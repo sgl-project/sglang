@@ -950,6 +950,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, register the prefix gather scratch of single-node shard groups as an NCCL symmetric window so NCCL 2.29.2+ runs the all-gather on copy engines (zero SMs). On single-node deployments this also makes the server set <code>NCCL_CUMEM_ENABLE=1</code> for every NCCL communicator unless it is already set, except under <code>--enable-memory-saver</code> or <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code>; see <code>--enable-kv-cache-sharding</code> for the full conditions. Set to <code>false</code> to keep the SM-kernel all-gather and the default <code>NCCL_CUMEM_ENABLE=0</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_SHARD_GATHER_TRANSPORT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Transport of the KV-shard prefix gather on the symmetric scratch: <code>nccl</code> (the NCCL all-gather), <code>multicast</code> (each rank pushes its block with copy-engine copies through the window's NVLS multicast address; the server then sets <code>NCCL_NVLS_ENABLE=1</code> for every NCCL communicator unless it is already set) or <code>unicast</code> (copy-engine pushes into every peer's window; no NVLS needed). A push transport that cannot reach every rank falls back to <code>nccl</code> with a warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>nccl</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KV_SHARD_GATHER_CHUNK_MB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Chunk size of the <code>multicast</code> / <code>unicast</code> prefix gather. Smaller chunks let a pause land sooner; larger chunks cost less per byte. <code>0</code> sends each block in one copy (and disables the pause).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With the <code>multicast</code> / <code>unicast</code> prefix gather, run its chunks behind the NVLink transfer gate so the forward's all-reduces and all-gathers pause it at the next chunk boundary. Opt-in: a parked chunk stalls every stream that shares its CUDA hardware queue (raise <code>CUDA_DEVICE_MAX_CONNECTIONS</code>, which the server keeps when above 8); a pause stuck behind one is broken only by <code>SGLANG_GATED_TRANSFER_WATCHDOG_MS</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GATED_TRANSFER_WATCHDOG_MS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Gated background transfers: force open a transfer gate whose pause has been held this many milliseconds, and log an error. A pause that never resumes means work the resume depends on is stuck behind a parked chunk (a hardware queue shared with it, a lazy module load or a device sync inside a pause); the transfer then overlaps the foreground op instead of hanging it. <code>0</code> disables the watchdog.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1000</code></td>
