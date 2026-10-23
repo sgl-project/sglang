@@ -1364,10 +1364,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert page_size * num_groups * bytes_per_token_to_send == src_kv_item_len
         assert page_size * bytes_per_token_dst == dst_kv_item_len
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
-            self.get_mha_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
-            )
+        (
+            src_k_ptrs,
+            src_v_ptrs,
+            dst_k_ptrs,
+            dst_v_ptrs,
+            layers_pp,
+        ) = self.get_mha_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
         )
         src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
         dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
@@ -1994,8 +1998,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(room, None)
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
+                    self._purge_room_state(
+                        room, terminal_status=self.request_status.get(room)
+                    )
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
                         # Snapshot first: the scheduler thread adds concurrently.
@@ -2276,10 +2281,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if not is_elided_entry(item_lens[i], dst_item_lens, j)
                 ]
             else:
-                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(
-                        src_data_ptrs, dst_data_ptrs, state_type
-                    )
+                (
+                    src_kv_ptrs,
+                    dst_kv_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs, dst_data_ptrs, state_type
                 )
                 mapped_dst_lens = None
                 if dst_item_lens is not None:
@@ -2298,9 +2305,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
+            (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
 
             layers_params = [
                 (
@@ -2569,9 +2580,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
-        src_handle, num_groups, num_ptr_pairs, num_slots_src = (
-            self.prep_handle_slice_src
-        )
+        (
+            src_handle,
+            num_groups,
+            num_ptr_pairs,
+            num_slots_src,
+        ) = self.prep_handle_slice_src
         dst_handle, num_slots_dst, head_group_idx = self.prep_handles_slice_dst[
             peer_name
         ]
@@ -3648,6 +3662,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         self._handle_deferred_abort_ack(notification)
+        if self._staging_outstanding.get(room_to_be_aborted, 0) <= 0:
+            self._purge_room_state(room_to_be_aborted, terminal_status=KVPoll.Failed)
         return True
 
     def _handle_deferred_abort_ack(self, notification: AbortNotification) -> None:
@@ -3670,6 +3686,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                self.sweep_stale_rooms()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
@@ -3703,8 +3720,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
+                if not self.is_room_scheduled(room):
+                    logger.warning(
+                        f"Rejecting un-scheduled bootstrap room {room} to prevent memory leak / DoS"
+                    )
+                    continue
+                if (
+                    room not in self.transfer_infos
+                    and len(self.transfer_infos) >= self.max_pending_rooms
+                ):
+                    logger.warning(
+                        f"Rejecting bootstrap room {room}: max pending rooms limit ({self.max_pending_rooms}) reached"
+                    )
+                    continue
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
+                    self.record_room_active(room)
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
@@ -3769,9 +3800,12 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return
 
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
-        )
+        (
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            should_skip,
+        ) = self._prepare_send_indices(kv_indices, state_indices)
         if should_skip:
             return
 

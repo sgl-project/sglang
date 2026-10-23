@@ -770,6 +770,8 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    SGLANG_DISAGGREGATION_ROOM_TTL = EnvFloat(15.0)
+    SGLANG_DISAGGREGATION_MAX_PENDING_ROOMS = EnvInt(4096)
 
     # ===================================================================
     # Distributed and model-parallel runtime

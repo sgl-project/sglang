@@ -871,6 +871,24 @@ class MoriKVManager(CommonKVManager):
                         current,
                     )
                     return
+                if not self.is_room_scheduled(transfer_info.room):
+                    logger.warning(
+                        "Rejecting un-scheduled bootstrap room %s to prevent memory leak / DoS",
+                        transfer_info.room,
+                    )
+                    return
+                if (
+                    transfer_info.room not in self.transfer_infos
+                    and len(self.transfer_infos) >= self.max_pending_rooms
+                ):
+                    logger.warning(
+                        "Rejecting bootstrap room %s: max pending rooms limit (%s) reached",
+                        transfer_info.room,
+                        self.max_pending_rooms,
+                    )
+                    return
+                if transfer_info.room not in self.transfer_infos:
+                    self.record_room_active(transfer_info.room)
                 infos = self.transfer_infos.setdefault(transfer_info.room, {})
                 infos[transfer_info.engine_key] = transfer_info
 
@@ -935,6 +953,7 @@ class MoriKVManager(CommonKVManager):
 
         if room_active:
             logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
+            self._purge_room_state(bootstrap_room, terminal_status=KVPoll.Failed)
         else:
             logger.debug(
                 "ABORT for room %s is already complete or not tracked",
@@ -968,6 +987,7 @@ class MoriKVManager(CommonKVManager):
         def bootstrap_worker():
             while not self._stopped:
                 try:
+                    self.sweep_stale_rooms()
                     msg = recv()
                     if msg is None:
                         continue
@@ -2080,9 +2100,12 @@ class MoriKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
-        )
+        (
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            should_skip,
+        ) = self._prepare_send_indices(kv_indices, state_indices)
         if should_skip:
             return
 
