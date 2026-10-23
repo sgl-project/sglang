@@ -91,7 +91,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
 )
 from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
@@ -889,7 +889,8 @@ class DeepseekV4HipRadixBackend(
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
-    low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
+    # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
+    low_ratio_prefill_graph = False
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
@@ -1074,9 +1075,9 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        self.opus_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.opus_prefill_workspace = SparsePrefillKVBuffer(self.device)
         self.opus_compressed_workspaces = {
-            ratio: SparsePrefillWorkspace(self.device) for ratio in (1, 2)
+            ratio: SparsePrefillKVBuffer(self.device) for ratio in (1, 2)
         }
         # Reset with the metadata: its inputs belong to one prefill forward.
         self._opus_prefill_state: Optional[_OpusPrefillState] = None
@@ -3491,11 +3492,6 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
-                raise NotImplementedError(
-                    "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
-                    "oracle) is not supported on HIP"
-                )
             # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
             assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
