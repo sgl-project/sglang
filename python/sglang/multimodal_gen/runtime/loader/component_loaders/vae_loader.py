@@ -152,6 +152,14 @@ def _should_use_channels_last_3d(
     if server_args is None:
         return False
 
+    if (
+        current_platform.is_rocm()
+        and not current_platform.get_gcn_arch_name().startswith("gfx9")
+    ):
+        # MIOpen has no fast channels_last_3d Conv3d kernels outside CDNA: on
+        # RDNA3 (gfx1100) one Wan decoder conv takes ~50 s instead of ~12 ms.
+        return False
+
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
