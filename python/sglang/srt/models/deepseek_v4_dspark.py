@@ -851,9 +851,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
+        self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
+
+    def project_commit_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> List[torch.Tensor]:
+        """The context rows' per-stage KV, before norm / rope / store; reads no KV
+        location, so it can run before the accept decides what is committed."""
         main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -863,6 +870,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def store_commit_kv(
+        self,
+        *,
+        kvs: List[torch.Tensor],
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
