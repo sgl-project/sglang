@@ -1000,7 +1000,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     ),
                     key=lambda source: source["dp_rank"],
                 )
-            # Same reason: each PP stage reports only its own L3 pools.
+            # Each PP stage reports only its own L3 pools; give every info the merged layout.
             merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
