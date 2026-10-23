@@ -31,6 +31,7 @@ class TestIQuestQ1ReasoningParser(CustomTestCase):
                 serving = OpenAIServingChat.__new__(OpenAIServingChat)
                 serving.reasoning_parser = "iquest_q1"
                 serving.chat_encoding_spec = None
+                serving._encoding_adapter = None
                 serving.template_manager = SimpleNamespace(reasoning_config=None)
                 serving._reasoning_detector = ReasoningParser("iquest_q1").detector
                 self.assertEqual(
@@ -41,6 +42,7 @@ class TestIQuestQ1ReasoningParser(CustomTestCase):
     def test_request_thinking_toggle_controls_reasoning(self):
         serving = OpenAIServingChat.__new__(OpenAIServingChat)
         serving.reasoning_parser = "iquest_q1"
+        serving._encoding_adapter = None
         request = ChatCompletionRequest(
             model="iquest-q1",
             messages=[{"role": "user", "content": "hi"}],
