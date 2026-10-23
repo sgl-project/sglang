@@ -3892,6 +3892,7 @@ class NixlKVReceiver(CommonKVReceiver):
 
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
+        self._staging_total_pages = len(kv_indices) if kv_indices is not None else 0
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
