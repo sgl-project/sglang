@@ -1,17 +1,32 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IpcA2AState,
     _peer_cuda_device,
     _Unsupported,
     ipc_a2a_ready,
+    ipc_shareable_zeros,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IpcA2AMultiState,
+    _PipelinePool,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _IPC = "sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a"
+_MULTI = f"{_IPC}_multi"
+
+# ipc_a2a_ready() only sets up the transport on CUDA. Elsewhere the platform may
+# lack is_full_nvlink and torch may lack the accelerator allocator-settings API.
+requires_cuda = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the IPC all-to-all transport is CUDA-only"
+)
 
 
+@requires_cuda
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("nvlink", [False, True])
 def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlink):
@@ -137,3 +152,63 @@ def test_drop_a2a_staging_buffers_clears_the_ulysses_cache():
         usp.drop_a2a_staging_buffers()
         usp.drop_a2a_staging_buffers()  # idempotent on an empty cache
     assert usp._A2A_STAGING_BUFFERS == {}
+
+
+@requires_cuda
+@pytest.mark.parametrize("expandable", [False, True])
+def test_ipc_buffers_are_allocated_outside_expandable_segments(expandable):
+    settings = "expandable_segments:True" if expandable else ""
+    calls = []
+    with (
+        patch(
+            f"{_IPC}.torch._C._accelerator_getAllocatorSettings",
+            return_value=settings,
+        ),
+        patch(
+            f"{_IPC}.torch._C._accelerator_setAllocatorSettings",
+            side_effect=lambda conf: calls.append(conf),
+        ),
+        patch(f"{_IPC}.torch.zeros", side_effect=lambda *a, **k: calls.append("alloc")),
+    ):
+        ipc_shareable_zeros(2, 8, dtype=None)
+    expected = ["expandable_segments:False", "alloc", "expandable_segments:True"]
+    assert calls == (expected if expandable else ["alloc"])
+
+
+def test_multi_rank_transport_exports_only_ipc_shareable_buffers():
+    # under expandable segments a plain allocation exports a handle whose import
+    # needs pidfd_getfd, so one such buffer sends the whole group to NCCL
+    state = IpcA2AMultiState()
+    shareable, exported = [], []
+
+    def shareable_zeros(*shape, dtype):
+        shareable.append(MagicMock())
+        return shareable[-1]
+
+    def share(t, group):
+        exported.append(t)
+        return [t, t]
+
+    agreed = MagicMock()
+    agreed.item.return_value = 1
+    with (
+        patch(f"{_MULTI}.ipc_shareable_zeros", side_effect=shareable_zeros),
+        patch(f"{_MULTI}.torch.zeros"),
+        patch(f"{_MULTI}.torch.tensor", return_value=agreed),
+        patch(f"{_MULTI}.torch.cuda.current_device", return_value=0),
+        patch(f"{_MULTI}.torch.cuda.can_device_access_peer", return_value=True),
+        patch(f"{_MULTI}.torch.cuda.is_current_stream_capturing", return_value=False),
+        patch(f"{_MULTI}.dist.get_rank", return_value=0),
+        patch(f"{_MULTI}.dist.get_world_size", return_value=2),
+        patch(f"{_MULTI}.dist.all_reduce"),
+        patch(f"{_MULTI}._member_devices", return_value=[0, 1]),
+        patch(f"{_MULTI}._StreamMemOps"),
+        patch(f"{_MULTI}.load_ipc_a2a_sync"),
+        patch("ctypes.CDLL"),
+        patch.object(state, "_share", side_effect=share),
+    ):
+        state.init(object())
+        state.get_staging(8, torch.bfloat16)
+        _PipelinePool(state, torch.bfloat16, 8, 8, 2)
+    # flags, timeout flag, staging, pipeline receive/output boxes and counters
+    assert [any(t is s for s in shareable) for t in exported] == [True] * 7

@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from PIL import Image
+from pydantic import Json
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -97,6 +98,22 @@ def _fallback_image_urls(
     return [
         f"/v1/images/{request_id}/content?variant={idx}" for idx in range(num_outputs)
     ]
+
+
+_SUPPORTED_RESPONSE_FORMATS = ("url", "b64_json")
+
+
+def _raise_if_url_response_undeliverable(resp_format: str, is_persistent: bool) -> None:
+    """Reject unusable response formats before generating."""
+    if resp_format not in _SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400, detail=f"response_format={resp_format} is not supported"
+        )
+    if resp_format == "url" and not is_persistent and not cloud_storage.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='url' requires cloud storage to be configured.",
+        )
 
 
 def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
@@ -207,6 +224,10 @@ def _build_image_response_kwargs(
             )
 
         if len(data) != len(save_file_path_list):
+            if cloud_storage.is_enabled():
+                raise HTTPException(
+                    status_code=502, detail="Cloud storage upload failed."
+                )
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
@@ -248,6 +269,14 @@ def _get_response_resize(
     return f"{width}x{height}"
 
 
+def _build_request_sampling_params(request_id: str, **kwargs):
+    # Request validation errors are client errors, as in the video API.
+    try:
+        return build_sampling_params(request_id, **kwargs)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -260,13 +289,22 @@ async def generations(
     output_format = _resolve_image_output_format(
         request.output_format, sampling_params_cls
     )
+    response_format = request.response_format
+    if "response_format" not in request.model_fields_set:
+        response_format = (
+            sampling_params_cls.default_image_response_format() or response_format
+        )
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     ext = choose_output_image_ext(output_format, request.background)
     prompt = await maybe_enhance_prompt(
         raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
     )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=request.task_type,
@@ -302,6 +340,9 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
+            profile=request.profile,
+            num_profiled_timesteps=request.num_profiled_timesteps,
+            profile_all_stages=request.profile_all_stages,
             progressive_mode=request_field_value(request, "progressive_mode"),
             progressive_levels=request_field_value(request, "progressive_levels"),
             progressive_delta=request_field_value(request, "progressive_delta"),
@@ -322,12 +363,6 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        response_format = request.response_format
-        if "response_format" not in request.model_fields_set:
-            response_format = (
-                sampling_params_cls.default_image_response_format() or response_format
-            )
-        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (
@@ -406,16 +441,25 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_cache_dit: Optional[bool] = Form(None),
+    cache_dit_params: Optional[Json[dict]] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
     perf_dump_path: Optional[str] = Form(None),
+    profile: Optional[bool] = Form(False),
+    num_profiled_timesteps: Optional[int] = Form(None),
+    profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -459,7 +503,7 @@ async def edits(
             task="image_edit",
             image_paths=input_paths,
         )
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=task_type,
@@ -476,6 +520,8 @@ async def edits(
             true_cfg_scale=true_cfg_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
             num_frames=num_frames,
             quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
@@ -484,6 +530,9 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             perf_dump_path=perf_dump_path,
+            profile=profile,
+            num_profiled_timesteps=num_profiled_timesteps,
+            profile_all_stages=profile_all_stages,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -496,7 +545,6 @@ async def edits(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (

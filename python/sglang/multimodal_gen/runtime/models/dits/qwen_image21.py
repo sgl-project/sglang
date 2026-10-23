@@ -25,6 +25,9 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -42,6 +45,11 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+    ConvRotInt8ComfyKitchenLinearMethod,
+    comfy_kitchen_swiglu_mlp,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -52,6 +60,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 
 _is_cuda = current_platform.is_cuda()
 
@@ -218,6 +229,31 @@ def project_into(layer, x, out):
     return out
 
 
+class PrefixPad:
+    """Rows BCG left-padded onto every cached prefix K/V, read on the host once per forward or graph replay."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.token = self.value = None
+
+    def get(self):
+        token = get_current_replay_token()
+        if self.value is None or token != self.token:
+            self.value, self.token = int(self.rows.item()), token
+        return self.value
+
+
+@eager_on_graph
+def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
+    # a graph break: the pad varies per request, and skipping it hands the
+    # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
+    # impl like USPAttention does without SP, since its forward is a break too
+    rows = prefix_pad.get()
+    return attn.attn_impl.forward(
+        q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
+    )
+
+
 def cat_outputs(outputs, dim=0):
     # torch.cat on a one-element list degrades to a full copy of the tensor.
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=dim)
@@ -286,6 +322,22 @@ class QwenImage21TimeEmbedding(nn.Module):
         )
 
 
+def _stacked_rows(a, b):
+    """[a; b] as one view when ``b`` directly follows ``a`` in the same storage, else None."""
+    # Layerwise offload leaves a flat placeholder in place of each weight.
+    if not (
+        a.dim() == 2
+        and a.is_cuda
+        and a.shape == b.shape
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+        and b.storage_offset() == a.storage_offset() + a.numel()
+    ):
+        return None
+    return a.as_strided((2 * a.shape[0], a.shape[1]), (a.shape[1], 1))
+
+
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
@@ -311,7 +363,72 @@ class QwenImage21FeedForward(nn.Module):
             prefix=f"{prefix}.out",
         )
 
+    def pack_gate_up_weights(self):
+        """Share one [2F, C] INT8 weight and [2F, 1] scale storage between gate_layer
+        and proj so the comfy_kitchen path projects both with one GEMM.
+
+        As with ``pack_qkv_weights``, parameters keep their names and shapes and
+        no reference to the shared storage is kept. Layers that are not plain
+        comfy_kitchen INT8 projections are left alone.
+        """
+        gate, up = self.gate_layer, self.proj
+        if self.packed_gate_up() is not None:
+            return
+        if not (
+            all(
+                type(layer) is ColumnParallelLinear
+                and isinstance(layer.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
+                and layer.weight.is_cuda
+                and layer.weight.dtype is torch.int8
+                and layer.weight.dim() == 2
+                for layer in (gate, up)
+            )
+            and gate.weight.shape == up.weight.shape
+            and gate.quant_method.group_size == up.quant_method.group_size
+        ):
+            return
+        rows = gate.weight.shape[0]
+        weight = torch.cat([gate.weight.data, up.weight.data], dim=0)
+        scale = torch.cat([gate.weight_scale.data, up.weight_scale.data], dim=0)
+        gate.weight.data, up.weight.data = weight[:rows], weight[rows:]
+        gate.weight_scale.data, up.weight_scale.data = scale[:rows], scale[rows:]
+
+    def packed_gate_up(self):
+        """The stacked [gate; up] weight and scale views when the comfy_kitchen
+        fused MLP can run, else None."""
+        gate, up, out = self.gate_layer, self.proj, self.out
+        # LoRA wrappers replace the layers; TP > 1 would need the down all-reduce.
+        if not (
+            type(gate) is ColumnParallelLinear
+            and type(up) is ColumnParallelLinear
+            and type(out) is RowParallelLinear
+            and out.tp_size == 1
+            and isinstance(gate.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
+            and isinstance(out.quant_method, ConvRotInt8ComfyKitchenLinearMethod)
+            and out.weight.dtype is torch.int8
+        ):
+            return None
+        weight = _stacked_rows(gate.weight, up.weight)
+        scale = _stacked_rows(gate.weight_scale, up.weight_scale)
+        if weight is None or scale is None:
+            return None
+        return weight, scale
+
+    def _apply(self, fn, recurse=True):
+        # .to() and CPU offload rebuild every parameter in its own storage;
+        # re-share them once the weights are back on the GPU.
+        module = super()._apply(fn, recurse)
+        self.pack_gate_up_weights()
+        return module
+
     def forward(self, x):
+        # Storage-identity checks cannot be traced; a compiled graph keeps the
+        # separate projections.
+        packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
+        if packed is not None:
+            return comfy_kitchen_swiglu_mlp(
+                x, *packed, self.gate_layer.quant_method.group_size, self.out
+            )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if (
@@ -388,6 +505,7 @@ class QwenImage21Attention(nn.Module):
             and not layer.gather_output
             and layer.weight.is_cuda
             and layer.weight.dtype is torch.bfloat16
+            and layer.weight.dim() == 2
             and layer.weight.is_contiguous()
             and layer.weight.shape == self.to_q.weight.shape
             for layer in layers
@@ -412,6 +530,9 @@ class QwenImage21Attention(nn.Module):
         ):
             return None
         q, k, v = self.to_q.weight, self.to_k.weight, self.to_v.weight
+        # Layerwise offload leaves a flat placeholder in place of each weight.
+        if q.dim() != 2:
+            return None
         rows, cols = q.shape
         if not (
             q.is_cuda
@@ -520,6 +641,10 @@ class QwenImage21Attention(nn.Module):
         the fused norm + RoPE kernel and SDPA both accept that layout. The first
         call compares every slice against the module forwards.
         """
+        # Storage-identity checks and the one-shot verification cannot be traced;
+        # a compiled graph keeps the plain projections instead of breaking here.
+        if torch.compiler.is_compiling():
+            return None
         layers = (self.to_q, self.to_k, self.to_v)
         packed = self.packed_qkv_weight()
         if not (
@@ -586,6 +711,11 @@ class QwenImage21Attention(nn.Module):
                 return reference[0], reference[1], None, None
         return k, v, k_out, v_out
 
+    def attend_target(self, q, k, v, prefix_pad):
+        if prefix_pad is None:
+            return self.target_attn(q, k, v)
+        return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
+
     def attend_sample(
         self,
         q,
@@ -593,20 +723,20 @@ class QwenImage21Attention(nn.Module):
         v,
         rope,
         prefix,
-        prefix_rope,
-        segments,
+        layout,
         cache,
         k_out=None,
         v_out=None,
+        prefix_pad=None,
     ):
         if cache:
             kp, vp = cache["key"], cache["value"]
             prefix_output = None
         else:
-            qp, kp, vp = self.qkv(prefix, prefix_rope)
+            qp, kp, vp = self.qkv(prefix, layout["prefix_rope"])
             outputs = []
             # text runs are causal; image blocks see the entire preceding sequence and themselves
-            for start, end, is_image in segments:
+            for start, end, is_image in layout["segments"]:
                 mask = None
                 if not is_image:
                     mask = (
@@ -625,7 +755,7 @@ class QwenImage21Attention(nn.Module):
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:
-                return self.target_attn(*cuda_packed), prefix_output
+                return self.attend_target(*cuda_packed, prefix_pad), prefix_output
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
@@ -651,13 +781,20 @@ class QwenImage21Attention(nn.Module):
                     logger=logger,
                 )
         if packed is not None:
-            out = self.target_attn(q, *packed)
+            out = self.attend_target(q, *packed, prefix_pad)
         else:
             k = apply_qk_norm_rope(k, self.norm_k, rope)
-            out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
+            if prefix_pad is None:
+                out = self.target_attn.forward_with_replicated_kv_prefix(
+                    q, kp, vp, k, v
+                )
+            else:
+                out = self.attend_target(
+                    q, torch.cat([kp, k], 1), torch.cat([vp, v], 1), prefix_pad
+                )
         return out, prefix_output
 
-    def forward(self, x, ropes, prefixes, layouts, caches):
+    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
         if packed is not None:
@@ -678,11 +815,11 @@ class QwenImage21Attention(nn.Module):
                 v[sample : sample + 1],
                 ropes[sample],
                 prefixes[sample],
-                layout["prefix_rope"],
-                layout["segments"],
+                layout,
                 caches[sample],
                 k_out=k_out,
                 v_out=v_out,
+                prefix_pad=prefix_pad,
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
@@ -713,6 +850,7 @@ class QwenImage21TransformerBlock(nn.Module):
         layouts,
         ropes,
         caches,
+        prefix_pad,
     ):
         # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
         # Slice here so prefix KV stays per-layer after that wrap.
@@ -732,6 +870,7 @@ class QwenImage21TransformerBlock(nn.Module):
             prefixes,
             layouts,
             caches,
+            prefix_pad,
         )
         hidden_states = residual_gate_add(hidden_states, attention, gate1)
         hidden_states = residual_gate_add(
@@ -863,6 +1002,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         super().post_load_weights()
         for block in self.transformer_blocks:
             block.attn.pack_qkv_weights()
+            block.img_mlp.pack_gate_up_weights()
 
     def prepare_lora_adapter(self, adapter):
         return _split_fused_gate_up_lora(
@@ -883,10 +1023,20 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         layouts,
         condition_latents=None,
         prefix_caches=None,
+        prefix_kv=None,
+        prefix_pad=None,
         **kwargs,
     ):
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+        if prefix_kv is not None:
+            # BCG stacks every layer's padded prefix K/V so a replay copies one input
+            prefix_caches = [
+                [
+                    {"key": key, "value": value}
+                    for key, value in prefix_kv.unflatten(0, (-1, 2))
+                ]
+            ]
         sp = get_sp_world_size()
         target_len = hidden_states.shape[1]
         if target_len % sp:
@@ -922,6 +1072,8 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                     )
             prefix_states.append({"hidden_states": prefix})
             ropes.append(layout["target_rope"][start:end])
+        if prefix_pad is not None:
+            prefix_pad = PrefixPad(prefix_pad)
         # Same extras for every block so Cache-DiT's UnifiedBlocks wrap is valid.
         # Each block slices prefix_caches by _layer_id. Visit once per layer for
         # layerwise offload.
@@ -934,6 +1086,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 layouts,
                 ropes,
                 prefix_caches,
+                prefix_pad,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:

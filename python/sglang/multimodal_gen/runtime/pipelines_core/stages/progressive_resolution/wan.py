@@ -47,11 +47,14 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
     - Initial noise must carry the temporal dimension T_lat.
     """
 
-    def __init__(self, transformer, scheduler, pipeline=None, vae=None) -> None:
+    def __init__(
+        self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
+    ) -> None:
         super().__init__(
             transformer,
             scheduler,
             pipeline=pipeline,
+            transformer_2=transformer_2,
             vae=vae,
             spectrum_A=WAN_SPECTRUM_A,
             spectrum_beta=WAN_SPECTRUM_BETA,

@@ -78,7 +78,7 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native"],
+            choices=["triton", "csgmv", "ascend", "torch_native", "triton_v2"],
         ),
     ] = "csgmv"
     max_lora_chunk_size: A[
