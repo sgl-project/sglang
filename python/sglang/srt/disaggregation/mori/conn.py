@@ -599,12 +599,17 @@ class MoriKVManager(CommonKVManager):
 
         room = kv_chunk.room
         targets = None
+        abort_targets = None
         with self._abort_ack_lock:
             self._staging_outstanding[room] -= 1
             if self._staging_outstanding[room] <= 0:
                 self._staging_outstanding.pop(room)
-                if room not in self._deferred_ack_poisoned_rooms:
+                if room in self._deferred_ack_poisoned_rooms:
+                    self._abort_notify_targets.pop(room, None)
+                else:
                     targets = self._deferred_ack_targets.pop(room, None)
+                    abort_targets = self._abort_notify_targets.pop(room, None)
+        self._send_abort_failure(room, abort_targets)
         self._send_abort_acks(room, targets)
 
     def _poison_failed_transfer(
@@ -2151,6 +2156,13 @@ class MoriKVSender(CommonKVSender):
                 super().clear()
         else:
             super().clear()
+
+    def abort(self):
+        if self.kv_mgr.enable_deferred_decode_kv_release:
+            with self.kv_mgr._abort_ack_lock:
+                super().abort()
+        else:
+            super().abort()
 
     def failure_exception(self):
         if self.conclude_state is None:
