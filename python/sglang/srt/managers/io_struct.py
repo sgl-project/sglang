@@ -337,7 +337,7 @@ class GenerateReqInput:
     return_prompt_token_ids: bool = False
 
     # Propagates trace context via Engine.generate/async_generate
-    external_trace_header: Optional[Dict[str, Any]] = None
+    external_trace_header: Optional[Dict[str, str]] = None
     received_time: Optional[float] = None
 
     # For EPD-disaggregated inference
@@ -1164,9 +1164,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
-    # See GenerateReqInput.kv_hints. A defaulted tail field: the Rust server
-    # stops emitting at disagg_prefill_dp_rank, so this slot decodes as None
-    # from its shorter arrays.
+    # See GenerateReqInput.kv_hints.
     kv_hints: Optional[KvHintsEnvelope] = None
 
     # Internal PP control bit, set by PP0 before forwarding the request.
@@ -1177,6 +1175,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # W3C trace context from the Rust server, which sends no time_stats; the
+    # scheduler parents this request's spans on it when time_stats is None.
+    external_trace_header: Optional[Dict[str, str]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

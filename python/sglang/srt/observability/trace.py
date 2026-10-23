@@ -75,6 +75,12 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
+# Needs opentelemetry imported, which get_global_tracing_enabled() implies.
+def has_valid_span_context(trace_headers: Mapping[str, str]) -> bool:
+    ctx = _trace_context_propagator.extract(trace_headers)
+    return trace.get_current_span(ctx).get_span_context().is_valid
+
+
 def get_global_trace_level() -> int:
 
     resources = get_resources()
@@ -322,6 +328,9 @@ def trace_set_thread_info(
 
 
 class TraceReqContext:
+    # Set by adopt_external_root; a class default, as copies skip __init__.
+    adopted_external_root: bool = False
+
     def __init__(
         self,
         rid,
@@ -412,6 +421,12 @@ class TraceReqContext:
                 "thread_label": thread_info.thread_label,
             }
         )
+        # An adopted root is the caller's span, so no other span carries the ids.
+        if self.adopted_external_root:
+            request_attrs = {"rid": self.rid}
+            if self.bootstrap_room is not None:
+                request_attrs["bootstrap_room"] = hex(self.bootstrap_room)
+            thread_context.thread_span.set_attributes(request_attrs)
 
         return thread_context
 
@@ -510,6 +525,7 @@ class TraceReqContext:
         copied.trace_level = self.trace_level
         copied.module_name = self.module_name
         copied.is_copy = True  # Mark as copy
+        copied.adopted_external_root = self.adopted_external_root
         copied.pid = None
 
         # thread_context is None, will be rebuilt via rebuild_thread_context()
@@ -542,6 +558,18 @@ class TraceReqContext:
         ts = ts or get_cur_time_ns()
         self.pid = pid if pid is not None else threading.get_native_id()
         self.thread_context = self.__create_thread_context(ts)
+
+    def adopt_external_root(self):
+        """Parent this context's spans on external_trace_header directly, as a
+        deserialized copy parents on the root span context it was sent."""
+        if not self.tracing_enable:
+            return
+
+        self.is_copy = True
+        self.adopted_external_root = True
+        self.root_span_context = _trace_context_propagator.extract(
+            self.external_trace_header or {}
+        )
 
     def trace_req_start(
         self,

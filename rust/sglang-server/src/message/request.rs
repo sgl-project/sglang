@@ -1,8 +1,8 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::LazyLock;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use itertools::izip;
@@ -107,6 +107,7 @@ pub fn into_requests(
         extra_key,
         cache_salt,
         session_params,
+        external_trace_header,
     } = req;
     if session_params.is_some() {
         return Err(Error::Validation(
@@ -360,6 +361,12 @@ pub fn into_requests(
     if let Some(value) = &routing_key {
         check_broadcast_budget(value.len(), n, "routing_key")?;
     }
+    let external_trace_header = trace_context(external_trace_header);
+    if let Some(context) = &external_trace_header {
+        // Shared in memory, but every item's scheduler header encodes its own copy.
+        let per_item = context.iter().map(|(k, v)| k.len() + v.len()).sum();
+        check_broadcast_budget(per_item, n, "external_trace_header")?;
+    }
     let lora_ids = flatten_column(fan_out(lora_path, n, "lora_path")?)
         .into_iter()
         .map(|name| resolve_lora_id(name, policy))
@@ -458,6 +465,7 @@ pub fn into_requests(
                 priority,
                 require_reasoning: require_reasoning.unwrap_or(false),
                 kv_hints,
+                external_trace_header: external_trace_header.clone(),
                 mm: pack_mm(image_data, video_data, audio_data),
                 mm_buffers: Vec::new(),
             }
@@ -633,6 +641,10 @@ pub struct GenerateRequest {
     pub priority: Option<i64>,
     pub require_reasoning: bool,
     pub kv_hints: Option<KvHintsEnvelope>,
+    /// The caller's W3C trace context, one map shared by every item of a call.
+    /// The scheduler parents its request spans on it: this server sends no
+    /// `time_stats`, which carry the context on the Python frontend's path.
+    pub external_trace_header: Option<Arc<BTreeMap<String, String>>>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
@@ -847,6 +859,17 @@ fn resolve_lora_id(
             ))
         }),
     }
+}
+
+/// Keep only the keys Python's propagator reads (`TRACE_HEADERS` in
+/// `observability/trace.py`); a context without a `traceparent` is none.
+fn trace_context(mut header: HashMap<String, String>) -> Option<Arc<BTreeMap<String, String>>> {
+    let traceparent = header.remove("traceparent").filter(|v| !v.is_empty())?;
+    let mut context = BTreeMap::from([("traceparent".to_owned(), traceparent)]);
+    if let Some(tracestate) = header.remove("tracestate").filter(|v| !v.is_empty()) {
+        context.insert("tracestate".to_owned(), tracestate);
+    }
+    Some(Arc::new(context))
 }
 
 /// Per-prompt `kv_hints`, following Python `_normalize_kv_hints`: one envelope
@@ -1159,6 +1182,41 @@ mod tests {
         let body = format!(r#"{{"text": "hi", {field}}}"#);
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("not supported"), "{field}: {err}");
+    }
+
+    /// Python hands one `external_trace_header` to every batch item and its
+    /// propagator reads only `traceparent`/`tracestate`; a context without a
+    /// `traceparent` has no span to parent on, so none is forwarded.
+    #[test]
+    fn trace_context_is_filtered_and_shared_by_every_item() {
+        const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let body = serde_json::json!({
+            "text": ["a", "b"],
+            "external_trace_header": {
+                "traceparent": TRACEPARENT,
+                "tracestate": "v=1",
+                "x-request-id": "req-1",
+            },
+        });
+        let (ps, _) = requests(&body.to_string()).unwrap();
+        let first = ps[0].external_trace_header.as_ref().expect("trace context");
+        let second = ps[1].external_trace_header.as_ref().expect("trace context");
+        assert!(Arc::ptr_eq(first, second), "one context for every item");
+        assert_eq!(
+            first
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            [("traceparent", TRACEPARENT), ("tracestate", "v=1")]
+        );
+
+        for body in [
+            r#"{"text": "a", "external_trace_header": {"tracestate": "v=1"}}"#,
+            r#"{"text": "a", "external_trace_header": {"traceparent": ""}}"#,
+        ] {
+            let (ps, _) = requests(body).unwrap();
+            assert!(ps[0].external_trace_header.is_none(), "{body}");
+        }
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

@@ -130,6 +130,26 @@
       "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"
     },
     {
+      "type": "GenerateRequest",
+      "name": "trace context map passes through as a string map",
+      "input": {
+        "text": "hi",
+        "external_trace_header": {
+          "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        }
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"external_trace_header\":{\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\"}}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "null trace context map is omitted",
+      "input": {
+        "text": "hi",
+        "external_trace_header": null
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false}"
+    },
+    {
       "type": "SamplingParams",
       "name": "empty object: every schema default is emitted",
       "input": {},

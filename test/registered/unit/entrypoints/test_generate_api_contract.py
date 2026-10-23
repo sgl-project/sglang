@@ -5,6 +5,7 @@ where the route applies it."""
 import unittest
 from types import SimpleNamespace
 
+import pydantic
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
@@ -97,6 +98,22 @@ class TestGenerateContract(CustomTestCase):
         error = generate_contract_error({"text": "hi", "sampling_params": bad})
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
+
+    def test_external_trace_header_is_a_string_map(self):
+        """The schema types the W3C carrier `map<string, string>`. The gate and
+        GenerateReqInput, which FastAPI parses the body into first, both refuse
+        a value that is not one."""
+        model = pydantic.TypeAdapter(GenerateReqInput)
+        traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        body = {"text": "hi", "external_trace_header": {"traceparent": traceparent}}
+        self.assertIsNone(generate_contract_error(body))
+        model.validate_python(body)
+        for bad in ({"tracestate": None}, {"traceparent": 1}, ["traceparent"]):
+            body = {"text": "hi", "external_trace_header": bad}
+            with self.subTest(external_trace_header=bad):
+                self.assertIsNotNone(generate_contract_error(body))
+                with self.assertRaises(pydantic.ValidationError):
+                    model.validate_python(body)
 
 
 class TestGenerateRouteGate(CustomTestCase):

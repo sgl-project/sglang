@@ -267,6 +267,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     kv_hints: Optional[KvHintsEnvelopeOrList] = None
     routing_key: Optional[str] = None
     max_thinking_tokens: Optional[int] = None
+    external_trace_header: Dict[str, str] = {}
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -1428,6 +1429,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "max_thinking_tokens":
             kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "external_trace_header":
+            kw["external_trace_header"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
     return GenerateRequest(**kw)
 
 
@@ -1495,6 +1498,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["routing_key"] = v.routing_key
     if v.max_thinking_tokens is not None:
         d["max_thinking_tokens"] = v.max_thinking_tokens
+    if v.external_trace_header:
+        d["external_trace_header"] = dict(v.external_trace_header)
     return d
 
 

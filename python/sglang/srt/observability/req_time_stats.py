@@ -36,6 +36,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     TraceSliceContext,
     get_global_tracing_enabled,
+    has_valid_span_context,
 )
 from sglang.srt.observability.trace_async import (
     TraceReqContextAsync,
@@ -377,6 +378,30 @@ class ReqTimeStatsBase:
 
     def decode_json(self, state: Dict[str, Any]):
         self.__setstate__(state)
+
+
+def time_stats_from_external_trace_header(
+    *,
+    rid: str,
+    bootstrap_room: Optional[int],
+    disagg_mode: DisaggregationMode,
+    external_trace_header: Optional[Dict[str, str]],
+) -> Optional[ReqTimeStatsBase]:
+    """The scheduler-side seed for a request whose frontend sent a W3C trace
+    context but no time_stats (the Rust server). The caller's span stands in
+    for the frontend's root span, so no SGLang root span is created."""
+    if not external_trace_header or not get_global_tracing_enabled():
+        return None
+    # Without a valid parent, each rank would start its own unrelated trace.
+    if not has_valid_span_context(external_trace_header):
+        return None
+
+    stats = ReqTimeStatsBase(disagg_mode=disagg_mode)
+    stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
+    if not stats.trace_ctx.tracing_enable:
+        return None
+    stats.trace_ctx.adopt_external_root()
+    return stats
 
 
 @dataclass
