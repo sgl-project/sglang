@@ -28,6 +28,7 @@ def mhc_mega_boundary(
     sinkhorn_iters,
     y_fp8=None,
     y_gemm_sf=None,
+    mega_moe_input=None,
 ):
     """Update the residual, collapse with carried pre, and compute next stats.
 
@@ -44,6 +45,15 @@ def mhc_mega_boundary(
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)
+    quant_outputs = dict(y_fp8=y_fp8, y_gemm_sf=y_gemm_sf)
+    if mega_moe_input is not None:
+        buf = mega_moe_input.buffer
+        quant_outputs = dict(
+            y_fp8=buf.x[:rows],
+            y_routed_sf=buf.x_sf[:rows],
+            y_shared_sf=buf.shared_l1_acts_sf[:rows],
+            shared_sf_block_m=mega_moe_input.shared_block_m,
+        )
     deep_gemm.mega_mhc(
         x=x,
         residual=residual,
@@ -67,7 +77,6 @@ def mhc_mega_boundary(
         new_post_mix=next_post,
         new_comb_res_mix=next_comb,
         y_bf16=normalized,
-        y_fp8=y_fp8,
-        y_gemm_sf=y_gemm_sf,
+        **quant_outputs,
     )
     return updated, normalized, (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
