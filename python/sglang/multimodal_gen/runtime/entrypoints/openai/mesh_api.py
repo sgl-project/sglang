@@ -103,9 +103,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         save_file_path = save_file_path_list[0]
 
-        file_size = None
-        if os.path.exists(save_file_path):
-            file_size = os.path.getsize(save_file_path)
+        file_size = os.path.getsize(save_file_path)
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
@@ -124,7 +122,14 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     except Exception as e:
         logger.exception("Mesh job %s failed", job_id)
         await MESH_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "file_path": None,
+                "url": None,
+                "file_size_bytes": None,
+            },
         )
 
 
@@ -218,14 +223,13 @@ async def create_mesh(
         )
 
     sampling_params = _build_sampling_params_from_request(request_id, req, input_path)
-    job = _mesh_job_from_sampling(request_id, req, sampling_params)
-    await MESH_STORE.upsert(request_id, job)
-
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
     )
 
+    job = _mesh_job_from_sampling(request_id, req, sampling_params)
+    await MESH_STORE.upsert(request_id, job)
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return MeshResponse(**job)
 
@@ -265,6 +269,10 @@ async def download_mesh_content(
     job = await MESH_STORE.get(mesh_id)
     if not job:
         raise HTTPException(status_code=404, detail="Mesh not found")
+
+    # an exporter may create its final path before generation finishes
+    if job["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Mesh output is not available")
 
     if job.get("url"):
         raise HTTPException(
