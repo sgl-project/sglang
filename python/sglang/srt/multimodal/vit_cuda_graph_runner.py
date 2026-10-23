@@ -53,6 +53,11 @@ class ViTCudaGraphRunner:
         self.block_ws: Dict[Hashable, torch.Tensor] = {}
         self.block_graphs: Dict[Hashable, torch.cuda.CUDAGraph] = {}
         self.block_output: Dict[Hashable, torch.Tensor] = {}
+        # One memory pool for all captured graphs: a private pool per graph grows
+        # reserved memory with every new image layout. Sharing relies on replays
+        # being serialized on one stream and on replay() returning a copy of the
+        # output, since the next replay of any graph can reuse that memory.
+        self._graph_pool = None
 
         # captured seqlens buffers (addresses must be stable for cuda-graph replay)
         self.cu_full_len: Dict[Hashable, torch.Tensor] = {}
@@ -229,11 +234,15 @@ class ViTCudaGraphRunner:
                 )
         torch.cuda.synchronize()
 
+        if self._graph_pool is None:
+            self._graph_pool = torch.cuda.graph_pool_handle()
         # Captured lazily while the LLM serves; other threads (e.g. the c10d NCCL
         # watchdog) keep calling the runtime, which global mode turns into an error.
         with (
             self._capture_context(),
-            torch.cuda.graph(graph, capture_error_mode="thread_local"),
+            torch.cuda.graph(
+                graph, pool=self._graph_pool, capture_error_mode="thread_local"
+            ),
         ):
             y = None
             deepstack_outs: List[torch.Tensor] = []
