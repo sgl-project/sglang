@@ -65,6 +65,28 @@ class ImageBlock(BaseModel):
     source: Optional[Union[dict[str, Any], str]] = None
 
 
+class VideoSource(BaseModel):
+    """SGLang extension for inline MP4 input; not an Anthropic API type."""
+
+    type: Literal["base64"]
+    media_type: Literal["video/mp4"]
+    data: str = Field(min_length=1)
+
+    @field_validator("data")
+    @classmethod
+    def _validate_data(cls, value):
+        if not value.strip():
+            raise ValueError("Video source data must not be empty")
+        return value
+
+
+class VideoBlock(BaseModel):
+    """SGLang extension accepted only in a user message's top-level content."""
+
+    type: Literal["video"] = "video"
+    source: VideoSource
+
+
 class ToolUseBlock(BaseModel):
     type: Literal["tool_use"] = "tool_use"
     id: str
@@ -114,6 +136,7 @@ AnthropicContentBlock = Annotated[
     Union[
         TextBlock,
         ImageBlock,
+        VideoBlock,
         ToolUseBlock,
         ToolResultBlock,
         ToolReferenceBlock,
@@ -125,9 +148,36 @@ AnthropicContentBlock = Annotated[
 ]
 
 
+def _contains_video_block(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict):
+            block_type, nested_content = block.get("type"), block.get("content")
+        else:
+            block_type = getattr(block, "type", None)
+            nested_content = getattr(block, "content", None)
+        if block_type == "video" or _contains_video_block(nested_content):
+            return True
+    return False
+
+
 class AnthropicMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: Union[str, list[AnthropicContentBlock]]
+
+    @model_validator(mode="after")
+    def _validate_video_location(self):
+        if isinstance(self.content, list):
+            for block in self.content:
+                if (block.type == "video" and self.role != "user") or (
+                    _contains_video_block(getattr(block, "content", None))
+                ):
+                    raise ValueError(
+                        "Video input is supported only in top-level user content; "
+                        "system, assistant and nested tool_result video are not supported"
+                    )
+        return self
 
 
 # ---------- Tools (discriminated by ``type`` family) ----------
@@ -352,6 +402,16 @@ class AnthropicCountTokensRequest(BaseModel):
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
+    @model_validator(mode="after")
+    def _reject_video_count(self):
+        # This endpoint counts the text template without running the video
+        # processor, so accepting video would return an understated count.
+        if _contains_video_block(self.system) or any(
+            _contains_video_block(message.content) for message in self.messages
+        ):
+            raise ValueError("count_tokens does not support video input")
+        return self
+
 
 class AnthropicCountTokensResponse(BaseModel):
     """Anthropic count_tokens API response."""
@@ -379,6 +439,13 @@ class AnthropicMessagesRequest(PDRoutingFields):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+
+    @field_validator("system")
+    @classmethod
+    def _reject_system_video(cls, value):
+        if _contains_video_block(value):
+            raise ValueError("Video input is supported only in top-level user content")
+        return value
 
     @field_validator("model")
     @classmethod
