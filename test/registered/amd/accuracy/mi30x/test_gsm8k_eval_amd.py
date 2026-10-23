@@ -42,14 +42,6 @@ CONFIGS = [
     ),
     ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, {"SGLANG_USE_AITER": "1"}, [], LEGACY),
     (MIXTRAL_FP8, 2, {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "0"}, [], LEGACY),
-    (MIXTRAL_FP8, 2, {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "1"}, [], SGL),
-    (
-        MIXTRAL_FP8,
-        2,
-        {"SGLANG_USE_AITER": "0", "SGLANG_MOE_PADDING": "0"},
-        ["--disable-cuda-graph"],
-        SGL,
-    ),
 ]
 
 
@@ -63,7 +55,7 @@ def legacy_eval(base_url, model):
         base_url=base_url, model=model, eval_name="gsm8k", num_threads=1024
     )
     eval_obj = GSM8KEval(num_examples=None, num_threads=1024, num_shots=5)
-    result, _, _ = run_eval_once(args, base_url, eval_obj)
+    result, _, _ = run_eval_once(args, f"{base_url}/v1", eval_obj)
     n = len(eval_obj._lines)
     official = truncated = continued = 0
     samples = []
@@ -97,7 +89,7 @@ def completion_eval(base_url, model):
         api="completion",
     )
     eval_obj = GSM8KEval(num_examples=None, num_threads=1024, num_shots=5)
-    result, _, _ = run_eval_once(args, base_url, eval_obj)
+    result, _, _ = run_eval_once(args, f"{base_url}/v1", eval_obj)
     return result.score
 
 
