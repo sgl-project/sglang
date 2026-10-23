@@ -2500,8 +2500,6 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
-    "MiniMaxM3VLForConditionalGeneration",
-    "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
     "Cohere2VisionForConditionalGeneration",
     "Glm5NextForConditionalGeneration",

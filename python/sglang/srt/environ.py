@@ -2214,9 +2214,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
-    "SGLANG_OPT_FUSE_TP_ALLREDUCE_RESIDUAL_NORM": _DeprecatedEnv(
-        note="The MiniMax-M3 CustomAllReduceV2 boundary fusion is always on where it applies."
-    ),
     "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
         note="DSpark draft sampling always uses Gumbel-max."
     ),
