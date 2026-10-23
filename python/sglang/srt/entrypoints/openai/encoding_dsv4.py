@@ -267,6 +267,7 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
     reasoning_effort_profile: str = "preview",
+    last_user_idx: Optional[int] = None,
 ) -> str:
     """
     Render a single message at the given index into its encoded string form.
@@ -279,6 +280,10 @@ def render_message(
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
+        last_user_idx: ``find_last_user_index(messages)``, if the caller already
+            has it. Rendering a conversation calls this once per message, and
+            the scan walks back over every trailing tool-result turn, so passing
+            it in keeps a whole-conversation render linear.
         reasoning_effort: Optional reasoning effort level. The preview profile accepts
             "high" and "max"; the official profile accepts "low", "high", and "max".
         reasoning_effort_profile: DeepSeek-V4 effort mapping ("preview" or "official").
@@ -294,7 +299,8 @@ def render_message(
 
     prompt = ""
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    if last_user_idx is None:
+        last_user_idx = find_last_user_index(messages)
 
     role = msg.get("role")
     content = msg.get("content")
@@ -662,6 +668,7 @@ def encode_messages(
         num_to_render = len(messages)
         context_len = len(context)
 
+    last_user_idx = find_last_user_index(full_messages)
     for idx in range(num_to_render):
         prompt += render_message(
             idx + context_len,
@@ -670,6 +677,7 @@ def encode_messages(
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
             reasoning_effort_profile=reasoning_effort_profile,
+            last_user_idx=last_user_idx,
         )
 
     return prompt

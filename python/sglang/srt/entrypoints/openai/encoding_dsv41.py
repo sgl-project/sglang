@@ -234,7 +234,12 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    last_user_idx: Optional[int] = None,
 ) -> str:
+    """``last_user_idx`` is ``find_last_user_index(messages)`` when the caller
+    already has it: that scan walks back over every trailing tool-result turn,
+    so recomputing it per message makes a whole-conversation render quadratic.
+    """
     assert 0 <= index < len(messages)
     assert thinking_mode in [
         "chat",
@@ -242,7 +247,8 @@ def render_message(
     ], f"Invalid thinking_mode `{thinking_mode}`"
 
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    if last_user_idx is None:
+        last_user_idx = find_last_user_index(messages)
 
     role = msg.get("role")
     content = msg.get("content")
@@ -670,6 +676,7 @@ def _encode_messages_text(
         num_to_render = len(messages)
         context_len = len(context)
 
+    last_user_idx = find_last_user_index(full_messages)
     for idx in range(num_to_render):
         prompt += render_message(
             idx + context_len,
@@ -677,6 +684,7 @@ def _encode_messages_text(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            last_user_idx=last_user_idx,
         )
 
     return prompt
