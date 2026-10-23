@@ -14,11 +14,11 @@ step outputs:
     should_run_<key>   'false' when precision mode is active, the suite
                        enumerated a non-empty registered pool, and this
                        suite's bucket is empty -> the caller skips the whole
-                       job; also 'false' for ALL suites when the PR is
-                       judgeable and nothing was recommended; 'true' otherwise
-                       (incl. full suites). A suite forced full by the
-                       multimodal safety gate stays 'true' regardless of both
-                       skip paths.
+                       job; also 'false' for ALL suites when nothing was
+                       recommended and the changed-file list is available;
+                       'true' otherwise (incl. full suites). A suite forced
+                       full by the multimodal safety gate stays 'true'
+                       regardless of both skip paths.
 
 Suite keys replace '-' with '_' because GitHub Actions output names must be
 valid shell identifiers. Any failure path yields empty/missing outputs, which
@@ -407,7 +407,7 @@ def write_github_summary(
             "Precision mode **on** — a3 suites run only the bucketed subset below."
         )
     elif skip_all_suites and not force_full:
-        lines.append("**All suites skipped**: the judgeable changes affect no test.")
+        lines.append("**All suites skipped**: the changes recommend no test.")
     else:
         lines.append("Precision mode **off** — suites run in full.")
     if full_run_paths:
@@ -686,7 +686,7 @@ def main():
         decision_reason = "pipeline configuration changed: " + ", ".join(full_run_paths)
     elif not raw_entries:
         decision = "skip_all"
-        decision_reason = "judgeable changes recommend no test"
+        decision_reason = "no test recommended"
     else:
         decision = "precision"
         decision_reason = f"{len(raw_entries)} recommended test(s)"
@@ -709,7 +709,7 @@ def main():
         )
 
     if skip_all_suites and not force_full:
-        print("::notice::Judgeable changes recommend no test — skipping all suites.")
+        print("::notice::No test recommended — skipping all suites.")
     precision_mode = args.precision_mode == "true" and decision == "precision"
     print(
         f"total_count={total_count} decision={decision} precision_mode={precision_mode}"
@@ -732,14 +732,14 @@ def main():
                 out.write("EOF\n")
                 # 'false' when precision mode is on, the suite enumerated a
                 # non-empty registered pool, and this bucket is empty -> the
-                # caller skips the whole suite job; or for ALL suites when the
-                # PR is judgeable and nothing was recommended (decision
-                # 'skip_all'). An empty ENUMERATION (0 registered files, e.g. a
-                # list_tests/run_suite filter drift) falls back to 'true' so the
-                # job runs the full suite instead of silently vanishing, except
-                # under 'skip_all', where no suite is expected to run at all.
-                # Anything else ('true', or a missing output from a failed step)
-                # means a full-suite run.
+                # caller skips the whole suite job; or for ALL suites when
+                # nothing was recommended and the changed-file list was
+                # available (decision 'skip_all'). An empty ENUMERATION (0
+                # registered files, e.g. a list_tests/run_suite filter drift)
+                # falls back to 'true' so the job runs the full suite instead of
+                # silently vanishing, except under 'skip_all', where no suite is
+                # expected to run at all. Anything else ('true', or a missing
+                # output from a failed step) means a full-suite run.
                 # A force_full suite never takes either skip path: its baseline
                 # is incomplete, so "nothing recommended" proves nothing.
                 should_run = (
