@@ -1493,9 +1493,11 @@ class VisionAttention(nn.Module):
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
             # overhead.
+            # On ROCm the compiled version captures cleanly after the runner's
+            # eager warmup and matches eager mode bit for bit, so keep it there.
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
-                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and not _is_hip
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)
