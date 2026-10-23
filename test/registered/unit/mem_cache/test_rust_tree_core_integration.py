@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -161,10 +162,16 @@ def _accumulate_step(result, tracker, device_frees, host_frees):
     result.host_frees.clear()
 
 
-def test_match_on_the_empty_tree_returns_no_indices():
-    core = _tree_core()
-    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert result.device_prefix_len == 0
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_on_the_empty_tree_returns_no_indices(backend):
+    core = _tree_core(backend, page_size=2)
+    for key in ([], [1], [1, 2, 3]):
+        result = core.match_prefix(MatchPrefixParams(key=_key(key)))
+        assert result.device_prefix_len == 0
+        assert result.last_visited_node_id is None
+        assert result.full_device_match_len is None
+    assert core.empty_match_result.last_visited_node_id is None
+    assert core.empty_match_result.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["rust", "python"])
@@ -232,14 +239,61 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
     cache.tree_core.sanity_check([], [])
 
 
-def test_insert_then_match_back_returns_the_exact_indices():
-    core = _tree_core()
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_insert_then_match_back_returns_the_exact_indices(backend):
+    core = _tree_core(backend)
     result = _insert(core, [1, 2, 3], [10, 11, 12])
     assert result.prefix_len == 0
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.last_device_node == matched.last_device_node
     assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
+    assert matched.last_visited_node_id == result.last_device_node
+    assert matched.full_device_match_len is None
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_reports_split_prefix_and_zero_match_clears_walk_facts(backend):
+    core = _tree_core(backend)
+    leaf = _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 9])))
+    assert matched.last_visited_node_id == matched.best_match_node
+    assert matched.last_visited_node_id != leaf
+    assert matched.device_prefix_len == 2
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
+    path = core.collect_path_info([leaf])[0]
+    assert path[0].node_id == matched.last_visited_node_id
+    assert path[0].path_end == 2
+
+    cache = SimpleNamespace(
+        supports_prefix_sharing=lambda: True,
+        root_node_handle=core.root_node_handle,
+    )
+    zeroed = zero_match_result(cache, matched._replace(full_device_match_len=2))
+    assert zeroed.last_device_node == core.root_node_handle()
+    assert zeroed.last_visited_node_id is None
+    assert zeroed.full_device_match_len is None
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_match_reports_host_only_node_independent_of_device_acceptance(
+    backend, hicache
+):
+    core = _tree_core(backend)
+    if hicache:
+        core.set_hicache_enabled()
+    host = core.insert_host(
+        core.root_node_handle(), _key([1, 2]), torch.tensor([100, 101]), ["h0", "h1"]
+    ).inserted_host_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    assert matched.last_visited_node_id == host
+    assert matched.last_device_node == core.root_node_handle()
+    assert matched.best_match_node == (host if hicache else core.root_node_handle())
+    assert matched.device_prefix_len == 0
+    assert matched.full_device_match_len is None
+    core.sanity_check([], [])
 
 
 def test_root_node_handle_is_namespace_independent():
@@ -784,11 +838,14 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
     stale_root = core.root_node_handle()
     core.reset()
     live_root = core.root_node_handle()
+    visited = _insert(core, [1], [10]).last_device_node
     result = MatchResult(
         device_prefix_len=0,
         last_device_node=live_root,
         last_host_node=live_root,
         best_match_node=live_root,
+        last_visited_node_id=visited,
+        full_device_match_len=0,
     )
     params = MatchPrefixParams(key=_key([]))
 
@@ -812,6 +869,8 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
         best_value_len=0,
     )
     assert finalized.best_match_node == live_root
+    assert finalized.last_visited_node_id == visited
+    assert finalized.full_device_match_len == 0
 
 
 def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
@@ -3934,6 +3993,17 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+    assert matched.last_visited_node_id != cache.tree_core.root_node_handle()
+    assert matched.last_visited_node_id is not None
+    if not ring:
+        assert matched.last_visited_node_id != matched.last_device_node
+    assert (
+        cache.tree_core.collect_path_info([matched.last_visited_node_id])[0][
+            -1
+        ].path_end
+        == 8
+    )
+    assert matched.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])

@@ -43,7 +43,8 @@ def test_png_output_saving_preserves_pixels(tmp_path, output_compression):
 
 
 @pytest.mark.parametrize(
-    ("output_compression", "expected_compress_level"), [(None, 1), (0, 0), (75, 1)]
+    ("output_compression", "expected_compress_level"),
+    [(None, 0), (0, 0), (75, 0), (100, 9)],
 )
 def test_png_output_saving_uses_fast_pillow_path(
     tmp_path, monkeypatch, output_compression, expected_compress_level
@@ -122,17 +123,16 @@ def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
     written = []
     imwrite = output_utils.imageio.imwrite
 
-    def imwrite_spy(path, frame, **kwargs):
-        written.append((path, kwargs))
-        return imwrite(path, frame, **kwargs)
+    def imwrite_spy(uri, frame, **kwargs):
+        written.append((uri, kwargs))
+        return imwrite(uri, frame, **kwargs)
 
     monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
-    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
 
     output_utils.warm_image_writer()
 
-    assert len(written) == 1
-    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert written == [("<bytes>", {"format": ".jpg", "quality": 75})]
     assert list(tmp_path.iterdir()) == []
 
 
