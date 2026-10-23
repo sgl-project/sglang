@@ -8,6 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
@@ -141,6 +142,91 @@ def test_vit_graph_rotary_workspace_keeps_the_model_cos_sin_dtype():
 
     used_cos, used_sin = runner._sin_cos_ws_by_graph["key"]
     assert torch.equal(used_cos, cos) and torch.equal(used_sin, sin)
+
+
+class _RecordingBlock:
+    attn = SimpleNamespace(
+        qkv_backend_name="aiter_attn",
+        num_attention_heads_per_partition=1,
+        head_size=2,
+    )
+
+    def __init__(self):
+        self.cu_seqlens_calls = []
+
+    def forward(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, output_ws):
+        self.cu_seqlens_calls.append(cu_seqlens)
+        return x + 1
+
+    __call__ = forward
+
+
+def _capacity_runner(capacity):
+    block = _RecordingBlock()
+    vit = SimpleNamespace(
+        blocks=[block],
+        merger=lambda y: y * 2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        use_data_parallel=True,
+    )
+    with envs.SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY.override(capacity):
+        runner = ViTCudaGraphRunner(vit)
+    runner.create_graph = lambda **kwargs: pytest.fail("captured past capacity")
+    return runner, block
+
+
+def _run(runner, cu_seqlens):
+    return runner.run(
+        x=torch.zeros(6, 2),
+        cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
+        cu_window_seqlens=None,
+        position_embeddings=None,
+        rotary_pos_emb_cos=torch.ones(6, 2),
+        rotary_pos_emb_sin=torch.zeros(6, 2),
+    )
+
+
+def test_vit_graph_cache_capacity_runs_new_layouts_without_capturing():
+    """Past the capacity a new layout must neither capture nor allocate per-key
+    buffers, and must run the blocks with the arguments a graph would use."""
+    runner, block = _capacity_runner(capacity=1)
+    runner.block_graphs["captured"] = object()
+
+    out = _run(runner, [0, 4, 6])
+
+    assert torch.equal(out, torch.full((6, 1, 2), 2.0))
+    assert list(runner.block_graphs) == ["captured"]
+    assert not runner.block_input and not runner.block_ws
+    assert not runner._sin_cos_ws_by_graph
+    ((cu_seqlens, max_len),) = block.cu_seqlens_calls
+    assert cu_seqlens.tolist() == [0, 4, 6] and max_len == 4
+
+
+def test_vit_graph_cache_capacity_still_replays_captured_layouts():
+    runner, block = _capacity_runner(capacity=1)
+    key = runner._get_graph_key(torch.empty(6, 1, 2), torch.tensor([0, 4, 6]), None)
+    runner.block_input[key] = torch.empty(6, 1, 2)
+    runner.block_output[key] = torch.full((6, 1, 2), 7.0)
+    runner.block_graphs[key] = SimpleNamespace(replay=lambda: None)
+
+    out = _run(runner, [0, 4, 6])
+
+    assert torch.equal(out, torch.full((6, 1, 2), 7.0))
+    assert not block.cu_seqlens_calls
+
+
+def test_vit_graph_cache_is_unbounded_by_default():
+    runner, _ = _capacity_runner(capacity=None)
+    captured = []
+    runner.create_graph = lambda **kwargs: captured.append(kwargs)
+    runner.replay = lambda **kwargs: None
+    for i in range(3):
+        runner.block_graphs[f"other{i}"] = object()
+
+    _run(runner, [0, 4, 6])
+
+    assert len(captured) == 1
 
 
 if __name__ == "__main__":

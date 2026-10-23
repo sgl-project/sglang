@@ -1599,6 +1599,9 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Max ViT CUDA graphs (one per attention layout) to capture; later layouts run
+    # without a graph. Unset keeps every layout.
+    SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(None)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.
