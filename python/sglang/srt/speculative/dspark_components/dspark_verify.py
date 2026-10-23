@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -169,6 +169,8 @@ class TargetVerifyExecutor:
         # Block-wise rejection draws (blockwise_rejection.py); None keeps the classic kernel.
         self._rejection_noise = rejection_noise
         self._simulated_correct_len = simulated_correct_len
+        # a target whose verify leaves its logits vocab-sharded gathers them with this
+        self.gather_deferred_logits: Optional[Callable] = None
 
     def accept_and_finalize(
         self,
@@ -184,6 +186,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        target_argmax: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -203,6 +206,7 @@ class TargetVerifyExecutor:
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
+            target_argmax=target_argmax,
             draft_block=draft_block,
             sampling_info=accept_sampling_info,
             draft_input=draft_input,
@@ -302,6 +306,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        needs_logits: bool = True,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -334,9 +339,15 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
-        if sampling_info is not None:
+        logits_output = result.logits_output
+        if logits_output.tp_local_logits is not None and needs_logits:
+            logits_output.next_token_logits = self.gather_deferred_logits(
+                logits_output.tp_local_logits[: verify_ids_2d.numel()]
+            )
+        # deferred logits that nothing reads come without adjustments to apply
+        if sampling_info is not None and logits_output.next_token_logits is not None:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
+                next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
             )
@@ -1246,7 +1257,7 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
-    target_logits: torch.Tensor,
+    target_logits: Optional[torch.Tensor],
     draft_block: DraftBlockResult,
     sampling_info,
     draft_input: DFlashDraftInputV2,
@@ -1256,6 +1267,7 @@ def accept_draft_tokens(
     fused_argmax: bool = False,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
+    target_argmax: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -1267,6 +1279,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
+            target_predict=target_argmax,
         )
     if _blockwise_rejection_applies(
         sampling_info=sampling_info,
@@ -1307,6 +1320,7 @@ def accept_draft_tokens(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
+        target_predict=target_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(

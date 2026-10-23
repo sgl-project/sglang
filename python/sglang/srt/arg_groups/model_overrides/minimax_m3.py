@@ -8,6 +8,7 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.arg_groups.model_overrides import minimax_m3_hip as _hip
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import get_quantization_config
@@ -56,6 +57,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     if quant_resolved == "minimax_m3_nvfp4":
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError("M3.1 NVFP4 only supports DSPARK or DFLASH speculation")
+        if get_platform().is_hip:
+            _hip.validate_nvfp4(cfg)
         if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
             algorithm = cfg.speculative_algorithm
             # Only the vision-language wrapper exposes the draft's hidden-state capture.
@@ -64,8 +67,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"M3.1 NVFP4 {algorithm} requires MiniMaxM3SparseForConditionalGeneration, "
                     f"got {hf_config.architectures[0]}"
                 )
-            if not get_platform().is_blackwell:
-                raise ValueError(f"M3.1 NVFP4 {algorithm} requires Blackwell")
+            if not (get_platform().is_blackwell or get_platform().is_hip):
+                raise ValueError(f"M3.1 NVFP4 {algorithm} requires Blackwell or ROCm")
             if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
                 raise ValueError(
                     f"M3.1 NVFP4 {algorithm} requires SGLANG_RAGGED_VERIFY_MODE=static"
@@ -91,6 +94,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 envs.SGLANG_SPEC_TP_SYNC.set("rng")
         if cfg.page_size not in (None, 128):
             raise ValueError("M3.1 NVFP4 requires --page-size 128")
+        if get_platform().is_hip and get_platform().is_gfx95:
+            return _hip.nvfp4_overrides(cfg, overrides)
         if not get_platform().is_blackwell:
             # MegaMoE and the packed NVFP4 KV cache are SM100-only; neither is
             # selected here, and the KV dtype stays at the model dtype.
@@ -122,6 +127,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         return overrides
 
     if get_platform().is_hip:
+        keeps_custom_ar = _hip.rocm_overrides(cfg, hf_config, quant_resolved, overrides)
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "triton"
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
@@ -142,7 +148,11 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom all-reduce enabled so the
         # quick-reduce path (ROCM_QUICK_REDUCE_QUANTIZATION=INT4/INT6/INT8) can
         # accelerate the large prefill all-reduce.
-        if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
+        if not (
+            aiter_fusion_resolved
+            or keeps_custom_ar
+            or envs.SGLANG_M3_ALLOW_CUSTOM_AR.get()
+        ):
             overrides["disable_custom_all_reduce"] = True
     elif get_platform().is_sm100:
         if is_attention_backend_not_set(cfg):

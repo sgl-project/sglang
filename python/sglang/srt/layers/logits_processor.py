@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     is_cpu,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -79,6 +80,10 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
+
+if _is_hip:
+    from sglang.srt.layers import logits_processor_hip as _hip
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -269,6 +274,11 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    # gfx950 DSpark target verify (LogitsProcessor.verify_argmax_only): this rank's vocab
+    # columns of the logits, left ungathered with next_token_logits None, and their row argmax.
+    tp_local_logits: Optional[torch.Tensor] = None
+    tp_logits_argmax: Optional[torch.Tensor] = None
 
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
@@ -494,6 +504,8 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        # set by the gfx950 DSpark worker; see logits_processor_hip
+        self.verify_argmax_only = False
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -604,6 +616,10 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
+        if self.verify_argmax_only and logits_metadata.forward_mode.is_target_verify():
+            return _hip.deferred_verify_logits(
+                self, pruned_states, lm_head, logits_metadata, hidden_states_to_store
+            )
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)

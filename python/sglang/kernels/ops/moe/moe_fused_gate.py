@@ -130,6 +130,7 @@ def _router_triton_kernel(
     HAS_PACKED: tl.constexpr,
     RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
+    SCORES_SPLIT_K: tl.constexpr,  # > 1: scores are split-K partials, summed in order
     stride_bias,
     stride_bias_alt,
     stride_input_ids,
@@ -141,6 +142,7 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    stride_split,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -184,9 +186,16 @@ def _router_triton_kernel(
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = live_m[:, None] & mask_n[None, :]
-    scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
-        tl.float32
-    )  # [BLOCK_M, BLOCK_N]
+    if SCORES_SPLIT_K == 1:
+        scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
+            tl.float32
+        )  # [BLOCK_M, BLOCK_N]
+    else:
+        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for split in tl.static_range(SCORES_SPLIT_K):
+            scores += tl.load(
+                row_ptr + split * stride_split, mask=mask2d, other=0.0
+            ).to(tl.float32)
 
     if SCORING_FUNC == 0:
         # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
@@ -360,7 +369,8 @@ def moe_fused_gate(
 
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
-    within). ``scores`` contains raw GEMM logits.
+    within). ``scores`` contains raw GEMM logits, ``[M, N]``, or their fp32 split-K
+    partials ``[S, M, N]``, which the kernel sums over S in order first.
 
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
@@ -378,7 +388,12 @@ def moe_fused_gate(
         torch.float16,
         torch.bfloat16,
     ), "scores must be float32/float16/bfloat16"
-    assert scores.ndim == 2, "scores must be 2D"
+    split_k, stride_split = 1, 0
+    if scores.ndim == 3:
+        assert scores.dtype == torch.float32, "split-K partials must be float32"
+        split_k, stride_split = scores.shape[0], scores.stride(0)
+        scores = scores[0]
+    assert scores.ndim == 2, "scores must be 2D, or 3D split-K partials"
     if bias is None:
         assert scoring_func.lower() == "softmax", (
             "bias is required for non-softmax routing"
@@ -543,6 +558,7 @@ def moe_fused_gate(
         HAS_PACKED=packed_out is not None,
         RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,
+        SCORES_SPLIT_K=split_k,
         stride_bias=bias.stride(0) if bias is not None else 0,
         stride_bias_alt=bias_alt.stride(0) if bias_alt is not None else 0,
         stride_input_ids=input_ids.stride(0) if input_ids is not None else 0,
@@ -554,6 +570,7 @@ def moe_fused_gate(
         stride_ik=indices.stride(1),
         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        stride_split=stride_split,
         num_warps=num_warps,
         **extra,
     )

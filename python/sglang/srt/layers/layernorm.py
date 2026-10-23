@@ -1109,6 +1109,9 @@ class GemmaRMSNorm(BaseFusedOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        # (N, K) of the block-fp8 GEMM reading the fused fp8 output, when the model binds
+        # it; the fused norm then zero-fills that GEMM's output for aiter's asm split-K.
+        self.fp8_out_gemm_shape: Optional[Tuple[int, int]] = None
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
