@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    dsv41_cp_replay_enabled,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
@@ -388,6 +389,7 @@ class CommonKVManager(BaseKVManager):
             or hybrid_decode_pulls_all_ranks
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
+            or dsv41_cp_replay_enabled(self.dsv41_spec_layout)
         )
 
         # bind zmq socket
@@ -1354,14 +1356,22 @@ class CommonKVManager(BaseKVManager):
             )
 
         local_layout = self.dsv41_spec_layout
-        if local_layout is not None or info.dsv41_spec_layout is not None:
-            if local_layout != info.dsv41_spec_layout:
+        remote_layout = info.dsv41_spec_layout
+        if remote_layout is not None and "cp_encoder_replay_version" in remote_layout:
+            remote_layout = remote_layout.copy()
+            version = remote_layout.pop("cp_encoder_replay_version")
+            if type(version) is not int or version != 1 or info.attn_cp_size <= 1:
+                raise RuntimeError(
+                    f"Unsupported DeepSeek-V4.1 CP encoder replay PD version {version!r} "
+                    f"with Prefill CP={info.attn_cp_size}"
+                )
+        if local_layout is not None or remote_layout is not None:
+            if local_layout != remote_layout:
                 mismatched_fields = sorted(
                     key
                     for key in (local_layout or {}).keys()
-                    | (info.dsv41_spec_layout or {}).keys()
-                    if (local_layout or {}).get(key)
-                    != (info.dsv41_spec_layout or {}).get(key)
+                    | (remote_layout or {}).keys()
+                    if (local_layout or {}).get(key) != (remote_layout or {}).get(key)
                 )
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD layout mismatch "
@@ -1501,6 +1511,7 @@ class CommonKVManager(BaseKVManager):
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
                 or info.enable_kv_cache_sharding
+                or dsv41_cp_replay_enabled(info.dsv41_spec_layout)
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks

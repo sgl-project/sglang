@@ -28,6 +28,8 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1904,7 +1906,7 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
             "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
         )
 
-    return {
+    layout = {
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
         "kv_layer_ids": list(kv_args.kv_layer_ids),
@@ -1912,6 +1914,19 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and get_parallel().attn_cp_size > 1
+        and get_exec().features.enable_encoder_swa_bounded_replay
+    ):
+        # Legacy Decode rejects this extension at bootstrap rather than waiting
+        # for a transfer whose CP owner/fan-in contract it does not implement.
+        layout["cp_encoder_replay_version"] = 1
+    return layout
+
+
+def dsv41_cp_replay_enabled(layout: Optional[dict]) -> bool:
+    return layout is not None and layout.get("cp_encoder_replay_version") == 1
 
 
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
