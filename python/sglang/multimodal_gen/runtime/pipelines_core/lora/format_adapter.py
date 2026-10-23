@@ -546,10 +546,9 @@ def _convert_ai_toolkit_flux_lora(
                     )
                     out[diffusers_key] = original_state_dict.pop(original_key)
 
-    for key, tensor in original_state_dict.items():
-        new_key = key.replace("double_blocks.", "transformer_blocks.")
-        new_key = new_key.replace("single_blocks.", "single_transformer_blocks.")
-        out[new_key] = tensor
+    # Leftover double/single block keys (MLP, modulation) keep their original
+    # names so the arch config's param_names_mapping resolves them.
+    out.update(original_state_dict)
 
     extra_mappings = {
         "img_in": "x_embedder",

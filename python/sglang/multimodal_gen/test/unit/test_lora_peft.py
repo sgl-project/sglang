@@ -7,6 +7,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.configs.models.dits.flux import FluxArchConfig
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     _convert_ai_toolkit_flux_lora,
     logger,
@@ -127,6 +129,7 @@ def test_ai_toolkit_flux_alpha_follows_renamed_modules():
     for module, rows in (
         ("double_blocks.0.img_attn.qkv", 12),
         ("double_blocks.0.img_attn.proj", 4),
+        ("double_blocks.0.img_mlp.0", 8),
         ("single_blocks.0.linear1", 20),
         ("single_blocks.0.linear2", 4),
     ):
@@ -144,5 +147,12 @@ def test_ai_toolkit_flux_alpha_follows_renamed_modules():
             "transformer_blocks.0.attn.to_out.0",
             "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
             "single_transformer_blocks.0.attn.to_out",
+            "double_blocks.0.img_mlp.0",
         )
+    }
+    mapping = get_param_names_mapping(FluxArchConfig().param_names_mapping)
+    assert {mapping(k)[0] for k in out if ".img_mlp." in k} == {
+        "transformer_blocks.0.ff.linear_in.lora_A.weight",
+        "transformer_blocks.0.ff.linear_in.lora_B.weight",
+        "transformer_blocks.0.ff.linear_in.alpha",
     }
