@@ -508,19 +508,6 @@ def generate_report(
                 ]
             )
 
-    # Recommendation source indicator
-    if recommendations_source == "output":
-        out.append(
-            "> **[Source: Workflow Output]** Recommended cases are passed from coverage recommendations outputs"
-        )
-    elif recommendations_source == "committed":
-        out.append(
-            "> **[Source: Local File]** Recommended test cases come from a txt file in the repository"
-        )
-    else:
-        out.append("> **[Source: None]** No recommended test cases found")
-    out.append("")
-
     # ================================================================
     #  Section 1: Full Failed Test List
     # ================================================================
@@ -575,99 +562,93 @@ def generate_report(
             )
         out.append("")
 
-    # ================================================================
-    #  Section 2: Full Recommended Test List
-    # ================================================================
-    out.append("---")
-    out.append("")
-    out.append(f"## Recommended Test Cases（ {len(recommended)} total）")
-    out.append("")
+    out.extend(["---", "", "## Recommended Test Cases", ""])
+    source = {
+        "output": "workflow coverage recommendations",
+        "committed": "local recommendations file",
+    }.get(recommendations_source, "unspecified")
     if recommended:
+        out.append(f"{len(recommended)} recommendation(s); source: {source}.")
+        out.append("")
+        out.append(
+            "Recommendations identify tests selected by coverage, not tests confirmed "
+            "to have run. A missing failure does not prove a pass."
+        )
+        out.extend(
+            [
+                "",
+                "<details>",
+                "<summary>Show recommended tests and observed failures</summary>",
+                "",
+                "| Recommended test | Evidence |",
+                "|---|---|",
+            ]
+        )
         normalized_failed = {normalize_test_path(item) for item in failed}
         failed_file_set = {item.split("::", 1)[0] for item in normalized_failed}
-        for i, item in enumerate(recommended, 1):
+        for item in recommended:
             normalized = normalize_test_path(item)
             has_failure = (
                 normalized in normalized_failed
                 if "::" in item
                 else normalized in failed_file_set
             )
-            tag = " **[Already Failed]**" if has_failure else ""
-            out.append(f"{i}. `{item}`{tag}")
-        out.append("")
+            status = (
+                "Failure observed"
+                if has_failure
+                else "No failure observed; execution unverified"
+            )
+            out.append(f"| `{item}` | {status} |")
+        out.extend(["", "</details>", ""])
     else:
-        out.append("> No recommended test cases")
-        out.append("")
+        out.extend(
+            [
+                "No recommendations were provided. This does not mean no tests were needed.",
+                "",
+            ]
+        )
 
-    # ================================================================
-    #  Section 3: Core Conclusion
-    # ================================================================
-    out.append("---")
-    out.append("")
-    out.append("## Core Conclusion")
-    out.append("")
+    out.extend(["---", "", "## Core Conclusion", ""])
+    if failed:
+        out.append(
+            f"- **Failures:** {len(failed)} failure entry/entries found in the available evidence."
+        )
+    else:
+        out.append(
+            "- **Failures:** none extracted from the available artifacts. "
+            "This does not establish that all tests ran or passed."
+        )
     if not recommended:
         out.append(
-            "> **Coverage comparison unavailable:** no recommended test cases were provided."
+            "- **Coverage comparison unavailable:** no recommended test cases were provided."
+        )
+        out.append(
+            "- **Next step:** investigate the reported failures and job logs. "
+            "Check the recommendation job output if coverage comparison was expected."
         )
     elif not failed:
+        out.append("- **Coverage comparison:** no observed failures to compare.")
         out.append(
-            "> No failed cases in this CI run; no need to compare against the recommendation list."
+            "- **Next step:** check job outcomes and log availability before treating "
+            "this as a clean run."
         )
-    elif len(miss) == 0:
-        out.append("> **All failed test cases are within the recommended scope.**")
     else:
-        total_failed = len(failed)
         out.append(
-            f"> ** {len(miss)}/{total_failed} failed cases are outside the recommended scope.**"
+            f"- **Coverage comparison:** {len(hit)} failure(s) matched recommendations; "
+            f"{len(miss)} did not. Matching does not establish the cause of a failure."
+        )
+        out.append(
+            "- **Next step:** investigate the failures. For unmatched entries, check "
+            "test selection and available diagnostics before concluding coverage is missing."
+            if miss
+            else "- **Next step:** investigate the matched failures; the recommendations included them."
+        )
+    if recommended:
+        out.append(
+            f"- **Unverified recommendations:** {len(untested)} had no observed failure; "
+            "they may have passed, been skipped, not run, or have missing logs."
         )
     out.append("")
-
-    # ================================================================
-    #  Section 4: Detail table
-    # ================================================================
-    if recommended:
-        out.append("| Category | Count |")
-        out.append("|---|---|")
-        out.append(f"| Failed & Matched Recommendation | {len(hit)} |")
-        out.append(f"| Failed but Not Matched Recommendation | {len(miss)} |")
-        out.append(f"| Recommended but Not Failed | {len(untested)} |")
-        out.append("")
-
-    if hit:
-        out.append("## Failed & Matched Recommendation")
-        out.append("")
-        out.append("| # | Failed test |")
-        out.append("|---|---|")
-        for i, t in enumerate(hit, 1):
-            out.append(f"| {i} | `{t}` |")
-        out.append("")
-
-    if miss:
-        out.append("## Failed but Not Matched Recommendation")
-        out.append("")
-        out.append(
-            "> Possible causes: uncovered modules, environment issues, flaky tests."
-        )
-        out.append("")
-        for t in miss:
-            out.append(f"- `{t}`")
-        out.append("")
-
-    if untested:
-        out.append("## Recommended but Not Failed")
-        out.append("")
-        out.append(
-            "> These test cases were recommended but did not fail this run (passed or not executed)."
-        )
-        out.append("")
-        for t in untested:
-            out.append(f"- `{t}`")
-        out.append("")
-
-    if not failed:
-        out.append("## No failed cases")
-        out.append("")
 
     out.append("---")
     out.append("*Generated by analyze_failure_report.py*")
