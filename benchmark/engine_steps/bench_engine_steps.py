@@ -8,13 +8,9 @@ requests per rank and times --measure-steps steps.
 Throughput counts whole steps only: the window starts and ends at step boundaries
 (the scheduler's stamps under --enable-metrics, else response arrival gaps).
 --server-log cross-checks the engine's per-step log lines over the same window; it
-needs the server on this host's clock, with SGLANG_LOG_MS=1. A requested check
-fails unless every rank logs the whole window at the fixed batch size and agrees
-within 0.5%. Requests go round-robin over the ranks, and a window in which the
-ranks served unequal tokens fails.
-The GPU denominator comes from the server's TP/PP/DP topology, unless overridden
-with --num-gpus. Local package/GPU/environment metadata belongs to the client
-host in HTTP mode; server configuration is recorded separately.
+needs the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
+package, GPU and environment fields describe the benchmark client; server_info
+records the server.
 
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
@@ -163,7 +159,7 @@ def check_cache(meta, new_tokens):
 
 
 def check_logs(check, result, size, dp, blurred):
-    """A requested cross-check must cover every rank and the fixed batch."""
+    """Every error voids the cross-check and fails the run."""
     per_rank = check["ms_per_step_per_rank"]
     errors = []
     if set(per_rank) != set(range(dp)):
@@ -219,10 +215,8 @@ class EngineTransport:
         return None if ret.success else ret.message or "flush failed"
 
     def finish(self):
-        try:
-            self.engine.tokenizer_manager.abort_request(
-                abort_all=True
-            )  # decode leftovers
+        try:  # abort decode leftovers
+            self.engine.tokenizer_manager.abort_request(abort_all=True)
         finally:
             self.engine.shutdown()
 
