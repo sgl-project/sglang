@@ -1709,6 +1709,9 @@ STANDALONE_FILE_EST_TIMES = {
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
+        # Initial H200 full-process observation: 97 s; refresh on H100 CI.
+        # This is a partitioning estimate, not a performance gate.
+        "../single_test_file/test_nomas_offline.py": 100.0,
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
