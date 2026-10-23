@@ -354,6 +354,7 @@ def _module_defines(module: str, attr: str) -> bool:
         ("communication.matmul_reduce_scatter", {"cute_dsl"}),
         ("elementwise.row_sum", {"jit"}),
         ("gemm.muse_spark_router_gemm", {"jit"}),
+        ("gemm.muse_spark_router_gemv", {"cute_dsl"}),
         ("layernorm.muse_spark_norm_gate", {"torch", "jit", "helion", "triton"}),
         ("layernorm.muse_spark_norm_residual", {"torch", "jit", "triton"}),
         ("layernorm.muse_spark_rmsnorm_nvfp4_quant", {"torch", "jit", "helion"}),

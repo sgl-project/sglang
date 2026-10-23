@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -55,7 +56,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import is_xpu, run_with_deadline
 
 try:
     from nixl._bindings import (
@@ -71,6 +72,8 @@ try:
     )
 except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -172,11 +175,35 @@ class _StateLayoutMismatch(ValueError):
     pass
 
 
+# A post NIXL rejected. NIXL may already have writes of the request on the wire
+# and does not wait for them, so the room must never be acked.
+class _NixlPostError(RuntimeError):
+    pass
+
+
 # Once one handle of a batch reports ERR, its siblings settle only when NIXL
 # notices their peer is gone, which for UCX means waiting out peer keepalive.
 # This worker serves other rooms, so bound that wait.
 NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
 NIXL_ERR_SETTLE_POLL_S = 0.001
+
+
+def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_ib_devices_for_gpu,
+    )
+
+    devices = get_ib_devices_for_gpu(ib_device, gpu_id)
+    if devices is None:
+        return None
+    names = [name.strip() for name in devices.split(",")]
+    if any(not name or ":" in name for name in names):
+        raise ValueError(
+            "NIXL UCX --disaggregation-ib-device requires HCA names without "
+            "port suffixes (e.g. mlx5_0); NIXL appends port 1."
+        )
+    # NIXL's UCX device_list parser splits on the literal delimiter ", ".
+    return ", ".join(names)
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
@@ -583,6 +610,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
+        if backend == "UCX" and self.kv_args.ib_device:
+            if os.environ.get("UCX_NET_DEVICES"):
+                logger.warning(
+                    "UCX_NET_DEVICES is set; ignoring --disaggregation-ib-device "
+                    "for NIXL UCX. Per-GPU CLI device mappings will not be applied."
+                )
+            else:
+                device_list = _resolve_ucx_device_list(
+                    self.kv_args.ib_device, self.kv_args.gpu_id
+                )
+                if device_list is not None:
+                    existing = backend_params.get("device_list")
+                    if (
+                        existing is not None
+                        and ", ".join(name.strip() for name in existing.split(","))
+                        != device_list
+                    ):
+                        raise ValueError(
+                            "Conflicting NIXL UCX device_list in "
+                            "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS and "
+                            "--disaggregation-ib-device. Configure only one "
+                            "device selection or make them agree."
+                        )
+                    backend_params["device_list"] = device_list
+                    logger.info(
+                        "NIXL UCX device binding: gpu_id=%s, engine_rank=%s, "
+                        "device_list=%s",
+                        self.kv_args.gpu_id,
+                        self.kv_args.engine_rank,
+                        device_list,
+                    )
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
@@ -927,8 +985,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError("Failed to create prepared state transfer")
         # The chunk owns the handle before posting, so a failed post settles too.
         yield xfer_handle
-        if self.agent.transfer(xfer_handle) == "ERR":
-            raise RuntimeError("Failed to post prepared state transfer")
+        self._post_xfer(xfer_handle, "Failed to post prepared state transfer")
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -955,6 +1012,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
 
     def _init_staging_allocator(self):
@@ -965,6 +1023,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
 
     def _register_staging_memory(self, ptr: int, size: int):
@@ -1077,6 +1136,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
+
+    def _post_xfer(self, xfer_handle: Any, error_msg: str) -> None:
+        # The NIXL Python API raises on a failed post rather than returning "ERR".
+        try:
+            state = self.agent.transfer(xfer_handle)
+        except Exception as e:
+            raise _NixlPostError(f"{error_msg}: {e}") from e
+        if state == "ERR":
+            raise _NixlPostError(error_msg)
 
     def _await_handles(
         self, handles: List[Any], *, failure_seen: bool
@@ -1738,6 +1806,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
+                            # NIXL reads the staging buffer asynchronously, and the next
+                            # decode rank's gather overwrites it from offset 0. Gated to
+                            # XPU, where this corrupted KV under concurrent requests.
+                            if _is_xpu and kv_xfer_handle is not None:
+                                self._await_handles(
+                                    [kv_xfer_handle], failure_seen=False
+                                )
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
@@ -1930,7 +2005,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
+                if isinstance(e, _NIXL_TRANSPORT_ERRORS) or isinstance(
+                    e.__cause__, _NIXL_TRANSPORT_ERRORS
+                ):
                     logger.warning(f"NIXL transport error for room {room}: {e}")
                 else:
                     logger.exception(
@@ -1944,6 +2021,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if not settle_timed_out:
                     notify, _ = self._await_handles(handles, failure_seen=True)
                 if notify:
+                    if (
+                        isinstance(e, _NixlPostError)
+                        and self.enable_deferred_decode_kv_release
+                    ):
+                        # The rejected request is not in `handles`, so its writes
+                        # may still land; leave the room to decode's release timeout.
+                        self.poison_deferred_ack_room(room)
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
                     # normal-path decrement was never reached, so without this
@@ -2139,9 +2223,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+            self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2295,9 +2377,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
 
     def send_kvcache(
@@ -2473,9 +2553,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post mixed prepped transfer")
+            self._post_xfer(
+                xfer_handle, "KVSender failed to post mixed prepped transfer"
+            )
             handles.append(xfer_handle)
         return handles
 
@@ -2520,9 +2600,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post prepped slice transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post prepped slice transfer")
         return xfer_handle
 
     def send_kvcache_staged(
@@ -2608,16 +2686,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
             [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
+            dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
@@ -2632,9 +2709,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+        self._post_xfer(xfer_handle, "[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2767,9 +2842,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
 
     def _send_slot_state(
@@ -2821,9 +2894,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create dsa_tail transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post dsa_tail transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post dsa_tail transfer")
         return xfer_handle
 
     def _send_mamba_state(
@@ -2877,9 +2948,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state transfer")
+        self._post_xfer(xfer_handle, "Failed to post Mamba state transfer")
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -3007,9 +3076,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state slice transfer")
+        self._post_xfer(xfer_handle, "Failed to post Mamba state slice transfer")
         return xfer_handle
 
     def _send_swa_state_slice(
@@ -3064,9 +3131,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create SWA state slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post SWA state slice transfer")
+        self._post_xfer(xfer_handle, "Failed to post SWA state slice transfer")
         return xfer_handle
 
     def maybe_send_extra(

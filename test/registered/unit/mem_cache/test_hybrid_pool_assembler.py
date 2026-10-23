@@ -14,7 +14,7 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -29,12 +29,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_declared_pools_present,
     _DsaStrategy,
-    _evict_mamba_for_device_alloc,
-    _evict_swa_for_device_alloc,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
-    _split_hicache_size,
     _SwaStrategy,
     _uses_unified_page_envelope_host,
     build_full_draft_pools,
@@ -76,64 +73,6 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
             physical_page_size=256,
             consumer="test consumer",
         )
-
-
-class _Pool:
-    def __init__(self, kv_bytes):
-        self._kv_bytes = kv_bytes
-
-    def get_kv_size_bytes(self):
-        return self._kv_bytes
-
-
-class TestDeviceAllocEviction(CustomTestCase):
-    def test_swa_evicts_only_allocation_shortfall(self):
-        cache = MagicMock()
-        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8
-
-        _evict_swa_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_called_once_with(EvictParams(swa_num_tokens=2))
-        cache.evict.assert_not_called()
-
-    def test_mamba_evicts_only_allocation_shortfall(self):
-        cache = MagicMock()
-        allocator = cache.req_to_token_pool.mamba_allocator
-        allocator.schedulable_available_size.return_value = 8
-
-        _evict_mamba_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_called_once_with(EvictParams(mamba_num=2))
-        cache.evict.assert_not_called()
-
-    def test_sufficient_capacity_skips_eviction(self):
-        cache = MagicMock()
-        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 10
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = 10
-
-        _evict_swa_for_device_alloc(cache, required_size=10)
-        _evict_mamba_for_device_alloc(cache, required_size=10)
-
-        cache.evict_for_alloc.assert_not_called()
-        cache.evict.assert_not_called()
-
-
-class TestSplitHicacheSize(CustomTestCase):
-    def test_splits_total_budget_by_device_bytes(self):
-        # scalar and (k, v) tuple return shapes both supported
-        shares = _split_hicache_size(
-            100, (_Pool(75 * 10**9), _Pool((15 * 10**9, 10 * 10**9)))
-        )
-        self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
-        self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
-
-    def test_splits_total_budget_by_device_bytes_three_pools(self):
-        # scalar and (k, v) tuple return shapes both supported
-        shares = _split_hicache_size(
-            100, (_Pool(55 * 10**9), _Pool((15 * 10**9, 10 * 10**9)), _Pool(20 * 10**9))
-        )
-        self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
-        self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
 
 
 class TestHybridStageLayerMappings(CustomTestCase):

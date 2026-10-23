@@ -104,14 +104,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
         target: EvictLayer,
     ) -> (usize, usize) {
-        let node = tree_core.arena.node_mut(node_id);
+        let node = tree_core.arena.node(node_id);
         let mut freed = 0;
         let mut host_freed = 0;
         if target.contains(EvictLayer::Device) && node.has_device_value(FULL) {
             let value = node.device_value(FULL);
-            freed = node.device_value_len(FULL);
+            freed = tree_core.component_reclaimable_value_len_(node_id, FULL);
             device_frees
                 .entry(FULL)
                 .or_default()
@@ -124,7 +125,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             host_frees
                 .entry(FULL)
                 .or_default()
-                .push(node.take_host_value(FULL));
+                .push(tree_core.arena.node_mut(node_id).take_host_value(FULL));
         }
         if freed > 0 {
             tree_core.dec_evictable_size(FULL, freed);
@@ -155,6 +156,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut Vec<CacheAction>,
     ) -> Option<NodeIdx_> {
         let ct = FULL;
         assert!(
@@ -203,6 +205,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
     ) {
         for spare_imminent_demotes in [true, false] {
             if tracker[&FULL] >= num_tokens {
@@ -230,6 +233,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     tracker,
                     device_frees,
                     host_frees,
+                    cache_actions,
                 );
                 tree_core.full_coexisting_host_nodes.discard(node_id);
             }
@@ -244,6 +248,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut Vec<CacheAction>,
     ) {
         let ct = FULL;
         let arena = &tree_core.arena;
@@ -262,7 +267,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             }
             // The parent id is captured before the eviction frees the leaf.
             let parent = tree_core.arena.node(x).try_parent();
-            tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees);
+            tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
             if let Some(parent) = parent
                 && tree_core.evictable_host_leaves.contains(parent)
             {
@@ -299,18 +304,19 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         // lock credits protected directly.
         let mut cur = node_id;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() || node.has_device_value(FULL) {
                 break;
             }
-            node.inc_device_lock_ref(FULL);
-            cur = node.parent();
+            let parent = node.parent();
+            tree_core.arena.node_mut(cur).inc_device_lock_ref(FULL);
+            cur = parent;
         }
 
         // Lock the device-on segment up to the root.
         let mut delta = 0;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() {
                 break;
             }
@@ -320,11 +326,11 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             );
             let parent = node.parent();
             let newly_locked_len = if node.device_lock_ref(FULL) == 0 {
-                Some(node.device_value_len(FULL))
+                Some(tree_core.component_reclaimable_value_len_(cur, FULL))
             } else {
                 None
             };
-            node.inc_device_lock_ref(FULL);
+            tree_core.arena.node_mut(cur).inc_device_lock_ref(FULL);
             if let Some(key_len) = newly_locked_len {
                 tree_core.dec_evictable_size(FULL, key_len);
                 tree_core.inc_protected_size(FULL, key_len);
@@ -387,7 +393,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
         let mut cur = node_id;
         loop {
-            let node = tree_core.arena.node_mut(cur);
+            let node = tree_core.arena.node(cur);
             if node.is_root() {
                 break;
             }
@@ -397,12 +403,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 old_lock_ref > 0,
                 "FULL segment release hit lock_ref=0 on node {cur}"
             );
-            let newly_unlocked_len = if old_lock_ref == 1 && node.has_device_value(FULL) {
-                Some(node.device_value_len(FULL))
+            let newly_unlocked_len = if old_lock_ref == 1 {
+                Some(tree_core.component_reclaimable_value_len_(cur, FULL))
             } else {
                 None
             };
-            node.dec_device_lock_ref(FULL);
+            tree_core.arena.node_mut(cur).dec_device_lock_ref(FULL);
             if let Some(key_len) = newly_unlocked_len {
                 tree_core.dec_protected_size(FULL, key_len);
                 tree_core.inc_evictable_size(FULL, key_len);
@@ -514,14 +520,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                         loaded
                             .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
                         let locked = loaded.device_lock_ref(FULL) > 0;
+                        let tokens = tree_core.component_reclaimable_value_len_(loaded_idx, FULL);
                         offset += n_len;
                         // Full uses leaf sets, not LRU. A value materialized
                         // under lock is protected; the last release moves it
                         // to evictable.
                         if locked {
-                            tree_core.inc_protected_size(FULL, n_len as usize);
+                            tree_core.inc_protected_size(FULL, tokens);
                         } else {
-                            tree_core.inc_evictable_size(FULL, n_len as usize);
+                            tree_core.inc_evictable_size(FULL, tokens);
                         }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
                     }
