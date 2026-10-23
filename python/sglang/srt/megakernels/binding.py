@@ -12,10 +12,10 @@ replaces, SGLang's kernel ops, and the reads listed below.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
@@ -108,8 +108,7 @@ class KvPoolView:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
 
 
-@dataclass(frozen=True)
-class KdaStateView:
+class KdaStateView(msgspec.Struct, frozen=True):
     """One KDA layer's SGLang-owned, non-ReplaySSM recurrent state."""
 
     conv: tuple[torch.Tensor, ...]
@@ -167,21 +166,18 @@ class KdaPoolView:
         return self._states[int(layer_id)]
 
 
-@dataclass(frozen=True)
-class HybridPoolView:
+class HybridPoolView(msgspec.Struct, frozen=True):
     mla: MlaPoolView
     kda: KdaPoolView
 
 
-@dataclass(frozen=True)
-class PreparationView:
+class PreparationView(msgspec.Struct, frozen=True):
     """Runtime resources offered to an optional pre-capture preparation hook."""
 
     hybrid: Optional[HybridPoolView] = None
 
 
-@dataclass(frozen=True)
-class MlaStepView:
+class MlaStepView(msgspec.Struct, frozen=True):
     block_table: torch.Tensor
     sequence_lengths: torch.Tensor
     write_slots: torch.Tensor
@@ -204,8 +200,7 @@ class KdaStepView:
         self._track_decode_state(int(layer_id))
 
 
-@dataclass(frozen=True)
-class HybridStepView:
+class HybridStepView(msgspec.Struct, frozen=True):
     mla: MlaStepView
     kda: KdaStepView
 
@@ -259,14 +254,12 @@ class ForwardView:
         return self._core_compressor()
 
 
-@dataclass(frozen=True)
-class _SealedSource:
+class _SealedSource(msgspec.Struct, frozen=True):
     identity: tuple
     current: Callable[[], Any]
 
 
-@dataclass(frozen=True)
-class _HybridSources:
+class _HybridSources(msgspec.Struct, frozen=True):
     model_runner: ModelRunner
     backend: HybridLinearAttnBackend
     full_backend: TRTLLMMLABackend
