@@ -323,7 +323,7 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
     """An eager low-ratio break inside the prefill graph's late-layer tail must read
     the hoisted rows of the tail, not rows rebuilt from the whole extend."""
 
-    def _run(self, hoisted_req, hoisted_pos, positions):
+    def _run(self, hoisted_req, hoisted_pos, positions, q_lora=None):
         backend = object.__new__(deepseek_v4_backend.DeepseekV4AttnBackend)
         backend.tail_source_kv_layer_id = None
         backend.forward_metadata = SimpleNamespace(
@@ -350,12 +350,13 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
             backend.forward_low_ratio_sources(
                 layer=layer,
                 x=torch.zeros(positions.shape[0], 4),
-                q_lora=torch.zeros(positions.shape[0], 4),
+                q_lora=torch.zeros(positions.shape[0], 4) if q_lora is None else q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
             )
         compress_args = backend._low_ratio_compress.call_args.args
         index_args = backend._low_ratio_index_topk.call_args.args
+        self.index_q_lora = index_args[2]
         return compress_args[2], compress_args[3], index_args[3], index_args[4]
 
     def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
@@ -368,6 +369,30 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(pos.tolist(), [2, 3, 3, 4, 5])
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
+
+    def test_quantized_q_lora_keeps_its_type_and_rows(self):
+        # HIP passes q_lora quantized: a struct a slice cannot cut. A decode or
+        # verify step's rows all live keeps it as is; DP padding cuts each field.
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
+
+        hoisted_req = torch.tensor([7, 7, 9])
+        hoisted_pos = torch.tensor([2, 3, 3])
+        for rows in (3, 5):
+            q_lora = Mxfp8Activation(
+                q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
+            )
+            positions = torch.cat(
+                [hoisted_pos, torch.zeros(rows - 3, dtype=torch.long)]
+            )
+            req, pos, _, _ = self._run(hoisted_req, hoisted_pos, positions, q_lora)
+            self.assertEqual(req.tolist(), [7, 7, 9])
+            self.assertEqual(pos.tolist(), [2, 3, 3])
+            got = self.index_q_lora
+            self.assertIsInstance(got, Mxfp8Activation)
+            if rows == 3:
+                self.assertIs(got, q_lora)
+            self.assertTrue(torch.equal(got.q, q_lora.q[:3]))
+            self.assertEqual(tuple(got.scale.shape), (3, 2))
 
 
 if __name__ == "__main__":

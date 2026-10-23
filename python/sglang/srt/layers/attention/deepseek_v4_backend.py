@@ -326,6 +326,24 @@ _bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
 
 
+def _first_rows(act, n: int):
+    """``act`` cut to its first n rows. HIP hands the low-ratio sources quantized
+    activations (``Mxfp8Activation``, ``Fp8GridActivation``): structs of row-major
+    tensors, which a slice of the struct cannot cut."""
+    if not isinstance(act, msgspec.Struct):
+        return act[:n]
+    fields = {name: getattr(act, name) for name in act.__struct_fields__}
+    if all(t.shape[0] == n for t in fields.values()):
+        return act
+    return msgspec.structs.replace(act, **{k: t[:n] for k, t in fields.items()})
+
+
+def _num_rows(act) -> int:
+    if isinstance(act, msgspec.Struct):
+        return getattr(act, act.__struct_fields__[0]).shape[0]
+    return act.shape[0]
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -2042,7 +2060,7 @@ class DeepseekV4AttnBackend(
         """Write every row's compressed KV for the source layer the tail starts at,
         before enter_late_layer_tail; the layer's own pass inside the tail then
         skips its compressor, also on a rank with no rows to write."""
-        if x.shape[0] > 0:
+        if _num_rows(x) > 0:
             self.forward_low_ratio_sources(
                 layer=layer,
                 x=x,
@@ -3393,9 +3411,9 @@ class DeepseekV4AttnBackend(
             # extend past them; an eager break in the late-layer tail sees fewer, and
             # there extend_seq_lens still spans the whole extend.
             n = min(hoisted_pos.shape[0], positions.shape[0])
-            x, positions = x[:n], positions[:n]
+            x, positions = _first_rows(x, n), positions[:n]
             if q_lora is not None:
-                q_lora = q_lora[:n]
+                q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
