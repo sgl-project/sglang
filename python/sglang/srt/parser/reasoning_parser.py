@@ -12,7 +12,10 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ResponsesRequest,
+)
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -49,6 +52,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 
 
 class StreamingParseResult:
@@ -2299,6 +2303,7 @@ class ReasoningParser:
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
         "cohere_command4": CohereCommand4Detector,
+        "response_template": ResponseTemplateReasoningDetector,
     }
 
     def __init__(
@@ -2309,6 +2314,7 @@ class ReasoningParser:
         request: ChatCompletionRequest = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
+        prefix: str | None = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -2385,6 +2391,14 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
+
+        if prefix is None:
+            prefix = getattr(request, "_response_parser_prefix", "")
+        if issubclass(detector_class, ResponseTemplateReasoningDetector):
+            if prefix:
+                kwargs["prefix"] = prefix
+            if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
+                kwargs["grammar_start"] = request._response_parser_grammar_start
 
         self.detector = detector_class(**kwargs)
 
