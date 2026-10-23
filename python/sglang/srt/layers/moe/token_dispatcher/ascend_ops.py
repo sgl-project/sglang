@@ -1,19 +1,20 @@
 """Ascend Ops MoE token dispatcher.
 
-Prefill and decode use different communication paths:
+Communication only: the expert-order regrouping and the local weighted
+unpermute live in the runner's ``ascend_ops -> ascend`` permute hooks
+(``moe_runner/ascend.py``), via the shared entry points in
+``hardware_backend/npu/moe/routing.py``.
 
-* prefill: TP-scoped ``allgather`` or ``alltoallv``, built on
-  ``npu_moe_init_routing_v2`` plus ``all_to_all_single``.
-* decode ``low_latency``: the MC2 MoE distribute ops
-  (``npu_moe_distribute_dispatch_v2`` / ``npu_moe_distribute_combine_v2``),
-  which perform the EP all-to-all (with optional int8/MX quantisation) around
-  the expert GEMMs.
-* decode ``fused_op``: a single ``dispatch_ffn_combine`` kernel (not
-  implemented yet).
+Paths (``--ascend-ops-config``):
 
-``torch_npu`` is imported lazily inside the path methods because this module is
-imported on every platform (``token_dispatcher/__init__`` and the triton MoE
-layer import it unconditionally).
+* prefill ``allgather``: TP all-gather; every rank computes its local
+  experts over the full batch.
+* prefill ``alltoallv``: token all-to-all over the TP group; the source-side
+  routing pass produces the wire layout.
+* decode ``low_latency``: MC2 distribute ops
+  (``npu_moe_distribute_dispatch_v2`` / ``npu_moe_distribute_combine_v2``)
+  around the expert GEMMs.
+* decode ``fused_op``: single fused kernel (not implemented yet).
 """
 
 from __future__ import annotations
@@ -29,11 +30,13 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
 )
-from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUFinalizeRouting
-from sglang.srt.hardware_backend.npu.moe.init_routing import (
+from sglang.srt.hardware_backend.npu.moe.routing import (
+    INT8_QUANT_MODE,
     MXFP8_QUANT_MODE,
-    NPUMoEInitRouting_v2,
-    _normalize_mxfp_scale,
+    ROUTING_QUANT_MODES,
+    npu_moe_init_routing,
+    npu_moe_finalize_routing,
+    normalize_mxfp_scale,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -46,14 +49,22 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu
 
-# ``quant_mode`` of the MC2 distribute ops, matching the enum used by
-# ``npu_moe_distribute_dispatch_setup``: 0 unquant, 1 static, 2 per-token
-# dynamic int8, 3 per-group dynamic fp8, 4 MX (e8m0 block scales).
-_MC2_QUANT_MODE = {
-    DispatcherOutputDtype.BF16: 0,
-    DispatcherOutputDtype.INT8: 2,
-    DispatcherOutputDtype.MXFP8: 4,
+if is_npu():
+    import torch_npu
+
+# Quant mode per consumer op.  The routing op's modes are shared with every
+# other Ascend MoE path (see routing.py); the MC2 distribute ops define
+# their own enum (``npu_moe_distribute_dispatch_setup``: 0 unquant, 2
+# per-token int8, 4 MX), so the same dtype maps to a different number.
+_QUANT_MODES = {
+    "routing": ROUTING_QUANT_MODES,
+    "mc2": {
+        DispatcherOutputDtype.BF16: 0,
+        DispatcherOutputDtype.INT8: 2,
+        DispatcherOutputDtype.MXFP8: 4,
+    },
 }
 
 # ``y_dtype`` of the MC2 ops is an ATen ``ScalarType`` value (op schema:
@@ -72,17 +83,35 @@ _TORCH_DTYPE_TO_ATEN = {
 
 
 class AscendOpsDispatchOutput(NamedTuple):
-    """Metadata passed from Ascend Ops dispatch to the MoE runner."""
+    """What the Ascend Ops dispatcher hands to the MoE runner.
+
+    Field meaning by ``exec_mode``:
+
+    - ``"mc2"`` (decode): ``hidden_states`` / ``hidden_states_scale`` are the
+      MC2 dispatch output (already grouped per expert), ``topk_weights`` /
+      ``topk_ids`` the (possibly padded) originals the MC2 combine needs.
+    - ``"alltoallv"`` (prefill): ``hidden_states`` is the raw a2a payload in
+      wire order, ``hidden_states_scale`` its scale, ``recv_counts`` the
+      per-source/per-expert receive counts the pre-permute derives the local
+      route ids from.
+    - ``"allgather"`` (prefill): ``hidden_states`` / ``hidden_states_scale``
+      are the gathered payload (bf16, or MXFP8 pre-quantized with its scale)
+      and ``topk_ids`` / ``topk_weights`` the gathered router output; the
+      local-expert filter and the regrouping run in the pre-permute.
+
+    ``quant_mode`` is the routing quant mode (see
+    ``hardware_backend/npu/moe/routing.py``); the MC2 path leaves it at -1.
+    """
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    expanded_row_idx: Optional[torch.Tensor]
-    expert_tokens: torch.Tensor
+    topk_weights: Optional[torch.Tensor]
+    topk_ids: Optional[torch.Tensor]
+    expert_tokens: Optional[torch.Tensor]
     group_list_type: int
-    prefill_mode: str
-    is_shortcut: bool = False
+    exec_mode: str
+    quant_mode: int = -1
+    recv_counts: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -143,7 +172,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.hidden_size = moe_runner_config.hidden_size
         self.quant_config: Optional[dict] = None
         self._dispatch_output: Optional[AscendOpsDispatchOutput] = None
-        self._dispatch_path: Optional[str] = None
         self._dispatch_group = None
         self._ep_comm_name: Optional[str] = None
         self._mc2_state: Optional[_MC2State] = None
@@ -161,8 +189,6 @@ class AscendOpsDispatcher(BaseDispatcher):
                     "NPU AllGather requires TP=EP, Attention CP=1, "
                     "contiguous expert placement and no fused shared experts"
                 )
-        self._init_routing = NPUMoEInitRouting_v2(quant_mode=-1)
-        self._finalize_routing = NPUFinalizeRouting(drop_pad_mode=2)
 
     def set_quant_config(self, quant_config: dict) -> None:
         """Store quantization settings used by the routing kernels."""
@@ -174,14 +200,12 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         if get_is_extend_in_batch():
+            self._dispatch_group = self.tp_group
             if self.ascend_ops_config.prefill == "allgather":
-                return self._dispatch_prefill_allgather(
-                    hidden_states, topk_weights, topk_ids
-                )
-            return self._dispatch_prefill_alltoallv(
-                hidden_states, topk_weights, topk_ids
-            )
+                return self._dispatch_allgather(hidden_states, topk_weights, topk_ids)
+            return self._dispatch_alltoallv(hidden_states, topk_weights, topk_ids)
 
+        self._dispatch_group = self.ep_group
         if self.ascend_ops_config.decode == "low_latency":
             return self._dispatch_decode_low_latency(
                 hidden_states, topk_weights, topk_ids
@@ -194,34 +218,22 @@ class AscendOpsDispatcher(BaseDispatcher):
                 "AscendOpsDispatcher.combine expects an AscendOpsCombineInput, "
                 f"got {combine_input.format.value}"
             )
-        if self._dispatch_output is None or self._dispatch_path is None:
+        output = self._dispatch_output
+        if output is None:
             raise RuntimeError("Ascend Ops combine called before dispatch")
 
-        path = self._dispatch_path
-        if path == "prefill_allgather":
-            return self._combine_prefill_allgather(combine_input)
-        if path == "prefill_alltoallv":
-            return self._combine_prefill_alltoallv(combine_input)
-        if path == "decode_low_latency":
-            return self._combine_decode_low_latency(combine_input)
-        if path == "decode_fused_op":
-            return self._combine_decode_fused_op(combine_input)
-        raise RuntimeError(f"unknown Ascend Ops dispatch path: {path}")
+        mode = output.exec_mode
+        if mode == "allgather":
+            return self._combine_allgather(combine_input.hidden_states)
+        if mode == "alltoallv":
+            return self._combine_alltoallv(combine_input.hidden_states)
+        if mode == "mc2":
+            return self._mc2_combine(combine_input)
+        raise RuntimeError(f"unknown Ascend Ops exec mode: {mode}")
 
-    # Dispatch path boundaries -------------------------------------------------
-
-    def _dispatch_prefill_allgather(self, hidden_states, topk_weights, topk_ids):
-        self._dispatch_path = "prefill_allgather"
-        self._dispatch_group = self.tp_group
-        return self._dispatch_allgather(hidden_states, topk_weights, topk_ids)
-
-    def _dispatch_prefill_alltoallv(self, hidden_states, topk_weights, topk_ids):
-        self._dispatch_path = "prefill_alltoallv"
-        self._dispatch_group = self.tp_group
-        return self._dispatch_alltoallv(hidden_states, topk_weights, topk_ids)
+    # Decode (MC2 low latency) -------------------------------------------------
 
     def _dispatch_decode_low_latency(self, hidden_states, topk_weights, topk_ids):
-        self._dispatch_path = "decode_low_latency"
         self._dispatch_group = self.ep_group
         num_tokens = hidden_states.shape[0]
         # Without DP attention every EP rank steps with the same BS, so no
@@ -239,29 +251,11 @@ class AscendOpsDispatcher(BaseDispatcher):
             topk_weights,
             padded_bs=pad_bs or num_tokens,
             dtype_mode="low_latency",
-            prefill_mode="",
         )
 
     def _dispatch_decode_fused_op(self, hidden_states, topk_weights, topk_ids):
-        self._dispatch_path = "decode_fused_op"
         self._dispatch_group = self.ep_group
         raise NotImplementedError("Ascend Ops decode fused-op dispatch is pending")
-
-    # Combine path boundaries --------------------------------------------------
-
-    def _combine_prefill_allgather(self, combine_input):
-        return self._combine_allgather(combine_input.hidden_states)
-
-    def _combine_prefill_alltoallv(self, combine_input):
-        return self._combine_alltoallv(combine_input.hidden_states)
-
-    def _combine_decode_low_latency(self, combine_input):
-        return self._mc2_combine(combine_input)
-
-    def _combine_decode_fused_op(self, combine_input):
-        raise NotImplementedError("Ascend Ops decode fused-op combine is pending")
-
-    # MC2 dispatch/combine -----------------------------------------------------
 
     def _mc2_dispatch(
         self,
@@ -270,19 +264,16 @@ class AscendOpsDispatcher(BaseDispatcher):
         topk_weights: torch.Tensor,
         padded_bs: int,
         dtype_mode: str,
-        prefill_mode: str,
     ) -> AscendOpsDispatchOutput:
         """Run ``npu_moe_distribute_dispatch_v2`` for one batch.
 
         ``padded_bs`` is the BS every rank in the EP group uses for this call;
         the trailing rows are dropped after combine via ``x_active_mask``.
         """
-        import torch_npu
-
         num_tokens = hidden_states.shape[0]
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.float()
-        quant_mode = self._quant_mode(dtype_mode)
+        quant_mode = self._quant_mode("mc2", dtype_mode)
 
         x_active_mask = None
         if padded_bs != num_tokens:
@@ -351,10 +342,9 @@ class AscendOpsDispatcher(BaseDispatcher):
             hidden_states_scale=dynamic_scales if quant_mode != 0 else None,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            expanded_row_idx=None,
             expert_tokens=expert_token_nums,
             group_list_type=1,
-            prefill_mode=prefill_mode,
+            exec_mode="mc2",
         )
         return self._dispatch_output
 
@@ -409,8 +399,6 @@ class AscendOpsDispatcher(BaseDispatcher):
 
     def _mc2_combine(self, combine_input: AscendOpsCombineInput) -> torch.Tensor:
         """Run ``npu_moe_distribute_combine_v2`` for the batch dispatched last."""
-        import torch_npu
-
         state = self._mc2_state
         output = self._dispatch_output
         if state is None or output is None:
@@ -438,20 +426,32 @@ class AscendOpsDispatcher(BaseDispatcher):
         self._dispatch_output = None
         return combined[: state.num_tokens]
 
-    def _quant_mode(self, dtype_mode: str) -> int:
+    def _quant_mode(self, op: str, dtype_mode: Optional[str] = None) -> int:
+        """Quant mode op ``"routing"`` or ``"mc2"`` uses for the wire dtype."""
         dtype = self._resolve_dispatch_dtype(dtype_mode)
         try:
-            return _MC2_QUANT_MODE[dtype]
+            return _QUANT_MODES[op][dtype]
         except KeyError:
             raise NotImplementedError(
-                "ascend_ops MC2 dispatch does not support dispatcher output "
-                f"dtype {dtype.value}; supported: bf16, int8, mxfp8"
+                f"ascend_ops {op} dispatch does not support dispatcher output "
+                f"dtype {dtype.value}; supported: "
+                f"{tuple(d.value for d in _QUANT_MODES[op])}"
             ) from None
 
-    def _resolve_dispatch_dtype(self, dtype_mode: str) -> DispatcherOutputDtype:
-        """Resolve the dispatch wire dtype for ``dtype_mode`` (normal/low_latency)."""
+    def _resolve_dispatch_dtype(
+        self, dtype_mode: Optional[str] = None
+    ) -> DispatcherOutputDtype:
+        """Resolve the dispatch wire dtype.
+
+        ``dtype_mode`` (e.g. ``"low_latency"``) first consults the
+        mode-specific ``<mode>_dispatcher_output_dtype`` key before falling
+        back to the shared ``dispatcher_output_dtype``; ``None`` reads only
+        the shared key.
+        """
         quant_config = self.quant_config or {}
-        raw = quant_config.get(f"{dtype_mode}_dispatcher_output_dtype")
+        raw = None
+        if dtype_mode is not None:
+            raw = quant_config.get(f"{dtype_mode}_dispatcher_output_dtype")
         if raw is None:
             raw = quant_config.get("dispatcher_output_dtype")
         if raw is None:
@@ -471,12 +471,13 @@ class AscendOpsDispatcher(BaseDispatcher):
     # Prefill allgather --------------------------------------------------------
 
     def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids):
+        """Gather the full batch on every TP rank."""
         if self._dispatch_output is not None:
             raise RuntimeError("NPU dispatch called before the previous combine")
         group = self._dispatch_group
         input_dtype = hidden_states.dtype
-        quant_mode = self._routing_quant_mode()
-        if quant_mode not in (-1, 1, MXFP8_QUANT_MODE):
+        quant_mode = self._quant_mode("routing")
+        if quant_mode not in (-1, INT8_QUANT_MODE, MXFP8_QUANT_MODE):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
@@ -523,14 +524,12 @@ class AscendOpsDispatcher(BaseDispatcher):
 
         scales = None
         if quant_mode == MXFP8_QUANT_MODE:
-            import torch_npu
-
             # Quantize local rows once, then gather MXFP8 payload and scales.
             if hidden_states.shape[0] > 0:
                 hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
                     hidden_states, dst_type=torch.float8_e4m3fn
                 )
-                scales = _normalize_mxfp_scale(scales).view(torch.uint8)
+                scales = normalize_mxfp_scale(scales).view(torch.uint8)
             else:
                 hidden_states = hidden_states.new_empty(
                     (0, self.hidden_size), dtype=torch.float8_e4m3fn
@@ -539,89 +538,30 @@ class AscendOpsDispatcher(BaseDispatcher):
                     (0, (self.hidden_size + 63) // 64, 2), dtype=torch.uint8
                 )
 
-        hidden_states = gather_rows(hidden_states)
-        if scales is not None:
-            scales = gather_rows(scales)
-        topk_weights = gather_rows(topk_weights.float())
-        topk_ids = gather_rows(topk_ids.to(torch.int32))
-        local_ids = topk_ids - self.ep_rank * self.num_local_experts
-        is_local = (local_ids >= 0) & (local_ids < self.num_local_experts)
-        topk_weights = topk_weights.masked_fill(~is_local, 0)
-        # Operator constraint: npu_moe_init_routing_v2 needs a non-negative
-        # out-of-range expert ID for dropped routes. Do not use -1: it can
-        # corrupt valid expert counts even when the routing weight is zero.
-        # num_local_experts is just beyond the valid local expert ID range.
-        local_ids = local_ids.masked_fill(~is_local, self.num_local_experts)
-        if scales is not None:
-            # Already MXFP8: reorder payload and scales without requantizing.
-            x, row_idx, expert_tokens, scales = torch_npu.npu_moe_init_routing_v2(
-                hidden_states,
-                local_ids,
-                active_num=local_ids.numel(),
-                expert_num=self.num_local_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                row_idx_type=0,
-                active_expert_range=[0, self.num_local_experts],
-                quant_mode=-1,
-                scale=scales,
-                x_dtype=torch.float8_e4m3fn,
-            )
-            scales = _normalize_mxfp_scale(scales)
-        else:
-            x, row_idx, expert_tokens, scales = self._init_routing_tokens(
-                hidden_states, local_ids, self.num_local_experts, quant_mode
-            )
-        # Grouped GEMM and activation use device counts, so keep the capacity.
-        # If any route is dropped, the final capacity row is unused. Combine
-        # zeros unused rows on device before this sentinel is read by finalize.
-        row_idx = row_idx.masked_fill(~is_local.reshape(-1), local_ids.numel() - 1)
         self._allgather_state = {
             "group": group,
             "row_sizes": row_sizes,
             "input_dtype": input_dtype,
         }
         self._dispatch_output = AscendOpsDispatchOutput(
-            hidden_states=x,
-            hidden_states_scale=scales,
-            topk_weights=topk_weights,
-            topk_ids=local_ids,
-            expanded_row_idx=row_idx,
-            expert_tokens=expert_tokens,
+            hidden_states=gather_rows(hidden_states),
+            hidden_states_scale=gather_rows(scales) if scales is not None else None,
+            topk_weights=gather_rows(topk_weights.float()),
+            topk_ids=gather_rows(topk_ids.to(torch.int32)),
+            expert_tokens=None,
             group_list_type=1,
-            prefill_mode="allgather",
+            exec_mode="allgather",
+            quant_mode=quant_mode,
         )
         return self._dispatch_output
 
-    def _combine_allgather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _combine_allgather(self, contributions: torch.Tensor) -> torch.Tensor:
+        """ReduceScatter the per-rank contributions back to the local shard."""
         state = self._allgather_state
         if state is None:
             raise RuntimeError("NPU AllGather combine called before dispatch")
-        dispatched = self._dispatch_output
         sizes = state["row_sizes"]
         group = state["group"]
-        # Operator constraint: finalize mode 2 requires the full
-        # [global_tokens * top_k, hidden] shape, not just the valid expert rows.
-        expert_output = torch.zeros(
-            (dispatched.topk_ids.numel(), self.hidden_size),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        expert_output[: hidden_states.shape[0]].copy_(hidden_states)
-        # Keep the valid count on device. Zero unused capacity before finalize:
-        # dropped routes must not read NaN even when their weight is zero.
-        unused_rows = torch.arange(
-            expert_output.shape[0], device=expert_output.device
-        ) >= dispatched.expert_tokens.sum()
-        expert_output.masked_fill_(unused_rows[:, None], 0)
-        # Keep weighted expert sums in FP32 across ranks. Rounding each
-        # rank's partial output to BF16 before ReduceScatter loses precision.
-        contributions = self._finalize_routing._finalize_routing(
-            expert_output,
-            topk_weights=dispatched.topk_weights,
-            expanded_row_idx=dispatched.expanded_row_idx,
-            topk_ids=dispatched.topk_ids,
-        )
         # Equal-sized chunks already have the layout required by ReduceScatter.
         max_rows = max(sizes)
         if min(sizes) == max_rows:
@@ -642,27 +582,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         return output
 
     # Prefill alltoallv --------------------------------------------------------
-
-    def _routing_quant_mode(self) -> int:
-        dtype = (self.quant_config or {}).get("dispatcher_output_dtype", "bf16")
-        dtype = getattr(dtype, "value", dtype)
-
-        dtype = {
-            "mxfp8": "mx_fp8_e4m3",
-            "mxfp4": "mx_fp4_e2m1",
-        }.get(dtype, dtype)
-        modes = {
-            "bf16": -1,
-            "int8": 1,
-            "mx_fp8_e4m3": 3,
-            "mx_fp4_e2m1": 9,
-        }
-        if dtype not in modes:
-            raise NotImplementedError(
-                "Ascend Ops alltoallv currently supports dispatcher output "
-                f"dtypes {tuple(modes)}, got {dtype!r}"
-            )
-        return modes[dtype]
 
     def _alltoall_counts(
         self, topk_ids: torch.Tensor, group
@@ -727,202 +646,75 @@ class AscendOpsDispatcher(BaseDispatcher):
         return output
 
     def _dispatch_alltoallv(self, hidden_states, topk_weights, topk_ids):
+        """Send each token to the rank owning its expert."""
         topk_ids = topk_ids.to(torch.int32)
         group = self._dispatch_group
         input_splits, output_splits, recv_counts = self._alltoall_counts(
             topk_ids, group
         )
 
-        quant_mode = self._routing_quant_mode()
-        permuted, expanded_row_idx, _, hidden_states_scale = self._init_routing_tokens(
-            hidden_states, topk_ids, self.num_experts, quant_mode
+        quant_mode = self._quant_mode("routing")
+        routed = npu_moe_init_routing(
+            hidden_states, topk_ids, self.num_experts, quant_mode=quant_mode
         )
 
-        scale_for_comm = hidden_states_scale
-        if quant_mode not in (-1, 1) and scale_for_comm is not None:
+        scale_for_comm = routed.scale
+        if quant_mode not in (-1, INT8_QUANT_MODE) and scale_for_comm is not None:
             scale_for_comm = scale_for_comm.view(torch.uint8)
         received_scale = (
             self._alltoall_single(scale_for_comm, output_splits, input_splits, group)
             if scale_for_comm is not None
             else None
         )
-
-        received = self._alltoall_single(permuted, output_splits, input_splits, group)
-        local_counts = recv_counts.reshape(-1)
-        ep_size = recv_counts.shape[0]
-        local_ids = torch.arange(
-            self.num_local_experts, dtype=torch.int32, device=received.device
-        ).repeat(ep_size, 1)
-        local_ids = torch.repeat_interleave(local_ids.reshape(-1), local_counts)
-        local_ids = local_ids.view(-1, 1)
-        if quant_mode not in (-1, 1) and received_scale is not None:
-            received_scale = received_scale.reshape(received_scale.shape[0], -1, 2)
-        if self.num_local_experts > 1 and hidden_states.shape[0] > 0:
-            local_permuted, local_expanded_row_idx, _, local_scale = (
-                self._init_routing_tokens(
-                    received,
-                    local_ids,
-                    self.num_local_experts,
-                    quant_mode,
-                    scale=received_scale,
-                    reuse_scale=quant_mode != -1,
-                )
-            )
-        else:
-            # With one local expert the alltoall result is already in expert
-            # order; the reference strategy skips the second routing pass.
-            local_permuted = received
-            local_expanded_row_idx = torch.arange(
-                received.shape[0], dtype=torch.int32, device=received.device
-            )
-            local_scale = received_scale
-
-        local_expert_tokens = recv_counts.sum(dim=0).to(torch.int64)
-        if quant_mode != -1 and self.num_local_experts > 1:
-            local_permuted = local_permuted.view(self._routing_quant_dtype(quant_mode))
-        local_topk_ids = local_ids
-        local_topk_weights = torch.ones(
-            (local_ids.shape[0], 1),
-            dtype=topk_weights.dtype,
-            device=topk_weights.device,
+        received = self._alltoall_single(
+            routed.hidden_states, output_splits, input_splits, group
         )
+
         self._alltoall_state = {
             "group": group,
             "input_splits": input_splits,
             "output_splits": output_splits,
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
-            "expanded_row_idx": expanded_row_idx.clone(),
-            "local_expanded_row_idx": local_expanded_row_idx.clone(),
-            "local_topk_ids": local_topk_ids,
-            "local_topk_weights": local_topk_weights,
+            "expanded_row_idx": routed.expanded_row_idx.clone(),
             "hidden_shape": hidden_states.shape,
         }
         self._dispatch_output = AscendOpsDispatchOutput(
-            hidden_states=local_permuted,
-            hidden_states_scale=local_scale,
-            topk_weights=local_topk_weights,
-            topk_ids=local_topk_ids,
-            expanded_row_idx=local_expanded_row_idx,
-            expert_tokens=local_expert_tokens,
+            hidden_states=received,
+            hidden_states_scale=received_scale,
+            topk_weights=None,
+            topk_ids=None,
+            expert_tokens=None,
             group_list_type=1,
-            prefill_mode="alltoallv",
+            exec_mode="alltoallv",
+            quant_mode=quant_mode,
+            recv_counts=recv_counts,
         )
         return self._dispatch_output
 
-    def _init_routing_tokens(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        num_experts: int,
-        quant_mode: int,
-        scale: Optional[torch.Tensor] = None,
-        reuse_scale: bool = False,
-    ):
-        if quant_mode == -1:
-            return NPUMoEInitRouting_v2(quant_mode=-1)._init_routing(
-                hidden_states, topk_ids, num_experts, topk_ids.shape[1]
-            )
+    def _combine_alltoallv(self, local_output: torch.Tensor) -> torch.Tensor:
+        """Reverse the a2a and apply the router weights at the source.
 
-        import torch_npu
-
-        quant_dtype = self._routing_quant_dtype(quant_mode)
-        if reuse_scale:
-            # This is the second routing pass in the reference alltoall
-            # strategy.  The scale is supplied by the first pass after the
-            # communication and quant_mode is intentionally omitted.
-            if scale is None:
-                raise ValueError("quantized local routing requires a scale")
-            return torch_npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                scale=scale,
-                expert_num=num_experts,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
-                x_dtype=quant_dtype,
-            )
-
-        return torch_npu.npu_moe_init_routing_v2(
-            hidden_states,
-            topk_ids,
-            quant_mode=quant_mode,
-            expert_num=num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            row_idx_type=0,
-            active_expert_range=[0, num_experts],
-        )
-
-    @staticmethod
-    def _routing_quant_dtype(quant_mode: int) -> torch.dtype:
-        return {
-            1: torch.int8,
-            3: torch.float8_e4m3fn,
-            9: torch.float4_e2m1fn_x2,
-        }[quant_mode]
-
-    @staticmethod
-    def _synchronize_npu(tensor: torch.Tensor) -> None:
-        """Wait for NPU communication/routing writes before consuming metadata."""
-        if tensor.device.type == "npu":
-            torch.npu.synchronize(tensor.device)
-
-    def _combine_alltoallv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        ``local_output`` arrives from the runner's post-permute already mapped
+        back to wire order (the post-permute undoes the local expert
+        regrouping with ``local_expanded_row_idx``).
+        """
         state = self._alltoall_state
         if state is None:
             raise RuntimeError("Ascend Ops alltoallv combine called before dispatch")
 
-        if self.num_local_experts > 1 and hidden_states.shape[0] > 0:
-            local_output = self._finalize_routing_no_export(
-                hidden_states,
-                None,
-                state["local_expanded_row_idx"],
-            )
-        else:
-            local_output = hidden_states
         source_order = self._alltoall_single(
             local_output,
             state["input_splits"],
             state["output_splits"],
             state["group"],
         )
-        output = self._finalize_routing_no_export(
+        output = npu_moe_finalize_routing(
             source_order,
-            state["topk_weights"],
             state["expanded_row_idx"],
+            topk_weights=state["topk_weights"],
         ).view(state["hidden_shape"])
 
         self._alltoall_state = None
         self._dispatch_output = None
         return output
-
-    @staticmethod
-    def _finalize_routing_no_export(
-        hidden_states: torch.Tensor,
-        topk_weights: Optional[torch.Tensor],
-        expanded_row_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        if (
-            hidden_states.shape[0] > 0
-            and expanded_row_idx.shape[0] != hidden_states.shape[0]
-        ):
-            raise RuntimeError(
-                "Ascend Ops finalize metadata mismatch: "
-                f"hidden_states has {hidden_states.shape[0]} rows but "
-                f"expanded_row_idx has {expanded_row_idx.shape[0]} rows"
-            )
-        hidden_states = hidden_states.contiguous()
-        expanded_row_idx = expanded_row_idx.to(torch.int32).contiguous()
-        if topk_weights is not None:
-            topk_weights = topk_weights.contiguous()
-        return torch.ops.npu.npu_moe_finalize_routing(
-            hidden_states,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights,
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=None,
-            drop_pad_mode=2,
-        )
