@@ -1491,6 +1491,18 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                # Gate the recv on our forward: the last stage sends only after its own,
+                # and an early recv spins on SMs and stalls flashinfer's all-SM MLA.
+                if (
+                    get_parallel().pp_async_batch_depth == 0
+                    and self.pp_group.is_first_rank
+                    and not self._pp_spec_relay
+                    and self.launch_event is not None
+                ):
+                    with self.pp_comm_stream_ctx:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
                 tensor_dict, output_recv_event = self._pp_recv_dict_from_prev_stage()
                 next_pp_outputs = PPProxyTensors(tensor_dict)
             with self.copy_stream_ctx:
