@@ -2,11 +2,13 @@
 
 After EP dispatch non-local experts arrive as ``-1``. ``_fused_virtual_topk_ids``
 must keep those sentinels instead of remapping them onto another adapter's
-virtual-expert slot, and the ``>= 1024``-expert align fallbacks must route
-``-1`` and ``>= num_experts`` IDs into a sentinel bucket rather than a real
-expert. Either bug corrupts routing silently.
+virtual-expert slot, and the ``>= 1024``-expert align paths must place every
+valid (token, expert) pair exactly once in its own expert's blocks while
+invalid IDs never enter a real expert's block. Either bug corrupts routing
+silently.
 """
 
+import collections
 import unittest
 
 import torch
@@ -127,7 +129,8 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
     """Shared tests for both the torch.compile and JIT align_block_size paths.
 
-    Subclasses override ``_align`` to select the concrete implementation.
+    Subclasses override ``_align`` to select the concrete implementation and
+    ``_invalid_ids`` with the IDs outside ``[0, num_experts)`` it accepts.
     """
 
     @classmethod
@@ -139,99 +142,76 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
     def _align(self, topk_ids, block_size, num_experts):
         raise NotImplementedError
 
-    @staticmethod
-    def _assigned_experts(expert_ids: torch.Tensor) -> list:
-        """Return the list of real expert ids assigned to blocks (filtering
-        out -1 sentinels for padding/exclusion)."""
-        return expert_ids[expert_ids != -1].cpu().tolist()
+    def _invalid_ids(self, num_experts):
+        raise NotImplementedError
 
-    def _assert_only_real_or_sentinel(self, expert_ids: torch.Tensor, num_experts: int):
-        for eid in expert_ids.cpu().tolist():
-            self.assertTrue(
-                eid == -1 or 0 <= eid < num_experts,
-                f"expert_ids contains invalid value {eid}",
+    def _assert_aligned(self, ids, block_size, num_experts):
+        """Every valid (token, expert) pair lands exactly once in a block of
+        its own expert, each expert gets ceil(pairs / block_size) blocks, a
+        real-expert block holds only its pairs and padding, and a -1 block
+        holds no valid pair and is no more than the invalid pairs need. The
+        order inside a block is not part of the contract."""
+        order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(0))
+        topk_ids = torch.tensor(ids, dtype=torch.int32)[order].view(-1, 2)
+        sorted_ids, expert_ids, num_post_pad = self._align(
+            topk_ids.to(self.device), block_size, num_experts
+        )
+        flat = topk_ids.view(-1).tolist()
+        padding = len(flat)
+        total = int(num_post_pad.reshape(-1)[0])
+        self.assertEqual(total % block_size, 0, f"padded count {total}")
+        self.assertLessEqual(total, sorted_ids.numel(), f"padded count {total}")
+        labels = expert_ids[: total // block_size].tolist()
+        blocks = sorted_ids[:total].view(-1, block_size).tolist()
+
+        placed, blocks_per_expert = collections.Counter(), collections.Counter()
+        for label, block in zip(labels, blocks):
+            pairs = [j for j in block if j != padding]
+            self.assertTrue(all(0 <= j < padding for j in pairs), f"block {block}")
+            if label == -1:
+                self.assertFalse(
+                    [j for j in pairs if 0 <= flat[j] < num_experts],
+                    f"valid pairs in a -1 block: {block}",
+                )
+                continue
+            self.assertTrue(0 <= label < num_experts, f"block label {label}")
+            self.assertEqual(
+                {flat[j] for j in pairs}, {label}, f"block of expert {label}: {block}"
             )
+            placed.update(pairs)
+            blocks_per_expert[label] += 1
 
-    def test_all_valid_baseline(self):
-        """Sanity: with no invalid IDs, every present real expert appears
-        in the assignment, and no junk values leak through."""
+        valid = [j for j, e in enumerate(flat) if 0 <= e < num_experts]
+        self.assertEqual(placed, collections.Counter(valid), "valid pairs")
+        per_expert = collections.Counter(flat[j] for j in valid)
+        self.assertEqual(
+            blocks_per_expert,
+            collections.Counter(
+                {e: -(-n // block_size) for e, n in per_expert.items()}
+            ),
+        )
+        num_invalid = len(flat) - len(valid)
+        self.assertLessEqual(labels.count(-1), -(-num_invalid // block_size))
+
+    def test_small_every_expert_with_invalid_ids(self):
+        """Every expert populated, one spanning two blocks, invalid IDs mixed
+        in."""
         num_experts = 8
         block_size = 16
-        topk_ids = torch.tensor(
-            [[0, 3], [4, 7], [1, 2], [5, 6]],
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
-
-        self._assert_only_real_or_sentinel(expert_ids, num_experts)
-        assigned = set(self._assigned_experts(expert_ids))
-        self.assertEqual(assigned, set(range(num_experts)))
-
-    def test_negative_ids_routed_to_sentinel(self):
-        """`-1` tokens must not appear as real expert assignments and must
-        not corrupt the assignment of real IDs."""
-        num_experts = 8
-        block_size = 16
-        topk_ids = torch.tensor(
-            [[0, -1], [-1, 7], [1, -1], [-1, -1]],
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
-
-        self._assert_only_real_or_sentinel(expert_ids, num_experts)
-        assigned = self._assigned_experts(expert_ids)
-        for valid_eid in (0, 1, 7):
-            self.assertIn(valid_eid, assigned)
-
-    def test_oor_ids_routed_to_sentinel(self):
-        """IDs `>= num_experts` (e.g. virtual-experts remap when combined
-        with non-local sentinels) must not break cumsum/searchsorted and
-        must not show up as real assignments."""
-        num_experts = 8
-        block_size = 16
-        topk_ids = torch.tensor(
-            [[0, 100], [50, 7], [1, 200]],
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
-
-        self._assert_only_real_or_sentinel(expert_ids, num_experts)
-        assigned = self._assigned_experts(expert_ids)
-        for valid_eid in (0, 1, 7, 50):
-            if valid_eid >= num_experts:
-                self.assertNotIn(valid_eid, assigned)
-            else:
-                self.assertIn(valid_eid, assigned)
+        valid = list(range(num_experts)) + [3] * block_size
+        ids = valid + self._invalid_ids(num_experts) * 4
+        self._assert_aligned(ids, block_size, num_experts)
 
     def test_mixed_invalid_at_production_size(self):
         """Mirror the production trigger: `num_experts >= 1024` (only path
         where the large-expert fallback is invoked instead of the native
-        align kernel)."""
+        align kernel). The first and last expert, lone pairs and one expert
+        spanning two blocks, interleaved with invalid IDs."""
         num_experts = 1500
         block_size = 16
-        topk_ids = torch.tensor(
-            [
-                [-1, 500],
-                [num_experts + 7, 1000],
-                [num_experts * 2, 100],
-                [-1, 0],
-            ],
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
-
-        self._assert_only_real_or_sentinel(expert_ids, num_experts)
-        assigned = self._assigned_experts(expert_ids)
-        for valid_eid in (0, 100, 500, 1000):
-            self.assertIn(valid_eid, assigned)
+        valid = [0, num_experts - 1, 100, 500, 1000] + [700] * (block_size + 3)
+        ids = valid + self._invalid_ids(num_experts) * 4
+        self._assert_aligned(ids, block_size, num_experts)
 
 
 class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
@@ -239,6 +219,10 @@ class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
 
     def _align(self, topk_ids, block_size, num_experts):
         return _align_block_size_torch(topk_ids, block_size, num_experts)
+
+    def _invalid_ids(self, num_experts):
+        # Negative and >= num_experts IDs both go to its sentinel bucket.
+        return [-1, num_experts + 7, 2 * num_experts]
 
 
 @unittest.skipIf(
@@ -258,6 +242,13 @@ class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         )
         expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
         return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+    def _invalid_ids(self, num_experts):
+        # Production hands this path EP's -1 and in-range virtual IDs only
+        # (_fused_virtual_topk_ids keeps sentinels negative). Its sort kernel
+        # indexes the bucket offsets by id + 1 without a bound, so IDs
+        # >= num_experts are outside its contract.
+        return [-1]
 
 
 if __name__ == "__main__":

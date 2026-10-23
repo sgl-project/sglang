@@ -13,12 +13,15 @@ first. What this guards is what CI can hold stable:
 - the server starts at all with multiple adapters + speculation (it used to
   crash loading the target's adapters into the draft model);
 - adapters are actually applied during target-verify (adapter output differs
-  from base output) in uniform batches, in a mixed-adapter batch, and in a
-  batch wider than the cuda-graph capture (the eager verify path used to
-  crash on extend_seq_lens_cpu=None);
+  from base output) in uniform batches and a mixed-adapter batch replayed
+  from the decode cuda graph, and in a batch wider than the capture limit,
+  whose target-verify runs eager (that path used to crash on
+  extend_seq_lens_cpu=None); the graph-pass counters prove which path ran,
+  since a request count alone does not show how the scheduler batched it;
 - speculation is really running (accept length above 1).
 """
 
+import re
 import unittest
 
 import requests
@@ -50,6 +53,30 @@ ADAPTERS = [
 # Row kinds of a mixed batch: base first, then every adapter.
 ROUTES = [None] + [name for name, _ in ADAPTERS]
 SAMPLING = {"temperature": 0, "max_new_tokens": 32}
+# Captures the 9-request mixed batch below but not the 24-request one. The
+# default limit on an 80 GB GPU (48 with EAGLE) captures both.
+DECODE_GRAPH_MAX_BS = 12
+WIDE_BATCH = 24
+
+
+def _decode_passes(base_url):
+    """Decode steps so far by mode. A speculative decode step counts its
+    target-verify forward: `decode_cuda_graph` when it replayed the captured
+    graph, `decode_none` when it ran eager."""
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    return {
+        mode: sum(
+            float(value)
+            for value in re.findall(
+                r'^sglang:cuda_graph_passes_total\{[^}]*mode="'
+                + mode
+                + r'"[^}]*\}\s+([0-9.eE+-]+)$',
+                metrics,
+                re.MULTILINE,
+            )
+        )
+        for mode in ("decode_cuda_graph", "decode_none")
+    }
 
 
 class TestEagle3MultiLoRA(CustomTestCase):
@@ -81,6 +108,8 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 # batches below co-batch base requests with adapter requests.
                 f"--max-loras-per-batch={len(ADAPTERS) + 1}",
                 "--mem-fraction-static=0.7",
+                f"--cuda-graph-max-bs-decode={DECODE_GRAPH_MAX_BS}",
+                "--enable-metrics",
                 "--lora-paths",
             ]
             + [f"{name}={path}" for name, path in ADAPTERS],
@@ -122,7 +151,12 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 f"{where}; LoRA was likely not applied during target-verify",
             )
 
+    def _decode_passes_since(self, before):
+        after = _decode_passes(self.base_url)
+        return {mode: after[mode] - before[mode] for mode in after}
+
     def test_adapters_are_applied_under_speculation(self):
+        before = _decode_passes(self.base_url)
         base = self._generate(PROMPTS, [None] * len(PROMPTS))
         for name, _ in ADAPTERS:
             adapted = self._generate(PROMPTS, [name] * len(PROMPTS))
@@ -133,12 +167,26 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 "was likely not applied during target-verify",
             )
         self._assert_adapters_applied(self._generate_mixed(PROMPTS), "a mixed batch")
-        # Wider than the default cuda-graph capture, so target-verify falls
-        # back to the eager path.
-        wide = 24
-        prompts = [PROMPTS[i % len(PROMPTS)] for i in range(wide // len(ROUTES))]
+        passes = self._decode_passes_since(before)
+        self.assertGreater(
+            passes["decode_cuda_graph"], 0, f"no target-verify graph replay: {passes}"
+        )
+        self.assertEqual(
+            passes["decode_none"],
+            0,
+            f"a batch within the capture limit ran eager target-verify: {passes}",
+        )
+
+        before = _decode_passes(self.base_url)
+        prompts = [PROMPTS[i % len(PROMPTS)] for i in range(WIDE_BATCH // len(ROUTES))]
         self._assert_adapters_applied(
-            self._generate_mixed(prompts), f"a {wide}-request eager batch"
+            self._generate_mixed(prompts), f"a {WIDE_BATCH}-request eager batch"
+        )
+        passes = self._decode_passes_since(before)
+        self.assertGreater(
+            passes["decode_none"],
+            0,
+            f"the {WIDE_BATCH}-request batch never ran eager target-verify: {passes}",
         )
 
     def test_speculation_is_active(self):

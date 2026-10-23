@@ -222,8 +222,11 @@
     "registered/unit/managers/test_lora_lru_unload_unit.py",
     "registered/unit/managers/test_lora_update_result_merge.py",
     "registered/unit/models/test_attention_sink_loader_layout.py",
+    "registered/unit/models/test_dots_fused_gate_loader_layout.py",
     "registered/unit/models/test_inkling_linear_loader_layout.py",
     "registered/unit/models/test_inkling_moe_loader_layout.py",
+    "registered/unit/models/test_interns1pro_fope_loader_layout.py",
+    "registered/unit/models/test_mimo_fused_qkv_loader_layout.py",
     "registered/unit/models/test_nemotron_h_shared_add.py"
   ]
 }

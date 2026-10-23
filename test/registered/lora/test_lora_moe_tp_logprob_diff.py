@@ -51,8 +51,18 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
                     for t in tp2["top_output_logprobs"][i]
                 ]
             )
-            ref_lps = torch.tensor(ref["lps"][: lps.shape[0]])
-            diff = torch.abs(lps[: ref_lps.shape[0]] - ref_lps)
+            ref_lps = torch.tensor(ref["lps"])
+            # One logprob per generated token on both sides, including the EOS
+            # token that ends a short answer: compare the whole reference, never
+            # a common prefix.
+            self.assertGreater(lps.numel(), 0, f"No output logprobs on prompt {i}")
+            self.assertEqual(
+                lps.shape, ref_lps.shape, f"Logprob count mismatch on prompt {i}"
+            )
+            self.assertTrue(
+                torch.isfinite(lps).all(), f"Non-finite logprob on prompt {i}"
+            )
+            diff = torch.abs(lps - ref_lps)
             stats = MOE_LORA_VLLM_REFERENCE_STATS[i]
             self.assertLessEqual(
                 diff.max().item(),

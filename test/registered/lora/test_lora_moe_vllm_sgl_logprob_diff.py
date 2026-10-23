@@ -11,6 +11,7 @@ Usage:
 
 """
 
+import math
 import multiprocessing as mp
 import unittest
 
@@ -119,12 +120,21 @@ class TestMoELoraRegression(unittest.TestCase):
             ]
             s_text = srt_outputs.output_strs[i].strip()
 
-            # Calculate actual stats
-            min_len = min(len(v_lps), len(s_lps))
-            diffs = [abs(v_lps[t] - s_lps[t]) for t in range(min_len)]
-
-            actual_max = max(diffs) if diffs else 0.0
-            actual_mean = sum(diffs) / len(diffs) if diffs else 0.0
+            self.assertEqual(v_text, s_text, f"String mismatch on prompt {i}")
+            # Both sides carry one logprob per generated token, including the
+            # EOS token that ends a short answer, so the comparison must cover
+            # the whole reference: a missing or truncated result fails instead
+            # of shrinking the comparison.
+            self.assertTrue(s_lps, f"No output logprobs on prompt {i}")
+            self.assertEqual(
+                len(s_lps), len(v_lps), f"Logprob count mismatch on prompt {i}"
+            )
+            self.assertTrue(
+                all(map(math.isfinite, s_lps)), f"Non-finite logprob on prompt {i}"
+            )
+            diffs = [abs(v - s) for v, s in zip(v_lps, s_lps)]
+            actual_max = max(diffs)
+            actual_mean = sum(diffs) / len(diffs)
 
             if logprob_bounds is None:
                 ref = MOE_LORA_VLLM_REFERENCE_STATS[i]
@@ -134,8 +144,6 @@ class TestMoELoraRegression(unittest.TestCase):
             else:
                 max_bound, mean_bound = logprob_bounds
 
-            # Assertions
-            self.assertEqual(v_text, s_text, f"String mismatch on prompt {i}")
             self.assertLessEqual(
                 actual_max, max_bound, f"Max LogProb Diff exceeded on prompt {i}"
             )
