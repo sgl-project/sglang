@@ -380,6 +380,8 @@ class KimiK3ImageProcessor(
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
     # image dependency is installed and otherwise falls back to PIL.
     gpu_image_decode = "nvjpeg_fancy"
+    # nvImageCodec decoding ignores EXIF orientation; the PIL path must match.
+    apply_exif_orientation = False
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2

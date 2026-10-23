@@ -223,6 +223,8 @@ def _forget_parent_executor_wakeups():
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    # False keeps images in their stored orientation, ignoring the EXIF tag.
+    apply_exif_orientation = True
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
@@ -486,6 +488,7 @@ class BaseMultimodalProcessor(ABC):
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "apply_exif_orientation": self.apply_exif_orientation,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
@@ -988,7 +991,11 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(
+                    data,
+                    cls.gpu_image_decode,
+                    apply_exif_orientation=cls.apply_exif_orientation,
+                )
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode

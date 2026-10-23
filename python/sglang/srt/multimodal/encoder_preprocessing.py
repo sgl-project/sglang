@@ -17,6 +17,7 @@ class EncoderMediaProcessorConfig:
     """Optional model-declared media loading behavior for encoder mode."""
 
     image_decode_mode: bool | str = False
+    apply_exif_orientation: bool = True
     preserve_media_metadata: bool = False
     preprocess_off_event_loop: bool = False
     audio_sample_rate: int | None = None

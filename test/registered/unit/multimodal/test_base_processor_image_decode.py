@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import requests
 import torch
-from PIL import Image
+from PIL import ExifTags, Image, ImageOps
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -57,6 +57,24 @@ def _jpeg_bytes(size=(8, 8)) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(arr, "RGB").save(buf, format="JPEG", quality=90, subsampling=2)
     return buf.getvalue()
+
+
+def _encode_with_orientation(fmt: str, orientation: int, size=(16, 8)) -> bytes:
+    arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
+    img = Image.fromarray(arr, "RGB")
+    exif = Image.Exif()
+    exif[ExifTags.Base.Orientation] = orientation
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, exif=exif)
+    return buf.getvalue()
+
+
+def _fake_torchcodec(decode_jpeg):
+    decoders = types.ModuleType("torchcodec.decoders")
+    decoders.decode_jpeg = decode_jpeg
+    torchcodec = types.ModuleType("torchcodec")
+    torchcodec.decoders = decoders
+    return {"torchcodec": torchcodec, "torchcodec.decoders": decoders}
 
 
 def _is_decoded(img: Image.Image) -> bool:
@@ -212,6 +230,97 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
         self.assertIs(pool._decode_params.sample_format, fake_format)
         self.assertFalse(pool._decode_params.apply_exif_orientation)
+
+    def test_gpu_jpeg_decode_failure_falls_back_to_pil(self):
+        data = _jpeg_bytes()
+        common._warn_gpu_jpeg_fallback.cache_clear()
+        decode = Mock(side_effect=RuntimeError("nvJPEG failed"))
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch.dict(sys.modules, _fake_torchcodec(decode)),
+        ):
+            image, _ = common.load_image(data, gpu_image_decode=True)
+
+        self.assertIsInstance(image, Image.Image)
+        reference = Image.open(io.BytesIO(data))
+        np.testing.assert_array_equal(np.asarray(image), np.asarray(reference))
+
+    def test_gpu_jpeg_decode_without_torchcodec_falls_back_to_pil(self):
+        """Hosts where torchcodec is missing or fails to load still serve JPEGs."""
+        data = _jpeg_bytes()
+        common._warn_gpu_jpeg_fallback.cache_clear()
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch.dict(sys.modules, {"torchcodec": None, "torchcodec.decoders": None}),
+        ):
+            image, _ = common.load_image(data, gpu_image_decode=True)
+
+        self.assertIsInstance(image, Image.Image)
+
+
+class TestExifOrientation(CustomTestCase):
+    def test_pil_decode_applies_exif_orientation(self):
+        """Non-regression test for https://github.com/sgl-project/sglang/issues/33464 (PIL path).
+
+        Phone photos store landscape pixels plus an Orientation tag; the model
+        must see the upright image a viewer shows, not the raw stored pixels.
+        """
+        for fmt in ("JPEG", "PNG", "WEBP"):
+            for orientation in range(1, 9):
+                with self.subTest(fmt=fmt, orientation=orientation):
+                    data = _encode_with_orientation(fmt, orientation)
+                    image = _StubProcessor._load_single_item(data, Modality.IMAGE)
+                    reference = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+                    self.assertEqual(image.size, reference.size)
+                    np.testing.assert_array_equal(
+                        np.asarray(image), np.asarray(reference.convert("RGB"))
+                    )
+
+    def test_pil_input_is_oriented_without_mutating_caller_image(self):
+        """Engine callers pass PIL images they still own; orientation must not
+        rotate their object in place."""
+        data = _encode_with_orientation("JPEG", 6, size=(16, 8))
+        caller_image = Image.open(io.BytesIO(data))
+        image, image_size = common.load_image(caller_image, gpu_image_decode=False)
+
+        self.assertEqual(image.size, (8, 16))
+        self.assertEqual(image_size, (8, 16))
+        self.assertEqual(caller_image.size, (16, 8))
+        self.assertEqual(caller_image.getexif()[ExifTags.Base.Orientation], 6)
+
+    def test_unrotated_image_is_not_copied(self):
+        """Pillow's exif_transpose copies even when there is nothing to undo."""
+        data = _encode_with_orientation("JPEG", 1)
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        self.assertIs(common._apply_exif_orientation(image), image)
+
+    def test_opted_out_processor_keeps_stored_orientation(self):
+        """Processors whose GPU decoder ignores EXIF (nvImageCodec) opt out, so
+        every decode path, torchcodec included, must leave the pixels as stored."""
+
+        class _NoExifProcessor(_StubProcessor):
+            gpu_image_decode = True
+            apply_exif_orientation = False
+
+        data = _encode_with_orientation("JPEG", 6, size=(16, 8))
+        decode = Mock()
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch.dict(sys.modules, _fake_torchcodec(decode)),
+        ):
+            image = _NoExifProcessor._load_single_item(data, Modality.IMAGE)
+
+        decode.assert_not_called()
+        self.assertEqual(image.size, (16, 8))
+
+    def test_malformed_exif_is_treated_as_no_rotation(self):
+        data = _jpeg_bytes(size=(16, 8))
+        with patch.object(
+            Image.Image, "getexif", side_effect=SyntaxError("corrupt EXIF")
+        ):
+            image, _ = common.load_image(data, gpu_image_decode=False)
+        self.assertEqual(image.size, (16, 8))
 
 
 if __name__ == "__main__":
