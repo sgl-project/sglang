@@ -224,29 +224,8 @@ def _skip_unless_supported(device):
 
 
 @pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
-def test_shared_outer_decode_matches_fp32_reference(
-    monkeypatch: pytest.MonkeyPatch, vendor: str
-) -> None:
-    device = torch.device("cuda")
-    _skip_unless_supported(device)
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
-    cpu = _make_cpu_tensors()
-    gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
-    reference = _fp32_reference(cpu)
-    runner = _build_runner(gpu, vendor)
-    actual = _run_once(runner, gpu).hidden_states.detach().float().cpu()
-    torch.testing.assert_close(actual, reference, atol=0.018, rtol=0.06)
-    # LoRA math must be present, not bypassed within tolerance.
-    base_only = dict(cpu)
-    base_only["token_lora_mapping"] = torch.full((_NUM_TOKENS,), -1, dtype=torch.int32)
-    assert (reference - _fp32_reference(base_only)).abs().max().item() > 0.02
-
-
-@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 @pytest.mark.parametrize("phase", (Phase.DECODE, Phase.PREFILL))
-def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
+def test_shared_outer_eager_and_graph_replay_match_fp32_reference(
     monkeypatch: pytest.MonkeyPatch, vendor: str, phase: Phase
 ) -> None:
     device = torch.device("cuda")
@@ -259,6 +238,16 @@ def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
         cpu["token_lora_mapping"].fill_(0)
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
     runner = _build_runner(gpu, vendor, phase=phase)
+    reference = _fp32_reference(cpu)
+    eager = _run_once(runner, gpu, is_prefill=phase is Phase.PREFILL)
+    torch.testing.assert_close(
+        eager.hidden_states.detach().float().cpu(), reference, atol=0.018, rtol=0.06
+    )
+    # LoRA math must be present, not bypassed within tolerance.
+    base_only = dict(cpu)
+    base_only["token_lora_mapping"] = torch.full((_NUM_TOKENS,), -1, dtype=torch.int32)
+    assert (reference - _fp32_reference(base_only)).abs().max().item() > 0.02
+
     capture = dict(is_prefill=phase is Phase.PREFILL, use_cuda_graph=True)
     # Workspace scratch is stream-local: warm up on the capture stream.
     stream = torch.cuda.Stream()
@@ -275,7 +264,7 @@ def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
     torch.cuda.synchronize()
     torch.testing.assert_close(
         captured.hidden_states.detach().float().cpu(),
-        _fp32_reference(cpu),
+        reference,
         atol=0.018,
         rtol=0.06,
     )

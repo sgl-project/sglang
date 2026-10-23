@@ -86,7 +86,7 @@ class TestLoRAOverlapLoader(CustomTestCase):
         event.query.return_value = query_return
         return event
 
-    def test_loaded_lora_reused_after_stale_event_drain(self):
+    def test_finished_loads_drain_before_capacity_validation(self):
         """A finished copy still listed as in flight must be drained before the
         capacity check: with one slot, lora_B only fits once lora_A's stale
         event is gone."""
@@ -197,40 +197,9 @@ class TestLoRAOverlapLoader(CustomTestCase):
             {"lora_A"}, set()
         )
 
-    def test_capacity_constraints_block_new_loads(self):
-        loader = self._create_loader()
-
-        events = [self._create_mock_event() for _ in range(4)]
-        self.mock_device_module.Event.side_effect = events
-
-        # Load 3 loras successfully
-        for i in range(3):
-            self.assertTrue(
-                loader._try_start_overlap_load(f"lora_{i}", running_loras=set())
-            )
-        self.assertEqual(len(loader.lora_to_overlap_load_event), 3)
-
-        # Capacity full - new load blocked
-        self.mock_lora_manager.validate_lora_batch.return_value = False
-        self.mock_lora_manager.fetch_new_loras.reset_mock()
-        result = loader.try_overlap_load_lora("lora_3", running_loras=set())
-        self.assertFalse(result)
-        self.mock_lora_manager.fetch_new_loras.assert_not_called()
-        self.assertNotIn("lora_3", loader.lora_to_overlap_load_event)
-
-        # First lora completes, freeing capacity
-        loader.lora_to_overlap_load_event["lora_0"].query.return_value = True
-
-        loader._drain_completed_overlap_loads()
-        self.assertEqual(
-            loader._check_overlap_load_status("lora_0"), LoRAOverlapLoadStatus.LOADED
-        )
-
-        # Now new load succeeds
-        self.mock_lora_manager.validate_lora_batch.return_value = True
-        self.assertTrue(loader._try_start_overlap_load("lora_3", running_loras=set()))
-
     def test_validation_includes_pending_and_running_loras(self):
+        """Capacity is checked against pending + running + new adapters, and a
+        load it rejects fetches nothing and installs no event."""
         loader = self._create_loader()
 
         events = [self._create_mock_event() for _ in range(5)]
@@ -240,15 +209,20 @@ class TestLoRAOverlapLoader(CustomTestCase):
         loader._try_start_overlap_load("pending_1", running_loras=set())
         loader._try_start_overlap_load("pending_2", running_loras=set())
 
-        # Load new lora with running_loras
+        # Capacity full: the new adapter is rejected.
         self.mock_lora_manager.validate_lora_batch.reset_mock()
+        self.mock_lora_manager.validate_lora_batch.return_value = False
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
         running = {"running_1", "running_2"}
-        loader.try_overlap_load_lora("new_lora", running_loras=running)
+        self.assertFalse(
+            loader.try_overlap_load_lora("new_lora", running_loras=running)
+        )
 
-        # Validation should include: pending + running + new
-        call_args = self.mock_lora_manager.validate_lora_batch.call_args[0][0]
-        expected = {"pending_1", "pending_2", "running_1", "running_2", "new_lora"}
-        self.assertEqual(call_args, expected)
+        self.mock_lora_manager.validate_lora_batch.assert_called_once_with(
+            {"pending_1", "pending_2", "running_1", "running_2", "new_lora"}
+        )
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        self.assertNotIn("new_lora", loader.lora_to_overlap_load_event)
 
 
 if __name__ == "__main__":
