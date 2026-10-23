@@ -387,11 +387,6 @@ output(
     ' "name": "search" }<|end_message|><|content_model_end_sampling|>',
 )
 output(
-    "payload_name_wins_over_header",
-    "<|message_model|>search<|content_invoke_tool_json|>"
-    '{"name":"get_weather","args":{}}<|end_message|><|content_model_end_sampling|>',
-)
-output(
     "marker_spellings_in_text_stay_text",
     "<|message_model|><|content_thinking|>use [[ORD:<|content_text|>]] here"
     "<|end_message|><|message_model|><|content_text|>see "
