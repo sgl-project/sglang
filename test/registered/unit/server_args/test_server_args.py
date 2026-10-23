@@ -631,6 +631,31 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
 
+    def test_config_scalar_values_starting_with_dash(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write('api-key: "--host"\nserved-model-name: "-example=model"\n')
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            config_args = ["--config", config_file, "--model-path", "dummy"]
+            merger = ConfigArgumentMerger(parser)
+            parsed = parser.parse_args(merger.merge_config_with_args(config_args))
+            self.assertEqual(parsed.api_key, "--host")
+            self.assertEqual(parsed.served_model_name, "-example=model")
+
+            for cli_args in (
+                ["--api-key", "override"] + config_args,
+                config_args + ["--api-key", "override"],
+            ):
+                with self.subTest(cli_args=cli_args):
+                    parsed = parser.parse_args(merger.merge_config_with_args(cli_args))
+                    self.assertEqual(parsed.api_key, "override")
+                    self.assertEqual(parsed.served_model_name, "-example=model")
+        finally:
+            os.unlink(config_file)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")

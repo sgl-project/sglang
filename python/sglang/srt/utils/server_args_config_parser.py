@@ -194,5 +194,9 @@ class ConfigArgumentMerger:
             args.extend(str(item) for item in value)
 
     def _add_scalar_arg(self, args: List[str], key: str, value: Any) -> None:
-        """Add scalar argument to the list."""
-        args.extend([f"--{key}", str(value)])
+        """Add a scalar value without interpreting leading dashes as options."""
+        value_str = str(value)
+        if value_str.startswith("-"):
+            args.append(f"--{key}={value_str}")
+        else:
+            args.extend([f"--{key}", value_str])
