@@ -657,12 +657,12 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
-        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.INDEXER})
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.COMPACT_INDEXER})
         self.assertEqual(
             group.sources,
             {
                 PoolName.KV: PoolName.KV,
-                PoolName.INDEXER: PoolName.KV,
+                PoolName.COMPACT_INDEXER: PoolName.KV,
             },
         )
         _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
@@ -671,15 +671,118 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[6, 26]])
         self.assertEqual(offsets, [[0, 16]])
         _, sizes, offsets = group.entry_map[
-            PoolName.INDEXER
+            PoolName.COMPACT_INDEXER
         ].get_prepared_layer_range_meta([0], 0)
         self.assertEqual(sizes, [[7, 17]])
         self.assertEqual(offsets, [[0, 18]])
         _, sizes, offsets = group.entry_map[
-            PoolName.INDEXER
+            PoolName.COMPACT_INDEXER
         ].get_prepared_layer_range_meta([0], 1)
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
+
+    def test_dsa_indexer_skips_shared_topk_placeholders(self):
+        """A linker prefill keeps the compact index-K layout a PD decode uses, so
+        the linker must carry only the layers that hold index keys."""
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        def dsa_pool(kv_width, index_buffers):
+            pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            pool.page_size = 2
+            pool.layer_num = len(index_buffers)
+            pool.kv_buffer = [
+                torch.zeros((8, kv_width), dtype=torch.uint8) for _ in index_buffers
+            ]
+            pool.index_key_cache = SimpleNamespace(buffer=index_buffers)
+            return pool
+
+        # Layers 0 and 2 reuse another layer's top-k: 0-row index-K placeholders.
+        kvcache = dsa_pool(
+            3,
+            [
+                torch.zeros((0, 7), dtype=torch.uint8),
+                torch.zeros((4, 11), dtype=torch.uint8),
+                torch.zeros((0, 7), dtype=torch.uint8),
+            ],
+        )
+        draft = dsa_pool(13, [torch.zeros((4, 17), dtype=torch.uint8)])
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=(draft,)),
+            components={ComponentType.FULL},
+        )
+
+        indexer = group.entry_map[PoolName.COMPACT_INDEXER]
+        self.assertEqual(
+            [tuple(buffer.shape) for buffer in indexer.get_hybrid_pool_buffer()],
+            [(4, 11), (4, 17)],
+        )
+        # Transfer layer 0 carries only the draft's keys, layer 2 none at all.
+        _, sizes, offsets = indexer.get_prepared_layer_range_meta([0], 0)
+        self.assertEqual((sizes, offsets), ([[17]], [[11]]))
+        _, sizes, offsets = indexer.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual((sizes, offsets), ([[11]], [[0]]))
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([0], 2))
+        _, sizes = indexer.get_page_buffer_meta(torch.arange(2))
+        self.assertEqual(sizes, [11, 17])
+        self.assertEqual(len(group.entry_map[PoolName.KV].get_hybrid_pool_buffer()), 4)
+
+    def test_compact_dsa_index_k_object_is_named_apart(self):
+        """Linker objects stored before the compact layout pack every layer's
+        index-K under `indexer`; reading one as the compact layout would install
+        other layers' keys."""
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.layer_num = 1
+        kvcache.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        kvcache.index_key_cache = SimpleNamespace(
+            buffer=[torch.zeros((4, 7), dtype=torch.uint8)]
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=()),
+            components={ComponentType.FULL},
+        )
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.registered_pools = group.entry_map
+        store.mla_suffix = "cp0_pp0"
+
+        keys = [
+            store._get_hybrid_page_component_keys(
+                ["page"], PoolTransfer(name=name, keys=["page"])
+            )[0]
+            for name in group.entry_map
+        ]
+
+        self.assertEqual(keys, [["page_cp0_pp0_k"], ["page_cp0_pp0_compact_indexer"]])
+
+    def test_cuda_linker_keeps_compact_dsa_index_k(self):
+        """A PD decode runs without the linker, so a linker prefill that dropped
+        the compact index-K layout would send state to unregistered buffers."""
+        from sglang.srt.mem_cache import kv_cache_configurator as kcc
+
+        memory = SimpleNamespace(
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            enable_unified_cache_external_linker=True,
+        )
+        disagg = SimpleNamespace(disaggregation_mode="null")
+        with (
+            patch.object(kcc, "get_memory", return_value=memory),
+            patch.object(kcc, "get_disagg", return_value=disagg),
+        ):
+            with patch.object(kcc, "_is_npu", False):
+                self.assertTrue(kcc._should_elide_dsa_index_k(is_draft_worker=False))
+            with patch.object(kcc, "_is_npu", True):
+                self.assertFalse(kcc._should_elide_dsa_index_k(is_draft_worker=False))
 
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
