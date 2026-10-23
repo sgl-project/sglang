@@ -36,18 +36,6 @@ export const config = (() => {
           { id: "offload", label: "DiT layerwise offload" },
         ],
       },
-      {
-        id: "api",
-        title: "Request API",
-        scope: "request",
-        default: "http",
-        description: "Both APIs are served by the same process. Realtime sessions use MessagePack over WebSocket.",
-        learnMore: "#5-realtime-session",
-        options: [
-          { id: "http", label: "HTTP video job" },
-          { id: "realtime", label: "Realtime WebSocket" },
-        ],
-      },
     ],
     commandBuilder: {
       defaultSelection: {
@@ -137,20 +125,11 @@ export const config = (() => {
       CURL_HOST: { target: "curl", label: "Server host", default: "127.0.0.1" },
       CURL_PORT: { target: "curl", label: "Request port", default: "30000" },
     },
-    curl: (s) =>
-      s.api === "realtime"
-        ? [
-            "python examples/nomas/realtime_client.py --url ws://{{CURL_HOST}}:{{CURL_PORT}}",
-            "--prompt-format json",
-            '--segment "120:$(cat first-event.json)"',
-            '--segment "120:$(cat second-event.json)"',
-            "--size 640x352 --steps 8 --seed 42 --output ./nomas-session",
-          ].join(" \\\n  ")
-        : [
-            "curl -sS http://{{CURL_HOST}}:{{CURL_PORT}}/v1/videos",
-            "-H 'Content-Type: application/json'",
-            "--data-binary @request.json",
-          ].join(" \\\n  "),
+    curl: [
+      "curl -sS http://{{CURL_HOST}}:{{CURL_PORT}}/v1/videos",
+      "-H 'Content-Type: application/json'",
+      "--data-binary @request.json",
+    ].join(" \\\n  "),
     runModes: ["python"],
     showPlaygroundLink: false,
     github: { cookbookModel: "tencent/Hy-Nomas" },
