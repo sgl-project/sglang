@@ -1,5 +1,7 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import json
+import os
 import sys
 import threading
 import types
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import requests
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -77,12 +80,23 @@ def _fake_staging_buffer_module(mock_gather=None):
 
 
 class TestNixlBackendInitialization(CustomTestCase):
-    def _initialize_manager(self, agent, device_module, mode, gpu_id):
+    def _initialize_manager(
+        self,
+        agent,
+        device_module,
+        mode,
+        gpu_id,
+        *,
+        backend="UCX",
+        ib_device=None,
+        backend_params=None,
+        ucx_net_devices="",
+    ):
         args = SimpleNamespace(
             pp_rank=0,
             engine_rank=0,
             gpu_id=gpu_id,
-            ib_device=None,
+            ib_device=ib_device,
             kv_data_ptrs=[],
             kv_item_lens=[],
             state_types=[],
@@ -99,15 +113,18 @@ class TestNixlBackendInitialization(CustomTestCase):
         api.nixl_thread_sync_t = SimpleNamespace(NIXL_THREAD_SYNC_STRICT="strict")
         nixl = types.ModuleType("nixl")
         nixl._api = api
-        agent.get_plugin_list.return_value = ["UCX"]
+        agent.get_plugin_list.return_value = [backend]
 
         with (
             patch.dict(sys.modules, {"nixl": nixl, "nixl._api": api}),
             patch.dict(
                 "os.environ",
                 {
-                    "SGLANG_DISAGGREGATION_NIXL_BACKEND": "UCX",
-                    "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS": "{}",
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND": backend,
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS": json.dumps(
+                        backend_params or {}
+                    ),
+                    "UCX_NET_DEVICES": ucx_net_devices,
                     "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "5",
                     "SGLANG_DISAGGREGATION_QUEUE_SIZE": "0",
                     "SGLANG_DISAGG_STAGING_BUFFER": "false",
@@ -131,6 +148,7 @@ class TestNixlBackendInitialization(CustomTestCase):
             self.assertIsNone(server_args.device)
             NixlKVManager.__init__(mgr, args, mode, server_args)
             get_device_module.assert_called_once_with("cuda")
+            self.assertEqual(os.environ["UCX_NET_DEVICES"], ucx_net_devices)
 
     def test_backend_initialization_selects_device_in_deadline_thread(self):
         caller_thread = threading.get_ident()
@@ -165,6 +183,61 @@ class TestNixlBackendInitialization(CustomTestCase):
                     "UCX",
                     {"num_threads": "8"} if mode == DisaggregationMode.PREFILL else {},
                 )
+
+    def test_backend_initialization_respects_ucx_device_selection(self):
+        mapping = '{"1":"rdma0","3":"rdma4"}'
+        net_devices = "rdma0:1,rdma4:1,lo"
+        cases = (
+            ("UCX", 1, mapping, "", {}, {"device_list": "rdma0"}),
+            ("UCX", 1, "rdma0,rdma4", "", {}, {"device_list": "rdma0, rdma4"}),
+            ("UCX", 3, mapping, "", {}, {"device_list": "rdma4"}),
+            ("UCX", 1, mapping, net_devices, {}, {}),
+            ("UCX", 3, mapping, net_devices, {}, {}),
+            ("UCX", 1, None, net_devices, {}, {}),
+            (
+                "UCX",
+                1,
+                mapping,
+                net_devices,
+                {"device_list": "rdma4"},
+                {"device_list": "rdma4"},
+            ),
+            ("LIBFABRIC", 1, mapping, net_devices, {}, {}),
+        )
+        for backend, gpu_id, ib_device, net, params, expected in cases:
+            with (
+                self.subTest(backend=backend, gpu_id=gpu_id, net=net, params=params),
+                patch("sglang.srt.disaggregation.nixl.conn.logger.warning") as warning,
+            ):
+                agent = MagicMock()
+                self._initialize_manager(
+                    agent,
+                    MagicMock(),
+                    DisaggregationMode.DECODE,
+                    gpu_id,
+                    backend=backend,
+                    ib_device=ib_device,
+                    backend_params=params,
+                    ucx_net_devices=net,
+                )
+                agent.create_backend.assert_called_once_with(backend, expected)
+                if backend == "UCX" and ib_device and net:
+                    warning.assert_called_once()
+                    self.assertIn(
+                        "Per-GPU CLI device mappings", warning.call_args[0][0]
+                    )
+                else:
+                    warning.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, "Conflicting NIXL UCX device_list"):
+            self._initialize_manager(
+                MagicMock(),
+                MagicMock(),
+                DisaggregationMode.DECODE,
+                1,
+                ib_device=mapping,
+                backend_params={"device_list": "rdma4"},
+            )
 
     def test_backend_initialization_propagates_error(self):
         error = RuntimeError("backend initialization failed")
@@ -468,6 +541,7 @@ class TestNixlNodeFailure(CustomTestCase):
         }
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["10.0.0.1:8998"] = {3, 4, 5}
+        mgr.heartbeat_failures = {"10.0.0.1:8998": 2, "10.0.0.2:8998": 1}
         mgr.request_status = {
             3: KVPoll.WaitingForInput,
             4: KVPoll.Transferring,
@@ -498,6 +572,45 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertIn(3, mgr.failure_records)
         self.assertIn(4, mgr.failure_records)
         self.assertNotIn(5, mgr.failure_records)
+        self.assertEqual(mgr.heartbeat_failures, {"10.0.0.2:8998": 1})
+
+    def test_a_prefill_reached_again_after_a_loss_needs_its_misses_again(self):
+        """A prefill dropped after max_failures missed heartbeats, then reached
+        again by a new request, is dropped again only after as many: one
+        missed heartbeat of a prefill busy for a few seconds is no loss."""
+        mgr = self._make_manager()
+        addr = "10.0.0.1:8998"
+        mgr.prefill_info_table = {addr: object()}
+        mgr.heartbeat_interval = 0
+        mgr.max_failures = 2
+        mgr.heartbeat_failures = {}
+        mgr.session_pool_lock = threading.Lock()
+        probes = ["miss", "miss", "miss", 200, "miss", 200]
+        ok = SimpleNamespace(status_code=200)
+
+        def get(*_args, **_kwargs):
+            if probes.pop(0) == "miss":
+                raise requests.Timeout("prefill busy")
+            return ok
+
+        mgr.session_pool = defaultdict(lambda: SimpleNamespace(get=get))
+        rounds = iter(range(len(probes)))
+        mgr._heartbeat_shutdown = SimpleNamespace(
+            is_set=lambda: False, wait=lambda _s: next(rounds, None) is None
+        )
+        losses = []
+        handle = mgr._handle_node_failure
+
+        def lost(failed):
+            losses.append(failed)
+            handle(failed)
+            # The next request to it registers it again.
+            mgr.prefill_info_table[failed] = object()
+
+        mgr._handle_node_failure = lost
+        mgr._start_heartbeat_checker_thread().join(10)
+        self.assertEqual(probes, [])
+        self.assertEqual(losses, [addr])
 
 
 class TestNixlStaging(CustomTestCase):

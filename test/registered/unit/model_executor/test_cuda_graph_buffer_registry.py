@@ -21,6 +21,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -259,6 +260,38 @@ class TestFillFromAndExtract(unittest.TestCase):
                 torch.tensor([5, 5], dtype=torch.int32),
             )
         )
+
+    def test_padding_reset_follows_each_axis(self):
+        """A replay may pad bs alone (ragged verify slots) or tokens alone (prefill
+        buckets); the padded axis's tail is still reset."""
+        r = self._build_registry()
+
+        def fill(*, raw_bs, raw_num_tokens):
+            for name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+                r.get_slot(name).buffer.fill_(99)
+            fb = _MiniForwardBatch(
+                batch_size=raw_bs,
+                req_pool_indices=torch.arange(raw_bs, dtype=torch.int64) + 1,
+                seq_lens=torch.arange(raw_bs, dtype=torch.int32) + 20,
+                out_cache_loc=torch.arange(raw_num_tokens, dtype=torch.int64) + 100,
+            )
+            r.fill_from(
+                fb,
+                raw_bs=raw_bs,
+                padded_bs=4,
+                raw_num_tokens=raw_num_tokens,
+                padded_num_tokens=8,
+            )
+            return lambda name: r.get_slot(name).buffer.tolist()
+
+        with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
+            slots = fill(raw_bs=2, raw_num_tokens=8)
+            self.assertEqual(slots("req_pool_indices"), [1, 2, 0, 0])
+            self.assertEqual(slots("seq_lens"), [20, 21, 5, 5])
+            slots = fill(raw_bs=4, raw_num_tokens=6)
+            self.assertEqual(
+                slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0]
+            )
 
     def test_keep_pad_preserves_padded_tail(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)

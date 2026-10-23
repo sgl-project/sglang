@@ -528,12 +528,18 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
     )
 
 
+def _run_as_single_rank(test: unittest.TestCase) -> None:
+    # The transfer queue sizes its release collectives from the gloo group;
+    # these tests have no process group, so answer as one rank.
+    world_size = patch.object(dist, "get_world_size", return_value=1)
+    world_size.start()
+    test.addCleanup(world_size.stop)
+
+
 class TestResolveDeferredReleases(CustomTestCase):
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
@@ -855,9 +861,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def _pop(self, q):
         released = []
@@ -915,6 +919,64 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
+
+
+class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
+    """Under HiSparse the transfer writes into the coordinator's host pages."""
+
+    def setUp(self):
+        super().setUp()
+        world_size = patch.object(dist, "get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
+
+    def _queue(self, mgr, log):
+        q = _make_pop_queue(mgr)
+        q.scheduler.enable_hisparse = True
+        q.scheduler.hisparse_coordinator = SimpleNamespace(
+            request_finished=lambda req: log.append(("hisparse", req.rid))
+        )
+        return q
+
+    def _pop_and_resolve(self, q, mgr, room, log):
+        release = lambda req, *args, **kwargs: log.append(("kv", req.rid))
+        with (
+            patch.object(decode_mod, "prepare_abort"),
+            patch.object(decode_mod, "release_kv_cache", side_effect=release),
+        ):
+            q.pop_transferred()
+            at_failure = list(log)
+            generation = mgr.register_deferred_abort_room(room)
+            for prefill_rank in (0, 1):
+                mgr.note_abort_ack(room, prefill_rank, generation)
+            q.resolve_deferred_releases()
+        return at_failure
+
+    def test_deferred_failure_keeps_the_destination_until_release(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [_make_failed_req(mgr, room=12, idx=6, abort_notified=False)]
+
+        at_failure = self._pop_and_resolve(q, mgr, 12, log)
+
+        self.assertEqual(at_failure, [])
+        self.assertEqual(log, [("hisparse", "r12"), ("kv", "r12")])
+
+    def test_immediate_failure_frees_the_destination_once(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [
+            _make_failed_req(
+                mgr, room=13, idx=7, abort_notified=False, notifiable=False
+            )
+        ]
+
+        at_failure = self._pop_and_resolve(q, mgr, 13, log)
+
+        self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
+        self.assertEqual(log, at_failure)
 
 
 class TestBackendOptIn(CustomTestCase):

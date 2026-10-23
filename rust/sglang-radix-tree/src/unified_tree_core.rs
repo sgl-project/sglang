@@ -139,6 +139,12 @@ pub struct MatchResult {
     pub last_host_node_id: NodeId,
     /// Deepest node accepted by all component validators; anchors host->device load-back.
     pub best_match_node_id: NodeId,
+    /// Deepest node stepped into, even if rejected; None when no node was stepped into.
+    pub last_visited_node_id: Option<NodeId>,
+    /// Optional reusable prefix length in the FULL validator's device-value scan,
+    /// before node-boundary or auxiliary constraints. None means no shorter prefix
+    /// was reported.
+    pub full_device_match_len: Option<usize>,
     /// Full-KV tokens that hit on host and must be loaded back to device.
     pub host_hit_length: usize,
     /// SWA tokens that hit on host (within the sliding window) and will be
@@ -1398,6 +1404,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         ) = self.match_prefix_helper_(
             root_id,
@@ -1415,6 +1422,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         )
     }
@@ -1501,6 +1509,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         NodeIdx_,
         usize,
         usize,
+        Option<NodeId>,
         Option<CacheAction>,
     ) {
         // Non-HiCache mode has only device-resident matches, so the scheduler
@@ -1607,12 +1616,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             offset += prefix_len;
         }
 
+        let last_visited_node_id = (node_id != root_id).then(|| self.arena.node(node_id).id);
         (
             value,
             best_match_node_id,
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         )
     }
@@ -1627,6 +1638,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         best_match_device_node_id: NodeIdx_,
         best_match_device_value_len: usize,
         full_kv_hit_length: usize,
+        last_visited_node_id: Option<NodeId>,
         action: Option<CacheAction>,
     ) -> MatchResult {
         for i in 0..self.components.len() {
@@ -1671,6 +1683,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
             last_host_node_id: self.arena.node(last_host_node_id).id,
             best_match_node_id: self.arena.node(best_match_node_id).id,
+            last_visited_node_id,
+            full_device_match_len: None,
             host_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
@@ -1703,6 +1717,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             last_device_node_id: root_id,
             last_host_node_id: root_id,
             best_match_node_id: root_id,
+            last_visited_node_id: None,
+            full_device_match_len: None,
             host_hit_length: 0,
             swa_host_hit_length: 0,
             swa_branching_seqlen: None,
