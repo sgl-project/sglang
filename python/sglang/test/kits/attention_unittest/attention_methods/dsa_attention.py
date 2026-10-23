@@ -1128,13 +1128,6 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
     major, minor = _torch.cuda.get_device_capability()
 
     if impl == "flashmla_sparse" or impl == "flashmla_kv":
-        try:
-            from sgl_kernel.flash_mla import (  # noqa: F401
-                flash_mla_sparse_fwd,
-                flash_mla_with_kvcache,
-            )
-        except ImportError as exc:
-            return False, f"sgl_kernel.flash_mla unavailable: {exc}"
         if major < 9:
             return False, f"{impl} requires SM>=9.0, got SM{major}.x"
         return True, ""
@@ -1394,7 +1387,7 @@ def run_dsa_sparse_fp8_prefill_case(
 ) -> None:
     """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
     prefix, `get_topk_transform_method` returns `RAGGED` (the only path
-    that exercises `dequantize_k_cache_paged` + the
+    that exercises `dequantize_k_cache_paged_dsa` + the
     `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`
     it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for
     FP8 KV cache (`set_dsa_prefill_impl`), so `flashmla_auto` and
