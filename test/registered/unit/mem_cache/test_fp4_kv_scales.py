@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.utils import setup_state_kv_args
+from sglang.srt.mem_cache.kv_cache_builder import _has_per_token_kv_scales
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +97,12 @@ class TestFP4KVScales(CustomTestCase):
             self.assertTrue(
                 torch.equal(pool.k_buffer[layer][new], pool.k_buffer[layer][old])
             )
+
+    def test_default_retraction_backup_avoids_host_pool_for_fp4_scales(self):
+        # The MHA host pool rejects per-token scales, so an FP4 pool must
+        # resolve to the cpu_tensor backup.
+        self.assertTrue(_has_per_token_kv_scales(_pool()))
+        self.assertFalse(_has_per_token_kv_scales(_pool(scales=False)))
 
 
 if __name__ == "__main__":
