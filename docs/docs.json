@@ -1540,8 +1540,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
-                      "cookbook/diffusion/Tencent/HunyuanImage3",
-                      "cookbook/diffusion/Tencent/HY-Nomas"
+                      "cookbook/diffusion/Tencent/HunyuanImage3"
                     ]
                   },
                   {
@@ -1691,6 +1690,12 @@
                     "group": "SANA-WM",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  },
+                  {
+                    "group": "HY-Nomas",
+                    "pages": [
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   }
                 ]

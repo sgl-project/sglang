@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Tencent Hy-Nomas (Apache-2.0), revision
-# 98a28976f23552bb2e2cf7941986e9cd10a3118a. Inference-only adaptation.
+# Adapted from Hy-Nomas (Apache-2.0):
+# https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/98a28976f23552bb2e2cf7941986e9cd10a3118a/hymm/models/vae/pixelumm_decoder
 """Native PixelUMM decoder for Nomas: the ported network and the SGLang decode contract.
 
 The first part is the GenExpert transformer adapted from HY-Nomas; the second

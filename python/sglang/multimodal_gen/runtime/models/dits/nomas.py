@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Tencent Hy-Nomas, revision 98a28976f23552bb2e2cf7941986e9cd10a3118a.
+# Adapted from Hy-Nomas (Apache-2.0):
+# https://github.com/Tencent-Hunyuan/Hy-Nomas/blob/98a28976f23552bb2e2cf7941986e9cd10a3118a/hymm/models/dit/nomas_cpt.py
+# https://github.com/Tencent-Hunyuan/Hy-Nomas/blob/98a28976f23552bb2e2cf7941986e9cd10a3118a/hymm/models/camera/action_module.py
 """Nomas DiT with explicit segment KV state, tensor and Ulysses sequence parallel.
 
 Consumes precomputed text features and normalized camera extrinsics. Under TP
