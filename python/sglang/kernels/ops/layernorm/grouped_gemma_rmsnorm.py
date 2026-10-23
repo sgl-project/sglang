@@ -55,8 +55,8 @@ def grouped_gemma_rmsnorm(
 
     Parameters
     ----------
-    input      : CUDA tensor [..., hidden_size], hidden_size % group_size == 0
-    weight     : CUDA tensor [hidden_size]
+    input      : CUDA/XPU tensor [..., hidden_size], hidden_size % group_size == 0
+    weight     : CUDA/XPU tensor [hidden_size]
     group_size : elements per variance group (multiple of 512)
     eps        : RMSNorm epsilon
     out        : optional pre-allocated output tensor (same shape/dtype as input)
@@ -65,6 +65,14 @@ def grouped_gemma_rmsnorm(
     -------
     Normalized tensor, same shape/dtype as input.
     """
+    if input.is_xpu:
+        from sgl_kernel import grouped_gemma_rmsnorm as xpu_grouped_gemma_rmsnorm
+
+        # The XPU kernel rejects non-contiguous inputs.
+        return xpu_grouped_gemma_rmsnorm(
+            input.contiguous(), weight, group_size, eps, out
+        )
+
     hidden_size = input.size(-1)
     x = input.reshape(-1, hidden_size)
     if out is None:
