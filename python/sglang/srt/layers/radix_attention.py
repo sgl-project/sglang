@@ -227,6 +227,7 @@ class RadixAttention(nn.Module):
             if result.data_ptr() != output.data_ptr():
                 output[:n].view(result.shape).copy_(result)
             raw = get_prefill_raw_num_tokens()
+            cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
             if (
                 cp_metadata is not None
                 and cp_metadata.per_rank_logical_token is not None
