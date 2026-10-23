@@ -130,6 +130,30 @@ async def _collect_anthropic_events(serving, anthropic_request):
 
 
 class TestAnthropicServing(unittest.TestCase):
+    def test_stream_error_string_code_keeps_overload_semantics(self):
+        for code in (503, "service_unavailable"):
+            with self.subTest(code=code):
+                line = (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "error": {
+                                "message": "busy",
+                                "type": "server_error",
+                                "code": code,
+                            }
+                        }
+                    )
+                    + "\n\n"
+                )
+                serving = self._serving([line])
+                events = asyncio.run(
+                    _collect_anthropic_events(serving, self._anthropic_request())
+                )
+                error = next(e for e in events if e["type"] == "error")
+                self.assertEqual(error["error"]["type"], "overloaded_error")
+                self.assertEqual(events[-1]["type"], "message_stop")
+
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"

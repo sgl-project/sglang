@@ -970,12 +970,8 @@ class AnthropicServing:
         def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
             """Detect an OpenAI handler streaming-error envelope.
 
-            ``OpenAIServingChat.create_streaming_error_response`` emits
-            ``data: {"error": {"object":"error","message":"...",
-            "type":"BadRequestError","code":400}}``; the regular
-            ChatCompletionStreamResponse validator rejects it. Pull the
-            type/message out so the Anthropic client sees the real
-            failure instead of a generic 'Stream processing error'.
+            Read the protocol type/string code first, while accepting the old
+            numeric-code envelope from compatible upstream handlers.
             """
             try:
                 payload = json.loads(data_str)
@@ -988,11 +984,24 @@ class AnthropicServing:
                 return None
             upstream_message = err.get("message") or "Upstream error"
             code = err.get("code")
-            error_type = (
-                ERROR_TYPE_MAP.get(code, "api_error")
-                if isinstance(code, int)
-                else "api_error"
-            )
+            upstream_type = err.get("type")
+            code_types = {
+                "not_found": "not_found_error",
+                "model_not_found": "not_found_error",
+                "request_timeout": "request_timeout_error",
+                "request_too_large": "request_too_large",
+                "service_unavailable": "overloaded_error",
+            }
+            if isinstance(code, str) and code in code_types:
+                error_type = code_types[code]
+            elif isinstance(upstream_type, str) and upstream_type in set(
+                ERROR_TYPE_MAP.values()
+            ):
+                error_type = upstream_type
+            elif isinstance(code, int):
+                error_type = ERROR_TYPE_MAP.get(code, "api_error")
+            else:
+                error_type = "api_error"
             return error_type, str(upstream_message)
 
         # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization

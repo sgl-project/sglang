@@ -8,7 +8,6 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
@@ -2035,14 +2034,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    status_code = finish_reason.get("status_code")
+                    if (
+                        finish_reason_type == "abort"
+                        and isinstance(status_code, int)
+                        and 400 <= status_code < 600
                     ):
-                        code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            status_code=status_code,
                         )
                         yield f"data: {error}\n\n"
                         error_aborted = True
@@ -2356,7 +2356,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
-                return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+                return self.create_error_response(
+                    text.message, text.type, text.code, text.param
+                )
 
             # Handle reasoning content
             reasoning_text = None
