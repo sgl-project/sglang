@@ -1119,6 +1119,10 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
                 self.assertIsNone(vae.cached_latents)
+                # the rollout cancels in-flight work; wait for the device to
+                # drain before asking whether the stream is idle, otherwise
+                # query() races the teardown and reports False at random
+                queue.stream.synchronize()
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
                 for _ in range(2):
