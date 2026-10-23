@@ -981,22 +981,20 @@ mod tests {
         ));
     }
 
-    /// A DeepSeek-V4 continuation drops its leading BOS, as SGLang's separate
-    /// prefix tokenization does.
+    /// A DeepSeek-V4 continuation is the assistant text as is, as SGLang's
+    /// `assistant_prefix`: its leading BOS is dropped once, from its ids.
     #[test]
-    fn deepseek_v4_continuation_drops_leading_bos() {
+    fn deepseek_v4_continuation_keeps_its_text() {
+        let bos = "<｜begin▁of▁sentence｜>";
         let rendered = render_dsv41(serde_json::json!({
             "model": "m",
             "messages": [
                 {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": "<｜begin▁of▁sentence｜>abc"}
+                {"role": "assistant", "content": format!("{bos}{bos}abc")}
             ],
             "continue_final_message": true
         }));
-        assert_eq!(
-            rendered.into_text(),
-            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>abc"
-        );
+        assert_eq!(rendered.continuation, format!("{bos}{bos}abc"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

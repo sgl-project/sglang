@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use serde_json::Value;
-use sglang_processor::dynamo_renderer::deepseek::common::tokens;
 use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
 
 pub use sglang_processor::ChatFormatter;
@@ -35,15 +34,8 @@ pub(super) fn render_chat(
         | ChatFormatter::Glm53(_)
         | ChatFormatter::KimiK3
         | ChatFormatter::Qwen38 { .. } => {
-            let (prompt, mut continuation) = formatter.render_request(body, defaults)?;
-            // SGLang tokenizes the DeepSeek-V4 prefix on its own and drops its leading BOS.
-            if matches!(
-                formatter,
-                ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41
-            ) && let Some(rest) = continuation.strip_prefix(tokens::BOS)
-            {
-                continuation = rest.to_owned();
-            }
+            // The continuation's leading BOS is dropped once its ids are encoded.
+            let (prompt, continuation) = formatter.render_request(body, defaults)?;
             Ok(RenderedChat {
                 prompt,
                 continuation,
