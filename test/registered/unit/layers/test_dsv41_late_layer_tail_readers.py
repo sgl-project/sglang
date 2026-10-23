@@ -370,29 +370,33 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
 
-    def test_quantized_q_lora_keeps_its_type_and_rows(self):
-        # HIP passes q_lora quantized: a struct a slice cannot cut. A decode or
-        # verify step's rows all live keeps it as is; DP padding cuts each field.
+    def _quantized_q_lora(self, rows):
         from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
 
-        hoisted_req = torch.tensor([7, 7, 9])
-        hoisted_pos = torch.tensor([2, 3, 3])
-        for rows in (3, 5):
-            q_lora = Mxfp8Activation(
-                q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
-            )
-            positions = torch.cat(
-                [hoisted_pos, torch.zeros(rows - 3, dtype=torch.long)]
-            )
-            req, pos, _, _ = self._run(hoisted_req, hoisted_pos, positions, q_lora)
-            self.assertEqual(req.tolist(), [7, 7, 9])
-            self.assertEqual(pos.tolist(), [2, 3, 3])
-            got = self.index_q_lora
-            self.assertIsInstance(got, Mxfp8Activation)
-            if rows == 3:
-                self.assertIs(got, q_lora)
-            self.assertTrue(torch.equal(got.q, q_lora.q[:3]))
-            self.assertEqual(tuple(got.scale.shape), (3, 2))
+        return Mxfp8Activation(
+            q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
+        )
+
+    def test_quantized_q_lora_passes_through_when_every_row_is_live(self):
+        """HIP passes q_lora as a quantized struct, which a slice cannot cut. A step
+        whose rows are all live (every decode and verify step) must hand it on as
+        is; slicing it anyway failed every decode graph capture with a TypeError."""
+        hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
+        q_lora = self._quantized_q_lora(3)
+        self._run(*hoisted, hoisted[1].clone(), q_lora)
+        self.assertIs(self.index_q_lora, q_lora)
+
+    def test_dp_padding_cuts_a_quantized_q_lora_by_rows(self):
+        """Rows past the hoisted ones (DP attention padding an eager extend) are
+        dropped from every field of a quantized q_lora, which keeps its type."""
+        hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
+        q_lora = self._quantized_q_lora(5)
+        positions = torch.cat([hoisted[1], torch.zeros(2, dtype=torch.long)])
+        self._run(*hoisted, positions, q_lora)
+        got = self.index_q_lora
+        self.assertIsInstance(got, type(q_lora))
+        self.assertTrue(torch.equal(got.q, q_lora.q[:3]))
+        self.assertEqual(tuple(got.scale.shape), (3, 2))
 
 
 if __name__ == "__main__":
