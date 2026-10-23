@@ -104,48 +104,6 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
-def _h3_detect_companion(gguf_ref: str) -> str:
-    """ComfyUI detect needs H3 safetensors keys; GGUF only overrides the DiT."""
-    name = os.path.basename(gguf_ref).lower()
-    prefer = []
-    if "ref2va" in name:
-        prefer.append("minimax_h3_ref2va_bf16.safetensors")
-    prefer.extend(
-        [
-            "minimax_h3_fl2va_bf16.safetensors",
-            "minimax_h3_ref2va_bf16.safetensors",
-        ]
-    )
-    folders = (
-        [os.path.dirname(os.path.abspath(gguf_ref))]
-        if os.path.dirname(gguf_ref)
-        else []
-    )
-    try:
-        import folder_paths
-
-        folders.extend(folder_paths.get_folder_paths("diffusion_models"))
-    except Exception:
-        pass
-    seen: set[str] = set()
-    for folder in folders:
-        if not folder:
-            continue
-        for candidate in prefer:
-            path = os.path.join(folder, candidate)
-            if path in seen:
-                continue
-            seen.add(path)
-            if os.path.isfile(path):
-                return path
-    raise ValueError(
-        "GGUF transformer needs a MiniMax-H3 BF16 safetensors in "
-        "models/diffusion_models for ComfyUI architecture detect "
-        f"(looked for {prefer}). Keep --model-path / unet_name on the "
-        "BF16 file and pass the GGUF via transformer_weights_path."
-    )
-
-
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
 NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
@@ -210,10 +168,16 @@ def _h3_unet_config_from_native(model_dir: str) -> dict:
 
 def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
-        raise ValueError(
-            f"Cannot detect architecture from GGUF {model_path!r}. "
-            "Use a MiniMax-H3 BF16 safetensors for detect."
+        # Same header-only trick as safetensors: tensor names and logical
+        # (unpacked) shapes are all detect_unet_config looks at.
+        from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+            read_gguf_tensor_meta,
         )
+
+        return {
+            name: _HeaderTensor(meta.logical_shape)
+            for name, meta in read_gguf_tensor_meta(model_path).items()
+        }
     if model_path.endswith(".safetensors"):
         from safetensors import safe_open
 
@@ -535,11 +499,11 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}
@@ -611,8 +575,6 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
-        if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(sgld_options["transformer_weights_path"])
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,

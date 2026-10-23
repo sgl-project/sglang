@@ -645,6 +645,44 @@ if not current_platform.is_hip():
             T2V_sampling_params,
         ),
     )
+# Dynamic LoRA at the default quality: the lossless-tier fusions (the fused
+# linear-GELU epilogue among them) must keep the adapter's delta. GT-free: the
+# output must match quality="exact" and differ from the adapter off. Skipped on
+# AMD: the match/change thresholds are calibrated on NVIDIA only.
+if not current_platform.is_hip():
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "wan2_1_t2v_1_3b_dynamic_lora_default_quality_1gpu",
+            DiffusionServerArgs(
+                model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+                lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+                extras=[
+                    "--lora-merge-mode",
+                    "dynamic",
+                    # layerwise offload leaves placeholder weights, which keep
+                    # the fused linear-GELU path unmounted
+                    "--dit-layerwise-offload",
+                    "false",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+                output_size="480x272",
+                num_frames=9,
+                # CRF 0, so the frame comparisons measure the model, not the encoder
+                extras={
+                    "num_inference_steps": 8,
+                    "seed": 42,
+                    "output_compression": 100,
+                },
+            ),
+            run_perf_check=False,
+            perf_warmup_requests=1,
+            run_consistency_check=False,
+            reference_quality="exact",
+            run_lora_effect_check=True,
+        ),
+    )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
 # Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
