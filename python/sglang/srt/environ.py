@@ -756,7 +756,12 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
-    SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
+    # NIXL/UCX opens one UCX worker per prefill progress thread (8), and each
+    # worker builds memory pools for every RDMA transport on every listed device;
+    # measured on 8xH200 CI hosts with two devices, that takes 30-55 s, so 60 s
+    # failed legitimate startups. Kept under the 300 s scheduler watchdog so a
+    # real hang still reports here first.
+    SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(240)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)

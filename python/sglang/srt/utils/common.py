@@ -3752,6 +3752,7 @@ def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> 
 
     # An overrunning fn cannot be cancelled; only process exit reaps the daemon thread.
     thread = threading.Thread(target=_target, daemon=True)
+    start = time.perf_counter()
     thread.start()
     thread.join(timeout_s)
     if thread.is_alive():
@@ -3760,6 +3761,7 @@ def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> 
         )
     if error:
         raise error[0]
+    logger.info(f"{what} returned in {time.perf_counter() - start:.1f}s")
     return result[0]
 
 
