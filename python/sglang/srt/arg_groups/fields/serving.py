@@ -253,6 +253,10 @@ class Serving(msgspec.Struct):
         bool,
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
     ] = False
+    clamp_max_new_tokens_to_context: A[
+        bool,
+        "Treat max_new_tokens (max_tokens / max_completion_tokens) as an upper bound: when the prompt fits the context but prompt plus max_new_tokens does not, cap max_new_tokens to the remaining context instead of returning an error. Prompts longer than the context are still rejected unless --allow-auto-truncate is set.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Streaming
