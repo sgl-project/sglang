@@ -26,6 +26,8 @@ from sglang.srt.layers.attention.graph_utils import (
     _zero_padded_tokens,
     allocate_attention_outputs,
     attention_input_scope,
+    attention_output_tokens,
+    attention_query_tokens,
     padded_extend_real_tokens,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -41,7 +43,6 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
     is_in_prefill_graph_scope,
 )
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -192,11 +193,7 @@ class RadixAttention(nn.Module):
         n = forward_batch.global_num_token_non_padded_cpu
         kv_n = n if key_value_num_tokens is None else key_value_num_tokens
         cache_n = n
-        cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
-        if getattr(cp_metadata, "graph_num_tokens", None) is not None:
-            # Interleave BCG gathers KV in global sequence order but Q stays
-            # local. Empty padded queries must not enter sparse attention.
-            n = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+        n = attention_query_tokens(forward_batch, n)
         return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
         lse = None
         if n == 0:
@@ -227,15 +224,7 @@ class RadixAttention(nn.Module):
             if result.data_ptr() != output.data_ptr():
                 output[:n].view(result.shape).copy_(result)
             raw = get_prefill_raw_num_tokens()
-            cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
-            if (
-                cp_metadata is not None
-                and cp_metadata.per_rank_logical_token is not None
-            ):
-                # Q/output rows are CP-local; cache locations and positions
-                # above remain global. Zero every invalid local row before
-                # captured projections/MoE can consume an empty-attention NaN.
-                raw = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+            raw = attention_output_tokens(forward_batch, raw)
             _zero_padded_tokens(output, raw)
             if idx_output is not None:
                 _zero_padded_tokens(idx_output, raw)

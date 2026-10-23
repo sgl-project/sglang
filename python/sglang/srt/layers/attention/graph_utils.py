@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.layers.cp.padding import (
+    attention_output_tokens as attention_output_tokens,
+)
+from sglang.srt.layers.cp.padding import (
+    attention_query_tokens as attention_query_tokens,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 
 if TYPE_CHECKING:
