@@ -634,7 +634,9 @@ jobs:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        runner: [linux-mi35x-gpu-1]
+        # The linux-mi35x-gpu-1 pool has only 4 runners and PR runs keep it
+        # backlogged for hours, so scheduled main runs use the 8-GPU pool.
+        runner: ${{ fromJson(github.event_name == 'schedule' && '["linux-mi35x-gpu-8"]' || '["linux-mi35x-gpu-1"]') }}
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
