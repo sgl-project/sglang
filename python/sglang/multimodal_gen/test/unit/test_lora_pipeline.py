@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.post_training.weights_updater import WeightsUpdater
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
@@ -267,6 +268,36 @@ def test_merged_lora_still_uses_weight_update_context():
     assert context_calls == 1
     assert layer.merged
     assert pipeline.is_lora_merged["transformer"]
+
+
+def test_ipc_lora_sync_updates_pipeline_state():
+    """After an IPC LoRA sync, set_lora must reapply and unmerge must restore base."""
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.server_args.lora_merge_mode = "merge"
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter", "/adapter", target="transformer", merge_mode="merge"
+        )
+    synced = [
+        ("linear.lora_A", torch.full((1, 2), 3.0)),
+        ("linear.lora_B", torch.ones(2, 1)),
+    ]
+    ok, message = WeightsUpdater(pipeline).update_weights_from_tensor(
+        {"transformer": synced}, weight_update_mode="lora_merge"
+    )
+    assert ok, message
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter", "/adapter", target="transformer", merge_mode="merge"
+        )
+    torch.testing.assert_close(layer.base_layer.weight, base_weight + 1)
+
+    pipeline.unmerge_lora_weights()
+    torch.testing.assert_close(layer.base_layer.weight, base_weight)
 
 
 def test_lora_alpha_override_updates_cached_adapter_scale():
