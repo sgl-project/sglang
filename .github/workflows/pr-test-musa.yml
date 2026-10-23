@@ -95,6 +95,9 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-label: run-ci-musa
     secrets: inherit
 
   # ==================== Multimodal Gen Tests ==================== #
