@@ -111,6 +111,8 @@ class TestNemotron35Embedding(CustomTestCase):
             head_dim=32,
             image_size=112,
             patch_size=14,
+            # SGLang's Pixtral MLP is SiLU-gated, as in the real checkpoints.
+            hidden_act="silu",
             initializer_range=0.1,
         )
         config = Mistral3Config(
