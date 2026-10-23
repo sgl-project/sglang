@@ -114,15 +114,18 @@ class TestEncoderOnlyVerifyPageTable(CustomTestCase):
             layers.append(layer)
         runner = MagicMock(is_draft_worker=is_draft_worker)
         runner.model.modules.return_value = layers
+        # override() restores the env only on a clean exit, so nothing raises inside.
         with envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.override(env):
-            return backend._resolve_encoder_only_reads_swa(runner)
+            try:
+                return backend._resolve_encoder_only_reads_swa(runner)
+            except NotImplementedError as error:
+                return error
 
     def test_only_a_draft_on_swa_slots_reads_the_swa_page_table(self):
         self.assertTrue(self._reads_swa())
         self.assertFalse(self._reads_swa(env=False))
         self.assertFalse(self._reads_swa(is_draft_worker=False))
-        with self.assertRaises(NotImplementedError):
-            self._reads_swa(swa_layer_ids=(0,))
+        self.assertIsInstance(self._reads_swa(swa_layer_ids=(0,)), NotImplementedError)
 
 
 if __name__ == "__main__":
