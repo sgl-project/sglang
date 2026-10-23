@@ -196,8 +196,12 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        if (
+            not get_platform().is_sm90
+            and not get_platform().is_sm100
+            and not get_platform().is_sm120
+        ):
+            raise RuntimeError("MXFP4 Marlin requires SM90+.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(
@@ -290,3 +294,6 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+    def get_marlin_quant_info(self, layer: Module) -> MarlinMoeQuantInfo:
+        return build_marlin_moe_quant_info(layer)

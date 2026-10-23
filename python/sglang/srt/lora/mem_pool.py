@@ -300,16 +300,10 @@ class LoRAMemoryPool:
             return self.attn_tp_size
         return self.tp_size
 
-    def _dense_local_dim(
-        self,
-        module_name: str,
-        base_model: torch.nn.Module,
-        layer_idx: int,
-        axis: str,
-    ) -> Optional[int]:
-        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
-        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
-            return None
+    def _dense_linear(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> Optional[torch.nn.Module]:
+        """The base linear named ``module_name`` in decoder layer ``layer_idx``, if any."""
         linears = getattr(self, "_dense_linears", None)
         if linears is None:
             linears = {}
@@ -322,7 +316,19 @@ class LoRAMemoryPool:
                 ):
                     linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
             self._dense_linears = linears
-        base_layer = linears.get((module_name, layer_idx))
+        return linears.get((module_name, layer_idx))
+
+    def _dense_local_dim(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+        axis: str,
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
+            return None
+        base_layer = self._dense_linear(module_name, base_model, layer_idx)
         if base_layer is None:
             return None
         if axis == "input":
@@ -681,17 +687,27 @@ class LoRAMemoryPool:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
-                    # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
+                    # Allocate dense/shared MLP buffers where needed; unused layers
+                    # keep zero-width placeholders to preserve layer indexing.
+                    dense_layers = [
+                        has_shared_experts
+                        or self._dense_linear(module_name, base_model, idx) is not None
+                        for idx in range(self.num_layer)
+                    ]
+                    if any(dense_layers):
                         buffer[module_name] = [
                             torch.zeros(
-                                get_lora_shape_fn(
-                                    module_name, base_model, self.max_lora_rank, idx
+                                (
+                                    get_lora_shape_fn(
+                                        module_name, base_model, self.max_lora_rank, idx
+                                    )
+                                    if dense
+                                    else (self.max_loras_per_batch, 0, 0)
                                 ),
                                 dtype=self.dtype,
                                 device=device,
                             )
-                            for idx in range(self.num_layer)
+                            for idx, dense in enumerate(dense_layers)
                         ]
 
                     # MoE expert version (4D)

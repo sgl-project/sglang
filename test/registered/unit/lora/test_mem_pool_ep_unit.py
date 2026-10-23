@@ -1888,5 +1888,108 @@ class TestColumnParallelLoraBShardsByBaseLinear(unittest.TestCase):
         self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (1, 48, 8))
 
 
+class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
+    """Allocate dense MLP buffers only on layers with dense/shared projections."""
+
+    HIDDEN, INTER, MOE_INTER, EXPERTS, TP, RANK, SLOTS = 64, 256, 32, 4, 4, 8, 2
+
+    def _model(self, n_dense: int, n_moe: int, shared: bool = False):
+        model = torch.nn.Module()
+        model.config = types.SimpleNamespace(
+            hidden_size=self.HIDDEN,
+            num_attention_heads=8,
+            intermediate_size=self.INTER,
+            moe_intermediate_size=self.MOE_INTER,
+            n_routed_experts=self.EXPERTS,
+            n_shared_experts=1 if shared else None,
+        )
+        model.anchor = torch.nn.Parameter(torch.zeros(1))
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList()
+        for idx in range(n_dense + n_moe):
+            layer = torch.nn.Module()
+            layer.mlp = torch.nn.Module()
+            inter = self.INTER if idx < n_dense else self.MOE_INTER
+            mlp = layer.mlp
+            if idx >= n_dense:
+                layer.mlp.experts = _FakeFusedMoE()
+                layer.mlp.experts.layer_id = idx
+                layer.mlp.experts.num_fused_shared_experts = 0
+                if shared:
+                    mlp = layer.mlp.shared_experts = torch.nn.Module()
+            if idx < n_dense or shared:
+                mlp.gate_up_proj = _FakeColLinear((inter // self.TP,) * 2)
+                mlp.down_proj = _FakeRowLinear(inter // self.TP)
+            model.model.layers.append(layer)
+        return model
+
+    def _pool(self, model) -> LoRAMemoryPool:
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.num_layer = len(model.model.layers)
+        pool.dtype = torch.bfloat16
+        pool.max_lora_rank = self.RANK
+        pool.max_loras_per_batch = self.SLOTS
+        pool.tp_size = self.TP
+        pool.tp_rank = 0
+        pool.attn_tp_size = self.TP
+        pool.moe_ep_size = 1
+        pool.moe_ep_rank = 0
+        pool.moe_tp_size = self.TP
+        pool.moe_tp_rank = 0
+        pool.moe_use_local_expert_ids = False
+        pool.experts_shared_outer_loras = False
+        pool.lora_added_tokens_size = 0
+        pool.base_hf_config = model.config
+        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.A_buffer, pool.B_buffer = {}, {}
+        with mock.patch.dict(
+            "sys.modules",
+            {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB},
+        ):
+            pool.init_buffers(model)
+        return pool
+
+    def test_only_the_dense_layer_gets_dense_buffers(self):
+        pool = self._pool(self._model(n_dense=1, n_moe=2))
+        local_inter, placeholder = self.INTER // self.TP, (self.SLOTS, 0, 0)
+        expected = {
+            ("A", "gate_up_proj"): (self.SLOTS, 2 * self.RANK, self.HIDDEN),
+            ("B", "gate_up_proj"): (self.SLOTS, 2 * local_inter, self.RANK),
+            ("A", "down_proj"): (self.SLOTS, self.RANK, local_inter),
+            ("B", "down_proj"): (self.SLOTS, self.HIDDEN, self.RANK),
+        }
+        for (side, name), shape in expected.items():
+            buffers = (pool.A_buffer if side == "A" else pool.B_buffer)[name]
+            with self.subTest(side=side, name=name):
+                self.assertEqual(
+                    [tuple(t.shape) for t in buffers], [shape, placeholder, placeholder]
+                )
+        for name in ("gate_up_proj_moe", "down_proj_moe"):
+            with self.subTest(name=name):
+                self.assertEqual(len(pool.A_buffer[name]), 3)
+                self.assertTrue(
+                    all(t.shape[1] == self.EXPERTS for t in pool.A_buffer[name])
+                )
+
+    def test_shared_experts_keep_a_dense_buffer_on_every_layer(self):
+        pool = self._pool(self._model(n_dense=1, n_moe=2, shared=True))
+        shared_inter = self.MOE_INTER // self.TP
+        self.assertEqual(
+            [tuple(t.shape) for t in pool.B_buffer["gate_up_proj"]],
+            [(self.SLOTS, 2 * self.INTER // self.TP, self.RANK)]
+            + [(self.SLOTS, 2 * shared_inter, self.RANK)] * 2,
+        )
+        self.assertEqual(
+            [tuple(t.shape) for t in pool.A_buffer["down_proj"]],
+            [(self.SLOTS, self.RANK, self.INTER // self.TP)]
+            + [(self.SLOTS, self.RANK, shared_inter)] * 2,
+        )
+
+    def test_an_all_moe_model_gets_only_expert_buffers(self):
+        pool = self._pool(self._model(n_dense=0, n_moe=2))
+        self.assertEqual(sorted(pool.A_buffer), ["down_proj_moe", "gate_up_proj_moe"])
+        self.assertEqual(sorted(pool.B_buffer), ["down_proj_moe", "gate_up_proj_moe"])
+
+
 if __name__ == "__main__":
     unittest.main()
