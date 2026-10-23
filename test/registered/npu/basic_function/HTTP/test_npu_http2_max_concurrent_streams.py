@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=50, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=50, suite="nightly-acc-8-npu-a5", nightly=True)
 
 
 class TestHttp2MaxConcurrentStreams(CustomTestCase):

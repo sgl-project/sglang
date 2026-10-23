@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=900, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=900, suite="nightly-acc-8-npu-a5", nightly=True)
 
 # Minimal valid 8x8 white JPEG base64 for testing (JPEG minimum block size is 8x8)
 _BASE64_WHITE_JPEG = (
