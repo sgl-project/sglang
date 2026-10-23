@@ -180,7 +180,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         from sglang.srt.beam_search.coordinator import BeamCoordinator
 
         return BeamCoordinator(
-            model_config=None,
+            model_config=SimpleNamespace(beam_trie_config=None),
             spec_algorithm=None,
             dllm_enabled=False,
             max_req_len=0,

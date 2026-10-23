@@ -533,3 +533,11 @@ register_kernel(
         capabilities=_SM10X,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)

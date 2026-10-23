@@ -110,6 +110,22 @@ class TestInitProfileBatchMode(CustomTestCase):
             self.assertIsNone(fake_self._profile_trace_tag)
 
 
+class TestBeamBatchesRunEager(CustomTestCase):
+    def test_trie_and_shared_context_batches_skip_graphs(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        for levels, metadata in ((object(), None), (None, object())):
+            with self.subTest(levels=levels, metadata=metadata):
+                forward_batch = SimpleNamespace(
+                    replace_embeds=None,
+                    spec_info=None,
+                    batch_size=4,
+                    beam_trie_levels=levels,
+                    beam_attention_metadata=metadata,
+                )
+                self.assertFalse(runner.can_run_graph(forward_batch))
+
+
 class TestInitProfileOriginalMode(CustomTestCase):
     """No flag, original flag only, or both (precedence) -> unscheduled pass with
     no per-bs schedule / directory / bookkeeping."""

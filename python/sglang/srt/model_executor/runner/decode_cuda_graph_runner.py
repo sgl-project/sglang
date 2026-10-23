@@ -867,6 +867,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        # Compact-trie logits and shared-context attention run eagerly.
+        if (
+            forward_batch.beam_trie_levels is not None
+            or forward_batch.beam_attention_metadata is not None
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
