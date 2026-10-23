@@ -863,7 +863,11 @@ class BaseMultimodalProcessor(ABC):
         if images:
             kwargs["images"] = images
             if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+                # Server-level image config is the default; per-request kwargs win.
+                kwargs["images_kwargs"] = {
+                    **self.image_config,
+                    **kwargs.get("images_kwargs", {}),
+                }
         if videos:
             kwargs["videos"] = videos
             video_config = (

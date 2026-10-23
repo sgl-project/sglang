@@ -1,6 +1,7 @@
 """Regression tests for Pixtral multimodal item processing."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -134,6 +135,53 @@ class TestPixtralProcessor(CustomTestCase):
         items = processor._finalize_mm_items([item], images=images)
 
         self.assertEqual([len(item.offsets) for item in items], [40, 40])
+
+    def test_request_longest_edge_is_forwarded(self):
+        processor = self._make_processor()
+        request = SimpleNamespace(mm_processor_kwargs={"size": {"longest_edge": 896}})
+
+        self.assertEqual(
+            processor._request_processor_kwargs(request),
+            {"images_kwargs": {"size": {"longest_edge": 896}}},
+        )
+        self.assertEqual(
+            processor._request_processor_kwargs(SimpleNamespace()), {}
+        )
+
+    def test_request_images_kwargs_override_server_image_config(self):
+        processor = self._make_processor()
+        processor.image_config = {"size": {"longest_edge": 1120}, "do_resize": True}
+        processor.disable_fast_image_processor = True
+        processor._tokenizer_auto_adds_specials = False
+        processor.mm_feature_transport = "cpu"
+        processor.FEATURE_NAMES = []
+        hf_processor = MagicMock(return_value={})
+
+        processor.process_mm_data(
+            "[IMG]",
+            images=[Image.new("RGB", (28, 28))],
+            processor=hf_processor,
+            images_kwargs={"size": {"longest_edge": 896}},
+        )
+
+        self.assertEqual(
+            hf_processor.call_args.kwargs["images_kwargs"],
+            {"size": {"longest_edge": 896}, "do_resize": True},
+        )
+
+    def test_invalid_request_processor_kwargs_are_rejected(self):
+        processor = self._make_processor()
+        for mm_processor_kwargs in (
+            {"size": {"longest_edge": 2048}},
+            {"size": {"longest_edge": 0}},
+            {"size": {"longest_edge": "896"}},
+            {"size": {"height": 896, "width": 896}},
+            {"do_resize": False},
+        ):
+            with self.subTest(mm_processor_kwargs=mm_processor_kwargs):
+                request = SimpleNamespace(mm_processor_kwargs=mm_processor_kwargs)
+                with self.assertRaises(ValueError):
+                    processor._request_processor_kwargs(request)
 
 
 if __name__ == "__main__":

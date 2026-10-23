@@ -80,7 +80,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
             return_text=True,
         )
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
-            mm_data, self.mm_tokens
+            mm_data, self.mm_tokens, **self._request_processor_kwargs(request_obj)
         )
 
         return MultimodalProcessorOutput(
@@ -88,6 +88,31 @@ class PixtralProcessor(BaseMultimodalProcessor):
             input_ids=input_ids.tolist(),
             im_token_id=self.IM_TOKEN_ID,
         )
+
+    def _request_processor_kwargs(self, request_obj) -> dict:
+        """Per-request image resizing, e.g. ``{"size": {"longest_edge": 1024}}``."""
+        mm_processor_kwargs = getattr(request_obj, "mm_processor_kwargs", None)
+        if not mm_processor_kwargs:
+            return {}
+        size = mm_processor_kwargs.get("size")
+        if set(mm_processor_kwargs) != {"size"} or not isinstance(size, dict):
+            raise ValueError(
+                "Pixtral mm_processor_kwargs supports only "
+                '{"size": {"longest_edge": N}}'
+            )
+        longest_edge = size.get("longest_edge")
+        # The vision tower's rotary table covers image_size pixels per side.
+        if (
+            set(size) != {"longest_edge"}
+            or not isinstance(longest_edge, int)
+            or isinstance(longest_edge, bool)
+            or not 0 < longest_edge <= self.image_size
+        ):
+            raise ValueError(
+                f"longest_edge must be an integer in [1, {self.image_size}], "
+                f"got {size}"
+            )
+        return {"images_kwargs": {"size": {"longest_edge": longest_edge}}}
 
     def _postprocess_mm_items_before_transport(
         self,
