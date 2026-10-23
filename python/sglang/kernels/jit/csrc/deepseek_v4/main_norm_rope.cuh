@@ -438,10 +438,8 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   }
 }
 
-// V4.1 layouts: one warp per token, each lane holding 16 consecutive values, so a token is read
-// with 16-byte loads and reduced without shared memory. The sum of squares is added in the order
-// of `fused_k_norm_rope_flashmla` (its thread t is pair t % 8 of lane t / 8 here), so the
-// written rows are bitwise equal.
+// The sum of squares is added in the order of `fused_k_norm_rope_flashmla` (its thread t is
+// pair t % 8 of lane t / 8 here), so both kernels write bitwise-equal rows.
 constexpr uint32_t kFusedKV41WarpsPerCTA = 4;
 // Below this many tokens the block-per-token kernel is as fast (decode, short prefill).
 constexpr uint32_t kFusedKV41MinTokens = 2048;
