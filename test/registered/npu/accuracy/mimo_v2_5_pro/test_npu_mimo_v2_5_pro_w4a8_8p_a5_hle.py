@@ -3,6 +3,10 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_performance_utils import (
+    MIMO_V2_5_PRO_DFLASH_MODEL_PATH,
+    MIMO_V2_5_PRO_FP4_MODEL_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -11,15 +15,7 @@ register_npu_ci(
     nightly=True,
 )
 
-# TODO: Add MIMO_V2_5_PRO_FP4_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py
-MIMO_V2_5_PRO_FP4_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
-)
-# TODO: Add MIMO_V2_5_PRO_DFLASH_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py
-MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
-)
-# TODO: Update HLE dataset path for CI environment
+# Update HLE dataset path for CI environment
 HLE_DATASET_PATH = "/mnt/share/w00937173/run_file/mimo-v2.5-pro/data/hle_dataset"
 
 MIMO_V2_5_PRO_FP4_8P_ENVS = {

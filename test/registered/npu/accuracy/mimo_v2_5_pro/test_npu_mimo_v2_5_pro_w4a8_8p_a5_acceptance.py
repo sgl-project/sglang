@@ -7,6 +7,11 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.e2e.test_npu_performance_utils import (
+    MIMO_V2_5_PRO_DFLASH_MODEL_PATH,
+    MIMO_V2_5_PRO_FP4_MODEL_PATH,
+    SHAREGPT_DATASET_TEST_FILE,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -19,16 +24,6 @@ register_npu_ci(
     suite="nightly-acc-8-npu-a5",
     nightly=True,
 )
-
-# TODO: Add MIMO_V2_5_PRO_FP4_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py
-MIMO_V2_5_PRO_FP4_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
-)
-# TODO: Add MIMO_V2_5_PRO_DFLASH_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py
-MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
-)
-SHAREGPT_DATASET_PATH = "/root/.cache/modelscope/hub/datasets/gliang1001/ShareGPT_V3_unfiltered_cleaned_split/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 MIMO_V2_5_PRO_FP4_8P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -138,7 +133,7 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_Acceptance(CustomTestCase):
             "--model",
             self.model_path,
             "--dataset-path",
-            SHAREGPT_DATASET_PATH,
+            SHAREGPT_DATASET_TEST_FILE,
             "--dataset-name",
             "random",
             "--tokenize-prompt",
