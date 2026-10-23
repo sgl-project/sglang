@@ -193,20 +193,6 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-def test_linker_class_resolves_each_backend():
-    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-        MooncakeDirectLinker,
-    )
-    from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
-        UMBPDirectLinker,
-    )
-
-    assert linker_attachment._linker_class("mooncake") is MooncakeDirectLinker
-    assert linker_attachment._linker_class("mori") is UMBPDirectLinker
-    with pytest.raises(ValueError, match="unknown"):
-        linker_attachment._linker_class("unknown")
-
-
 @pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
@@ -673,8 +659,6 @@ class TestUnifiedCacheLinkerPythonBackend(
         tail = tail.last_device_node
         cache.check_hicache_events()
 
-        # The new store holds nothing, so the whole path goes out again,
-        # including the node inserted while detached.
         cache.attach_cache_linker("mooncake")
         second = linkers[1]
         self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])

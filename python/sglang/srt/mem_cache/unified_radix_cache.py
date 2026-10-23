@@ -313,7 +313,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
-        # Owns the external linker lifecycle; built by init_linker_attachment.
         self._linker_attachment: Optional[CacheLinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -3392,12 +3391,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
-    # ---- External linker lifecycle (delegated) ----
-
     def attach_cache_linker(
         self, storage_backend: str, storage_backend_extra_config: Optional[str] = None
     ) -> str:
-        """Attach the external linker; raises when it is not attached."""
         if self._linker_attachment is None:
             raise RuntimeError(
                 "Launch with --enable-unified-cache-external-linker to attach "

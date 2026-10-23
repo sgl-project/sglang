@@ -1,9 +1,3 @@
-"""Attach / detach the direct external linker of a ``UnifiedRadixCache``.
-
-Startup and the admin API share :meth:`CacheLinkerAttachment.attach`; the admin
-API and process teardown share :meth:`CacheLinkerAttachment.detach`.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -45,7 +39,6 @@ def _linker_class(storage_backend: str) -> type[UnifiedCacheLinker]:
 def runtime_change_rejection(
     *, prefetch_policy: Optional[str] = None, write_policy: Optional[str] = None
 ) -> Optional[str]:
-    """Why the linker cannot be attached or detached after startup, if it cannot."""
     if get_memory().enable_linker_mla_dedup:
         return (
             "--enable-linker-mla-dedup does not support runtime attach or detach "
@@ -57,8 +50,6 @@ def runtime_change_rejection(
 
 
 class CacheLinkerAttachment:
-    """Attach / detach the external linker of one ``UnifiedRadixCache``."""
-
     def __init__(
         self,
         cache: UnifiedRadixCache,
@@ -72,7 +63,6 @@ class CacheLinkerAttachment:
         self._server_args = server_args
         self._params = params
         self._kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        # The forward worker's load-consumer hook, wired beside the KV pool's.
         self._register_layer_transfer_counter = register_layer_transfer_counter
         self._forward_stream = forward_stream
         self.storage_backend: Optional[str] = None
@@ -81,7 +71,6 @@ class CacheLinkerAttachment:
     def attach(
         self, storage_backend: str, storage_backend_extra_config: Optional[str] = None
     ) -> str:
-        """Link the store on every rank, or raise with nothing linked on any rank."""
         if self.storage_backend is not None:
             if (storage_backend, storage_backend_extra_config) == (
                 self.storage_backend,
@@ -137,7 +126,6 @@ class CacheLinkerAttachment:
         return f"External linker attached to {storage_backend!r}."
 
     def detach(self) -> str:
-        """Drain and close the linker, and unlink it from the tree and the pools."""
         if self.storage_backend is None:
             return "External linker is not attached."
         self._cache.close_cache_linker()

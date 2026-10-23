@@ -1,5 +1,3 @@
-"""Runtime detach / re-attach of the UnifiedRadixCache direct linker."""
-
 import json
 import os
 import unittest
@@ -89,7 +87,6 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         )
 
     def _loaded_tokens(self, input_ids, flush=True):
-        """Generate once and return how many prompt tokens came from the store."""
         if flush:
             self._request("POST", "/flush_cache").raise_for_status()
         response = self._request(
@@ -110,7 +107,6 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         detached_ids = [(i * 53) % 30000 + 100 for i in range(num_tokens)]
         min_loaded = num_tokens - PAGE_SIZE
 
-        # A flush drops the device copy, so a repeat comes back from the store.
         self._loaded_tokens(stored_ids)
         self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
@@ -136,10 +132,8 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         status = self._request("GET", "/hicache/storage-backend").json()
         self.assertEqual(status["unified_cache_external_linker_backend"], "mooncake")
 
-        # Nodes inserted while detached are hashed on attach and offloaded on reuse.
         self._loaded_tokens(detached_ids, flush=False)
         self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)
-        # The store kept the pages written before the detach.
         self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
 
