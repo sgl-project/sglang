@@ -864,6 +864,72 @@ class TestResponseTemplateAdapters(CustomTestCase):
             )
         self.assertEqual(streaming.incomplete_tool_call_indices, set())
 
+    def test_transform_each_casts_arguments_to_the_transformed_call(self):
+        """A member's arguments are cast to the schema of the call its transform
+        produces, never to the schema of the function named in the raw member."""
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "tool_calls": {
+                    "open": "<calls>",
+                    "close": "</calls>",
+                    "content": "json",
+                    "transform_each": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "echo",
+                            "arguments": "{function.arguments}",
+                        },
+                    },
+                },
+            },
+        }
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    parameters={
+                        "type": "object",
+                        "properties": {"days": {"type": days_type}},
+                    },
+                ),
+            )
+            for name, days_type in (("get_forecast", "integer"), ("echo", "string"))
+        ]
+        text = (
+            '<calls>[{"function":{"name":"get_forecast",'
+            '"arguments":{"days":"003"}}}]</calls>'
+        )
+
+        def streamed(chunk_size):
+            detector = ResponseTemplateToolDetector(
+                response_template=template, prefix="<assistant>"
+            )
+            calls = []
+            for start in range(0, len(text), chunk_size):
+                chunk = text[start : start + chunk_size]
+                calls += detector.parse_streaming_increment(chunk, tools).calls
+            return calls + detector.finish(tools).calls
+
+        parsed = ResponseTemplateToolDetector(
+            response_template=template, prefix="<assistant>"
+        ).detect_and_parse(text, tools)
+        for mode, calls in (
+            ("non-streaming", parsed.calls),
+            ("whole output", streamed(len(text))),
+            ("per character", streamed(1)),
+        ):
+            with self.subTest(mode=mode):
+                ((name, arguments),) = [
+                    (call.name, json.loads(call.parameters)) for call in calls
+                ]
+                self.assertEqual(
+                    (name, arguments, type(arguments["days"])),
+                    ("echo", {"days": "003"}, str),
+                )
+
     def test_malformed_call_is_dropped(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,

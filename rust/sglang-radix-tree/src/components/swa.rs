@@ -7,13 +7,17 @@ use std::collections::HashMap;
 
 use tch::{Kind, Tensor};
 
+use crate::cache_action::{
+    FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull,
+    SwaRebuild,
+};
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
@@ -57,7 +61,7 @@ impl SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         leaf_id: NodeIdx_,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let leaf = tree_core.arena.node(leaf_id);
         if leaf.is_root() || leaf.device_lock_ref(SWA) > 0 {
@@ -80,17 +84,11 @@ impl SwaComponent {
 
         let (new_parent, action) = tree_core.split_node_(leaf_id, split_at);
         assert!(
-            !matches!(
-                action,
-                Some(CacheAction::UpdatePendingBackupOnNodeSplit {
-                    ack_id: Some(_),
-                    ..
-                })
-            ),
+            action.as_ref().is_none_or(|action| action.ack_id.is_none()),
             "fresh SWA leaf cannot be write-through-pending"
         );
         if let Some(action) = action {
-            cache_actions.push(action);
+            cache_actions.push(Box::new(action));
         }
         Some(new_parent)
     }
@@ -193,12 +191,12 @@ impl SwaComponent {
 
 impl SwaComponent {
     /// Queue a free of the given SWA host slots; empty tensors are dropped.
-    fn release_swa_host_(&self, host_indices: Tensor, cache_actions: &mut Vec<CacheAction>) {
+    fn release_swa_host_(&self, host_indices: Tensor, cache_actions: &mut CacheActions) {
         if host_indices.numel() > 0 {
-            cache_actions.push(CacheAction::FreeComponentHostSlot {
+            cache_actions.push(Box::new(FreeComponentHostSlot {
                 component_type: SWA,
                 host_indices: vec![host_indices],
-            });
+            }));
         }
     }
 
@@ -234,7 +232,7 @@ impl SwaComponent {
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -307,7 +305,7 @@ impl SwaComponent {
                 if fill_start > node_start {
                     let (_, action) = tree_core.split_node_(cur, fill_start - node_start);
                     if let Some(action) = action {
-                        cache_actions.push(action);
+                        cache_actions.push(Box::new(action));
                     }
                 }
                 self.attach_swa_host_value_(tree_core, cur, slice);
@@ -441,7 +439,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: &InsertParams<'_, K>,
         preserve_full_ids: bool,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> usize {
         if params.prev_prefix_len >= total_prefix_len + prefix_len {
             return prefix_len;
@@ -467,21 +465,23 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // Branch 1: entire value_slice is within SWA window — recover
             result.record_adopted_range(SWA, total_prefix_len, total_prefix_len + prefix_len);
             if node.device_lock_ref(FULL) > 0 || preserve_full_ids {
-                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
+                cache_actions.push(Box::new(RecoverSwaWithLockedFull {
                     node_id: node.id,
                     kept_full: node.device_value(FULL).shallow_clone(),
                     incoming_full: value_slice,
-                });
+                }));
                 return 0;
             }
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
-            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(FreeDeviceKVFullOnly {
+                indices: vec![old_full],
+            }));
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: node.id,
                 source_value: value_slice,
-            });
+            }));
             0
         } else if swa_evicted_seqlen < total_prefix_len + prefix_len {
             // Branch 2: value_slice[start_idx:] is within SWA window — partial recover
@@ -495,26 +495,28 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     .narrow(0, start_idx as i64, (full_len - start_idx) as i64);
             let (_, action) = tree_core.split_node_(node_id, start_idx);
             if let Some(action) = action {
-                cache_actions.push(action);
+                cache_actions.push(Box::new(action));
             }
             let new_full = value_slice.narrow(0, start_idx as i64, (prefix_len - start_idx) as i64);
             if preserve_full {
-                cache_actions.push(CacheAction::RecoverSwaWithLockedFull {
+                cache_actions.push(Box::new(RecoverSwaWithLockedFull {
                     node_id: node_ext_id,
                     kept_full: old_full,
                     incoming_full: new_full,
-                });
+                }));
                 return start_idx;
             }
             result.record_adopted_range(FULL, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
-            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(FreeDeviceKVFullOnly {
+                indices: vec![old_full],
+            }));
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: node_ext_id,
                 source_value: new_full,
-            });
+            }));
             start_idx
         } else {
             // Branch 3: entire value_slice is outside SWA window — not consumed
@@ -530,7 +532,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         // _unevict_node_on_insert already wrote the request's fresh KV slice
         // into the base value. We just need to rebuild SWA from that slice for
@@ -552,7 +554,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let start_idx = swa_evicted_seqlen - total_prefix_len;
             let (_, action) = tree_core.split_node_(node_id, start_idx);
             if let Some(action) = action {
-                cache_actions.push(action);
+                cache_actions.push(Box::new(action));
             }
         } else {
             return;
@@ -562,10 +564,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             total_prefix_len.max(swa_evicted_seqlen),
             total_prefix_len + prefix_len,
         );
-        cache_actions.push(CacheAction::SwaRebuild {
+        cache_actions.push(Box::new(SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
-        });
+        }));
     }
 
     fn commit_insert_component_data(
@@ -575,7 +577,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if let Some(branching_seqlen) = params.swa_branching_seqlen {
             result.swa_branch_inserted = params.key.atom_len() >= branching_seqlen;
@@ -599,7 +601,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // (tombstone) and an in-window child; `node` becomes the child.
                 let (_, action) = tree_core.split_node_(node_id, split_pos);
                 if let Some(action) = action {
-                    cache_actions.push(action);
+                    cache_actions.push(Box::new(action));
                 }
             }
         }
@@ -609,18 +611,18 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         // the in-window tail lands more-MRU.
         let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id, cache_actions);
         if let Some(capped_parent) = capped_parent {
-            cache_actions.push(CacheAction::SwaRebuild {
+            cache_actions.push(Box::new(SwaRebuild {
                 node_id: tree_core.arena.node(capped_parent).id,
                 source_value: tree_core
                     .arena
                     .device_value(capped_parent, FULL)
                     .shallow_clone(),
-            });
+            }));
         }
-        cache_actions.push(CacheAction::SwaRebuild {
+        cache_actions.push(Box::new(SwaRebuild {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
-        });
+        }));
     }
 
     fn redistribute_on_node_split(
@@ -671,7 +673,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = SWA;
@@ -741,7 +743,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = SWA;
         assert!(
@@ -848,7 +850,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = SWA;
         let mut x = tree_core
@@ -1057,7 +1059,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -1142,10 +1144,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 assert_eq!(offset, host_indices.size()[0]);
                 // Rebuild the full->swa mapping for the loaded chunks at the orchestration layer.
                 if !full_chunks.is_empty() {
-                    cache_actions.push(CacheAction::RebuildFullToSwaMapping {
+                    cache_actions.push(Box::new(RebuildFullToSwaMapping {
                         full_indices: full_chunks,
                         swa_indices: swa_chunks,
-                    });
+                    }));
                 }
             }
             CacheTransferPhase::Prefetch => {
@@ -1289,7 +1291,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if tree_core.arena.node(node_id).is_root() {
             return;

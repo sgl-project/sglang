@@ -849,6 +849,34 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
 )
 
 
+def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
+    """Whether the ratio-1/2 sources run as an eager break: inside a breakable graph
+    without the in-graph low-ratio path, or in a decoder tail graph."""
+    return (
+        forward_batch.forward_mode.is_extend()
+        and is_in_breakable_cuda_graph()
+        and (
+            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            or in_replay_tail_graph()
+        )
+    )
+
+
+def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
+    # Like the sources above: the compressor syncs with the host.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    get_attn_backend().write_tail_source_kv(
+        layer=layer,
+        x=x[:real_num_tokens],
+        positions=positions[:real_num_tokens],
+        forward_batch=forward_batch,
+    )
+
+
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(deepseek_v4_write_tail_source_kv)
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -856,6 +884,13 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
+
+
+def _engram_image_token_id(config) -> Optional[int]:
+    """The image token Engram hashes as blocked and leaves ungated (V4.1 vision)."""
+    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        return config.image_token_id
+    return None
 
 
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
@@ -2418,14 +2453,7 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and (
-                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
-                    or in_replay_tail_graph()
-                )
-            ):
+            if _low_ratio_sources_break(attn_backend, forward_batch):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
                 attn_backend.forward_low_ratio_sources(
@@ -3095,6 +3123,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                 engram_layout,
                 quant_config=quant_config,
                 prefix=add_prefix("engram", prefix),
+                image_token_id=_engram_image_token_id(config),
             )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
@@ -3729,12 +3758,7 @@ class DeepseekV4Model(nn.Module):
             self.engram_hasher = EngramHasher.from_config(
                 config,
                 self.engram_layout,
-                image_token_id=(
-                    config.image_token_id
-                    if config.model_type == "deepseek_v41"
-                    and config.vision_n_layers > 0
-                    else None
-                ),
+                image_token_id=_engram_image_token_id(config),
             )
 
         if not _is_cuda:
@@ -3972,12 +3996,17 @@ class DeepseekV4Model(nn.Module):
                         source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)
-                    attn_backend.write_tail_source_kv(
-                        layer=source.self_attn,
-                        x=source_x,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
+                    if _low_ratio_sources_break(attn_backend, forward_batch):
+                        bcg_deepseek_v4_write_tail_source_kv(
+                            source.self_attn, source_x, positions
+                        )
+                    else:
+                        attn_backend.write_tail_source_kv(
+                            layer=source.self_attn,
+                            x=source_x,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                        )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
@@ -4067,17 +4096,9 @@ class DeepseekV4Model(nn.Module):
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
+                    input_ids=input_ids,
                     cp_all_tokens=cp_extend,
                 )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
-                    hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
-                        state.residual,
-                        hidden_states,
-                    )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4272,10 +4293,13 @@ class DeepseekV4Model(nn.Module):
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
         try:
-            return self._forward_impl(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
         finally:
             residual_batch.clear(forward_batch)
 
@@ -4443,8 +4467,9 @@ class DeepseekV4Model(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
+            # The kernel widens each element to fp32 as it loads it.
             hidden_states = mhc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
             hidden_states = self.hc_head(
