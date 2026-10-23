@@ -1932,11 +1932,10 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         self.assertEqual(len(controller.load_queue), 1)
 
 
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
 class TestRotationPhase(_TreeCoreBackendCase):
     """The backup's host start class: rotation base + the node's first
     position-page, read host-side (the device value is on the GPU)."""
-
-    tree_core_backend = "python"
 
     def _phase(self, tree, tokens):
         node = tree.match_prefix(
