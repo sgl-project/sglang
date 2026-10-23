@@ -78,11 +78,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_mega_decode,
-        )
+        from sglang.kernels.ops.attention import flash_mla_interface
 
-        data, scale, _ = flash_mla_mega_decode(
+        data, scale, _ = flash_mla_interface.flash_mla_mega_decode(
             q,
             swa_k_cache,
             swa_page_indices,
@@ -109,11 +107,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         topk_length: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_mega_prefill,
-        )
+        from sglang.kernels.ops.attention import flash_mla_interface
 
-        data, scale, _, _ = flash_mla_mega_prefill(
+        data, scale, _, _ = flash_mla_interface.flash_mla_mega_prefill(
             q,
             kv,
             indices,
