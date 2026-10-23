@@ -128,8 +128,6 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # Multi-node is rejected with direct in server-args validation, so a hybrid
-    # mode here already covers every multi-node run.
     return get_exec().moe.deepep_v2_mode == "hybrid"
 
 

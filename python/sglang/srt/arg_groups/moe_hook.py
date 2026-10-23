@@ -427,11 +427,6 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
-        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
-            raise ValueError(
-                "--deepep-v2-mode direct is NVLink-only and cannot run across "
-                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
-            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,

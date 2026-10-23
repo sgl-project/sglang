@@ -3270,11 +3270,9 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_direct_mode_rejected_across_nodes(self):
-        # direct is NVLink-only; multi-node must ask for hybrid up front.
-        args = self._args(moe_runner_backend="deep_gemm", nnodes=2)
-        with self.assertRaisesRegex(ValueError, "--deepep-v2-mode hybrid"):
-            handle_a2a_moe(args)
+    def test_both_modes_accepted_across_nodes(self):
+        """DeepEP V2.5 direct mode reaches remote peers over RDMA, so multi-node must not force hybrid."""
+        handle_a2a_moe(self._args(moe_runner_backend="deep_gemm", nnodes=2))
         handle_a2a_moe(
             self._args(
                 moe_runner_backend="deep_gemm", nnodes=2, deepep_v2_mode="hybrid"
