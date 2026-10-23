@@ -1255,8 +1255,11 @@ on Ascend NPU. Follow the
 and install compatible CANN, PyTorch, and torch_npu versions before running.
 The backend requires `npu_dynamic_quant` and `npu_quant_matmul`.
 
-Weights are quantized per output channel after loading, and activations are
-dynamically quantized per token. Linear outputs retain the input FP16/BF16
+Weights are quantized per output channel as each complete local weight is loaded,
+after fused projections are assembled and tensor-parallel slicing is applied.
+The loader releases that weight's FP16/BF16 buffer immediately, reducing peak NPU
+loading memory. FSDP/DTensor loading keeps the existing post-load conversion path.
+Activations are dynamically quantized per token. Linear outputs retain the input FP16/BF16
 dtype. This online method does not require calibration or a ModelSlim
 `quant_model_description.json`; use the existing ModelSlim loading path for
 pre-quantized checkpoints.

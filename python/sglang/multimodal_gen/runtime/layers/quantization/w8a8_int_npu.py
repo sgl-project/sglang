@@ -112,15 +112,21 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def _process_weight_on_load(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if weight.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 "w8a8_int diffusion quantization requires FP16 or BF16 "
                 f"weights, got {weight.dtype}"
             )
+        torch.npu.config.allow_internal_format = True
         self.kernel.process_weights_after_loading(layer)
         set_weight_attrs(layer.weight, {"input_dim": 1, "output_dim": 0})
+        layer._w8a8_weight_processed = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_w8a8_weight_processed", False):
+            self._process_weight_on_load(layer)
         # Convert GEMM bias once instead of on every denoising step.
         if layer.bias is not None and not layer.skip_bias_add:
             layer.bias.data = layer.bias.data.to(torch.float32)
