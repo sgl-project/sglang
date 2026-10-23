@@ -10,9 +10,8 @@ Run from test/srt::
 
   python3 -m unittest xpu.test_gemma_4_e2b.TestGemma4E2BXPU.test_simple_qa
 
-A single end-to-end test (``test_simple_qa``) verifies the model boots
-on XPU and returns a coherent reply. On failure the assertion message
-includes the model's actual output.
+Full-model and text-only launches verify that the model boots on XPU,
+preserves processor token IDs, and rejects media without its encoders.
 
 Server is started with ``sglang serve`` (``--model-impl sglang``).
 """
@@ -22,9 +21,15 @@ from __future__ import annotations
 import unittest
 
 import openai
+import requests
 import torch
 
 from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer_from_processor,
+)
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.vlm_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -77,8 +82,11 @@ def _empty_xpu_cache() -> None:
 
 @unittest.skipUnless(is_xpu(), "Intel XPU not available")
 class TestGemma4E2BXPU(CustomTestCase):
+    server_args = XPU_SERVER_ARGS
+
     @classmethod
     def setUpClass(cls):
+        cls.process = None
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
@@ -89,14 +97,15 @@ class TestGemma4E2BXPU(CustomTestCase):
             cls.base_url,
             timeout=LAUNCH_TIMEOUT,
             api_key=cls.api_key,
-            other_args=list(XPU_SERVER_ARGS),
+            other_args=list(cls.server_args),
             device="xpu",
         )
         cls.base_url += "/v1"
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         _empty_xpu_cache()
 
     def test_simple_qa(self):
@@ -125,16 +134,63 @@ class TestGemma4E2BXPU(CustomTestCase):
         )
 
 
-from sglang.test.ci.ci_register import register_xpu_ci
+class TestGemma4E2BTextOnlyXPU(TestGemma4E2BXPU):
+    """The text-only launch must omit media capability and reject media inputs."""
 
-# Single e2e test: boot + a short Q&A.
+    server_args = XPU_SERVER_ARGS + [
+        "--language-model-only",
+        "--cuda-graph-backend-decode",
+        "full",
+    ]
+
+    def test_preserves_processor_token_ids(self):
+        tokenizer = get_tokenizer_from_processor(
+            get_processor(self.model, trust_remote_code=True)
+        )
+        prompt = tokenizer.apply_chat_template(
+            _simple_text_messages(),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        response = requests.post(
+            f"{self.base_url}/tokenize",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={"prompt": prompt, "add_special_tokens": True},
+            timeout=30,
+        )
+        response.raise_for_status()
+        self.assertEqual(response.json()["tokens"], tokenizer.encode(prompt))
+
+    def test_rejects_media_without_encoders(self):
+        url = self.base_url.removesuffix("/v1")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        info = requests.get(f"{url}/model_info", headers=headers, timeout=30)
+        info.raise_for_status()
+        self.assertFalse(info.json()["has_image_understanding"])
+        self.assertFalse(info.json()["has_audio_understanding"])
+        response = requests.post(
+            f"{url}/generate",
+            headers=headers,
+            json={
+                "text": "Describe this image.",
+                "image_data": "data:image/png;base64,AA==",
+                "sampling_params": {"max_new_tokens": 1},
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("--language-model-only", response.text)
+
+
+# Full-model and text-only launches.
 register_xpu_ci(
-    est_time=240,
+    est_time=360,
     suite="nightly-xpu-kernel-main-1-gpu",
     nightly=True,
 )
 register_xpu_ci(
-    est_time=240,
+    est_time=360,
     suite="nightly-xpu-kernel-wheel-1-gpu",
     nightly=True,
 )

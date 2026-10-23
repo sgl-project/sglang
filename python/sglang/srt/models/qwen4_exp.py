@@ -98,8 +98,9 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
 
+_is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1104,7 +1105,7 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1311,9 +1312,9 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(torch.get_device_module().current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with torch.get_device_module().stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
@@ -1323,7 +1324,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        torch.get_device_module().current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
@@ -1521,6 +1522,16 @@ def _build_qwen4_exp_stages(config, layer_id, residual, *, linear_attention=Fals
     return append_stages((attn, None), (ffn, None))
 
 
+def _prepare_decode_moe_comm(mlp):
+    # qwen4_decode pulls in CUDA-only communication kernels (tvm_ffi), so
+    # only import it where its Blackwell decode path can be enabled.
+    if not (_is_cuda and isinstance(mlp, Qwen2MoeSparseMoeBlock)):
+        return None
+    from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
+
+    return prepare_qwen4_decode_comm(mlp)
+
+
 class Qwen4ExpLayerExtensionMixin:
     stage_facts = staticmethod(_qwen4_exp_stage_facts)
 
@@ -1594,13 +1605,7 @@ class Qwen4ExpLayerExtensionMixin:
             linear_attention=linear_attention,
         )
 
-        from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
-
-        self._decode_moe_comm = (
-            prepare_qwen4_decode_comm(self.mlp)
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            else None
-        )
+        self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
     def hc_norms(self, normalized_input, next_norm):

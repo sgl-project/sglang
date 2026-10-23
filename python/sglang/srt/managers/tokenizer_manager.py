@@ -190,9 +190,9 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.hf_transformers.processor import get_text_tokenizer
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
-    get_tokenizer,
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
@@ -638,8 +638,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
-                self.tokenizer = get_tokenizer(
+                self.tokenizer = get_text_tokenizer(
                     get_serving().tokenizer_path,
+                    model_architectures=self.model_config.hf_config.architectures,
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
