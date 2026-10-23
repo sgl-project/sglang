@@ -38,8 +38,30 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+
+
+class TestReasoningUsage(CustomTestCase):
+    def test_reasoning_details_follow_the_cumulative_counter(self):
+        for count in (None, 0, 7):
+            with self.subTest(count=count):
+                usage = UsageInfo(reasoning_tokens=count)
+                for payload in (
+                    usage.model_dump(),
+                    json.loads(usage.model_dump_json()),
+                ):
+                    self.assertEqual(payload["reasoning_tokens"], count)
+                    self.assertEqual(
+                        payload["completion_tokens_details"],
+                        {"reasoning_tokens": count or 0},
+                    )
+                usage.reasoning_tokens = 11
+                self.assertEqual(
+                    usage.model_dump()["completion_tokens_details"],
+                    {"reasoning_tokens": 11},
+                )
 
 
 class TestCompletionRequest(unittest.TestCase):

@@ -59,6 +59,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    computed_field,
     field_serializer,
     field_validator,
     model_serializer,
@@ -206,6 +207,10 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -213,6 +218,12 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+
+    @computed_field
+    @property
+    def completion_tokens_details(self) -> CompletionTokensDetails:
+        # Derive both wire fields from the same cumulative counter.
+        return CompletionTokensDetails(reasoning_tokens=self.reasoning_tokens or 0)
 
 
 class StreamOptions(BaseModel):
