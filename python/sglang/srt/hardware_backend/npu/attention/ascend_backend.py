@@ -575,7 +575,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
-        # MLA DCP prepares its local tables and device lengths below.
+        # MLA DCP prepares its local KV metadata below.
         if self.needs_cpu_seq_lens and not dense_mla_dcp_partial:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
@@ -702,10 +702,8 @@ class AscendAttnBackend(AttentionBackend):
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
             global_kv_lens_cpu = metadata.seq_lens_cpu_int
-            global_kv_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
                 query_len = int(forward_batch.spec_info.draft_token_num)
-                global_kv_lens = global_kv_lens.to(torch.int64) + query_len
                 spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is not None and spec_algorithm.is_dflash_family():
                     # Active Host lengths already include verify tokens; Ascend's
@@ -713,11 +711,6 @@ class AscendAttnBackend(AttentionBackend):
                     global_kv_lens_cpu = torch.where(
                         global_kv_lens_cpu == 0, query_len, global_kv_lens_cpu
                     )
-            elif forward_batch.spec_info is not None:
-                step_offset = self.speculative_step_id + 1
-                global_kv_lens = global_kv_lens + step_offset
-
-            # Size the table from FIA's Host bound, which can lead device lengths.
             metadata.seq_lens_cpu_int, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
                     global_kv_lens_cpu, forward_batch.req_pool_indices
@@ -729,20 +722,14 @@ class AscendAttnBackend(AttentionBackend):
                     self.req_to_token[forward_batch.req_pool_indices, :1]
                     // (self.page_size * self.dcp_size)
                 ).to(torch.int32)
-            metadata.seq_lens = get_dcp_lens(
-                global_kv_lens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).int()
             if forward_batch.forward_mode.is_target_verify():
                 metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
-                    global_kv_lens,
+                    global_kv_lens_cpu,
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
                     interleave_size=self.page_size,
-                )
+                ).to(device=self.device, dtype=torch.int32)
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
                 metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
