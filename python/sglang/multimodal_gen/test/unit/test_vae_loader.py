@@ -690,7 +690,8 @@ class TestVAELoader(unittest.TestCase):
             (LTX2PipelineConfig, 2, "video_vae", False),
             (Cosmos3Config, 1, "vae", True),
             (Cosmos3Config, 1, "video_vae", True),
-            (Cosmos3Config, 2, "video_vae", False),
+            (Cosmos3Config, 2, "video_vae", True),
+            (Cosmos3Config, 4, "vae", True),
         ]
         with (
             patch.dict("os.environ", {}, clear=True),
