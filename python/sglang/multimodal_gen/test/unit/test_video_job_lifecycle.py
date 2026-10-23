@@ -1,7 +1,115 @@
 import asyncio
 import os
+import tempfile
+import threading
+from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
+
+
+def _request_app(monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        video_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            input_save_path=None, output_path=None, served_model_name="test"
+        ),
+    )
+    monkeypatch.setattr(
+        video_api, "resolve_sampling_params_cls", lambda _: SamplingParams
+    )
+    app = FastAPI()
+    app.include_router(video_api.router)
+    return app
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+def test_invalid_video_request_removes_temporary_uploads(
+    monkeypatch, tmp_path, multipart
+):
+    """Parsing can fail after creating a directory or persisting an upload."""
+    app = _request_app(monkeypatch, tmp_path)
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            if multipart:
+                response = await client.post(
+                    "/v1/videos",
+                    data={"prompt": "test", "extra_body": '{"seed": "invalid"}'},
+                    files={"input_reference": ("input.png", b"upload", "image/png")},
+                )
+            else:
+                response = await client.post("/v1/videos", json={"seed": "invalid"})
+            assert response.status_code == 400
+            assert not list(tmp_path.glob("sglang*"))
+
+    asyncio.run(run_test())
+
+
+def test_cancelled_preparation_finishes_before_request_cleanup(monkeypatch, tmp_path):
+    """Cancelling to_thread does not stop its writes; cleanup must run afterwards."""
+    app = _request_app(monkeypatch, tmp_path)
+    started, finish = threading.Event(), threading.Event()
+    cleaned = []
+
+    class Sampling:
+        def prepare_video_request_for_queue(self, batch):
+            started.set()
+            assert finish.wait(timeout=5)
+            (Path(batch.output_path) / "prepared.bin").write_bytes(b"prepared")
+
+        def cleanup_video_request(self, batch):
+            cleaned.append((Path(batch.output_path) / "prepared.bin").exists())
+
+    sampling = Sampling()
+
+    def build_sampling(_request_id, req):
+        sampling.output_path = req.output_path
+        return sampling
+
+    monkeypatch.setattr(video_api, "_build_video_sampling_params", build_sampling)
+    monkeypatch.setattr(
+        video_api,
+        "prepare_request",
+        lambda **_: SimpleNamespace(
+            sampling_params=sampling,
+            output_path=sampling.output_path,
+        ),
+    )
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            task = asyncio.create_task(
+                client.post("/v1/videos", json={"prompt": "test"})
+            )
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                for _ in range(2):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert cleaned == []
+            finally:
+                finish.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert cleaned == [True]
+            assert not list(tmp_path.glob("sglang*"))
+            assert not video_api._VIDEO_JOB_TASKS
+
+    asyncio.run(run_test())
 
 
 def test_video_job_registry_holds_task_until_completion():
@@ -25,7 +133,8 @@ def test_video_job_registry_holds_task_until_completion():
     asyncio.run(run_test())
 
 
-def test_shutdown_video_jobs_cancels_and_awaits_cleanup():
+@pytest.mark.parametrize("already_started", [False, True])
+def test_shutdown_video_jobs_cancels_and_awaits_cleanup(already_started):
     async def run_test():
         started = asyncio.Event()
         cleaned_up = asyncio.Event()
@@ -38,7 +147,8 @@ def test_shutdown_video_jobs_cancels_and_awaits_cleanup():
                 cleaned_up.set()
 
         task = video_api._start_video_job("job-id", job())
-        await started.wait()
+        if already_started:
+            await started.wait()
         await video_api.shutdown_video_jobs()
 
         assert task.cancelled()
