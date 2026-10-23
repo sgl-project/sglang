@@ -488,9 +488,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = get_free_cpu_memory()
-        n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        free_gpu_memory = get_free_cpu_memory_per_rank()
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -905,6 +903,36 @@ def get_free_cpu_memory() -> int:
         free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
 
     return free_cpu_memory
+
+
+def get_free_cpu_memory_per_rank() -> int:
+    free_cpu_memory = psutil.virtual_memory().available
+
+    numa_count = len({node for _, _, _, node in parse_lscpu_topology()}) or 1
+    memory_per_rank = free_cpu_memory // numa_count
+
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    instance_current_cpu_memory = get_instance_memory_status(
+        "/sys/fs/cgroup/memory.current"
+    )
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
+        # Assume local workers share one cgroup; independent DP replicas have
+        # separate WORLD groups, so include them in the allowance split.
+        num_local_ranks = (
+            torch.distributed.get_world_size()
+            * get_parallel().dp_size
+            // get_parallel().nnodes
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        memory_per_rank = min(
+            memory_per_rank, instance_free_cpu_memory // num_local_ranks
+        )
+
+    return memory_per_rank
 
 
 def get_cpu_memory_capacity():
@@ -4514,7 +4542,9 @@ def get_cpu_ids_by_node():
     # Sort by NUMA node index
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
     return [
-        ",".join(map(str, sorted(cpus))) for _, cpus in sorted(node_to_cpus.items())
+        ",".join(map(str, sorted(cpus)))
+        for _, cpus in sorted(node_to_cpus.items())
+        if cpus
     ]
 
 
