@@ -26,7 +26,8 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from importlib.metadata import distributions
+from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -71,15 +72,25 @@ def group_window(groups, lo, hi):
     return ends[i][0], ends[j][0], ends[j][1] - ends[i][1], gaps
 
 
-def log_steps(lines, mode, t0, t1, size):
-    """Engine lines whose interval since the rank's previous line lies inside [t0, t1]
-    (epoch seconds), reduced to ms per step per rank at batch `size`."""
+def log_steps(lines, mode, t0, t1, size, tol=None):
+    """Per rank, the engine's ms per step over [t0, t1] (epoch seconds). With `tol`, t0
+    and t1 are scheduler step ends: each rank logs a line within `tol` of every step end,
+    so the lines from the one at t0 to the one at t1 are the window's steps. Otherwise
+    the lines whose interval since the rank's previous line lies inside the window, at
+    batch `size`."""
     per_rank, spans, prev, accept, seen = {}, {}, {}, [], set()
+    edges = {}
     for m in filter(None, map(LINES[mode].search, lines)):
         ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
         ts, step = ts + float(m.group(2) or 0), 0.001 if m.group(2) else 1.0
         rank = int(m.group(3) or 0)
         start, prev[rank] = prev.get(rank, 0.0), ts
+        if tol is not None:
+            if m.group(2) and t0 - tol < ts <= t1 + tol:
+                edges.setdefault(rank, []).append(ts)
+                if ts < t1 - tol:  # the batches launched inside the window
+                    seen.add(int(m.group(4)))
+            continue
         if start < t0 or ts + step > t1:  # stamps are truncated to `step`
             continue
         seen.add(int(m.group(4)))
@@ -90,10 +101,25 @@ def log_steps(lines, mode, t0, t1, size):
             lo, hi = spans.get(rank, (start, ts + step))
             spans[rank] = min(lo, start), max(hi, ts + step)
             accept += [accept_len] if m.group(5) else []
+    if tol is not None:
+        whole = {
+            r: ts
+            for r, ts in edges.items()
+            if len(ts) > 1 and ts[0] - t0 <= tol and t1 - ts[-1] <= tol
+        }
+        check = {
+            "ms_per_step_per_rank": {
+                r: (ts[-1] - ts[0]) / (len(ts) - 1) * 1000 for r, ts in whole.items()
+            },
+            "complete": bool(prev) and whole.keys() == prev.keys(),
+            "sizes_seen": sorted(seen),
+        }
+        return check
     check = {
         "ms_per_step_per_rank": {r: statistics.mean(v) for r, v in per_rank.items()}
     }
     check["coverage"] = min(((b - a) / (t1 - t0) for a, b in spans.values()), default=0)
+    check["complete"] = check["coverage"] >= 0.8
     check["sizes_seen"] = sorted(seen)
     if accept:
         check["accept_len"] = statistics.mean(accept)
@@ -189,58 +215,88 @@ def nvidia_smi(*args):
         return []
 
 
+def package_version(name):
+    try:
+        return version(name)  # the first one on sys.path, the one import resolves
+    except PackageNotFoundError:
+        spec = find_spec(name.replace("-", "_"))
+        return spec and spec.origin  # a source tree without metadata: its path
+
+
 def environment():
     pkgs = {"sglang", "sglang-kernel", "sgl-deep-gemm", "sgl-flash-mla", "torch"}
-    vers = {
-        d.metadata["Name"].lower().replace("_", "-"): d.version for d in distributions()
-    }
     gpus = nvidia_smi("--query-gpu=index,name,uuid,driver_version", "--format=csv")
     env = {k: v for k, v in os.environ.items() if k.startswith("SGLANG_")}
     devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     return dict(
-        versions={p: vers.get(p) for p in sorted(pkgs)},
+        versions={p: package_version(p) for p in sorted(pkgs)},
         gpus=gpus[1:],
         visible_devices=devices,
         sglang_env=env,
     )
 
 
-async def batch(args, tp, prompt, n_each, params, done):
-    """n_each requests per rank, about eight steps' worth in flight on each."""
+async def batch(args, tp, prompt, n_each, params, done, what):
+    """n_each requests per rank, submitted round-robin over the ranks so none starts
+    ahead, about eight steps' worth in flight on each."""
     in_flight = max(1, args.tokens_per_step // args.new_tokens) * 8 + 1
+    limits = [asyncio.Semaphore(in_flight) for _ in range(args.dp)]
 
-    async def rank_worker(r):
-        sem = asyncio.Semaphore(in_flight)
+    async def one(r):
+        async with limits[r]:
+            async for t, meta in tp.generate(prompt(r), params, r, False):
+                new = meta["prompt_tokens"] - meta["cached_tokens"]
+                done.append((t, meta.get("prefill_finished_time"), new, r))
 
-        async def one():
-            async with sem:
-                async for t, meta in tp.generate(prompt(r), params, r, False):
-                    new = meta["prompt_tokens"] - meta["cached_tokens"]
-                    done.append((t, meta.get("prefill_finished_time"), new))
-
-        await asyncio.gather(*(one() for _ in range(n_each)))
-
-    await asyncio.gather(*(rank_worker(r) for r in range(args.dp)))
+    tasks = [
+        asyncio.ensure_future(one(r)) for _ in range(n_each) for r in range(args.dp)
+    ]
+    finished, last, shown = 0, time.time(), time.time()
+    try:
+        while finished < len(tasks):
+            await asyncio.wait([t for t in tasks if not t.done()], timeout=1)
+            for task in tasks:
+                if task.done() and task.exception():
+                    raise task.exception()
+            now, n = time.time(), sum(t.done() for t in tasks)
+            if n > finished:
+                finished, last = n, now
+            if now - last > args.timeout:
+                raise SystemExit(
+                    f"{what}: no request finished for {args.timeout:.0f} s"
+                )
+            if now - shown >= 5 or finished == len(tasks):
+                print(f"{what}: {finished}/{len(tasks)} requests", flush=True)
+                shown = now
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def prefill(args, tp, prompt):
     nc, B = args.new_tokens, args.tokens_per_step
     per_step = max(1, B // nc)
     params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
-    await batch(args, tp, prompt, args.warmup_steps * per_step, params, [])
+    await batch(args, tp, prompt, args.warmup_steps * per_step, params, [], "warmup")
     done = []
-    await batch(args, tp, prompt, args.requests, params, done)
-    if min(n for *_, n in done) < nc:
+    await batch(args, tp, prompt, args.requests, params, done, "measured")
+    if min(n for _, _, n, _ in done) < nc:
         raise SystemExit(
             "part of a suffix was cached: a warm cache, e.g. --no-flush after an "
             "earlier run with the same --seed"
         )
-    stamp = "scheduler" if all(s for _, s, _ in done) else "arrival"
-    times = [s if stamp == "scheduler" else t for t, s, _ in done]
+    stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
+    times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
     t0, t1, _, group_ms = group_window(
         step_groups(times, per_step * args.dp), args.lo, args.hi
     )
-    tokens = sum(n for t, (*_, n) in zip(times, done) if t0 < t <= t1)
+    per_rank = [0] * args.dp
+    for t, (_, _, n, r) in zip(times, done):
+        per_rank[r] += n if t0 < t <= t1 else 0
+    if len(set(per_rank)) > 1:
+        raise SystemExit(f"ranks served unequal tokens in the window: {per_rank}")
+    tokens = sum(per_rank)
     steps = tokens / (B * args.dp)
     if steps < 3:
         raise SystemExit("the window holds under three steps; raise --requests")
@@ -250,7 +306,8 @@ async def prefill(args, tp, prompt):
         )
     if args.profile_steps:
         await tp.start_profile(args.profile)
-        await batch(args, tp, prompt, (args.profile_steps + 4) * per_step, params, [])
+        n_profile = (args.profile_steps + 4) * per_step
+        await batch(args, tp, prompt, n_profile, params, [], "profile")
     return dict(
         steps=steps,
         seconds=t1 - t0,
@@ -274,8 +331,11 @@ async def decode(args, tp, prompt):
             first.add((r, k))
 
     async def wait(cond, why):
-        deadline = time.time() + args.timeout
+        deadline, shown = time.time() + args.timeout, time.time()
         while not cond():
+            if time.time() - shown >= 5:
+                print(why(), flush=True)
+                shown = time.time()
             if ended := next((task for task in tasks if task.done()), None):
                 exc = ended.exception()  # None: it finished
                 raise SystemExit(f"a request ended early ({exc!r}); see --output-len")
@@ -400,14 +460,17 @@ def main():
     async def run():
         warm = {"max_new_tokens": 1, "temperature": 0.0}
         for _ in range(2):  # the second pass hits: later requests reuse the prefix
-            await batch(args, tp, prompt, 1, warm, [])
+            await batch(args, tp, prompt, 1, warm, [], "prefix warmup")
         return await (prefill if args.mode == "prefill" else decode)(args, tp, prompt)
 
-    query = ["--query-gpu=clocks.sm,power.draw", "--format=csv,noheader,nounits"]
+    query = [
+        "--query-gpu=timestamp,clocks.sm,power.draw",
+        "--format=csv,noheader,nounits",
+    ]
     if devices := os.environ.get("CUDA_VISIBLE_DEVICES"):
         query += ["-i", devices]  # nvidia-smi itself ignores the variable
     sampler = args.sample_gpu and subprocess.Popen(
-        ["nvidia-smi", *query, "-lms", "500"], stdout=subprocess.PIPE, text=True
+        ["nvidia-smi", *query, "-lms", "250"], stdout=subprocess.PIPE, text=True
     )
     try:
         res = tp.run(run())
@@ -423,19 +486,33 @@ def main():
         res["accept_len"] = tokens / (steps * size * args.dp)
     if sampler:
         sampler.terminate()
-        rows = [r.split(",") for r in sampler.communicate()[0].splitlines() if "," in r]
-        for key, col in zip(("sm_clock_mhz", "power_w"), zip(*rows)):
+        rows = [
+            r.split(", ") for r in sampler.communicate()[0].splitlines() if ", " in r
+        ]
+        t0, t1 = res["wall"]
+        in_window = [
+            r[1:]
+            for r in rows
+            if t0 <= datetime.strptime(r[0], "%Y/%m/%d %H:%M:%S.%f").timestamp() <= t1
+        ]
+        for key, col in zip(("sm_clock_mhz", "power_w"), zip(*in_window)):
             res[key + "_median"] = statistics.median(float(x) for x in col)
     lines = [line for path in args.server_log for line in open(path, errors="replace")]
-    check = log_steps(lines, args.mode, *res["wall"], size) if lines else {}
+    tol = min(res["group_ms"]) / 4000 if res["stamp"] == "scheduler" else None
+    check = log_steps(lines, args.mode, *res["wall"], size, tol) if lines else {}
+    median = statistics.median(res["group_ms"])
+    # Streamed chunks of short decode steps blur the step boundaries
+    blurred = args.mode == "decode" and any(
+        not 0.6 * median <= ms <= 1.6 * median for ms in res["group_ms"]
+    )
     if per_rank := check.get("ms_per_step_per_rank"):
         check["ms_per_step"] = statistics.mean(per_rank.values())
         check["diff_pct"] = (res["ms_per_step"] / check["ms_per_step"] - 1) * 100
-        # Too little of the window logged cannot vouch for it: no verdict
-        if check["coverage"] >= 0.8:
+        # Lines that miss part of the window on some rank cannot vouch for it
+        if check["complete"] and not blurred:
             check["agree"] = abs(check["diff_pct"]) <= 0.5
     elif lines:
-        check["no_match"] = f"no line at size {size} inside the window"
+        check["no_match"] = "no engine line matches the window"
     odd = args.mode == "prefill" and set(check.get("sizes_seen", [size])) != {size}
     if odd:  # the window held prefill steps of another size
         check["agree"] = False
@@ -458,17 +535,22 @@ def main():
         print(
             f"engine log: {check['ms_per_step']:.2f} ms/step, {check['diff_pct']:+.2f}%"
         )
-        if "agree" not in check:
+        if blurred:
             print(
-                f"WARNING: engine lines cover {check['coverage']:.0%} of the window; "
-                "set SGLANG_LOG_MS=1 on the server or measure longer"
+                "WARNING: decode steps stray past 0.6-1.6x their median, so the step "
+                "count is unreliable at this step length; tok/s still holds"
+            )
+        elif "agree" not in check:
+            print(
+                "WARNING: the engine lines miss part of the window on some rank; set "
+                "SGLANG_LOG_MS=1 (and --enable-metrics for prefill) on the server"
             )
         elif not check["agree"]:
             print("WARNING: the engine log disagrees by more than 0.5%")
     if odd:
         print(f"WARNING: prefill steps of {check['sizes_seen']} tokens in the window")
     if "no_match" in check:
-        print(f"WARNING: {check['no_match']}; sizes seen {check['sizes_seen']}")
+        print(f"WARNING: {check['no_match']}")
     tp.finish()
     if args.out:
         with open(args.out, "w") as f:

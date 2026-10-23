@@ -78,6 +78,20 @@ class TestLogSteps(CustomTestCase):
         got = bench.log_steps(lines, "decode", t0, t0 + 2, 63)
         self.assertEqual((got["ms_per_step_per_rank"], got["sizes_seen"]), ({}, [64]))
 
+    def test_prefill_lines_at_step_ends(self):
+        # Step ends at 10:00:05.000, .100, .200 and .300; each rank logs within 1 ms.
+        t0 = datetime(2026, 10, 22, 10, 0, 5).timestamp()
+        line = (
+            "[2026-10-22 10:00:05.{:03d} DP{} TP0 EP0] Prefill batch, #new-seq: 2, "
+            "#new-token: 8192, #cached-token: 0, input throughput (token/s): 1.00"
+        )
+        lines = [line.format(ms, r) for ms in (0, 100, 200, 301) for r in (0, 1)]
+        got = bench.log_steps(lines, "prefill", t0, t0 + 0.3, 8192, tol=0.02)
+        self.assertTrue(got["complete"])
+        self.assertAlmostEqual(got["ms_per_step_per_rank"][1], 301 / 3, places=3)
+        got = bench.log_steps(lines[:-1], "prefill", t0, t0 + 0.3, 8192, tol=0.02)
+        self.assertFalse(got["complete"])  # rank 1 has no line at the last step end
+
 
 if __name__ == "__main__":
     unittest.main()
