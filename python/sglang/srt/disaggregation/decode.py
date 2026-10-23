@@ -3254,6 +3254,15 @@ class SchedulerDisaggregationDecodeMixin:
         prefill chunk would leave them, so the tail is an ordinary extend; the
         decoder SWA bounded replay floors the decoder layers at its start.
         """
+        hold_s = envs.SGLANG_DSV41_TAIL_HOLD_MS.get() / 1000
+        if hold_s > 0:
+            # While decode has work, tails run only on the first step of each
+            # hold period, so one extend step takes several. Under DP attention
+            # every rank crosses the period boundary on the same step, so their
+            # tails share it.
+            period = int(time.time() / hold_s)
+            period_start = period != getattr(self, "dsv41_tail_period", None)
+            self.dsv41_tail_period = period
         if self.grammar_manager.has_waiting_grammars():
             for req in self.grammar_manager.get_ready_grammar_requests():
                 self._add_request_to_queue(req)
@@ -3267,6 +3276,13 @@ class SchedulerDisaggregationDecodeMixin:
         ):
             # Alternate with decode so a stream of arrivals cannot starve it.
             return None
+        if hold_s > 0 and not period_start and not running_batch.is_empty():
+            queued_tokens = sum(
+                len(req.full_untruncated_fill_ids) - req.dsv41_tail_start
+                for req in self.waiting_queue
+            )
+            if queued_tokens < self.max_prefill_tokens:
+                return None
 
         num_free_reqs = (
             min(self.req_to_token_pool.size, self.max_running_requests)

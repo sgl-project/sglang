@@ -1,5 +1,6 @@
 """Decode-side scheduling of the --dsv41-encoder-only-prefill tail extend."""
 
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ from sglang.srt.disaggregation.utils import (
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -129,6 +131,34 @@ class TestDsv41TailExtendSchedule(CustomTestCase):
         )
         self.assertIsNone(Mixin._get_new_dsv41_tail_extend_batch(sched, running))
         schedule_batch.init_new.assert_not_called()
+
+    def test_tails_run_once_per_hold_period_while_decode_runs(self, schedule_batch, _):
+        running = _batch(ForwardMode.DECODE, 4)
+        period = int(time.time() / 60)
+        with envs.SGLANG_DSV41_TAIL_HOLD_MS.override(60_000):
+            # Mid-period: held.
+            sched = _scheduler([_req(1000)], running)
+            sched.dsv41_tail_period = period
+            self.assertIsNone(Mixin._get_new_dsv41_tail_extend_batch(sched, running))
+            schedule_batch.init_new.assert_not_called()
+
+            # The first step of a period runs every waiting tail.
+            reqs = [_req(1000), _req(2000)]
+            sched = _scheduler(reqs, running)
+            sched.dsv41_tail_period = period - 1
+            Mixin._get_new_dsv41_tail_extend_batch(sched, running)
+            self.assertEqual(schedule_batch.init_new.call_args.args[0], reqs)
+            self.assertEqual(sched.dsv41_tail_period, period)
+
+            # A full token budget, or idle decode, runs at once.
+            for req, kwargs, batch in (
+                (_req(1000), {"max_prefill_tokens": 128}, running),
+                (_req(1000), {}, _batch(ForwardMode.DECODE, 0)),
+            ):
+                sched = _scheduler([req], batch, **kwargs)
+                sched.dsv41_tail_period = period
+                Mixin._get_new_dsv41_tail_extend_batch(sched, batch)
+                self.assertEqual(schedule_batch.init_new.call_args.args[0], [req])
 
     def test_finished_tail_extend_merges_into_decode(self, *_):
         running, tail = _batch(ForwardMode.DECODE, 4), _batch(ForwardMode.EXTEND, 2)
