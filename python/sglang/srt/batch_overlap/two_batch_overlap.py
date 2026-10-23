@@ -660,6 +660,8 @@ class TboForwardBatchPreparer:
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
+            child_b.extend_prefix_lens_cpu,
+            child_b.extend_seq_lens_cpu,
         )
 
     @classmethod
