@@ -15,21 +15,17 @@ logger = logging.getLogger(__name__)
 # Pure-prefill acceptance scenario for Kimi-K3 W4A8 32P (4-node mix):
 # cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s.
 #
-# The server config mirrors the dev pure-prefill launch on the same
-# topology (prefill.sh TP mode): no DSPARK draft, radix cache disabled,
-# decode cuda graphs off, mem-fraction 0.78, chunked-prefill 65536
-# (16384 per DP rank), max-total-tokens 250000. Do NOT merge this config
-# with the decode scenario: run 39917316049 crashed the server with an
-# ACL 507034 in the DeepEP dispatch when the pure-prefill memory tuning
-# (0.78 + 65536) shared a server with the DSPARK draft + decode graphs
-# required by the pure-decode tier - the two scenarios need mutually
-# exclusive server configs and therefore separate test cases.
-#
-# Known gap: a single-stream 128k prefill on this dp-attention deployment
-# reached only ~2.2k tok/s (TTFT ~58 s) vs ~7.2k tok/s on the dev CPP
-# (TP16 x PP4 x DP2) topology - the C1 request lights up one DP attention
-# domain only. This case keeps the 20 s SLO as the gate so the CI trend
-# is tracked honestly while the prefill topology question is settled.
+# The server config reproduces the dev CPP acceptance environment
+# (prefill_prefix.sh CPP mode, the topology that measured 18.2 s on 128k
+# cold prefill): PP4 x TP16 x DP2 with layer partition 24,24,24,21,
+# chunked-prefill 16384 (8192 per DP), no DSPARK, radix disabled, decode
+# graphs off, overlap schedule off. Do NOT merge this config with the
+# decode scenario: run 39917316049 crashed a DSPARK + decode-graph server
+# when the pure-prefill memory tuning was applied to it - the scenarios
+# need mutually exclusive configs and separate cases. The mixed TP64/DP4
+# topology is architecturally slower for single-stream 128k prefill
+# (2246 tok/s run 39882825354, 1336 tok/s run 39944680878, vs 7188 tok/s
+# here) - knobs cannot close a 3.2x topology gap.
 register_npu_ci(
     est_time=3600,
     suite="",
@@ -49,9 +45,14 @@ KIMI_K3_W4A8_32P_ENVS = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_BUFFSIZE": "2000",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
+    # Dev CPP reference (aisbench_prefill_20261017): ROUND2/PER512, FIA on,
+    # and the 4-stage PP layer partition.
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ASCEND_USE_FIA": "1",
+    "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
+    "SGLANG_PP_LAYER_PARTITION": "24,24,24,21",
 }
 
 KIMI_K3_W4A8_32P_PREFILL_ARGS = [
@@ -70,23 +71,30 @@ KIMI_K3_W4A8_32P_PREFILL_ARGS = [
     "modelslim",
     "--dtype",
     "bfloat16",
+    # CPP topology (TP16 x PP4 x DP2, layer partition 24,24,24,21) - the
+    # dev acceptance configuration in which 128k cold prefill measured
+    # 18.2 s. The mixed TP64/DP4 topology is architecturally slower for a
+    # single-stream 128k prefill (one DP attention domain lights up):
+    # 2246 tok/s with the decode-tier extras (run 39882825354) and 1336
+    # tok/s with the pure-prefill tuning (run 39944680878) - knobs cannot
+    # close a 3.2x topology gap.
     "--tp-size",
-    64,
-    # Deprecated spelling, still auto-converted to --attn-dp-size on main;
-    # required by the older sglang build in the nightly image.
+    16,
+    "--pp-size",
+    4,
+    "--pp-async-batch-depth",
+    0,
+    "--disable-overlap-schedule",
     "--enable-dp-attention",
     "--dp-size",
-    4,
+    2,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
-    # Pure-prefill tuning (dev prefill.sh TP mode): the memory freed by
-    # dropping the DSPARK draft, the decode graphs and the radix cache is
-    # what makes 0.78 + 65536 safe on this topology.
     "--mem-fraction-static",
     0.78,
     "--chunked-prefill-size",
-    65536,
+    16384,
     "--max-total-tokens",
     250000,
     "--disable-radix-cache",
