@@ -2409,8 +2409,6 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        # Clear first: a late failure for a cleared room is dropped, not
-        # re-recorded after the pop.
         self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
@@ -2909,7 +2907,6 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        # Clear first, as in the sender.
         self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
