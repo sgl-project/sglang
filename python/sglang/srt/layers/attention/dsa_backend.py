@@ -87,6 +87,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -295,6 +299,9 @@ class DSAMetadata:
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Pool-managed index reads take logical page IDs and translate them once.
+    # Raw attention/indexer kernels instead use the scratch-addressed tables.
+    indexer_logical_page_table: Optional[torch.Tensor] = None
     # seq lens for each batch.
     indexer_seq_lens_cpu: Optional[torch.Tensor] = None
     # seq lens for each batch.
@@ -551,11 +558,16 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = self.dcp_size == 1
+        # Dense MHA expands prefix KV outside the DSA metadata path. Keep
+        # sharded prefill on the sparse kernels with explicit scratch addresses.
+        self.supports_mha_one_shot: bool = (
+            self.dcp_size == 1 and self._kv_shard_pool is None
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (
@@ -1106,6 +1118,11 @@ class DeepseekSparseAttnBackend(
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
 
+        kv_shard_extend = self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool, self.req_to_token, forward_batch
+        )
+        indexer_logical_page_table = None
+
         page_table_1_flattened = None
         topk_indices_offset = None
 
@@ -1264,6 +1281,14 @@ class DeepseekSparseAttnBackend(
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
 
+            if kv_shard_extend:
+                # Kernels read the gathered prefix/chunk scratch; the indexer
+                # pool read takes logical pages and translates them itself.
+                indexer_logical_page_table = self._transform_table_1_to_real(page_table)
+                page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                    page_table
+                ).to(page_table.dtype)
+
             if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
@@ -1302,7 +1327,11 @@ class DeepseekSparseAttnBackend(
                 kv_cache_capacity = (
                     self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
                 )
-                if forward_batch.seq_lens_sum > kv_cache_capacity:
+                if (
+                    # Sharded extends index scratch rows, bounded by construction.
+                    not kv_shard_extend
+                    and forward_batch.seq_lens_sum > kv_cache_capacity
+                ):
                     max_idx = page_table_1_flattened.max().item()
                     assert max_idx < kv_cache_capacity, (
                         f"Invalid page table index: max={max_idx}, "
@@ -1381,6 +1410,7 @@ class DeepseekSparseAttnBackend(
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
+            indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,

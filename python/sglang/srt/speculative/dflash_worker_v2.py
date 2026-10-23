@@ -2331,6 +2331,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._wait_for_fused_hicache_load(batch)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,

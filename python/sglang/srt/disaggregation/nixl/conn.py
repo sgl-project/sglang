@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -604,30 +605,36 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 "with string keys and string values"
             )
         if backend == "UCX" and self.kv_args.ib_device:
-            device_list = _resolve_ucx_device_list(
-                self.kv_args.ib_device, self.kv_args.gpu_id
-            )
-            if device_list is not None:
-                existing = backend_params.get("device_list")
-                if (
-                    existing is not None
-                    and ", ".join(name.strip() for name in existing.split(","))
-                    != device_list
-                ):
-                    raise ValueError(
-                        "Conflicting NIXL UCX device_list in "
-                        "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS and "
-                        "--disaggregation-ib-device. Configure only one "
-                        "device selection or make them agree."
-                    )
-                backend_params["device_list"] = device_list
-                logger.info(
-                    "NIXL UCX device binding: gpu_id=%s, engine_rank=%s, "
-                    "device_list=%s",
-                    self.kv_args.gpu_id,
-                    self.kv_args.engine_rank,
-                    device_list,
+            if os.environ.get("UCX_NET_DEVICES"):
+                logger.warning(
+                    "UCX_NET_DEVICES is set; ignoring --disaggregation-ib-device "
+                    "for NIXL UCX. Per-GPU CLI device mappings will not be applied."
                 )
+            else:
+                device_list = _resolve_ucx_device_list(
+                    self.kv_args.ib_device, self.kv_args.gpu_id
+                )
+                if device_list is not None:
+                    existing = backend_params.get("device_list")
+                    if (
+                        existing is not None
+                        and ", ".join(name.strip() for name in existing.split(","))
+                        != device_list
+                    ):
+                        raise ValueError(
+                            "Conflicting NIXL UCX device_list in "
+                            "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS and "
+                            "--disaggregation-ib-device. Configure only one "
+                            "device selection or make them agree."
+                        )
+                    backend_params["device_list"] = device_list
+                    logger.info(
+                        "NIXL UCX device binding: gpu_id=%s, engine_rank=%s, "
+                        "device_list=%s",
+                        self.kv_args.gpu_id,
+                        self.kv_args.engine_rank,
+                        device_list,
+                    )
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
