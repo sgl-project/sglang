@@ -579,5 +579,5 @@ The server supports adjusting output quality and compression levels for both ima
 #### Notes
 
 - **Precedence**: When both `output-quality` and `output-compression` are provided, `output-compression` takes precedence
-- **Format Support**: Quality settings apply to JPEG, and video formats. PNG uses lossless compression and ignores these settings
+- **Format Support**: Quality settings apply to JPEG, and video formats. PNG is lossless: by default it is stored without zlib compression, which encodes fastest but keeps files close to the raw pixel size; an `output-compression` other than 75 selects zlib level `round(output-compression / 100 * 9)` instead
 - **File Size vs Quality**: Lower compression values (or "low" quality preset) produce smaller files but may show visible artifacts
