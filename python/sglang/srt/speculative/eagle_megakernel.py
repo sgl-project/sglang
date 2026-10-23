@@ -52,6 +52,9 @@ def _unservable_reasons(draft: Any) -> list[str]:
         reasons.append("the entries run a multi-step draft (speculative_num_steps > 1)")
     if get_spec().speculative_use_rejection_sampling:
         reasons.append("the entries do not run rejection sampling")
+    # the draft's top-1 would be a hot-vocab index, and the entries get no map
+    if draft.hot_token_id is not None:
+        reasons.append("the entries do not run a speculative token map")
     if get_parallel().attn_dp_enabled:
         # the graph runners would pad to other DP ranks' batches, which _bucket does
         # not see

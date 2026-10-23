@@ -148,6 +148,7 @@ def _init(
     dp_attention=False,
     target_backend=None,
     draft_backend=None,
+    hot_token_id=None,
 ):
     """init_eagle_megakernel, with --enable-nvidia-megakernel unless enabled is False,
     for a draft worker whose model's megakernel offers these entries; by default its
@@ -171,6 +172,7 @@ def _init(
             SimpleNamespace(attn_backends=(draft_backend,)) if num_steps > 1 else None
         ),
         draft_extend_attn_backend=None,
+        hot_token_id=hot_token_id,
     )
     spec = SimpleNamespace(speculative_use_rejection_sampling=rejection_sampling)
     parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
@@ -354,10 +356,12 @@ class TestEagleEntries(CustomTestCase):
                 dp_attention=True,
                 target_backend=sliding,
                 draft_backend=SimpleNamespace(),
+                hot_token_id=torch.arange(4),
             )
         for reason in (
             "chain draft (topk 1)",
             "rejection sampling",
+            "speculative token map",
             "DP attention",
             "sliding-window pool",
             "the draft must run trtllm_mha, not SimpleNamespace",
