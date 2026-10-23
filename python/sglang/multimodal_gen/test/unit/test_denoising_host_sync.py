@@ -8,7 +8,7 @@ stage and model.
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABac
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising_dmd
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -118,6 +119,74 @@ def _run_request(device, wrap_device_tensor=lambda t: t, guard=nullcontext()):
     return ctx.latents.as_subclass(torch.Tensor)
 
 
+class _TinyVideoDiT(_TinyDiT):
+    def forward(self, hidden_states, timestep, guidance=None):
+        hidden = self.proj(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        return hidden + timestep.view(-1, 1, 1, 1, 1) / 1000
+
+
+def _run_dmd_request(device_tensor=lambda t: t, nan_latents=False):
+    """One DMD request; device timesteps go through ``device_tensor``."""
+    torch.manual_seed(0)
+    stage = denoising_dmd.DmdDenoisingStage.__new__(denoising_dmd.DmdDenoisingStage)
+    stage.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(should_use_guidance=False)
+    )
+    stage.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
+    stage.transformer = _TinyVideoDiT()
+    stage.transformer_2 = None
+    stage.attn_backend = SDPABackend
+    stage._extra_func_kwarg_names_cache = {}
+    stage._manage_dit_use_site = Mock()
+    stage.progress_bar = MagicMock()
+    stage.log_info = Mock()
+    final = {}
+    stage._post_denoising_loop = lambda latents, **kwargs: final.update(latents=latents)
+    latents = torch.randn(1, 2, 4, 2, 2)
+    if nan_latents:
+        latents[0, 1, 0, 0, 0] = float("nan")
+    stage._prepare_denoising_loop = lambda batch, args: SimpleNamespace(
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+        num_warmup_steps=0,
+        latents=latents,
+        pos_cond_kwargs={},
+    )
+    batch = SimpleNamespace(
+        image_embeds=[],
+        image_latent=None,
+        generator=[torch.Generator().manual_seed(1)],
+        metrics=None,
+        perf_dump_path=None,
+        is_warmup=False,
+        is_cfg_negative=False,
+    )
+    server_args = SimpleNamespace(
+        disable_autocast=True,
+        pipeline_config=SimpleNamespace(dmd_denoising_steps=[1000, 757, 522]),
+    )
+    tensor = torch.tensor
+
+    def tensor_on_device(data, **kwargs):
+        made = tensor(data, **kwargs)
+        return device_tensor(made) if "device" in kwargs else made
+
+    cpu = torch.device("cpu")
+    with (
+        torch.no_grad(),
+        patch.object(denoising_dmd, "get_local_torch_device", return_value=cpu),
+        patch.object(
+            denoising_dmd.DmdDenoisingStage,
+            "device",
+            new_callable=PropertyMock,
+            return_value=cpu,
+        ),
+        patch.object(torch, "tensor", tensor_on_device),
+    ):
+        stage.forward(batch, server_args)
+    return final["latents"].as_subclass(torch.Tensor)
+
+
 class TestDenoisingLoopHostSync(unittest.TestCase):
     def test_steps_never_read_device_schedule_on_host(self):
         expected = _run_request("cpu")
@@ -125,6 +194,14 @@ class TestDenoisingLoopHostSync(unittest.TestCase):
             "cpu", wrap_device_tensor=lambda t: t.as_subclass(SyncOnRead)
         )
         self.assertTrue(torch.equal(actual, expected))
+
+    def test_dmd_steps_never_read_device_timesteps(self):
+        expected = _run_dmd_request()
+        actual = _run_dmd_request(device_tensor=lambda t: t.as_subclass(SyncOnRead))
+        self.assertTrue(torch.equal(actual, expected))
+        # the NaN guard still fires, read once after the loop
+        with self.assertRaisesRegex(AssertionError, "contains nan"):
+            _run_dmd_request(nan_latents=True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_loop_syncs_only_for_the_host_schedule(self):
