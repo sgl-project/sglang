@@ -1061,7 +1061,7 @@ class TestSampler(unittest.TestCase):
     def test_camera_major_helpers(self):
         latents = torch.arange(2 * 4).float().view(1, 1, 8, 1, 1)
         picked = camera_major_slice(
-            latents, num_views=2, frames_per_view=4, frames=(1, 3)
+            latents, num_views=2, frames_per_view=4, frames=torch.tensor([1, 3])
         )
         self.assertEqual(picked.flatten().tolist(), [1, 3, 5, 7])
         camera_major_write(
@@ -1069,7 +1069,7 @@ class TestSampler(unittest.TestCase):
             torch.zeros(1, 1, 4, 1, 1),
             num_views=2,
             frames_per_view=4,
-            frames=(1, 3),
+            frames=torch.tensor([1, 3]),
         )
         self.assertEqual(latents.flatten().tolist(), [0, 0, 2, 0, 4, 0, 6, 0])
 

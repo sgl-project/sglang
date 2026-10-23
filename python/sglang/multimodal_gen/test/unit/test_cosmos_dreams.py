@@ -42,7 +42,7 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
-    null_action_token_positions,
+    null_action_token_slices,
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
@@ -621,13 +621,13 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
         torch.testing.assert_close(unpacked_action, action)
         torch.testing.assert_close(unpacked_vision, vision)
         self.assertEqual(
-            null_action_token_positions(
+            null_action_token_slices(
                 (0, 2), num_frames=3, tokens_per_frame=10, action_tokens_per_frame=4
             ),
-            [0, 1, 2, 3, 20, 21, 22, 23],
+            [slice(0, 4), slice(20, 24)],
         )
         with self.assertRaises(ValueError):
-            null_action_token_positions(
+            null_action_token_slices(
                 (3,), num_frames=3, tokens_per_frame=10, action_tokens_per_frame=4
             )
 
