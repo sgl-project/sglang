@@ -27,7 +27,6 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -58,6 +57,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -189,6 +189,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_owns_attention = (
             get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
+        # Only the last target PP stage loads the draft. Capture its TP group
+        # before draft_pp_context hides the target's pipeline topology.
+        load_group = get_pp_stage_load_group()
         with (
             draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
@@ -204,6 +207,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
                 random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
 
         # Alias for better readability
@@ -402,8 +406,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""
-        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
         hf_config = self.draft_runner.model_config.hf_config
         if (
             not _qsa_index_share_requested(hf_config)
@@ -421,6 +423,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 "speculative decoding"
             )
             return
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
         layer_ids = sorted(
             {
                 module.layer_id
@@ -524,13 +528,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+                or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
 
         graph_supported_backend_types = [
             TritonAttnBackend,
             TRTLLMMLABackend,
             TRTLLMHAAttnBackend,
-            TokenspeedMLABackend,
             FlashInferAttnBackend,
             QwenSparseAttnBackend,
         ]
@@ -548,8 +552,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             graph_supported_backend_types.append(DeepseekV4AttnBackend)
         if _is_cuda:
+            # FlashAttention is CUDA-only here; import lazily so MUSA and NPU
+            # builds don't pull sgl_kernel in at import time.
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            graph_supported_backend_types.append(FlashAttentionBackend)
             # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # sgl_kernel.flash_mla at import time.
+            # FlashMLA at import time.
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             graph_supported_backend_types.append(FlashMLABackend)
@@ -729,13 +740,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
+        # Materialize the chain directly only when the Triton kernel can write
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and (_is_cuda or _is_hip)
             and self.hot_token_id is None
             and not needs_draft_probs
         ):
@@ -787,7 +798,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_context(
                         ForwardContext(
                             attn_backend=self.draft_attn_backend.attn_backends[i]
-                        )
+                        ),
+                        forward_batch=forward_batch,
                     ),
                     canary_index_ctx,
                 ):
@@ -805,6 +817,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
+                        sampling_seed=forward_batch.sampling_info.sampling_seed,
+                        positions=forward_batch.positions + 1,
+                        draft_step=i + 1,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -890,7 +905,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_context(
                     ForwardContext(
                         attn_backend=self.draft_attn_backend.attn_backends[i]
-                    )
+                    ),
+                    forward_batch=forward_batch,
                 ),
                 canary_index_ctx,
             ):
@@ -1018,7 +1034,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             use_rejection_sampling,
         )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            topk_p, topk_index = fast_sample(
+                probs,
+                num_samples=1,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch.seq_lens,
+            )
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
@@ -1186,6 +1207,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch_result.new_seq_lens,
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(

@@ -29,8 +29,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 LAYER = 78
 PREFIX = f"model.layers.{LAYER}"
 EXPERT_LEAF = f"{PREFIX}.mlp.experts.0.w1"
+SHARED_EXPERT_LEAF = f"{PREFIX}.mlp.shared_experts.gate_proj"
 ATTN_LEAF = f"{PREFIX}.self_attn.q_proj"
 EXPERT_WEIGHT = f"{PREFIX}.mlp.experts.0.gate_proj.weight"
+SHARED_EXPERT_WEIGHT = f"{PREFIX}.mlp.shared_experts.gate_proj.weight"
 _PTPC_ENV = "sglang.srt.models.glm4_moe.envs.SGLANG_GLM_NEXTN_MOE_PTPC.get"
 
 
@@ -68,6 +70,21 @@ class TestEnableGlmNextnMoePtpc(CustomTestCase):
             self.assertFalse(
                 should_apply_glm_nextn_moe_ptpc(_quark_cfg(exclude=[ATTN_LEAF]), LAYER)
             )
+
+    def test_ptpc_disables_shared_expert_fusion(self):
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLMNextN"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_hidden_layers=LAYER,
+        )
+        # Shared expert BF16 (excluded) or still quantized: neither fits the slot.
+        for exclude in ([EXPERT_LEAF, SHARED_EXPERT_LEAF], [EXPERT_LEAF]):
+            with self.subTest(exclude=exclude), patch(_PTPC_ENV, return_value=True):
+                reason = GlmMoeDsaForCausalLMNextN.shared_experts_fusion_disable_reason(
+                    hf_config, _quark_cfg(exclude=exclude)
+                )
+                self.assertIn("PTPC", reason or "")
 
 
 class TestResolveNextnQuantConfigPtpcOn(CustomTestCase):
@@ -132,7 +149,13 @@ class TestMaybeQuantGlmNextnMoeToPtpc(CustomTestCase):
         loader = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
         loader.quant_config = cfg
         loader.config = SimpleNamespace(num_hidden_layers=LAYER)
-        weights = [(EXPERT_WEIGHT, torch.ones(4, 8, dtype=torch.bfloat16))]
+        weights = [
+            (EXPERT_WEIGHT, torch.ones(4, 8, dtype=torch.bfloat16)),
+            (
+                SHARED_EXPERT_WEIGHT,
+                torch.full((4, 8), 1e-4, dtype=torch.bfloat16),
+            ),
+        ]
         with patch(
             _PTPC_ENV,
             return_value=flag,
@@ -146,14 +169,15 @@ class TestMaybeQuantGlmNextnMoeToPtpc(CustomTestCase):
         self.assertIn(EXPERT_WEIGHT[: -len("weight")] + "weight_scale", names)
         weight = dict(out)[EXPERT_WEIGHT]
         self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(dict(out)[SHARED_EXPERT_WEIGHT].dtype, torch.bfloat16)
+        self.assertNotIn(SHARED_EXPERT_WEIGHT[: -len("weight")] + "weight_scale", names)
 
     def test_flag_on_does_not_cast_when_experts_not_excluded(self):
         src = _quark_cfg(exclude=[ATTN_LEAF])
         out = self._cast(src, flag=True)
-        self.assertEqual(len(out), 1)
-        name, tensor = out[0]
-        self.assertEqual(name, EXPERT_WEIGHT)
-        self.assertEqual(tensor.dtype, torch.bfloat16)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(dict(out)[EXPERT_WEIGHT].dtype, torch.bfloat16)
+        self.assertEqual(dict(out)[SHARED_EXPERT_WEIGHT].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

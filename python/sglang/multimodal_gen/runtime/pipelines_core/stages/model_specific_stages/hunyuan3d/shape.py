@@ -252,9 +252,6 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
 class Hunyuan3DShapeDenoisingStage(DenoisingStage):
     """Denoising stage for Hunyuan3D shape generation."""
 
-    def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
-        super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
-
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.transformer:
             return "hy3dshape_model"

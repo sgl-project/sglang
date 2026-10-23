@@ -43,7 +43,8 @@ def test_png_output_saving_preserves_pixels(tmp_path, output_compression):
 
 
 @pytest.mark.parametrize(
-    ("output_compression", "expected_compress_level"), [(None, 1), (0, 0), (75, 1)]
+    ("output_compression", "expected_compress_level"),
+    [(None, 0), (0, 0), (75, 0), (100, 9)],
 )
 def test_png_output_saving_uses_fast_pillow_path(
     tmp_path, monkeypatch, output_compression, expected_compress_level
@@ -75,21 +76,63 @@ def test_png_output_saving_uses_fast_pillow_path(
     assert save_calls == [("PNG", expected_compress_level)]
 
 
+@pytest.mark.parametrize("extension", ["jpg", "jpeg", "JPG"])
+@pytest.mark.parametrize("alpha", [0, 128, 255])
+def test_rgba_jpeg_output_composites_on_white(tmp_path, extension, alpha):
+    """Composite RGBA onto a white background before JPEG encoding."""
+    frame = np.full((32, 32, 4), [20, 80, 160, alpha], dtype=np.uint8)
+    original = frame.copy()
+    output_path = tmp_path / f"rgba.{extension}"
+
+    save_materialized_output(
+        MaterializedOutput(sample=None, frames=[frame]),
+        DataType.IMAGE,
+        str(output_path),
+        output_compression=75,
+    )
+
+    with Image.open(output_path) as image:
+        assert image.format == "JPEG" and image.mode == "RGB"
+        assert image.size == (32, 32)
+        actual = np.asarray(image).copy()
+    expected = (np.array([20, 80, 160]) * alpha + 255 * (255 - alpha) + 127) // 255
+    # JPEG is lossy; a constant-color image should stay within a few levels.
+    np.testing.assert_allclose(actual, np.broadcast_to(expected, actual.shape), atol=3)
+    np.testing.assert_array_equal(frame, original)
+
+
+def test_rgba_png_output_preserves_transparent_pixels(tmp_path):
+    rgb = _rgb_frame()
+    alpha = np.array([[0, 64, 128], [192, 254, 255]], dtype=np.uint8)
+    frame = np.concatenate([rgb, alpha[..., None]], axis=-1)
+    output_path = tmp_path / "rgba.png"
+
+    save_materialized_output(
+        MaterializedOutput(sample=None, frames=[frame]),
+        DataType.IMAGE,
+        str(output_path),
+        output_compression=75,
+    )
+
+    with Image.open(output_path) as image:
+        assert image.mode == "RGBA"
+        np.testing.assert_array_equal(np.asarray(image), frame)
+
+
 def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
     written = []
     imwrite = output_utils.imageio.imwrite
 
-    def imwrite_spy(path, frame, **kwargs):
-        written.append((path, kwargs))
-        return imwrite(path, frame, **kwargs)
+    def imwrite_spy(uri, frame, **kwargs):
+        written.append((uri, kwargs))
+        return imwrite(uri, frame, **kwargs)
 
     monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
-    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
 
     output_utils.warm_image_writer()
 
-    assert len(written) == 1
-    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert written == [("<bytes>", {"format": ".jpg", "quality": 75})]
     assert list(tmp_path.iterdir()) == []
 
 
