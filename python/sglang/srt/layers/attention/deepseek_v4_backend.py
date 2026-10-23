@@ -75,7 +75,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -1302,7 +1302,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2758,6 +2758,7 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        self.sparse_prefill_kv_buffer.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -4198,7 +4199,7 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -4209,10 +4210,18 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+            # Layers sharing a kv_source reuse its dequant: no later layer writes
+            # that cache, and graph replay keeps the layer order.
+            workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
+                n_compressed + cache.swa_token_ids.shape[0],
+                head_source=(
+                    extra_k_cache.data_ptr(),
+                    flat_token_ids.data_ptr(),
+                    n_compressed,
+                ),
             )
-            compressed_slice = workspace[:n_compressed]
+            if not compressed_filled:
+                compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
@@ -4369,7 +4378,7 @@ class DeepseekV4AttnBackend(
         flat_token_ids = None
 
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
@@ -4384,7 +4393,7 @@ class DeepseekV4AttnBackend(
             )
 
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 n_compressed + cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
