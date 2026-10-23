@@ -143,6 +143,11 @@ async def lifespan(app: FastAPI):
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    worker_monitor = (
+        asyncio.create_task(_monitor_workers(app))
+        if app.state.worker_processes
+        else None
+    )
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
@@ -159,6 +164,10 @@ async def lifespan(app: FastAPI):
         )
         yield
     finally:
+        if worker_monitor is not None:
+            worker_monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_monitor
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -185,25 +194,38 @@ async def liveness():
     return {"status": "ok"}
 
 
-@health_router.get("/health")
-async def health(request: Request):
-    """Report readiness for normal inference traffic."""
-    if not request.app.state.server_warmup_done.is_set():
-        return Response(status_code=503)
-    for worker in request.app.state.worker_processes:
+def _worker_failure(app: FastAPI) -> str | None:
+    for worker in app.state.worker_processes:
         try:
             # is_running also detects PID reuse; an unreaped child is still a zombie
             if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
                 continue
         except psutil.NoSuchProcess:
             pass
-        return orjson_response(
-            {
-                "status": "unhealthy",
-                "error": "Scheduler worker exited; restart the server.",
-            },
-            status_code=503,
-        )
+        return "Scheduler worker exited; restart the server."
+    return None
+
+
+async def _monitor_workers(app: FastAPI) -> None:
+    # Do not probe through the scheduler: a dead non-output rank can leave
+    # its peers blocked in collectives, unable to answer even a health RPC.
+    while True:
+        error = _worker_failure(app)
+        if error is not None:
+            logger.error(error)
+            async_scheduler_client.mark_failed(error)
+            return
+        await asyncio.sleep(1)
+
+
+@health_router.get("/health")
+async def health(request: Request):
+    """Report readiness for normal inference traffic."""
+    error = async_scheduler_client.failure_reason or _worker_failure(request.app)
+    if error is not None:
+        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
+    if not request.app.state.server_warmup_done.is_set():
+        return Response(status_code=503)
     return {"status": "ok"}
 
 
@@ -464,6 +486,11 @@ def create_app(server_args: ServerArgs, *, worker_pids: tuple[int, ...] = ()):
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
+        # Keep GETs available for completed results and failure diagnostics.
+        if request.method == "POST" and async_scheduler_client.failure_reason:
+            return orjson_response(
+                {"error": async_scheduler_client.failure_reason}, status_code=503
+            )
         warmup_done = getattr(request.app.state, "server_warmup_done", None)
         if (
             warmup_done is not None

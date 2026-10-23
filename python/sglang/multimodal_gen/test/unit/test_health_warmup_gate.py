@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import (
     health_generate,
     liveness,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 
 
@@ -33,6 +34,39 @@ def _make_request(warmup_done) -> SimpleNamespace:
 
 
 class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_monitor_rejects_posts_but_preserves_completed_results(self):
+        client = AsyncSchedulerClient()
+        args = SimpleNamespace(
+            enable_metrics=False,
+            pipeline_config=mock.Mock(
+                supports_action_endpoint=lambda: False,
+                supports_openpi_endpoint=lambda: False,
+            ),
+        )
+        with (
+            subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]
+            ) as worker,
+            mock.patch.object(http_server, "async_scheduler_client", client),
+        ):
+            app = http_server.create_app(args, worker_pids=(worker.pid,))
+            app.state.server_warmup_done = asyncio.Event()
+            app.state.server_warmup_done.set()
+            app.add_api_route("/completed", lambda: {"result": "saved"})
+            worker.kill()
+            worker.wait(timeout=5)
+            await asyncio.wait_for(http_server._monitor_workers(app), timeout=5)
+            async with http_server.httpx.AsyncClient(
+                transport=http_server.httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as http:
+                self.assertEqual((await http.get("/health")).status_code, 503)
+                self.assertEqual((await http.get("/liveness")).status_code, 200)
+                self.assertEqual((await http.post("/v1/videos")).status_code, 503)
+                self.assertEqual(
+                    (await http.get("/completed")).json(), {"result": "saved"}
+                )
+
     async def test_liveness_returns_200_before_warmup(self):
         self.assertEqual(await liveness(), {"status": "ok"})
 

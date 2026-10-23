@@ -462,11 +462,18 @@ server-based warmup fails, the server terminates instead of reporting ready.
 
 For standard serving (including `--webui`) and locally launched disaggregated
 pools, losing any tracked worker makes `/health` return `503`; `/liveness`
-continues to report HTTP availability. Remove the instance from routing and
-restart it. This check does not restart workers or recover in-flight jobs, and
-does not detect a hung process, an unusable CUDA context, or workers on other
-machines. A standalone disaggregation router does not own worker processes and
-cannot validate their health through this local check.
+continues to report HTTP availability. A local monitor checks workers once per
+second, fails outstanding scheduler requests, and rejects new POST requests with
+`503`, even without an RPC timeout. Completed job status and content remain
+readable until the server stops. Remove the instance from routing and restart
+the whole server; workers and in-flight jobs are not automatically recovered.
+
+An allocator OOM during a multi-rank forward terminates the affected worker:
+other ranks may still be inside collectives, so continuing the next request is
+unsafe. Single-GPU replicas, including independent DP replicas, retain normal
+request-level OOM handling. The monitor does not detect arbitrary hangs, unusable
+CUDA contexts, or workers on other machines. A standalone disaggregation router
+does not own worker processes and cannot validate their health through this check.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
