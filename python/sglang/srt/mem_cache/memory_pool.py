@@ -5040,11 +5040,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        """Write the first commit_lens[i] rows of each loc_2d [bs, n] row.
-
-        The other rows go to the reserved padding slot 0, which keeps shapes
-        static and avoids a host sync on commit_lens.
-        """
+        # Rows past commit_lens go to padding slot 0: static shapes, no host sync.
         offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
         loc = torch.where(offsets < commit_lens[:, None], loc_2d, 0).reshape(-1)
         self.set_mla_kv_buffer(

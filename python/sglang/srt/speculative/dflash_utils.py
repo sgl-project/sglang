@@ -137,8 +137,7 @@ def dflash_draft_cell_size_per_token(
             calculate_mla_kv_cache_dim,
         )
 
-        # The compressed latent is replicated across TP ranks, not expanded
-        # into per-head K/V or sharded with the query heads.
+        # One latent row per token, replicated across TP ranks.
         kv_dim = calculate_mla_kv_cache_dim(
             model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
         )
@@ -531,11 +530,7 @@ def _parse_optional_int(
 
 
 def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
-    """Whether every draft layer uses MLA attention.
-
-    SpecForge exports the scalar ``dflash_config.attention_mode``; per-layer
-    ``attention_modes`` lists come from forks that mix modes. Default is gqa.
-    """
+    # SpecForge exports attention_mode; forks that mix modes list attention_modes.
     if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
         raise ValueError(
             "DFLASH dflash_config sets both attention_mode and attention_modes; "
@@ -575,7 +570,6 @@ _DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
 
 
 def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
-    """Reject MLA draft settings the target's DeepSeek MLA layer cannot serve."""
     text_config = _get_text_config(draft_hf_config)
     required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
     missing = [name for name in required if _cfg_get(text_config, name) is None]

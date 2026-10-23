@@ -54,15 +54,13 @@ def draft_is_deepseek_v4() -> bool:
 
 
 def draft_attention_backend_override(*, draft_is_moe: bool) -> Optional[str]:
-    """The backend a DSpark draft's layout needs instead of the inherited one."""
     if draft_is_moe:
         return DSV4_DRAFT_ATTENTION_BACKEND
     from sglang.srt.speculative.draft_worker_common import (
         resolve_draft_worker_attention_backend,
     )
 
-    # trtllm_mha serves only MHA/GQA layers; it implies CUDA, where flashinfer
-    # serves MLA drafts.
+    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
     if resolve_draft_worker_attention_backend() == "trtllm_mha":
         draft_hf_config = _load_draft_hf_config()
         if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:

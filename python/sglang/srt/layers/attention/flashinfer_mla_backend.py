@@ -210,8 +210,6 @@ class FlashInferMhaChunkKVRunner:
 
 
 def _planned_causal(model: torch.nn.Module) -> bool:
-    """The mask the paged MLA wrappers fix when they plan a batch, from the
-    attn_type every attention layer of the model declares."""
     causal = {
         module.attn_type != AttentionType.ENCODER_ONLY
         for module in model.modules()
@@ -250,6 +248,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        # The paged MLA wrappers fix the mask when they plan a batch.
         self.causal = _planned_causal(model_runner.model)
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.

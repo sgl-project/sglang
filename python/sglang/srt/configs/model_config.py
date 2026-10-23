@@ -1307,7 +1307,6 @@ class ModelConfig:
         from sglang.srt.configs.dots3 import Dots3Config
 
         is_dflash_mla_draft = False
-        # Only DFlash-family draft checkpoints carry a dflash_config.
         if getattr(self.hf_config, "dflash_config", None):
             from sglang.srt.speculative.dflash_utils import (
                 parse_dflash_draft_config,
@@ -1397,8 +1396,7 @@ class ModelConfig:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
             if is_dflash_mla_draft:
-                # Sliding draft layers share the full layers' latent rows; the
-                # template's GQA head_dim would size a separate triton buffer.
+                # Sliding draft layers share the latent rows, not a GQA head_dim.
                 self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)

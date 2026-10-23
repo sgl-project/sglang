@@ -228,9 +228,8 @@ class TestDFlashMLA(CustomTestCase):
             )
 
     def test_every_load_path_absorbs_kv_b_proj(self):
-        """The absorbed forward reads w_kc / w_vc, so every load path must derive
-        them: SpecForge's split checkpoint, an already-fused export, and loaders
-        that bypass load_weights (dummy, sharded state) and call post_load_weights."""
+        """Split and fused checkpoints, and loaders that bypass load_weights,
+        all leave the w_kc / w_vc the absorbed forward reads."""
 
         def assert_absorbed(attn):
             w_kc, w_vc = attn.kv_b_proj.weight.view(HEADS, NOPE + VDIM, KV_LORA).split(

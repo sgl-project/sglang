@@ -450,12 +450,6 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashMLAAttention(DeepseekV2AttentionMLA):
-    """SpecForge MLA draft attention served by the target's absorbed MLA path.
-
-    SpecForge exports DeepSeek's MLA parameter names and RoPE conventions, so
-    only the DFlash layer causality, context-KV writes and loading differ.
-    """
-
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
@@ -533,7 +527,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         rows.copy_(loaded_weight)
 
     def absorb_kv_b_proj(self) -> None:
-        """Split kv_b_proj into the per-head w_kc / w_vc the absorbed forward reads."""
         w_kc, w_vc = self.kv_b_proj.weight.unflatten(
             0, (-1, self.qk_nope_head_dim + self.v_head_dim)
         ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
@@ -567,8 +560,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
     def project_context_kv(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Cache rows of target-context tokens: normalized latent and rotated k_pe,
-        each [n, 1, dim]."""
+        """Normalized latent and rotated k_pe of context tokens, each [n, 1, dim]."""
         if self.q_lora_rank is None:
             latent, _ = self.kv_a_proj_with_mqa(hidden_states)
         else:
@@ -591,8 +583,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
-        """Write this layer's rows for target-context tokens; with cache_loc_2d,
-        only each request's first commit_lens rows."""
+        """With cache_loc_2d, writes only each request's first commit_lens rows."""
         k_nope, k_pe = self.project_context_kv(positions, hidden_states)
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
@@ -826,7 +817,7 @@ class DFlashDraftModel(nn.Module):
                     f"{type(self).__name__} does not support mla draft attention."
                 )
             attention_cls = DFlashMLAAttention
-            # No fused qkv_proj to slice; context KV goes through write_context_kv().
+            # No fused qkv_proj to slice.
             self.supports_fused_context_kv = False
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
@@ -1131,8 +1122,7 @@ class DFlashDraftModel(nn.Module):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        """Derive weights the forward reads from loaded ones; loaders that bypass
-        load_weights call this directly."""
+        """Loaders that bypass load_weights call this directly."""
         if self.draft_config.is_mla:
             for layer in self.layers:
                 layer.self_attn.absorb_kv_b_proj()

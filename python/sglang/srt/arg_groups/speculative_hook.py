@@ -899,8 +899,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
-            # trtllm_mha serves only MHA/GQA layers; the fallback is the default
-            # MLA draft backend.
+            # trtllm_mha serves only MHA/GQA layers.
             fallback_backend = get_fallback_backend()
             logger.warning(
                 "DFLASH MLA drafts cannot use 'trtllm_mha'. Falling back to '%s'.",
