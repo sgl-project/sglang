@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -270,6 +270,68 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
     )
 
 
+MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
+
+
+class MegaMoeInput(NamedTuple):
+    buf: SymmBuffer
+    num_tokens: int
+    x: torch.Tensor
+    routed_sf: torch.Tensor
+    shared_sf: torch.Tensor
+    shared_block_m: int
+
+    def views(self):
+        return (self.x, self.routed_sf, self.shared_sf, self.shared_block_m)
+
+    def mark(self, rows: torch.Tensor) -> None:
+        setattr(rows, MEGA_MOE_INPUT_TAG, (self.buf, self.num_tokens))
+
+
+def _mega_moe_input_in_buffer(rows: torch.Tensor, buf, num_tokens: int) -> bool:
+    tag = getattr(rows, MEGA_MOE_INPUT_TAG, None)
+    return tag is not None and tag[0] is buf and tag[1] == num_tokens
+
+
+def mega_moe_input_target(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor, forward_batch
+) -> Optional[MegaMoeInput]:
+    if not (
+        should_use_mega_gate(moe, hidden_states, forward_batch)
+        and get_moe_a2a_backend().is_megamoe()
+        and is_mega_moe_experts_ready(moe.experts)
+        and moe.mega_shared_l1_weights is not None
+        and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
+    ):
+        return None
+    import deep_gemm
+
+    buf = _mega_moe_buffer(moe)
+    num_tokens = hidden_states.shape[0]
+    x = buf.x[:num_tokens]
+    if x.dtype != torch.float8_e4m3fn:
+        x = x.view(torch.float8_e4m3fn)
+    routed_sf = buf.x_sf[:num_tokens]
+    if not routed_sf.is_contiguous():
+        return None
+    shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    return MegaMoeInput(
+        buf,
+        num_tokens,
+        x,
+        routed_sf,
+        buf.shared_l1_acts_sf[:num_tokens],
+        shared_block_m,
+    )
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -474,21 +536,25 @@ def run_mega_routed_experts(
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
             )
-        mega_moe_pre_dispatch(
-            hidden_states,
-            buf.topk_idx if routing_in_buffer else topk_ids_in,
-            buf.topk_weights if routing_in_buffer else topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-            shared_x_sf=(
-                buf.shared_l1_acts_sf if shared_l1_weights is not None else None
-            ),
-            shared_block_m=shared_block_m,
-            copy_topk=not routing_in_buffer,
-        )
+        if not (
+            routing_in_buffer
+            and _mega_moe_input_in_buffer(hidden_states, buf, num_tokens)
+        ):
+            mega_moe_pre_dispatch(
+                hidden_states,
+                buf.topk_idx if routing_in_buffer else topk_ids_in,
+                buf.topk_weights if routing_in_buffer else topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+                shared_x_sf=(
+                    buf.shared_l1_acts_sf if shared_l1_weights is not None else None
+                ),
+                shared_block_m=shared_block_m,
+                copy_topk=not routing_in_buffer,
+            )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
