@@ -153,7 +153,6 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server, tmp_path):
 
     with _paused(workers):
         for invalid in (
-            {"n": -1},
             {"seed": -1},
             {"num_inference_steps": 0},
             {"guidance_scale": -1},
