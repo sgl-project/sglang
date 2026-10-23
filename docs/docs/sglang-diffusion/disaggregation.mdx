@@ -444,7 +444,7 @@ without replacing the original request. Each scheduler message carries one
 request; use concurrent API calls for independent requests, or `n` for multiple
 outputs from one request.
 
-Invalid tensor results fail only the associated request when its ID can be
+Tensor decoding errors fail only the associated request when its ID can be
 recovered. Results without an identifiable request are logged and discarded;
 affected requests still rely on `--disagg-timeout`. Reported worker errors release
 their scheduling capacity and reserved receive slots so later requests can run.

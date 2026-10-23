@@ -262,6 +262,11 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                     {"request_id": request_id},
                 )
             output = client.recv_pyobj()
+            # the reply can arrive before the head finishes request cleanup
+            deadline = time.monotonic() + 5
+            while server._tracker.get(request_id) is not None:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
             if fail_image:
                 assert "invalid reference" in output.error
             elif fail_role:
