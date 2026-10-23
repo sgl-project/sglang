@@ -4293,10 +4293,13 @@ class DeepseekV4Model(nn.Module):
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
         try:
-            return self._forward_impl(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
         finally:
             residual_batch.clear(forward_batch)
 
