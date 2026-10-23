@@ -1115,6 +1115,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_is_kda = False
         self.enable_linear_replayssm_spec = False
         self.replayssm_spec_fold = False
+        self.replayssm_spec_write_pos = None
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
         self.debug_memory_pool = False
@@ -1908,6 +1909,9 @@ class UnifiedSWAKVPool(SWAKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
         )
+
+        self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
+        self.swa_kv_pool.model_layer_ids = tuple(swa_attention_layer_ids)
 
         # disagg/nvlink disabled; keep attrs present to avoid AttributeError.
         self.enable_custom_mem_pool = False
