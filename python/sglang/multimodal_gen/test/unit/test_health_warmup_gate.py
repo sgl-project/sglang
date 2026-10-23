@@ -5,12 +5,18 @@
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 from urllib.error import URLError
+
+import psutil
+from fastapi import Response
 
 from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
@@ -22,7 +28,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 
 
 def _make_request(warmup_done) -> SimpleNamespace:
-    state = SimpleNamespace(server_warmup_done=warmup_done)
+    state = SimpleNamespace(server_warmup_done=warmup_done, worker_processes=[])
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
@@ -51,6 +57,34 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         warmup_done.set()
         resp = await health_generate(_make_request(warmup_done))
         self.assertEqual(resp, {"status": "ok"})
+
+    @unittest.skipUnless(sys.platform == "linux", "requires waitid WNOWAIT")
+    async def test_exited_worker_is_unready_before_and_after_reaping(self):
+        """A dead replica must not remain ready just because warmup completed."""
+        warmup_done = asyncio.Event()
+        warmup_done.set()
+        request = _make_request(warmup_done)
+        with subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        ) as worker:
+            # Another live replica must not hide the dead one.
+            request.app.state.worker_processes = [
+                psutil.Process(os.getpid()),
+                psutil.Process(worker.pid),
+            ]
+            self.assertEqual(await health(request), {"status": "ok"})
+            worker.kill()
+            await asyncio.to_thread(
+                os.waitid, os.P_PID, worker.pid, os.WEXITED | os.WNOWAIT
+            )
+            for reaped in (False, True):
+                if reaped:
+                    worker.wait(timeout=5)
+                for endpoint in (health, health_generate):
+                    response = await endpoint(request)
+                    self.assertIsInstance(response, Response)
+                    self.assertEqual(response.status_code, 503)
+                self.assertEqual(await liveness(), {"status": "ok"})
 
 
 class TestRouteModelPrebuild(unittest.TestCase):
