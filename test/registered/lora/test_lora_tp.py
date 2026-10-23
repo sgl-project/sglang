@@ -16,14 +16,12 @@
 
 import multiprocessing as mp
 import unittest
-from typing import List
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     CI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
-    LoRAModelCase,
     run_lora_test_one_by_one,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -39,29 +37,24 @@ register_amd_ci(
 
 
 class TestLoRATP(CustomTestCase):
-    def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
-        tp_list = [2]  # Define TP sizes to iterate over
-        for model_case in model_cases:
+    def test_ci_lora_models(self):
+        for model_case in CI_LORA_MODELS:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
             prompts = (
                 DEFAULT_PROMPTS
                 if not model_case.skip_long_prompt
                 else [p for p in DEFAULT_PROMPTS if len(p) < 1000]
             )
-            for tp_size in tp_list:
-                model_case.tp_size = tp_size
-                for torch_dtype in TORCH_DTYPES:
-                    run_lora_test_one_by_one(
-                        prompts,
-                        model_case,
-                        torch_dtype,
-                        max_new_tokens=32,
-                        test_tag=f"tp={tp_size}",
-                        attention_backend="fa3",
-                    )
-
-    def test_ci_lora_models(self):
-        self._run_tp_on_model_cases(CI_LORA_MODELS)
+            model_case.tp_size = 2
+            for torch_dtype in TORCH_DTYPES:
+                run_lora_test_one_by_one(
+                    prompts,
+                    model_case,
+                    torch_dtype,
+                    max_new_tokens=32,
+                    test_tag="tp=2",
+                    attention_backend="fa3",
+                )
 
 
 if __name__ == "__main__":

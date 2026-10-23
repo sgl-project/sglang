@@ -1,4 +1,5 @@
 import dataclasses
+import os
 import random
 from typing import Any, Dict, List, Optional
 
@@ -386,6 +387,76 @@ def run_moe_lora_tp_generation(
         "top_output_logprobs": outputs.top_output_logprobs,
         "output_strs": outputs.output_strs,
     }
+
+
+def kl_v2(a, b):
+    """Mean of 0.5 * (a - b) ** 2 over two logprob sequences."""
+    a = torch.tensor(a) if not torch.is_tensor(a) else a
+    b = torch.tensor(b) if not torch.is_tensor(b) else b
+    return (((a - b) ** 2) * 0.5).mean().item()
+
+
+def get_prompt_logprobs(engine, input_ids, lora_path):
+    """Logprobs of every prompt token after the first, for one sequence given
+    as token ids (a flat or batched list, or a tensor)."""
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.tolist()
+    if not isinstance(input_ids[0], list):
+        input_ids = [input_ids]
+    out = engine.generate(
+        input_ids=input_ids,
+        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
+        return_logprob=True,
+        logprob_start_len=0,
+        lora_path=lora_path,
+    )
+    if isinstance(out, list):
+        out = out[0]
+    return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
+
+
+def assert_lora_matches_trainer_logprobs(
+    test_case, engine, adapter_path, kl_threshold, lora_path="my_lora"
+):
+    """Shared check of the test_lora_*_logprob_diff.py files: the adapter must
+    change the prompt logprobs and keep them within `kl_threshold` (kl_v2) of
+    the trainer's, recorded in the adapter's compare_sample_train_data.pt."""
+    cdata = torch.load(
+        os.path.join(adapter_path, "compare_sample_train_data.pt"),
+        weights_only=False,
+    )
+
+    base_logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=None)
+    logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=lora_path)
+
+    base_t = torch.tensor(base_logprobs)
+    lora_t = torch.tensor(logprobs)
+    diff = (base_t - lora_t).abs()
+    print(
+        f"[VERIFY] base vs lora: mean_diff={diff.mean().item():.6f}, "
+        f"max_diff={diff.max().item():.6f}, "
+        f"identical={torch.equal(base_t, lora_t)}"
+    )
+
+    test_case.assertFalse(
+        torch.equal(base_t, lora_t),
+        "LoRA logprobs should differ from base model logprobs",
+    )
+
+    kl_sglang_trainer = kl_v2(cdata["training_logprobs"], logprobs)
+    kl_orig_trainer = kl_v2(cdata["training_logprobs"], cdata["sampling_logprobs"])
+    kl_sglang_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
+
+    print(f"KL(orig_sampler, trainer) = {kl_orig_trainer:.6e}")
+    print(f"KL(sglang, trainer)       = {kl_sglang_trainer:.6e}")
+    print(f"KL(sglang, orig_sampler)  = {kl_sglang_orig:.6e}")
+
+    test_case.assertLessEqual(
+        kl_sglang_trainer,
+        kl_threshold,
+        f"KL(sglang, trainer) = {kl_sglang_trainer:.6e} exceeds "
+        f"threshold {kl_threshold}",
+    )
 
 
 CI_LORA_MODELS = [
