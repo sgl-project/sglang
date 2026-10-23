@@ -1,12 +1,12 @@
-"""Exercise SWA eviction frontiers without importing CUDA or model weights."""
+"""Exercise SWA eviction frontiers without accelerator execution or model weights."""
 
 import ast
-import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from sglang.srt.mem_cache import common as cache_common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,35 +16,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class ReplayRetentionTest(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        package = importlib.util.find_spec("sglang")
-        cls.source = (
-            Path(next(iter(package.submodule_search_locations))) / "srt/mem_cache"
-        )
-        tree = ast.parse((cls.source / "common.py").read_text())
-        function = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "free_swa_out_of_window_slots"
-        )
-        module = ast.Module(
-            body=[
-                ast.ImportFrom(
-                    module="__future__", names=[ast.alias(name="annotations")], level=0
-                ),
-                function,
-            ],
-            type_ignores=[],
-        )
-        ast.fix_missing_locations(module)
-        namespace = {
-            "ComponentType": SimpleNamespace(SWA="swa"),
-            "ceil_align": lambda n, alignment: (
-                (n + alignment - 1) // alignment * alignment
-            ),
-        }
-        exec(compile(module, "swa-replay-retention", "exec"), namespace)
-        cls.free_window = staticmethod(namespace["free_swa_out_of_window_slots"])
+        cls.source = Path(cache_common.__file__).parent
+        cls.free_window = staticmethod(cache_common.free_swa_out_of_window_slots)
 
     def frontier(
         self,
