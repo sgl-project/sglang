@@ -707,7 +707,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
         self.indexer_kv_store_int8 = (
-            index_head_dim is not None and envs.SGLANG_NPU_INDEXER_INT8.get()
+            envs.SGLANG_NPU_INDEXER_INT8.get()
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
         )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
