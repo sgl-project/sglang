@@ -10,7 +10,7 @@ from sglang.srt.lora.moe.runner import MoeLoraRunner
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class _FakeProvider:
