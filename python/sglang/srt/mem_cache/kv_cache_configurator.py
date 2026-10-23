@@ -819,9 +819,9 @@ class KVCacheConfigurator:
                 "buffer; the draft binds a private pool over the virtual id space."
             )
             return None
-        # The region holds rows in the target's KV dtype; a draft that resolved
-        # its own would read and write them as something else. Compare the KV
-        # dtypes, not their storage: every fp8 flavor is stored as uint8.
+        # The draft's resolved dtype must match its region, which can differ
+        # from the target's rows. Compare logical KV dtypes, not their storage:
+        # every fp8 flavor is stored as uint8.
         from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
 
         for host in placement.hosts():
@@ -832,9 +832,8 @@ class KVCacheConfigurator:
                 raise ValueError(
                     f"Fused draft KV: the draft resolved its KV cache dtype to "
                     f"{self.kv_cache_dtype}, but its region inside the target's "
-                    f"pages holds {region_kv_dtype}. Set "
-                    "--speculative-draft-kv-cache-dtype to the target's KV cache "
-                    "dtype."
+                    f"pages holds {region_kv_dtype}. The draft KV dtype must "
+                    "match the dtype used to size its fused region."
                 )
         return placement
 
@@ -1061,6 +1060,7 @@ class KVCacheConfigurator:
         Asymmetric K/V rows fuse only on backends that carry v_head_dim through
         to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
+            LAYER_FULL,
             FusedDraftDecision,
             PlacementContext,
             draft_kv_profile,
@@ -1125,12 +1125,20 @@ class KVCacheConfigurator:
                     "rows, but the replicated draft reads every token"
                 )
             )
-        # HiCache and host-pool retraction build the draft's host pool off its
-        # own device pool, which a fused draft does not have. The external
-        # linker would too; the gate refuses it on the unified pool.
-        if get_memory().enable_hierarchical_cache:
-            host_pool_flag = "--enable-hierarchical-cache"
-        elif get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+        # DFLASH's dense full-attention rows can ride in the target's L2
+        # page envelopes. Other HiCache paths still build a separate draft
+        # host pool, as does host-pool decode retraction.
+        fused_hicache = get_memory().enable_hierarchical_cache
+        if fused_hicache:
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                validate_fused_hicache_draft,
+            )
+
+            try:
+                validate_fused_hicache_draft(target_config=self)
+            except NotImplementedError as exc:
+                return FusedDraftDecision(declined=str(exc))
+        if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
             host_pool_flag = "--disaggregation-decode-retraction-backup=host_pool"
         else:
             host_pool_flag = None
@@ -1153,22 +1161,29 @@ class KVCacheConfigurator:
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
         )
+        if fused_hicache and set(profile.kinds) != {LAYER_FULL}:
+            return FusedDraftDecision(
+                declined="HiCache fused DFLASH requires a full-attention-only draft"
+            )
         num_runners = (
             int(get_spec().speculative_num_steps)
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # A fused draft stores its rows in the host's KV dtype. An explicit
-        # draft dtype resolves here as the draft runner will; `auto` follows
-        # the draft's quant config, which only the draft runner knows, so it
-        # is checked when the draft binds. DFLASH-family FA4 is already known:
-        # it always uses the draft's compute dtype, including with default/auto
-        # KV settings. Decline fusion now if that differs from the host.
+        # FA4's DFLASH-family KV always uses the draft's compute dtype. Its
+        # region has its own typed views inside the host's byte buffer, so
+        # price those rows in that dtype even when the target uses FP8.
+        # Other drafts retain the host dtype; an unresolved `auto` is checked
+        # when the draft binds, after its quant config is available.
+        region_kv_dtype = self.kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
         if draft_kv_cache_dtype not in (None, "auto") or (
             self.spec_algorithm.is_dflash_family() and draft_backend == "fa4"
         ):
-            from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                allow_target_draft_different_cache_dtype,
+                configure_kv_cache_dtype,
+            )
 
             _, draft_kv_dtype = configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
@@ -1180,12 +1195,18 @@ class KVCacheConfigurator:
                 speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
             )
             if draft_kv_dtype != self.kv_cache_dtype:
-                return FusedDraftDecision(
-                    declined=(
-                        f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
-                        f"from the host's ({self.kv_cache_dtype})"
+                if allow_target_draft_different_cache_dtype(
+                    is_dflash=self.spec_algorithm.is_dflash_family(),
+                    speculative_draft_attention_backend=draft_backend,
+                ):
+                    region_kv_dtype = draft_kv_dtype
+                else:
+                    return FusedDraftDecision(
+                        declined=(
+                            f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
+                            f"from the host's ({self.kv_cache_dtype})"
+                        )
                     )
-                )
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
@@ -1195,8 +1216,8 @@ class KVCacheConfigurator:
                 asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
                 draft_backends=self._draft_attention_backends(),
             ),
-            store_dtype=_store_dtype_for(self.kv_cache_dtype),
-            kv_dtype=self.kv_cache_dtype,
+            store_dtype=_store_dtype_for(region_kv_dtype),
+            kv_dtype=region_kv_dtype,
         )
 
     def _draft_attention_backends(self) -> tuple:
@@ -2635,6 +2656,8 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         # DCP allocation is in the global virtual loc space.
                         # The target attention path localizes these locs when

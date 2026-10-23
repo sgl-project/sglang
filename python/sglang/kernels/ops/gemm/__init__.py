@@ -525,3 +525,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
+    )
+)

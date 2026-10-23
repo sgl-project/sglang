@@ -526,15 +526,26 @@ def launch_disagg_server(server_args: ServerArgs):
         and server_args.decoder_urls is None
     )
     required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
-    if not glm_distributed_mode_enabled:
-        required_urls.extend(
-            [
-                ("--encoder-urls", server_args.encoder_urls),
-                ("--decoder-urls", server_args.decoder_urls),
-            ]
+    split_encoding = bool(
+        server_args.prompt_encoder_urls or server_args.image_encoder_urls
+    )
+    if split_encoding and server_args.encoder_urls is not None:
+        raise ValueError(
+            "Use either --encoder-urls or split --prompt-encoder-urls/--image-encoder-urls"
         )
+    if not glm_distributed_mode_enabled:
+        required_urls.append(("--decoder-urls", server_args.decoder_urls))
+        if split_encoding:
+            required_urls.extend(
+                [
+                    ("--prompt-encoder-urls", server_args.prompt_encoder_urls),
+                    ("--image-encoder-urls", server_args.image_encoder_urls),
+                ]
+            )
+        else:
+            required_urls.append(("--encoder-urls", server_args.encoder_urls))
     for name, val in required_urls:
-        if val is None:
+        if not parse_url_string(val):
             raise ValueError(f"{name} is required for --disagg-role server")
 
     host = server_args.host or "127.0.0.1"
@@ -550,22 +561,23 @@ def launch_disagg_server(server_args: ServerArgs):
 
     frontend_endpoint = f"tcp://{host}:{base_port}"
 
-    logger.info(
-        "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s)",
-        len(encoder_work_endpoints),
-        len(denoiser_work_endpoints),
-        len(decoder_work_endpoints),
-    )
-    logger.info("  Frontend: %s", frontend_endpoint)
-    logger.info("  Encoder work endpoints: %s", encoder_work_endpoints)
-    logger.info("  Denoiser work endpoints: %s", denoiser_work_endpoints)
-    logger.info("  Decoder work endpoints: %s", decoder_work_endpoints)
-    logger.info(
-        "  Result endpoints: encoder=%s, denoiser=%s, decoder=%s",
-        encoder_result_ep,
-        denoiser_result_ep,
-        decoder_result_ep,
-    )
+    logger.info("Starting DiffusionServer: frontend=%s", frontend_endpoint)
+    for role, endpoints in (
+        (RoleType.ENCODER, encoder_work_endpoints),
+        (RoleType.PROMPT_ENCODER, parse_url_string(server_args.prompt_encoder_urls)),
+        (RoleType.IMAGE_ENCODER, parse_url_string(server_args.image_encoder_urls)),
+        (RoleType.DENOISER, denoiser_work_endpoints),
+        (RoleType.DECODER, decoder_work_endpoints),
+    ):
+        if endpoints:
+            offset = ServerArgs.DISAGG_RESULT_PORT_OFFSETS[role]
+            logger.info(
+                "  %s: work=%s result=tcp://%s:%d",
+                role.value,
+                endpoints,
+                host,
+                base_port + offset,
+            )
 
     denoiser_options = (
         {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}
@@ -582,6 +594,10 @@ def launch_disagg_server(server_args: ServerArgs):
         timeout_s=float(server_args.disagg_timeout),
         server_args=server_args,
         glm_distributed_mode_enabled=glm_distributed_mode_enabled,
+        prompt_encoder_work_endpoints=parse_url_string(server_args.prompt_encoder_urls),
+        image_encoder_work_endpoints=parse_url_string(server_args.image_encoder_urls),
+        prompt_encoder_result_endpoint=f"tcp://{host}:{base_port + 4}",
+        image_encoder_result_endpoint=f"tcp://{host}:{base_port + 5}",
         **denoiser_options,
     )
     diffusion_server.start()
@@ -649,7 +665,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
-        "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
+        "warmup_mode": "request" if role_type.is_input_encoder else "off",
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],
@@ -786,7 +802,7 @@ def dispatch_launch(server_args: ServerArgs):
         launch_server(server_args)
     elif role == RoleType.SERVER:
         launch_disagg_server(server_args)
-    elif role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER):
+    elif role.is_input_encoder or role.is_transfer_receiver:
         launch_disagg_role(server_args)
     else:
         raise ValueError(f"Unknown disagg_role: {role}")

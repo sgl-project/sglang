@@ -984,12 +984,21 @@ def handle_model_capability_adjustments(server_args: Any):
     # A Clef checkpoint's joint schema head reads the final hidden state of
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    # also puts the FA backend on its raw K/V path, which skips the KV pool. A
+    # Kev checkpoint's pointer head reads two positions of each question's
+    # prompt and is served the same way.
     if model_config.joint_head_config is not None:
+        name, head = "Clef", "joint schema head"
+        tp_reason = ", since the joint schema head reads full LM head rows"
+    elif model_config.pointer_head is not None:
+        name, head, tp_reason = "Kev", "pointer head", ""
+    else:
+        name = None
+    if name is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
-                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
-                "since the joint schema head reads full LM head rows"
+                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
+                f"{tp_reason}"
             )
         for key, value in (
             ("is_embedding", True),
@@ -1008,7 +1017,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 ),
             )
         logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
+            f"{name} {head} detected: serving /v1/systemone decisions in "
             "embedding mode without radix cache, chunked prefill, or CUDA graphs."
         )
 
