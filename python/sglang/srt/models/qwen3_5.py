@@ -184,13 +184,9 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
-_gdn_online_mxfp4 = tuple(
-    p for p in envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get().split(",") if p
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj") if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() else ()
 )
-if not set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "out_proj"}:
-    raise ValueError(
-        f"SGLANG_ROCM_GDN_ONLINE_MXFP4 accepts in_proj_qkvz and out_proj, got {_gdn_online_mxfp4}"
-    )
 if _gdn_online_mxfp4 and not (_use_aiter and _is_gfx95):
     logger.warning("SGLANG_ROCM_GDN_ONLINE_MXFP4 needs gfx95x and SGLANG_USE_AITER=1")
     _gdn_online_mxfp4 = ()
