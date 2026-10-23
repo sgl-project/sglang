@@ -2642,8 +2642,6 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int,
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
-        if self.tool_call_parser == "kimi_k3":
-            return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
