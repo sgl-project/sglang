@@ -233,6 +233,10 @@ class AITerBackend(AttentionBackend):
     Backend for AITemplate attention implementation.
     """
 
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.AITER
@@ -342,7 +346,9 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        *,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
@@ -353,35 +359,52 @@ class AITerImpl(AttentionImpl):
             key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
             value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
             attn_metadata: Metadata for the attention operation (unused).
+            return_softmax_lse: Also return the softmax LSE, [batch_size, num_heads, seq_len].
 
         Returns:
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        if _use_fp8_attn:
+        # The FP8 FMHA ASM path has no LSE output, so ring attention, which
+        # LSE-merges every hop, has to go through the BF16 kernel.
+        if _use_fp8_attn and return_softmax_lse:
+            logger.warning_once(
+                "FP8 FMHA prefill cannot return the softmax LSE. Falling back to BF16."
+            )
+        elif _use_fp8_attn:
             output = self._forward_fp8(query, key, value)
             if output is not None:
                 return output
 
         if USE_AITER_GFX1250:
-            return self._forward_bf16_eager(query, key, value)
-        return self._forward_bf16(query, key, value)
+            return self._forward_bf16_eager(
+                query, key, value, return_softmax_lse=return_softmax_lse
+            )
+        return self._forward_bf16(
+            query, key, value, return_softmax_lse=return_softmax_lse
+        )
 
     def _forward_bf16(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-    ) -> torch.Tensor:
-        return aiter.flash_attn_func(
+        *,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        output = aiter.flash_attn_func(
             query,
             key,
             value,
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=False,
+            return_lse=return_softmax_lse,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
+        if return_softmax_lse:
+            output, softmax_lse = output
+            return output, softmax_lse
+        return output
 
     # On gfx1250 flash_attn_func dispatches to a FlyDSL kernel whose Python JIT reads
     # thread-local MLIR context state; Dynamo tracing into it fails at compile time.
@@ -391,8 +414,29 @@ class AITerImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-    ) -> torch.Tensor:
-        return self._forward_bf16(query, key, value)
+        *,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self._forward_bf16(
+            query, key, value, return_softmax_lse=return_softmax_lse
+        )
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one rotated KV chunk for ring merging."""
+        # aiter's only BF16 entry point is batched, so one packed chunk is the
+        # batch-1 case of the call forward already makes.
+        output, softmax_lse = self.forward(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            return_softmax_lse=True,
+        )
+        return output.squeeze(0), softmax_lse.squeeze(0)
 
     @torch.compiler.disable
     def forward_varlen(
