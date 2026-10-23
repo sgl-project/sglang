@@ -816,61 +816,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             round_up(real_max_seqlen, FLASHINFER_MAX_SEQLEN_BUCKETS[-1]),
         )
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        """Interpolate position embeddings for (batch, 3) size input dimensions.
-
-        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
-        along temporal dimension. The result is reorganized according to spatial_merge_size.
-
-        Args:
-            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
-                     in patches for each sample.
-
-        Returns:
-            Interpolated position embeddings tensor.
-        """
-        grid_thw_cpu = grid_thw.cpu().numpy()
-
-        # transfer data to CPU before loop
-        temporal_dims = grid_thw_cpu[:, 0].tolist()
-        height_dims = grid_thw_cpu[:, 1].tolist()
-        width_dims = grid_thw_cpu[:, 2].tolist()
-
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
-
-        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
-        total_patches = sum(patches_size)
-        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
-        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
-
-        current_idx = 0
-
-        # calculate indices and weights on CPU
-        for t, h, w in zip(temporal_dims, height_dims, width_dims):
-            h_idxs = self._get_interpolation_indices(h)
-            w_idxs = self._get_interpolation_indices(w)
-
-            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
-
-            end_idx = current_idx + h * w
-            for i in range(4):
-                all_indices_np[i, current_idx:end_idx] = indices[i]
-                all_weights_np[i, current_idx:end_idx] = weights[i]
-            current_idx = end_idx
-
-        idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
-
-        # calculate interpolation
-        pos_embeds = self.pos_embed(idx_tensor.view(-1))
-        pos_embeds = pos_embeds.view(4, total_patches, -1)
-        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
-        patch_pos_embeds = patch_pos_embeds.split(patches_size)
-        return self._get_position_embedding(
-            patch_pos_embeds, temporal_dims, height_dims, width_dims
-        )
-
     def compute_flashinfer_batch_offsets_packed(
         self,
         token_cu_seqlens: np.ndarray,
