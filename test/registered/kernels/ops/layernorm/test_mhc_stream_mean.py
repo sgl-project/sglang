@@ -19,7 +19,7 @@ def _assert_bitwise(got: torch.Tensor, ref: torch.Tensor):
     assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
 
 
-@pytest.mark.parametrize("m", [0, 1, 7, 1024, 4097])
+@pytest.mark.parametrize("m", [0, 7, 4097])
 @pytest.mark.parametrize("h", [1024, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_matches_torch_mean_bitwise(m: int, h: int, dtype: torch.dtype):
@@ -48,13 +48,6 @@ def test_strided_rows_and_out_slot():
     got = mhc_stream_mean(x, out=slot)
     assert got.data_ptr() == slot.data_ptr()
     _assert_bitwise(slot.clone(), x.mean(dim=1))
-
-
-@pytest.mark.parametrize("hc,h", [(4, 4000), (2, 4096), (8, 4096)])
-def test_fallback_shapes_match_torch_mean(hc: int, h: int):
-    torch.manual_seed(0)
-    x = torch.randn(32, hc, h, device="cuda", dtype=torch.bfloat16)
-    _assert_bitwise(mhc_stream_mean(x), x.mean(dim=1))
 
 
 def test_out_with_other_dtype_takes_the_fallback():

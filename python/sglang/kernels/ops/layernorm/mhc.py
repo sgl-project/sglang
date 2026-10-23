@@ -2768,8 +2768,8 @@ def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.T
     """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
     into ``out`` when given."""
     m, hc, h = x.shape
-    # The in-order fp32 sum matches torch's CUDA reduction for 4 streams (the mHC
-    # width) over rows of whole 1024-element blocks; it differs for some other widths.
+    # Bitwise equality with torch's CUDA mean holds for 4 streams (the mHC width)
+    # over whole 1024-element blocks; torch orders some other widths differently.
     if (
         _is_hip
         or x.device.type != "cuda"
