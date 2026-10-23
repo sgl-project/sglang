@@ -308,6 +308,7 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    batch.global_num_tokens_across_dp = mlp_sync_info.global_num_tokens
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]

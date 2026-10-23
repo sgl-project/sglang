@@ -1149,6 +1149,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1172,10 +1173,14 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
+                    if weight_name_filter is not None and not weight_name_filter(name):
+                        continue
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if weight_name_filter is not None and not weight_name_filter(name):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -1330,6 +1335,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    weight_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1352,7 +1358,17 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    name: f.get_tensor(name)
+                    for name in f.keys()
+                    if weight_name_filter is None or weight_name_filter(name)
+                }
+        if weight_name_filter is not None and disable_mmap:
+            result = {
+                name: tensor
+                for name, tensor in result.items()
+                if weight_name_filter(name)
+            }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

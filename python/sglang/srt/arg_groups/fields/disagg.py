@@ -124,6 +124,27 @@ class Disagg(msgspec.Struct):
     ] = 0
 
     # -------------------------------------------------------------------------
+    # AFD (Attention-FFN Disaggregation)
+    # -------------------------------------------------------------------------
+    afd_role: A[
+        Optional[Literal["attn", "ffn"]],
+        'AFD (Attention-FFN Disaggregation) role of this instance. "attn" runs '
+        'the model without routed experts; "ffn" serves expert computation. '
+        "If not specified, AFD is disabled.",
+    ] = None
+    afd_ffn_addr: A[
+        Optional[str],
+        "host:port of the AFD ffn instance's server (its --host/--port). The "
+        "internal handshake port is derived from it. Required for --afd-role "
+        "attn; must not be set for --afd-role ffn.",
+    ] = None
+    afd_backend: A[
+        Literal["nccl"],
+        "The AFD data-plane backend for transferring routed expert tensors.",
+    ] = "nccl"
+    afd_ffn_moe_backend: A[str, Arg(no_cli=True, resolvable=True)] = "none"
+
+    # -------------------------------------------------------------------------
     # Encode prefill disaggregation
     # -------------------------------------------------------------------------
     encoder_only: A[

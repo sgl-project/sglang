@@ -9,11 +9,13 @@ import torch
 
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    is_moe_input_scattered_across_dp_ranks,
     post_experts_output_is_complete,
     reduce_moe_output,
     should_add_replicated_moe_output,
 )
-from sglang.srt.runtime_context import get_forward
+from sglang.srt.runtime_context import get_context, get_flags, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,11 +23,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def a2a(name=None):
-    names = ("flashinfer", "pplx", "flashinfer_megamoe")
-    return types.SimpleNamespace(
-        **{f"is_{n}": (lambda n=n: n == name) for n in names},
-        is_none=lambda: name is None,
-    )
+    return MoeA2ABackend(name)
 
 
 @contextlib.contextmanager
@@ -39,14 +37,16 @@ def moe_config(
     reduce_scatterv=False,
 ):
     with (
-        patch.object(
-            moe_utils,
-            "get_parallel",
-            return_value=types.SimpleNamespace(
-                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size
-            ),
+        get_parallel().override(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            attn_tp_size=tp_size,
+            attn_tp_rank=tp_rank,
+            moe_tp_size=tp_size,
+            moe_tp_rank=tp_rank,
+            dwdp_size=dwdp_size,
         ),
-        patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a(backend)),
+        get_flags().moe.override(a2a_backend=a2a(backend)),
         patch.object(
             moe_utils,
             "should_use_flashinfer_cutlass_moe_fp4_allgather",
@@ -107,6 +107,27 @@ class TestReduceMoeOutput(CustomTestCase):
         with moe_config():
             self.assertFalse(post_experts_output_is_complete(is_tp_path=False))
 
+    def test_afd_layout_preserves_partial_or_complete_outputs(self):
+        for backend, scattered in (("none", False), ("deepep", True)):
+            with (
+                self.subTest(ffn_backend=backend),
+                get_context().override_server_args(
+                    afd_role="attn", afd_ffn_moe_backend=backend
+                ),
+                moe_config(backend="afd"),
+            ):
+                self.assertEqual(is_moe_input_scattered_across_dp_ranks(), scattered)
+                for is_tp_path in (False, True):
+                    self.assertEqual(
+                        post_experts_output_is_complete(is_tp_path=is_tp_path),
+                        scattered,
+                    )
+                count, output = self.all_reduces()
+                self.assertEqual(count, 0 if scattered else 1)
+                torch.testing.assert_close(
+                    output, torch.full((2, 3), 1.0 if scattered else 2.0)
+                )
+
 
 class TestReplicatedMoeOutput(CustomTestCase):
     """A shared expert replicated with tp_size=1 holds its full output on every
@@ -153,6 +174,25 @@ class TestReplicatedMoeOutput(CustomTestCase):
             get_forward().scoped(mlp_reduce_scatter=True),
         ):
             self.assertTrue(should_add_replicated_moe_output())
+
+    def test_afd_shared_output_is_counted_once_per_token(self):
+        for backend, scattered in (("none", False), ("deepep", True)):
+            with (
+                self.subTest(ffn_backend=backend),
+                get_context().override_server_args(
+                    afd_role="attn", afd_ffn_moe_backend=backend
+                ),
+            ):
+                outputs = self.summed_over_two_ranks(
+                    flags={"mlp_reduce_scatter": True}, backend="afd"
+                )
+                if scattered:
+                    for rank, output in enumerate(outputs):
+                        torch.testing.assert_close(
+                            output, torch.full((2, 3), 11.0 + rank)
+                        )
+                else:
+                    torch.testing.assert_close(sum(outputs), torch.full((2, 3), 13.0))
 
 
 class TestModelsWithExplicitDpCompletion(CustomTestCase):
