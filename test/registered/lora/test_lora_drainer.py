@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from typing import cast
+from typing import Optional, cast
 from unittest import mock
 
 from sglang.srt.lora.lora_drainer import LoRADrainer
@@ -14,101 +14,134 @@ from sglang.test.lora_utils import (
 register_cuda_ci(est_time=59, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="extra-a-test-1-gpu-small-amd")
 
-MOCK_START_TIME = 1000.0
+NOW = 1000.0
 LORA_DRAIN_WAIT_THRESHOLD = 3.0
+STARVING_WAIT = LORA_DRAIN_WAIT_THRESHOLD + 1.0
 
 
-def make_req(lora_id, wait_queue_entry_time, max_new_tokens, output_len=0):
-    time_stats = SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time)
-    sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-    req_ns = SimpleNamespace(
+def make_req(
+    lora_id: Optional[str],
+    max_new_tokens: int = 10,
+    waited_secs: float = 0.0,
+    finished: bool = False,
+) -> Req:
+    """A stand-in for `Req` with only the fields the drainer reads."""
+    req = SimpleNamespace(
         lora_id=lora_id,
-        time_stats=time_stats,
-        sampling_params=sampling_params,
-        output_ids=[0] * output_len,
+        time_stats=SimpleNamespace(wait_queue_entry_time=NOW - waited_secs),
+        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+        output_ids=[],
+        finished=lambda: finished,
     )
-    return cast(Req, req_ns)
+    return cast(Req, req)
+
+
+def starving_req(lora_id: Optional[str]) -> Req:
+    return make_req(lora_id, waited_secs=STARVING_WAIT)
 
 
 class TestLoRADrainer(unittest.TestCase):
-    def test_update_draining_marks_adapter(self):
-        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
-            drainer = LoRADrainer(
-                max_loras_per_batch=1, max_wait_time_secs=LORA_DRAIN_WAIT_THRESHOLD
-            )
+    def setUp(self):
+        patcher = mock.patch("time.monotonic", return_value=NOW)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-            # Waiting request for adapter 'A' that has been waiting longer than threshold
-            wait_entry = MOCK_START_TIME - (LORA_DRAIN_WAIT_THRESHOLD + 0.01)
-            waiting_req = make_req("A", wait_entry, max_new_tokens=10)
+    def make_drainer(self, max_loras_per_batch: int) -> LoRADrainer:
+        return LoRADrainer(max_loras_per_batch, LORA_DRAIN_WAIT_THRESHOLD)
 
-            running_req = make_req("B", wait_entry, max_new_tokens=100, output_len=0)
+    def assert_draining(self, drainer: LoRADrainer, lora_id: str):
+        # Running requests in these tests need at most 100 tokens.
+        self.assertFalse(drainer.can_schedule(make_req(lora_id, max_new_tokens=1000)))
 
-            drainer.update_draining_state(
-                waiting_queue=[waiting_req],
-                running_reqs=[running_req],
-            )
+    def assert_not_draining(self, drainer: LoRADrainer, lora_id: str):
+        self.assertTrue(drainer.can_schedule(make_req(lora_id, max_new_tokens=1000)))
 
-            # Running adapter 'B' should be marked as draining for 'A'
-            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
+    def test_longest_waiting_adapter_drains_the_adapter_closest_to_done(self):
+        drainer = self.make_drainer(max_loras_per_batch=2)
+        waiting = [make_req("A", waited_secs=STARVING_WAIT + 1), starving_req("D")]
+        running = [make_req("B", max_new_tokens=5), make_req("C", max_new_tokens=100)]
+        drainer.update_draining_state(waiting, running)
 
-            # Once running adapter 'B' finishes running, it should no longer be draining
-            drainer.update_draining_state(waiting_queue=[waiting_req], running_reqs=[])
-            self.assertIsNone(drainer.adapter_to_stats["B"].is_draining_for)
+        # 'A' has waited longest, and 'B' will leave the batch first.
+        self.assertEqual(drainer.drained_adapter_to_drain["B"].starving_adapter, "A")
+        self.assertEqual(drainer.drained_adapter_to_drain["C"].starving_adapter, "D")
 
-        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
-            drainer = LoRADrainer(
-                max_loras_per_batch=2, max_wait_time_secs=LORA_DRAIN_WAIT_THRESHOLD
-            )
+    def test_drain_ends_when_the_drained_adapter_leaves_the_batch(self):
+        drainer = self.make_drainer(max_loras_per_batch=1)
+        waiting = [starving_req("A")]
+        drainer.update_draining_state(waiting, [make_req("B")])
+        self.assert_draining(drainer, "B")
 
-            # Two starving adapters should cause two running adapters to drain.
-            wait_entryA = MOCK_START_TIME - (LORA_DRAIN_WAIT_THRESHOLD + 0.05)
-            wait_entryD = MOCK_START_TIME - (LORA_DRAIN_WAIT_THRESHOLD + 0.01)
-            starving_a = make_req("A", wait_entryA, max_new_tokens=10)
-            starving_d = make_req("D", wait_entryD, max_new_tokens=10)
+        drainer.update_draining_state(waiting, [])
+        self.assert_not_draining(drainer, "B")
 
-            # Running adapters B and C with different remaining tokens
-            running_b = make_req("B", wait_entryA, max_new_tokens=5, output_len=0)
-            running_c = make_req("C", wait_entryA, max_new_tokens=100, output_len=0)
+    def test_drained_adapter_only_admits_requests_that_finish_with_it(self):
+        drainer = self.make_drainer(max_loras_per_batch=1)
+        running = [make_req("B", max_new_tokens=100)]
+        drainer.update_draining_state([starving_req("A")], running)
 
-            drainer.update_draining_state(
-                waiting_queue=[starving_a, starving_d],
-                running_reqs=[running_b, running_c],
-            )
+        # 'B' has 100 tokens left.
+        self.assertTrue(drainer.can_schedule(make_req("B", max_new_tokens=100)))
+        self.assertFalse(drainer.can_schedule(make_req("B", max_new_tokens=101)))
 
-            # B (smaller remaining tokens) should be drained for the most-starved adapter 'A'
-            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
+    def test_drained_adapter_admits_nothing_once_its_anchor_finishes(self):
+        """A drained adapter must stop admitting once its anchor stops early, at EOS."""
+        drainer = self.make_drainer(max_loras_per_batch=1)
+        waiting = [starving_req("A")]
+        anchor = make_req("B", max_new_tokens=100)
+        drainer.update_draining_state(waiting, [anchor])
 
-            # C should be drained for the other starving adapter 'D'
-            self.assertEqual(drainer.adapter_to_stats["C"].is_draining_for, "D")
+        # 'B' stays in the batch for a request admitted during the drain.
+        anchor.finished = lambda: True
+        admitted = make_req("B", max_new_tokens=50)
+        drainer.update_draining_state(waiting, [anchor, admitted])
+        self.assertFalse(drainer.can_schedule(make_req("B", max_new_tokens=1)))
 
-    def test_can_schedule_respects_draining_tolerance(self):
-        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
-            drainer = LoRADrainer(
-                max_loras_per_batch=1, max_wait_time_secs=LORA_DRAIN_WAIT_THRESHOLD
-            )
+    def test_drain_ends_once_the_starving_adapter_no_longer_needs_a_slot(self):
+        """A drain whose starving adapter needs no slot must stop rejecting requests."""
+        running_b = make_req("B", max_new_tokens=5)
+        running_c = make_req("C", max_new_tokens=100)
+        name_to_case = {
+            # 'C' left the batch on its own and 'A' took its slot.
+            "starving adapter got a slot": (
+                [starving_req("A")],
+                [make_req("A"), running_b],
+            ),
+            # 'A' has nothing waiting anymore, e.g. its requests were aborted.
+            "starving adapter has nothing waiting": ([], [running_b, running_c]),
+        }
+        for name, (waiting, running) in name_to_case.items():
+            with self.subTest(name):
+                drainer = self.make_drainer(max_loras_per_batch=2)
+                drainer.update_draining_state(
+                    [starving_req("A")], [running_b, running_c]
+                )
+                self.assert_draining(drainer, "B")
 
-            wait_entry = MOCK_START_TIME - (LORA_DRAIN_WAIT_THRESHOLD + 0.01)
-            starving_req = make_req("A", wait_entry, max_new_tokens=10)
+                drainer.update_draining_state(waiting, running)
+                self.assert_not_draining(drainer, "B")
 
-            running_b = make_req("B", wait_entry, max_new_tokens=15, output_len=0)
-            drainer.update_draining_state(
-                waiting_queue=[starving_req],
-                running_reqs=[running_b],
-            )
+    def test_adapter_in_the_batch_does_not_drain_others(self):
+        """An adapter in the batch must not drain others for its own waiting requests."""
+        drainer = self.make_drainer(max_loras_per_batch=2)
+        # If 'A' could drain others, it would drain 'B': 'B' has fewer tokens left.
+        running = [make_req("A", max_new_tokens=100), make_req("B")]
+        drainer.update_draining_state([starving_req("A")], running)
+        self.assert_not_draining(drainer, "B")
 
-            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
+    def test_base_model_can_trigger_a_drain(self):
+        """Starving base-model requests (lora_id None) must trigger a drain too."""
+        drainer = self.make_drainer(max_loras_per_batch=1)
+        drainer.update_draining_state([starving_req(None)], [make_req("B")])
+        self.assert_draining(drainer, "B")
 
-            # max_new_tokens is less than running adapter B's max_new_tokens
-            req_ok = make_req(
-                lora_id="B", wait_queue_entry_time=0, max_new_tokens=10, output_len=0
-            )
-            self.assertTrue(drainer.can_schedule(req_ok))
-
-            # max_new_tokens is more than running adapter B's max_new_tokens
-            req_bad = make_req(
-                lora_id="B", wait_queue_entry_time=0, max_new_tokens=20, output_len=0
-            )
-            self.assertFalse(drainer.can_schedule(req_bad))
+    def test_finished_requests_do_not_hold_a_slot(self):
+        """A finished request still in the batch must not keep its adapter's slot."""
+        drainer = self.make_drainer(max_loras_per_batch=2)
+        # If 'C' still held a slot, 'B' would be drained: it has fewer tokens left.
+        running = [make_req("B"), make_req("C", max_new_tokens=100, finished=True)]
+        drainer.update_draining_state([starving_req("A")], running)
+        self.assert_not_draining(drainer, "B")
 
     def test_batch_splitting_with_drainer(self):
         run_lora_batch_splitting_equivalence_test(
