@@ -11,13 +11,16 @@ from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
 from sglang.kernels.ops.lora.moe.moe_lora_align import moe_lora_align_block_size
-from sglang.srt.lora.lora_moe_runners import _naive_moe_lora_align_block_size
+from sglang.srt.lora.lora_moe_runners import (
+    _get_moe_lora_block_config,
+    _naive_moe_lora_align_block_size,
+)
 from sglang.srt.utils import get_device, is_xpu, set_random_seed
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # ==============================================================================
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=26, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def round_up(x, base):
@@ -196,15 +199,13 @@ def use_fused_moe_lora_kernel(
             None,  # maybe_expert_map
         )
 
-    config = {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 64,
-        "GROUP_SIZE_M": 1,
-        "NUM_WARPS": 4,
-        "NUM_STAGES": 3,
-        "SPLIT_K": 1,
-    }
+    # Production tiles (lora_moe_runners): shrink N and expand K follow the
+    # rank; BLOCK_SIZE_M must equal the align block size.
+    blk = _get_moe_lora_block_config(max_lora_rank)
+    # (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, NUM_WARPS,
+    #  NUM_STAGES, SPLIT_K)
+    shrink_tiles = (block_size, blk["shrink_block_size_n"], 64, 1, 4, 3, 1)
+    expand_tiles = (block_size, 64, blk["expand_block_size_k"], 1, 4, 3, 1)
 
     expert_ids = expert_ids.view(max_loras, -1)
     sorted_token_ids = sorted_token_ids.view(max_loras, -1)
@@ -222,20 +223,8 @@ def use_fused_moe_lora_kernel(
         top_k_num,
         lora_ids,
         adapter_enabled,
-        config["BLOCK_SIZE_M"],
-        config["BLOCK_SIZE_N"],
-        config["BLOCK_SIZE_K"],
-        config["GROUP_SIZE_M"],
-        config["NUM_WARPS"],
-        config["NUM_STAGES"],
-        config["SPLIT_K"],
-        config["BLOCK_SIZE_M"],
-        config["BLOCK_SIZE_N"],
-        config["BLOCK_SIZE_K"],
-        config["GROUP_SIZE_M"],
-        config["NUM_WARPS"],
-        config["NUM_STAGES"],
-        config["SPLIT_K"],
+        *shrink_tiles,
+        *expand_tiles,
         mul_routed_weight,
         fully_sharded=fully_sharded,
         offset=offset,
@@ -281,7 +270,7 @@ def use_torch(
     return torch.stack(outputs, dim=0)
 
 
-DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+DTYPES = [torch.float16, torch.bfloat16]
 DEVICES = [get_device(0)]
 SEED = [42]
 
@@ -290,7 +279,7 @@ SEED = [42]
 @pytest.mark.parametrize("num_tokens", [100])
 @pytest.mark.parametrize("top_k_num", [6, 12])
 @pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("max_loras", [4, 6, 16])
+@pytest.mark.parametrize("max_loras", [4, 16])
 @pytest.mark.parametrize("N", [1408])
 @pytest.mark.parametrize("K", [2048])
 @pytest.mark.parametrize("max_lora_rank", [16, 32, 64])

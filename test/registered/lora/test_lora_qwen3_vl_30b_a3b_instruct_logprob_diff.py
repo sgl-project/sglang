@@ -36,19 +36,17 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=110,
-    stage="base-c",
-    runner_config="4-gpu-h100",
+    stage="base-b",
+    runner_config="2-gpu-large",
 )
 
 BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
-TP_SIZE = 4
+TP_SIZE = 2
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True
-PREFILL_ATTENTION_BACKEND = "fa4"
-DECODE_ATTENTION_BACKEND = "fa4"
 
 KL_THRESHOLD = 5e-3
 
@@ -87,8 +85,6 @@ class TestLoRAQwen3VL_30B_A3B_Instruct_LogprobDiff(CustomTestCase):
             attention_backend="flashinfer",
             moe_runner_backend=MOE_RUNNER_BACKEND,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
-            prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
-            decode_attention_backend=DECODE_ATTENTION_BACKEND,
         )
 
         try:

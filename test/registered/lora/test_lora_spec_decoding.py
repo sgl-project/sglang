@@ -13,10 +13,9 @@ first. What this guards is what CI can hold stable:
 - the server starts at all with multiple adapters + speculation (it used to
   crash loading the target's adapters into the draft model);
 - adapters are actually applied during target-verify (adapter output differs
-  from base output);
-- a mixed-adapter batch, and a batch wider than the cuda-graph capture, are
-  served without error (the eager verify path used to crash on
-  extend_seq_lens_cpu=None);
+  from base output) in uniform batches, in a mixed-adapter batch, and in a
+  batch wider than the cuda-graph capture (the eager verify path used to
+  crash on extend_seq_lens_cpu=None);
 - speculation is really running (accept length above 1).
 """
 
@@ -48,6 +47,8 @@ ADAPTERS = [
     ("fact", "algoprog/fact-generation-llama-3.1-8b-instruct-lora"),
     ("guard", "nvidia/llama-3.1-nemoguard-8b-topic-control"),
 ]
+# Row kinds of a mixed batch: base first, then every adapter.
+ROUTES = [None] + [name for name, _ in ADAPTERS]
 SAMPLING = {"temperature": 0, "max_new_tokens": 32}
 
 
@@ -102,6 +103,25 @@ class TestEagle3MultiLoRA(CustomTestCase):
             self.assertTrue(item["text"].strip(), f"empty output in {results}")
         return [item["text"] for item in results]
 
+    def _generate_mixed(self, prompts):
+        """Serve every prompt under every route in one batch; outputs by route."""
+        texts = self._generate(
+            [p for p in prompts for _ in ROUTES],
+            [r for _ in prompts for r in ROUTES],
+        )
+        return {route: texts[i :: len(ROUTES)] for i, route in enumerate(ROUTES)}
+
+    def _assert_adapters_applied(self, by_route, where):
+        # The base rows come from the same batch, so a silently dropped
+        # adapter would reproduce them exactly.
+        for name, _ in ADAPTERS:
+            self.assertNotEqual(
+                by_route[name],
+                by_route[None],
+                f"adapter {name} matched the base model on every prompt of "
+                f"{where}; LoRA was likely not applied during target-verify",
+            )
+
     def test_adapters_are_applied_under_speculation(self):
         base = self._generate(PROMPTS, [None] * len(PROMPTS))
         for name, _ in ADAPTERS:
@@ -112,19 +132,13 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 f"adapter {name} matched the base model on every prompt; LoRA "
                 "was likely not applied during target-verify",
             )
-
-    def test_mixed_adapter_and_wide_batches_are_served(self):
-        routes = [None] + [name for name, _ in ADAPTERS]
-        self._generate(
-            [p for p in PROMPTS for _ in routes],
-            [r for _ in PROMPTS for r in routes],
-        )
+        self._assert_adapters_applied(self._generate_mixed(PROMPTS), "a mixed batch")
         # Wider than the default cuda-graph capture, so target-verify falls
         # back to the eager path.
         wide = 24
-        self._generate(
-            [PROMPTS[i % len(PROMPTS)] for i in range(wide)],
-            [routes[i % len(routes)] for i in range(wide)],
+        prompts = [PROMPTS[i % len(PROMPTS)] for i in range(wide // len(ROUTES))]
+        self._assert_adapters_applied(
+            self._generate_mixed(prompts), f"a {wide}-request eager batch"
         )
 
     def test_speculation_is_active(self):

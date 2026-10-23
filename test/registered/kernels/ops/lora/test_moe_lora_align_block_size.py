@@ -11,7 +11,11 @@ import torch
 from sglang.kernels.ops.lora.moe.moe_lora_align import moe_lora_align_block_size
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# test_fused_moe_lora_kernel.py runs this align kernel against a torch reference
+# per PR; this wider matrix is opt-in.
+register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-large")
+# backend-specific: the HIP JIT build of moe_lora_align_kernel.cu and its
+# wave64 per-warp expert counters.
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
@@ -60,10 +64,10 @@ def sample_data(num_experts, max_loras, num_tokens, topk_num):
     return (topk_ids.to("cuda"), seg_indptr.to("cuda"), req_to_lora.to("cuda"))
 
 
-@pytest.mark.parametrize("num_tokens", [100, 200, 1024, 4096])
+@pytest.mark.parametrize("num_tokens", [200, 4096])
 @pytest.mark.parametrize("topk_num", [6])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 512])
-@pytest.mark.parametrize("max_loras", [2, 32])
+@pytest.mark.parametrize("num_experts", [64, 512])
+@pytest.mark.parametrize("max_loras", [32])
 @pytest.mark.parametrize("block_size", [16])
 def test_moe_lora_align_block_size(
     num_tokens, topk_num, num_experts, max_loras, block_size

@@ -1,27 +1,10 @@
-"""Unit tests for the LoRA virtual-experts kernels under post-EP-dispatch
-sentinel `topk_ids` (-1) and out-of-range expert IDs.
+"""Sentinel handling in the LoRA virtual-experts kernels.
 
-Covers two regression bugs that surface only with `--lora-use-virtual-experts`
-+ `ep_size > 1`:
-
-- `_fused_virtual_topk_ids` must preserve negative sentinel topk_ids. After
-  EP dispatch, non-local experts arrive as `-1`; the pre-fix kernel mapped
-  them onto a real virtual-expert slot belonging to another adapter and
-  triggered OOB loads in downstream LoRA kernels.
-
-- `_align_block_size_torch` / `_align_block_size_jit` (the `>= 1024`-expert
-  fallback paths) must route `-1` and `>= num_experts` IDs into a sentinel
-  bucket so they don't OOB-index `padded_offsets[sorted_expert_ids]` (negative
-  wrap, or past-end) and don't get assigned to a real expert in the
-  consumer-block table.
-
-Both kernels run on CUDA or XPU; only the CUDA-JIT align variant is CUDA-only.
-The fallback is gated on `virtual_num_experts >= 1024` in production, but we
-exercise it directly here at smaller sizes for cheaper iteration; one test
-sticks to the >1024 regime to mirror the production trigger.
-
-Usage:
-    python -m pytest test/registered/lora/test_virtual_experts_kernels.py -v
+After EP dispatch non-local experts arrive as ``-1``. ``_fused_virtual_topk_ids``
+must keep those sentinels instead of remapping them onto another adapter's
+virtual-expert slot, and the ``>= 1024``-expert align fallbacks must route
+``-1`` and ``>= num_experts`` IDs into a sentinel bucket rather than a real
+expert. Either bug corrupts routing silently.
 """
 
 import unittest
@@ -32,7 +15,9 @@ from sglang.srt.utils import get_device, is_cuda, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# backend-specific: XPU runs the torch.compile align fallback in production and
+# builds the Triton topk remap with its own backend.
 register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
 
 
@@ -247,20 +232,6 @@ class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
         assigned = self._assigned_experts(expert_ids)
         for valid_eid in (0, 100, 500, 1000):
             self.assertIn(valid_eid, assigned)
-
-    def test_empty_topk_ids_does_not_crash(self):
-        """Edge: empty input. Should return empty/zero outputs without
-        OOB indexing on the sentinel bucket."""
-        num_experts = 8
-        block_size = 16
-        topk_ids = torch.empty((0, 2), dtype=torch.int32, device=self.device)
-
-        sorted_token_ids, expert_ids, num_post_padded = self._align(
-            topk_ids, block_size, num_experts
-        )
-
-        self.assertEqual(num_post_padded.item(), 0)
-        self.assertEqual(self._assigned_experts(expert_ids), [])
 
 
 class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):

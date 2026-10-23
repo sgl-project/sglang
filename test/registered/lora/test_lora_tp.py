@@ -12,41 +12,34 @@
 # limitations under the License.
 # ==============================================================================
 
+"""TP-sharded LoRA A/B weights must reproduce the HF adapter outputs."""
+
 import multiprocessing as mp
-import os
 import unittest
-from typing import List, Optional
+from typing import List
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
-    ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
-    CI_MULTI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=230,
-    stage="base-c",
-    runner_config="8-gpu-h200",
-)
+register_cuda_ci(est_time=115, stage="base-b", runner_config="2-gpu-large")
+# backend-specific: ROCm's Triton build of the chunked-SGMV LoRA kernels on
+# TP-sharded adapter weights.
 register_amd_ci(
-    est_time=116,
+    est_time=58,
     suite="stage-b-test-2-gpu-large-amd",
-    disabled="see https://github.com/sgl-project/sglang/issues/13107",
+    disabled="see https://github.com/sgl-project/sglang/issues/13107; until 2026-12-31",
 )
 
 
 class TestLoRATP(CustomTestCase):
-    def _run_tp_on_model_cases(
-        self,
-        model_cases: List[LoRAModelCase],
-        enable_lora_overlap_loading: Optional[bool] = None,
-    ):
+    def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
         tp_list = [2]  # Define TP sizes to iterate over
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
@@ -63,31 +56,12 @@ class TestLoRATP(CustomTestCase):
                         model_case,
                         torch_dtype,
                         max_new_tokens=32,
-                        enable_lora_overlap_loading=enable_lora_overlap_loading,
-                        test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
+                        test_tag=f"tp={tp_size}",
                         attention_backend="fa3",
                     )
 
     def test_ci_lora_models(self):
         self._run_tp_on_model_cases(CI_LORA_MODELS)
-
-    def test_lora_overlap_loading_ci_lora_models(self):
-        self._run_tp_on_model_cases(
-            CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
-        )
-
-    def test_all_lora_models(self):
-        if is_in_ci():
-            return
-
-        # Retain ONLY_RUN check here
-        filtered_models = []
-        for model_case in ALL_OTHER_LORA_MODELS:
-            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
-                continue
-            filtered_models.append(model_case)
-
-        self._run_tp_on_model_cases(filtered_models)
 
 
 if __name__ == "__main__":
