@@ -219,6 +219,9 @@ class EngineTransport:
 
         await self.engine.tokenizer_manager.start_profile(ProfileReq(**body))
 
+    async def stop_profile(self):
+        await self.engine.tokenizer_manager.stop_profile()
+
     def server_info(self):
         return self.engine.get_server_info()
 
@@ -270,6 +273,10 @@ class HttpTransport:
         async with self.post("/start_profile", body) as resp:
             resp.raise_for_status()
 
+    async def stop_profile(self):
+        async with self.post("/stop_profile", {}) as resp:
+            resp.raise_for_status()
+
     def server_info(self):
         with urlopen(self.url + "/server_info", timeout=self.timeout) as response:
             return json.load(response)
@@ -319,7 +326,18 @@ def environment():
     )
 
 
-async def batch(args, tp, prompt, n_each, params, done, what, *, check_prefix=False):
+async def batch(
+    args,
+    tp,
+    prompt,
+    n_each,
+    params,
+    done,
+    what,
+    *,
+    check_prefix=False,
+    on_complete=None,
+):
     """n_each requests per rank, submitted round-robin over the ranks so none starts
     ahead, about eight steps' worth in flight on each."""
     in_flight = max(1, args.tokens_per_step // args.new_tokens) * 8 + 1
@@ -331,6 +349,8 @@ async def batch(args, tp, prompt, n_each, params, done, what, *, check_prefix=Fa
             if check_prefix:
                 check_cache(meta, args.new_tokens)
             done.append((t, meta.get("prefill_finished_time"), new, r))
+            if on_complete is not None:
+                await on_complete(r)
 
     async def one(r):
         async with limits[r]:
@@ -360,6 +380,79 @@ async def batch(args, tp, prompt, n_each, params, done, what, *, check_prefix=Fa
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def profile_prefill(args, tp, prompt, params):
+    """Profile a separate, continuously fed burst after every rank warms up."""
+    per_step = max(1, args.tokens_per_step // args.new_tokens)
+    warmup = max(
+        per_step, math.ceil(args.requests * args.lo), args.warmup_steps * per_step
+    )
+    reserve = (args.profile_steps + 4) * per_step
+    if warmup + reserve > args.requests:
+        raise SystemExit(
+            f"profile needs {warmup} warmup + {reserve} remaining requests per rank; "
+            "raise --requests or lower --lo/--profile-steps"
+        )
+    completed, done = [0] * args.dp, []
+    record = dict(
+        requests_per_rank=args.requests,
+        warmup_completions_per_rank=warmup,
+        required_remaining_per_rank=reserve,
+        requested_steps=args.profile_steps,
+    )
+
+    def check_remaining():
+        remaining = [args.requests - n for n in completed]
+        if min(remaining) < reserve:
+            raise RuntimeError(
+                f"profile burst is draining: remaining per rank {remaining}, "
+                f"need at least {reserve}; raise --requests"
+            )
+
+    async def on_complete(rank):
+        completed[rank] += 1  # Count responses, not tasks waiting for the profile ACK.
+        if "trigger_wall" in record or min(completed) < warmup:
+            return
+        check_remaining()
+        record.update(trigger_wall=time.time(), trigger_completions=completed.copy())
+        print(f"profile: triggering at per-rank completions {completed}", flush=True)
+        # Only this request awaits the ACK; all peers keep the normal batch's
+        # semaphore-limited supply. Its request timeout also bounds this await.
+        await tp.start_profile(args.profile)
+        record.update(ack_wall=time.time(), ack_completions=completed.copy())
+        check_remaining()
+
+    try:
+        await batch(
+            args,
+            tp,
+            prompt,
+            args.requests,
+            params,
+            done,
+            "profile",
+            check_prefix=True,
+            on_complete=on_complete,
+        )
+        if "ack_wall" not in record:
+            raise RuntimeError("profile did not start after all ranks warmed up")
+    except BaseException:
+        # batch has already cancelled and joined all request/callback tasks.
+        # A failed or cancelled start may still have reached the engine.
+        if "trigger_wall" in record:
+            try:
+                await asyncio.wait_for(tp.stop_profile(), timeout=args.timeout)
+            except Exception as exc:
+                print(f"profile cleanup failed: {exc!r}", file=sys.stderr)
+        raise
+    record.update(burst_end_wall=time.time(), final_completions=completed.copy())
+    # These are client control/request bounds. Exact captured GPU steps and
+    # their batch sizes must come from the trace, not completion counters.
+    record["range_source"] = (
+        "client trigger/ack and burst completion; inspect trace for captured steps"
+    )
+    return record
 
 
 async def prefill(args, tp, prompt):
@@ -412,11 +505,11 @@ async def prefill(args, tp, prompt):
     steps, tokens = rank_steps[0], sum(per_rank)
     t0 = statistics.mean(a for a, _ in spans)
     t1 = statistics.mean(b for _, b in spans)
-    if args.profile_steps:
-        await tp.start_profile(args.profile)
-        n_profile = (args.profile_steps + 4) * per_step
-        await batch(args, tp, prompt, n_profile, params, [], "profile")
+    profile = (
+        await profile_prefill(args, tp, prompt, params) if args.profile_steps else None
+    )
     return dict(
+        **({"profile": profile} if profile is not None else {}),
         steps=steps,
         seconds=t1 - t0,
         tokens=tokens,

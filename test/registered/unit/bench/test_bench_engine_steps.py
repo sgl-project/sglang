@@ -416,5 +416,173 @@ class TestWorkloadGuards(unittest.TestCase):
         self.assertEqual(result["tokens"], 5)
 
 
+class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
+    def args(self, **changes):
+        values = dict(
+            tokens_per_step=2,
+            new_tokens=1,
+            dp=2,
+            timeout=2,
+            requests=400,
+            lo=0.2,
+            hi=0.9,
+            warmup_steps=1,
+            profile_steps=2,
+            profile=dict(num_steps=2),
+        )
+        return SimpleNamespace(**(values | changes))
+
+    def transport(self, args):
+        class Transport:
+            def __init__(self):
+                self.completed = [0] * args.dp
+                self.active = 0
+                self.calls = 0
+                self.stops = 0
+                self.ack_started = asyncio.Event()
+                self.delay_ack = False
+                self.fail_peer = False
+                self.fail_start = False
+
+            async def generate(self, ids, params, rank, stream):
+                self.active += 1
+                try:
+                    await asyncio.sleep(0)  # deterministic event-loop interleaving
+                    if self.fail_peer and self.ack_started.is_set() and rank == 0:
+                        raise ValueError("peer failed")
+                    self.completed[rank] += 1
+                    stamp = 1000 + self.completed[rank] // 2 * 0.1
+                    yield (
+                        stamp,
+                        dict(
+                            prompt_tokens=2,
+                            cached_tokens=1,
+                            prefill_finished_time=stamp,
+                        ),
+                    )
+                finally:
+                    self.active -= 1
+
+            async def start_profile(self, body):
+                self.calls += 1
+                self.at_trigger = self.completed.copy()
+                self.ack_started.set()
+                if self.fail_start:
+                    raise ValueError("profile start failed")
+                if self.delay_ack:
+                    await asyncio.Event().wait()
+                await asyncio.sleep(0)
+                self.at_ack = self.completed.copy()
+
+            async def stop_profile(self):
+                self.stops += 1
+
+        return Transport()
+
+    async def test_continuous_supply_and_all_rank_threshold(self):
+        args = self.args()
+        tp = self.transport(args)
+        generate = tp.generate
+        slow_rank_gate = asyncio.Event()
+
+        async def unequal(ids, params, rank, stream):
+            if rank == 1:
+                await slow_rank_gate.wait()
+            async for item in generate(ids, params, rank, stream):
+                if tp.completed[0] >= 100:
+                    slow_rank_gate.set()
+                yield item
+
+        tp.generate = unequal
+        record = await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.calls, 1)
+        self.assertGreaterEqual(min(tp.at_trigger), 80)
+        self.assertGreater(tp.at_trigger[0], tp.at_trigger[1])
+        # The trigger is beyond the entire in-flight limit (17/rank), proving
+        # the producer replenished it rather than waiting for a drained burst.
+        self.assertGreater(min(tp.at_trigger), 17)
+        self.assertGreater(sum(tp.at_ack), sum(tp.at_trigger))
+        self.assertEqual(record["final_completions"], [400, 400])
+        self.assertEqual(tp.active, 0)
+
+    async def test_insufficient_budget_fails_before_sending(self):
+        args = self.args(lo=0.99)
+        tp = self.transport(args)
+        with self.assertRaisesRegex(SystemExit, "profile needs"):
+            await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.completed, [0, 0])
+        self.assertEqual(tp.calls, 0)
+
+    async def test_peer_failure_cancels_callback_waiting_for_ack(self):
+        args = self.args()
+        tp = self.transport(args)
+        tp.fail_peer = tp.delay_ack = True
+        with self.assertRaisesRegex(ValueError, "peer failed"):
+            await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.active, 0)
+        self.assertEqual(tp.stops, 1)
+        self.assertFalse(
+            [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        )
+
+    async def test_profile_ack_timeout_cleans_up(self):
+        args = self.args(timeout=0.03)
+        tp = self.transport(args)
+        tp.delay_ack = True
+        with self.assertRaises(asyncio.TimeoutError):
+            await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.active, 0)
+        self.assertEqual(tp.stops, 1)
+
+    async def test_profile_start_failure_cleans_up(self):
+        args = self.args()
+        tp = self.transport(args)
+        tp.fail_start = True
+        with self.assertRaisesRegex(ValueError, "profile start failed"):
+            await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.active, 0)
+        self.assertEqual(tp.stops, 1)
+
+    async def test_profile_does_not_change_timed_result(self):
+        plain_args = self.args(profile_steps=0)
+        plain = await bench.prefill(
+            plain_args, self.transport(plain_args), lambda r: []
+        )
+        prof_args = self.args()
+        prof = await bench.prefill(prof_args, self.transport(prof_args), lambda r: [])
+        profile_record = prof.pop("profile")
+        self.assertEqual(prof, plain)
+        self.assertEqual(profile_record["final_completions"], [400, 400])
+
+    async def test_delayed_ack_cannot_silently_profile_the_drain(self):
+        args = self.args()
+        tp = self.transport(args)
+        start = tp.start_profile
+
+        async def late_ack(body):
+            await start(body)
+            # Keep serving during the ACK, but exhaust the reserve on one rank.
+            while min(tp.completed) < args.requests - 1:
+                await asyncio.sleep(0)
+
+        tp.start_profile = late_ack
+        with self.assertRaisesRegex(RuntimeError, "profile burst is draining"):
+            await bench.profile_prefill(args, tp, lambda r: [], {})
+        self.assertEqual(tp.active, 0)
+        self.assertEqual(tp.stops, 1)
+
+    async def test_external_cancellation_joins_requests_and_stops_profile(self):
+        args = self.args()
+        tp = self.transport(args)
+        tp.delay_ack = True
+        task = asyncio.create_task(bench.profile_prefill(args, tp, lambda r: [], {}))
+        await tp.ack_started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(tp.active, 0)
+        self.assertEqual(tp.stops, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
