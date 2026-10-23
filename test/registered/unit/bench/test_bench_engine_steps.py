@@ -288,6 +288,48 @@ class TestWorkloadGuards(unittest.TestCase):
         self.assertAlmostEqual(result["ms_per_step"], 100.0)
         self.assertEqual(result["new_tokens_per_step"], 4)
 
+    def test_prefill_steps_with_offset_ranks(self):
+        # Two ranks step every 100 ms, rank 1 45 ms behind rank 0: a step must not
+        # split into one group per rank.
+        class Transport:
+            def __init__(self):
+                self.count = [0, 0]
+
+            def server_info(self):
+                return dict(tp_size=1, dp_size=2)
+
+            def flush_cache(self):
+                return None
+
+            async def generate(self, ids, params, rank, stream):
+                self.count[rank] += 1
+                stamp = 1000 + (self.count[rank] // 2) * 0.1 + 0.045 * rank
+                yield (
+                    stamp,
+                    dict(prompt_tokens=9, cached_tokens=7, prefill_finished_time=stamp),
+                )
+
+            def run(self, coro):
+                return asyncio.run(coro)
+
+            def finish(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = ["bench", "prefill", "--dp", "2", "--base-url", "http://localhost"]
+            argv += ["--context", "9", "--new-tokens", "2", "--tokens-per-step", "4"]
+            argv += ["--requests", "80", "--warmup-steps", "1", "--out", str(output)]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(bench, "HttpTransport", return_value=Transport()),
+                patch.object(bench, "environment", return_value={}),
+            ):
+                bench.main()
+            result = json.loads(output.read_text())["result"]
+        self.assertAlmostEqual(result["ms_per_step"], 100.0)
+        self.assertEqual(result["new_tokens_per_step"], 4)
+
     def test_prefill_record_uses_server_gpu_count(self):
         class Transport:
             def __init__(self):

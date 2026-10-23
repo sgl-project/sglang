@@ -374,26 +374,44 @@ async def prefill(args, tp, prompt):
     )
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
-    groups = step_groups(times, per_step * args.dp)
-    t0, t1, _, group_ms = group_window(groups, args.lo, args.hi)
-    per_rank = [0] * args.dp
-    for t, (_, _, n, r) in zip(times, done):
-        per_rank[r] += n if t0 < t <= t1 else 0
+    # The window comes from all completions; steps from each rank's own ends, since
+    # one rank's ends can trail another's and split a step shared across ranks.
+    T0, T1, _, _ = group_window(
+        step_groups(times, per_step * args.dp), args.lo, args.hi
+    )
+    spans, rank_steps, per_rank, group_ms = [], [], [], []
+    for r in range(args.dp):
+        mine = [(t, n) for t, (_, _, n, rr) in zip(times, done) if rr == r]
+        groups = step_groups([t for t, _ in mine], per_step)
+        all_ends = [end for end, _ in groups]
+        if r == 0:  # rank 0's ends inside the window anchor every rank's window
+            inside = [end for end in all_ends if T0 <= end <= T1]
+            if len(inside) < 4:
+                raise SystemExit("the window holds under three steps; raise --requests")
+            anchors = inside[0], inside[-1]
+        a, b = (min(all_ends, key=lambda end: abs(end - x)) for x in anchors)
+        ends = [end for end in all_ends if a <= end <= b]
+        counts = [c for end, c in groups if a < end <= b]
+        if min(counts) < 0.8 * statistics.median(counts):  # a short step
+            raise SystemExit(
+                f"rank {r} steps finished {min(counts)} to {max(counts)} requests: "
+                "the queue ran dry"
+            )
+        spans.append((a, b))
+        rank_steps.append(len(ends) - 1)
+        per_rank.append(sum(n for t, n in mine if a < t <= b))
+        group_ms += [(y - x) * 1000 for x, y in zip(ends, ends[1:])]
+    if len(set(rank_steps)) > 1:
+        raise SystemExit(f"ranks ran unequal steps in the window: {rank_steps}")
     # Requests count at completion, so window edges can shift a few between ranks;
     # a rank short by a whole step's budget missed steps.
     if max(per_rank) - min(per_rank) > B:
         raise SystemExit(f"ranks served unequal tokens in the window: {per_rank}")
-    tokens = sum(per_rank)
     # Count steps, not tokens / B: replayed tokens (e.g. the encoder's SWA window)
     # share the step budget, so a full step can carry fewer than B new tokens.
-    steps = len(group_ms)
-    if steps < 3:
-        raise SystemExit("the window holds under three steps; raise --requests")
-    counts = [c for end, c in groups if t0 < end <= t1]
-    if min(counts) < 0.8 * statistics.median(counts):  # a short step
-        raise SystemExit(
-            f"steps finished {min(counts)} to {max(counts)} requests: the queue ran dry"
-        )
+    steps, tokens = rank_steps[0], sum(per_rank)
+    t0 = statistics.mean(a for a, _ in spans)
+    t1 = statistics.mean(b for _, b in spans)
     if args.profile_steps:
         await tp.start_profile(args.profile)
         n_profile = (args.profile_steps + 4) * per_step
