@@ -1724,6 +1724,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Actual newly admitted prompt cache tokens; None means unsupported/unknown.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1814,6 +1817,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Actual newly admitted prompt cache tokens; None means unsupported/unknown.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

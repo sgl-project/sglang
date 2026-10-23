@@ -2581,6 +2581,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
                     )
+                # Unknown accounting must not look like a measured zero.
+                cache_write_tokens = recv_obj.cache_write_tokens
+                if cache_write_tokens is not None and cache_write_tokens[i] is not None:
+                    meta_info["cache_write_tokens"] = cache_write_tokens[i]
                 # Add detailed cache breakdown if available
                 if (
                     hasattr(recv_obj, "cached_tokens_details")

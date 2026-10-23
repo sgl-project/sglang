@@ -347,6 +347,7 @@ class _GenerationStreamAccumulator:
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     cached_tokens: list = field(default_factory=list)
+    cache_write_tokens: list = field(default_factory=list)
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
@@ -474,6 +475,7 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.cached_tokens.append(req.cached_tokens)
+        self.cache_write_tokens.append(getattr(req, "cache_write_tokens", None))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -720,6 +722,7 @@ class _GenerationStreamAccumulator:
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
+            cache_write_tokens=self.cache_write_tokens,
             cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
