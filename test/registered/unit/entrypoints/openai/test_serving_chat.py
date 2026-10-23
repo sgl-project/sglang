@@ -3203,6 +3203,55 @@ class ServingChatTestCase(CustomTestCase):
         self.assertNotIn("r2", next_turn)
         self.assertTrue(next_turn.endswith("q3<｜Assistant｜><think>"))
 
+    def test_dsv41_system_only_conversation_opens_assistant_turn(self):
+        """A conversation with only a system message still ends in a generation prompt."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        system = [{"role": "system", "content": "Write a haiku about rain."}]
+        for thinking_mode, opener in (("thinking", "<think>"), ("chat", "</think>")):
+            with self.subTest(thinking_mode=thinking_mode):
+                prompt = encoding_dsv41.encode_messages(
+                    system, thinking_mode=thinking_mode
+                )
+                self.assertTrue(
+                    prompt.endswith("Write a haiku about rain.<｜Assistant｜>" + opener)
+                )
+                self.assertEqual(prompt.count("<｜Assistant｜>"), 1)
+
+        # A user message holding only tool results is not a user turn, so the
+        # system message also opens the turn before a first tool call.
+        tool_turn = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "value"},
+        ]
+        for thinking_mode, opener in (("thinking", "<think>"), ("chat", "</think>")):
+            with self.subTest(thinking_mode=thinking_mode, first_turn="tool_call"):
+                prompt = encoding_dsv41.encode_messages(
+                    system + tool_turn, thinking_mode=thinking_mode
+                )
+                self.assertIn(
+                    "Write a haiku about rain.<｜Assistant｜>" + opener, prompt
+                )
+
+        # A leading system message before a user turn renders as before.
+        prompt = encoding_dsv41.encode_messages(
+            system + [{"role": "user", "content": "go"}], thinking_mode="chat"
+        )
+        self.assertEqual(
+            prompt,
+            "<｜begin▁of▁sentence｜><｜System｜>Write a haiku about rain."
+            "<｜User｜>go<｜Assistant｜></think>",
+        )
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"

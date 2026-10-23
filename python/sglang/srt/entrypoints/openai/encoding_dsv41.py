@@ -410,7 +410,8 @@ def render_message(
             prompt += task_sp_token
 
     elif messages[index].get("role") in ["user", "developer"] or (
-        messages[index].get("role") == "system" and index > 0
+        # A leading system message opens the turn only when nothing else will.
+        messages[index].get("role") == "system" and (index > 0 or last_user_idx == -1)
     ):
         # Normal generation: append Assistant + thinking token
         prompt += ASSISTANT_SP_TOKEN
