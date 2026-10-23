@@ -9,7 +9,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestGlm47SchemaTypes(unittest.TestCase):
-    def check_arguments(self, schema, expected, raw_values=None):
+    def check_arguments(self, schema, expected, raw_values=None, name="inspect"):
         tools = [
             Tool(type="function", function=Function(name="inspect", parameters=schema))
         ]
@@ -19,7 +19,12 @@ class TestGlm47SchemaTypes(unittest.TestCase):
                 key, value if isinstance(value, str) else json.dumps(value)
             )
             pairs.append(f"<arg_key>{key}</arg_key><arg_value>{raw}</arg_value>")
-        text = "<tool_call>inspect" + "".join(pairs) + "</tool_call>"
+        text = (
+            Glm47MoeDetector().bot_token
+            + name
+            + "".join(pairs)
+            + Glm47MoeDetector().eot_token
+        )
         for size in (0, 1, 7, len(text)):
             with self.subTest(schema=schema, expected=expected, chunk_size=size):
                 detector = Glm47MoeDetector()
@@ -37,6 +42,20 @@ class TestGlm47SchemaTypes(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 for key in expected:
                     self.assertIs(type(actual[key]), type(expected[key]))
+
+    def test_function_name_followed_by_newline(self):
+        """The non-streaming path strips the function name like streaming.
+
+        Regression for issue #45953: with the name left unstripped, a model
+        writing a newline after the name made parse_base_json reject the call
+        as an undefined tool and silently drop it (no tool_calls, empty
+        content), while the streaming path accepted the same output.
+        """
+        self.check_arguments(
+            {"properties": {"value": {"type": "string"}}},
+            {"value": "Paris"},
+            name="inspect\n",
+        )
 
     def test_field_types(self):
         cases = [

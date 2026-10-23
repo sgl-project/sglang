@@ -385,7 +385,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_name = func_detail.group(1).strip() if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
