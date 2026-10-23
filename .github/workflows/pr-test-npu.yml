@@ -639,6 +639,10 @@ jobs:
       only_tests_base_c_test_perf_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_perf_2_npu_a3 }}
       should_run_base_c_test_perf_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_perf_16_npu_a3 }}
       only_tests_base_c_test_perf_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_perf_16_npu_a3 }}
+      should_run_multimodal_gen_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_multimodal_gen_test_1_npu_a3 }}
+      only_tests_multimodal_gen_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_multimodal_gen_test_1_npu_a3 }}
+      should_run_multimodal_gen_test_4_npu_a3: ${{ steps.bucket-tests.outputs.should_run_multimodal_gen_test_4_npu_a3 }}
+      only_tests_multimodal_gen_test_4_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_multimodal_gen_test_4_npu_a3 }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -654,10 +658,13 @@ jobs:
         with:
           # test/registered + python/sglang/test/ci are needed by
           # list_tests.py to enumerate each suite's test files for bucketing.
+          # The diffusion case config is read (AST only) by
+          # bucket_recommended_tests.py to enumerate multimodal cases.
           sparse-checkout: |
             scripts
             test/registered
             python/sglang/test/ci
+            python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py
           sparse-checkout-cone-mode: false
 
       - name: Download test case map
@@ -731,6 +738,8 @@ jobs:
             --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
             --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
+            --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
+            --case-map "$PWD/test_case_map.json" \
             --precision-mode "${PRECISION_MODE}" \
             --github-output "${GITHUB_OUTPUT}" \
             --github-summary "${GITHUB_STEP_SUMMARY:-}" \
