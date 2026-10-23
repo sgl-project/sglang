@@ -723,12 +723,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
 
-    def test_sparse_prefill_workspace_reuses_and_grows(self):
+    def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-            SparsePrefillWorkspace,
+            SparsePrefillKVBuffer,
         )
 
-        workspace = SparsePrefillWorkspace(torch.device("cpu"))
+        workspace = SparsePrefillKVBuffer(torch.device("cpu"))
         first = workspace.get(3)
         reused = workspace.get(2)
         grown = workspace.get(7)
