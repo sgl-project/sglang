@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention import flash_mla_interface
+from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     dequantize_k_cache_v41,
@@ -203,7 +204,9 @@ class TestFlashMLAV41(CustomTestCase):
                 c.decode(meta)
                 self.assertEqual(
                     meta.tile_scheduler_metadata is not None,
-                    _flashmla_v41_splits_kv(c.indices, c.extra_indices),
+                    _flashmla_v41_splits_kv(
+                        c.indices, c.extra_indices, SPLIT_KV_MIN_TOPK
+                    ),
                 )
 
     def test_schedule_is_shared_across_layers(self):
