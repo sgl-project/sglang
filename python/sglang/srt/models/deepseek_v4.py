@@ -863,17 +863,10 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
 
 
 def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
-    # Without the in-graph low-ratio path (SM90) the source compressor reads
-    # per-request rows on the host, so it runs as an eager break over live rows.
+    # Like the sources above: the compressor syncs with the host.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    backend = get_attn_backend()
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
-    if real_num_tokens == 0:
-        # Nothing to write, but mark the source layer as write_tail_source_kv does,
-        # so its own pass inside the tail still skips the compressor.
-        backend.tail_source_kv_layer_id = layer.layer_id
-        return
-    backend.write_tail_source_kv(
+    get_attn_backend().write_tail_source_kv(
         layer=layer,
         x=x[:real_num_tokens],
         positions=positions[:real_num_tokens],

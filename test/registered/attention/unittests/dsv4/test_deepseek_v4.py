@@ -955,8 +955,18 @@ class TestDSV4WriteTailSourceKvBreak(CustomTestCase):
         self.assertIs(kwargs["forward_batch"], forward_batch)
 
     def test_no_live_rows_marks_source_layer_without_writing(self):
-        backend, _, _, _ = self._run(real_num_tokens=0)
-        backend.write_tail_source_kv.assert_not_called()
+        from sglang.srt.layers.attention import deepseek_v4_backend as mod
+
+        backend = object.__new__(mod.DeepseekV4AttnBackend)
+        backend.tail_source_kv_layer_id = None
+        backend.forward_low_ratio_sources = mock.Mock()
+        backend.write_tail_source_kv(
+            layer=SimpleNamespace(layer_id=21),
+            x=torch.zeros(0, 4),
+            positions=torch.zeros(0, dtype=torch.int64),
+            forward_batch=SimpleNamespace(),
+        )
+        backend.forward_low_ratio_sources.assert_not_called()
         self.assertEqual(backend.tail_source_kv_layer_id, 21)
 
 
