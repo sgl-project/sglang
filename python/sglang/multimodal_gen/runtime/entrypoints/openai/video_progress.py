@@ -90,7 +90,7 @@ async def run_progress_listener(endpoint: str) -> None:
                 )
                 if result is not None:
                     await apply_progress(job_id=result[0], progress=result[1])
-            except (TypeError, ValueError) as e:
+            except (TypeError, ValueError, OverflowError) as e:
                 logger.warning("Failed to apply progress update: %s", e)
     finally:
         context.destroy(linger=0)

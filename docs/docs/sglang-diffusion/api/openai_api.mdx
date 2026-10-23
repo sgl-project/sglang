@@ -377,6 +377,11 @@ support single-node, monolithic serving; other deployments may remain `queued`
 at 0 until completion. Job metadata is process-local and does not survive an
 HTTP server restart.
 
+An accepted job continues after the submitting client disconnects. For a bounded
+scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
+and generation. A timeout marks the job failed but does not cancel GPU work.
+Retrying creates another job, so clients should retain and poll the returned ID.
+
 **Python Example:**
 
 ```python Python

@@ -335,6 +335,7 @@ def test_apply_progress_only_moves_running_jobs(monkeypatch):
         b'["job", true, 10]',
         b'["job", NaN, 10]',
         b'["job", 5, Infinity]',
+        pytest.param(b'["job", 0.5, 1' + b"0" * 400 + b"]", id="overflow"),
         b'["job", 5]',
         b"\xff",
     ],
