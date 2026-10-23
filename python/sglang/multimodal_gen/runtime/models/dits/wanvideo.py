@@ -45,6 +45,8 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
+    apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -610,6 +612,46 @@ class WanTransformerBlock(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        # [3 * dim, dim] weight / [3 * dim] bias whose row blocks back to_q, to_k, to_v
+        self.qkv_weight: torch.Tensor | None = None
+        self.qkv_bias: torch.Tensor | None = None
+
+    def fuse_qkv_weights(self) -> None:
+        """Back to_q / to_k / to_v with one weight and one bias, so a single GEMM
+        projects all three while each layer keeps a view of its own rows"""
+        layers = (self.to_q, self.to_k, self.to_v)
+        if not all(
+            type(layer) is ColumnParallelLinear
+            and isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is not None
+            and not layer.skip_bias_add
+            and not layer.gather_output
+            for layer in layers
+        ):
+            return
+        with torch.no_grad():
+            weight = torch.cat([layer.weight for layer in layers])
+            bias = torch.cat([layer.bias for layer in layers])
+        rows = self.to_q.weight.shape[0]
+        for i, layer in enumerate(layers):
+            layer.weight.data = weight[i * rows : (i + 1) * rows]
+            layer.bias.data = bias[i * rows : (i + 1) * rows]
+        self.qkv_weight, self.qkv_bias = weight, bias
+
+    def _qkv_fused(self, x: torch.Tensor) -> bool:
+        # the layers still read views of the fused weight (offload or a LoRA wrapper undo it)
+        weight, bias = self.qkv_weight, self.qkv_bias
+        if weight is None or weight.device != x.device:
+            return False
+        layers = (self.to_q, self.to_k, self.to_v)
+        w_step = self.to_q.weight.numel() * weight.element_size()
+        b_step = self.to_q.bias.numel() * bias.element_size()
+        return all(
+            type(layer) is ColumnParallelLinear
+            and layer.weight.data_ptr() == weight.data_ptr() + i * w_step
+            and layer.bias.data_ptr() == bias.data_ptr() + i * b_step
+            for i, layer in enumerate(layers)
+        )
 
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
@@ -624,9 +666,15 @@ class WanTransformerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
         RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
+        if self._qkv_fused(norm_hidden_states):
+            qkv = apply_unquantized_linear(
+                norm_hidden_states, self.qkv_weight, self.qkv_bias
+            )
+            query, key, value = qkv.split(self.to_q.weight.shape[0], dim=-1)
+        else:
+            query, _ = self.to_q(norm_hidden_states)
+            key, _ = self.to_k(norm_hidden_states)
+            value, _ = self.to_v(norm_hidden_states)
         qk_norms = ((query, self.norm_q), (key, self.norm_k))
         roped = (
             rope_cos_sin_cache is not None
@@ -1157,6 +1205,19 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["blocks"]
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        for block in self.blocks:
+            if isinstance(block, WanTransformerBlock):
+                block.fuse_qkv_weights()
+        fused = sum(
+            isinstance(block, WanTransformerBlock) and block.qkv_weight is not None
+            for block in self.blocks
+        )
+        logger.info(
+            "Fused q/k/v projection weights in %d/%d blocks", fused, len(self.blocks)
+        )
 
     def _make_block(
         self,
