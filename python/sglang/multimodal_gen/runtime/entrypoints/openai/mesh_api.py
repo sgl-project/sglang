@@ -62,15 +62,19 @@ def _build_sampling_params_from_request(
         "image_path": [image_path] if image_path else None,
         "save_output": True,
         "output_file_name": f"{request_id}.{ext}",
-        "seed": req.seed,
-        "generator_device": req.generator_device,
     }
-    if req.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = req.num_inference_steps
-    if req.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = req.guidance_scale
-    if req.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = req.negative_prompt
+    sampling_kwargs.update(
+        req.model_dump(
+            include={
+                "seed",
+                "generator_device",
+                "num_inference_steps",
+                "guidance_scale",
+                "negative_prompt",
+            },
+            exclude_none=True,
+        )
+    )
 
     return SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,

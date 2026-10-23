@@ -14,6 +14,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import (
     image_api,
@@ -282,6 +285,42 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
         assert await store.list_page() == []
 
     asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("seed,device", [(None, None), (0, "cpu"), ([0, 7], "cuda")])
+def test_mesh_optional_sampling_fields_preserve_defaults(
+    monkeypatch, tmp_path, seed, device
+):
+    args = SimpleNamespace(
+        model_path="mesh",
+        backend="native",
+        model_id=None,
+        pipeline_config=Hunyuan3D2PipelineConfig(),
+        output_path=str(tmp_path),
+        comfyui_mode=False,
+    )
+    monkeypatch.setattr(mesh_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        SamplingParams, "from_pretrained", lambda *a, **kw: SamplingParams()
+    )
+    request = mesh_api.MeshGenerationsRequest(
+        seed=seed,
+        generator_device=device,
+        num_inference_steps=4,
+        guidance_scale=5.0,
+        negative_prompt="test",
+    )
+    sampling = mesh_api._build_sampling_params_from_request(
+        "mesh", request, "input.png"
+    )
+    defaults = SamplingParams()
+    assert sampling.seed == (defaults.seed if seed is None else seed)
+    assert sampling.generator_device == (
+        defaults.generator_device if device is None else device
+    )
+    assert sampling.num_inference_steps == 4
+    assert sampling.guidance_scale == 5.0
+    assert sampling.negative_prompt == "test"
 
 
 def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
