@@ -1,3 +1,9 @@
+import multiprocessing as mp
+import os
+import pickle
+import signal
+import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -5,6 +11,25 @@ from unittest.mock import Mock, patch
 from sglang.multimodal_gen.runtime import launch_server as ls
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
+
+
+def _startup_worker(spec):
+    outcome = pickle.loads(spec.server_args._pickle).outcome
+    if spec.rank == 11:
+        if outcome == "exit":
+            os._exit(23)
+        if outcome == "error":
+            spec.pipe_writer.send({"status": "error", "error": "bad checkpoint"})
+        elif outcome == "ready_exit":
+            spec.pipe_writer.send({"status": "ready"})
+            os._exit(23)
+        elif outcome != "eof":
+            spec.pipe_writer.send({"status": "ready"})
+    elif outcome == "ready":
+        time.sleep(0.05)
+        spec.pipe_writer.send({"status": "ready"})
+    spec.pipe_writer.close()
+    time.sleep(60)
 
 
 class _FakeProcess:
@@ -34,6 +59,84 @@ class _FakeProcess:
 
 
 class TestLaunchServerShutdown(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "uses CPU-only fork and SIGALRM")
+    def test_startup_waits_for_all_ranks_and_cleans_up_failures(self):
+        context = mp.get_context("fork")
+
+        def timed_out(*_):
+            raise TimeoutError("startup did not notice a failed peer")
+
+        for outcome in (
+            "ready",
+            "exit",
+            "error",
+            "eof",
+            "ready_exit",
+            "spawn_error",
+            "interrupt",
+        ):
+            processes, pipes = [], []
+
+            def make_pipe(**kwargs):
+                pair = context.Pipe(**kwargs)
+                pipes.extend(pair)
+                return pair
+
+            def make_process(**kwargs):
+                if len(processes) == 1 and outcome == "interrupt":
+                    raise KeyboardInterrupt
+                process = context.Process(**kwargs)
+                if len(processes) == 1 and outcome == "spawn_error":
+                    process.start = Mock(side_effect=OSError("cannot spawn"))
+                processes.append(process)
+                return process
+
+            previous = signal.signal(signal.SIGALRM, timed_out)
+            try:
+                with (
+                    self.subTest(outcome=outcome),
+                    patch.object(ls, "bootstrap_scheduler_process", _startup_worker),
+                    patch.object(
+                        ls.mp,
+                        "get_context",
+                        return_value=SimpleNamespace(
+                            Pipe=make_pipe, Process=make_process
+                        ),
+                    ),
+                ):
+                    signal.alarm(5)
+                    payload = ls.ServerArgsPayload.capture(
+                        SimpleNamespace(outcome=outcome)
+                    )
+                    if outcome == "ready":
+                        self.assertEqual(
+                            ls._start_scheduler_processes(
+                                payload, [(3, 10), (4, 11)], "test-r"
+                            ),
+                            processes,
+                        )
+                        self.assertTrue(all(p.is_alive() for p in processes))
+                    else:
+                        error = {
+                            "spawn_error": OSError,
+                            "interrupt": KeyboardInterrupt,
+                        }.get(outcome, RuntimeError)
+                        with self.assertRaises(error):
+                            ls._start_scheduler_processes(
+                                payload, [(3, 10), (4, 11)], "test-r"
+                            )
+                        self.assertFalse(any(p.is_alive() for p in processes))
+                    self.assertTrue(all(pipe.closed for pipe in pipes))
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, previous)
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    if process.pid is not None:
+                        process.join(5)
+                    process.close()
+
     def test_monolithic_shutdown_requests_scheduler_then_forces_worker(self):
         process = _FakeProcess()
         server_args = SimpleNamespace(disagg_role=RoleType.MONOLITHIC)
