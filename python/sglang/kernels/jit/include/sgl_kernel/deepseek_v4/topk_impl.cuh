@@ -368,17 +368,22 @@ struct TopKConfig {
     __syncthreads();
     uint32_t total_active = num_ties;
 
+    // Refine the exact score first, then the inverse index. A score plateau
+    // can exceed the remaining slots; arrival-order atomics cannot choose it.
 #pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    for (int round = 0; round < 8; round++) {
+      const uint32_t shift = 24 - (round % 4) * 8;
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
 
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
-        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
+        if (active[i]) {
+          const uint32_t digit_key = round < 4 ? key[i] : ~idx[i];
+          atomicAdd(&histogram[(digit_key >> shift) & 0xFFu], 1);
+        }
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (round < 7 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -403,26 +408,27 @@ struct TopKConfig {
       __syncthreads();
 
       const auto [threshold_bin, above_count, equal_count] = smem->match;
-      if (round < 3) total_active = equal_count;
+      if (round < 7) total_active = equal_count;
       topk_remain -= above_count;
 
       // 4. Scatter
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
-        const uint32_t bin = (key[i] >> shift) & 0xFFu;
+        const uint32_t digit_key = round < 4 ? key[i] : ~idx[i];
+        const uint32_t bin = (digit_key >> shift) & 0xFFu;
         if (bin > threshold_bin) {
           write_pos[i] = atomicAdd(&smem->counter, 1);
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (round == 7 || equal_count == topk_remain) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // Otherwise refine the threshold bucket in the next digit.
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (round == 7 || topk_remain == 0 || equal_count == topk_remain) break;
     }
 
 #pragma unroll
