@@ -1,0 +1,273 @@
+{
+  "date": "2026-10-23",
+  "host": "217",
+  "branch": "feat/hisparse-lim-copysfa-opt-217",
+  "source_verification": {
+    "sglang": {
+      "commit": "bbb72a632302500529a2cf3fe362231ef2a879fc",
+      "base": "9f77288b2c76da09c794951848296ea4169e2de8",
+      "files_checked": 11,
+      "mismatches": []
+    },
+    "kernel": {
+      "commit": "632971ef8d337e3f797e38f6636f7351e69ece3a",
+      "base": "86034b44f84edd0542a283a9aa3e9dde4205db3a",
+      "files_checked": 4,
+      "mismatches": []
+    }
+  },
+  "cpu_tests": {
+    "registered": 11,
+    "manual": 14,
+    "passed": true
+  },
+  "native_tests": {
+    "passed": 53,
+    "skipped": 0
+  },
+  "framework_standard": {
+    "scope": "fixed projections, real manager/allocator/attention; no model score or timing claim",
+    "eager_topk": "pass",
+    "resident_payload_bitwise": "pass",
+    "attention_cpu_oracle": "pass",
+    "graph_reset_padding_and_reuse": "pass",
+    "mixed_fallback_to_graph": "pass",
+    "prefill_ragged_gather": "pass",
+    "operator_calls": {
+      "npu::fused_lightning_indexer_manage": 1,
+      "fused_lightning_indexer_manage": 1,
+      "npu::fused_scatter_copy_sparse_flash_attention": 2,
+      "fused_scatter_copy_sparse_flash_attention_combined": 2
+    },
+    "request_rows": 3,
+    "batch_capacity": 3,
+    "decode_path": "copy_sfa",
+    "native_plan_shared": true
+  },
+  "framework_padded": {
+    "scope": "fixed projections, real manager/allocator/attention; no model score or timing claim",
+    "eager_topk": "pass",
+    "resident_payload_bitwise": "pass",
+    "attention_cpu_oracle": "pass",
+    "graph_reset_padding_and_reuse": "pass",
+    "mixed_fallback_to_graph": "pass",
+    "prefill_ragged_gather": "pass",
+    "operator_calls": {
+      "npu::fused_lightning_indexer_manage": 1,
+      "fused_lightning_indexer_manage": 1,
+      "npu::fused_scatter_copy_sparse_flash_attention": 2,
+      "fused_scatter_copy_sparse_flash_attention_combined": 2
+    },
+    "request_rows": 3,
+    "batch_capacity": 16,
+    "decode_path": "copy_sfa",
+    "native_plan_shared": true
+  },
+  "model": {
+    "phase": "passed",
+    "scope": "GLM-5.2 W4A8 startup and short/long decode smoke; no GPQA score",
+    "requests": [
+      {
+        "input_tokens": 512,
+        "completion_tokens": 32,
+        "contains_expected_needle": true,
+        "wall_seconds": 24.42522740503773
+      },
+      {
+        "input_tokens": 8192,
+        "completion_tokens": 32,
+        "contains_expected_needle": true,
+        "wall_seconds": 11.451037424849346
+      },
+      {
+        "input_tokens": 32768,
+        "completion_tokens": 32,
+        "contains_expected_needle": true,
+        "wall_seconds": 38.9290533750318
+      }
+    ],
+    "decode_graph_capture_ranks": 16,
+    "server_args": {
+      "model_path": "/models/GLM-5.2-w4a8",
+      "quantization": "modelslim",
+      "tp_size": 16,
+      "ep_size": 16,
+      "attn_dp_size": 2,
+      "max_running_requests": 4,
+      "cuda_graph_config": {
+        "decode": {
+          "backend": "full",
+          "max_bs": 8,
+          "bs": [
+            8
+          ],
+          "tc_compiler": "eager",
+          "max_context_size": null,
+          "full_prefill_max_req": null,
+          "full_prefill_prefix_chunk_tokens": null,
+          "max_seq_len": null
+        },
+        "prefill": {
+          "backend": "disabled",
+          "max_bs": 2048,
+          "bs": [
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            48,
+            64,
+            80,
+            96,
+            112,
+            128,
+            144,
+            160,
+            176,
+            192,
+            208,
+            224,
+            240,
+            256,
+            288,
+            320,
+            352,
+            384,
+            416,
+            448,
+            480,
+            512,
+            576,
+            640,
+            704,
+            768,
+            832,
+            896,
+            960,
+            1024,
+            1280,
+            1536,
+            1792,
+            2048
+          ],
+          "tc_compiler": "eager",
+          "max_context_size": null,
+          "full_prefill_max_req": null,
+          "full_prefill_prefix_chunk_tokens": null,
+          "max_seq_len": null
+        }
+      },
+      "context_length": 36864,
+      "kv_cache_dtype": "bfloat16",
+      "page_size": 128,
+      "speculative_algorithm": null
+    },
+    "driver_returncode": 0,
+    "request_pool_rows_5_logged": false
+  },
+  "kernel_build": {
+    "libraries": {
+      "/usr/local/python3.12.13/lib/python3.12/site-packages/sgl_kernel_npu/_C.cpython-312-aarch64-linux-gnu.so": "fb146766c1087d74a77fcf04c3005468baf341d4de1ef8fede6ca14173c97fe1",
+      "/usr/local/python3.12.13/lib/python3.12/site-packages/sgl_kernel_npu/lib/libsgl_kernel_npu.so": "0bbcb79d39e54ce42b80f08dfad5706bf39164790e8c569a7fb0ca0a16ab7e1d"
+    },
+    "operators": {
+      "fused_lightning_indexer_manage": true,
+      "fused_scatter_copy_sparse_flash_attention": true,
+      "plan_sparse_kv_cache": true
+    }
+  },
+  "baseline": {
+    "scope": "fixed-input full-visible Q1 indexer/manager/attention; no model throughput claim",
+    "batch": 4,
+    "context": 8192,
+    "layers": 2,
+    "graph_us_per_step_samples": [
+      773.65966796875,
+      773.1597391764323,
+      773.9171346028646,
+      773.6130777994791,
+      773.5090637207031
+    ],
+    "graph_us_per_step_median": 773.6130777994791,
+    "manager_allocated_bytes": 52740608,
+    "manager_budget_bytes": 49343612,
+    "topk_and_resident_payload": "pass",
+    "attention_cpu_oracle": "pass",
+    "selected_ids_sha256": "ae6af6abb20d89a99b6a1442b011f2bd9195bfabcb8f9816f0d0e31972c7ad43",
+    "dispatcher_counts_per_step": {
+      "aten::where": 36,
+      "aten::copy_": 28,
+      "npu::fused_lightning_indexer_manage": 1,
+      "aten::masked_fill_": 1,
+      "npu::fused_scatter_copy_sparse_flash_attention": 2
+    }
+  },
+  "optimized": {
+    "scope": "fixed-input full-visible Q1 indexer/manager/attention; no model throughput claim",
+    "batch": 4,
+    "context": 8192,
+    "layers": 2,
+    "graph_us_per_step_samples": [
+      704.3116760253906,
+      704.5168050130209,
+      704.1318766276041,
+      704.3601481119791,
+      704.2678833007812
+    ],
+    "graph_us_per_step_median": 704.3116760253906,
+    "manager_allocated_bytes": 40116224,
+    "manager_budget_bytes": 37506172,
+    "topk_and_resident_payload": "pass",
+    "attention_cpu_oracle": "pass",
+    "selected_ids_sha256": "ae6af6abb20d89a99b6a1442b011f2bd9195bfabcb8f9816f0d0e31972c7ad43",
+    "dispatcher_counts_per_step": {
+      "aten::where": 16,
+      "aten::copy_": 16,
+      "npu::fused_lightning_indexer_manage": 1,
+      "aten::masked_fill_": 5,
+      "npu::fused_scatter_copy_sparse_flash_attention": 2
+    }
+  },
+  "lint": {
+    "registered_test_check": "pass",
+    "ruff_selected_and_format": "pass",
+    "git_diff_whitespace": "pass"
+  },
+  "source_hashes": {
+    "sglang": {
+      "commit": "bbb72a632302500529a2cf3fe362231ef2a879fc",
+      "base": "9f77288b2c76da09c794951848296ea4169e2de8",
+      "files": {
+        "benchmark/hisparse/bench_lim_copy_sfa.py": "30b622f10da8730e0f9ecb411af402061a7787fbe7b6c10458f77b287115633e",
+        "benchmark/hisparse/bench_lim_framework.py": "0d7df435dd046798933e98497bfa9ad9195d39806458af82158f520ed1105574",
+        "benchmark/hisparse/check_lim_copy_sfa.py": "924e307f3ea6d7a5dacdd734c2f0828e616565b11f80df27aae30c94840cc6e4",
+        "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py": "7de5a08e0a9dea455d2d4bd0e2ace88b51c2079ddf437caf1f70dbecc71d9099",
+        "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/attention.py": "24a909d8498545e92594f8839fbbe2052756c21f919cc9b02af98e90e47b9e5a",
+        "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/budget.py": "f290cd104f5d3ad19b111f67bbee3db417c56175938e1a8ea8bf7b1009bd094e",
+        "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/config.py": "c083add77dd5bb061b280b15601ea6f3dbda22af79ff3dd5069ccbed0d470b94",
+        "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/lim.py": "007cd1acf270bea7ce6f2a5ea9a3824a76614b48e3e13981d515a17b6868f4fe",
+        "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/manager.py": "de5edfe2218f566236a6babfc5cb5e9d4ded2e851c5cc06a7da01c328f7d7cef",
+        "test/manual/npu/test_sparse_kv_offload_cache.py": "242ca02f3fbbb73d78e259f5373c685d68cb895ee853b559b11f70eabb27a39a",
+        "test/registered/unit/hardware_backend/test_npu_lim_state.py": "aa1f9a559ac078a50c1d0d78f8498a7b11c6be8ab59ab278737f614d39b19444"
+      }
+    },
+    "kernel": {
+      "commit": "632971ef8d337e3f797e38f6636f7351e69ece3a",
+      "base": "86034b44f84edd0542a283a9aa3e9dde4205db3a",
+      "files": {
+        "csrc/fused_scatter_copy_sparse_flash_attention/op_host/fused_copy_sfa.cpp": "bc69022014a13e13600aa27c65975a004604cb95cb7e97c070eb1d1061940f63",
+        "csrc/fused_scatter_copy_sparse_flash_attention/op_kernel/sparse_flash_attention_impl/fused_scatter_copy_sparse_flash_attention_service_vector_mla.h": "765d37064fc35a33de75855c13d895f05357cb930454423f7d33eb5ca15db38a",
+        "tests/test_copy_sfa_dynamic_tnd.py": "b10a97477031e54857514b199a4bffb14d5066fc74ac0810595afb7e01ba872d",
+        "tests/test_lim_copy_sfa.py": "b439160930a337da88ede3ebdac8a956ec1d99537a7c6afc5f46fe8d17a7b41f"
+      }
+    }
+  },
+  "wheel": {
+    "filename": "sgl_kernel_npu-2026.9.0-cp312-cp312-linux_aarch64.whl",
+    "sha256": "b2918606de22167b0736c35dbc4b87fd0a225b32f54852040f6ea48f6c009ecd"
+  }
+}
