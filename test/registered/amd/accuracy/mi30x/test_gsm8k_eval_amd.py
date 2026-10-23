@@ -1,333 +1,154 @@
 """
-AMD GSM8K Evaluation Test (Migrated from test/srt/nightly/)
-
-This test evaluates instruction-tuned models on the gsm8k benchmark using chat completions.
-Models are tested with various TP configurations on AMD GPUs.
-
-Registry: nightly-amd suite (2-GPU tests)
+DIAGNOSTIC ONLY (not for merge): root-cause the low GSM8K scores of
+neuralmagic/Mistral-7B-Instruct-v0.3-FP8 and neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8
+on AMD. For each config it runs:
+  1. the legacy scorer used by this nightly (5-shot prompt in one chat message,
+     max_tokens 2048, no stop, last number in the response),
+     plus re-scores of the same responses truncated at the next "Question:" block;
+  2. the 5-shot completion API with stop=["Question"] (few_shot_gsm8k style);
+  3. sgl-eval gsm8k, which is what the NVIDIA nightly baselines on H100
+     (27.82% Mistral-7B-FP8, 40.33% Mixtral-8x7B-FP8).
 """
 
-import json
 import os
+import re
 import time
+import traceback
 import unittest
-import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    is_in_ci,
-    parse_models,
-    popen_launch_server,
-    write_github_step_summary,
-    write_results_to_json,
-)
+from sglang.test.run_eval import run_eval_once
+from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval, get_answer_value
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
-# Register for AMD CI - GSM8K evaluation tests (~60 min)
 register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
-MODEL_SCORE_THRESHOLDS = {
-    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
-    # Llama 3.1 series
-    "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
-    "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
-    # Llama 3.2 series (smaller models)
-    "meta-llama/Llama-3.2-3B-Instruct": 0.43,  # 48.2% - 5%
-    # Mistral series
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.47,  # 52.1% - 5%
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5% (lower if AMD scores differently)
-    # DeepSeek series
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
-    # Qwen2 series
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
-    "Qwen/Qwen2.5-7B-Instruct": 0.82,  # 86.3% - 5%
-    # Qwen3 series
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.86,  # 91.4% - 5% (full attention mode; ensure sufficient max_tokens)
-    "Qwen/Qwen3-8B": 0.76,  # ~81%  - 5%
-    # Google Gemma
-    "google/gemma-2-27b-it": 0.86,  # 90.7% - 5%
-    "google/gemma-2-9b-it": 0.74,  # 78.5% - 5%
-    # "neuralmagic/gemma-2-2b-it-FP8": 0.4,  # Small 2B model - OOM on single GPU
-    # FP8 quantized models
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.46,  # ~51%  - 5%
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.76,  # 80.7% - 5% (official A14B score)
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
-}
-
-failing_models = {
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
-    "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
-    "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
-    "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
-}
+# (model, tp, env overrides)
+CONFIGS = [
+    ("neuralmagic/Mistral-7B-Instruct-v0.3-FP8", 1, {"SGLANG_USE_AITER": "1"}),
+    ("mistralai/Mistral-7B-Instruct-v0.3", 1, {"SGLANG_USE_AITER": "1"}),
+    (
+        "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+        2,
+        {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "0"},
+    ),
+    (
+        "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+        2,
+        {"SGLANG_USE_AITER": "0", "SGLANG_MOE_PADDING": "0"},
+    ),
+    ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, {"SGLANG_USE_AITER": "1"}),
+]
 
 
-def remove_failing_models(model_str):
-    models = model_str.split(",")
-    filtered = [m for m in models if m not in failing_models]
-    return ",".join(filtered)
+def truncate_at_next_question(text):
+    m = re.search(r"\n\s*Question:", text)
+    return text[: m.start()] if m else text
 
 
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
-)
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
-)
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
-)
-
-# AMD-specific models verified on MI300X
-# TP1 models - smaller models that fit on single GPU
-AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
-    "meta-llama/Llama-3.2-3B-Instruct,Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen3-8B,google/gemma-2-9b-it"
-)
-# TP2 models - larger models requiring 2 GPUs
-AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
-    "Qwen/Qwen3-30B-A3B-Thinking-2507"
-)
-
-NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
-DISABLE_HF_XET_MODELS = {
-    "Qwen/Qwen2-57B-A14B-Instruct",
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
-}
-TRITON_MOE_MODELS = {
-    # "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
-    # "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    # "mistralai/Mistral-7B-Instruct-v0.3",
-}
-# AMD-specific models that need special launch config (matching in-house CI sanity_check.py)
-# AMD_SPECIAL_CONFIG_MODELS = {
-#     "Qwen/Qwen3-30B-A3B-Thinking-2507", # default config works
-# }
-
-
-def popen_launch_server_wrapper(base_url, model, is_tp2):
-    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
-    if is_tp2:
-        other_args.extend(["--tp", "2"])
-
-    # Use same config as sanity_check.py for AMD-specific models (scaled for tp=2)
-    # Original tp=8: chunked-prefill-size=130172, max-running-requests=128
-    # Scaled tp=2:   chunked-prefill-size=32543,  max-running-requests=32
-    # if model in AMD_SPECIAL_CONFIG_MODELS:
-    #     other_args.extend([
-    #         "--chunked-prefill-size", "32543",
-    #         "--max-running-requests", "32",
-    #         "--mem-fraction-static", "0.85",
-    #         "--attention-backend", "aiter",
-    #     ])
-
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
+def legacy_eval(base_url, model):
+    args = SimpleNamespace(
+        base_url=base_url, model=model, eval_name="gsm8k", num_threads=1024
     )
-    return process
+    eval_obj = GSM8KEval(num_examples=None, num_threads=1024, num_shots=5)
+    result, _, _ = run_eval_once(args, base_url, eval_obj)
+    n = len(eval_obj._lines)
+    official = truncated = continued = 0
+    samples = []
+    for i in range(n):
+        resp = result.convos[i][-1]["content"] or ""
+        gold = get_answer_value(eval_obj._lines[i]["answer"])
+        ok = get_answer_value(resp) == gold
+        cut = truncate_at_next_question(resp)
+        ok_cut = get_answer_value(cut) == gold
+        official += ok
+        truncated += ok_cut
+        if cut != resp:
+            continued += 1
+        if not ok and len(samples) < 3:
+            samples.append((gold, resp))
+    return dict(
+        legacy_official=official / n,
+        legacy_truncated=truncated / n,
+        legacy_continued_frac=continued / n,
+        legacy_mean_len=sum(len(c[-1]["content"] or "") for c in result.convos) / n,
+        samples=samples,
+    )
 
 
-def check_model_scores(results):
-    """Check model scores and generate summary table with pass/fail status."""
-    failed_models = []
-    passed_count = 0
-    failed_count = 0
-
-    summary = "| Model | TP | Score | Threshold | Startup | Eval | Total | Status |\n"
-    summary += "| ----- | -- | ----- | --------- | ------- | ---- | ----- | ------ |\n"
-
-    for result in results:
-        model = result["model"]
-        score = result["score"]
-        tp_size = result.get("tp_size", 2)
-        startup_time = result.get("startup_time")
-        eval_time = result.get("eval_time")
-        total_time = result.get("total_time")
-
-        threshold = MODEL_SCORE_THRESHOLDS.get(model)
-        if threshold is None:
-            print(f"Warning: No threshold defined for model {model}")
-            status = "⚠️ NO THRESHOLD"
-        elif score >= threshold:
-            status = "✅ PASS"
-            passed_count += 1
-        else:
-            status = "❌ FAIL"
-            failed_count += 1
-            failed_models.append(
-                f"- {model}: score={score:.4f}, threshold={threshold:.4f}"
-            )
-
-        # Format times
-        startup_str = f"{startup_time:.0f}s" if startup_time is not None else "N/A"
-        eval_str = f"{eval_time:.0f}s" if eval_time is not None else "N/A"
-        total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
-        threshold_str = f"{threshold:.2f}" if threshold is not None else "N/A"
-
-        line = f"| {model} | {tp_size} | {score:.3f} | {threshold_str} | {startup_str} | {eval_str} | {total_str} | {status} |\n"
-        summary += line
-
-    print(f"\n{'=' * 60}")
-    print("SUMMARY - TP=2 Instruction Models (gsm8k)")
-    print(f"{'=' * 60}")
-    print(summary)
-    print(f"\n📊 Final Statistics:")
-    print(f"   Passed: {passed_count}")
-    print(f"   Failed: {failed_count}")
-
-    if is_in_ci():
-        write_github_step_summary(f"### TestNightlyGsm8KEval (TP=2)\n{summary}")
-
-    if failed_models:
-        failure_msg = "\n".join(failed_models)
-        raise AssertionError(f"The following models failed:\n{failure_msg}")
+def completion_eval(base_url, model):
+    args = SimpleNamespace(
+        base_url=base_url,
+        model=model,
+        eval_name="gsm8k",
+        num_threads=1024,
+        api="completion",
+    )
+    eval_obj = GSM8KEval(num_examples=None, num_threads=1024, num_shots=5)
+    result, _, _ = run_eval_once(args, base_url, eval_obj)
+    return result.score
 
 
-# Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
-class TestNightlyGsm8KEval(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
-            # AMD-specific models verified on MI300X
-            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-        ]
-        cls.base_url = DEFAULT_URL_FOR_TEST
+def sgl_eval(base_url, model):
+    args = SimpleNamespace(
+        base_url=base_url,
+        model=model,
+        eval_name="gsm8k",
+        num_examples=None,
+        num_threads=1024,
+    )
+    return run_sgl_eval(args)["score"]
 
-    def test_gsm8k_all_models(self):
-        warnings.filterwarnings(
-            "ignore", category=ResourceWarning, message="unclosed.*socket"
-        )
-        is_first = True
-        all_results = []
-        total_test_start = time.time()
 
-        print(f"\n{'=' * 60}")
-        print("AMD GSM8K Evaluation Test (TP=2 Instruction Models)")
-        print(f"{'=' * 60}")
-        print(f"Benchmark: gsm8k (chat completions)")
-        print(f"{'=' * 60}\n")
-
-        for model_group, is_fp8, is_tp2 in self.model_groups:
-            for model in model_group:
-                with self.subTest(model=model):
-                    tp_size = 2 if is_tp2 else 1
-                    print(f"\n{'=' * 60}")
-                    print(f"Testing: {model} (TP={tp_size}, FP8={is_fp8})")
-                    print(f"{'=' * 60}")
-
-                    model_start = time.time()
-                    startup_time = None
-                    eval_time = None
-
-                    os.environ["SGLANG_MOE_PADDING"] = (
-                        "0" if model in NO_MOE_PADDING_MODELS else "1"
-                    )
-                    os.environ["HF_HUB_DISABLE_XET"] = (
-                        "1" if model in DISABLE_HF_XET_MODELS else "0"
-                    )
-                    os.environ["SGLANG_USE_AITER"] = (
-                        "0" if model in TRITON_MOE_MODELS else "1"
-                    )
-
-                    # Launch server with timing
-                    print(f"🚀 Launching server...")
-                    server_start = time.time()
-                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
-                    startup_time = time.time() - server_start
-                    print(f"⏱️  Server startup: {startup_time:.1f}s")
-
-                    args = SimpleNamespace(
-                        base_url=self.base_url,
-                        model=model,
-                        eval_name="gsm8k",
-                        num_examples=None,
-                        num_threads=1024,
-                    )
-
-                    # Run eval with timing and retries
-                    print(f"📊 Running gsm8k evaluation...")
-                    eval_start = time.time()
-                    threshold = MODEL_SCORE_THRESHOLDS.get(model)
-                    metrics = None
-                    for attempt in range(3):
-                        try:
-                            metrics = run_eval(args)
-                            score = metrics["score"]
-                            if threshold and score >= threshold:
-                                break
-                        except Exception as e:
-                            print(f"   Attempt {attempt + 1} failed with error: {e}")
-                    eval_time = time.time() - eval_start
-                    total_time = time.time() - model_start
-
-                    # Print results
-                    score = metrics["score"] if metrics else 0.0
-                    threshold_str = f"{threshold:.2f}" if threshold else "N/A"
-                    passed = threshold and score >= threshold
-
-                    print(f"\n📈 Results for {model}:")
-                    print(f"   Score: {score:.3f} (threshold: {threshold_str})")
-                    print(f"\n⏱️  Runtime breakdown:")
-                    print(f"   Server startup: {startup_time:.1f}s")
-                    print(f"   Evaluation: {eval_time:.1f}s")
-                    print(f"   Total: {total_time:.1f}s")
-
-                    if passed:
-                        print(f"\n   Status: ✅ PASSED")
-                    else:
-                        print(f"\n   Status: ❌ FAILED")
-
-                    write_results_to_json(model, metrics, "w" if is_first else "a")
-                    is_first = False
-
-                    all_results.append(
-                        {
-                            "model": model,
-                            "score": score,
-                            "tp_size": tp_size,
-                            "is_fp8": is_fp8,
-                            "startup_time": startup_time,
-                            "eval_time": eval_time,
-                            "total_time": total_time,
-                        }
-                    )
-
-                    print(f"\n🛑 Stopping server...")
+class TestDiagGsm8kMistral(unittest.TestCase):
+    def test_diag(self):
+        rows = []
+        for model, tp, env in CONFIGS:
+            label = f"{model} tp={tp} {env}"
+            print(f"\n{'=' * 70}\nDIAG {label}\n{'=' * 70}", flush=True)
+            os.environ.update(env)
+            other_args = ["--trust-remote-code", "--log-level-http", "warning"]
+            if tp == 2:
+                other_args += ["--tp", "2"]
+            process = None
+            row = {"label": label}
+            try:
+                t = time.time()
+                process = popen_launch_server(
+                    model, DEFAULT_URL_FOR_TEST, timeout=3600, other_args=other_args
+                )
+                row["startup_s"] = round(time.time() - t)
+                for name, fn in (
+                    ("legacy", legacy_eval),
+                    ("completion_stop_question", completion_eval),
+                    ("sgl_eval", sgl_eval),
+                ):
+                    try:
+                        out = fn(DEFAULT_URL_FOR_TEST, model)
+                        if isinstance(out, dict):
+                            samples = out.pop("samples")
+                            row.update({k: round(v, 4) for k, v in out.items()})
+                            for gold, resp in samples:
+                                print(f"--- WRONG sample, gold={gold}\n{resp[:800]}\n")
+                        else:
+                            row[name] = round(out, 4)
+                    except Exception:
+                        row[name] = "ERROR"
+                        traceback.print_exc()
+            except Exception:
+                row["launch"] = "ERROR"
+                traceback.print_exc()
+            finally:
+                if process is not None:
                     kill_process_tree(process.pid)
-
-        # Calculate total test runtime
-        total_test_time = time.time() - total_test_start
-
-        try:
-            with open("results.json", "r") as f:
-                print("\nFinal Results from results.json:")
-                print(json.dumps(json.load(f), indent=2))
-        except Exception as e:
-            print(f"Error reading results.json: {e}")
-
-        # Check all scores after collecting all results
-        check_model_scores(all_results)
-        print(
-            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
-        )
+            print(f"DIAG RESULT {row}", flush=True)
+            rows.append(row)
+        print("\nDIAG SUMMARY")
+        for row in rows:
+            print(f"DIAG SUMMARY {row}")
 
 
 if __name__ == "__main__":
