@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sglang.api.v1 import api_types
 from sglang.srt import rust_extensions
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -12,7 +13,11 @@ from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import (
+    derive_attention_ranks,
+    get_context,
+    get_parallel,
+)
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
 from sglang.srt.server_args import ServerArgs
@@ -44,6 +49,22 @@ def _scheduler_for_typed_config():
         tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
+    )
+
+
+def _reported_deployment_info() -> api_types.DeploymentInfo:
+    """The DeploymentInfo this rank's listener reports, decoded by the api.v1
+    contract."""
+    extension = MagicMock()
+    with (
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(
+            _scheduler_for_typed_config(), extension=extension
+        )
+    return api_types.DeploymentInfo.from_json_value(
+        json.loads(extension.ServerArgs.call_args.kwargs["deployment_info"])
     )
 
 
@@ -122,6 +143,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    # Rust reads absent keys as defaults, so every contract field must be sent
+    # under its contract name.
+    assert set(deployment_info) == set(api_types.DeploymentInfo.__struct_fields__)
 
 
 @pytest.mark.parametrize(
@@ -263,6 +287,82 @@ def test_dp_leaders_reuse_node_local_ports(
         assert [c.kwargs["port_offset"] for c in calls] == expected
         # P/D bootstrap must register against the same ports Rust binds.
         assert ports == [30000 + offset for offset in expected]
+
+
+@pytest.mark.parametrize(
+    "server_args,leaders",
+    [
+        (
+            {"nnodes": 2, "node_rank": 1, "tp_size": 4, "attn_dp_size": 4},
+            [(2, 2), (3, 3)],
+        ),
+        (
+            {
+                "nnodes": 4,
+                "node_rank": 1,
+                "tp_size": 4,
+                "pp_size": 2,
+                "attn_dp_size": 2,
+                "attn_cp_size": 2,
+            },
+            [(2, 1)],
+        ),
+        ({"tp_size": 2, "dp_size": 2}, [(0, 0), (0, 1)]),
+        ({}, [(0, 3)]),
+    ],
+    ids=[
+        "attention-dp-second-node",
+        "pp-cp-first-stage",
+        "plain-dp",
+        "external-dp-rank",
+    ],
+)
+def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
+    """Given every (tp_rank, dp_rank) DP leader on one node, each of their
+    listeners reports the same node table, whose entry for each listener is
+    the port offset it binds and the DP rank it reports itself."""
+    with (
+        get_context().override_server_args(
+            host="0.0.0.0", port=30000, grpc_port=40000, **server_args
+        ),
+        patch.object(rust_extensions, "load_rust_extension") as extension,
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+    ):
+        parallel = get_parallel()
+        reported = []
+        for tp_rank, dp_rank in leaders:
+            attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+                tp_rank=tp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_size=parallel.attn_cp_size,
+            )
+            with parallel.override(
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                attn_dp_rank=attn_dp_rank,
+                attn_tp_rank=attn_tp_rank,
+                attn_cp_rank=0,
+            ):
+                rust_server.RustServer.launch(
+                    SimpleNamespace(
+                        server_args=SimpleNamespace(),
+                        model_config=SimpleNamespace(is_multimodal=False),
+                    )
+                )
+                reported.append(_reported_deployment_info())
+        calls = extension.return_value.Server.call_args_list
+
+    table = [
+        api_types.NodeRustListener(
+            port_offset=c.kwargs["port_offset"],
+            dp_rank=info.dp_rank,
+            http_port=30000 + c.kwargs["port_offset"],
+            grpc_port=40000 + c.kwargs["port_offset"],
+        )
+        for c, info in zip(calls, reported)
+    ]
+    assert [info.node_listeners for info in reported] == [table] * len(leaders)
 
 
 @pytest.mark.parametrize(

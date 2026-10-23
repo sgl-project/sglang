@@ -4748,6 +4748,13 @@ impl ::serde::Serialize for DeploymentInfo {
                 &self.kv_event_sources,
             )?;
         }
+        if !self.node_listeners.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "node_listeners",
+                &self.node_listeners,
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -4783,6 +4790,7 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                 let mut f_hicache_write_policy = None;
                 let mut f_hicache_host_total_tokens = None;
                 let mut f_kv_event_sources = None;
+                let mut f_node_listeners = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "disaggregation_bootstrap_port" => {
@@ -4924,6 +4932,15 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                                     .unwrap_or_default(),
                             );
                         }
+                        "node_listeners" => {
+                            if f_node_listeners.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("node_listeners"));
+                            }
+                            f_node_listeners = Some(
+                                map.next_value::<Option<Vec<NodeRustListener>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -4949,6 +4966,79 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                     hicache_write_policy: f_hicache_write_policy.flatten(),
                     hicache_host_total_tokens: f_hicache_host_total_tokens.flatten(),
                     kv_event_sources: f_kv_event_sources.unwrap_or_default(),
+                    node_listeners: f_node_listeners.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for NodeRustListener {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "port_offset", &self.port_offset)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", &self.dp_rank)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "http_port", &self.http_port)?;
+        if let Some(v) = &self.grpc_port {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "grpc_port", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for NodeRustListener {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = NodeRustListener;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct NodeRustListener")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_port_offset = None;
+                let mut f_dp_rank = None;
+                let mut f_http_port = None;
+                let mut f_grpc_port = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "port_offset" => {
+                            if f_port_offset.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("port_offset"));
+                            }
+                            f_port_offset = Some(map.next_value::<u32>()?);
+                        }
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<u32>()?);
+                        }
+                        "http_port" => {
+                            if f_http_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("http_port"));
+                            }
+                            f_http_port = Some(map.next_value::<u32>()?);
+                        }
+                        "grpc_port" => {
+                            if f_grpc_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("grpc_port"));
+                            }
+                            f_grpc_port = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(NodeRustListener {
+                    port_offset: f_port_offset.unwrap_or_default(),
+                    dp_rank: f_dp_rank.unwrap_or_default(),
+                    http_port: f_http_port.unwrap_or_default(),
+                    grpc_port: f_grpc_port.flatten(),
                 })
             }
         }

@@ -453,10 +453,24 @@
               "topic": "kv-events",
               "block_size": 64
             }
+          ],
+          "node_listeners": [
+            {
+              "port_offset": 0,
+              "dp_rank": 0,
+              "http_port": 30000,
+              "grpc_port": 30010
+            },
+            {
+              "port_offset": 1,
+              "dp_rank": 1,
+              "http_port": 30001,
+              "grpc_port": null
+            }
           ]
         }
       },
-      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":4096,\"max_total_num_tokens\":8192,\"version\":\"0.5.0\",\"internal_states\":[{\"last_gen_throughput\":1.5,\"memory_usage\":{\"weight\":2.0}}],\"host\":\"127.0.0.1\",\"port\":30000,\"incremental_streaming_output\":true,\"disaggregation_mode\":\"decode\",\"deployment_info\":{\"disaggregation_bootstrap_port\":8998,\"node_rank\":1,\"nnodes\":2,\"dp_size\":4,\"dp_rank\":1,\"dist_init_addr\":\"10.0.0.1:5000\",\"base_gpu_id\":2,\"page_size\":64,\"dcp_size\":2,\"max_running_requests\":32,\"max_prefill_tokens\":8192,\"enable_dp_attention\":true,\"speculative_algorithm\":\"EAGLE\",\"enable_hierarchical_cache\":true,\"hicache_ratio\":0.5,\"hicache_size\":4096,\"hicache_write_policy\":\"write_back\",\"hicache_host_total_tokens\":16384,\"kv_event_sources\":[{\"dp_rank\":1,\"endpoint\":\"tcp://127.0.0.1:5557\",\"topic\":\"kv-events\",\"block_size\":64}]}}"
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":4096,\"max_total_num_tokens\":8192,\"version\":\"0.5.0\",\"internal_states\":[{\"last_gen_throughput\":1.5,\"memory_usage\":{\"weight\":2.0}}],\"host\":\"127.0.0.1\",\"port\":30000,\"incremental_streaming_output\":true,\"disaggregation_mode\":\"decode\",\"deployment_info\":{\"disaggregation_bootstrap_port\":8998,\"node_rank\":1,\"nnodes\":2,\"dp_size\":4,\"dp_rank\":1,\"dist_init_addr\":\"10.0.0.1:5000\",\"base_gpu_id\":2,\"page_size\":64,\"dcp_size\":2,\"max_running_requests\":32,\"max_prefill_tokens\":8192,\"enable_dp_attention\":true,\"speculative_algorithm\":\"EAGLE\",\"enable_hierarchical_cache\":true,\"hicache_ratio\":0.5,\"hicache_size\":4096,\"hicache_write_policy\":\"write_back\",\"hicache_host_total_tokens\":16384,\"kv_event_sources\":[{\"dp_rank\":1,\"endpoint\":\"tcp://127.0.0.1:5557\",\"topic\":\"kv-events\",\"block_size\":64}],\"node_listeners\":[{\"port_offset\":0,\"dp_rank\":0,\"http_port\":30000,\"grpc_port\":30010},{\"port_offset\":1,\"dp_rank\":1,\"http_port\":30001}]}}"
     },
     {
       "type": "SamplingParams",

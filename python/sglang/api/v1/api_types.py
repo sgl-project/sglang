@@ -792,6 +792,7 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     hicache_write_policy: Optional[str] = None
     hicache_host_total_tokens: Optional[int] = None
     kv_event_sources: List[KvEventSource] = []
+    node_listeners: List[NodeRustListener] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "DeploymentInfo":
@@ -801,6 +802,24 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_DeploymentInfo(self)
+
+
+class NodeRustListener(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.NodeRustListener: JSON object (unknown keys ignored)."""
+
+    port_offset: int = 0
+    dp_rank: int = 0
+    http_port: int = 0
+    grpc_port: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "NodeRustListener":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_NodeRustListener(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_NodeRustListener(self)
 
 
 class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
@@ -2445,6 +2464,8 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
             kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_event_sources":
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "node_listeners":
+            kw["node_listeners"] = [] if x is None else [decode_NodeRustListener(e) for e in _expect_seq(x, expected="a sequence")]
     return DeploymentInfo(**kw)
 
 
@@ -2479,6 +2500,33 @@ def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
         d["hicache_host_total_tokens"] = v.hicache_host_total_tokens
     if v.kv_event_sources:
         d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
+    if v.node_listeners:
+        d["node_listeners"] = [encode_NodeRustListener(e) for e in v.node_listeners]
+    return d
+
+
+def decode_NodeRustListener(value: Any) -> NodeRustListener:
+    m = _expect_map(value, expected="struct NodeRustListener")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "port_offset":
+            kw["port_offset"] = _expect_uint(x, expected="u32")
+        elif key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "http_port":
+            kw["http_port"] = _expect_uint(x, expected="u32")
+        elif key == "grpc_port":
+            kw["grpc_port"] = None if x is None else _expect_uint(x, expected="u32")
+    return NodeRustListener(**kw)
+
+
+def encode_NodeRustListener(v: NodeRustListener) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["port_offset"] = v.port_offset
+    d["dp_rank"] = v.dp_rank
+    d["http_port"] = v.http_port
+    if v.grpc_port is not None:
+        d["grpc_port"] = v.grpc_port
     return d
 
 
