@@ -1,6 +1,7 @@
 """Unit tests for srt/managers/scheduler_components/shm_tag_exchange.py."""
 
 import sys
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -14,6 +15,11 @@ import torch.distributed
 import torch.multiprocessing
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import shm_tag_exchange
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    _broadcast_via_exchange,
+)
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils import stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,6 +65,14 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
     return cache
 
 
+def _shm_names():
+    # macOS caps POSIX shared-memory names at 30 bytes;
+    # elsewhere keep the prefix the CI stale-shm sweep reclaims.
+    if sys.platform == "darwin":
+        return patch.object(stale_shm_cleanup, "_SGL_SHM_PREFIX", "s")
+    return nullcontext()
+
+
 def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     torch.distributed.init_process_group(
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
@@ -66,13 +80,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     try:
         with (
             envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True),
-            # macOS caps POSIX shared-memory names at 30 bytes;
-            # elsewhere keep the prefix the CI stale-shm sweep reclaims.
-            (
-                patch.object(stale_shm_cleanup, "_SGL_SHM_PREFIX", "s")
-                if sys.platform == "darwin"
-                else nullcontext()
-            ),
+            _shm_names(),
         ):
             # A row holds 6 ready counts, one more per extra host pool, and the folded
             # digest's 2 words: 8, 9 and 10 values here. The shm table holds 8.
@@ -90,6 +98,51 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
             exchange.close()
     finally:
         torch.distributed.destroy_process_group()
+
+
+def _exchange_rounds(rank: int, init_file: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
+    )
+    group = torch.distributed.group.WORLD
+    try:
+        with envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True), _shm_names():
+            exchange = shm_tag_exchange.get_shm_exchange(group, "rounds")
+        assert isinstance(exchange, ShmTagExchange)
+        # a broken protocol fails here instead of waiting out the 30-minute default
+        exchange.timeout_s = 30.0
+        try:
+            # Five calls reuse each parity half of the table twice; rank 1 publishes
+            # late on odd calls, so rank 0 waits there and runs ahead on even ones.
+            for seq in range(1, 6):
+                if rank == 1 and seq % 2:
+                    time.sleep(0.05)
+                rows = exchange.allgather([seq, 10 * seq + rank])
+                assert rows == [[seq, 10 * seq], [seq, 10 * seq + 1]], (seq, rows)
+            tp_group = SimpleNamespace(rank=rank, ranks=[0, 1], cpu_group=group)
+            for reqs in ([], [{"rid": "a", "input_ids": [1, 2]}, "b"]):
+                got = _broadcast_via_exchange(
+                    reqs if rank == 0 else None, exchange=exchange, tp_group=tp_group
+                )
+                assert got == reqs, (rank, reqs, got)
+        finally:
+            exchange.close()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestShmTagExchange(CustomTestCase):
+    def test_rounds_and_request_broadcast_match_on_every_rank(self):
+        """Every rank reads every rank's values of each call, through repeated reuse
+        of both table halves with one rank late, and the request broadcast hands
+        the source's list, empty or not, to every rank."""
+        with TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _exchange_rounds,
+                args=(str(Path(directory) / "gloo-init"),),
+                nprocs=2,
+                join=True,
+            )
 
 
 class TestHiCacheReadyCountsThroughShm(CustomTestCase):
