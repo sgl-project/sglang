@@ -14,6 +14,11 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export HCCL_BUFFSIZE=1000 HCCL_OP_EXPANSION_MODE=AIV
+# DeepEP auto shares one HCCL window between normal and V2 low-latency ops.
+# Keep their payload and synchronization state in the hybrid window layout.
+export DEEPEP_HYBRID_DEPLOYMENT=1
+# Bound V2's allocated receive capacity for this launcher's decode batch <= 16.
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export HCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo
 export HCCL_CONNECT_TIMEOUT=600 HCCL_EXEC_TIMEOUT=600
 export TRANSFORMERS_VERBOSITY=error
