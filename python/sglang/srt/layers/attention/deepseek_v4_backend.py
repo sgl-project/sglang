@@ -83,7 +83,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
-    has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1012,13 +1011,8 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-# Rows per logits chunk of the ratio-1/2 indexer metadata under the prefill CUDA
-# graph; its width is _prefill_graph_context_width.
-_PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
-
-
-# The candidate window (2,048 blocks of 8 tokens): inside it the captured full
-# top-k equals the two-level selection.
+# The replayed context limit when the prefill graph's metadata is built at a fixed
+# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
 _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
@@ -1085,30 +1079,11 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
 
-    def refresh_for_breakable_cuda_graph_replay_(
-        self,
-        static_metadata: DSV4Metadata,
-        *,
-        two_level: bool,
-    ):
+    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
-        if not two_level:
-            # The captured full top-k fallback reads the ratio-1/2 lengths and
-            # page tables by address: refresh them in place.
-            maybe_copy_inplace(
-                self.c1_indexer_metadata, src=static_metadata.c1_indexer_metadata
-            )
-            maybe_copy_inplace(
-                self.c2_indexer_metadata, src=static_metadata.c2_indexer_metadata
-            )
-        else:
-            # Two-level candidates: only the eager full top-k breaks read these, so
-            # they take the live objects; captured consumers read the bridge tensors.
-            self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
-            self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
         maybe_copy_inplace(
             self.low_ratio_req_indices, src=static_metadata.low_ratio_req_indices
         )
@@ -1607,59 +1582,20 @@ class DeepseekV4AttnBackend(
             ),
         )
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
-            low = core_attn_metadata.low_ratios
-            metadata.c1_indexer_metadata = (
-                self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 1)
-                if 1 in low
-                else None
-            )
-            metadata.c2_indexer_metadata = (
-                self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 2)
-                if 2 in low
-                else None
-            )
             metadata.low_ratio_req_indices = req_pool_indices_repeated.to(torch.int64)
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
         return metadata
 
-    def _low_ratio_prefill_indexer_metadata(
-        self, core: DSV4AttnMetadata, compress_ratio: int
-    ) -> PagedIndexerMetadata:
-        num_pages = core.page_table.shape[1]
-        max_seq_len = self._prefill_graph_seq_limit()
-        if max_seq_len is not None:
-            num_pages = min(max_seq_len // self.page_size, num_pages)
-        index_page_size = self.token_to_kv_pool.get_index_k_page_size(compress_ratio)
-        page_table = expand_index_page_table(
-            core.page_table[:, :num_pages],
-            full_page_size=self.page_size,
-            compress_ratio=compress_ratio,
-            index_page_size=index_page_size,
-        )
-        # Unclamped: a token with no completed group scores nothing, as in eager.
-        c_seq_lens = (core.seq_lens_casual // compress_ratio).to(torch.int32)
-        row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
-        return PagedIndexerMetadata(
-            page_size=self.page_size,
-            compressed_page_size=index_page_size,
-            page_table=page_table,
-            compressed_seq_lens=c_seq_lens,
-            use_topk_v2=False,
-            use_prefill_cuda_graph=True,
-            compress_ratio=compress_ratio,
-            row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
-        )
-
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
-        return (
-            bool(self.low_ratios)
-            and has_dense_fp4_indexer()
-            and is_sm100_or_newer()
-            and get_parallel().attn_cp_size == 1
+        """Whether ratio-1/2 sources run in the prefill graph with two-level candidates:
+        the full top-k layers score at eager breaks, and the consumers score the
+        published candidate blocks in the graph. Otherwise the sources are one eager
+        break."""
+        return bool(self.low_ratios) and isinstance(
+            self.prefill_candidates, SparseTableBackend
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -3128,10 +3064,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
-        capture_metadata.refresh_for_breakable_cuda_graph_replay_(
-            static_metadata,
-            two_level=self._prefill_graph_two_level(),
-        )
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
@@ -3156,10 +3089,7 @@ class DeepseekV4AttnBackend(
         if held is None:
             self._bcg_tail_metadata[rows] = fresh
             return fresh
-        held.refresh_for_breakable_cuda_graph_replay_(
-            fresh,
-            two_level=self._prefill_graph_two_level(),
-        )
+        held.refresh_for_breakable_cuda_graph_replay_(fresh)
         held.core_attn_metadata.swa_out_cache_loc = (
             fresh.core_attn_metadata.swa_out_cache_loc
         )
@@ -3302,11 +3232,10 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            two_level = self._prefill_graph_two_level()
             captured_index = (
                 run_indexer
                 and layer.indexer is not None
-                and (layer.indexer.uses_candidates or not two_level)
+                and layer.indexer.uses_candidates
             )
             _bcg_low_ratio_source_projections(
                 layer, x, q_lora, pos, bufs, run_compressor, captured_index
@@ -3761,35 +3690,19 @@ class DeepseekV4AttnBackend(
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
-        metadata = (
-            self.forward_metadata.c1_indexer_metadata
-            if ratio == 1
-            else self.forward_metadata.c2_indexer_metadata
-        )
-        assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         inputs = CapturedPrefillInputs(
             indexer=indexer,
             layer_id=layer.layer_id,
             q=projected_q,
             weights=projected_w,
-            paged_metadata=metadata,
+            index_page_size=self.token_to_kv_pool.get_index_k_page_size(ratio),
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        # At any width: inside the candidate window the published table is the
-        # identity, and past it the full top-k would be wrong.
-        if indexer.uses_candidates and self._prefill_graph_two_level():
-            self.prefill_candidates.consume_prefill_captured(
-                inputs, self.forward_metadata.candidate_metadata
-            )
-            return
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Inside the window every block is a candidate: the full top-k applies.
-            width = metadata.max_compressed_seq_len
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
-        self.full_topk_indexer.topk_prefill_captured(inputs)
+        # At any width: the consumer scores only the blocks the source published.
+        self.prefill_candidates.consume_prefill_captured(
+            inputs, self.forward_metadata.candidate_metadata
+        )
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
@@ -3888,25 +3801,15 @@ class DeepseekV4AttnBackend(
             return
         self.forward_metadata.candidate_metadata = published
 
-    def _prefill_graph_two_level(self) -> bool:
-        """Whether the full top-k layers score at eager breaks and the consumers score
-        the published candidate blocks inside the prefill graph."""
-        return isinstance(self.prefill_candidates, SparseTableBackend)
-
     def _prefill_graph_replays_any_context(self) -> bool:
         """Whether a prefill graph replay admits any context length: with two-level
         candidates only c4/c128 compress metadata would be captured at a width."""
-        return (
-            self.low_ratio_prefill_graph
-            and self._prefill_graph_two_level()
-            and not self.has_c4
-            and not self.has_c128
-        )
+        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
 
     @property
     def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's captured indexer width; prefill context parallelism builds
-        its own metadata and needs none."""
+        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
+        context parallelism builds its own metadata and needs none."""
         if (
             self.low_ratios != (1, 2)
             or get_parallel().attn_cp_size > 1

@@ -907,6 +907,15 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Set by someone bisecting a numerical or performance regression to an
+    # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
+    # without rebuilding. The tile is on by default because hipBLASLt ships no
+    # tuned gfx1250 kernel, so the library GEMM this falls back to is slower
+    # than the BF16 path it replaces and, under torch.compile, fails to lower
+    # torch._scaled_mm at all. That is the part the code cannot tell you: this
+    # is a diagnostic switch, not a supported off-ramp -- to actually stop
+    # serving FP8, drop --quantization fp8.
+    SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -1347,6 +1356,11 @@ class Envs:
     # device only, matching how the nvcc path pins -gencode to this GPU.
     SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
+    # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+    # Per-file overrides for dense LoRA plan tables.
+    SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
+
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================
@@ -1732,12 +1746,10 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
-    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
-    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
-    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

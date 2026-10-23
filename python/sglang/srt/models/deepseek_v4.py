@@ -802,10 +802,12 @@ def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> N
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens:
-        output[:real_num_tokens].copy_(
-            layer._mega_core(
-                query[:real_num_tokens], attn_sink, forward_batch, get_attn_backend()
-            )
+        layer._mega_core(
+            query[:real_num_tokens],
+            attn_sink,
+            forward_batch,
+            get_attn_backend(),
+            out=output[:real_num_tokens],
         )
     output[real_num_tokens:].zero_()
 
@@ -1514,6 +1516,7 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         allow_mxfp8_output: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         data, scale = attn_backend.forward(
             q=q,
@@ -1545,7 +1548,7 @@ class MQALayer(MqaAttentionBase):
                 out=(y.view(rows, groups, -1), y_sf),
             )
             return y, y_sf
-        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32))
+        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
     def _get_npu_rope_position_cache(
         self,
@@ -4058,7 +4061,8 @@ class DeepseekV4Model(nn.Module):
                     )
             engram = self.layers[i].engram
             if engram is not None:
-                before_engram = state.residual
+                # No local name holds the pre-Engram residual: it would stay alive
+                # until the next Engram layer.
                 hidden_states = engram(
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
@@ -4071,7 +4075,7 @@ class DeepseekV4Model(nn.Module):
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
-                        before_engram,
+                        state.residual,
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
@@ -4083,6 +4087,7 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
+                del aux
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4353,9 +4358,13 @@ class DeepseekV4Model(nn.Module):
         tail = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
+            # Hand the layer input over without keeping a reference here, so the
+            # layer loop can free it once the first residual replaces it.
+            layer_input = [hidden_states]
+            del hidden_states
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
                 positions,
-                hidden_states,
+                layer_input.pop(),
                 forward_batch,
                 input_ids,
                 input_ids_global,

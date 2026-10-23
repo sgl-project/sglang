@@ -191,7 +191,10 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Wan-Animate-2",
-      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      modelIds: [
+        "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+        "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+      ],
       cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
