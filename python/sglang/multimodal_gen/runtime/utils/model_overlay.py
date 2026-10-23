@@ -53,6 +53,11 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
         "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
     },
+    "FastVideo/FastVideo-FastH3-Omni-8-Step-V1": {
+        "overlay_repo_id": "Niehen6174/FastH3-Omni-overlay",
+        "overlay_revision": "953ede55daf20a70cc6f0b59464293e2f408608c",
+        "source_revision": "53e0d26a1691aa473b6262d8196a8feb2c297df0",
+    },
 }
 
 
@@ -97,33 +102,8 @@ def _compute_overlay_fingerprint(overlay_dir: str) -> str:
     return hasher.hexdigest()
 
 
-def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
-    bundled_overlay_subdir = overlay_spec.get("bundled_overlay_subdir")
-    if not bundled_overlay_subdir:
-        return None
-    bundled_overlay_dir = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "model_overlays",
-            str(bundled_overlay_subdir),
-        )
-    )
-    if not os.path.isdir(bundled_overlay_dir):
-        return None
-    if load_overlay_manifest_if_present(bundled_overlay_dir) is None:
-        return None
-    return bundled_overlay_dir
-
-
 def get_diffusion_cache_root() -> str:
     return envs.SGLANG_DIFFUSION_CACHE_ROOT
-
-
-def clear_model_overlay_registry_cache() -> None:
-    global _MODEL_OVERLAY_REGISTRY_CACHE
-    _MODEL_OVERLAY_REGISTRY_CACHE = None
 
 
 def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
@@ -446,15 +426,6 @@ def download_overlay_metadata(
     *,
     snapshot_download_fn: Callable[..., str],
 ) -> str:
-    bundled_overlay_dir = _resolve_bundled_overlay_dir(overlay_spec)
-    if bundled_overlay_dir is not None:
-        logger.info(
-            "Using bundled overlay metadata for %s from %s",
-            source_model_id,
-            bundled_overlay_dir,
-        )
-        return bundled_overlay_dir
-
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     if os.path.exists(overlay_repo_id):
         logger.info(
