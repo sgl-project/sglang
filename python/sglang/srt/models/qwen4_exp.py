@@ -59,6 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.dequantization import dequantize_layers_to_bf16
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
@@ -105,6 +106,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+# The checkpoint name prefix of the vision tower's tensors
+VISION_CHECKPOINT_PREFIX = "model.visual."
 
 
 def _ple_table_is_fp8(
@@ -2283,6 +2287,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # The vision tower is built in BF16, so its MXFP8 and W4A16_NVFP4
+        # linears load dequantized instead of as raw quantized bytes.
+        if self.visual is not None and isinstance(
+            self.quant_config, ModelOptMixedPrecisionConfig
+        ):
+            weights = dequantize_layers_to_bf16(
+                weights,
+                prefix=VISION_CHECKPOINT_PREFIX,
+                quant_algo_of=self.quant_config.resolve_quant_algo,
+            )
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),

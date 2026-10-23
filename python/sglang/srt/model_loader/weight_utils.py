@@ -39,6 +39,7 @@ from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -499,6 +500,44 @@ def _check_index_files_exist(
     return True, None
 
 
+def safetensors_files_in_index(folder: str, index_file: str, pattern: str) -> List[str]:
+    """The shards INDEX_FILE in FOLDER lists that match PATTERN, as paths in FOLDER."""
+    index_path = os.path.join(folder, index_file)
+    if not os.path.isfile(index_path):
+        return []
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+    shard_names = sorted(set(weight_map.values()))
+    return [
+        os.path.join(folder, shard_name)
+        for shard_name in shard_names
+        if fnmatch.fnmatch(shard_name, pattern)
+    ]
+
+
+def safetensors_files_holding(
+    folder: str,
+    index_file: str,
+    weight_files: List[str],
+    weight_name_filter: Callable[[str], bool],
+) -> List[str]:
+    """The WEIGHT_FILES holding a tensor WEIGHT_NAME_FILTER keeps, by INDEX_FILE in FOLDER.
+
+    Without the index every file is kept, since nothing says where tensors are.
+    """
+    index_path = os.path.join(folder, index_file)
+    if not os.path.isfile(index_path):
+        return weight_files
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+    needed_shards = {
+        os.path.normpath(os.path.join(folder, shard_name))
+        for name, shard_name in weight_map.items()
+        if weight_name_filter(name)
+    }
+    return [path for path in weight_files if os.path.normpath(path) in needed_shards]
+
+
 def _find_local_hf_snapshot_dir_unlocked(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -565,6 +604,12 @@ def _find_local_hf_snapshot_dir_unlocked(
     try:
         for pattern in allow_patterns:
             matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            if not matched_files and pattern.endswith(".safetensors"):
+                matched_files = safetensors_files_in_index(
+                    folder=found_local_snapshot_dir,
+                    index_file=SAFE_WEIGHTS_INDEX_NAME,
+                    pattern=pattern,
+                )
             for f in matched_files:
                 # os.path.exists returns False for broken symlinks.
                 if not os.path.exists(f):
