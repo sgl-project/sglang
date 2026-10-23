@@ -2773,9 +2773,7 @@ class AscendAttnBackend(AttentionBackend):
             self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify()
         )
         if dense_mla_dcp_verify and q.shape[0] == 0:
-            # DSpark makes idle DP ranks execute a zero-token verify pass so
-            # they can participate in model-wide collectives.  There is no
-            # local DCP attention work on those ranks; skip FIA.
+            # Hybrid DP idle batches may be relabeled as zero-token target verify.
             return (
                 q.new_zeros((0, layer.tp_q_head_num * self.kv_lora_rank)),
                 q.new_zeros((0, layer.tp_q_head_num), dtype=torch.float32),
@@ -2931,19 +2929,18 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
                 )
 
+            block_table = self.forward_metadata.block_tables
+            if self.forward_metadata.seq_lens_cpu_int is None:
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+            else:
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
+
             if dense_mla_dcp_verify:
                 # Keep the full query shape, including graph padding rows.
                 query_len = forward_batch.spec_info.draft_token_num
                 batch_size = q.shape[0] // query_len
-                block_table = self.forward_metadata.block_tables[:batch_size]
-                if self.forward_metadata.seq_lens_cpu_int is None:
-                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list[
-                        :batch_size
-                    ]
-                else:
-                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int[
-                        :batch_size
-                    ].tolist()
                 return self._forward_mla_fia(
                     q,
                     q_rope,
@@ -2952,9 +2949,9 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     batch_size=batch_size,
                     query_len=query_len,
-                    block_table=block_table,
+                    block_table=block_table[:batch_size],
                     actual_seq_lengths=[query_len] * batch_size,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv[:batch_size],
                     attn_mask=self.forward_metadata.dcp_mtp_attn_mask[:batch_size],
                     return_softmax_lse=True,
                 )
@@ -2965,12 +2962,6 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
@@ -2982,10 +2973,8 @@ class AscendAttnBackend(AttentionBackend):
             # block_table.shape[0] == len(actual_seq_lengths); slice to match.
             if not self.graph_mode:
                 actual_bs = len(actual_seq_lengths)
-                block_table = self.forward_metadata.block_tables[:actual_bs]
+                block_table = block_table[:actual_bs]
                 actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
-            else:
-                block_table = self.forward_metadata.block_tables
 
             if (
                 self.q_head_num_padding is not None
