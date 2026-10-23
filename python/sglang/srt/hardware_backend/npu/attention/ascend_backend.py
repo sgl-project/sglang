@@ -582,9 +582,14 @@ class AscendAttnBackend(AttentionBackend):
                 torch.int64 if dense_mla_dcp_partial else torch.int32
             )
             if forward_batch.forward_mode.is_target_verify():
+                query_len = int(forward_batch.spec_info.draft_token_num)
                 if spec_algorithm is None or not spec_algorithm.is_dflash_family():
-                    effective_seq_lens_cpu = effective_seq_lens_cpu + int(
-                        forward_batch.spec_info.draft_token_num
+                    effective_seq_lens_cpu = effective_seq_lens_cpu + query_len
+                elif dense_mla_dcp_partial:
+                    # Active Host lengths already include verify tokens; Ascend's
+                    # zero-filled DP padding rows still need the verify block.
+                    effective_seq_lens_cpu = torch.where(
+                        effective_seq_lens_cpu == 0, query_len, effective_seq_lens_cpu
                     )
             elif (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -597,19 +602,6 @@ class AscendAttnBackend(AttentionBackend):
 
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
-            effective_seq_lens = forward_batch.seq_lens
-            if forward_batch.forward_mode.is_target_verify():
-                query_len = forward_batch.spec_info.draft_token_num
-                effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
-                if spec_algorithm is not None and spec_algorithm.is_dflash_family():
-                    # Active Host lengths already include verify tokens; Ascend's
-                    # zero-filled DP padding rows still need the verify block.
-                    effective_seq_lens_cpu = torch.where(
-                        effective_seq_lens_cpu == 0, query_len, effective_seq_lens_cpu
-                    )
-            elif forward_batch.spec_info is not None:
-                step_offset = self.speculative_step_id + 1
-                effective_seq_lens = effective_seq_lens + step_offset
             # Size the table from FIA's Host bound, which can lead device lengths.
             metadata.seq_lens_cpu_int, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
@@ -682,6 +674,12 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         if dense_mla_dcp_partial:
+            effective_seq_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_target_verify():
+                effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
+            elif forward_batch.spec_info is not None:
+                step_offset = self.speculative_step_id + 1
+                effective_seq_lens = effective_seq_lens + step_offset
             metadata.seq_lens = get_dcp_lens(
                 effective_seq_lens,
                 self.dcp_size,
