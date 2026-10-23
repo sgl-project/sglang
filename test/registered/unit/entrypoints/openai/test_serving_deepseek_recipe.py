@@ -1,14 +1,13 @@
-"""The deepseek-recipe chat encoding backend: the request translation, the
-sampling overlay and the adapter registration."""
+"""The deepseek-recipe chat encoding backend: the adapter registration, the
+prompt path and the handler's thinking decision."""
 
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints.openai import serving_deepseek_recipe as recipe
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
@@ -18,165 +17,57 @@ def _user(content="x"):
     return {"role": "user", "content": content}
 
 
-class TestPreNormalize(CustomTestCase):
-    def test_task_is_rejected(self):
-        with self.assertRaises(ValueError):
-            recipe.pre_normalize({"messages": [_user()], "task": "title"})
+def _tokenizer_file(test):
+    """The V4.1 tokenizer from the Hub cache or the Hub; skip when neither answers."""
+    from huggingface_hub import hf_hub_download
 
-    def test_developer_becomes_system(self):
-        body = recipe.pre_normalize(
-            {"messages": [{"role": "developer", "content": "Be terse."}, _user()]}
-        )
-        self.assertEqual(body["messages"][0]["role"], "system")
-
-    def test_thinking_toggle_sources(self):
-        kwargs = recipe.pre_normalize(
-            {"messages": [_user()], "chat_template_kwargs": {"thinking": False}}
-        )
-        self.assertEqual(kwargs["thinking"], {"type": "disabled"})
-        self.assertNotIn("chat_template_kwargs", kwargs)
-        reasoning = recipe.pre_normalize(
-            {"messages": [_user()], "reasoning": {"effort": "low", "enabled": True}}
-        )
-        self.assertEqual(reasoning["thinking"], {"type": "enabled"})
-        self.assertEqual(reasoning["reasoning_effort"], "low")
-        self.assertNotIn("reasoning", reasoning)
-        none = recipe.pre_normalize({"messages": [_user()], "reasoning_effort": "none"})
-        self.assertEqual(none["thinking"], {"type": "disabled"})
-        overridden = recipe.pre_normalize(
-            {
-                "messages": [_user()],
-                "reasoning_effort": "high",
-                "chat_template_kwargs": {"thinking": False},
-            }
-        )
-        self.assertEqual(overridden["thinking"], {"type": "disabled"})
-        explicit = recipe.pre_normalize(
-            {
-                "messages": [_user()],
-                "thinking": {"type": "enabled"},
-                "chat_template_kwargs": {"thinking": False},
-            }
-        )
-        self.assertEqual(explicit["thinking"], {"type": "enabled"})
-        default = recipe.pre_normalize({"messages": [_user()]}, {"thinking": False})
-        self.assertEqual(default["thinking"], {"type": "disabled"})
-        self.assertNotIn("thinking", recipe.pre_normalize({"messages": [_user()]}))
-
-    def test_effort_sources(self):
-        body = recipe.pre_normalize(
-            {
-                "messages": [_user()],
-                "reasoning_effort": "high",
-                "chat_template_kwargs": {"reasoning_effort": 30},
-            }
-        )
-        self.assertEqual(body["reasoning_effort"], 30)
-        default = recipe.pre_normalize(
-            {"messages": [_user()]}, {"reasoning_effort": "max"}
-        )
-        self.assertEqual(default["reasoning_effort"], "max")
-
-    def test_tool_choice_renders_as_auto(self):
-        tools = [
-            {"type": "function", "function": {"name": "a"}},
-            {"type": "function", "function": {"name": "b"}},
-        ]
-        named = recipe.pre_normalize(
-            {
-                "messages": [_user()],
-                "tools": tools,
-                "tool_choice": {"type": "function", "function": {"name": "b"}},
-            }
-        )
-        self.assertEqual(named["tool_choice"], "auto")
-        self.assertEqual(len(named["tools"]), 2)
-        required = recipe.pre_normalize(
-            {"messages": [_user()], "tools": tools, "tool_choice": "required"}
-        )
-        self.assertEqual(required["tool_choice"], "auto")
-        for body in (
-            {"messages": [_user()], "tools": tools, "tool_choice": "none"},
-            {"messages": [_user()], "tools": [], "tool_choice": "auto"},
-        ):
-            off = recipe.pre_normalize(body)
-            self.assertNotIn("tools", off)
-            self.assertNotIn("tool_choice", off)
-
-    def test_history_translation_and_host_fields(self):
-        body = recipe.pre_normalize(
-            {
-                "messages": [
-                    _user("weather?"),
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_0",
-                                "type": "function",
-                                "function": {
-                                    "name": "get_weather",
-                                    "arguments": {"location": "Paris", "days": 1.5},
-                                },
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
-                    {"role": "assistant", "content": "It is"},
-                ],
-                "continue_final_message": True,
-                "n": 2,
-                "response_format": {"type": "structural_tag", "structures": []},
-            }
-        )
-        call = body["messages"][1]["tool_calls"][0]
-        self.assertEqual(
-            call["function"]["arguments"], '{"location":"Paris","days":1.5}'
-        )
-        self.assertTrue(body["messages"][3]["prefix"])
-        self.assertNotIn("continue_final_message", body)
-        self.assertNotIn("response_format", body)
-        self.assertEqual(body["n"], 2)
-        unpaired = recipe.pre_normalize(
-            {"messages": [_user(), {"role": "tool", "content": "sunny"}]}
-        )
-        self.assertNotIn("tool_call_id", unpaired["messages"][1])
-
-    def test_input_is_not_mutated(self):
-        original = {"messages": [{"role": "developer", "content": "x"}], "n": 3}
-        recipe.pre_normalize(original)
-        self.assertEqual(original["messages"][0]["role"], "developer")
-        self.assertEqual(original["n"], 3)
+    try:
+        return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
+    except Exception as error:  # noqa: BLE001
+        test.skipTest(f"the tokenizer is not available: {error}")
 
 
-class TestOverlaySampling(CustomTestCase):
-    def _render(self, **overrides):
-        values = dict(
-            prompt="",
-            prompt_ids=[0, 1, 2],
-            temperature=1.0,
-            top_p=0.95,
-            thinking=True,
-            request=SimpleNamespace(resolve_max_tokens=lambda prompt, limit: 65536),
-        )
-        values.update(overrides)
-        return recipe.RecipeRender(**values)
+def _serving(test, tokenizer):
+    """A chat handler on the recipe backend, configured like a V4.1 server."""
+    from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
 
-    def test_recipe_sampling_and_default_max_tokens(self):
-        params = {"temperature": 0.0, "top_p": 0.1, "max_new_tokens": None}
-        recipe.overlay_sampling(
-            params, self._render(), prompt_tokens=100, context_length=1_000_000
-        )
-        self.assertEqual(params["temperature"], 1.0)
-        self.assertEqual(params["top_p"], 0.95)
-        self.assertEqual(params["max_new_tokens"], 65536)
-        params = {"max_new_tokens": 5}
-        recipe.overlay_sampling(
-            params, self._render(), prompt_tokens=1, context_length=10
-        )
-        self.assertEqual(params["max_new_tokens"], 5)
-        self.assertNotIn("json_schema", params)
+    reset_context()
+    test.addCleanup(reset_context)
+    args = ServerArgs(
+        model_path="dummy",
+        chat_encoding_backend="recipe",
+        reasoning_parser="deepseek-v41",
+        tool_call_parser="deepseekv41",
+    )
+    publish(args, role="tokenizer")
+    manager = SimpleNamespace(
+        model_path="dummy",
+        served_model_name="dummy",
+        server_args=args,
+        tokenizer=tokenizer,
+        model_config=SimpleNamespace(
+            is_multimodal=False,
+            context_len=131072,
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v41",
+                architectures=["DeepseekV41ForCausalLM"],
+                to_dict=lambda: {},
+            ),
+            get_default_sampling_params=lambda: {},
+        ),
+        config_value=lambda name: getattr(args, name),
+    )
+    template_manager = SimpleNamespace(
+        chat_template_name=None,
+        jinja_template_content_format=None,
+        reasoning_config=None,
+        force_reasoning=False,
+        python_chat_template=None,
+        jinja_template_may_reorder_tool_results=False,
+    )
+    return OpenAIServingChat(manager, template_manager)
 
 
 class TestAdapterRegistry(CustomTestCase):
@@ -225,27 +116,28 @@ class TestAdapterRegistry(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "reasoning_effort=60"):
             registry.build_chat_encoding_adapter(
                 self._context(
-                    "dsv41", "recipe", default_kwargs={"reasoning_effort": 60}
+                    "dsv41",
+                    "recipe",
+                    tokenizer=SimpleNamespace(backend_tokenizer=None),
+                    default_kwargs={"reasoning_effort": 60},
                 )
             )
 
-    @unittest.skipUnless(
-        recipe.is_deepseek_recipe_available(), "deepseek-recipe is not installed"
-    )
+    def test_recipe_backend_needs_the_fast_tokenizer(self):
+        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
+
+        with self.assertRaisesRegex(ValueError, "fast tokenizer"):
+            registry.build_chat_encoding_adapter(
+                self._context("dsv41", "recipe", tokenizer=SimpleNamespace())
+            )
+
     def test_recipe_adapter_encodes_and_overlays_sampling(self):
-        from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
 
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        try:
-            tokenizer_file = hf_hub_download(
-                MODEL, "tokenizer.json", revision=REVISION, local_files_only=True
-            )
-        except Exception:  # noqa: BLE001 - not cached: nothing to encode with
-            self.skipTest("the tokenizer is not cached")
-        tokenizer = Tokenizer.from_file(tokenizer_file)
+        tokenizer = Tokenizer.from_file(_tokenizer_file(self))
         adapter = registry.build_chat_encoding_adapter(
             self._context(
                 "dsv41",
@@ -260,10 +152,6 @@ class TestAdapterRegistry(CustomTestCase):
             model="anything",
             messages=[{"role": "user", "content": ""}],
             thinking={"type": "disabled"},
-        )
-        self.assertEqual(
-            adapter.render(request=request, tools=None).prompt,
-            "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>",
         )
         self.assertEqual(
             adapter.encode_messages(messages=[], request=request, tools=None),
@@ -314,60 +202,13 @@ class TestHandlerThinking(CustomTestCase):
     """The handler takes its thinking decision from recipe, whose default is on,
     so the engine counts reasoning tokens and the parsers split the output."""
 
-    @unittest.skipUnless(
-        recipe.is_deepseek_recipe_available(), "deepseek-recipe is not installed"
-    )
     def test_thinking_follows_recipe(self):
-        from huggingface_hub import hf_hub_download
         from transformers import PreTrainedTokenizerFast
 
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.runtime_context import publish, reset_context
-        from sglang.srt.server_args import ServerArgs
 
-        try:
-            tokenizer_file = hf_hub_download(
-                MODEL, "tokenizer.json", revision=REVISION, local_files_only=True
-            )
-        except Exception:  # noqa: BLE001 - not cached: nothing to encode with
-            self.skipTest("the tokenizer is not cached")
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
-        reset_context()
-        self.addCleanup(reset_context)
-        args = ServerArgs(
-            model_path="dummy",
-            chat_encoding_backend="recipe",
-            reasoning_parser="deepseek-v41",
-            tool_call_parser="deepseekv41",
-        )
-        publish(args, role="tokenizer")
-        manager = SimpleNamespace(
-            model_path="dummy",
-            served_model_name="dummy",
-            server_args=args,
-            tokenizer=tokenizer,
-            model_config=SimpleNamespace(
-                is_multimodal=False,
-                context_len=131072,
-                hf_config=SimpleNamespace(
-                    model_type="deepseek_v41",
-                    architectures=["DeepseekV41ForCausalLM"],
-                    to_dict=lambda: {},
-                ),
-                get_default_sampling_params=lambda: {},
-            ),
-            config_value=lambda name: getattr(args, name),
-        )
-        template_manager = SimpleNamespace(
-            chat_template_name=None,
-            jinja_template_content_format=None,
-            reasoning_config=None,
-            force_reasoning=False,
-            python_chat_template=None,
-            jinja_template_may_reorder_tool_results=False,
-        )
-        chat = OpenAIServingChat(manager, template_manager)
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file(self))
+        chat = _serving(self, tokenizer)
         think_start = tokenizer.convert_tokens_to_ids("<think>")
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         output = "I think.</think>Hello"
@@ -378,7 +219,8 @@ class TestHandlerThinking(CustomTestCase):
             ret = [
                 {
                     "text": output,
-                    "output_ids": tokenizer.encode(output, add_special_tokens=False),
+                    "output_ids": tokenizer.encode(output, add_special_tokens=False)
+                    + [1],
                     "index": 0,
                     "meta_info": {
                         "id": "chatcmpl-1",

@@ -156,7 +156,11 @@ def _build_deepseek_recipe(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapt
         DeepSeekRecipeChatEncodingAdapter,
     )
 
-    return DeepSeekRecipeChatEncodingAdapter.from_context(ctx)
+    return DeepSeekRecipeChatEncodingAdapter(
+        chat_encoding_spec=ctx.chat_encoding_spec,
+        tokenizer=ctx.require("tokenizer"),
+        default_chat_template_kwargs=ctx.default_chat_template_kwargs,
+    )
 
 
 _BUILDERS: dict[

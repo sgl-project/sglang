@@ -519,7 +519,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 hf_config=self.tokenizer_manager.model_config.hf_config,
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
-                default_chat_template_kwargs=self.default_chat_template_kwargs,
+                default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
                 backend=backend,
             )
         )
