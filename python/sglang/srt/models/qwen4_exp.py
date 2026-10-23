@@ -45,7 +45,10 @@ from sglang.srt.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
-from sglang.srt.layers.hyperconnection_packed import PackedHCModelMixin
+from sglang.srt.layers.hyperconnection_packed import (
+    check_packed_hc_initial_load,
+    prepare_packed_hc_weights,
+)
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
     SumGroup,
@@ -2208,9 +2211,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         return model_output
 
 
-class Qwen4ExpForConditionalGeneration(
-    PackedHCModelMixin, Qwen3VLForConditionalGeneration
-):
+class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2231,6 +2232,7 @@ class Qwen4ExpForConditionalGeneration(
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
+        self.register_load_state_dict_pre_hook(check_packed_hc_initial_load)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
@@ -2240,6 +2242,12 @@ class Qwen4ExpForConditionalGeneration(
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
+
+    def post_load_weights(self, *, force=True):
+        prepare_packed_hc_weights(self, force=force)
+
+    def post_load_weights_from_preprocessed(self):
+        prepare_packed_hc_weights(self, weights_preprocessed=True)
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -2301,6 +2309,7 @@ class Qwen4ExpForConditionalGeneration(
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        check_packed_hc_initial_load(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),

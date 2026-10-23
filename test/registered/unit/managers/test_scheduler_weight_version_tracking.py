@@ -302,72 +302,38 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
                 run_post_load=False
             )
 
-    def test_incomplete_end_preserves_session_without_finalizing_any_runner(self):
-        """A missing HC bucket must reject end before any runner is repacked."""
-        target, draft = _runner(), _runner()
-        validator = draft.weight_updater.validate_weight_update
-        validator.side_effect = ValueError("HC missing Inject")
-        manager = self._manager(target, draft)
-        manager._session = _WeightUpdateSession(selector="all", loaded_weights=True)
-
-        with patch("torch.distributed.is_initialized", return_value=False):
-            rejected = manager.end_weight_update(EndWeightUpdateReqInput())
-
-            self.assertFalse(rejected.success)
-            self.assertIn("draft", rejected.message)
-            self.assertIn("missing Inject", rejected.message)
-            self.assertIsNotNone(manager._session)
-            for runner in (target, draft):
-                runner.weight_updater.end_weight_update.assert_not_called()
-
-            # The caller can supply the missing bucket and retry this session.
-            validator.side_effect = None
-            completed = manager.end_weight_update(EndWeightUpdateReqInput())
-            self.assertTrue(completed.success, completed.message)
-            self.assertIsNone(manager._session)
-            for runner in (target, draft):
-                runner.weight_updater.end_weight_update.assert_called_once_with(
-                    run_post_load=False
-                )
-
-    def test_peer_incomplete_end_prevents_local_finalization(self):
-        """Every TP rank must reject end when a peer still has pending HC weights."""
-        target = _runner()
-        manager = self._manager(target)
-        manager._session = _WeightUpdateSession(selector="all", loaded_weights=True)
-
-        def gather(errors, local_error, *, group):
-            self.assertIsNone(local_error)
-            errors[:] = [None, "target: HC missing Down"]
-
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.all_gather_object", side_effect=gather),
-        ):
-            output = manager.end_weight_update(EndWeightUpdateReqInput())
-
-        self.assertFalse(output.success)
-        self.assertIn("missing Down", output.message)
-        self.assertIsNotNone(manager._session)
-        target.weight_updater.end_weight_update.assert_not_called()
-
     def test_session_selector_confines_begin_and_end_to_selected_runners(self):
         """end finalizing a runner begin never restored would repack unrestored weights."""
         target, draft = _runner(), _runner()
         manager = self._manager(target, draft, session=False)
 
+        target.weight_updater.check_weight_update_session_supported.side_effect = (
+            ValueError("unselected target must not be validated")
+        )
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
         manager._session = _WeightUpdateSession(selector="draft", loaded_weights=True)
-        target.weight_updater.validate_weight_update.side_effect = ValueError(
-            "unselected target must not be validated"
-        )
         manager.end_weight_update(EndWeightUpdateReqInput())
 
         target.weight_updater.begin_weight_update.assert_not_called()
         target.weight_updater.end_weight_update.assert_not_called()
+        target.weight_updater.check_weight_update_session_supported.assert_not_called()
         draft.weight_updater.begin_weight_update.assert_called_once_with()
         draft.weight_updater.end_weight_update.assert_called_once()
+
+    def test_unsupported_draft_rejects_begin_before_any_runner_is_restored(self):
+        """An unsupported draft must not leave the target in a half-open session."""
+        target, draft = _runner(), _runner()
+        draft.weight_updater.check_weight_update_session_supported.side_effect = (
+            ValueError("Online weight updates are not supported with packed HC")
+        )
+        manager = self._manager(target, draft, session=False)
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput(selector="all"))
+        self.assertFalse(output.success)
+        self.assertIn("draft", output.message)
+        self.assertIn("Online weight updates", output.message)
+        self.assertIsNone(manager._session)
+        for runner in (target, draft):
+            runner.weight_updater.begin_weight_update.assert_not_called()
 
     def test_begin_rejects_reentry(self):
         """A second begin would leave the first session's runners unfinalized."""

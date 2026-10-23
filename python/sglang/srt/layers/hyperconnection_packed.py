@@ -5,19 +5,14 @@ Native state dictionaries contain already-folded Down+Inject and interleaved RMS
 they must not be folded again. No original checkpoint tensors are retained.
 """
 
-import logging
-from contextlib import contextmanager
 from functools import cache
 from typing import Optional
 
-import msgspec
 import torch
 from torch import nn
 
 from sglang.kernels.ops.gemm.hc_mix import _deterministic_inference
 from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionBase
-
-logger = logging.getLogger(__name__)
 
 
 @cache
@@ -88,10 +83,16 @@ class _PackedParameter(nn.Module):
 class PackedGatedResidual(GatedResidual):
     """Native Down+Inject/RMS storage, shared by the small- and large-T kernels.
 
-    Updates are serialized with inference. Raw checkpoint updates are finalized
-    once at a complete-load boundary, so RMS may arrive after either projection.
-    Changing RMS requires both raw projections; native updates use packed tensors.
+    Checkpoint weights are folded once after the initial load. Online updates
+    are unsupported; native checkpoints contain the already-folded parameters.
     """
+
+    _derived_weight_cache_error = (
+        "Online weight updates are not supported with packed HyperConnection "
+        "weights in this version. Reload the model to change its weights."
+    )
+    # Also reject sessions that bypass loaders and write native storage directly.
+    _reject_weight_update_sessions = True
 
     def __init__(self, config, role: Optional[str] = None):
         HyperConnectionBase.__init__(self, config, True, True, role)
@@ -109,9 +110,6 @@ class PackedGatedResidual(GatedResidual):
         self._hc_loaded_weights = set()
         self._hc_load_format = None
         self._hc_weights_ready = False
-        self._hc_needs_full_reload = False
-        self._hc_update_open = False
-        self._hc_refresh_up = False
         self._install_weight_loaders()
         self.register_load_state_dict_pre_hook(self._before_native_state_load)
         self.register_load_state_dict_post_hook(self._after_native_state_load)
@@ -186,15 +184,12 @@ class PackedGatedResidual(GatedResidual):
     def _install_weight_loaders(self):
         for parameter in self.parameters():
             parameter.weight_loader = self._load_sum_source_weight
-            parameter.hc_weight_loader = self._load_sum_source_weight
         self.input_mix_weight_down.weight.hc_merged_down_inject = True
-        self.input_mix_weight_down.weight.weight_loader_aliases = (
-            "input_mix_weight_down.weight",
-            "block_inject_weight.weight",
-        )
 
     @torch.no_grad()
     def _load_sum_source_weight(self, parameter, loaded_weight, *, copy_value=True):
+        if self._hc_weights_ready:
+            raise ValueError(self._derived_weight_cache_error)
         c, h, lowrank = self.hc_count, self.hidden_size, self.config.hc_lowrank
         if parameter is self.input_mix_weight_up.weight:
             if loaded_weight.shape != parameter.shape:
@@ -237,73 +232,28 @@ class PackedGatedResidual(GatedResidual):
                 )
             self._hc_load_format = source_format
         self._sum_weights_dirty = True
-        try:
-            if copy_value:
-                destination.copy_(value)
-        except Exception:
-            update_open = self._hc_update_open
-            self.abort_sum_state_update()
-            self._hc_update_open = update_open
-            raise
+        if copy_value:
+            destination.copy_(value)
         self._hc_loaded_weights.add(key)
-
-    def begin_sum_state_update(self, *, reuse=False):
-        if self._hc_update_open:
-            if reuse:
-                return False
-            raise ValueError("A packed HC weight update is already open")
-        if self._hc_loaded_weights:
-            logger.warning(
-                "Discarding an incomplete HC update; reload complete HC weights"
-            )
-            self.abort_sum_state_update()
-        self._hc_update_open = True
-        return True
-
-    def abort_sum_state_update(self):
-        # In-place writes are not rolled back. A subsequent session must supply
-        # a complete raw or native group before this module can run again.
-        self._hc_update_open = False
-        self._hc_weights_ready = False
-        self._hc_needs_full_reload = True
-        self._sum_weights_dirty = True
-        self._hc_loaded_weights.clear()
-        self._hc_load_format = None
-        self._hc_refresh_up = False
 
     def offload_resident_parameters(self):
         # Both shells retain views of these tensors (and a padded Up layout).
         # Parameter-only functional_call offload cannot replace those views.
         return self.parameters()
 
-    def finish_sum_state_update(self, *, force=False):
-        self.prepare_sum_state_weights(force=force, finalize=True)
-        self._hc_update_open = False
-
-    def validate_sum_state_weights(self):
+    def _validate_initial_weights(self):
         loaded = self._hc_loaded_weights
-        complete_required = self._hc_needs_full_reload or not self._hc_weights_ready
         if self._hc_load_format == "checkpoint":
-            pair = loaded & {"down", "inject"}
-            if len(pair) == 1 or ("norm" in loaded and len(pair) != 2):
-                raise ValueError(
-                    "Packed HC requires Down and Inject together; "
-                    "an RMS update also requires both original projections"
-                )
-            if complete_required and not {"down", "inject", "norm", "up"} <= loaded:
+            if not {"down", "inject", "norm", "up"} <= loaded:
                 raise ValueError(
                     "Initial packed HC loading requires Down, Inject, RMS and Up"
                 )
         elif self._hc_load_format == "native":
-            if "norm" in loaded and "packed" not in loaded:
-                raise ValueError(
-                    "A native HC RMS update also requires folded Down+Inject"
-                )
-            if complete_required and not {"packed", "norm", "up"} <= loaded:
+            if not {"packed", "norm", "up"} <= loaded:
                 raise ValueError(
                     "Initial native HC loading requires packed Down, RMS and Up"
                 )
-        elif complete_required:
+        else:
             raise ValueError("Packed HC weights have not been loaded")
 
     @torch.no_grad()
@@ -323,42 +273,26 @@ class PackedGatedResidual(GatedResidual):
         self._hc_load_format = "native"
 
     @torch.no_grad()
-    def prepare_sum_state_weights(self, *, force=False, finalize=False):
-        if force:
-            self._hc_refresh_up = True
-            self._sum_weights_dirty = True
-        if self._hc_update_open and not finalize:
-            return False
-        if self._hc_refresh_up and not self._hc_loaded_weights:
-            if self._hc_needs_full_reload:
-                raise ValueError(
-                    "A failed HC update requires a complete raw or native reload; "
-                    "force preparation cannot validate unobserved writes"
-                )
-            # Sharded/native loaders and P2P/RDMA write the registered native
-            # tensors directly. Force rebinds caches; it never folds them again.
-            self._hc_weights_ready = True
-            self._sum_weights_dirty = True
-        if not self._sum_weights_dirty:
+    def prepare_sum_state_weights(self, *, force=False):
+        if self._hc_weights_ready:
             return True
-        self.validate_sum_state_weights()
-        if self._hc_load_format == "checkpoint" and "down" in self._hc_loaded_weights:
+        if force and not self._hc_loaded_weights:
+            # Dummy/sharded loaders initialize the registered native tensors
+            # directly. They need local views, not another checkpoint fold.
+            self._hc_load_format = "native"
+            self._hc_loaded_weights.update(("packed", "norm", "up"))
+        self._validate_initial_weights()
+        if self._hc_load_format == "checkpoint":
             self._fold_checkpoint_weights()
+        self._bind_native_weights()
         self._hc_weights_ready = True
-        self._bind_native_weights(
-            refresh_up=self._hc_refresh_up or "up" in self._hc_loaded_weights
-        )
         self._hc_loaded_weights.clear()
         self._hc_load_format = None
         self._sum_weights_dirty = False
-        self._hc_refresh_up = False
-        self._hc_needs_full_reload = False
-        if finalize:
-            self._hc_update_open = False
         return True
 
     @torch.no_grad()
-    def _bind_native_weights(self, *, refresh_up):
+    def _bind_native_weights(self):
         from sglang.kernels.ops.elementwise.hc_down_batched_sum import (
             BatchedDownWeights,
         )
@@ -400,43 +334,27 @@ class PackedGatedResidual(GatedResidual):
             norm_weight_permuted=norm,
             deterministic=self._deterministic_hc,
         )
-        if self._sum_operators is None:
-            small = SmallTSumHCShell(
-                self,
-                down_weights=weights,
-                norm_weight_permuted=norm,
-                deterministic=self._deterministic_hc,
-            )
-        else:
-            from sglang.kernels.ops.gemm.hc_mix_splitk import permute_pad_up_weight
-
-            small = self._sum_operators[0]
-            previous = small.weights
-            if refresh_up:
-                previous.up.copy_(permute_pad_up_weight(up, self.hc_count))
-            # Scratch is client-local and is never exported over IPC. Refresh
-            # its initial state at serialized load boundaries, preserving Graph pointers.
-            previous.scratch.zero_()
-            small.weights = msgspec.structs.replace(
-                previous, down_inject=weights.matrix, norm_permuted=norm
-            )
+        small = SmallTSumHCShell(
+            self,
+            down_weights=weights,
+            norm_weight_permuted=norm,
+            deterministic=self._deterministic_hc,
+        )
         self._sum_operators = (small, large)
         self._install_weight_loaders()
 
     @torch.no_grad()
     def restore_sum_state_from_ipc(self):
-        if self._hc_needs_full_reload:
-            raise ValueError("A failed HC update requires a complete reload")
-        self._hc_weights_ready = True
-        self._bind_native_weights(refresh_up=True)
-        self._sum_weights_dirty = False
+        if self._hc_load_format == "checkpoint":
+            raise ValueError("Preprocessed HC loading cannot contain raw weights")
+        self.prepare_sum_state_weights(force=True)
 
     def _apply(self, fn, recurse=True):
         self._sum_operators = None
         result = nn.Module._apply(self, fn, recurse=recurse)
         self._install_weight_loaders()
         if self._hc_weights_ready and not self._hc_loaded_weights:
-            self._bind_native_weights(refresh_up=True)
+            self._bind_native_weights()
         return result
 
     def _before_native_state_load(
@@ -450,6 +368,8 @@ class PackedGatedResidual(GatedResidual):
         unexpected_keys,
         error_msgs,
     ):
+        if self._hc_weights_ready:
+            raise ValueError(self._derived_weight_cache_error)
         assign = local_metadata.get("assign_to_params_buffers", False)
         names = {
             "input_mix_weight_down.weight": self.input_mix_weight_down.weight,
@@ -463,10 +383,6 @@ class PackedGatedResidual(GatedResidual):
             if prefix + name in state_dict
         }
         down = selected.get("input_mix_weight_down.weight")
-        if not self._hc_update_open and "hc_norm.weight" in selected and down is None:
-            raise ValueError(
-                "An RMS update requires Down and Inject (or their native packed tensor)"
-            )
         norm = selected.get("hc_norm.weight")
         raw = (
             "block_inject_weight.weight" in selected
@@ -478,34 +394,18 @@ class PackedGatedResidual(GatedResidual):
                 "Raw HC checkpoint loading requires assign=False; "
                 "assign=True supports native packed state"
             )
-        if assign and selected:
-            # Replacing storage requires new shells and Graph recapture.
-            self._sum_operators = None
-            self._sum_weights_dirty = True
         if raw:
             if self._hc_packed_down.is_meta:
                 raise ValueError(
                     "Materialize HC before raw checkpoint loading; "
                     "meta assign supports native packed state"
                 )
-            if (
-                not self._hc_update_open
-                and not {
-                    "input_mix_weight_down.weight",
-                    "block_inject_weight.weight",
-                }
-                <= selected.keys()
-            ):
-                raise ValueError("Packed HC requires Down and Inject together")
             for name, value in selected.items():
                 self._load_sum_source_weight(
                     names[name], value, copy_value=name != "input_mix_weight_up.weight"
                 )
-            # A state_dict call can be one bucket of an explicit update session.
-            # Preserve raw values until end: a later bucket may supply new RMS.
-            if not self._hc_update_open:
-                self.validate_sum_state_weights()
-                self._fold_checkpoint_weights()
+            self._validate_initial_weights()
+            self._fold_checkpoint_weights()
             state_dict.pop(prefix + "block_inject_weight.weight", None)
             if down is not None or "block_inject_weight.weight" in selected:
                 state_dict[prefix + "input_mix_weight_down.weight"] = (
@@ -522,77 +422,29 @@ class PackedGatedResidual(GatedResidual):
     def _after_native_state_load(self, module, incompatible_keys):
         if not self._hc_weights_ready and not self._hc_loaded_weights:
             return
-        # assign=True may replace Parameter objects after the pre-hook. Rebind
-        # views and loader callbacks as well as refreshing Up's derived layout.
-        self.prepare_sum_state_weights(finalize=not self._hc_update_open)
+        # Native assign may replace Parameter objects during the initial load.
+        self.prepare_sum_state_weights()
         self._install_weight_loaders()
 
 
-class PackedHCModelMixin:
-    """Model-owned loading hooks for native HC parameters and their local views.
+def check_packed_hc_initial_load(model, *_):
+    """Reject reloads before a model loader or state-dict traversal writes anything."""
+    for module in model.modules():
+        if isinstance(module, PackedGatedResidual) and module._hc_weights_ready:
+            raise ValueError(module._derived_weight_cache_error)
 
-    The generic loaders/updater dispatch model hooks, without inspecting HC
-    layers. Preprocessed native imports only rebind views; they must not rerun
-    checkpoint folding or other model/quantization postprocessing.
-    """
 
-    def _packed_hc_modules(self):
-        return (
-            (name, module)
-            for name, module in self.named_modules()
-            if isinstance(module, PackedGatedResidual)
-        )
-
-    def post_load_weights(self, *, force=True):
-        for _, module in self._packed_hc_modules():
-            module.prepare_sum_state_weights(force=force)
-
-    def post_load_weights_from_direct(self, *, force=False):
-        # Direct/custom loaders only changed parameter storage. Do not rerun
-        # unrelated checkpoint transformations on already-processed weights.
-        PackedHCModelMixin.post_load_weights(self, force=force)
-
-    def post_load_weights_from_preprocessed(self):
-        for _, module in self._packed_hc_modules():
-            module.restore_sum_state_from_ipc()
-
-    def begin_weight_update(self):
-        for _, module in self._packed_hc_modules():
-            module.begin_sum_state_update()
-
-    def validate_weight_update(self):
-        for name, module in self._packed_hc_modules():
+def prepare_packed_hc_weights(model, *, force=True, weights_preprocessed=False):
+    """Bind initial HC weights; preprocessed imports must never be folded again."""
+    for name, module in model.named_modules():
+        if isinstance(module, PackedGatedResidual):
             try:
-                module.validate_sum_state_weights()
+                if weights_preprocessed:
+                    module.restore_sum_state_from_ipc()
+                else:
+                    module.prepare_sum_state_weights(force=force)
             except ValueError as exc:
                 raise ValueError(f"{name or '<root>'}: {exc}") from exc
-
-    def end_weight_update(self, *, force=False):
-        self.validate_weight_update()
-        for _, module in self._packed_hc_modules():
-            module.finish_sum_state_update(force=force)
-
-    @contextmanager
-    def weight_update_context(self):
-        # Checkpoint-engine can deliver multiple buckets inside or outside an
-        # already-open update session. Only finish/abort sessions opened here.
-        owned = []
-        try:
-            for name, module in self._packed_hc_modules():
-                if module.begin_sum_state_update(reuse=True):
-                    owned.append((name, module))
-            yield
-            for name, module in owned:
-                try:
-                    module.validate_sum_state_weights()
-                except ValueError as exc:
-                    raise ValueError(f"{name or '<root>'}: {exc}") from exc
-            for _, module in owned:
-                module.finish_sum_state_update()
-        except Exception:
-            for _, module in owned:
-                module.abort_sum_state_update()
-            raise
 
 
 def create_gated_residual(config, use_mix=True, use_combine=True, role=None):

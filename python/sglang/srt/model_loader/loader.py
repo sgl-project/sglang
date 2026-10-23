@@ -323,13 +323,6 @@ def post_load_weights(model: nn.Module, *, weights_preprocessed: bool = False) -
     hook = getattr(model, hook_name, None)
     if hook is not None:
         hook()
-    validate_model_weights(model)
-
-
-def validate_model_weights(model: nn.Module) -> None:
-    validate = getattr(model, "validate_weight_update", None)
-    if validate is not None:
-        validate()
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -1038,7 +1031,6 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         DefaultModelLoader.load_weights_only(model, weights, target_device)
-        validate_model_weights(model)
         DefaultModelLoader.postprocess_weights(model, target_device)
 
     @staticmethod

@@ -1,8 +1,7 @@
 """A tensor weight update loads the entry of the process's deployment TP rank."""
 
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -10,13 +9,11 @@ import torch
 from sglang.srt.layers.hyperconnection import HyperConnectionConfig
 from sglang.srt.layers.hyperconnection_packed import (
     PackedGatedResidual,
-    PackedHCModelMixin,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
     WeightUpdater,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, post_load_weights
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,11 +62,20 @@ class TestTensorUpdateRank(unittest.TestCase):
         self.assertTrue(torch.equal(model.weight.detach(), per_rank[1]))
 
 
-class _HCModel(PackedHCModelMixin, torch.nn.Module):
-    pass
+class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
+    def _updater(self, model):
+        return WeightUpdater(
+            tp_rank=0,
+            device="cpu",
+            gpu_id=0,
+            model_config=None,
+            custom_weight_loaders={},
+            get_model=lambda: model,
+            update_model_fields=lambda **kwargs: self.fail("model metadata changed"),
+            recapture_cuda_graph=lambda: self.fail("Graph was recaptured"),
+            get_model_runner=lambda: self.fail("checkpoint worker was constructed"),
+        )
 
-
-class TestHCWeightUpdateCompletion(CustomTestCase):
     def test_checkpoint_load_rejects_completely_missing_hc_weights(self):
         from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
         from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
@@ -93,152 +99,122 @@ class TestHCWeightUpdateCompletion(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "have not been loaded"):
                     model.load_weights([])
                 self.assertFalse(model.hc._hc_weights_ready)
+                model.hc._hc_weights_ready = True
+                with self.assertRaisesRegex(ValueError, "Online weight updates"):
+                    model.load_weights([])
 
-    def test_checkpoint_engine_buckets_finalize_once_and_recover(self):
-        model = _HCModel()
+    def test_packed_hc_rejects_update_entrypoints_before_mutation(self):
+        model = torch.nn.Module()
         model.hc = PackedGatedResidual(
             HyperConnectionConfig(
-                hidden_size=512,
-                hc_lowrank=8,
-                hc_per_branch_norm=True,
-                params_dtype=torch.bfloat16,
+                hidden_size=512, hc_lowrank=8, hc_per_branch_norm=True
             )
         )
-        payload = {
-            "input_mix_weight_down.weight": torch.ones(8, 2048, dtype=torch.bfloat16),
-            "block_inject_weight.weight": torch.full(
-                (4, 2048), 2, dtype=torch.bfloat16
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        model.load_weights = lambda weights: self.fail("an update reached the loader")
+        updater = self._updater(model)
+        calls = (
+            lambda: updater.update_weights_from_disk("unused", "auto"),
+            lambda: updater.load_weights_from_distributed([]),
+            lambda: updater.update_weights_from_tensor([], load_format="direct"),
+            lambda: updater.update_weights_from_tensor(
+                [], load_format="flattened_bucket"
             ),
-            "input_mix_weight_up.weight": torch.full(
-                (2048, 8), 3, dtype=torch.bfloat16
-            ),
-            "hc_norm.weight": torch.full((2048,), 0.5, dtype=torch.bfloat16),
-        }
-
-        def load_bucket(items):
-            parameters = dict(model.hc.named_parameters())
-            for name, value in items:
-                name = name.replace(
-                    "block_inject_weight.weight", "input_mix_weight_down.weight"
-                )
-                parameter = parameters[name]
-                parameter.weight_loader(parameter, value)
-            self.assertFalse(model.hc.prepare_sum_state_weights())
-
-        model.load_weights = load_bucket
-        should_fail = False
-
-        class Worker:
-            def __init__(self, runner):
-                self.runner = runner
-
-            def update_weights_from_ipc(self, handles):
-                for index, item in enumerate(payload.items()):
-                    self.runner.model.load_weights([item])
-                    if should_fail and index == 0:
-                        raise RuntimeError("interrupted synthetic IPC update")
-
-        fake = ModuleType("sglang.srt.checkpoint_engine.checkpoint_engine_worker")
-        fake.SGLangCheckpointEngineWorkerExtensionImpl = Worker
-        updater = WeightUpdater(
-            tp_rank=0,
-            device="cpu",
-            gpu_id=0,
-            model_config=None,
-            custom_weight_loaders={},
-            get_model=lambda: model,
-            update_model_fields=lambda *args, **kwargs: None,
-            recapture_cuda_graph=lambda: None,
-            get_model_runner=lambda: SimpleNamespace(model=model),
+            lambda: updater.update_weights_from_ipc(SimpleNamespace(zmq_handles={})),
         )
-        with (
-            patch.dict(sys.modules, {fake.__name__: fake}),
-            patch.object(WeightUpdater, "_assert_weight_cache_inactive"),
-            patch(
-                "sglang.srt.model_executor.model_runner_components.weight_updater._unsupported_derived_weight_cache_error",
-                return_value=None,
-            ),
-        ):
-            request = SimpleNamespace(zmq_handles={})
-            success, message = updater.update_weights_from_ipc(request)
-            self.assertTrue(success, message)
-            torch.testing.assert_close(
-                model.hc._hc_packed_down[:, :8],
-                torch.full((4, 8, 512), 1.5, dtype=torch.bfloat16),
-            )
-            self.assertFalse(model.hc._hc_update_open)
-            should_fail = True
-            success, _ = updater.update_weights_from_ipc(request)
-            self.assertFalse(success)
-            self.assertFalse(model.hc._hc_weights_ready)
-            self.assertFalse(model.hc._hc_update_open)
-            with self.assertRaisesRegex(ValueError, "complete raw or native reload"):
-                post_load_weights(model)
-            self.assertFalse(model.hc._hc_weights_ready)
-            should_fail = False
-            updater.begin_weight_update()
-            success, message = updater.update_weights_from_ipc(request)
-            self.assertTrue(success, message)
-            self.assertTrue(model.hc._hc_update_open)  # Outer session still owns end.
-            updater.end_weight_update(run_post_load=False)
-            self.assertTrue(model.hc._hc_weights_ready)
-            self.assertFalse(model.hc._hc_update_open)
-            torch.testing.assert_close(
-                model.hc._hc_packed_down[:, :8],
-                torch.full((4, 8, 512), 1.5, dtype=torch.bfloat16),
-            )
+        with patch.object(WeightUpdater, "_assert_weight_cache_inactive"):
+            for index, call in enumerate(calls):
+                with self.subTest(entrypoint=index):
+                    success, message = call()
+                    self.assertFalse(success)
+                    self.assertIn("Online weight updates are not supported", message)
+            for call in (
+                updater.begin_weight_update,
+                lambda: updater.end_weight_update(run_post_load=True),
+            ):
+                with self.assertRaisesRegex(ValueError, "Online weight updates"):
+                    call()
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
-    def test_pending_hc_rejects_completion_even_when_post_load_is_skipped(self):
-        """A successful bucket is not a complete HC update or a valid initial load."""
-        hc = PackedGatedResidual.__new__(PackedGatedResidual)
-        torch.nn.Module.__init__(hc)
-        hc._packed_sum_weights = True
-        hc._hc_loaded_weights = {"down"}
-        hc._sum_weights_dirty = True
-        hc._sum_operators = (object(), object())
-        hc._hc_load_format = "checkpoint"
-        hc._hc_weights_ready = True
-        hc._hc_needs_full_reload = False
-        hc._hc_update_open = True
-        hc._hc_refresh_up = False
-        model = _HCModel()
-        model.add_module("hc", hc)
-        model.load_weights = lambda weights: None
-        updater = WeightUpdater(
-            tp_rank=0,
-            device="cpu",
-            gpu_id=0,
-            model_config=None,
-            custom_weight_loaders={},
-            get_model=lambda: model,
-            update_model_fields=lambda *args, **kwargs: None,
-            recapture_cuda_graph=lambda: None,
-            get_model_runner=lambda: None,
-        )
+    def test_other_derived_caches_keep_existing_native_sessions(self):
+        """A non-HC cache marker alone must not disable native-memory sessions."""
+        model = torch.nn.Linear(2, 2, bias=False)
+        model._derived_weight_cache_error = "existing non-HC derived cache"
+        updater = self._updater(model)
         with (
             patch(
                 "sglang.srt.model_executor.model_runner_components.weight_updater."
-                "DefaultModelLoader.postprocess_weights",
-            ) as postprocess,
-            patch("sglang.srt.model_loader.loader.is_cuda_alike", return_value=False),
+                "DefaultModelLoader.restore_weights_before_loading"
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components.weight_updater."
+                "DefaultModelLoader.postprocess_weights"
+            ),
         ):
-            with self.assertRaisesRegex(ValueError, "hc:.*Down and Inject"):
-                updater.end_weight_update(run_post_load=False)
-            with self.assertRaisesRegex(ValueError, "hc:.*Down and Inject"):
-                post_load_weights(model)
-            # Initial/default disk loading has no begin/end update session.
-            with self.assertRaisesRegex(ValueError, "hc:.*Down and Inject"):
-                DefaultModelLoader.load_weights_and_postprocess(
-                    model, [], torch.device("cpu")
-                )
-            postprocess.assert_not_called()
+            updater.begin_weight_update()
+            with torch.no_grad():
+                model.weight.fill_(2)
+            updater.end_weight_update(run_post_load=True)
+        torch.testing.assert_close(model.weight, torch.full((2, 2), 2.0))
 
-            hc._hc_loaded_weights.clear()
-            hc._hc_load_format = None
-            hc._hc_refresh_up = False
-            hc._sum_weights_dirty = False
-            updater.end_weight_update(run_post_load=False)
-            postprocess.assert_called_once()
+    def test_model_state_dict_guards_run_before_any_parameter_is_written(self):
+        """Both actual model constructors must install the root reload guard."""
+        from sglang.srt.models import qwen4_exp, qwen4_exp_mtp
+
+        config = SimpleNamespace(hidden_size=512, hc_count=4, vocab_size=8)
+
+        def init_parent(instance, config, *_):
+            torch.nn.Module.__init__(instance)
+            instance.config = config
+            instance.language_model_only = True
+            instance.visual = None
+
+        with patch.object(
+            qwen4_exp.Qwen3VLForConditionalGeneration, "__init__", init_parent
+        ):
+            models = [qwen4_exp.Qwen4ExpForConditionalGeneration(config)]
+        with (
+            patch.object(
+                qwen4_exp_mtp,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_group=None, enable_dp_lm_head=False),
+            ),
+            patch.object(
+                qwen4_exp_mtp.Qwen4ExpForCausalLMMTP,
+                "_init_mtp_input_fusion",
+                return_value=None,
+            ),
+            patch.object(
+                qwen4_exp_mtp, "Qwen4ExpModel", return_value=torch.nn.Module()
+            ),
+            patch.object(
+                qwen4_exp_mtp, "ParallelLMHead", return_value=torch.nn.Identity()
+            ),
+            patch.object(
+                qwen4_exp_mtp, "LogitsProcessor", return_value=torch.nn.Identity()
+            ),
+        ):
+            models.append(qwen4_exp_mtp.Qwen4ExpForCausalLMMTP(config))
+        for model in models:
+            with self.subTest(model=type(model).__name__):
+                model.before_hc = torch.nn.Parameter(
+                    torch.zeros(1), requires_grad=False
+                )
+                model.hc = PackedGatedResidual(
+                    HyperConnectionConfig(
+                        hidden_size=512, hc_lowrank=8, hc_per_branch_norm=True
+                    )
+                )
+                model.hc._hc_weights_ready = True
+                with self.assertRaisesRegex(ValueError, "Online weight updates"):
+                    model.load_state_dict({"before_hc": torch.ones(1)}, strict=False)
+                torch.testing.assert_close(
+                    model.before_hc, torch.zeros(1), rtol=0, atol=0
+                )
 
 
 if __name__ == "__main__":
