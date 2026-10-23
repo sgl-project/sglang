@@ -152,6 +152,19 @@ def get_storage_hash_str(
     return get_hash_str(key, prior_hash, page_size=page_size)
 
 
+def get_event_hash_str(
+    key: Any,
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    """Keep router event IDs in their legacy salt-only hash domain."""
+    if prior_hash is None and getattr(key, "cache_salt", None) is not None:
+        prior_hash = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + key.cache_salt.encode("utf-8")
+        ).hexdigest()
+    return get_hash_str(key, prior_hash, page_size=page_size)
+
+
 def hash_str_to_int64(hash_str: str) -> int:
     """Convert SHA256 hex string to signed 64-bit integer for events.
 

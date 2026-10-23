@@ -353,7 +353,7 @@ class KVCRStore(HiCacheStorage):
 
     def _operation_hint(self, extra_info, keys=None):
         hint = (
-            peer_hint(extra_info, self._source_offset)
+            peer_hint(extra_info, self._source_offset, keys)
             if self._extra.get("enable_remote_hint", True)
             else None
         )
