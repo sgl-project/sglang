@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real HTTP/GPU lifecycle regression; extra topologies run when two GPUs exist."""
+"""Real HTTP/GPU lifecycle regression with a small Wan checkpoint.
+
+CI runs single/batch2 on diffusion partition 0. With two GPUs, pytest also runs
+DP2, Ulysses2, TP2 and CFG2; use ``-k dp2`` to select one topology.
+"""
 
 import hashlib
 import io
@@ -77,7 +81,9 @@ def _paused(workers):
                 worker.resume()
 
 
-def test_video_jobs_survive_concurrency_timeouts_and_deletion(server, tmp_path):
+def test_video_jobs_survive_concurrency_timeouts_and_deletion(
+    server, tmp_path, record_property
+):
     ctx, mode, num_gpus = server
     base = f"http://127.0.0.1:{ctx.port}"
 
@@ -143,6 +149,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server, tmp_path):
         baseline = submit()
         wait([baseline])
     reference = decoded_hash(baseline)
+    record_property("decoded_reference_sha256", reference)
     children = psutil.Process(ctx.process.pid).children(recursive=True)
     workers = [
         child
@@ -189,6 +196,8 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server, tmp_path):
     try:
         wait([failed_save], expected="failed")
         call("GET", f"/v1/videos/{failed_save}/content", expected=404)
+        job = call("GET", f"/v1/videos/{failed_save}").json()
+        assert str(bad_output) in job["error"]["message"], job
     finally:
         bad_output.unlink()
 
