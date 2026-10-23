@@ -4387,6 +4387,8 @@ class DeepseekV4AttnBackend(
                 and q_flat.shape[0] >= 16384
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.tail_forward_metadata is None
+                and not get_exec().overlap.enable_two_batch_overlap
+                and not get_exec().overlap.enable_single_batch_overlap
                 and not dsa_use_prefill_cp(forward_batch)
                 and not is_in_breakable_cuda_graph()
                 and not torch.cuda.is_current_stream_capturing()

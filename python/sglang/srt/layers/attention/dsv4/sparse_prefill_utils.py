@@ -140,8 +140,8 @@ class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
     Fields depend on request/token mappings and compressed page tables, not
-    per-layer k_cache; per-layer top-k combinations are recomputed into reused
-    buffers.
+    per-layer k_cache. Large eager layers may reuse a top-k combination until
+    the next index producer explicitly invalidates it; other paths recompute.
     """
 
     # Geometry computed once per chunk.
