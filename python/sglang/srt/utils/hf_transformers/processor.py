@@ -23,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import cached_file
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
@@ -217,9 +218,7 @@ def _get_minimax_m31_processor(model_path, config, revision):
         MiniMaxM31VideoProcessor,
     )
 
-    filename = _resolve_local_or_cached_file(
-        model_path, "preprocessor_config.json", revision=revision
-    )
+    filename = cached_file(model_path, "preprocessor_config.json", revision=revision)
     with open(filename) as f:
         raw = json.load(f)
     compression = raw.get("img_token_compression_config", {})
