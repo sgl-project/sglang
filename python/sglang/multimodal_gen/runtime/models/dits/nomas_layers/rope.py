@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Hy-Nomas (Apache-2.0):
-# https://github.com/Tencent-Hunyuan/Hy-Nomas/blob/98a28976f23552bb2e2cf7941986e9cd10a3118a/hymm/models/dit/modules/posemb_layers.py
+# Adapted from: https://github.com/Tencent-Hunyuan/Hy-Nomas
 """Nomas RoPE tables: real (cos, sin), heads-last layout; arithmetic order matches upstream."""
 
 import torch

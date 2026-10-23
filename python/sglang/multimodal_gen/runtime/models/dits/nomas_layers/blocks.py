@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Hy-Nomas (Apache-2.0):
-# https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/98a28976f23552bb2e2cf7941986e9cd10a3118a/hymm/models/dit/modules
+# Adapted from: https://github.com/Tencent-Hunyuan/Hy-Nomas
 # Original PatchEmbed: Copyright 2020 Ross Wightman.
 """Nomas DiT building blocks; upstream options Nomas never sets are removed, parameter names are unchanged."""
 
