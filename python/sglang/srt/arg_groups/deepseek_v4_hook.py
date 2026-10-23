@@ -239,12 +239,47 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "context parallelism is enabled."
         )
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+    if cfg.enable_encoder_swa_bounded_replay:
+        validate_cp_encoder_replay(
+            cfg, is_cuda=get_platform().is_cuda, is_sm90=get_platform().is_sm90
+        )
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"strategy={cfg.cp_strategy}, "
         f"attn_dp_size={attn_dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
+
+
+def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
+    """CP-only constraints after the common model and parallelism checks."""
+    if not cfg.enable_encoder_swa_bounded_replay or cfg.attn_cp_size <= 1:
+        return
+    if not is_cuda or not is_sm90:
+        raise ValueError("CP encoder replay currently requires SM90 CUDA")
+    unsupported = (
+        (
+            "prefill CUDA graphs",
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+        ("MoE all-to-all", cfg.moe_a2a_backend != "none"),
+        ("KV cache sharding", cfg.enable_kv_cache_sharding),
+        (
+            "DSA layer splitting or CP/TP group sharing",
+            cfg.enable_dsa_cache_layer_split or cfg.enable_cp_tp_group_sharing,
+        ),
+        ("the direct L3 linker", cfg.enable_unified_cache_external_linker),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(f"CP encoder replay does not support {feature} yet")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("CP encoder replay P/D requires the handoff extension")
+    if cfg.enable_hierarchical_cache:
+        if cfg.hicache_host_memory_mode != "cache":
+            raise ValueError("CP encoder replay requires cache host memory mode")
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError("CP encoder replay L3 requires the restore extension")
 
 
 def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
@@ -289,6 +324,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
+        # validate_deepseek_v4_cp checks the new envelope after resolving CP.
+        if cfg.attn_cp_size > 1 and not cfg.enable_prefill_cp:
+            raise ValueError("encoder replay requires interleave prefill CP")
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -308,7 +346,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and get_platform().is_hip,
             ),
-            ("context parallelism", cfg.attn_cp_size > 1),
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
             ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),

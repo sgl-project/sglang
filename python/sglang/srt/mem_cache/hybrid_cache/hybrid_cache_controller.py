@@ -309,6 +309,10 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.cp_encoder_replay:
+            raise ValueError(
+                "CP encoder replay L3 requires the Mooncake restore extension"
+            )
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
