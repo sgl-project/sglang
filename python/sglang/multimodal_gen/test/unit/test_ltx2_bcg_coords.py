@@ -255,7 +255,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             kwargs["audio_hidden_states"] * 0.5 + prompt,
         )
 
-    def _run_step(self, *, mode, warmup, runner, value):
+    def _run_step(self, *, mode, warmup, runner, value, sigmas=None):
         stage = object.__new__(LTX2DenoisingStage)
         stage.sampler_name = "euler"
         stage._attention_backend_active_override = None
@@ -272,11 +272,19 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         stage.server_args = args
         video = torch.arange(8, dtype=torch.float32).view(1, 2, 4) + value
         audio = torch.arange(4, dtype=torch.float32).view(1, 1, 4) + value
+        if sigmas is None:
+            sigmas = torch.tensor([1.0, 0.5])
+        scheduler = SimpleNamespace(
+            sigmas=sigmas,
+            step=lambda output, t, sample, return_dict: (sample - 0.5 * output,),
+        )
         ctx = SimpleNamespace(
             latents=video,
             audio_latents=audio,
-            scheduler=SimpleNamespace(sigmas=torch.tensor([1.0, 0.5])),
-            audio_scheduler=object(),
+            scheduler=scheduler,
+            sigmas_host=torch.tensor([1.0, 0.5]),
+            sigmas_device=sigmas,
+            audio_scheduler=scheduler,
             stage="stage1",
             is_warmup=warmup,
             is_ltx23_variant=False,
@@ -289,8 +297,14 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             reserved_frames_mask=None,
             z=None,
         )
-        step = SimpleNamespace(step_index=0, current_model=self._model)
-        params = LTX23SamplingParams(video_rescale_scale=0.0, audio_rescale_scale=0.0)
+        step = SimpleNamespace(
+            step_index=0, current_model=self._model, t_device=torch.tensor(1000.0)
+        )
+        params = (
+            LTX2SamplingParams()
+            if mode == "official"
+            else LTX23SamplingParams(video_rescale_scale=0.0, audio_rescale_scale=0.0)
+        )
         embeds = torch.full((1, 2, 4), value)
         batch = SimpleNamespace(
             quality="exact" if mode == "legacy" else "lossless",
@@ -302,6 +316,9 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             prompt_attention_mask=torch.ones(1, 2),
             negative_attention_mask=torch.ones(1, 2),
             ltx2_num_image_tokens=int(mode == "ti2v"),
+            do_classifier_free_guidance=True,
+            guidance_scale=4.0,
+            rollout_controllers={},
         )
         stage._prepare_ltx2_model_inputs = lambda *_: SimpleNamespace(
             latent_model_input=ctx.latents,
@@ -344,6 +361,53 @@ class TestLTX2GuidanceBCG(CustomTestCase):
                     self.assertTrue(
                         kwargs["perturbation_configs"][3]["skip_a2v_cross_attn"]
                     )
+
+    def test_steps_never_read_device_sigmas_on_host(self):
+        modes = ("official", "batched", "ti2v", "hq", "legacy", "legacy_batched")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                expected = self._run_step(
+                    mode=mode, warmup=False, runner=None, value=1.0
+                )
+                actual = self._run_step(
+                    mode=mode,
+                    warmup=False,
+                    runner=None,
+                    value=1.0,
+                    sigmas=torch.tensor([1.0, 0.5]).as_subclass(_DeviceSigmas),
+                )
+                for result, reference in zip(actual, expected):
+                    torch.testing.assert_close(
+                        result.as_subclass(torch.Tensor), reference, rtol=0, atol=0
+                    )
+
+    def test_tensor_sigma_x0_matches_python_float(self):
+        torch.manual_seed(0)
+        sample = torch.randn(2, 6, 8, dtype=torch.bfloat16)
+        velocity = torch.randn(2, 6, 8, dtype=torch.bfloat16)
+        for sigma in (
+            torch.tensor(0.7182, dtype=torch.float32),
+            torch.tensor(0.3141592653589793, dtype=torch.float64),
+        ):
+            with self.subTest(dtype=sigma.dtype):
+                self.assertTrue(
+                    torch.equal(
+                        LTX2DenoisingStage._ltx2_velocity_to_x0(
+                            sample, velocity, sigma
+                        ),
+                        LTX2DenoisingStage._ltx2_velocity_to_x0(
+                            sample, velocity, float(sigma)
+                        ),
+                    )
+                )
+
+
+class _DeviceSigmas(torch.Tensor):
+    # a CUDA schedule in a CPU test: any host read of a value would sync
+    def item(self):
+        raise AssertionError("denoising step read a device sigma on the host")
+
+    __float__ = __bool__ = item
 
 
 class _AttentionBlock(torch.nn.Module):

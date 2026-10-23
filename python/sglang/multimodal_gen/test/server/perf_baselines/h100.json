@@ -2293,6 +2293,39 @@
             "runtime_peak_allocated_mb": 9999.0,
             "estimated_full_test_time_s": 90
         },
+        "wan2_1_t2v_1_3b_dynamic_lora_default_quality_1gpu": {
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 2.36,
+                "LatentPreparationStage": 0.11,
+                "TimestepPreparationStage": 0.48,
+                "DenoisingStage": 687.26,
+                "DecodingStage": 88.7,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 107.57,
+                "1": 99.77,
+                "2": 78.34,
+                "3": 78.47,
+                "4": 82.14,
+                "5": 79.72,
+                "6": 80.1,
+                "7": 80.0
+            },
+            "expected_e2e_ms": 782.31,
+            "expected_load_ms": 31976.56,
+            "expected_avg_denoise_ms": 85.76,
+            "expected_median_denoise_ms": 80.05,
+            "load_peak_vram_mb": 4148.0,
+            "runtime_peak_vram_mb": 13494.0,
+            "warmup_peak_vram_mb": 13968.0,
+            "load_peak_allocated_mb": 3976.25,
+            "runtime_peak_allocated_mb": 5521.42,
+            "load_peak_host_anon_mb": 10335.67,
+            "runtime_peak_host_anon_mb": 10335.67,
+            "estimated_full_test_time_s": 51.9
+        },
         "wan2_1_i2v_14b_lora_2gpu": {
             "expected_load_ms": 66554.82,
             "stages_ms": {
