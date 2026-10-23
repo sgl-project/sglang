@@ -16,9 +16,9 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -339,6 +339,10 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
             # The layer-local shared path consumes the same post-attention input.
             inplace=False,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
@@ -485,7 +489,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=NormQuantReadout(
@@ -501,10 +505,6 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -563,6 +563,11 @@ class InternS2MobiusAttentionDecoderLayer(
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # Inherited forward_prepare_npu reads this. Mobius is never PP-split and its
+        # schedule is layer_types, not full_attention_interval.
+        self.refreshes_rope_cos_sin = layer_id == config.layer_types.index(
+            "full_attention"
+        )
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
@@ -583,8 +588,7 @@ class InternS2MobiusAttentionDecoderLayer(
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -593,8 +597,7 @@ class InternS2MobiusAttentionDecoderLayer(
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.attn = RadixAttention(
@@ -617,7 +620,7 @@ class InternS2MobiusAttentionDecoderLayer(
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=NormQuantReadout(
@@ -633,10 +636,6 @@ class InternS2MobiusAttentionDecoderLayer(
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.alt_stream = alt_stream
 

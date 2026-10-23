@@ -48,23 +48,24 @@ from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -77,8 +78,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -91,9 +92,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -124,7 +126,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     ceil_align,
     ceil_div,
-    get_bool_env_var,
     is_cuda,
     log_info_on_rank0,
     make_pp_layers,
@@ -194,11 +195,11 @@ class Dots3MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -206,8 +207,7 @@ class Dots3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -216,8 +216,7 @@ class Dots3MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -226,7 +225,7 @@ class Dots3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x, forward_batch=None):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
@@ -278,9 +277,7 @@ class Dots3MoE(nn.Module):
         super().__init__()
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -314,17 +311,17 @@ class Dots3MoE(nn.Module):
         )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=config.num_experts_per_tok,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -337,12 +334,10 @@ class Dots3MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
-                ),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                else "tp",
             )
             is_packed_weight = quant_config is not None and (
                 quant_config.get_name()
@@ -471,14 +466,10 @@ class Dots3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
         final_hidden_states = self.experts(
@@ -486,14 +477,15 @@ class Dots3MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if fused_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif not self.experts.should_fuse_routed_scaling_factor_in_topk:
+        elif not fused_in_topk:
             final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -566,7 +558,6 @@ class Dots3AttentionMLA(nn.Module):
     ) -> None:
         super().__init__()
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.layer_id = layer_id
@@ -645,8 +636,7 @@ class Dots3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("q_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -655,8 +645,7 @@ class Dots3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -666,8 +655,7 @@ class Dots3AttentionMLA(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.k_rope_only_layernorm = RMSNorm(
@@ -1383,9 +1371,8 @@ class Dots3DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Dots3MoE(
@@ -1397,18 +1384,14 @@ class Dots3DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Dots3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 
@@ -1417,31 +1400,38 @@ class Dots3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
         # The MTP block uses a dense MLP.
         if is_nextn:
             return False
         return (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     def forward(
@@ -1502,6 +1492,7 @@ class Dots3Model(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Dots3DecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1607,7 +1598,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.model = Dots3Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1651,10 +1643,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             )
         return None
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1670,9 +1662,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
         if mm_inputs.audio_start_id is not None and mm_inputs.audio_end_id is not None:
             token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
-        return MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=token_pairs or None
-        ).pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=token_pairs or None
+        )
 
     def _get_precomputed_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         embed_param = next(self.model.embed_tokens.parameters())
@@ -1794,7 +1786,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
-                    and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                    and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
                     # The issue is that when multiplying w_kc the reduction dim can not be divided
@@ -1955,12 +1947,17 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         )
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
 
         def shard_g_proj_for_attention_tp(
-            weight: torch.Tensor, cat_dim: int, is_scale: bool
+            weight: torch.Tensor,
+            cat_dim: int,
+            is_scale: bool,
+            *,
+            q_b_proj: ColumnParallelLinear,
         ):
+            group = unwrap_lora_layer(q_b_proj).tp_group
+            attn_tp_rank = group.rank_in_group if group is not None else 0
+            attn_tp_size = group.world_size if group is not None else 1
             assert weight.ndim > cat_dim, (
                 f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
             )
@@ -2009,7 +2006,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
             g_proj_weight = cached_a_proj[g_proj_name]
             g_proj_shard = shard_g_proj_for_attention_tp(
-                g_proj_weight, cat_dim, is_scale
+                g_proj_weight,
+                cat_dim,
+                is_scale,
+                q_b_proj=self.get_submodule(param_name.rsplit(".", 2)[0]).q_b_proj,
             )
             scale_block_n = _get_scale_block_n(self.quant_config)
             kv_a_proj_weight_aligned = (
@@ -2471,6 +2471,10 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         return Dots3LanguageModelForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        return Dots3LanguageModelForCausalLM.num_fusable_shared_experts(hf_config)
 
     def __init__(
         self,

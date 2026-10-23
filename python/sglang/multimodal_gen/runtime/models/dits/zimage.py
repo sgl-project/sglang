@@ -1380,10 +1380,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return self._pin_for_active_capture(result)
 
     @staticmethod
-    def _has_padding(valid_lens: list[int], target_len: int) -> bool:
-        return any(int(length) < target_len for length in valid_lens)
-
-    @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
         """Normalize 4D/5D image latents into per-sample tensors."""
         if torch.is_tensor(hidden_states):
@@ -1455,23 +1451,24 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
-        """Replace padded token rows after each valid sequence length."""
-        if not torch.is_tensor(valid_lens) and all(
-            int(length) >= tensor.shape[1] for length in valid_lens
-        ):
+        """Replace padded token rows after each valid sequence length.
+
+        Selects rather than mask-assigns: a boolean-mask write syncs with the host.
+        """
+        seq_len = tensor.shape[1]
+        pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        if not torch.is_tensor(valid_lens):
+            if all(int(length) >= seq_len for length in valid_lens):
+                return tensor
+            tensor = tensor.clone()
+            for row, length in enumerate(valid_lens):
+                tensor[row, int(length) :] = pad_value
             return tensor
-        positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        if torch.is_tensor(valid_lens):
-            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
-        else:
-            lengths = torch.tensor(valid_lens, device=tensor.device)
-        if lengths.ndim == 0:
-            lengths = lengths.reshape(1)
-        lengths = lengths.unsqueeze(1)
-        pad_mask = positions >= lengths
-        tensor = tensor.clone()
-        tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
-        return tensor
+        lengths = valid_lens.to(device=tensor.device, dtype=torch.long).reshape(-1, 1)
+        positions = torch.arange(seq_len, device=tensor.device).unsqueeze(0)
+        return torch.where(
+            (positions >= lengths).unsqueeze(-1), pad_value.view(1, 1, -1), tensor
+        )
 
     @staticmethod
     def _replace_padding_with_token_mask(
