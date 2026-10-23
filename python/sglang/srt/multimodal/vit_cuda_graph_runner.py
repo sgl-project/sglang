@@ -97,9 +97,17 @@ class ViTCudaGraphRunner:
         return self.vit.dtype
 
     def _get_sin_cos_ws(
-        self, graph_key: Hashable, seq_len: int, head_dim: int
+        self,
+        graph_key: Hashable,
+        seq_len: int,
+        head_dim: int,
+        dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the stable rotary buffers captured by one graph."""
+        """Return the stable rotary buffers captured by one graph.
+
+        dtype is the dtype of the cos/sin the model passes (fp32 for Qwen3-VL),
+        not the ViT dtype, so the graph rotates with the same values as eager.
+        """
         graph_ws = self._sin_cos_ws_by_graph.get(graph_key)
         if graph_ws is not None:
             return graph_ws
@@ -107,6 +115,7 @@ class ViTCudaGraphRunner:
         needs_new_workspace = self.sin_cos_ws is None or (
             self.sin_cos_ws[0].size(0) < seq_len
             or self.sin_cos_ws[0].size(1) < head_dim
+            or self.sin_cos_ws[0].dtype != dtype
         )
         if needs_new_workspace:
             previous = self.sin_cos_ws
@@ -119,10 +128,10 @@ class ViTCudaGraphRunner:
             )
             max_head_dim = max(previous_head_dim, head_dim)
             cos_ws = torch.empty(
-                max_shape, max_head_dim, dtype=self.dtype, device=self.device
+                max_shape, max_head_dim, dtype=dtype, device=self.device
             )
             sin_ws = torch.empty(
-                max_shape, max_head_dim, dtype=self.dtype, device=self.device
+                max_shape, max_head_dim, dtype=dtype, device=self.device
             )
             if previous is not None:
                 # CUDA graphs retain captured addresses, so an older allocation
@@ -371,7 +380,7 @@ class ViTCudaGraphRunner:
         if position_embeddings is not None:
             head_dim = position_embeddings[0].shape[1]
             used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
-                graph_key, seq_len, head_dim
+                graph_key, seq_len, head_dim, dtype=position_embeddings[0].dtype
             )
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
@@ -382,7 +391,7 @@ class ViTCudaGraphRunner:
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             head_dim = rotary_pos_emb_cos.shape[1]
             used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
-                graph_key, seq_len, head_dim
+                graph_key, seq_len, head_dim, dtype=rotary_pos_emb_cos.dtype
             )
             used_cos_ws.copy_(rotary_pos_emb_cos)
             used_sin_ws.copy_(rotary_pos_emb_sin)
@@ -409,14 +418,14 @@ class ViTCudaGraphRunner:
         if position_embeddings is not None:
             head_dim = position_embeddings[0].shape[1]
             used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
-                graph_key, seq_len, head_dim
+                graph_key, seq_len, head_dim, dtype=position_embeddings[0].dtype
             )
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             head_dim = rotary_pos_emb_cos.shape[1]
             used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
-                graph_key, seq_len, head_dim
+                graph_key, seq_len, head_dim, dtype=rotary_pos_emb_cos.dtype
             )
             used_cos_ws.copy_(rotary_pos_emb_cos)
             used_sin_ws.copy_(rotary_pos_emb_sin)
