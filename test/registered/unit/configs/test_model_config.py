@@ -15,6 +15,8 @@ from sglang.srt.configs.model_config import (
     get_hybrid_layer_ids,
     is_embedding_gemma,
     is_embedding_nemotron3,
+    is_embedding_nemotron35,
+    is_generation_model,
     is_multimodal_model,
     load_decision_config,
     register_model_config_factory,
@@ -87,6 +89,34 @@ class TestEmbeddingNemotron3Config(CustomTestCase):
         ):
             with self.subTest(fields=fields):
                 self.assertFalse(is_embedding_nemotron3(SimpleNamespace(**fields)))
+
+
+class TestEmbeddingNemotron35Config(CustomTestCase):
+    def test_detects_bidirectional_mean_pooled_mistral3(self):
+        config = SimpleNamespace(
+            architectures=["Mistral3Model"], is_causal=False, pooling="avg"
+        )
+        self.assertTrue(is_embedding_nemotron35(config))
+        self.assertFalse(is_embedding_nemotron3(config))
+
+    def test_does_not_misclassify_other_mistral3_checkpoints(self):
+        for fields in (
+            {"architectures": ["Mistral3Model"]},
+            {"architectures": ["Mistral3Model"], "is_causal": False},
+            {"architectures": ["Mistral3Model"], "pooling": "avg"},
+            {
+                "architectures": ["Mistral3ForConditionalGeneration"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
+            {"architectures": ["Ministral3Model"], "is_causal": False, "pooling": "avg"},
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_embedding_nemotron35(SimpleNamespace(**fields)))
+
+    def test_is_multimodal_embedding_model(self):
+        self.assertTrue(is_multimodal_model(["EmbeddingNemotron35Model"]))
+        self.assertFalse(is_generation_model(["EmbeddingNemotron35Model"]))
 
 
 class TestDraftModelConfig(CustomTestCase):

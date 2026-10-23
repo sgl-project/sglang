@@ -58,6 +58,25 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertTrue(spec.safe_disable_kv_cache)
         self.assertTrue(spec.encoder_only_attention)
 
+    def test_embedding_nemotron35_declares_multimodal_mean_contract(self):
+        spec = resolve_embedding_model_spec(
+            ["EmbeddingNemotron35Model"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "embedding_nemotron35")
+        self.assertEqual(spec.execution, EmbeddingExecution.MULTIMODAL)
+        self.assertEqual(spec.pooling, PoolingStrategy.MEAN)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertTrue(spec.normalize)
+        self.assertTrue(spec.supports_multimodal)
+        self.assertTrue(spec.auto_enable_embedding)
+        self.assertTrue(spec.safe_disable_radix_cache)
+        self.assertTrue(spec.safe_disable_chunked_prefill)
+        # The no-KV prefill path is not validated with image features.
+        self.assertFalse(spec.safe_disable_kv_cache)
+
     def _resolve_nemotron3_embedding_args(self, attention_backend):
         args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
         args._model_config = SimpleNamespace(
@@ -106,7 +125,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 9)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")

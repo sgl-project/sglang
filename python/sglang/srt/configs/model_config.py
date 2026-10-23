@@ -637,6 +637,9 @@ class ModelConfig:
         if is_embedding_nemotron3(self.hf_config):
             # A bare Ministral3 backbone configured as a mean-pooled embedder.
             self.hf_config.architectures = ["EmbeddingNemotron3Model"]
+        elif is_embedding_nemotron35(self.hf_config):
+            # A bare Mistral3 vision-language backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron35Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -2346,6 +2349,20 @@ def is_embedding_nemotron3(config) -> bool:
     )
 
 
+def is_embedding_nemotron35(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3.5-Embed checkpoint.
+
+    Nemotron-3.5-Embed is serialized as the bare ``Mistral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    return (
+        "Mistral3Model" in (getattr(config, "architectures", None) or [])
+        and getattr(config, "is_causal", True) is False
+        and getattr(config, "pooling", None) == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2365,6 +2382,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "EmbeddingNemotron3Model" in model_architectures
+        or "EmbeddingNemotron35Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
@@ -2389,6 +2407,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
     "EmbeddingGemma2Model",
+    "EmbeddingNemotron35Model",
     "Gemma4UnifiedForConditionalGeneration",
     "DiffusionGemmaForBlockDiffusion",
     "Glm4vForConditionalGeneration",
