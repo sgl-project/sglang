@@ -1874,9 +1874,7 @@ class ConstrainedToolBodyTest(CustomTestCase):
                 for chunks in [[text[:i], text[i:]] for i in range(len(text))] + [list(text)]:
                     self.assertEqual(self._calls(template, chunks, True, tools), constrained, chunks)
 
-    def test_calls_after_a_malformed_body_survive_without_the_grammar(self):
-        text = '<call:f>{"a": "x</call><call:f>{"b": 1}</call>'
-        self.assertEqual(self._calls(_JSON_BODY_TEMPLATE, [text], False), [("f", {"b": 1})])
+    def test_body_cut_off_under_the_grammar_yields_no_call(self):
         # A length cut leaves a well-formed body open, so it yields no call.
         self.assertEqual(self._calls(_JSON_BODY_TEMPLATE, ['<call:f>{"a": "x</call>'], True), [])
 

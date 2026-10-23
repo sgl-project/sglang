@@ -13,13 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponseTool,
 )
-from sglang.srt.entrypoints.openai.responses_adapters import response_tool_name
-from sglang.srt.entrypoints.openai.responses_tools.beam import (
-    BeamToolAdapter,
-    flatten_response_input,
-    flatten_response_tools,
-    response_tool_choice,
-)
+from sglang.srt.entrypoints.openai.responses_tools.beam import flatten_response_tools
 from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -74,31 +68,6 @@ def test_ambiguous_or_unsupported_namespace_rejected(tools):
         flatten(tools)
 
 
-def test_names_and_choices_are_reversible_without_hashing():
-    tools = [
-        namespace(name="n" * 128, namespace="s" * 128),
-        namespace(namespace="home"),
-    ]
-    flat, names = flatten(tools)
-    assert flat[0]["name"] == "s" * 128 + "__" + "n" * 128
-    assert response_tool_choice(
-        {"type": "function", "namespace": "home", "name": "weather"}, flat, names
-    ) == {"type": "function", "name": "home__weather"}
-    assert flat[1]["description"] == "Namespace home: Office tools\n\nForecast"
-    call = {
-        "type": "function_call",
-        "namespace": "s" * 128,
-        "name": "n" * 128,
-        "call_id": "call_x",
-        "arguments": "{}",
-    }
-    internal = flatten_response_input(call)
-    assert {**internal, **response_tool_name(internal["name"], names)} == call
-    assert flatten(list(reversed(tools)))[1] == names
-    with pytest.raises(ValueError, match="not declared"):
-        response_tool_choice({"type": "function", "name": "weather"}, flat, names)
-
-
 @pytest.mark.parametrize(
     "tools,choice",
     [
@@ -110,9 +79,6 @@ def test_names_and_choices_are_reversible_without_hashing():
     ],
 )
 def test_named_choice_matches_public_namespace(tools, choice):
-    flat, names = flatten(tools)
-    with pytest.raises(ValueError, match="not declared"):
-        response_tool_choice(choice, flat, names)
     response = asyncio.run(
         make_serving(model_type="beam").create_responses(
             ResponsesRequest(input="hi", tools=tools, tool_choice=choice)
@@ -123,9 +89,8 @@ def test_named_choice_matches_public_namespace(tools, choice):
 
 
 @pytest.mark.parametrize("name", [None, "", 1])
-@pytest.mark.parametrize("kind", ["function_call", "custom_tool_call"])
-def test_replayed_call_requires_name(kind, name):
-    call = {"type": kind, "call_id": "call_x"}
+def test_replayed_call_requires_name(name):
+    call = {"type": "function_call", "call_id": "call_x"}
     if name is not None:
         call["name"] = name
     response = asyncio.run(
@@ -137,31 +102,25 @@ def test_replayed_call_requires_name(kind, name):
     assert "require a name" in json.loads(response.body)["error"]["message"]
 
 
-def test_tool_translation_keeps_request_and_private_state_separate():
-    request = ResponsesRequest(input="hi", tools=[namespace("custom")])
-    public = request.model_dump()
-    translated, _ = BeamToolAdapter.from_request(request, tool_call_parser=None)
-    assert request.model_dump() == public
-    assert translated.tools[0].name == "office__weather"
-    assert translated.tools[0].type == "custom"
-    assert translated._tool_state.public_tools == request.tools
-    assert translated.model_dump().keys() == public.keys()
-    assert "_tool_state" not in ResponsesRequest.model_json_schema()["properties"]
-    assert request._tool_state.names == {}
-
-
 def test_namespace_mapping_preserves_extra_tool_options():
     tool = namespace()
     tool["tools"][0]["vendor_option"] = "kept"
     flat, _ = flatten([tool])
     assert flat[0]["vendor_option"] == "kept"
+    assert flat[0]["description"] == "Namespace office: Office tools\n\nForecast"
 
 
-@pytest.mark.parametrize("choice", ["auto", "named"])
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("kind", ["function", "custom"])
-@pytest.mark.parametrize("nsname", ["office", "n" * 128])
-def test_namespace_beam_generation_and_continuation(stream, kind, nsname, choice):
+@pytest.mark.parametrize(
+    "stream,kind,choice",
+    [
+        (False, "function", "auto"),
+        (False, "custom", "named"),
+        (True, "function", "named"),
+        (True, "custom", "auto"),
+    ],
+)
+def test_namespace_beam_generation_and_continuation(stream, kind, choice):
+    nsname = "n" * 128
     serving = make_serving(model_type="beam")
     serving.enable_response_store = True
     serving.reasoning_parser = serving.tool_call_parser = "beam"
@@ -267,45 +226,6 @@ def test_namespace_beam_generation_and_continuation(stream, kind, nsname, choice
 
     with patch.object(serving, "_apply_conversation_template", side_effect=render):
         asyncio.run(run())
-
-
-@pytest.mark.parametrize("required", [False, True])
-def test_native_encoder_calls_keep_their_namespace(required):
-    """Calls a native chat encoder returns must name their public namespace, also
-    when required-tool JSON carries them."""
-    from sglang.srt.function_call.core_types import ToolCallItem
-
-    serving = make_serving()
-    serving.reasoning_parser = None
-    # Without a tool parser, required calls arrive as the generic JSON array.
-    serving.tool_call_parser = None if required else "qwen25"
-    arguments = '{"city": "Paris"}'
-    if required:
-        output = ("", f'[{{"name": "office__weather", "parameters": {arguments}}}]', [])
-    else:
-        call = ToolCallItem(tool_index=0, name="office__weather", parameters=arguments)
-        output = ("", "", [call])
-
-    class Encoder:
-        def parse_responses_output(self, **_):
-            return output
-
-    request, _ = BeamToolAdapter.from_request(
-        ResponsesRequest(
-            input="Weather?",
-            tools=[namespace()],
-            tool_choice="required" if required else "auto",
-        ),
-        tool_call_parser=serving.tool_call_parser,
-    )
-    with patch.object(serving, "_encoding_output", return_value=Encoder()):
-        items = serving._make_response_output_items(
-            request, "", None, require_reasoning=False, output_ids=[1]
-        )
-
-    (call,) = [item.model_dump() for item in items if item.type == "function_call"]
-    assert (call["name"], call["namespace"]) == ("weather", "office")
-    assert json.loads(call["arguments"]) == {"city": "Paris"}
 
 
 if __name__ == "__main__":

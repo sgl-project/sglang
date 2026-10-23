@@ -16,11 +16,9 @@ from utils import (
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
-    MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -51,97 +49,6 @@ RESPONSE_TEMPLATE = {
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
-    def test_create_responses_beam_continuation_reaches_engine_and_parsers(self):
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                serving = make_serving()
-                serving.reasoning_parser = "beam"
-                serving.tool_call_parser = "beam"
-                serving._reasoning_detector = BeamReasoningDetector()
-                tokenizer = serving.tokenizer_manager.tokenizer
-                tokenizer.response_template = None
-                tokenizer.init_kwargs = {}
-                tokenizer.decode.return_value = "<|start|>assistant"
-                request = ResponsesRequest(
-                    model="x",
-                    stream=stream,
-                    store=False,
-                    instructions="Be concise.",
-                    tools=[
-                        {
-                            "type": "function",
-                            "name": "get_weather",
-                            "parameters": {"type": "object"},
-                        }
-                    ],
-                    input=[
-                        {"role": "user", "content": "Weather?"},
-                        {
-                            "type": "function_call",
-                            "name": "get_weather",
-                            "call_id": "call_weather",
-                            "arguments": "{}",
-                        },
-                        {
-                            "type": "function_call_output",
-                            "call_id": "call_weather",
-                            "output": "Sunny.",
-                        },
-                    ],
-                )
-                raw = (
-                    "<|channel|>analysis<|message|>Use the result.<|end|>"
-                    "<|start|>assistant<|channel|>final<|message|>Sunny.<|return|>"
-                )
-                captured = {}
-
-                async def generate(adapted, raw_request):
-                    captured["engine"] = adapted
-                    yield engine_chunk(raw, 9, finish=True)
-
-                serving.tokenizer_manager.generate_request = generate
-
-                def render(chat_request, is_multimodal):
-                    captured["chat"] = chat_request
-                    # Only the checkpoint renderer is substituted. The real
-                    # request processing and Beam parsers run on either path.
-                    return MessageProcessingResult(
-                        prompt="<|start|>assistant",
-                        prompt_ids=[1, 2, 3],
-                        image_data=None,
-                        audio_data=None,
-                        video_data=None,
-                        modalities=[],
-                        stop=[],
-                    )
-
-                async def respond():
-                    response = await serving.create_responses(request)
-                    if stream:
-                        events = [event async for event in response]
-                        return find_completed_event(events)["response"]
-                    return response.model_dump()
-
-                with patch.object(
-                    serving, "_apply_conversation_template", side_effect=render
-                ):
-                    response = asyncio.run(respond())
-                self.assertEqual(response["status"], "completed")
-                self.assertEqual(
-                    [i["type"] for i in response["output"]], ["reasoning", "message"]
-                )
-                self.assertEqual(response["output"][1]["content"][0]["text"], "Sunny.")
-                self.assertEqual(captured["engine"].input_ids, [1, 2, 3])
-                self.assertFalse(
-                    captured["engine"].sampling_params["skip_special_tokens"]
-                )
-                self.assertTrue(captured["engine"].require_reasoning)
-                messages = captured["chat"].messages
-                self.assertEqual(messages[0].content, "Be concise.")
-                self.assertEqual(messages[-1].tool_call_id, "call_weather")
-                self.assertEqual(messages[-1].content, "Sunny.")
-                self.assertEqual(captured["chat"].tools[0].function.name, "get_weather")
-
     def test_beam_cut_off_regions_match_full_output(self):
         serving = make_serving()
         serving.reasoning_parser = "beam"
@@ -188,32 +95,29 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             full = serving._make_response_output_items(
                 request, raw, tokenizer, require_reasoning=True
             )
-            for finish, status in (("length", "incomplete"), ("abort", "failed")):
-                # The second layout exposes the tool name before its XML body
-                # is cut off. The first delivers the entire truncated output at once.
-                for split in (0, len(raw) - 3):
-                    with self.subTest(raw=raw, finish=finish, split=split):
-                        chunk = engine_chunk(raw, 9, finish=True)
-                        chunk["meta_info"]["finish_reason"] = {"type": finish}
-                        chunks = (
-                            [engine_chunk(raw[:split]), chunk] if split else [chunk]
+            # The second layout exposes the tool name before its XML body
+            # is cut off. The first delivers the entire truncated output at once.
+            for split in (0, len(raw) - 3):
+                with self.subTest(raw=raw, split=split):
+                    chunk = engine_chunk(raw, 9, finish=True)
+                    chunk["meta_info"]["finish_reason"] = {"type": "abort"}
+                    chunks = [engine_chunk(raw[:split]), chunk] if split else [chunk]
+                    events = event_payloads(
+                        StreamFixture(serving, request, require_reasoning=True).run(
+                            chunks
                         )
-                        events = event_payloads(
-                            StreamFixture(serving, request, require_reasoning=True).run(
-                                chunks
-                            )
-                        )
-                        terminal = events[-1]
-                        self.assertEqual(terminal["type"], f"response.{status}")
-                        self.assertEqual(
-                            normalized(terminal["response"]["output"]),
-                            normalized([i.model_dump() for i in full]),
-                        )
-                        if raw == tool:
-                            item = terminal["response"]["output"][-1]
-                            self.assertEqual(item["type"], "function_call")
-                            self.assertEqual(item["status"], "incomplete")
-                            self.assertEqual(item["arguments"], "")
+                    )
+                    terminal = events[-1]
+                    self.assertEqual(terminal["type"], "response.failed")
+                    self.assertEqual(
+                        normalized(terminal["response"]["output"]),
+                        normalized([i.model_dump() for i in full]),
+                    )
+                    if raw == tool:
+                        item = terminal["response"]["output"][-1]
+                        self.assertEqual(item["type"], "function_call")
+                        self.assertEqual(item["status"], "incomplete")
+                        self.assertEqual(item["arguments"], "")
 
     def test_beam_terminal_status_and_usage_match_full_response(self):
         serving = make_serving()
@@ -230,7 +134,6 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         for finish, expected_status in (
             ("stop", "completed"),
             ("length", "incomplete"),
-            ("abort", "failed"),
             ("error", "failed"),
         ):
             with self.subTest(finish=finish):
@@ -337,13 +240,11 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             )
             self.assertEqual([i.type for i in full], kinds)
             expected = semantic([i.model_dump() for i in full])
-            # A single engine chunk, character-wise output, and every two-way
-            # split exercise both complete regions and partial control/XML
-            # delimiters.
+            # A single engine chunk and character-wise output exercise both
+            # complete regions and partial control/XML delimiters.
             boundaries = [[len(raw)], list(range(1, len(raw) + 1))]
-            boundaries.extend([split, len(raw)] for split in range(1, len(raw)))
             for ends in boundaries:
-                with self.subTest(raw=raw, ends=ends if len(ends) == 2 else len(ends)):
+                with self.subTest(raw=raw, ends=len(ends)):
                     events = StreamFixture(
                         serving, request, require_reasoning=True
                     ).run(

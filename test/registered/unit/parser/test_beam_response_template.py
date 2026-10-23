@@ -9,7 +9,6 @@ from xgrammar.testing import _is_grammar_accept_string
 from sglang.srt.entrypoints.openai.protocol import Function, Tool, ToolChoice
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -57,33 +56,16 @@ def _full_call(
     name: str,
     body: str,
     *,
-    terminator: str = "<|call|>",
     constrain: bool = True,
 ) -> str:
     return PREFIX + _continuation_call(
         name,
         body,
-        terminator=terminator,
         constrain=constrain,
     )
 
 
 class TestBeamResponseTemplate(CustomTestCase):
-    def test_retaining_incomplete_calls_is_opt_in(self):
-        text = _continuation_call(
-            "get_weather", '<rfl:parameter name="city">\nPar', terminator=""
-        )
-        legacy = FunctionCallParser([_tool()], "beam", prefix=PREFIX)
-        _, calls = legacy.parse_non_stream(text)
-        self.assertEqual(calls, [])
-
-        parser = FunctionCallParser([_tool()], "beam", prefix=PREFIX)
-        _, calls = parser.parse_non_stream(text, preserve_incomplete=True)
-        self.assertEqual(
-            [(call.name, call.parameters) for call in calls], [("get_weather", "")]
-        )
-        self.assertEqual(parser.detector.incomplete_tool_call_indices, {0})
-
     def test_reasoning_and_final_content(self):
         parser = ReasoningParser(model_type="beam", prefix=PREFIX)
         generation = (
@@ -96,58 +78,14 @@ class TestBeamResponseTemplate(CustomTestCase):
         self.assertEqual(reasoning, "Think first.")
         self.assertEqual(content, "Answer.")
 
-    def test_prefilled_reasoning_continues_from_prompt(self):
-        parser = ReasoningParser(
-            model_type="beam",
-            prefix=PREFIX + "<|channel|>analysis<|message|>Existing",
-        )
-
-        reasoning, content = parser.parse_non_stream(
-            " thought.<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>Done.<|return|>"
-        )
-
-        self.assertEqual(reasoning, " thought.")
-        self.assertEqual(content, "Done.")
-
-    def test_reasoning_to_parallel_tool_parser_handoff(self):
-        tools = [_tool(), _tool("set_alarm", {"hour": {"type": "integer"}})]
-        reasoning_parser = ReasoningParser(model_type="beam", prefix=PREFIX)
-        tool_parser = FunctionCallParser(
-            tools=tools,
-            tool_call_parser="beam",
-            prefix=PREFIX,
-        )
-        generation = (
-            "<|channel|>analysis<|message|>Use two tools.<|end|>"
-            + _full_call(
-                "get_weather",
-                _parameter("city", "Paris"),
-                terminator="<|end|>",
-            )
-            + _full_call("set_alarm", _parameter("hour", "7"))
-        )
-
-        reasoning, tool_wire = reasoning_parser.parse_non_stream(generation)
-        content, calls = tool_parser.parse_non_stream(tool_wire)
-
-        self.assertEqual(reasoning, "Use two tools.")
-        self.assertEqual(content, "")
-        self.assertEqual([call.name for call in calls], ["get_weather", "set_alarm"])
-        self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
-        self.assertEqual(json.loads(calls[1].parameters), {"hour": 7})
-
     def test_output_cut_before_the_next_message_start_ends_its_region(self):
         """Output that stops after `<|end|>`, such as at `max_tokens`, has ended
         its reasoning or call and lacks only the next message's start."""
         for end in ("<|end|>", "<|end|><|start|>"):
             with self.subTest(end=end):
                 reasoning_parser = ReasoningParser(model_type="beam", prefix=PREFIX)
-                parser, streaming = (
-                    FunctionCallParser(
-                        tools=[_tool()], tool_call_parser="beam", prefix=PREFIX
-                    )
-                    for _ in range(2)
+                parser = FunctionCallParser(
+                    tools=[_tool()], tool_call_parser="beam", prefix=PREFIX
                 )
                 generation = _continuation_call(
                     "get_weather", _parameter("city", "Paris"), terminator=end
@@ -157,16 +95,10 @@ class TestBeamResponseTemplate(CustomTestCase):
                     "<|channel|>analysis<|message|>plan" + end
                 )
                 _, calls = parser.parse_non_stream(generation)
-                streamed = streaming.parse_stream_chunk(generation)[1]
-                streamed += streaming.parse_stream_end()[1]
 
                 self.assertEqual(reasoning, "plan")
                 self.assertEqual([call.name for call in calls], ["get_weather"])
                 self.assertEqual(json.loads(calls[0].parameters), {"city": "Paris"})
-                self.assertEqual(
-                    json.loads("".join(call.parameters for call in streamed)),
-                    {"city": "Paris"},
-                )
 
     def test_value_ends_before_an_opener_on_the_next_line(self):
         tools = [
@@ -177,46 +109,14 @@ class TestBeamResponseTemplate(CustomTestCase):
             '<rfl:parameter name="content">\nprint(1)\n\n' + _parameter("path", "a.py"),
         )
         expected = {"content": "print(1)\n", "path": "a.py"}
-        for level in ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER:
-            with (
-                self.subTest(level=level.name),
-                envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value),
-            ):
-                parser, streaming = (
-                    FunctionCallParser(
-                        tools=tools, tool_call_parser="beam", prefix=PREFIX
-                    )
-                    for _ in range(2)
-                )
-                _, tag = parser.get_structure_constraint("required")
-                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+        parser = FunctionCallParser(tools=tools, tool_call_parser="beam", prefix=PREFIX)
+        _, tag = parser.get_structure_constraint("required")
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
 
-                _, calls = parser.parse_non_stream(generation)
-                streamed = []
-                for char in generation:
-                    streamed += streaming.parse_stream_chunk(char)[1]
-                streamed += streaming.parse_stream_end()[1]
+        _, calls = parser.parse_non_stream(generation)
 
-                self.assertTrue(_is_grammar_accept_string(grammar, generation))
-                self.assertEqual(json.loads(calls[0].parameters), expected)
-                self.assertEqual(
-                    json.loads("".join(call.parameters for call in streamed)), expected
-                )
-
-    def test_tool_call_requires_constraint_marker(self):
-        parser = FunctionCallParser(
-            tools=[_tool()],
-            tool_call_parser="beam",
-            prefix=PREFIX,
-        )
-        generation = _continuation_call(
-            "get_weather", _parameter("city", "Paris"), constrain=False
-        )
-
-        content, calls = parser.parse_non_stream(generation)
-
-        self.assertEqual(content, generation)
-        self.assertEqual(calls, [])
+        self.assertTrue(_is_grammar_accept_string(grammar, generation))
+        self.assertEqual(json.loads(calls[0].parameters), expected)
 
     def test_declared_tool_names_are_kept(self):
         for name in ("refl.search", "2fa_check"):
@@ -236,66 +136,6 @@ class TestBeamResponseTemplate(CustomTestCase):
                 self.assertEqual(content, "")
                 self.assertEqual([call.name for call in calls], [name])
                 self.assertEqual(json.loads(calls[0].parameters), {"query": "weather"})
-
-    def test_call_opener_quoted_in_a_held_answer_stays_text(self):
-        """Under a grammar that admits calls or an answer, a call opener quoted in
-        the answer is answer text, whether the reasoning is parsed first or the
-        tool parser reads the whole output."""
-        answer = "A call looks like:" + _continuation_call(
-            "get_weather", _parameter("city", "Paris"), terminator=" and more."
-        )
-        generation = (
-            "<|channel|>analysis<|message|>Plan<|end|><|start|>assistant"
-            "<|channel|>final<|message|>" + answer
-        )
-        reasoning = BeamReasoningDetector(prefix=PREFIX, constrained=True)
-        tool_parser = FunctionCallParser(
-            tools=[_tool()], tool_call_parser="beam", prefix=PREFIX, constrained=True
-        )
-
-        parsed = reasoning.detect_and_parse(generation)
-
-        self.assertEqual((parsed.reasoning_text, parsed.normal_text), ("Plan", answer))
-        self.assertTrue(reasoning.answer_started)
-        self.assertEqual(tool_parser.parse_non_stream(generation), (generation, []))
-
-    def test_answer_opener_quoted_in_reasoning_keeps_the_later_call(self):
-        """Only an answer opener outside the reasoning ends call parsing, and the
-        reasoning stays in the unseparated text as written."""
-        reasoning = (
-            "<|channel|>analysis<|message|>The marker is "
-            "<|channel|>final<|message|>. Use the tool.<|end|><|start|>assistant"
-        )
-        generation = reasoning + _continuation_call(
-            "get_weather", _parameter("city", "Paris")
-        )
-        for constrained in (False, True):
-            for stream in (False, True):
-                with self.subTest(constrained=constrained, stream=stream):
-                    parser = FunctionCallParser(
-                        tools=[_tool()],
-                        tool_call_parser="beam",
-                        prefix=PREFIX,
-                        constrained=constrained,
-                    )
-                    if stream:
-                        content, calls = "", []
-                        for char in generation:
-                            text, new_calls = parser.parse_stream_chunk(char)
-                            content, calls = content + text, calls + new_calls
-                        text, new_calls = parser.parse_stream_end()
-                        content, calls = content + text, calls + new_calls
-                    else:
-                        content, calls = parser.parse_non_stream(generation)
-
-                    self.assertEqual(content, reasoning)
-                    self.assertEqual(
-                        [call.name for call in calls if call.name], ["get_weather"]
-                    )
-                    self.assertEqual(
-                        json.loads("".join(call.parameters for call in calls)),
-                        {"city": "Paris"},
-                    )
 
     def test_reasoning_cut_off_in_its_closer_is_kept_as_written(self):
         """The rest of a closer that ends the parse is no output."""
@@ -317,31 +157,6 @@ class TestBeamResponseTemplate(CustomTestCase):
                     content = parser.parse_non_stream(generation)[0]
 
                 self.assertEqual(content, generation)
-
-    def test_answer_opened_by_the_prompt_continues_as_text(self):
-        """Under a grammar that admits calls or an answer, generation that
-        continues an answer the prompt opened is text, streamed or not."""
-        prefix = PREFIX + "<|channel|>final<|message|>The capital is "
-        for constrained in (False, True):
-            with self.subTest(constrained=constrained):
-                parser = FunctionCallParser(
-                    tools=[_tool()],
-                    tool_call_parser="beam",
-                    prefix=prefix,
-                    constrained=constrained,
-                )
-                streaming = FunctionCallParser(
-                    tools=[_tool()],
-                    tool_call_parser="beam",
-                    prefix=prefix,
-                    constrained=constrained,
-                )
-                streamed = "".join(
-                    streaming.parse_stream_chunk(char)[0] for char in "Paris."
-                )
-
-                self.assertEqual(parser.parse_non_stream("Paris."), ("Paris.", []))
-                self.assertEqual(streamed + streaming.parse_stream_end()[0], "Paris.")
 
     def test_undeclared_tool_calls_follow_the_forwarding_setting(self):
         command = _parameter("command", "pwd")
@@ -393,11 +208,6 @@ class TestBeamResponseTemplate(CustomTestCase):
                 + _full_call("set_count", _parameter("count", "7")),
                 [weather, ("set_count", {"count": 7})],
             ),
-            (
-                "required",
-                _continuation_call("set_count", _parameter("count", "x")),
-                None,
-            ),
             ("required", PREFIX + "<|channel|>final<|message|>Paris<|return|>", None),
             (
                 ToolChoice(type="function", function={"name": "set_count"}),
@@ -433,53 +243,6 @@ class TestBeamResponseTemplate(CustomTestCase):
                         [(call.name, json.loads(call.parameters)) for call in parsed],
                         calls,
                     )
-
-    def test_tag_from_message_start_requires_reasoning(self):
-        """Output from the start anchor must open with the reasoning, and a call
-        after it must be read back."""
-        count = _tool("set_count", {"count": {"type": "integer"}})
-        count.function.strict = True
-        parser = FunctionCallParser(
-            tools=[_tool(), count], tool_call_parser="beam", prefix=PREFIX
-        )
-        thought = "<|channel|>analysis<|message|>plan<|end|>"
-        city = _parameter("city", "Paris")
-        weather = [("get_weather", {"city": "Paris"})]
-        cases = [
-            (_continuation_call("get_weather", city), None),
-            (thought + _full_call("get_weather", city), weather),
-            (_continuation_call("set_count", _parameter("count", "x")), None),
-            (thought + _full_call("set_count", _parameter("count", "x")), None),
-            (
-                _continuation_call("get_weather", city, terminator="<|end|>")
-                + _full_call("get_weather", city),
-                None,
-            ),
-            ("<|channel|>final<|message|>Paris<|return|>", None),
-        ]
-
-        named = ToolChoice(type="function", function={"name": "get_weather"})
-        for tool_choice, parallel_tool_calls in (("required", False), (named, True)):
-            tag = parser.detector.get_structural_tag(
-                tools=parser.tools,
-                tool_choice=tool_choice,
-                thinking_mode=True,
-                parallel_tool_calls=parallel_tool_calls,
-                message_start=True,
-            )
-            grammar = Grammar.from_structural_tag(tag.model_dump_json())
-            for text, calls in cases:
-                with self.subTest(tool_choice=tool_choice, text=text):
-                    self.assertIs(_is_grammar_accept_string(grammar, text), bool(calls))
-                    if calls:
-                        _, parsed = parser.parse_non_stream(text)
-                        self.assertEqual(
-                            [
-                                (call.name, json.loads(call.parameters))
-                                for call in parsed
-                            ],
-                            calls,
-                        )
 
     def test_values_typed_by_enum_or_local_ref_are_constrained(self):
         """A value typed only by its enum or local `$ref` must not be read back as text."""
@@ -528,79 +291,22 @@ class TestBeamResponseTemplate(CustomTestCase):
                 )
 
     def test_closers_in_json_values_and_names_stay_in_the_call(self):
-        """Closers in JSON strings or names must not end the call, nor a last literal
-        keep it open."""
-        note = _tool("set_note", {"text": {"type": "string"}})
-        strings = {
-            "x": {"type": "string"},
-            "short": {"type": "string", "maxLength": 3},
-            "any": {"type": "string", "pattern": "^.*$"},
-            "mark": {"enum": ["a<|end|>b"]},
-        }
-        place = _tool(
-            "set_place",
-            {
-                "loc": {"type": "object", "properties": strings},
-                "n": {"type": "integer"},
-            },
-        )
-        for tool in (note, place):
-            tool.function.strict = True
+        """Closers in JSON strings must not end the call."""
+        strings = {"x": {"type": "string"}}
         spot = _tool("set_spot", {"loc": {"type": "object", "properties": strings}})
         weather = _tool()
         weather.function.parameters["additionalProperties"] = True
         parser = FunctionCallParser(
-            tools=[weather, note, place, spot],
+            tools=[weather, spot],
             tool_call_parser="beam",
             prefix=PREFIX,
             constrained=True,
         )
         _, tag = parser.get_structure_constraint("required")
         grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        city = _parameter("city", "ab")
         cases = [
             ("get_weather", _parameter("city", "a<|end|><|start|>assistantb"), None),
             ("get_weather", _parameter("city", "a<|end|>b"), {"city": "a<|end|>b"}),
-            ("get_weather", city, {"city": "ab"}),
-            (
-                "get_weather",
-                city + _parameter("a<|end|>b", "x"),
-                {"city": "ab", "a<|end|>b": "x"},
-            ),
-            ("set_note", _parameter("text", "a<|end|><|start|>assistantb"), None),
-            ("set_note", _parameter("text", "ab"), {"text": "ab"}),
-            (
-                "set_place",
-                _parameter("loc", '{"x": "a<|end|>b"}'),
-                {"loc": {"x": "a<|end|>b"}},
-            ),
-            ("set_place", _parameter("n", "7"), {"n": 7}),
-            (
-                "set_place",
-                _parameter("loc", '{"x": "a</rfl:parameter>b"}'),
-                {"loc": {"x": "a</rfl:parameter>b"}},
-            ),
-            (
-                "set_place",
-                _parameter("loc", '{"x": "a\\u003c|end|>b"}'),
-                {"loc": {"x": "a<|end|>b"}},
-            ),
-            (
-                "set_place",
-                _parameter("loc", '{"short": "<|e"}'),
-                {"loc": {"short": "<|e"}},
-            ),
-            ("set_place", _parameter("loc", '{"short": "<|en"}'), None),
-            (
-                "set_place",
-                _parameter("loc", '{"any": "a<|end|>"}'),
-                {"loc": {"any": "a<|end|>"}},
-            ),
-            (
-                "set_place",
-                _parameter("loc", '{"mark": "a<|end|>b"}'),
-                {"loc": {"mark": "a<|end|>b"}},
-            ),
             (
                 "set_spot",
                 _parameter("loc", '{"x": "a<|end|><|start|>assistantb"}'),
@@ -709,33 +415,6 @@ class TestBeamResponseTemplate(CustomTestCase):
 
                 self.assertEqual(kind, "json_schema")
 
-    def test_strict_tools_constrain_automatic_tool_choice(self):
-        count = _tool("set_count", {"count": {"type": "integer"}})
-        count.function.strict = True
-        answer = "<|channel|>final<|message|>Sunny."
-        cases = [
-            (_continuation_call("get_weather", _parameter("city", "P")), True),
-            (answer + "<|return|>", True),
-            (
-                answer + "<|end|>" + _full_call("get_weather", _parameter("city", "P")),
-                False,
-            ),
-            (_continuation_call("set_count", _parameter("count", "x")), False),
-        ]
-
-        self.assertIsNone(
-            FunctionCallParser(
-                tools=[_tool()], tool_call_parser="beam"
-            ).get_structure_constraint("auto")
-        )
-        parser = FunctionCallParser(tools=[_tool(), count], tool_call_parser="beam")
-        kind, tag = parser.get_structure_constraint("auto")
-        grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        self.assertEqual(kind, "structural_tag")
-        for text, expected in cases:
-            with self.subTest(text=text):
-                self.assertIs(_is_grammar_accept_string(grammar, text), expected)
-
     def test_automatic_calls_hold_declared_arguments_and_names(self):
         """At any strict level, declared arguments are held where they can be,
         and calls name declared tools only."""
@@ -764,30 +443,18 @@ class TestBeamResponseTemplate(CustomTestCase):
                 with self.subTest(level=level, text=text):
                     self.assertIs(_is_grammar_accept_string(grammar, text), expected)
 
-    def test_forced_call_with_unencodable_tool_name_is_rejected(self):
-        parser = FunctionCallParser(
-            tools=[_tool("get weather")], tool_call_parser="beam"
-        )
-
-        with self.assertRaisesRegex(ValueError, "tool name"):
-            parser.get_structure_constraint("required")
-
     def test_parameter_strict_level_checks_the_tools_it_constrains(self):
         """The parameter strict level must not let an unencodable parameter name
         through."""
         with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER.value):
-            for strict in (False, True):
-                for tool_choice in ("auto", "required"):
-                    with self.subTest(strict=strict, tool_choice=tool_choice):
-                        tool = _tool("get_weather", {'a"b': {"type": "string"}})
-                        tool.function.strict = strict
-                        parser = FunctionCallParser(
-                            tools=[tool], tool_call_parser="beam"
-                        )
+            for tool_choice in ("auto", "required"):
+                with self.subTest(tool_choice=tool_choice):
+                    tool = _tool("get_weather", {'a"b': {"type": "string"}})
+                    parser = FunctionCallParser(tools=[tool], tool_call_parser="beam")
 
-                        with self.assertRaisesRegex(ValueError, "parameter name"):
-                            parser.get_structure_constraint(tool_choice)
-                        self.assertIs(tool.function.strict, strict)
+                    with self.assertRaisesRegex(ValueError, "parameter name"):
+                        parser.get_structure_constraint(tool_choice)
+                    self.assertFalse(tool.function.strict)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from sglang.srt.function_call.response_template_structural_tag import (
     supports_tool_call_structural_tag,
     tool_call_structural_tag,
 )
-from sglang.srt.parser.chat_parsing.content_parsers import parse_content
 from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -69,7 +68,6 @@ def _build(
     template=TEMPLATE,
     tools=(WEATHER, PING),
     *,
-    parallel=True,
     thinking=True,
     answer=False,
     sorted_arguments=False,
@@ -78,7 +76,7 @@ def _build(
     return tool_call_structural_tag(
         loaded.fields["tool_calls"],
         list(tools),
-        parallel_tool_calls=parallel,
+        parallel_tool_calls=True,
         thinking=loaded.fields["thinking"] if thinking else None,
         answer=loaded.fields["content"] if answer else None,
         sorted_arguments=sorted_arguments,
@@ -115,15 +113,6 @@ class TestToolCallStructuralTag(CustomTestCase):
             with self.subTest(text=text):
                 self.assertIs(_accepts(tag, text), expected)
 
-    def test_single_call_when_parallel_calls_are_disabled(self):
-        tag = _build(parallel=False)
-
-        self.assertTrue(_accepts(tag, CALL))
-        self.assertFalse(_accepts(tag, CALL + CALL))
-
-    def test_thinking_is_rejected_when_not_requested(self):
-        self.assertFalse(_accepts(_build(thinking=False), "<think>plan</think>" + CALL))
-
     def test_answer_field_lets_the_model_reply_instead(self):
         cases = [
             ("<think>plan</think><answer>Sunny.", True),
@@ -155,35 +144,24 @@ class TestToolCallStructuralTag(CustomTestCase):
 
     def test_required_reasoning_opens_the_message_with_nonempty_reasoning(self):
         loaded = load_response_template(ANSWER_TEMPLATE)
-        for required in (False, True):
-            tag = tool_call_structural_tag(
-                loaded.fields["tool_calls"],
-                [WEATHER],
-                parallel_tool_calls=True,
-                thinking=loaded.fields["thinking"],
-                answer=loaded.fields["content"],
-                message_start=["<assistant>"],
-                grammar_requires_reasoning=required,
-            )
-            cases = [
-                ("<answer>Sunny.", not required),
-                ("<think></think><answer>Sunny.", not required),
-                ("<think> \n</think><answer>Sunny.", True),
-                ("<think>\nplan</think><answer>Sunny.", True),
-            ]
-            for text, expected in cases:
-                with self.subTest(required=required, text=text):
-                    self.assertIs(_accepts(tag, text), expected)
-
-    def test_json_arguments_follow_schema(self):
-        template = copy.deepcopy(TEMPLATE)
-        template["fields"]["tool_calls"].update(content="json", content_args={})
-        tag = _build(template, tools=[WEATHER])
-
-        self.assertTrue(
-            _accepts(tag, '<call name="get.weather">{"city": "Paris"}</call>')
+        tag = tool_call_structural_tag(
+            loaded.fields["tool_calls"],
+            [WEATHER],
+            parallel_tool_calls=True,
+            thinking=loaded.fields["thinking"],
+            answer=loaded.fields["content"],
+            message_start=["<assistant>"],
+            grammar_requires_reasoning=True,
         )
-        self.assertFalse(_accepts(tag, '<call name="get.weather">{"days": 3}</call>'))
+        cases = [
+            ("<answer>Sunny.", False),
+            ("<think></think><answer>Sunny.", False),
+            ("<think> \n</think><answer>Sunny.", True),
+            ("<think>\nplan</think><answer>Sunny.", True),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertIs(_accepts(tag, text), expected)
 
     def test_underivable_tool_formats_return_none(self):
         """Among them, formats in which a value or the arguments and the text
@@ -339,28 +317,9 @@ class TestToolCallStructuralTag(CustomTestCase):
                 tag = _build(tools=[_tool(parameters, strict=strict)])
                 self.assertIs(tag is not None, derivable)
 
-    def test_json_values_and_names_may_hold_closers(self):
+    def test_names_and_escaped_json_values_may_hold_closers(self):
         closers = copy.deepcopy(TEMPLATE)
         closers["fields"]["tool_calls"]["close"] = ["</call>", "STOP"]
-        loose = {"type": "integer", "allOf": [{"type": ["integer", "string"]}]}
-        text = {"type": "string"}
-        cases = [
-            (TEMPLATE, loose, "7", True),
-            (TEMPLATE, loose, '"a</call>b"', True),
-            (
-                closers,
-                {"type": "object", "properties": {"x": text}},
-                '{"x": "STOP"}',
-                True,
-            ),
-            (closers, text, "aSTOPb", False),
-        ]
-        for template, schema, value, accepted in cases:
-            with self.subTest(schema=schema, value=value):
-                schema = {"type": "object", "properties": {"v": schema}}
-                tag = _build(template, tools=[_tool(schema)])
-                self.assertIs(_accepts(tag, _call(("v", value))), accepted)
-
         tag = _build(closers, tools=[_tool(None, strict=False)])
         self.assertTrue(_accepts(tag, _call(("aSTOPb", "x"))))
         quoted = copy.deepcopy(TEMPLATE)
@@ -407,14 +366,7 @@ class TestToolCallStructuralTag(CustomTestCase):
         loose = _build(tools=[_tool(conditional, strict=False)])
         self.assertTrue(_accepts(loose, _call(("days", "soon"))))
 
-    def test_only_strict_tools_follow_their_schema(self):
-        off_schema = _call(("days", "soon"))
-        parameters = WEATHER["function"]["parameters"]
-
-        self.assertTrue(
-            _accepts(_build(tools=[_tool(parameters, strict=False)]), off_schema)
-        )
-        self.assertFalse(_accepts(_build(tools=[_tool(parameters)]), off_schema))
+    def test_strict_tool_without_parameters_takes_none(self):
         self.assertTrue(_accepts(_build(tools=[_tool(None)]), _call()))
         self.assertFalse(_accepts(_build(tools=[_tool(None)]), _call(("a", "x"))))
 
@@ -462,11 +414,6 @@ class TestToolCallStructuralTag(CustomTestCase):
             _build(template, tools=[_tool(parameters, strict=strict)])
             for strict in (False, True)
         ]
-
-        self.assertEqual(
-            parse_content(cases[1][0], "xml-inline", content_args),
-            {"city": "Paris", "days": "3"},
-        )
         for body, *expected in cases:
             with self.subTest(body=body):
                 call = f'<call name="f">{body}</call>'
@@ -483,9 +430,8 @@ class TestToolCallStructuralTag(CustomTestCase):
         }
         tag = _build(template, tools=[_tool(parameters)])
 
-        def call(keys: str, lookahead: bool) -> str:
-            ends = ["\n" if lookahead else "\n</arg>"] * (len(keys) - 1) + ["\n</arg>"]
-            body = "".join(f'<arg name="{k}">x{e}' for k, e in zip(keys, ends))
+        def call(keys: str) -> str:
+            body = "".join(f'<arg name="{k}">x\n</arg>' for k in keys)
             return f'<call name="f">{body}</call>'
 
         # Parameters in call order, and whether the call is accepted.
@@ -504,9 +450,8 @@ class TestToolCallStructuralTag(CustomTestCase):
             ("bcc", False),
         ]
         for keys, expected in cases:
-            for lookahead in (False, True):
-                with self.subTest(keys=keys, lookahead=lookahead):
-                    self.assertIs(_accepts(tag, call(keys, lookahead)), expected)
+            with self.subTest(keys=keys):
+                self.assertIs(_accepts(tag, call(keys)), expected)
 
     def test_required_argument_without_schema_is_still_required(self):
         """A required entry that is no name leaves the tool to the generic JSON

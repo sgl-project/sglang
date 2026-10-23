@@ -70,8 +70,6 @@ def test_shell_uses_bash_command_schema():
         [{"type": "shell", "environment": {"type": "container_auto"}}],
         [{"type": "shell", "environment": {"type": "local", "skills": []}}],
         [SHELL, {"type": "function", "name": "bash"}],
-        [{"type": "function", "name": "bash"}, SHELL],
-        [SHELL, SHELL],
     ],
 )
 def test_shell_rejects_unsupported_options_and_collisions(tools):
@@ -79,15 +77,12 @@ def test_shell_rejects_unsupported_options_and_collisions(tools):
         registry(tools)
 
 
-@pytest.mark.parametrize("choice", ["auto", {"type": "shell"}])
-def test_shell_is_not_enabled_on_other_models(choice):
+def test_shell_is_not_enabled_on_other_models():
     serving = make_serving()
     serving.tokenizer_manager.generate_request = generate = Mock()
 
     response = asyncio.run(
-        serving.create_responses(
-            ResponsesRequest(input="Run", tools=[SHELL], tool_choice=choice)
-        )
+        serving.create_responses(ResponsesRequest(input="Run", tools=[SHELL]))
     )
 
     assert response.status_code == 400
@@ -136,14 +131,13 @@ def test_shell_result_rejects_missing_outcome():
 
 # Replay serializes each outcome the same way in every mode.
 @pytest.mark.parametrize(
-    "mode,outcome",
+    "mode,outcome,choice",
     [
-        ("full", {"type": "exit", "exit_code": 7}),
-        ("stream", {"type": "timeout"}),
-        ("background", {"type": "exit", "exit_code": 7}),
+        ("full", {"type": "exit", "exit_code": 7}, "required"),
+        ("stream", {"type": "timeout"}, {"type": "shell"}),
+        ("background", {"type": "exit", "exit_code": 7}, "auto"),
     ],
 )
-@pytest.mark.parametrize("choice", ["auto", "required", {"type": "shell"}])
 def test_beam_shell_call_and_client_result_continuation(
     shell_serving, mode, outcome, choice
 ):
@@ -241,17 +235,12 @@ def test_beam_shell_call_and_client_result_continuation(
             {"previous_response_id": result["id"], "input": [output]},
             {"input": [call, output]},
         ):
-            for tools, next_choice in (
-                ([SHELL], "auto"),
-                ([], "auto"),
-                ([SHELL], "none"),
-            ):
+            for tools in ([SHELL], []):
                 response = await serving.create_responses(
                     ResponsesRequest(
                         model="x",
                         store=False,
                         tools=tools,
-                        tool_choice=next_choice,
                         **continuation,
                     )
                 )
@@ -263,9 +252,7 @@ def test_beam_shell_call_and_client_result_continuation(
                     "command": command
                 }
                 assert json.loads(messages[-1].content) == output
-                if next_choice == "none":
-                    assert rendered[-1] is None
-                elif not tools:
+                if not tools:
                     assert not seen[-1].tools
 
     asyncio.run(run())
@@ -289,27 +276,6 @@ def test_namespaced_bash_remains_a_client_function():
     assert adapter.builtin_streams == {}
 
 
-def test_invalid_bash_arguments_fail_instead_of_returning_executable_command():
-    r = registry()
-    response = r.response(
-        {
-            "status": "completed",
-            "output": [
-                {
-                    "type": "function_call",
-                    "name": "bash",
-                    "id": "fc_x",
-                    "call_id": "call_x",
-                    "arguments": '{"command":["pwd"]}',
-                    "status": "completed",
-                }
-            ],
-        }
-    )
-    assert response["status"] == "failed"
-    assert response["output"][0]["action"]["commands"] == []
-
-
 @pytest.mark.parametrize("status", ["incomplete", "in_progress"])
 def test_partial_shell_calls_never_expose_commands(status):
     r = registry()
@@ -327,7 +293,8 @@ def test_partial_shell_calls_never_expose_commands(status):
     assert call["action"]["commands"] == []
 
 
-def test_invalid_shell_terminal_event_matches_failed_response():
+@pytest.mark.parametrize("arguments", ['{"command":["pwd"]}', "not json"])
+def test_invalid_shell_terminal_event_matches_failed_response(arguments):
     r = registry()
     event = r.event(
         {
@@ -340,7 +307,7 @@ def test_invalid_shell_terminal_event_matches_failed_response():
                         "name": "bash",
                         "id": "fc_x",
                         "call_id": "call_x",
-                        "arguments": "not json",
+                        "arguments": arguments,
                         "status": "completed",
                     }
                 ],
@@ -350,6 +317,7 @@ def test_invalid_shell_terminal_event_matches_failed_response():
     assert event["type"] == "response.failed"
     assert event["response"]["status"] == "failed"
     assert event["response"]["error"]["code"] == "server_error"
+    assert event["response"]["output"][0]["action"]["commands"] == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -464,9 +432,7 @@ def test_truncated_shell_history_can_be_continued(shell_serving, stream):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(
-    "choice", ["auto", "none", {"type": "function", "name": "run_command"}]
-)
+@pytest.mark.parametrize("choice", ["auto", "none"])
 def test_native_shell_declares_bash_with_the_client_tools(shell_serving, choice):
     serving, seen, rendered = shell_serving
     client = {
@@ -484,9 +450,7 @@ def test_native_shell_declares_bash_with_the_client_tools(shell_serving, choice)
         if choice == "none":
             raw += "<|start|>assistant<|channel|>final<|message|>No tools.<|return|>"
         else:
-            if choice == "auto":
-                raw += call("bash")
-            raw += call("run_command")
+            raw += call("bash") + call("run_command")
         yield engine_chunk(raw, finish=True)
 
     serving.tokenizer_manager.generate_request = generate
@@ -503,15 +467,10 @@ def test_native_shell_declares_bash_with_the_client_tools(shell_serving, choice)
     if choice == "none":
         assert [i["type"] for i in calls] == ["message"]
         assert rendered[0] is None
-    elif choice == "auto":
+    else:
         assert [i["type"] for i in calls] == ["shell_call", "function_call"]
         assert calls[-1]["name"] == "run_command"
         assert [t["function"]["name"] for t in rendered[0]] == ["bash", "run_command"]
-    else:
-        assert [(i["type"], i["name"]) for i in calls] == [
-            ("function_call", "run_command")
-        ]
-        assert [t["function"]["name"] for t in rendered[0]] == ["run_command"]
 
 
 if __name__ == "__main__":

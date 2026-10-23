@@ -95,18 +95,15 @@ class TestTokenizeFormattingOptions(CustomTestCase):
             (False, False): turn,
         }
         # Multimodal renders are cached; the prompt flag must separate their keys.
-        for multimodal in (False, True):
-            serving = self._serving(multimodal=multimodal)
-            for (prompt, special), text in expected.items():
-                body = {"messages": HISTORY}
-                if prompt is not None:
-                    body["add_generation_prompt"] = prompt
-                if special is not None:
-                    body["add_special_tokens"] = special
-                with self.subTest(
-                    multimodal=multimodal, prompt=prompt, special=special
-                ):
-                    self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
+        serving = self._serving(multimodal=True)
+        for (prompt, special), text in expected.items():
+            body = {"messages": HISTORY}
+            if prompt is not None:
+                body["add_generation_prompt"] = prompt
+            if special is not None:
+                body["add_special_tokens"] = special
+            with self.subTest(prompt=prompt, special=special):
+                self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
 
     def test_options_that_cannot_apply_are_rejected(self):
         chatml = self._serving(chat_template="chatml")

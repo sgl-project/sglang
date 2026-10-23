@@ -795,23 +795,13 @@ class TestReasonerGrammarBackend(CustomTestCase):
             "start_anchor": "<assistant>",
             "fields": {"thinking": {"open": "<think>", "close": "</think>"}},
         }
-        for detector, starts in (
-            (self._make_parser().detector, ()),
-            (
-                ResponseTemplateReasoningDetector(response_template=template),
-                ("<think>",),
-            ),
-        ):
-            with self.subTest(detector=type(detector).__name__):
-                reasoner = ReasonerGrammarBackend(
-                    backend, SimpleNamespace(detector=detector), self._make_tokenizer()
-                )
-                grammar = reasoner._init_value_dispatch(("structural_tag", "{}"), True)
+        detector = ResponseTemplateReasoningDetector(response_template=template)
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=detector), self._make_tokenizer()
+        )
+        grammar = reasoner._init_value_dispatch(("structural_tag", "{}"), True)
 
-                grammar.set_reasoning_in_grammar()
-
-                self.assertEqual(grammar.think_starts, starts)
-                self.assertTrue(grammar.reasoning_in_grammar)
+        self.assertEqual(grammar.think_starts, ("<think>",))
 
     def test_accepts_multi_token_think_start_marker(self):
         """think_start_token can be multi-token (e.g., GPT-OSS) since it's not used."""

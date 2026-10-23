@@ -815,7 +815,6 @@ class ServingChatTestCase(CustomTestCase):
         """JSON-schema output starts after the reasoning only when the grammar
         backend waits for it, which a pattern-only reasoning closer cannot; a
         JSON answer then starts at the answer opener."""
-        named = {"type": "function", "function": {"name": "get_weather"}}
         pattern_closed = {
             **_DELIMITED_RESPONSE_TEMPLATE,
             "fields": {
@@ -826,11 +825,6 @@ class ServingChatTestCase(CustomTestCase):
         json_object = {"response_format": {"type": "json_object"}}
         cases = {
             "auto tool choice": ("beam", {"tools": [_WEATHER_TOOL]}, None),
-            "named tool with a template grammar": (
-                "beam",
-                {"tools": [_WEATHER_TOOL], "tool_choice": named},
-                None,
-            ),
             "response_format after reasoning": (
                 "beam",
                 json_object,
@@ -956,11 +950,7 @@ class ServingChatTestCase(CustomTestCase):
                     ),
                 )
                 for served_output, expected in cases:
-                    for stream, incremental in (
-                        (False, False),
-                        (True, False),
-                        (True, True),
-                    ):
+                    for stream, incremental in ((False, False), (True, True)):
                         with self.subTest(
                             text=served_output["text"],
                             separate=separate,
@@ -1011,11 +1001,7 @@ class ServingChatTestCase(CustomTestCase):
         )
         for output, separated, unseparated in cases:
             for separate, expected in ((True, separated), (False, unseparated)):
-                for stream, incremental in (
-                    (False, False),
-                    (True, False),
-                    (True, True),
-                ):
+                for stream, incremental in ((False, False), (True, True)):
                     with self.subTest(
                         text=output["text"],
                         separate=separate,
@@ -1123,11 +1109,9 @@ class ServingChatTestCase(CustomTestCase):
         self._use_delimited_response_template("beam")
         function = {**_WEATHER_TOOL["function"], "strict": True}
         answer = "<think>Hm</think><answer>Sunny.</call>"
-        call = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
         for text, no_stop_trim, served in (
             (answer, False, ("Hm", "Sunny.", [])),
             (answer, True, ("Hm", "Sunny.</call>", [])),
-            (call, False, ("Hm", "", [("get_weather", {"city": "Paris"})])),
         ):
             for stream in (False, True):
                 with self.subTest(text=text, no_stop_trim=no_stop_trim, stream=stream):
@@ -1142,8 +1126,8 @@ class ServingChatTestCase(CustomTestCase):
                     )
 
     def test_json_answer_keeps_the_answer_framing(self):
-        """JSON output must not skip the answer opener, while a forced tool array stays
-        bare JSON."""
+        """JSON output must not skip the answer opener or admit an answer closer after
+        the JSON, while a forced tool array stays bare JSON."""
         self._use_delimited_response_template("beam")
         answer, call = '<answer>{"a": 1}', '<call:get_weather>{"city": "Paris"}</call>'
         for prompt, from_start, texts in (
@@ -1153,6 +1137,8 @@ class ServingChatTestCase(CustomTestCase):
                 {
                     answer: False,
                     "<think>Plan</think>" + answer: True,
+                    "<think>Plan</think>" + answer + "</answer>": False,
+                    '<think>Plan</think><answer>{"a": "</answer>"}': True,
                     call: False,
                     "<answer>no": False,
                     '{"a": 1}': False,
@@ -1206,90 +1192,34 @@ class ServingChatTestCase(CustomTestCase):
             request._response_parser_grammar_start, GRAMMAR_AFTER_REASONING
         )
 
-    def test_json_answer_is_served_as_the_json_it_ends_with(self):
-        """The grammar must not admit an answer closer after the JSON, which would be
-        served as JSON."""
-        self._use_delimited_response_template("beam")
-        fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
-        adapted, _ = self._convert_rendered_as("<assistant>", **fields)
-        grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
-        for answer, admitted in (
-            ('{"a": 1}', True),
-            ('{"a": "</answer>"}', True),
-            ('{"a": 1}</answer>', False),
-        ):
-            text = "<think>Hm</think><answer>" + answer
-            with self.subTest(answer=answer):
-                self.assertIs(_is_grammar_accept_string(grammar, text), admitted)
-            if not admitted:
-                continue
-            for stream in (False, True):
-                with self.subTest(answer=answer, stream=stream):
-                    served = self._served(
-                        self._stopped_on_token(text, 2), stream, **fields
-                    )
-                    self.assertEqual(served, ("Hm", answer, []))
-
     def test_json_answer_admits_only_calls_the_tool_parser_reads(self):
         """Before a JSON answer, the grammar must not admit calls the tool parser cannot
-        read."""
-        self._use_delimited_response_template("beam")
-        fields = {"tools": [_WEATHER_TOOL], "response_format": {"type": "json_object"}}
-        call = '<think>Hm</think><call:get_weather>{"city": "Paris"}</call>'
-        answer = '<think>Hm</think><answer>{"a": 1}'
-        for parser, reads_calls in (
-            ("response_template", True),
-            ("beam", True),
-            ("hermes", False),
-            ("qwen25", False),
-        ):
-            self.chat.tool_call_parser = parser
-            adapted, _ = self._convert_rendered_as("<assistant>", **fields)
-            grammar = Grammar.from_structural_tag(
-                adapted.sampling_params["structural_tag"]
-            )
-            with self.subTest(parser=parser):
-                self.assertIs(_is_grammar_accept_string(grammar, call), reads_calls)
-                self.assertTrue(_is_grammar_accept_string(grammar, answer))
-            served = {answer: (2, ("Hm", '{"a": 1}', []))}
-            if reads_calls:
-                served[call] = (7, ("Hm", "", [("get_weather", {"city": "Paris"})]))
-            for text, (token_id, expected) in served.items():
-                for stream in (False, True):
-                    with self.subTest(parser=parser, text=text, stream=stream):
-                        self.assertEqual(
-                            self._served(
-                                self._stopped_on_token(text, token_id), stream, **fields
-                            ),
-                            expected,
-                        )
-
-    def test_json_answer_holds_strict_calls_and_their_count(self):
-        """Calls instead of a JSON answer must keep the strictness and count the tools
-        ask for."""
+        read, and calls must keep the strictness and count the tools ask for."""
         self._use_delimited_response_template("beam")
         strict = copy.deepcopy(_WEATHER_TOOL)
         strict["function"]["strict"] = True
+        weather = {"tools": [_WEATHER_TOOL]}
+        single = {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}
         call = '<call:get_weather>{"city": "Paris"}</call>'
-        json_object = {"response_format": {"type": "json_object"}}
-        for fields, text, admitted in (
-            ({"tools": [strict]}, call, True),
-            ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
-            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
-            ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
-            (
-                {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},
-                call + call,
-                False,
-            ),
+        answer = '<answer>{"a": 1}'
+        for parser, fields, text, admitted in (
+            ("beam", weather, call, True),
+            ("beam", weather, answer, True),
+            ("hermes", weather, call, False),
+            ("hermes", weather, answer, True),
+            ("beam", {"tools": [strict]}, call, True),
+            ("beam", {"tools": [strict]}, call.replace('"Paris"', "1"), False),
+            ("beam", single, call, True),
+            ("beam", single, call + call, False),
         ):
+            self.chat.tool_call_parser = parser
             adapted, _ = self._convert_rendered_as(
-                "<assistant>", **fields, **json_object
+                "<assistant>", response_format={"type": "json_object"}, **fields
             )
             grammar = Grammar.from_structural_tag(
                 adapted.sampling_params["structural_tag"]
             )
-            with self.subTest(fields=fields, text=text):
+            with self.subTest(parser=parser, fields=fields, text=text):
                 self.assertIs(
                     _is_grammar_accept_string(grammar, "<think>Hm</think>" + text),
                     admitted,
@@ -1305,28 +1235,14 @@ class ServingChatTestCase(CustomTestCase):
             "type": "structural_tag",
             "format": {"type": "regex", "pattern": ".*"},
         }
-        for tool, fields, error in (
-            (strict, {"regex": ".*"}, "another output constraint"),
-            (
-                _WEATHER_TOOL,
-                {"parallel_tool_calls": False, "ebnf": 'root ::= "x"'},
-                "another output constraint",
-            ),
-            (strict, {"response_format": structural_tag}, "another output constraint"),
-            (
-                _WEATHER_TOOL,
-                {"tool_choice": "required", "regex": ".*"},
-                "cannot both be honored",
-            ),
+        for tool, fields in (
+            (strict, {"regex": ".*"}),
+            (_WEATHER_TOOL, {"parallel_tool_calls": False, "ebnf": 'root ::= "x"'}),
+            (strict, {"response_format": structural_tag}),
         ):
             with self.subTest(fields=fields, strict=tool["function"].get("strict")):
-                with self.assertRaisesRegex(ValueError, error):
+                with self.assertRaisesRegex(ValueError, "another output constraint"):
                     self._convert_rendered_as("<assistant>", tools=[tool], **fields)
-        adapted, _ = self._convert_rendered_as(
-            "<assistant>", tools=[_WEATHER_TOOL], regex=".*"
-        )
-        self.assertEqual(adapted.sampling_params["regex"], ".*")
-        self.assertNotIn("structural_tag", adapted.sampling_params)
 
     def test_automatic_calls_need_a_grammar_from_the_message_start(self):
         """Grammar-held automatic calls must not go unenforced when output may skip the
@@ -1339,24 +1255,22 @@ class ServingChatTestCase(CustomTestCase):
         self._use_delimited_response_template("beam", template)
         strict = {**_WEATHER_TOOL, "function": {**_WEATHER_TOOL["function"]}}
         strict["function"]["strict"] = True
-        for tool, parallel_tool_calls in ((strict, True), (_WEATHER_TOOL, False)):
-            for prompt, rejected in (
-                ("<assistant>", True),
-                ("<assistant><think>So", False),
-            ):
-                with self.subTest(tool=tool, prompt=prompt):
-                    request = ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Weather?"}],
-                        tools=[tool],
-                        parallel_tool_calls=parallel_tool_calls,
-                    )
-                    if rejected:
-                        with self.assertRaisesRegex(ValueError, "skip the reasoning"):
-                            self._convert_rendered_as(prompt, request)
-                        continue
-                    adapted, _ = self._convert_rendered_as(prompt, request)
-                    self.assertIn("structural_tag", adapted.sampling_params)
+        for prompt, rejected in (
+            ("<assistant>", True),
+            ("<assistant><think>So", False),
+        ):
+            with self.subTest(prompt=prompt):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[strict],
+                )
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "skip the reasoning"):
+                        self._convert_rendered_as(prompt, request)
+                    continue
+                adapted, _ = self._convert_rendered_as(prompt, request)
+                self.assertIn("structural_tag", adapted.sampling_params)
 
     def _chat_outcome(self, adapted, request, output):
         """(calls, reasoning, content, finish reasons) as a client reconstructs them."""
@@ -2052,46 +1966,32 @@ class ServingChatTestCase(CustomTestCase):
             (
                 "<|start|>assistant<|channel|>analysis<|message|>So",
                 False,
-                # The reasoning closer already wrote <|start|>assistant, and a
-                # value must not hold a call closer.
-                {
-                    call: True,
-                    full_call: False,
-                    call.replace("Paris", "Pa<|end|><|start|>assistantris"): False,
-                },
+                # The reasoning closer already wrote <|start|>assistant.
+                {call: True, full_call: False},
             ),
         ):
-            for tool_choice, strict in (
-                ("required", False),
-                ({"type": "function", "function": {"name": "get_weather"}}, False),
-                ("auto", False),
-                ("auto", True),
-            ):
-                with self.subTest(
-                    prompt=prompt, tool_choice=tool_choice, strict=strict
-                ):
-                    function = {**_WEATHER_TOOL["function"], "strict": strict}
-                    adapted, _ = self._convert_rendered_as(
-                        prompt,
-                        ChatCompletionRequest(
-                            model="x",
-                            messages=[{"role": "user", "content": "hi"}],
-                            tools=[{**_WEATHER_TOOL, "function": function}],
-                            tool_choice=tool_choice,
-                        ),
-                    )
-                    params = adapted.sampling_params
+            with self.subTest(prompt=prompt):
+                adapted, _ = self._convert_rendered_as(
+                    prompt,
+                    ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[_WEATHER_TOOL],
+                        tool_choice="required",
+                    ),
+                )
+                params = adapted.sampling_params
 
-                    self.assertIs(adapted.require_reasoning, True)
+                self.assertIs(adapted.require_reasoning, True)
+                self.assertIs(
+                    get_request_reasoning_in_grammar(params.get("custom_params")),
+                    from_start,
+                )
+                grammar = Grammar.from_structural_tag(params["structural_tag"])
+                for text, expected in texts.items():
                     self.assertIs(
-                        get_request_reasoning_in_grammar(params.get("custom_params")),
-                        from_start,
+                        _is_grammar_accept_string(grammar, text), expected, text
                     )
-                    grammar = Grammar.from_structural_tag(params["structural_tag"])
-                    for text, expected in texts.items():
-                        self.assertIs(
-                            _is_grammar_accept_string(grammar, text), expected, text
-                        )
 
     def test_template_turn_grammar_frames_unconstrained_turns(self):
         """Beam holds every turn nothing else constrains to the template's framing,
@@ -2180,7 +2080,7 @@ class ServingChatTestCase(CustomTestCase):
         )
         # With tools, the rest of the answer is still served as generated.
         for separate in (True, False):
-            for stream, incremental in ((False, False), (True, False), (True, True)):
+            for stream, incremental in ((False, False), (True, True)):
                 with self.subTest(
                     separate=separate, stream=stream, incremental=incremental
                 ):

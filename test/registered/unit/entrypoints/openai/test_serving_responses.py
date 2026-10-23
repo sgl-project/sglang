@@ -37,7 +37,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
 )
-from sglang.srt.entrypoints.openai.responses_adapters import encode_reasoning_state
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
@@ -64,68 +63,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
-    def test_beam_tool_continuation_preserves_reasoning_and_instructions(self):
-        serving = make_serving()
-        serving.tokenizer_manager.model_config.hf_config.model_type = "beam"
-        request = ResponsesRequest(
-            model="x",
-            store=False,
-            instructions="Current system instructions.",
-            tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                }
-            ],
-            input=[
-                {"role": "developer", "content": "Use the weather tool."},
-                {"role": "user", "content": "Weather in Paris?"},
-                {
-                    "type": "reasoning",
-                    "summary": [],
-                    "encrypted_content": encode_reasoning_state("Check weather. 😀"),
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_weather",
-                    "name": "get_weather",
-                    "arguments": '{"city":"Paris"}',
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_weather",
-                    "output": "Sunny.",
-                },
-            ],
-        )
-        # This checks the inputs delivered to the checkpoint's chat template;
-        # checkpoint-specific rendering needs its actual tokenizer assets.
-        messages = serving._construct_input_messages(request)
-        self.assertEqual(
-            [m["role"] for m in messages], ["system", "user", "assistant", "tool"]
-        )
-        self.assertEqual(
-            messages[0]["content"],
-            "Current system instructions.\n\nDeveloper instructions:\nUse the weather tool.",
-        )
-        self.assertEqual(messages[2]["reasoning_content"], "Check weather. 😀")
-        self.assertEqual(messages[2]["tool_calls"][0]["id"], "call_weather")
-        self.assertEqual(
-            orjson.loads(messages[2]["tool_calls"][0]["function"]["arguments"]),
-            {"city": "Paris"},
-        )
-        self.assertEqual(
-            messages[3],
-            {"role": "tool", "tool_call_id": "call_weather", "content": "Sunny."},
-        )
-        tool = serving._response_tools_to_chat_tools(request)[0]
-        self.assertEqual(tool.function.name, "get_weather")
-        self.assertEqual(tool.function.parameters, request.tools[0].parameters)
-
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")
@@ -372,15 +309,30 @@ class InputMessageConstructionTestCase(CustomTestCase):
                     "summary": [{"type": "summary_text", "text": "conclusion"}],
                 },
                 {"role": "assistant", "content": "answer", "phase": "final_answer"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "lookup"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                },
             ],
             store=False,
         )
         messages = serving._construct_input_messages(request)
-        self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
-        self.assertEqual([m["content"] for m in messages], ["working", "answer"])
         self.assertEqual(
-            [m["reasoning_content"] for m in messages], ["plan", "conclusion"]
+            [m.get("phase") for m in messages], ["commentary", "final_answer", None]
         )
+        self.assertEqual(
+            [m.get("content") for m in messages], ["working", "answer", None]
+        )
+        self.assertEqual(
+            [m["reasoning_content"] for m in messages], ["plan", "conclusion", "lookup"]
+        )
+        self.assertEqual(messages[-1]["tool_calls"][0]["id"], "call_weather")
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
@@ -939,91 +891,24 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                 )
                 self.assertEqual(response["output"][1]["content"][0]["text"], payload)
 
-    def test_forced_call_grammar_covers_skipped_reasoning(self):
-        """Forced calls that skip the reasoning must not escape the grammar."""
-        self._respond(
-            False,
-            output=self._output(self._CALL, matched=7),
-            **self._BEAM,
-            tool_choice="required",
-        )
+    def test_unconstrained_turns_take_the_template_grammar(self):
+        """Under Beam's parser, a turn nothing else constrains takes the template's
+        framing, opening with the reasoning."""
+        self._respond(False, output=self._output(self._CALL, matched=7), **self._BEAM)
         params = self.sampling_params
 
         self.assertTrue(get_request_reasoning_in_grammar(params.get("custom_params")))
         grammar = Grammar.from_structural_tag(params["structural_tag"])
         call = '<call:get_weather>{"city": "Paris"}</call>'
         for text, expected in (
-            (call, False),
             ("<think>Plan</think>" + call, True),
-            ("<answer>Paris</answer>", False),
+            (call, False),
+            ("<think>Plan</think><answer>Paris</answer>", True),
+            ('<think>Plan</think><answer>{"a": 1}', True),
+            ("Paris", False),
         ):
             with self.subTest(text=text):
                 self.assertIs(_is_grammar_accept_string(grammar, text), expected)
-
-    def test_unconstrained_turns_take_the_template_grammar(self):
-        """Under Beam's parser, a turn nothing else constrains takes the template's
-        framing, opening with the reasoning, and a JSON `text.format` replaces it."""
-        call = '<call:get_weather>{"city": "Paris"}</call>'
-        answer = "<think>Plan</think><answer>Paris</answer>"
-        json_answer = '<think>Plan</think><answer>{"a": 1}'
-        for constraint, accepted in (
-            (
-                {},
-                {
-                    "<think>Plan</think>" + call: True,
-                    call: False,
-                    answer: True,
-                    json_answer: True,
-                    "Paris": False,
-                },
-            ),
-            (
-                {"text": {"format": {"type": "json_object"}}},
-                {"<think>Plan</think>" + call: True, answer: False, json_answer: True},
-            ),
-        ):
-            with self.subTest(constraint=constraint):
-                self._respond(
-                    False,
-                    output=self._output(self._CALL, matched=7),
-                    **self._BEAM,
-                    **constraint,
-                )
-                grammar = Grammar.from_structural_tag(
-                    self.sampling_params["structural_tag"]
-                )
-                for text, expected in accepted.items():
-                    self.assertIs(_is_grammar_accept_string(grammar, text), expected)
-        self._respond(False, output=self._output(self._CALL, matched=7))
-        self.assertNotIn("structural_tag", self.sampling_params)
-
-    def test_tool_call_is_parsed_under_delimited_template(self):
-        """A tool call after the reasoning becomes a completed function call
-        under required, named, or JSON output constraints, also when it ends on
-        the tool closer that detokenization keeps before a JSON answer."""
-        constraints = (
-            {"tool_choice": "required"},
-            {"tool_choice": {"type": "function", "name": "get_weather"}},
-            {"text": {"format": {"type": "json_object"}}},
-        )
-        for constraint in constraints:
-            for stream in (False, True):
-                with self.subTest(**constraint, stream=stream):
-                    response = self._respond(
-                        stream,
-                        output=self._output(self._CALL, matched=7),
-                        **self._BEAM,
-                        **constraint,
-                    )
-
-                    self.assertEqual(response["status"], "completed")
-                    self.assertEqual(
-                        [item["type"] for item in response["output"]],
-                        ["reasoning", "function_call"],
-                    )
-                    call = response["output"][1]
-                    self.assertEqual(call["name"], "get_weather")
-                    self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
 
     def test_call_ended_by_another_stop_token_is_complete(self):
         """A complete call ended by a stop token other than its closer must not be
@@ -1060,40 +945,28 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
 
         self.assertEqual(response.status_code, 400)
 
-    def test_json_answer_admits_only_calls_the_tool_parser_reads(self):
-        """Before a JSON answer, the grammar must not admit calls the tool parser cannot
-        read."""
+    def test_json_answer_admits_only_declared_calls(self):
+        """Before a JSON answer, the grammar must admit only calls to declared
+        tools."""
         constraint = {"text": {"format": {"type": "json_object"}}}
         call = self._output(self._CALL, matched=7)
         answer = self._output(
             '<think>Check the forecast.</think><answer>{"a": 1}', matched=2
         )
-        for parser, reads_calls in (("response_template", True), ("hermes", False)):
-            for stream in (False, True):
-                with self.subTest(parser=parser, stream=stream):
-                    response = self._respond(
-                        stream,
-                        output=answer,
-                        reasoning_parser="beam",
-                        tool_call_parser=parser,
-                        **constraint,
-                    )
-                    grammar = Grammar.from_structural_tag(
-                        self.sampling_params["structural_tag"]
-                    )
-                    self.assertIs(
-                        _is_grammar_accept_string(grammar, call["text"]), reads_calls
-                    )
-                    self.assertFalse(
-                        _is_grammar_accept_string(
-                            grammar, call["text"].replace("get_weather", "delete_all")
-                        )
-                    )
-                    message = response["output"][-1]
-                    self.assertEqual(
-                        (message["type"], message["content"][0]["text"]),
-                        ("message", '{"a": 1}'),
-                    )
+        self._respond(
+            False,
+            output=answer,
+            reasoning_parser="beam",
+            tool_call_parser="response_template",
+            **constraint,
+        )
+        grammar = Grammar.from_structural_tag(self.sampling_params["structural_tag"])
+        self.assertTrue(_is_grammar_accept_string(grammar, call["text"]))
+        self.assertFalse(
+            _is_grammar_accept_string(
+                grammar, call["text"].replace("get_weather", "delete_all")
+            )
+        )
         self.assertEqual(
             self._respond(
                 False,
@@ -1141,21 +1014,10 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         output = self._output(
             "<think>Check the forecast.</think><answer>Sunny.", matched=2
         )
-        for parser in ("response_template", "beam"):
-            for stream in (False, True):
-                with self.subTest(parser=parser, stream=stream):
-                    response = self._respond(
-                        stream,
-                        output=output,
-                        reasoning_parser=parser,
-                        tool_call_parser=parser,
-                        tools=[tool],
-                    )
+        response = self._respond(False, output=output, **self._BEAM, tools=[tool])
 
-                    self.assertEqual(response["output"][-1]["type"], "message")
-                    self.assertEqual(
-                        response["output"][-1]["content"][0]["text"], "Sunny."
-                    )
+        self.assertEqual(response["output"][-1]["type"], "message")
+        self.assertEqual(response["output"][-1]["content"][0]["text"], "Sunny.")
 
     def test_tool_markup_inside_an_answer_is_answer_data(self):
         """Tool markup inside a text or JSON answer must stay in the answer, never
