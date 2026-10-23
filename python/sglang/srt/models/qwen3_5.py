@@ -1901,7 +1901,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
-            packed = mxfp4 = 0
+            packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
                     mxfp4 += sum(
