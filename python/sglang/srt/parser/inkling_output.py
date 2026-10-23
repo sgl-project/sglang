@@ -62,6 +62,7 @@ class InklingOutputParser:
         self._separate_reasoning = separate_reasoning
         self._hold_reasoning = separate_reasoning and not stream_reasoning
         self._parse_tool_calls = parse_tool_calls
+        _spans, self._parser = self._tml.renderer.render_for_completion([])
         tokenizer = self._tml.tokenizer
         self._content_kind_ids = frozenset(
             tokenizer.encode_special(name) for name in _CONTENT_KIND_NAMES
@@ -240,9 +241,10 @@ class InklingOutputParser:
         return self._text_decoder.decode(tokenizer.decode_bytes([token_id]))
 
     def _close_message(self, delta: _DeltaBuilder) -> None:
-        _spans, parser = self._tml.local.renderer.render_for_completion([])
         try:
-            messages = parser.parse_tokens(self._parse_prefix + self._message_ids)[1:]
+            messages = self._parser.parse_tokens(
+                self._parse_prefix + self._message_ids
+            )[1:]
         except self._tml.v0.ParseError as exc:
             self._recover_message(delta, exc)
             return

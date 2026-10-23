@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import json
-import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
@@ -35,13 +34,6 @@ _IMAGE_LOCATION_PREFIX = "sglang-inkling-image://"
 _AUDIO_LOCATION_PREFIX = "sglang-inkling-audio://"
 
 
-class _ThreadRenderer(threading.local):
-    # tml-renderers renderers and their parsers panic when called off the thread
-    # that made them; prompts render on executor threads, outputs parse on the loop.
-    def __init__(self, v0: Any, tokenizer: Any):
-        self.renderer = v0.Renderer(tokenizer)
-
-
 @functools.cache
 def load_tml_renderers() -> SimpleNamespace:
     try:
@@ -50,7 +42,7 @@ def load_tml_renderers() -> SimpleNamespace:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
     tokenizer = tokenizers.O200kBaseChatTokenizer()
     return SimpleNamespace(
-        chat=chat, v0=v0, tokenizer=tokenizer, local=_ThreadRenderer(v0, tokenizer)
+        chat=chat, v0=v0, tokenizer=tokenizer, renderer=v0.Renderer(tokenizer)
     )
 
 
@@ -79,9 +71,7 @@ def render_inkling_messages(
         if reasoning_effort is None
         else reasoning_effort
     )
-    spans, _parser = tml.local.renderer.render_for_completion_with_effort(
-        native, effort
-    )
+    spans, _parser = tml.renderer.render_for_completion_with_effort(native, effort)
     return _spans_to_input_ids(spans, tml)
 
 
