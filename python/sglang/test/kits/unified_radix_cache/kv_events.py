@@ -81,11 +81,10 @@ class UnifiedRadixCacheKVEventsFixtures:
         return leaf
 
     def _init_hicache(self, cache, *, write_policy: str = "write_through"):
-        # Production config: kernel IO backend + page_first layout with
-        # PINNED host pools (kernel GPU DMA requires them). Pools track their
-        # cudaHostRegister'd pointers and unregister on destroy()/GC, so the
-        # many fixtures sharing this process cannot collide on recycled
-        # address ranges (rc=712).
+        # Production config: kernel IO backend + page_first layout.
+        # Pinned host pools (kernel GPU DMA requires them) track their registered
+        # pointers and unregister on destroy/GC, so fixtures sharing a process
+        # cannot collide on recycled address ranges.
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,

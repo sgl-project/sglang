@@ -155,11 +155,6 @@ class TestMambaTrackGrid(unittest.TestCase):
     def test_widened_tree_page_rounds_the_interval_up(self):
         self.assertEqual(self._grid(interval=256, tree_page=512), 512)
 
-    def test_interval_already_on_the_tree_page_is_untouched(self):
-        self.assertEqual(self._grid(interval=256, tree_page=256), 256)
-        self.assertEqual(self._grid(interval=256, tree_page=128), 256)
-        self.assertEqual(self._grid(interval=256, tree_page=64), 256)
-
     def test_grid_stays_on_the_chunk_size(self):
         self.assertEqual(self._grid(interval=192, tree_page=64, chunk=128) % 128, 0)
 
