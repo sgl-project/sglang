@@ -8,6 +8,7 @@ from sglang.srt.entrypoints.request_headers import (
     apply_header_overrides,
     apply_session_id_header,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,6 +137,17 @@ class TestApplySessionIdHeader(CustomTestCase):
         obj = _session_obj()
         apply_session_id_header(obj, Headers({"x-session-id": ""}))
         self.assertIsNone(obj.session_id)
+
+    def test_configured_header_replaces_the_default(self):
+        headers = Headers({"x-session-id": "default", "x-conversation": "conv-2"})
+        with envs.SGLANG_SESSION_ID_HEADER.override("X-Conversation"):
+            obj = _session_obj()
+            apply_session_id_header(obj, headers)
+            self.assertEqual(obj.session_id, "conv-2")
+        with envs.SGLANG_SESSION_ID_HEADER.override(""):
+            obj = _session_obj()
+            apply_session_id_header(obj, headers)
+            self.assertIsNone(obj.session_id)
 
     def test_session_params_disables_header(self):
         # The scheduler treats session_params and session_id as mutually

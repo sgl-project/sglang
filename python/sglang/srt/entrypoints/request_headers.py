@@ -6,6 +6,8 @@ This mechanism allows upstream callers to leave the body opaque
 
 from fastapi import HTTPException
 
+from sglang.srt.environ import envs
+
 # request header -> (target attribute, value type)
 _HEADER_OVERRIDES = {
     "x-override-rid": ("rid", str),
@@ -18,13 +20,10 @@ _HEADER_OVERRIDES = {
     "x-override-priority": ("priority", int),
 }
 
-# Same header the vLLM OpenAI server accepts, and the one sgl-router already
-# uses for sticky session routing.
-SESSION_ID_HEADER = "x-session-id"
-
 
 def apply_session_id_header(obj, headers) -> None:
-    """Fall back to ``X-Session-ID`` when the body carries no session identity.
+    """Fall back to the ``SGLANG_SESSION_ID_HEADER`` header (``X-Session-ID`` by
+    default) when the body carries no session identity.
 
     The body always wins: this only fills a missing ``session_id``, so a caller
     that sets the field explicitly is unaffected. ``session_params`` describes a
@@ -35,7 +34,8 @@ def apply_session_id_header(obj, headers) -> None:
         return
     if getattr(obj, "session_params", None) is not None:
         return
-    value = headers.get(SESSION_ID_HEADER)
+    header = envs.SGLANG_SESSION_ID_HEADER.get()
+    value = headers.get(header) if header else None
     if value:
         obj.session_id = value
 
