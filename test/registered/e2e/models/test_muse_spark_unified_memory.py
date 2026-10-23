@@ -1,4 +1,4 @@
-"""Muse Spark unified KV cache coverage with TRT-LLM attention and DFlash2."""
+"""Muse Spark unified KV + HiCache coverage with TRT-LLM and fused DFlash2."""
 
 import json
 import os
@@ -63,6 +63,9 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
             "--speculative-num-draft-tokens",
             "8",
             "--enable-unified-memory",
+            "--enable-hierarchical-cache",
+            "--hicache-size",
+            "200",
             "--mm-feature-transport",
             "cpu",
             "--reasoning-parser",
@@ -79,7 +82,7 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
 
     def test_gsm8k(self):
         # Exercise decode/verify writes into the shared GQA/SWA pool with all
-        # 1,319 questions, including the FA4 draft's separate BF16 KV cache.
+        # 1,319 questions, including the FA4 draft's fused BF16 KV region.
         metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=self.base_url,
