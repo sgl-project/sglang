@@ -1,8 +1,3 @@
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPCombineInput,
-    AscendTPDispatcher,
-    AscendTPDispatchOutput,
-)
 from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
     AscendOpsDispatcher,
@@ -104,9 +99,6 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
-    "AscendTPDispatcher",
-    "AscendTPDispatchOutput",
-    "AscendTPCombineInput",
     "AscendOpsDispatcher",
     "AscendOpsDispatchOutput",
     "AscendOpsCombineInput",

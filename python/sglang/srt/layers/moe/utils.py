@@ -40,7 +40,6 @@ class MoeA2ABackend(Enum):
     NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
-    ASCEND_TP = "ascend_tp"
     ASCEND_OPS = "ascend_ops"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
@@ -75,9 +74,6 @@ class MoeA2ABackend(Enum):
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
-
-    def is_ascend_tp(self):
-        return self == MoeA2ABackend.ASCEND_TP
 
     def is_ascend_ops(self):
         return self == MoeA2ABackend.ASCEND_OPS

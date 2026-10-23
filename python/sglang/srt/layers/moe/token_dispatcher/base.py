@@ -23,8 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         AscendOpsCombineInput,
         AscendOpsDispatchOutput,
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -133,12 +131,6 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_ascend_tp(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_ascend_tp()
-
-    @staticmethod
     def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendOpsDispatchOutput]:
@@ -181,14 +173,10 @@ class DispatchOutputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
     ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
-
-    def is_ascend_tp(self) -> bool:
-        return self == DispatchOutputFormat.ASCEND_TP
 
     def is_ascend_ops(self) -> bool:
         return self == DispatchOutputFormat.ASCEND_OPS
@@ -243,12 +231,6 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_ascend_tp(
-        combine_input: CombineInput,
-    ) -> TypeGuard[AscendTPCombineInput]:
-        return combine_input.format == CombineInputFormat.ASCEND_TP
-
-    @staticmethod
     def format_is_ascend_ops(
         combine_input: CombineInput,
     ) -> TypeGuard[AscendOpsCombineInput]:
@@ -294,7 +276,6 @@ class CombineInputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
     ASCEND_OPS = "ascend_ops"
 
 
