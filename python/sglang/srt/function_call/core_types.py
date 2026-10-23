@@ -10,6 +10,8 @@ class ToolCallItem(BaseModel):
     tool_index: int
     name: Optional[str] = None
     parameters: str  # JSON string
+    # Model-emitted tool call id, verbatim; None if the detector does not capture it.
+    tool_call_id: Optional[str] = None
 
 
 class StreamingParseResult(BaseModel):
