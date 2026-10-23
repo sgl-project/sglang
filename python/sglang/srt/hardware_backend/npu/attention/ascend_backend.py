@@ -846,9 +846,7 @@ class AscendAttnBackend(AttentionBackend):
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
             dcp_page_size = self.page_size * self.dcp_size
-            graph_num_pages = max(
-                1, (total_context_len + dcp_page_size - 1) // dcp_page_size
-            )
+            graph_num_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
         self.graph_metadata = {
             "block_tables": torch.empty(
                 (max_bs, graph_num_pages),
@@ -861,11 +859,6 @@ class AscendAttnBackend(AttentionBackend):
                 max_bs, dtype=torch.int32, device=self.device
             )
             if self.speculative_num_draft_tokens is not None:
-                self.graph_metadata["dcp_spec_seq_lens"] = torch.zeros(
-                    max_bs * self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
                 self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
                     (
                         max_bs,
@@ -995,10 +988,6 @@ class AscendAttnBackend(AttentionBackend):
         if self.dense_mla_dcp_target:
             metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
             if forward_mode.is_target_verify():
-                num_spec_rows = bs * self.speculative_num_draft_tokens
-                metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
-                    :num_spec_rows
-                ]
                 metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
                     :bs
                 ]
@@ -1231,18 +1220,16 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
-                metadata.dcp_spec_seq_lens.copy_(
-                    get_dcp_chain_spec_lens(
-                        effective_seq_lens,
-                        query_len,
-                        self.dcp_size,
-                        self.dcp_rank,
-                        interleave_size=self.page_size,
-                    )
+                local_query_lens = get_dcp_chain_spec_lens(
+                    effective_seq_lens,
+                    query_len,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    interleave_size=self.page_size,
                 )
                 active_mask_width = max(1, num_pages) * self.page_size
                 dcp_mask = build_mla_dcp_mtp_mask(
-                    metadata.dcp_spec_seq_lens,
+                    local_query_lens,
                     query_len,
                     active_mask_width,
                 )
