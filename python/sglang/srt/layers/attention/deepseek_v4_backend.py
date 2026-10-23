@@ -267,18 +267,11 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-@functools.lru_cache(maxsize=None)
-def _split_kv_min_topk() -> int:
-    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
-
-    return SPLIT_KV_MIN_TOPK
-
-
 def _flashmla_v41_splits_kv(
-    indices: torch.Tensor, extra_indices: Optional[torch.Tensor]
+    indices: torch.Tensor, extra_indices: Optional[torch.Tensor], min_topk: int
 ) -> bool:
     extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
-    return indices.shape[-1] + extra_topk >= _split_kv_min_topk()
+    return indices.shape[-1] + extra_topk >= min_topk
 
 
 def _low_ratio_source_projections(
@@ -1227,6 +1220,17 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        if is_cuda():
+            from sglang.kernels.ops.attention import flash_mla_interface
+
+            self._swa_interleaved = (
+                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+            )
+            self._flash_mla_with_kvcache = functools.partial(
+                flash_mla_interface.flash_mla_with_kvcache,
+                use_legacy=not self._swa_interleaved,
+            )
+            self._flashmla_split_kv_min_topk = flash_mla_interface.SPLIT_KV_MIN_TOPK
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
@@ -1394,19 +1398,6 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_state_slot_offset=online_c128_state_slot_offset,
-        )
-
-    @functools.cached_property
-    def _swa_interleaved(self) -> bool:
-        return self.token_to_kv_pool.get_swa_key_layout().is_interleaved
-
-    @functools.cached_property
-    def _flash_mla_with_kvcache(self):
-        from sglang.kernels.ops.attention import flash_mla_interface
-
-        return functools.partial(
-            flash_mla_interface.flash_mla_with_kvcache,
-            use_legacy=not self._swa_interleaved,
         )
 
     def init_forward_metadata_indexer(
@@ -4160,7 +4151,11 @@ class DeepseekV4AttnBackend(
 
                 if self.is_dsv41 and (
                     not self._swa_interleaved
-                    or _flashmla_v41_splits_kv(swa_page_indices, extra_indices)
+                    or _flashmla_v41_splits_kv(
+                        swa_page_indices,
+                        extra_indices,
+                        self._flashmla_split_kv_min_topk,
+                    )
                 ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
