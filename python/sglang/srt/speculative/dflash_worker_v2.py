@@ -2826,6 +2826,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 return_kv_loc_plan=True,
+                before_sample=(
+                    grammar_barrier if batch.mixed_decode_rows_have_grammar() else None
+                ),
             )
             kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 

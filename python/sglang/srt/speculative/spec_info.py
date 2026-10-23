@@ -171,6 +171,12 @@ class SpeculativeAlgorithm(Enum):
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
+    def supports_mixed_grammar_barrier(self) -> bool:
+        # Whether the worker runs the grammar barrier between the target extend
+        # forward and its sampling, so a mixed batch's decode rows see the
+        # previous batch's committed tokens without a synchronous step.
+        return self.is_dflash_family()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
