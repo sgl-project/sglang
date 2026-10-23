@@ -9,6 +9,8 @@ matmuls are allowed); everything else runs F.linear. Results are bitwise repeata
 including side-stream CUDA-graph replay.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -130,3 +132,7 @@ def test_router_tf32_precision_keeps_multi_row_on_cublas():
                 _check(_router(w)(x), x, w, True)
     finally:
         torch.set_float32_matmul_precision(previous)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
