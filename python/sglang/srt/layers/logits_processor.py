@@ -1098,8 +1098,6 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                # Keep low-precision operands and avoid rounding the projection
-                # output before it reaches the FP32 sampler buffer.
                 logits = torch.mm(
                     hidden_states,
                     lm_head.weight.T,
@@ -1107,8 +1105,6 @@ class LogitsProcessor(nn.Module):
                     out=out,
                 )
             elif self.use_fp32_lm_head:
-                # Only the explicit full-FP32 policy promotes operands when
-                # the backend cannot produce FP32 output from their dtype.
                 logits = torch.matmul(
                     hidden_states.to(torch.float32),
                     lm_head.weight.to(torch.float32).T,
