@@ -109,7 +109,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
     def wait(job_ids, expected="completed"):
         pending = set(job_ids)
         history = {job_id: ("queued", 0) for job_id in job_ids}
-        intermediate = False
+        intermediate = set()
         deadline = time.monotonic() + 90
         while pending and time.monotonic() < deadline:
             for job_id in list(pending):
@@ -119,7 +119,8 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
                 assert type(progress) is int and old_progress <= progress <= 100, job
                 assert not (old_status == "in_progress" and status == "queued"), job
                 assert (progress == 100) == (status == "completed"), job
-                intermediate |= status == "in_progress" and 0 < progress < 99
+                if status == "in_progress" and 0 < progress < 99:
+                    intermediate.add(job_id)
                 history[job_id] = (status, progress)
                 if status in ("completed", "failed"):
                     assert status == expected, (job, ctx.log_tail())
@@ -177,7 +178,8 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
             call("GET", f"/v1/videos/{job_id}/content", expected=404)
         call("GET", "/health")
 
-    assert wait(jobs), "no intermediate progress was observed"
+    observed = wait(jobs)
+    assert observed == set(jobs), f"no intermediate progress for {set(jobs) - observed}"
     for job_id, outputs in zip(jobs, [1, 2, 1, 2]):
         hashes = [decoded_hash(job_id, variant) for variant in range(outputs)]
         assert len(set(hashes)) == outputs
