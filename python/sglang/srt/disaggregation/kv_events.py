@@ -36,7 +36,7 @@ import zmq
 from pydantic import BaseModel
 
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +374,10 @@ class EventPublisher(ABC):
         """Describe a source accessible to a separate local process, if any."""
         return None
 
+    def describe_advertised_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Describe a source accessible from other machines, if any."""
+        return None
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -410,6 +414,9 @@ class ZmqEventPublisher(EventPublisher):
     bind:
         Whether to bind the PUB socket. When unset, preserve the endpoint-based
         heuristic: bind wildcard, IPC and inproc addresses; connect otherwise.
+    advertise_host:
+        Host other machines use to reach a wildcard or loopback bind. When
+        unset, wildcard binds advertise the node's detected IP.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -425,6 +432,7 @@ class ZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
         bind: Optional[bool] = None,
+        advertise_host: Optional[str] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -439,6 +447,7 @@ class ZmqEventPublisher(EventPublisher):
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
         self._bind = bind
+        self._advertise_host = advertise_host
         self._replay_endpoint = self.offset_endpoint_port(
             replay_endpoint, self._dp_rank
         )
@@ -490,7 +499,41 @@ class ZmqEventPublisher(EventPublisher):
                 host = "::1"
             return NetworkAddress(host, address.port).to_tcp()
 
-        endpoint = local_endpoint(self._local_pub_endpoint)
+        return self._describe_source(block_size, local_endpoint)
+
+    def describe_advertised_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Report the bound socket with a host other machines can reach.
+
+        A wildcard bind takes ``advertise_host`` or, failing that, the node's
+        detected IP. A loopback bind is reachable only on this node, so it is
+        advertised only when ``advertise_host`` says how to reach it. IPC and
+        connect-style publishers are never advertised off-box.
+        """
+        host = self._advertise_host or self._detected_host()
+
+        def advertised_endpoint(endpoint: Optional[str]) -> Optional[str]:
+            if endpoint is None or parse_advertisable_tcp(endpoint) is None:
+                return None
+            address = NetworkAddress.parse(endpoint[len("tcp://") :])
+            bound = address.host
+            if bound in ("*", "0.0.0.0", "::"):
+                reachable = host
+            elif bound in ("127.0.0.1", "::1", "localhost"):
+                reachable = self._advertise_host
+            else:
+                reachable = bound
+            if reachable is None:
+                return None
+            return NetworkAddress(reachable, address.port).to_tcp()
+
+        return self._describe_source(block_size, advertised_endpoint)
+
+    def _describe_source(
+        self,
+        block_size: int,
+        reachable: Callable[[Optional[str]], Optional[str]],
+    ) -> Optional[dict[str, Any]]:
+        endpoint = reachable(self._local_pub_endpoint)
         if endpoint is None:
             return None
         source = {
@@ -499,10 +542,20 @@ class ZmqEventPublisher(EventPublisher):
             "topic": self._topic_bytes.decode("utf-8"),
             "block_size": block_size,
         }
-        replay_endpoint = local_endpoint(self._local_replay_endpoint)
+        replay_endpoint = reachable(self._local_replay_endpoint)
         if replay_endpoint is not None:
             source["replay_endpoint"] = replay_endpoint
         return source
+
+    def _detected_host(self) -> Optional[str]:
+        try:
+            return get_local_ip_auto(fallback=None)
+        except ValueError:
+            logger.warning(
+                "Could not detect this node's IP; its KV-event publisher is not "
+                "advertised to other machines. Set kv_events_config.advertise_host."
+            )
+            return None
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -695,6 +748,12 @@ class KVEventsConfig(BaseModel):
     bind: Optional[bool] = None
     """Bind (true) or connect (false) the PUB socket. When unset, infer from
     the endpoint as before. Use true to bind a concrete address such as loopback.
+    """
+
+    advertise_host: Optional[str] = None
+    """Host that routers on other machines use to reach this node's publisher
+    (see ``kv_events.sources`` in /server_info). When unset, a wildcard bind
+    advertises the node's detected IP and a loopback bind is not advertised.
     """
 
     replay_endpoint: Optional[str] = None

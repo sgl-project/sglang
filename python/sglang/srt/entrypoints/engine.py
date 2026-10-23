@@ -988,17 +988,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
-            if any("kv_event_sources" in info for info in infos):
-                # Both gRPC entrypoints consume the first scheduler info. Keep
-                # the sources from every local scheduler, not just the first.
-                infos[0]["kv_event_sources"] = sorted(
-                    (
-                        source
-                        for info in infos
-                        for source in info.get("kv_event_sources", [])
-                    ),
-                    key=lambda source: source["dp_rank"],
-                )
+            for key in ("kv_event_sources", "advertised_kv_event_sources"):
+                if any(key in info for info in infos):
+                    # Both gRPC entrypoints consume the first scheduler info.
+                    # Keep the sources from every local scheduler, not just
+                    # the first.
+                    infos[0][key] = sorted(
+                        (source for info in infos for source in info.get(key, [])),
+                        key=lambda source: source["dp_rank"],
+                    )
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:

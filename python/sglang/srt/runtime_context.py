@@ -2120,6 +2120,22 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # as the SUB endpoints;
                                               # present only when
                                               # replay_endpoint is tcp
+            "sources": [                      # added by build_server_info
+                {                             # once the schedulers are
+                    "dp_rank": 8,             # ready: every DP rank's
+                    "node_rank": 1,           # publisher on every node,
+                    "endpoint": "tcp://10.0.0.2:5565",
+                                              # with a host reachable from
+                                              # other machines, so no host
+                                              # substitution is needed
+                    "replay_endpoint": "tcp://10.0.0.2:5566",
+                                              # optional
+                    "topic": "",
+                    "block_size": <kv_event_block_size>,
+                },
+            ],                                # Prefer this list when present:
+                                              # base + dp_rank with one host
+                                              # is wrong for multi-node DP
         }
 
     Returns None (i.e. "no publisher to describe") when any of:

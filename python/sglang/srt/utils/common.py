@@ -3577,8 +3577,15 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     """
     result = server_args.resolved_dict()
     result["launch_command"] = server_args.launch_command
+    scheduler_info = dict(scheduler_info)
+    advertised_sources = scheduler_info.pop("advertised_kv_event_sources", None)
     result.update(scheduler_info)
-    result["kv_events"] = describe_kv_events_publisher(server_args)
+    kv_events = describe_kv_events_publisher(server_args)
+    if kv_events is not None and advertised_sources is not None:
+        # Every DP rank's publisher across all nodes, with hosts reachable
+        # from other machines. Routers prefer this to base + dp_rank.
+        kv_events["sources"] = advertised_sources
+    result["kv_events"] = kv_events
     return result
 
 

@@ -1911,10 +1911,12 @@ class Scheduler(
         if get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
         ):
+            block_size = self.page_size * get_parallel().dcp_size
             result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
+                self.kv_events_publisher.local_kv_event_sources(block_size)
+            )
+            result_dict["advertised_kv_event_sources"] = (
+                self.kv_events_publisher.advertised_kv_event_sources(block_size)
             )
         return result_dict
 

@@ -11,6 +11,7 @@ import atexit
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 import msgspec
 import zmq
@@ -29,6 +30,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -163,6 +165,122 @@ class TestNamespacedBlockHash(CustomTestCase):
         )
         self.assertEqual(
             namespaced_block_hash(-5, namespace_seed=seed), -1810974732006142875
+        )
+
+
+class TestAdvertisedKvEventSource(CustomTestCase):
+    """The off-box view of a publisher, merged onto node 0 for multi-node DP."""
+
+    def _publisher(self, **config):
+        publisher = EventPublisherFactory.create(
+            json.dumps({"publisher": "zmq", **config}), attn_dp_rank=2
+        )
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        return publisher
+
+    def _ports(self):
+        with zmq.Context.instance().socket(zmq.PUB) as probe:
+            pub = probe.bind_to_random_port("tcp://127.0.0.1")
+        with zmq.Context.instance().socket(zmq.ROUTER) as probe:
+            replay = probe.bind_to_random_port("tcp://127.0.0.1")
+        # The publisher offsets both by attn_dp_rank=2.
+        return pub, replay
+
+    def test_wildcard_bind_uses_advertise_host(self):
+        pub, replay = self._ports()
+        publisher = self._publisher(
+            endpoint=f"tcp://*:{pub - 2}",
+            replay_endpoint=f"tcp://*:{replay - 2}",
+            topic="kv",
+            advertise_host="10.0.0.5",
+        )
+        self.assertEqual(
+            publisher.describe_advertised_source(64),
+            dict(
+                dp_rank=2,
+                endpoint=f"tcp://10.0.0.5:{pub}",
+                replay_endpoint=f"tcp://10.0.0.5:{replay}",
+                topic="kv",
+                block_size=64,
+            ),
+        )
+        # The local view is unchanged: loopback for a separate local process.
+        self.assertEqual(
+            publisher.describe_local_source(64)["endpoint"], f"tcp://127.0.0.1:{pub}"
+        )
+
+    def test_wildcard_bind_falls_back_to_detected_ip(self):
+        pub, _ = self._ports()
+        publisher = self._publisher(endpoint=f"tcp://*:{pub - 2}")
+        with patch(
+            "sglang.srt.disaggregation.kv_events.get_local_ip_auto",
+            return_value="10.0.0.9",
+        ):
+            source = publisher.describe_advertised_source(64)
+        self.assertEqual(source["endpoint"], f"tcp://10.0.0.9:{pub}")
+        self.assertNotIn("replay_endpoint", source)
+
+        with patch(
+            "sglang.srt.disaggregation.kv_events.get_local_ip_auto",
+            side_effect=ValueError("no ip"),
+        ):
+            self.assertIsNone(publisher.describe_advertised_source(64))
+
+    def test_loopback_bind_is_advertised_only_with_a_host(self):
+        pub, _ = self._ports()
+        publisher = self._publisher(endpoint=f"tcp://127.0.0.1:{pub - 2}", bind=True)
+        with patch(
+            "sglang.srt.disaggregation.kv_events.get_local_ip_auto",
+            return_value="10.0.0.9",
+        ):
+            self.assertIsNone(publisher.describe_advertised_source(64))
+        self.assertIsNotNone(publisher.describe_local_source(64))
+
+        pub, _ = self._ports()
+        publisher = self._publisher(
+            endpoint=f"tcp://127.0.0.1:{pub - 2}", bind=True, advertise_host="h1"
+        )
+        self.assertEqual(
+            publisher.describe_advertised_source(64)["endpoint"], f"tcp://h1:{pub}"
+        )
+
+    def test_connect_style_publisher_is_not_advertised(self):
+        pub, _ = self._ports()
+        publisher = self._publisher(
+            endpoint=f"tcp://10.0.0.7:{pub - 2}", advertise_host="10.0.0.5"
+        )
+        self.assertIsNone(publisher.describe_advertised_source(64))
+        self.assertIsNone(publisher.describe_local_source(64))
+
+    def test_build_server_info_attaches_sources_to_the_descriptor(self):
+        cfg = json.dumps({"publisher": "zmq", "endpoint": "tcp://*:5557"})
+        args = ServerArgs(model_path="dummy", page_size=16, kv_events_config=cfg)
+        sources = [
+            {"dp_rank": 0, "node_rank": 0, "endpoint": "tcp://10.0.0.1:5557"},
+            {"dp_rank": 1, "node_rank": 1, "endpoint": "tcp://10.0.0.2:5558"},
+        ]
+        info = build_server_info(
+            args,
+            {
+                "max_total_num_tokens": 8,
+                "kv_event_sources": [],
+                "advertised_kv_event_sources": sources,
+            },
+        )
+        self.assertEqual(info["kv_events"]["sources"], sources)
+        self.assertEqual(info["kv_events"]["endpoint_port_base"], 5557)
+        self.assertEqual(info["kv_event_sources"], [])
+        self.assertNotIn("advertised_kv_event_sources", info)
+
+        without = build_server_info(args, {"max_total_num_tokens": 8})
+        self.assertNotIn("sources", without["kv_events"])
+
+        disabled = ServerArgs(model_path="dummy", page_size=16)
+        self.assertIsNone(
+            build_server_info(disabled, {"advertised_kv_event_sources": sources})[
+                "kv_events"
+            ]
         )
 
 
