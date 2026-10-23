@@ -1089,6 +1089,26 @@ class ServerArgs(DisaggServerArgsMixin):
                 self._parse_attention_backend_config(self.attention_backend_config)
             )
 
+        if "eqbsa_attn" in {
+            self.attention_backend,
+            *self.component_attention_backends.values(),
+        }:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn_v2 import (
+                _nonnegative_int,
+                _validate_precision,
+            )
+
+            config = self.attention_backend_config
+            _validate_precision(config.get("precision", "mix"))
+            _nonnegative_int(config.get("skip_first_steps", 10), "skip_first_steps")
+            _nonnegative_int(config.get("dense_last_steps", 0), "dense_last_steps")
+            # Sparse block geometry is independent of Q/K's internal
+            # quantization groups. The public EQBSA route fixes both blocks at 128.
+            for name in ("block_size", "block_size_q", "block_size_kv"):
+                size = config.get(name, 128)
+                if isinstance(size, bool) or not isinstance(size, int) or size != 128:
+                    raise ValueError("EQBSA MIX requires Q/KV sparse blocks of 128")
+
         if self.backend != Backend.DIFFUSERS and isinstance(
             self.pipeline_config, LTX2PipelineConfig
         ):
@@ -1112,14 +1132,15 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "eqbsa_attn")
             and "text_encoder" not in self.component_attention_backends
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Laser and EQBSA target the MiniMax-H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
             self._automatic_component_attention_backend_keys.add("text_encoder")
