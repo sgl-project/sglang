@@ -38,6 +38,14 @@ def _make_heads() -> dict[str, torch.Tensor]:
     return heads
 
 
+class _CountedUploads(torch.Tensor):
+    uploads = 0
+
+    def to(self, *args, **kwargs):
+        _CountedUploads.uploads += 1
+        return super().to(*args, **kwargs)
+
+
 class TestMiniMaxH3PDDOffline(CustomTestCase):
     def test_tp_projection_matches_full_head(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -74,6 +82,42 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
                             torch.cat([output[i] for output in outputs], dim=-1),
                             expected,
                         )
+
+    def test_heads_are_uploaded_once_not_per_step(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "heads.safetensors"
+            heads = _make_heads()
+            save_file(heads, str(path))
+            arch = MiniMaxH3DiTArchConfig(
+                hidden_size=5, latents_dim=6, audio_latents_dim=4, patch_size=(1, 1, 1)
+            )
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                return_value=SimpleNamespace(world_size=1, rank_in_group=0),
+            ):
+                layer = MiniMaxH3FinalLayer(
+                    arch, None, prefix="final_layer", use_adaln_cache=True
+                )
+            layer.load_pdd_fused_heads(str(path))
+            # the loaded heads stay on the host; count their copies to the device
+            layer._pdd_heads = {
+                key: value.as_subclass(_CountedUploads)
+                for key, value in layer._pdd_heads.items()
+            }
+            _CountedUploads.uploads = 0
+            h = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+            for step in range(8):
+                with set_forward_context(step, None):
+                    outputs = layer._project(h)
+                for output, name in zip(outputs, ("video_out", "audio_out")):
+                    expected = torch.nn.functional.linear(
+                        h, heads[f"{name}.weight"][step], heads[f"{name}.bias"][step]
+                    )
+                    self.assertTrue(
+                        torch.equal(output.as_subclass(torch.Tensor), expected)
+                    )
+            # one weight and one bias stack per head for the whole loop
+            self.assertEqual(_CountedUploads.uploads, 4)
 
     def test_schedule_validation_and_warmup(self):
         apply_schedule = partial(
