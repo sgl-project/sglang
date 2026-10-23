@@ -11,20 +11,20 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+    is_unified_kv_triton,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -702,6 +702,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hf_config, quant_config
         )
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        return DeepseekV4ForCausalLM.num_fusable_shared_experts(hf_config)
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -711,9 +715,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -849,9 +851,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
+        self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
+
+    def project_commit_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> List[torch.Tensor]:
+        """The context rows' per-stage KV, before norm / rope / store; reads no KV
+        location, so it can run before the accept decides what is committed."""
         main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -861,6 +870,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def store_commit_kv(
+        self,
+        *,
+        kvs: List[torch.Tensor],
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
@@ -929,9 +948,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            # The kernel widens each element to fp32 as it loads it.
+            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
@@ -988,6 +1008,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
+        n_routed_experts = _dspark_stage_config(self.config).n_routed_experts
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -996,7 +1017,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
+            num_experts=(n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
@@ -1010,7 +1031,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
                     ".mlp.shared_experts.",
-                    f".mlp.experts.{self.config.n_routed_experts}.",
+                    f".mlp.experts.{n_routed_experts}.",
                 )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
@@ -1062,6 +1083,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        self.post_load_weights()
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        for stage in self.stages:
+            stage.refresh_mhc_norm_weight_cache()
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set

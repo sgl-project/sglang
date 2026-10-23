@@ -248,12 +248,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
-    if cfg.speculative_skip_dp_mlp_sync:
-        assert cfg.speculative_algorithm == "EAGLE", (
-            "--speculative-skip-dp-mlp-sync is only supported with "
-            f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
-        )
-
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
             cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")
@@ -903,6 +897,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
+            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
+            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
+                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
@@ -1144,6 +1141,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
             )
+        if cfg.enable_deterministic_inference and not cfg.device.startswith("cuda"):
+            raise ValueError(
+                "Deterministic rejection sampling is currently supported only on "
+                "CUDA-compatible devices because draft proposal sampling uses a "
+                "Triton hash kernel."
+            )
         if (
             cfg.speculative_accept_threshold_single != 1.0
             or cfg.speculative_accept_threshold_acc != 1.0
@@ -1154,13 +1157,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--speculative-accept-threshold-acc; rejection sampling ignores "
                 "the accept thresholds."
             )
-        if cfg.enable_deterministic_inference:
-            raise ValueError(
-                "--speculative-use-rejection-sampling is incompatible with "
-                "--enable-deterministic-inference; the sampling kernel draws "
-                "coins from the global RNG and is not batch-invariant."
-            )
-
         if (
             resolved_view(server_args).enable_multi_layer_eagle
             and cfg.speculative_eagle_topk != 1
