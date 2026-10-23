@@ -464,6 +464,8 @@ For standard serving (including `--webui`) and locally launched disaggregated
 pools, losing any tracked worker makes `/health` return `503`; `/liveness`
 continues to report HTTP availability. The same applies when the local offline
 broker or disaggregation routing loop exits, even if its process is still alive.
+The broker replies to malformed jobs and inference errors without stopping;
+an unrecoverable socket receive or send error stops it and makes the server unready.
 A local monitor checks these components once per
 second, fails outstanding scheduler requests, and rejects new POST requests with
 `503`, even without an RPC timeout. Completed job status and content remain

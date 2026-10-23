@@ -96,27 +96,17 @@ async def run_zeromq_broker(server_args: ServerArgs):
         socket.bind(broker_endpoint)
         logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
         while True:
+            # transport failures must stop the broker so readiness can reject work
+            payload = await socket.recv()
             try:
-                # 1. Receive a request from an offline client
-                payload = await socket.recv()
                 request_batch = pickle.loads(payload)
                 logger.debug("Broker received an offline job from a client.")
-
-                # 2. Forward the request to the main Scheduler via the shared client
                 response_batch = await async_scheduler_client.forward(request_batch)
-
-                # 3. Send the Scheduler's reply back to the offline client
-                await socket.send(pickle.dumps(response_batch))
-
+                response = pickle.dumps(response_batch)
             except Exception as e:
-                logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
-                # A reply must be sent to prevent the client from hanging
-                try:
-                    await socket.send(
-                        pickle.dumps({"status": "error", "message": str(e)})
-                    )
-                except Exception:
-                    pass
+                logger.exception("Error in ZMQ Broker request: %s", e)
+                response = pickle.dumps({"status": "error", "message": str(e)})
+            await socket.send(response)
     finally:
         socket.close(linger=0)
         ctx.destroy(linger=0)
