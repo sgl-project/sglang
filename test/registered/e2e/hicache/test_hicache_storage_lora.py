@@ -13,7 +13,6 @@ import requests
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,17 +22,23 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
 
-LORA_NAME = "sql"
-LORA_PATH = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+# The test checks cache keys and storage round trips, not model quality, so a
+# small model with a matching adapter will do (the RL tensor-load test uses both).
+MODEL = "Qwen/Qwen3-0.6B"
+LORA_NAME = "alice"
+LORA_PATH = "charent/self_cognition_Alice"
 PAGE_SIZE = 64
 PROMPT_TOKENS = 768
+# Room for the test's few requests; caps the device KV pool, and with it the
+# host pool that --hicache-ratio sizes from it.
+MAX_TOTAL_TOKENS = 16384
 
 
 class TestHiCacheStorageLoRAIsolation(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = get_tokenizer(cls.model)
 
@@ -42,6 +47,8 @@ class TestHiCacheStorageLoRAIsolation(CustomTestCase):
             "--enable-hierarchical-cache",
             "--mem-fraction-static",
             "0.6",
+            "--max-total-tokens",
+            str(MAX_TOTAL_TOKENS),
             "--hicache-ratio",
             "1.2",
             "--page-size",
@@ -123,6 +130,11 @@ class TestHiCacheStorageLoRAIsolation(CustomTestCase):
 
         # Cold pass with the adapter populates host and storage.
         lora_first = self.send_request(prompt, lora_path=LORA_NAME)
+        # Decoded random tokens can re-tokenize to another count; the server's
+        # own count must keep the hit floor reachable (more than 11 pages).
+        self.assertGreater(
+            lora_first["meta_info"]["prompt_tokens"], hit_floor + PAGE_SIZE
+        )
         self.flush_device_cache()
 
         # Read adapter pages before any base request stores the same prompt.
