@@ -881,6 +881,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         return self._match_prefix_helper(key, params)
 
+    def _create_match_validators(
+        self, params: MatchPrefixParams, match_device_only: bool
+    ) -> tuple[Callable[[UnifiedTreeNode], bool], ...]:
+        return tuple(
+            comp.create_match_validator(match_device_only=match_device_only)
+            for comp in self.components
+        )
+
     def _match_prefix_helper(
         self, key: RadixKey, params: MatchPrefixParams
     ) -> MatchResult:
@@ -898,23 +906,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
-        if separate_device_match:
-            validators = tuple(
-                comp.create_match_validator() for comp in self.components
-            )
-            device_validators = tuple(
-                comp.create_match_validator(match_device_only=True)
-                for comp in self.components
-            )
-        else:
-            validators = tuple(
-                comp.create_match_validator(match_device_only=True)
-                for comp in self.components
-            )
-            device_validators = validators
+        validators = self._create_match_validators(
+            params, match_device_only=not separate_device_match
+        )
+        device_validators = (
+            self._create_match_validators(params, match_device_only=True)
+            if separate_device_match
+            else validators
+        )
 
         def _all_valid(validators, node):
-            return all([v(node) for v in validators])
+            return all([validator(node) for validator in validators])
 
         def _update_best_if_valid(node):
             nonlocal best_match_node
