@@ -685,7 +685,7 @@ class _HostTable:
         if layout not in ("shared", "per_rank"):
             raise ValueError(
                 f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
-                "'shared' or 'per_rank'"
+                "'shared', 'per_rank', 'replicated' or 'hybrid'"
             )
         self.layout = layout
         self.nbytes = nbytes
@@ -846,6 +846,7 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self.shard_table: Optional[_HostTable] = None
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
@@ -866,11 +867,32 @@ class EngramEmbedding(nn.Module):
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        n = num_embeddings if layout == "shared" else self.rows
+        if layout == "hybrid":
+            self.shard_table = _HostTable(
+                "per_rank",
+                max(1, self.rows * (dim + dim // FP8_BLOCK_SIZE)),
+                f"sglang_engram_{layer_id}_shard",
+                get_parallel().tp_group,
+            )
+            w_bytes = self.rows * dim
+            raw = self.shard_table.bytes
+            self._shard_weight = (
+                raw[:w_bytes].view(torch.float8_e4m3fn).view(self.rows, dim)
+            )
+            self._shard_scale = (
+                raw[w_bytes : w_bytes + self.rows * (dim // FP8_BLOCK_SIZE)]
+                .view(torch.float8_e8m0fnu)
+                .view(self.rows, dim // FP8_BLOCK_SIZE)
+            )
+            ptr = self.shard_table.device_ptr
+            self._shard_table_ptrs = (ptr, ptr + w_bytes)
+            layout = "shared"
+        self._full_rows = layout in ("shared", "replicated")
+        n = num_embeddings if self._full_rows else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         self.host_table = _HostTable(
-            layout,
+            "per_rank" if layout == "replicated" else layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
@@ -886,7 +908,11 @@ class EngramEmbedding(nn.Module):
 
     @property
     def _shared(self) -> bool:
-        return self.host_table is not None and self.host_table.layout == "shared"
+        return self.host_table is not None and self._full_rows
+
+    @property
+    def _replicated(self) -> bool:
+        return self._shared and self.host_table.layout == "per_rank"
 
     @property
     def shared_host_table_without_ats(self) -> bool:
@@ -899,17 +925,33 @@ class EngramEmbedding(nn.Module):
         assert self.shared_host_table_without_ats
         self.staged_by_scheduler = True
 
-    def _table_ptrs(self) -> tuple[int, int]:
+    def _table_ptrs(self, shards: bool = False) -> tuple[int, int]:
         if self.host_table is None:
             return self.weight.data_ptr(), self.scale.data_ptr()
+        if shards:
+            return self._shard_table_ptrs
         return self._host_table_ptrs
+
+    def _use_shards(self, forward_batch: Optional[ForwardBatch]) -> bool:
+        if self.shard_table is None or forward_batch is None:
+            return False
+        counts = forward_batch.global_num_tokens_cpu
+        if counts is None:
+            return False
+        return sum(counts) >= envs.SGLANG_DSV41_ENGRAM_HYBRID_MIN_TOKENS.get()
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
+        if self._replicated:
+            param.data.copy_(loaded_weight)
+        elif self._shared:
             param.data[rows].copy_(loaded_weight[rows])
         else:
             param.data.copy_(loaded_weight[rows])
+        if self.shard_table is not None:
+            shard = self._shard_weight if param is self.weight else self._shard_scale
+            shard.copy_(loaded_weight[rows])
+            self.shard_table.dirty = True
         if self.host_table is not None:
             self.host_table.dirty = True
 
@@ -917,6 +959,8 @@ class EngramEmbedding(nn.Module):
         """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if self.shard_table is not None:
+            self.shard_table.finish_load(f"{label} shards")
 
     def forward(
         self,
@@ -925,7 +969,8 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        if self._shared:
+        shards = self._use_shards(forward_batch)
+        if self._shared and not shards:
             if indices.shape[0] == 0:
                 return self._empty(indices)
             out = self._empty(indices)
@@ -950,8 +995,8 @@ class EngramEmbedding(nn.Module):
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
-            return self._dp_sharded_lookup(indices, forward_batch)
-        return self._lookup(indices)
+            return self._dp_sharded_lookup(indices, forward_batch, shards=shards)
+        return self._lookup(indices, shards=shards)
 
     def dequant_staged(
         self,
@@ -982,12 +1027,12 @@ class EngramEmbedding(nn.Module):
         )
         return out
 
-    def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
+    def _lookup(self, indices: torch.Tensor, shards: bool = False) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
         per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
             return self._empty(indices)
-        values = self._owned_rows(indices)
+        values = self._owned_rows(indices, shards=shards)
         if self.tp_size > 1:
             values = self._reduce_owned_rows(values)
         return values
@@ -1006,7 +1051,7 @@ class EngramEmbedding(nn.Module):
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
 
-    def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
+    def _owned_rows(self, indices: torch.Tensor, shards: bool = False) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
@@ -1019,7 +1064,7 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            *self._table_ptrs(),
+            *self._table_ptrs(shards),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
@@ -1031,7 +1076,10 @@ class EngramEmbedding(nn.Module):
         return out
 
     def _dp_sharded_lookup(
-        self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
+        self,
+        indices: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        shards: bool = False,
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
@@ -1043,7 +1091,7 @@ class EngramEmbedding(nn.Module):
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
             return self._empty(indices)
-        values = self._owned_rows(ids_global).view(rows, -1)
+        values = self._owned_rows(ids_global, shards=shards).view(rows, -1)
         local = torch.empty(
             (indices.shape[0], values.shape[1]),
             dtype=values.dtype,
