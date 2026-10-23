@@ -505,8 +505,6 @@ class AscendAttnBackend(AttentionBackend):
         kv_lens_cpu: torch.Tensor,
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
-        *,
-        block_tables: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP."""
         parallel = get_parallel()
@@ -526,30 +524,13 @@ class AscendAttnBackend(AttentionBackend):
                 interleave_size=self.page_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
-        if self.use_dsa and block_tables is None:
-            max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
-            block_tables = (
-                self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
-            ).to(torch.int32)
-        else:
-            if block_tables is None:
-                max_len = local_kv_lens.max().item() if local_kv_lens.numel() else 0
-                num_pages = max(1, (max_len + self.page_size - 1) // self.page_size)
-                block_tables = torch.empty(
-                    (req_pool_indices.numel(), num_pages),
-                    dtype=torch.int32,
-                    device=self.req_to_token.device,
-                )
-            if req_pool_indices.numel():
-                torch.div(
-                    self.req_to_token[
-                        req_pool_indices,
-                        : block_tables.shape[1] * page_stride : page_stride,
-                    ],
-                    page_stride,
-                    rounding_mode="floor",
-                    out=block_tables,
-                )
+        max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
+        if self.dense_mla_dcp_target:
+            # Keep at least one page-table column for empty MLA lengths.
+            max_len = max(1, max_len)
+        block_tables = (
+            self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
+        ).to(torch.int32)
         if is_spec:
             block_tables = block_tables.repeat_interleave(
                 self.speculative_num_draft_tokens, dim=0
@@ -1148,12 +1129,21 @@ class AscendAttnBackend(AttentionBackend):
                     // self.dcp_size,
                 ),
             )
-            local_seq_lens, _ = self._get_kv_lens_and_block_tables(
-                effective_seq_lens,
+            # Use the existing Host lengths for table bounds without a device readback.
+            _, block_tables = self._get_kv_lens_and_block_tables(
+                attention_kv_lens_cpu,
                 req_pool_indices[:bs],
-                block_tables=metadata.block_tables[:, :active_num_pages],
+            )
+            metadata.block_tables[:, :active_num_pages].copy_(
+                block_tables[:, :active_num_pages]
             )
             metadata.block_tables[:, active_num_pages:].zero_()
+            local_seq_lens = get_dcp_lens(
+                effective_seq_lens,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.page_size,
+            ).int()
             metadata.seq_lens.copy_(local_seq_lens)
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
             if in_capture:
