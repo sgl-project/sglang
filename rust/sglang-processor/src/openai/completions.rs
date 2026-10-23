@@ -11,8 +11,8 @@ use sglang_api_types::api::v1::{
 };
 
 use super::request::{
-    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
-    lora_path, one, usage_flags, yes,
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
+    format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
     Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
@@ -175,8 +175,10 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let mut lowered = generate_body(&request, headers)?;
-    lowered.custom_labels = labels;
+    let lowered = GenerateRequest {
+        custom_labels: labels,
+        ..generate_body(&request, headers)?
+    };
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let responder = CompletionResponder {
@@ -224,16 +226,7 @@ fn generate_body(
         no_stop_trim: Some(request.no_stop_trim),
         ignore_eos: Some(request.ignore_eos),
         skip_special_tokens: Some(request.skip_special_tokens),
-        logit_bias: request
-            .logit_bias
-            .iter()
-            .flat_map(|v| v.iter())
-            .map(|(k, v)| {
-                v.as_f64()
-                    .map(|v| (k.clone(), v))
-                    .ok_or(Unsupported("invalid_request"))
-            })
-            .collect::<Result<_, _>>()?,
+        logit_bias: float_logit_bias(&request.logit_bias)?,
         custom_params: request
             .custom_params
             .as_ref()
