@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
+from sglang.srt.entrypoints.systemone import serving as systemone_serving
 from sglang.srt.entrypoints.systemone.joint_schema import encode_joint_schema
 from sglang.srt.entrypoints.systemone.kev import encode_kev
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
@@ -475,6 +476,86 @@ class TestJointSchemaAdmission(CustomTestCase):
                     self.assertLess(max(decoded), len(payload))
                 else:
                     self.assertEqual(decoded[-1], len(payload))
+
+
+class _HangingManager(HeadManager):
+    """generate_request hangs until abort_request releases it, recording aborts.
+
+    Models the /v1/systemone disconnect bug: the scoring request is short, so
+    the generic non-streaming wait never reaches its (multi-second) disconnect
+    poll and an abandoned request would otherwise run to completion."""
+
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.aborted = []
+        self._release = asyncio.Event()
+
+    def abort_request(self, rid="", abort_all=False):
+        self.aborted.append(rid)
+        self._release.set()
+
+    async def generate_request(self, request, raw_request):
+        self.requests.append(request)
+        await self._release.wait()
+        yield {"embedding": [], "meta_info": {"prompt_tokens": 0}}
+
+
+class TestRequestIdAndDisconnectAbort(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    async def test_caller_rid_labels_the_internal_request(self):
+        """A proxy-supplied rid reaches the internal request, like chat's."""
+        manager = HeadManager(self.tokenizer)
+        response = await _handler(manager).handle_request(
+            SystemOneRequest(**REQUEST, rid="proxy-rid"), None
+        )
+        self.assertEqual(response.status_code, 200)
+        (sent,) = manager.requests
+        self.assertEqual(sent.rid, "proxy-rid")
+
+    async def test_rid_is_generated_when_the_caller_supplies_none(self):
+        manager = HeadManager(self.tokenizer)
+        response = await _handler(manager).handle_request(
+            SystemOneRequest(**REQUEST), None
+        )
+        self.assertEqual(response.status_code, 200)
+        (sent,) = manager.requests
+        self.assertIsInstance(sent.rid, str)
+        self.assertTrue(sent.rid)
+
+    async def test_disconnected_client_aborts_the_request(self):
+        manager = _HangingManager(self.tokenizer)
+        raw_request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=True))
+        with mock.patch.object(systemone_serving, "_DISCONNECT_POLL_SECONDS", 0.01):
+            response = await _handler(manager).handle_request(
+                SystemOneRequest(**REQUEST), raw_request
+            )
+        # The disconnect surfaces as a 400 whose message names the aborted rid.
+        self.assertEqual(response.status_code, 400)
+        (sent,) = manager.requests
+        self.assertEqual(manager.aborted, [sent.rid])
+        self.assertIn(sent.rid, json.loads(response.body)["message"])
+
+    async def test_connected_client_gets_the_answer(self):
+        """The guard stays silent while the client is connected."""
+        manager = HeadManager(self.tokenizer)
+        raw_request = SimpleNamespace(
+            is_disconnected=mock.AsyncMock(return_value=False)
+        )
+        with mock.patch.object(systemone_serving, "_DISCONNECT_POLL_SECONDS", 0.01):
+            response = await _handler(manager).handle_request(
+                SystemOneRequest(**REQUEST), raw_request
+            )
+        self.assertEqual(response.status_code, 200)
+        # The answer body is intact, and nothing was aborted (HeadManager has
+        # no abort_request; a call would raise AttributeError).
+        body = json.loads(response.body)
+        self.assertEqual(set(body["answers"]), set(REQUEST["questions"]))
 
 
 class TestKevPrompt(CustomTestCase):
