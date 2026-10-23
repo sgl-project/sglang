@@ -51,10 +51,6 @@ GridTHW = Tuple[int, int, int]
 SegmentBounds = Tuple[Tuple[int, int], ...]
 
 
-def _qkv_impl_module_name(impl_label: str) -> str:
-    return f"qkv_impl_{impl_label}"
-
-
 def _resolve_grid_thw_list(
     grid_thws: torch.Tensor, grid_thw_list: Optional[Sequence[Sequence[int]]] = None
 ) -> Tuple[GridTHW, ...]:
@@ -420,30 +416,22 @@ class MoonViTEncoderLayer(nn.Module):
         self.attention_backend = attention_backend
         if attention_backend == "auto":
             if not torch.cuda.is_available():
-                attention_impl_labels = ()
+                implementation_backends = ()
             elif _is_hip:
-                attention_impl_labels = ("triton_attn",)
+                implementation_backends = ("triton_attn",)
             else:
-                attention_impl_labels = ("triton_attn", "fa4")
+                implementation_backends = ("triton_attn", "fa4")
         elif attention_backend == "sdpa":
-            attention_impl_labels = ()
+            implementation_backends = ()
         else:
-            attention_impl_labels = (attention_backend,)
-        self.attention_backend_impls = nn.ModuleDict(
-            {
-                _qkv_impl_module_name(impl_label): QKV_BACKEND_IMPL[impl_label](
-                    use_data_parallel=True,
-                    workspace_buffer=attention_workspace,
-                )
-                for impl_label in attention_impl_labels
-            }
-        )
-
-    def _has_attention_impl(self, impl_label: str) -> bool:
-        return _qkv_impl_module_name(impl_label) in self.attention_backend_impls
-
-    def _get_attention_impl(self, impl_label: str) -> nn.Module:
-        return self.attention_backend_impls[_qkv_impl_module_name(impl_label)]
+            implementation_backends = (attention_backend,)
+        self.attention_backend_impls: dict[str, nn.Module] = {
+            backend: QKV_BACKEND_IMPL[backend](
+                use_data_parallel=True,
+                workspace_buffer=attention_workspace,
+            )
+            for backend in implementation_backends
+        }
 
     def _attention(
         self,
@@ -480,7 +468,7 @@ class MoonViTEncoderLayer(nn.Module):
         else:
             if selected_attention_backend == "flashinfer_cudnn":
                 xv = xv.contiguous()
-            attn_out = self._get_attention_impl(selected_attention_backend)(
+            attn_out = self.attention_backend_impls[selected_attention_backend](
                 xq,
                 xk,
                 xv,
@@ -594,7 +582,7 @@ class MoonViT3dEncoder(nn.Module):
             return False
 
         block = self.blocks[0]
-        if not block._has_attention_impl("fa4"):
+        if "fa4" not in block.attention_backend_impls:
             return False
 
         num_tokens = 256
@@ -614,7 +602,7 @@ class MoonViT3dEncoder(nn.Module):
         cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
         metadata = prepare_vision_attention_metadata(cu_seqlens, device=device)
         with torch.inference_mode():
-            block._get_attention_impl("fa4")(
+            block.attention_backend_impls["fa4"](
                 q,
                 k,
                 v,

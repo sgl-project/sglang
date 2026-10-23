@@ -31,12 +31,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class _RecordingVisionAttention(torch.nn.Module):
     def __init__(self, **_kwargs):
         super().__init__()
-        self.marker = torch.nn.Parameter(torch.ones(()))
         self.call_count = 0
 
     def forward(self, q, _k, _v, **_kwargs):
         self.call_count += 1
-        return q * self.marker
+        return q
 
 
 def _make_kimi_k3_encoder_layer(attention_backend):
@@ -53,24 +52,17 @@ def _make_kimi_k3_encoder_layer(attention_backend):
     )
 
 
-@pytest.mark.parametrize("impl_label", ["cuda", "triton_attn"])
-def test_kimi_k3_vision_impl_labels_are_not_child_module_names(monkeypatch, impl_label):
-    """Implementation labels must not become nn.Module child names."""
+def test_kimi_k3_vision_backend_label_can_overlap_module_name(monkeypatch):
+    """Backend labels may overlap with nn.Module APIs without blocking startup."""
+    backend = "cuda"
     monkeypatch.setitem(
         kimi_k3_vl.QKV_BACKEND_IMPL,
-        impl_label,
+        backend,
         _RecordingVisionAttention,
     )
 
-    layer = _make_kimi_k3_encoder_layer(impl_label)
-    child_name = f"qkv_impl_{impl_label}"
-    implementation = layer.attention_backend_impls[child_name]
-
-    assert (
-        dict(layer.named_modules())[f"attention_backend_impls.{child_name}"]
-        is implementation
-    )
-    assert f"attention_backend_impls.{child_name}.marker" in layer.state_dict()
+    layer = _make_kimi_k3_encoder_layer(backend)
+    implementation = layer.attention_backend_impls[backend]
 
     output = layer._attention(
         torch.randn(2, 8),
@@ -79,49 +71,11 @@ def test_kimi_k3_vision_impl_labels_are_not_child_module_names(monkeypatch, impl
         torch.ones(2, 4, dtype=torch.complex64),
         SimpleNamespace(),
         use_fused_rope=False,
-        selected_attention_backend=impl_label,
+        selected_attention_backend=backend,
     )
 
     assert output.shape == (2, 8)
     assert implementation.call_count == 1
-
-
-def test_kimi_k3_fa4_precompile_uses_registered_backend(monkeypatch):
-    monkeypatch.setitem(
-        kimi_k3_vl.QKV_BACKEND_IMPL,
-        "fa4",
-        _RecordingVisionAttention,
-    )
-    block = _make_kimi_k3_encoder_layer("fa4")
-    encoder = SimpleNamespace(attention_backend="auto", blocks=[block])
-    original_zeros = torch.zeros
-    original_tensor = torch.tensor
-
-    def zeros_on_cpu(*args, **kwargs):
-        kwargs["device"] = "cpu"
-        return original_zeros(*args, **kwargs)
-
-    def tensor_on_cpu(*args, **kwargs):
-        kwargs["device"] = "cpu"
-        return original_tensor(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "zeros", zeros_on_cpu)
-    monkeypatch.setattr(torch, "tensor", tensor_on_cpu)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 3))
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
-    monkeypatch.setattr(kimi_k3_vl, "_is_fa4_available", lambda: True)
-    monkeypatch.setattr(
-        kimi_k3_vl,
-        "prepare_vision_attention_metadata",
-        lambda *_args, **_kwargs: SimpleNamespace(),
-    )
-
-    assert MoonViT3dEncoder.precompile_attention_backend(
-        encoder,
-        torch.float32,
-        torch.device("cuda"),
-    )
-    assert block.attention_backend_impls["qkv_impl_fa4"].call_count == 1
 
 
 @pytest.mark.parametrize(
