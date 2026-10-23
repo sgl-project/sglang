@@ -109,8 +109,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
             or not 0 < longest_edge <= self.image_size
         ):
             raise ValueError(
-                f"longest_edge must be an integer in [1, {self.image_size}], "
-                f"got {size}"
+                f"longest_edge must be an integer in [1, {self.image_size}], got {size}"
             )
         return {"images_kwargs": {"size": {"longest_edge": longest_edge}}}
 

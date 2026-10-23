@@ -144,9 +144,7 @@ class TestPixtralProcessor(CustomTestCase):
             processor._request_processor_kwargs(request),
             {"images_kwargs": {"size": {"longest_edge": 896}}},
         )
-        self.assertEqual(
-            processor._request_processor_kwargs(SimpleNamespace()), {}
-        )
+        self.assertEqual(processor._request_processor_kwargs(SimpleNamespace()), {})
 
     def test_request_images_kwargs_override_server_image_config(self):
         processor = self._make_processor()
