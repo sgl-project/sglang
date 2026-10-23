@@ -39,11 +39,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
-class TestCompletionRequest(unittest.TestCase):
+class TestCompletionRequest(CustomTestCase):
     """Test CompletionRequest protocol model"""
 
     def test_basic_completion_request(self):
@@ -76,7 +77,7 @@ class TestCompletionRequest(unittest.TestCase):
             )
 
 
-class TestChatCompletionRequest(unittest.TestCase):
+class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
@@ -542,7 +543,7 @@ class TestChatCompletionRequest(unittest.TestCase):
                     sampling_params.verify(vocab_size=32)
 
 
-class TestAudioContentParts(unittest.TestCase):
+class TestAudioContentParts(CustomTestCase):
     """Test audio content parts and the input_audio conversion"""
 
     def _audio_part(self, part):
@@ -611,7 +612,7 @@ class TestAudioContentParts(unittest.TestCase):
         )
 
 
-class TestModelSerialization(unittest.TestCase):
+class TestModelSerialization(CustomTestCase):
     """Test model serialization with hidden states"""
 
     def _chat_payloads(self, tool_calls):
@@ -728,7 +729,7 @@ class TestModelSerialization(unittest.TestCase):
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 
-class TestFunctionDeferLoading(unittest.TestCase):
+class TestFunctionDeferLoading(CustomTestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
     def test_function_defaults_preserve_strict(self):
@@ -794,7 +795,7 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[1].type, "text")
 
 
-class TestValidationEdgeCases(unittest.TestCase):
+class TestValidationEdgeCases(CustomTestCase):
     """Test edge cases and validation scenarios"""
 
     def test_negative_token_limits(self):
