@@ -732,8 +732,8 @@ class TestKDAPackedDecode(unittest.TestCase):
     @unittest.skipIf(not is_cuda(), "The row-streaming decode kernel is CUDA-only")
     def test_safe_gate_packed_decode_stays_on_triton(self):
         """At the safe-gate models' 8-32 heads per rank the row-streaming CUDA
-        kernel is 2-3x slower than triton at batch 8-16 (H200, B200), so safe-gate
-        decode must not take it even when its inputs are covered."""
+        kernel is slower than triton at every batch on H200 and B200 (up to 2.8x
+        at batch 8), so safe-gate decode must not take it even when covered."""
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         B, H, HV, K, V = 16, 8, 8, 128, 128
