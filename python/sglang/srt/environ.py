@@ -1356,6 +1356,11 @@ class Envs:
     # device only, matching how the nvcc path pins -gencode to this GPU.
     SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
+    # Per-file overrides for packaged MoE LoRA plans, tiles, and base GEMM configs.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+    # Per-file overrides for dense LoRA plan tables.
+    SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
+
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================
@@ -1725,6 +1730,9 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Scheduler-side staging of shared host-table rows on GPUs without ATS
+    # (engram_staging.py); pays off for large prefill batches.
+    SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1741,12 +1749,10 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
-    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
-    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
-    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
