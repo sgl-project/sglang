@@ -18,13 +18,15 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+    cast_q_fp8_for_q8kv8_prefill,
+    q8kv8_padded_num_heads,
     sparse_mla_q8kv8_prefill_fwd,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     CompressedGather,
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -182,7 +184,7 @@ def _make_backend(
         sparse_prefill_cache=None, late_layer_tail=None
     )
     backend.req_to_token = req_to_token
-    backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
+    backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(device)
     backend.softmax_scale = 512**-0.5
     backend.head_dim_v = 512
     backend.dsv4_prefill_backend = dsv4_prefill_backend
@@ -443,6 +445,8 @@ def _patched_sparse_kernels(
     q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
     q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
+    q8_mod.q8kv8_padded_num_heads = q8kv8_padded_num_heads
+    q8_mod.cast_q_fp8_for_q8kv8_prefill = cast_q_fp8_for_q8kv8_prefill
 
     old_modules = {
         name: sys.modules.get(name)
@@ -750,7 +754,8 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         floor = torch.cat(
             [torch.full((n,), s, device=device) for s, n in zip(starts, lens)]
         )
-    layout = window_layout(req, pos, floor=floor, num_groups=2)
+    # Only the query-side indices matter here; no window history is copied.
+    layout = window_layout(req, pos, zero_row=0, floor=floor, num_groups=2)
     seq = torch.tensor(
         [s + n for s, n in zip(starts, lens)], device=device, dtype=torch.int32
     )

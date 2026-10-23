@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
 import zmq
@@ -97,52 +97,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
-
-
-@contextmanager
-def _mock_cuda_platform(
-    *,
-    memory_gb: int = 80,
-    available_memory_gb: int | dict[int, int] | None = None,
-):
-    def get_available_gpu_memory(device_id=0, **_kwargs):
-        if isinstance(available_memory_gb, dict):
-            return available_memory_gb[device_id]
-        if available_memory_gb is not None:
-            return available_memory_gb
-        return memory_gb
-
-    with (
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
-            return_value=False,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
-            return_value=False,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-            return_value=True,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
-            return_value=False,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
-            return_value=memory_gb * 1024**3,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
-            side_effect=get_available_gpu_memory,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
-            return_value=True,
-        ),
-    ):
-        yield
+from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
 
 
 def _from_dict_without_model_resolution(
@@ -151,7 +106,7 @@ def _from_dict_without_model_resolution(
     pipeline_config = pipeline_config or QwenImagePipelineConfig()
     with (
         patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
-        _mock_cuda_platform(),
+        mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
 
@@ -191,7 +146,7 @@ class _CudaPlatformTestCase(unittest.TestCase):
         # Residency queries inspect the platform after argument construction too.
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(_mock_cuda_platform())
+        stack.enter_context(mock_cuda_platform())
 
 
 class TestSchedulerEndpoints(unittest.TestCase):
@@ -284,7 +239,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             patch.object(
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -570,7 +525,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             patch.object(
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -591,7 +546,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             patch.object(
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -874,7 +829,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
                 "--component-quantizations.text_encoder",
-                "kitchen_int8",
+                "convrot_int8",
                 "--component-quantization-ignored-layers.text_encoder",
                 "model.layers.0",
                 "lm_head",
@@ -3495,7 +3450,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         args = self._from_dict(
             {"model_path": "/fake", "disagg_server_addr": "127.0.0.1:30000"}
         )
-        with self.assertRaisesRegex(ValueError, "only defined for encoder"):
+        with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
     def test_cli_args_parsed(self):
@@ -3550,7 +3505,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         with (
             patch.object(sys, "argv", ["sglang"] + argv),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
@@ -3569,7 +3524,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         with (
             patch.object(sys, "argv", ["sglang"] + argv),
-            _mock_cuda_platform(),
+            mock_cuda_platform(),
         ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)

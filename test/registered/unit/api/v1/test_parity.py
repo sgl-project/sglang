@@ -1,4 +1,4 @@
-"""Parity of the three `/generate` vocabularies: the hand-written Python
+"""Parity of the `/generate` and HiCache API vocabularies: the hand-written Python
 request structs (`io_struct.GenerateReqInput`, `SamplingParams`), the
 generated Python types (`sglang.api.v1.api_types`), and the generated Rust
 types (`rust/sglang-api-types`).
@@ -6,14 +6,17 @@ types (`rust/sglang-api-types`).
 The cross-language half runs through `rust/sglang-api-types/testdata/
 json_parity.json`: both generators must turn each fixture input into the same
 canonical bytes (`tests/json_parity.rs` checks the Rust side). The Python half
-pins the field sets against the hand-written structs and proves a schema
-request still normalizes through the dataclass the Python server runs.
+pins the field sets against the hand-written structs, checks HiCache request
+validation, and proves a generation request still normalizes through the
+dataclass the Python server runs.
 """
 
 import dataclasses
 import json
 import unittest
 from pathlib import Path
+
+from pydantic import TypeAdapter
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -27,7 +30,11 @@ from sglang.api.v1.api_types import (
     GenerateResponse,
     SamplingParams,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    BaseReq,
+    GenerateReqInput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -134,6 +141,31 @@ class TestCrossLanguageFixtures(CustomTestCase):
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():
             self.assertTrue(hasattr(api_types, case["type"]), case["type"])
+
+
+class TestHiCacheRequestParity(CustomTestCase):
+    def test_attach_fields_match_python(self):
+        """Only scheduler transport fields are excluded from the public request."""
+        self.assertEqual(
+            set(api_types.AttachHiCacheStorageRequest.__struct_fields__),
+            set(AttachHiCacheStorageReqInput.__struct_fields__)
+            - set(BaseReq.__struct_fields__),
+        )
+
+    def test_attach_fixtures_match_python_validation_and_defaults(self):
+        """Decode using the same Pydantic adapter as the Python HTTP endpoint."""
+        adapter = TypeAdapter(AttachHiCacheStorageReqInput)
+        for case in load_fixtures():
+            if case["type"] != "AttachHiCacheStorageRequest":
+                continue
+            with self.subTest(case=case["name"]):
+                python = adapter.validate_python(case["input"])
+                generated = api_types.AttachHiCacheStorageRequest.from_json_value(
+                    case["input"]
+                )
+                self.assertIsNotNone(generated.hicache_storage_backend)
+                for name in generated.__struct_fields__:
+                    self.assertEqual(getattr(generated, name), getattr(python, name))
 
 
 class TestRequestFieldParity(CustomTestCase):
