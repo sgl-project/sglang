@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
 CUSTOM_TOOL_INPUT_KEY = "input"
 
@@ -72,6 +72,16 @@ def custom_tool_names(tools: Any) -> Set[str]:
     return {tool.name for tool in tools or [] if tool.type == "custom" and tool.name}
 
 
+def namespace_functions(tool: Any) -> Iterator[Dict[str, Any]]:
+    """Unwrap the flat and OpenAI-wrapped members accepted by Muse's template."""
+    for member in tool.tools or []:
+        if member.get("type", "function") != "function":
+            continue
+        function = member.get("function", member)
+        if isinstance(function, dict) and function.get("name"):
+            yield function
+
+
 def namespace_function_names(tools: Any) -> Dict[str, Tuple[str, str]]:
     """Map each namespace member's call name ``<namespace>.<function>`` to
     ``(namespace, function)``."""
@@ -79,8 +89,7 @@ def namespace_function_names(tools: Any) -> Dict[str, Tuple[str, str]]:
         f"{tool.name}.{member['name']}": (tool.name, member["name"])
         for tool in tools or []
         if tool.type == "namespace" and tool.name
-        for member in tool.tools or []
-        if member.get("type", "function") == "function" and member.get("name")
+        for member in namespace_functions(tool)
     }
 
 

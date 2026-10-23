@@ -1,6 +1,8 @@
 import asyncio
+import json
 import unittest
 
+from transformers.utils.chat_template_utils import _compile_jinja_template
 from utils import (
     StreamFixture,
     engine_chunk,
@@ -10,10 +12,7 @@ from utils import (
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
-    MessageProcessingResult,
-    ResponsesRequest,
-)
+from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -80,40 +79,83 @@ class NamespaceToolChatToolsTestCase(CustomTestCase):
 class NamespaceToolTemplateTestCase(CustomTestCase):
     def _template_tools(self, request):
         serving = make_serving()
-        seen = {}
-
-        def fake_process(chat_request, is_multimodal):
-            seen["template_tools"] = chat_request._template_tools
-            return MessageProcessingResult(
-                prompt="prompt",
-                prompt_ids=[1, 2, 3],
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=[],
-            )
-
-        serving._process_messages = fake_process
-        asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        serving.template_manager.chat_template_name = None
+        serving.template_manager.jinja_template_content_format = "string"
+        serving._prompt_text_round_trip_is_lossy = False
+        tokenizer = serving.tokenizer_manager.tokenizer
+        template = _compile_jinja_template("{{ tools | tojson }}")
+        tokenizer.apply_chat_template.side_effect = lambda messages, **kwargs: (
+            template.render(messages=messages, **kwargs)
         )
-        return seen["template_tools"]
+        tokenizer.encode.side_effect = lambda text, **kwargs: list(text.encode("utf-8"))
+        _, _, _, processed = asyncio.run(
+            serving._make_request(request, None, tokenizer)
+        )
+        return json.loads(bytes(processed.prompt_ids).decode("utf-8"))
 
     def test_namespace_reaches_the_template_nested(self):
-        """Namespace metadata and namespace-level deferral exist only on the
-        namespace entry, so flattening it before the template loses both."""
-        tools = self._template_tools(_request())
-        self.assertEqual(tools[0]["type"], "namespace")
-        self.assertEqual(tools[0]["name"], "browser")
-        self.assertTrue(tools[0]["defer_loading"])
-        self.assertEqual(tools[0]["tools"][0]["name"], "search")
-        self.assertFalse(tools[0]["tools"][0]["defer_loading"])
-        self.assertEqual(tools[1]["function"]["name"], "lookup")
-        self.assertTrue(tools[1]["function"]["defer_loading"])
+        """Muse distinguishes inherited, explicitly eager and deferred members;
+        flattening namespaces or filling absent flags changes its prompt."""
+        members = [
+            {"name": "inherited", "parameters": QUERY},
+            {"name": "eager", "parameters": QUERY, "defer_loading": False},
+            {"name": "deferred", "parameters": QUERY, "defer_loading": True},
+        ]
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                supplied = (
+                    [{"type": "function", "function": member} for member in members]
+                    if wrapped
+                    else members
+                )
+                tools = self._template_tools(
+                    _request(tools=[{**BROWSER, "tools": supplied}, LOOKUP])
+                )
+                self.assertEqual(tools[0]["type"], "namespace")
+                self.assertEqual(tools[0]["name"], "browser")
+                self.assertEqual(tools[0]["description"], "Browse the web")
+                self.assertTrue(tools[0]["defer_loading"])
+                functions = [m.get("function", m) for m in tools[0]["tools"]]
+                self.assertEqual(
+                    [m["name"] for m in functions], ["inherited", "eager", "deferred"]
+                )
+                self.assertNotIn("defer_loading", functions[0])
+                self.assertFalse(functions[1]["defer_loading"])
+                self.assertTrue(functions[2]["defer_loading"])
+                self.assertEqual(tools[1]["function"]["name"], "lookup")
+                self.assertTrue(tools[1]["function"]["defer_loading"])
 
     def test_requests_without_namespaces_keep_the_flattened_tools(self):
-        self.assertIsNone(self._template_tools(_request(tools=[LOOKUP])))
+        (tool,) = self._template_tools(_request(tools=[LOOKUP]))
+        self.assertEqual(tool["function"]["name"], "lookup")
+        self.assertTrue(tool["function"]["defer_loading"])
+
+    def test_namespace_does_not_hide_custom_tool_schema(self):
+        """Adding a namespace must not remove a custom tool from the prompt."""
+        for tool_format in (
+            {"type": "text"},
+            {"type": "grammar", "syntax": "lark", "definition": 'start: "pwd"'},
+        ):
+            with self.subTest(tool_format=tool_format):
+                custom = {
+                    "type": "custom",
+                    "name": "execute",
+                    "description": "Execute a command.",
+                    "format": tool_format,
+                    "defer_loading": True,
+                }
+                tools = self._template_tools(_request(tools=[BROWSER, custom]))
+                self.assertEqual(len(tools), 2)
+                function = tools[1]["function"]
+                self.assertEqual(function["name"], "execute")
+                self.assertEqual(function["parameters"]["required"], ["input"])
+                self.assertEqual(
+                    function["parameters"]["properties"]["input"]["type"], "string"
+                )
+                self.assertTrue(function["defer_loading"])
+                self.assertIn("Execute a command.", function["description"])
+                if tool_format["type"] == "grammar":
+                    self.assertIn('start: "pwd"', function["description"])
 
 
 class NamespaceToolCallOutputTestCase(CustomTestCase):
@@ -158,6 +200,45 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
         self.assertEqual(len(items), 3)
         for item in items:
             self.assertEqual((item["namespace"], item["name"]), ("browser", "search"))
+
+    def test_muse_calls_accept_flat_and_wrapped_namespace_members(self):
+        """Both member shapes accepted by Muse's template must parse and split.
+
+        Template contract: meta-models/Muse-Spark-Open-816B-A42B-NVFP4,
+        revision 4239e4db19376904f2e82c167e78f70abb5455fe.
+        """
+        raw = (
+            " to=browser.search<|message|><atem:function_calls>"
+            '<atem:invoke name="browser.search">'
+            '<atem:parameter name="query">news</atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eot|>"
+        )
+        function = {"name": "search", "parameters": QUERY, "defer_loading": True}
+        for member in (function, {"type": "function", "function": function}):
+            with self.subTest(member=member):
+                request = _request(tools=[{**BROWSER, "tools": [member]}])
+                serving = self._serving()
+                serving.tool_call_parser = "muse"
+                tools = serving._response_tools_to_chat_tools(request)
+                self.assertEqual(
+                    [tool.function.name for tool in tools], ["browser.search"]
+                )
+                self.assertTrue(tools[0].function.defer_loading)
+                items = serving._make_response_output_items(
+                    request, raw, tokenizer=None, require_reasoning=False
+                )
+                self.assertEqual(len(items), 1)
+                full = items[0].model_dump(exclude_none=True)
+                events = StreamFixture(serving, request).run(
+                    [engine_chunk(raw[:70]), engine_chunk(raw, 2, finish=True)]
+                )
+                (streamed,) = find_completed_event(events)["response"]["output"]
+                for item in (full, streamed):
+                    self.assertEqual(item["type"], "function_call")
+                    self.assertEqual(
+                        (item["namespace"], item["name"]), ("browser", "search")
+                    )
+                    self.assertEqual(json.loads(item["arguments"]), {"query": "news"})
 
 
 class NamespaceToolCallReplayTestCase(CustomTestCase):

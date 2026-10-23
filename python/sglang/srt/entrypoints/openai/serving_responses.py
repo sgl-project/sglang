@@ -84,6 +84,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     label_developer_content,
     namespace_function_names,
+    namespace_functions,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -1328,11 +1329,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             if tool.type == "namespace" and tool.name:
                 # Members are called as ``<namespace>.<function>``; register those
                 # names so the tool-call parser accepts the calls.
-                for member in tool.tools or []:
-                    if member.get("type", "function") != "function":
-                        continue
-                    if not member.get("name"):
-                        continue
+                for member in namespace_functions(tool):
                     chat_tools.append(
                         Tool(
                             type="function",
@@ -1341,6 +1338,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 description=member.get("description"),
                                 parameters=member.get("parameters"),
                                 strict=bool(member.get("strict", False)),
+                                defer_loading=member.get("defer_loading"),
                             ),
                         )
                     )
@@ -1382,21 +1380,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "type": "namespace",
                     "name": tool.name,
                     "description": tool.description or "",
-                    "tools": [
-                        dict(member)
-                        for member in tool.tools or []
-                        if member.get("type", "function") == "function"
-                    ],
+                    "tools": [dict(member) for member in namespace_functions(tool)],
                 }
                 if tool.defer_loading is not None:
                     namespace["defer_loading"] = tool.defer_loading
                 template_tools.append(namespace)
-            elif tool.type == "function":
+            elif tool.type in ("function", "custom") and tool.name:
                 function = {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
                 }
+                if tool.type == "custom":
+                    function["description"] = custom_tool_description(
+                        tool.description, tool.format
+                    )
+                    function["parameters"] = custom_tool_parameters()
                 if tool.defer_loading is not None:
                     function["defer_loading"] = tool.defer_loading
                 template_tools.append({"type": "function", "function": function})
