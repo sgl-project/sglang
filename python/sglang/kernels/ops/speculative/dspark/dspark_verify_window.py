@@ -407,12 +407,14 @@ class ScatterCompactToStrided:
         layout: RaggedVerifyLayout,
         fill_value: float,
         verify_num_draft_tokens: int,
+        point_mass_fill: bool = False,
     ) -> torch.Tensor:
         return scatter_compact_to_strided(
             compact=compact,
             layout=layout,
             fill_value=fill_value,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            point_mass_fill=point_mass_fill,
         )
 
     @classmethod
@@ -423,12 +425,14 @@ class ScatterCompactToStrided:
         layout: RaggedVerifyLayout,
         fill_value: float,
         verify_num_draft_tokens: int,
+        point_mass_fill: bool = False,
     ) -> torch.Tensor:
         return scatter_compact_to_strided_triton(
             compact=compact,
             layout=layout,
             fill_value=fill_value,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            point_mass_fill=point_mass_fill,
         )
 
 
@@ -438,7 +442,10 @@ def scatter_compact_to_strided(
     layout: RaggedVerifyLayout,
     fill_value: float,
     verify_num_draft_tokens: int,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
+    """``point_mass_fill``: padding rows hold 0 in column 0 and ``fill_value``
+    elsewhere, so padded logits rows are point masses rather than uniform."""
     stride = verify_num_draft_tokens
     bs = layout.verify_lens.shape[0]
     dim = compact.shape[1]
@@ -447,6 +454,8 @@ def scatter_compact_to_strided(
     strided = torch.full(
         (bs * stride + 1, dim), fill_value, dtype=compact.dtype, device=device
     )
+    if point_mass_fill:
+        strided[:, 0] = 0
     req_id, within, valid = compact_row_index(
         verify_lens=layout.verify_lens,
         padded_total=layout.graph_num_tokens,
@@ -472,6 +481,7 @@ def _scatter_compact_to_strided_kernel(
     dim,
     fill_value,
     BLOCK_D: tl.constexpr,
+    POINT_MASS_FILL: tl.constexpr,
 ):
     o = tl.program_id(0).to(tl.int64)
     dblk = tl.program_id(1)
@@ -484,7 +494,10 @@ def _scatter_compact_to_strided_kernel(
     in_range = w < vl_i
     src = tl.where(in_range, start_i + w, 0)
     val = tl.load(compact_ptr + src * dim + d, mask=dmask & in_range, other=0)
-    val = tl.where(in_range, val, fill_value)
+    if POINT_MASS_FILL:
+        val = tl.where(in_range, val, tl.where(d == 0, 0, fill_value))
+    else:
+        val = tl.where(in_range, val, fill_value)
     tl.store(out_ptr + o * dim + d, val, mask=dmask)
 
 
@@ -495,6 +508,7 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
@@ -513,6 +527,7 @@ def scatter_compact_to_strided_into(
         dim,
         fill_value,
         BLOCK_D=BLOCK_D,
+        POINT_MASS_FILL=point_mass_fill,
     )
     return out
 
@@ -523,6 +538,7 @@ def scatter_compact_to_strided_triton(
     layout: RaggedVerifyLayout,
     fill_value: float,
     verify_num_draft_tokens: int,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
     stride = verify_num_draft_tokens
     bs = layout.verify_lens.shape[0]
@@ -535,6 +551,7 @@ def scatter_compact_to_strided_triton(
         out=out,
         stride=stride,
         fill_value=fill_value,
+        point_mass_fill=point_mass_fill,
     )
 
 
