@@ -4386,7 +4386,7 @@ class DeepseekV4AttnBackend(
                 and compress_ratio in (1, 2)
                 and q_flat.shape[0] >= 16384
                 and forward_batch.forward_mode.is_extend_without_speculative()
-                and self.tail_forward_metadata is None
+                and self.forward_metadata is not self.tail_forward_metadata
                 and not get_exec().overlap.enable_two_batch_overlap
                 and not get_exec().overlap.enable_single_batch_overlap
                 and not dsa_use_prefill_cp(forward_batch)
