@@ -77,7 +77,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
             mla_host = MLATokenToKVPoolHost(
-                device_pool=device_pool,
+                buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=page_size,
@@ -86,6 +86,20 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 device="cpu",
                 allocator_type="default",
                 override_kv_cache_dim=device_pool.kv_cache_dim,
+                device_capacity_tokens=(
+                    device_pool.size
+                    if device_pool.host_capacity_tokens is None
+                    else device_pool.host_capacity_tokens
+                ),
+                start_layer=device_pool.start_layer,
+                end_layer=device_pool.end_layer,
+                target_layer_num=(
+                    (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                    // device_pool.layer_shard_size
+                    if device_pool.layer_shard_enabled
+                    else device_pool.layer_num
+                ),
+                layer_shard_enabled=device_pool.layer_shard_enabled,
             )
             indexer_host = DSAIndexerPoolHost(
                 decl=make_dsa_indexer_pool_decl(device_pool),

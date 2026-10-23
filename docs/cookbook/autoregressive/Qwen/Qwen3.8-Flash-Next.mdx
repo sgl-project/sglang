@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes Qwen3.8-Flash-Next support (v0.5.20 or later).
+Use an SGLang build that includes Qwen3.8-Flash-Next support (v0.5.22 or later).
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
