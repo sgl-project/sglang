@@ -208,6 +208,16 @@ impl CoreEvent {
 }
 
 impl CoreOutput {
+    /// The scheduler's decode latency for a finished non-streaming request,
+    /// whose first token this frontend does not see. It rides only that
+    /// request's terminal delta and is read off it there (for a model package's
+    /// [`GenerateHook`](crate::GenerateHook)), so [`append_delta`](Self::append_delta)
+    /// does not fold it into the cumulative output.
+    pub(crate) fn scheduler_decode_latency(&self) -> Option<std::time::Duration> {
+        let seconds = self.extras.as_deref()?.decode_latency?;
+        std::time::Duration::try_from_secs_f64(seconds).ok()
+    }
+
     /// One `/generate` frame. `index` is the batch position (batch form only);
     /// `e2e_latency` rides the terminal frame only.
     ///
@@ -446,6 +456,29 @@ fn matched_value(matched: &Matched) -> api::Matched {
     api::Matched { value: Some(value) }
 }
 
+/// One case of `testdata/frame_metadata.json` (built by Python's
+/// `build_rust_frame_metadata_fixture`), and the events its frame decodes to.
+#[cfg(test)]
+pub(crate) fn frame_metadata_case(name: &str) -> (serde_json::Value, Vec<ChunkEvent>) {
+    use crate::message::response::{for_each_chunk, frame_decode_batch_cols};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/frame_metadata.json")).unwrap();
+    let case = fixture[name].clone();
+    let bytes = |hex: &serde_json::Value| -> Vec<u8> {
+        let hex = hex.as_str().unwrap_or_default();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let data = bytes(&case["data"]);
+    let framed = frame_decode_batch_cols(&bytes(&case["header"]), &[data.as_slice()]);
+    let mut events = Vec::new();
+    assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
+    (case, events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,26 +552,10 @@ mod tests {
     /// (`testdata/frame_metadata.json`, built by
     /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
     /// to the completion the client received, the launch version before one,
-    /// and only nonzero media counts, also behind a frame's logprob columns.
+    /// and only nonzero media counts, also behind a frame's logprob columns;
+    /// the scheduler's decode latency reaches its row.
     #[test]
     fn frame_metadata_matches_python() {
-        use crate::message::response::{for_each_chunk, frame_decode_batch_cols};
-
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../testdata/frame_metadata.json")).unwrap();
-        let bytes = |hex: &serde_json::Value| -> Vec<u8> {
-            let hex = hex.as_str().unwrap();
-            (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                .collect()
-        };
-        let decode = |header: &[u8], data: &[u8]| {
-            let framed = frame_decode_batch_cols(header, &[data]);
-            let mut events = Vec::new();
-            assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
-            events
-        };
         let keys = |output: &CoreOutput| {
             let meta = json(&output.meta_info("rid", None));
             let mut keys = serde_json::Map::new();
@@ -558,8 +575,7 @@ mod tests {
         let launch = Some(Arc::<str>::from("launch"));
 
         for name in ["batch", "logprob_batch"] {
-            let batch = &fixture[name];
-            let events = decode(&bytes(&batch["header"]), &bytes(&batch["data"]));
+            let (batch, events) = super::frame_metadata_case(name);
             assert_eq!(events.len(), 2);
             for event in events {
                 let rid = event.rid.as_str().to_owned();
@@ -568,6 +584,13 @@ mod tests {
                 output.weight_version = launch.clone();
                 output.completion_tokens = completion_tokens;
                 assert_eq!(keys(&output), batch["meta_info"][&rid], "{name} {rid}");
+                assert_eq!(
+                    output.scheduler_decode_latency(),
+                    batch["decode_latencies"][&rid]
+                        .as_f64()
+                        .map(std::time::Duration::from_secs_f64),
+                    "{name} {rid}"
+                );
                 if rid == "logprobs" {
                     let meta = json(&output.meta_info(&rid, None));
                     assert_eq!(
@@ -580,8 +603,7 @@ mod tests {
 
         // A scheduler abort folds into what the stream already sent, and its
         // spans are clipped to those tokens.
-        let abort = &fixture["abort"];
-        let mut events = decode(&bytes(&abort["header"]), &[]);
+        let (abort, mut events) = super::frame_metadata_case("abort");
         let mut aborted = CoreOutput {
             weight_version: launch.clone(),
             completion_tokens: abort["completion_tokens"].as_u64().unwrap(),

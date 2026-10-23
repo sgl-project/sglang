@@ -28,9 +28,10 @@ RUST_FRAME_METADATA_FIXTURE = os.path.join(
 
 
 def build_rust_frame_metadata_fixture() -> dict:
-    """The headers `push_generation` and `push_abort` send for the weight-version
-    and media-count columns, and the `meta_info` keys Python's TokenizerManager
-    derives from the same values, with "launch" as the server's weight version.
+    """The headers `push_generation` and `push_abort` send for the weight-version,
+    media-count and decode-latency columns, and the `meta_info` keys Python's
+    TokenizerManager derives from the same values, with "launch" as the
+    server's weight version.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
     from sglang.srt.managers.io_struct import AbortReq
@@ -69,12 +70,20 @@ def build_rust_frame_metadata_fixture() -> dict:
         + ["output_hidden_states"]
     )
 
-    def push_generation(multimodal, **columns):
+    def push_generation(multimodal, decode_latencies, **columns):
         server = RustServer(Mock(), http_port=0)
         server._multimodal_enabled = multimodal
-        server.push_generation(SimpleNamespace(**{**no_extras, **columns}))
+        payload = SimpleNamespace(**{**no_extras, **columns})
+        server.push_generation(payload, decode_latencies)
         header, data = server.server.push_decode_result_batch.call_args.args
-        return {"header": header.hex(), "data": b"".join(data).hex()}
+        return {
+            "header": header.hex(),
+            "data": b"".join(data).hex(),
+            "decode_latencies": {
+                columns["rids"][row]: latency
+                for row, latency in decode_latencies.items()
+            },
+        }
 
     swapped = [
         WeightVersionSpan(version="old", start=0, end=2),
@@ -82,6 +91,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     ]
     batch = push_generation(
         True,
+        {0: 0.25},
         rids=["done", "running"],
         finished_reasons=[{"type": "length", "length": 3}, None],
         prompt_tokens=[5, 6],
@@ -97,11 +107,12 @@ def build_rust_frame_metadata_fixture() -> dict:
         "done": meta_info(swapped, 3, image=8),
         "running": meta_info(None, 1, audio=2),
     }
-    # A text model's frame with output logprobs: the spans follow the
-    # extras columns rather than their padding.
+    # A text model's frame with output logprobs: the spans and the decode
+    # latency follow the extras columns rather than their padding.
     single = [WeightVersionSpan(version="v1", start=0, end=2)]
     logprob_batch = push_generation(
         False,
+        {0: 0.5},
         rids=["logprobs", "plain"],
         finished_reasons=[{"type": "length", "length": 2}, None],
         prompt_tokens=[3, 4],
@@ -192,6 +203,10 @@ class TestRustServerExtension(CustomTestCase):
                 return extension
 
             @classmethod
+            def _server_kwargs(cls, scheduler):
+                return {"model_setting": sentinel.setting}
+
+            @classmethod
             def _resolve_multimodal(cls, scheduler):
                 return None
 
@@ -211,7 +226,10 @@ class TestRustServerExtension(CustomTestCase):
             default_max_new_tokens=128,
         )
         extension.Server.assert_called_once_with(
-            sentinel.args, cores=None, port_offset=1
+            sentinel.args,
+            cores=None,
+            port_offset=1,
+            model_setting=sentinel.setting,
         )
         instance.server.start_mm_workers.assert_called_once_with(sentinel.spec, 8)
         self.assertIsInstance(instance, ModelServer)

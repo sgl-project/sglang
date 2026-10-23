@@ -354,6 +354,7 @@ mod tests {
                 ),
                 server_args,
                 chat_formatter: None,
+                generate_hook: None,
             }),
             intake_rx,
             abort_rx,

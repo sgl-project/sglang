@@ -1257,6 +1257,7 @@ mod tests {
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+                generate_hook: None,
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()

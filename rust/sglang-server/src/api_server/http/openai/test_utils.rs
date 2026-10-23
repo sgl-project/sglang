@@ -112,6 +112,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
         chat_formatter: None,
+        generate_hook: None,
     })
 }
 
@@ -169,6 +170,7 @@ fn answering_app_state() -> Arc<super::AppState> {
                 spec: super::template::builtin_template("chatml").unwrap(),
             },
         ))),
+        generate_hook: None,
     })
 }
 

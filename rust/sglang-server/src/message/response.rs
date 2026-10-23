@@ -198,6 +198,10 @@ pub struct BatchHeader {
     pub audio_tokens: Vec<u32>,
     #[serde(default)]
     pub video_tokens: Vec<u32>,
+    /// A finished non-streaming request's decode latency in seconds, measured
+    /// by the scheduler (`None` for every other row).
+    #[serde(default)]
+    pub decode_latencies: Vec<Option<f64>>,
 }
 
 /// The completion tokens `[start, end)` one weight version produced, as the
@@ -327,6 +331,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.image_tokens)
         || !per_req_ok(&h.audio_tokens)
         || !per_req_ok(&h.video_tokens)
+        || !(h.decode_latencies.is_empty() || h.decode_latencies.len() == n)
     {
         reject!()
     }
@@ -422,6 +427,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         let image_tokens = h.image_tokens.get(i).copied().unwrap_or(0);
         let audio_tokens = h.audio_tokens.get(i).copied().unwrap_or(0);
         let video_tokens = h.video_tokens.get(i).copied().unwrap_or(0);
+        let decode_latency = h.decode_latencies.get(i).copied().flatten();
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely,
@@ -430,13 +436,15 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             let has_metadata = !weight_versions.is_empty()
                 || image_tokens != 0
                 || audio_tokens != 0
-                || video_tokens != 0;
+                || video_tokens != 0
+                || decode_latency.is_some();
             has_metadata.then(|| {
                 Box::new(ChunkExtras {
                     weight_versions,
                     image_tokens,
                     audio_tokens,
                     video_tokens,
+                    decode_latency,
                     ..Default::default()
                 })
             })
@@ -510,6 +518,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 image_tokens,
                 audio_tokens,
                 video_tokens,
+                decode_latency,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -699,6 +708,9 @@ pub struct ChunkExtras {
     pub image_tokens: u32,
     pub audio_tokens: u32,
     pub video_tokens: u32,
+    /// A finished non-streaming request's decode latency in seconds, from the
+    /// scheduler.
+    pub decode_latency: Option<f64>,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -724,6 +736,7 @@ impl ChunkExtras {
             && self.image_tokens == 0
             && self.audio_tokens == 0
             && self.video_tokens == 0
+            && self.decode_latency.is_none()
     }
 }
 

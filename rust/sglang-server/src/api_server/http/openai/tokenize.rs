@@ -286,6 +286,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            generate_hook: None,
         })
     }
 

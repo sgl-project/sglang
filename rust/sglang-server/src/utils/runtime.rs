@@ -357,6 +357,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.server_args.clone(),
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
+                        cfg.generate_hook.clone(),
                         shutdown_rx.clone(),
                         hicache_manager,
                     );
@@ -416,6 +417,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(test_server_args()),
+            generate_hook: None,
         }
     }
 
@@ -504,6 +506,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -540,6 +543,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -616,6 +620,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -719,6 +724,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),

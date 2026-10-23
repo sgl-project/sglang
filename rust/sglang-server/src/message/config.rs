@@ -68,6 +68,8 @@ pub struct RuntimeConfig {
     /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
     /// each `AppState`) is cheap; immutable after construction.
     pub server_args: Arc<ServerArgs>,
+    /// A model package's keys for native `/generate` frames.
+    pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
 }
 
 impl Default for RuntimeConfig {
@@ -75,6 +77,7 @@ impl Default for RuntimeConfig {
         Self {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
+            generate_hook: None,
         }
     }
 }
