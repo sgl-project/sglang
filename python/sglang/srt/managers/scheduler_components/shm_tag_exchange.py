@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
 
@@ -262,13 +263,18 @@ def get_shm_exchange(
     group: Optional[dist.ProcessGroup], kind: str, multihost: bool = False
 ):
     """Collective on first call per (group, kind): every rank of the group must call it
-    at the same point. Returns None (stock path) when disabled, or when the group spans
-    hosts and the caller did not opt in with multihost=True."""
+    at the same point. Returns None (stock path) when disabled, under --sleep-on-idle,
+    or when the group spans hosts and the caller did not opt in with multihost=True."""
     if group is None:
         return None
     key = (id(group), kind)
     if key not in _EXCHANGES:
-        if not envs.SGLANG_Q35MF_EDGE_SHM_SYNC.get() or dist.get_world_size(group) <= 1:
+        if (
+            not envs.SGLANG_Q35MF_EDGE_SHM_SYNC.get()
+            # an idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile
+            or get_device().sleep_on_idle
+            or dist.get_world_size(group) <= 1
+        ):
             _EXCHANGES[key] = None
         else:
             from sglang.srt.distributed.parallel_state import in_the_same_node_as

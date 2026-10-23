@@ -73,6 +73,12 @@ def _shm_names():
     return nullcontext()
 
 
+def _sleep_on_idle(on: bool):
+    return patch.object(
+        shm_tag_exchange, "get_device", return_value=SimpleNamespace(sleep_on_idle=on)
+    )
+
+
 def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     torch.distributed.init_process_group(
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
@@ -80,6 +86,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     try:
         with (
             envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True),
+            _sleep_on_idle(False),
             _shm_names(),
         ):
             # A row holds 6 ready counts, one more per extra host pool, and the folded
@@ -106,8 +113,12 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
     )
     group = torch.distributed.group.WORLD
     try:
-        with envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True), _shm_names():
-            exchange = shm_tag_exchange.get_shm_exchange(group, "rounds")
+        with envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True):
+            # --sleep-on-idle keeps the gloo path: the other ranks would spin
+            with _sleep_on_idle(True):
+                assert shm_tag_exchange.get_shm_exchange(group, "idle") is None
+            with _sleep_on_idle(False), _shm_names():
+                exchange = shm_tag_exchange.get_shm_exchange(group, "rounds")
         assert isinstance(exchange, ShmTagExchange)
         # a broken protocol fails here instead of waiting out the 30-minute default
         exchange.timeout_s = 30.0
