@@ -763,6 +763,47 @@ class TestMooncakeStorageMetrics(CustomTestCase):
         self.assertEqual(stats.backup_pgs, [])
         self.assertEqual(stats.backup_bandwidth, [])
 
+    def test_v2_set_metrics_count_partly_stored_pages(self):
+        """A page putting only some of its objects still counts as one
+        backed-up page, since the put list is filtered per object."""
+
+        class RecordingKVDraftPool:
+            page_size = 1
+
+            def __init__(self):
+                self.kv_buffer = torch.empty((128,), dtype=torch.uint8)
+
+            def get_page_buffer_meta(self, indices):
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([5000 + int(i) * 10, 5001 + int(i) * 10])
+                    sizes.extend([8, 8])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(
+            extra_backend_tag="tag", enable_storage_metrics=True
+        )
+        store.register_mem_host_pool_v2(RecordingKVDraftPool(), PoolName.DRAFT)
+        # page0: k stored, v missing; page1: fully stored; page2: fully missing.
+        fake_store.existing_keys.update(
+            {"tag_page0_0_draft_k", "tag_page1_0_draft_k", "tag_page1_0_draft_v"}
+        )
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([5, 6, 7]),
+                )
+            ]
+        )
+
+        # page0 (partly put) and page2 (fully put) both count; page1 does not.
+        self.assertEqual(store.backup_pgs, [2])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

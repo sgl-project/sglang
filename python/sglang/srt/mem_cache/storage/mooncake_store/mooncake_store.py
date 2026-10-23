@@ -1074,13 +1074,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     @staticmethod
     def _count_v2_missing_pages(prepared, missing_idx) -> int:
-        # A page counts as written iff any of its component objects was put;
-        # all components of a missing page are put together.
+        # The put list is filtered per object, so a partly-stored page puts
+        # only its missing components; a page counts as backed up when any
+        # of its component objects was put.
         missing = set(missing_idx)
-        return sum(
-            sum(1 for i in range(start, end) if i in missing) // key_multiplier
-            for _, key_multiplier, start, end in prepared
-        )
+        pages = 0
+        for _, key_multiplier, start, end in prepared:
+            for page_start in range(start, end, key_multiplier):
+                if any(
+                    i in missing
+                    for i in range(page_start, min(page_start + key_multiplier, end))
+                ):
+                    pages += 1
+        return pages
 
     def _record_v2_io_metrics(
         self, num_pages: int, num_bytes: int, elapsed: float, is_set: bool
