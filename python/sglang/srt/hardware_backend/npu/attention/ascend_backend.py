@@ -114,7 +114,7 @@ class ForwardMetadata:
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
-    # DCP decode inputs
+    # DCP per-request lengths and decode inputs
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_seq_lens: Optional[torch.Tensor] = None
     dcp_block_tables: Optional[torch.Tensor] = None
@@ -702,7 +702,7 @@ class AscendAttnBackend(AttentionBackend):
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
             global_kv_lens_cpu = metadata.seq_lens_cpu_int
-            metadata.seq_lens_cpu_int, metadata.block_tables = (
+            metadata.dcp_seq_lens_cpu_int, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
                     global_kv_lens_cpu, forward_batch.req_pool_indices
                 )
@@ -2876,7 +2876,11 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             block_table = self.forward_metadata.block_tables
-            if self.forward_metadata.seq_lens_cpu_int is None:
+            if dense_mla_dcp_verify and not self.graph_mode:
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.dcp_seq_lens_cpu_int.cpu().int().tolist()
+                )
+            elif self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
@@ -3664,11 +3668,14 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = k_pe.view(
                         -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                     )
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_list
-                    if self.forward_metadata.seq_lens_cpu_int is None
-                    else self.forward_metadata.seq_lens_cpu_int
-                )
+                if self.dense_mla_dcp_target and not self.graph_mode:
+                    actual_seq_lengths_kv = self.forward_metadata.dcp_seq_lens_cpu_int
+                else:
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_list
+                        if self.forward_metadata.seq_lens_cpu_int is None
+                        else self.forward_metadata.seq_lens_cpu_int
+                    )
                 query_len = num_tokens // forward_batch.batch_size
                 return self._forward_mla_fia(
                     q,
