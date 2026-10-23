@@ -73,7 +73,8 @@ class TestPackedMxfp4InProjGpu(CustomTestCase):
         )
         ba_ref_w = _dequant(ba_w, ba_s, quark_w4a4_mxfp4._MXFP4_VALUES)
         out_ref = torch.empty(0, dtype=torch.bfloat16, device="cuda")
-        for m in (1, 2, 7, 16, 33, 64):
+        # 65..256 rows: the CUDA-graph-only range of the packed in_proj.
+        for m in (1, 2, 7, 16, 33, 64, 65, 128, 200, 256):
             with self.subTest(m=m):
                 x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
                 x_q, x_scales = quark_w4a4_mxfp4.per_1x32_f4_quant(x)
