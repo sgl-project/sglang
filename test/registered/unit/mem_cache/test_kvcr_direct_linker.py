@@ -168,6 +168,7 @@ class TestKVCRDirectLinker(CustomTestCase):
                 module + ".resolve_hybrid_device_pool_group", return_value=self.group
             ),
             patch(module + ".torch.cuda.Event", side_effect=Event),
+            patch(module + ".freeze_gc"),
         ]
         for p in self.patches:
             p.start()
@@ -937,6 +938,41 @@ class TestKVCRDirectLinker(CustomTestCase):
                 self.ranked_linker(
                     {"replicated_source_rank_routing": option}, **topology
                 )
+
+    def test_shard_replicated_requires_source_rank_routing_and_dedup(self):
+        for options in (
+            {"shard_replicated": True},
+            {"shard_replicated": True, "replicated_source_rank_routing": True},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.ranked_linker(options)
+
+    def test_sharded_plan_mismatch_fails_on_every_rank(self):
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        def peer_differs(digests, digest, group=None):
+            digests[0], digests[1] = digest, b"peer"
+
+        for shard, queued in ((True, ["load"]), (True, []), (False, ["load"])):
+            linker = SimpleNamespace(
+                _queued=[SimpleNamespace(rid=r, plan=()) for r in queued],
+                _tp_group=None,
+                _shard=shard,
+            )
+            with (
+                self.subTest(shard=shard, queued=queued),
+                patch.object(torch.distributed, "get_world_size", return_value=2),
+                patch.object(
+                    torch.distributed, "all_gather_object", side_effect=peer_differs
+                ),
+            ):
+                if shard:
+                    with self.assertRaisesRegex(RuntimeError, "sharded storage"):
+                        KVCRDirectLinker._prepare_gather(linker)
+                else:
+                    self.assertIsNone(KVCRDirectLinker._prepare_gather(linker))
 
     def test_unaddressed_remote_shard_hints_do_not_admit_failed_deliveries(self):
         from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
