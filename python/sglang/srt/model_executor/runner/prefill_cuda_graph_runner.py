@@ -2042,6 +2042,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The engram lookup break reads the staged rows at replay.
+        static_forward_batch.engram_staged_rows = forward_batch.engram_staged_rows
         # The encoder replay fold: a replay builds the same window floors and
         # compressor slots as an eager prefill.
         static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay

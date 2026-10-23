@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -91,6 +92,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
 )
+from sglang.srt.layers.attention.graph_variants import DSV41_EARLY_VERIFY_VARIANTS
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -123,6 +125,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
+    join_in_graph_metadata_prep,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -141,8 +146,7 @@ from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
-
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -205,9 +209,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if get_platform().is_sm120 or _is_xpu:
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
-    return flash_mla.get_mla_metadata()[0]
+    return get_mla_metadata()[0]
 
 
 # FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
@@ -266,6 +270,13 @@ def _maybe_precompute_flashmla_sched_meta(
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
+
+
+def _flashmla_v41_splits_kv(
+    indices: torch.Tensor, extra_indices: Optional[torch.Tensor], min_topk: int
+) -> bool:
+    extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
+    return indices.shape[-1] + extra_topk >= min_topk
 
 
 def _low_ratio_source_projections(
@@ -1011,11 +1022,6 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-# The replayed context limit when the prefill graph's metadata is built at a fixed
-# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
-_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
-
-
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
@@ -1149,6 +1155,18 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+def _replan_topk_in_graph(metadata) -> None:
+    from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+
+    for indexer in (
+        metadata.indexer_metadata,
+        metadata.c1_indexer_metadata,
+        metadata.c2_indexer_metadata,
+    ):
+        if indexer is not None and indexer.use_topk_v2:
+            plan_topk_v2(indexer.compressed_seq_lens, out=indexer.topk_metadata)
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -1168,6 +1186,9 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    pre_kv_store_hook = None
+    builds_verify_metadata_early = False
+    draft_metadata_glued = False
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
@@ -1196,6 +1217,9 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
+        self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
@@ -1214,6 +1238,17 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        if is_cuda():
+            from sglang.kernels.ops.attention import flash_mla_interface
+
+            self._swa_interleaved = (
+                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+            )
+            self._flash_mla_with_kvcache = functools.partial(
+                flash_mla_interface.flash_mla_with_kvcache,
+                use_legacy=not self._swa_interleaved,
+            )
+            self._flashmla_split_kv_min_topk = flash_mla_interface.SPLIT_KV_MIN_TOPK
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
@@ -1312,10 +1347,66 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        # Once a draft runner glues this prep (glue_draft_metadata): the draft
+        # block's extend lengths come from device constants, one per batch size.
+        self.draft_metadata_glued = False
+        self._draft_extend_lens: Dict[Tuple[int, ...], torch.Tensor] = {}
+        # Set by the target verify runner that stages this metadata early: the replay
+        # prep then builds the full metadata and the verify graph records none.
+        self.builds_verify_metadata_early = False
+        # Ids of the captured verify metadata built that way; the bucket keeps them alive.
+        self._early_verify_metadata_ids: set = set()
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def glue_target_verify_metadata(self) -> str:
+        # The static target verify prep reads the runner's slots and own buffers only;
+        # host lengths, online c128 MTP, trtllm, a request window and CP are unaudited.
+        for bad, why in (
+            (self.is_draft_runner, "a draft runner"),
+            (self.needs_cpu_seq_lens, "host sequence lengths"),
+            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.online_c128_mtp.enabled(), "online c128 MTP"),
+            (read_ragged_verify_mode() is not RaggedVerifyMode.STATIC, "ragged verify"),
+            (self.token_to_kv_pool.request_window is not None, "a request window"),
+            (get_parallel().attn_cp_size != 1, "context parallelism"),
+        ):
+            if bad:
+                return why
+        return ""
+
+    def glue_draft_metadata(self) -> str:
+        # The draft block prep is host-free (host inputs follow from bs, CPU lengths
+        # feed only asserts) except in these cases.
+        for bad, why in (
+            (not self.is_dspark_draft, "not the DSpark draft runner"),
+            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.online_c128_mtp.enabled(), "online c128 MTP"),
+            (self.token_to_kv_pool.request_window is not None, "a request window"),
+            (get_parallel().attn_cp_size != 1, "context parallelism"),
+        ):
+            if bad:
+                return why
+        self.draft_metadata_glued = True
+        return ""
+
+    def _draft_block_extend_lens(self, lens: List[int]) -> torch.Tensor:
+        """The draft block's extend lengths on the device; glued, a cached constant
+        (a captured host copy would replay from a freed pinned buffer)."""
+        if not self.draft_metadata_glued:
+            return self._move_to_device(lens)
+        key = tuple(lens)
+        cached = self._draft_extend_lens.get(key)
+        if cached is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"draft block extend lengths {key} first seen inside the metadata "
+                    "glue capture"
+                )
+            cached = self._draft_extend_lens[key] = self._move_to_device(lens)
+        return cached
 
     def _resolve_verify_layout(
         self,
@@ -2097,7 +2188,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.
@@ -2120,6 +2211,7 @@ class DeepseekV4AttnBackend(
         self,
         raw_metadata: DSV4RawVerifyMetadata,
         online_c128_state_slot_offset: int = 0,
+        graph_backed: bool = False,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -2165,7 +2257,9 @@ class DeepseekV4AttnBackend(
             num_groups=bs,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata, use_prefill_cuda_graph=graph_backed
+            )
             if self.has_c4
             else None
         )
@@ -2196,6 +2290,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=1,
                     rows_per_request=rows_per_request,
+                    use_prefill_cuda_graph=graph_backed,
                 )
                 if 1 in low
                 else None
@@ -2205,6 +2300,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=2,
                     rows_per_request=rows_per_request,
+                    use_prefill_cuda_graph=graph_backed,
                 )
                 if 2 in low
                 else None
@@ -2348,6 +2444,11 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
+        # Replay prep built this in full except the indexer top-k plans, which the graph
+        # records like the in-graph upgrade (the prep's copy diverged at long context).
+        if id(self.forward_metadata) in self._early_verify_metadata_ids:
+            _replan_topk_in_graph(self.forward_metadata)
+            return
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
@@ -2449,6 +2550,68 @@ class DeepseekV4AttnBackend(
                     )
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
+
+    def enable_early_verify_metadata(self) -> None:
+        """Called by the target verify runner whose own predicate stages the metadata
+        early, so capture and replay agree on which metadata object the graph reads."""
+        self.builds_verify_metadata_early = True
+        logger.info("Target verify metadata built outside the verify graph.")
+
+    def _uses_early_verify_metadata(self, *, ragged_layout) -> bool:
+        """Whether this prep builds the full verify metadata: only for an early
+        variant; the others keep their in-graph upgrade."""
+        if not self.builds_verify_metadata_early or ragged_layout is not None:
+            return False
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+            skip_low_ratio_indexer,
+        )
+
+        early = get_capture_attention_variant() in DSV41_EARLY_VERIFY_VARIANTS
+        # Only the in-graph upgrade fills the all-position indices of such a variant.
+        assert not (early and any(map(skip_low_ratio_indexer, self.low_ratios))), (
+            "early verify metadata does not fill candidate_all indices"
+        )
+        return early
+
+    def _install_early_verify_metadata(
+        self, *, graph_key, raw_metadata: DSV4RawVerifyMetadata, out_cache_loc
+    ) -> None:
+        """Build what ``init_forward_metadata_in_graph`` records for target verify and
+        copy it into the metadata the early variant's graph was captured with."""
+        graph_key = (graph_key, "early")
+        # Graph-backed, like the in-graph build it replaces: one indexer call per layer,
+        # no free-memory row chunking (a chunked schedule would be rebound, not copied).
+        metadata = self.make_forward_metadata_from_raw_verify(
+            raw_metadata=raw_metadata,
+            online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
+            graph_backed=True,
+        )
+        # The full build leaves the SWA write locations to the in-graph op it replaces.
+        pool = self.token_to_kv_pool
+        swa_out_cache_loc = (
+            pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int32)
+            if pool.request_window is None and pool.swa_req_ring_size is None
+            else None
+        )
+        self.tail_forward_metadata = None
+        bucket_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
+            _GraphBucket.TARGET_VERIFY
+        ]
+        captured = bucket_metadata.get(graph_key)
+        if captured is None:
+            metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
+            bucket_metadata[graph_key] = metadata
+            self._early_verify_metadata_ids.add(id(metadata))
+            self.forward_metadata = metadata
+            return
+        # copy_ assigns swa_out_cache_loc; the verify graphs read the captured tensor.
+        captured_swa_out_cache_loc = captured.core_attn_metadata.swa_out_cache_loc
+        captured.copy_(metadata)
+        if captured_swa_out_cache_loc is not None:
+            captured_swa_out_cache_loc.copy_(swa_out_cache_loc)
+        captured.core_attn_metadata.swa_out_cache_loc = captured_swa_out_cache_loc
+        self.forward_metadata = captured
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
@@ -2612,6 +2775,15 @@ class DeepseekV4AttnBackend(
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )
+            if self._uses_early_verify_metadata(ragged_layout=ragged_layout):
+                self._install_early_verify_metadata(
+                    graph_key=graph_key,
+                    raw_metadata=temp_metadata,
+                    out_cache_loc=out_cache_loc_padded,
+                )
+                if in_capture:
+                    self._current_capture_raw = None
+                return
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(
                 actual_forward_mode,
@@ -2990,8 +3162,9 @@ class DeepseekV4AttnBackend(
         return self.forward_metadata
 
     def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
-        """One context width for the full rows' and the late-layer tail's metadata."""
-        if self._prefill_graph_replays_any_context():
+        """One context width for the full rows' and the late-layer tail's metadata:
+        the live context, unless c4/c128 compress metadata is captured at a width."""
+        if not self.has_c4 and not self.has_c128:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
@@ -3621,7 +3794,7 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+        if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
             pool.set_extra_key_buffer_fused(
@@ -3798,23 +3971,6 @@ class DeepseekV4AttnBackend(
             return
         self.forward_metadata.candidate_metadata = published
 
-    def _prefill_graph_replays_any_context(self) -> bool:
-        """Whether a prefill graph replay admits any context length: with two-level
-        candidates only c4/c128 compress metadata would be captured at a width."""
-        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
-
-    @property
-    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
-        context parallelism builds its own metadata and needs none."""
-        if (
-            self.low_ratios != (1, 2)
-            or get_parallel().attn_cp_size > 1
-            or self._prefill_graph_replays_any_context()
-        ):
-            return None
-        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
-
     def _prefill_graph_seq_limit(self) -> Optional[int]:
         """The replayed context limit: cuda_graph_config[prefill].max_seq_len when
         the user sets it, else this backend's default."""
@@ -3858,6 +4014,9 @@ class DeepseekV4AttnBackend(
         """Idle never trusts its metadata, which may be stale or unset: it writes
         the request window's idle layout, or translates the zero-padded
         out_cache_loc to the dummy slot."""
+        join_in_graph_metadata_prep()
+        if self.pre_kv_store_hook is not None:
+            self.pre_kv_store_hook()
         out_cache_loc = forward_batch.out_cache_loc
         window = self.token_to_kv_pool.request_window
         if forward_batch.forward_mode.is_idle():
@@ -4127,9 +4286,16 @@ class DeepseekV4AttnBackend(
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                    flash_mla_with_kvcache = self._flash_mla_with_kvcache
 
-                if self.is_dsv41:
+                if self.is_dsv41 and (
+                    not self._swa_interleaved
+                    or _flashmla_v41_splits_kv(
+                        swa_page_indices,
+                        extra_indices,
+                        self._flashmla_split_kv_min_topk,
+                    )
+                ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
                         q=q,
@@ -4176,7 +4342,9 @@ class DeepseekV4AttnBackend(
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+            from sglang.kernels.ops.attention.flash_mla_interface import (
+                flash_mla_sparse_fwd,
+            )
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
