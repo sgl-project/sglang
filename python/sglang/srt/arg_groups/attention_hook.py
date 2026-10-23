@@ -40,8 +40,11 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
-# Hybrid SWA models verified to need the pool off in deterministic mode, and to run without it. Others are left
-# alone: Gemma 4 and Laguna, for example, fail to start without the pool.
+# Hybrid sliding-window (SWA) models that turn off the hybrid SWA memory pool in
+# deterministic mode with the radix cache. A model is listed only when tests show
+# both that the pool breaks its determinism and that it runs correctly without the
+# pool. Other hybrid SWA models keep the pool: Gemma 4 and Laguna, for example,
+# fail to start without it.
 _DETERMINISTIC_NO_SWA_POOL_ARCHS = frozenset({"GptOssForCausalLM", "MellumForCausalLM"})
 
 
@@ -672,8 +675,9 @@ def handle_deterministic_inference(server_args: Any):
                 f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
             )
 
-        # With the radix cache, how much of a cached prefix the SWA pool can reuse depends on
-        # which sliding-window KV it has evicted, so a result would depend on earlier requests.
+        # A cached prefix can be reused only as far as its sliding-window KV is still in
+        # the SWA pool, so how a prompt is prefilled would depend on what earlier requests
+        # evicted.
         if (
             disable_swa_pool
             and not cfg.disable_radix_cache
