@@ -267,9 +267,7 @@ class BeamTrieConstraint:
         size = self.config.codebook_size
         pair_rows = self._sparse_level2_rows(prefix_codes)
         if pair_rows.is_cuda:
-            from sglang.srt.beam_search.trie_kernels import (
-                materialize_sparse_mask,
-            )
+            from sglang.kernels.ops.grammar.trie_mask import materialize_sparse_mask
 
             return materialize_sparse_mask(
                 pair_rows,
@@ -313,7 +311,7 @@ class BeamTrieConstraint:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sparse = self.level2_sparse
         assert sparse is not None and logits.is_cuda
-        from sglang.srt.beam_search.trie_kernels import mask_sparse_logits
+        from sglang.kernels.ops.grammar.trie_mask import mask_sparse_logits
 
         pair_rows = self._sparse_level2_rows(prefix_codes)
         starts = sparse.offsets[pair_rows].long()

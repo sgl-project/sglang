@@ -136,7 +136,7 @@ class BeamTrieOutputHead:
         end = self.config.token_end
         logits = None
         if use_grouped_projection:
-            from sglang.srt.beam_search.trie_kernels import (
+            from sglang.kernels.ops.gemm.codebook_projection import (
                 project_active_codebook_logits,
             )
 

@@ -184,7 +184,7 @@ def forward(
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
     output = torch.empty_like(flat_q)
-    from sglang.srt.beam_search.shared_context_attention_kernel import (
+    from sglang.kernels.ops.attention.beam_shared_context import (
         shared_context_attention,
     )
 
