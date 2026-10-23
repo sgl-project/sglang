@@ -2357,6 +2357,7 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
 class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
     pass
 
+
 class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
     """Carry the L3 availability envelope, including explicit disabled replies."""
 

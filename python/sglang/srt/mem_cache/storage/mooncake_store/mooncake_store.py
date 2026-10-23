@@ -21,9 +21,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
     SidecarPoolSpec,
+    disabled_l3_layout,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
-from sglang.srt.mem_cache.l3_layout import disabled_l3_layout
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics

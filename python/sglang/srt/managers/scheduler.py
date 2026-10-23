@@ -5488,7 +5488,7 @@ class Scheduler(
         return self.internal_state.get_internal_state(recv_req)
 
     def _hicache_l3_layout(self) -> dict:
-        from sglang.srt.mem_cache.l3_layout import disabled_l3_layout
+        from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
 
         if not self.enable_hierarchical_cache:
             return disabled_l3_layout(

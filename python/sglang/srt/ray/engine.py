@@ -31,7 +31,7 @@ from sglang.srt.entrypoints.engine import (
     _calculate_rank_ranges,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.l3_layout import merge_scheduler_info_layouts
+from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
     get_parallel,

@@ -771,7 +771,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
 
     def test_scheduler_infos_share_the_merged_layout(self):
         """Any startup info must be representative, whichever one a consumer reads."""
-        from sglang.srt.mem_cache.l3_layout import merge_scheduler_info_layouts
+        from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 
         infos = [
             self._scheduler(self._stage_store(rank)).get_init_info() for rank in (0, 1)

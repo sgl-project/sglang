@@ -54,7 +54,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import is_health_check_generate_req
-from sglang.srt.mem_cache.l3_layout import merge_l3_layouts
+from sglang.srt.mem_cache.hicache_storage import merge_l3_layouts
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -826,17 +826,21 @@ class DataParallelController:
 
     def get_init_info(self) -> dict:
         """Build the parent handshake without dropping or choosing a replica layout."""
-        info = {
-            "max_total_num_tokens": self.max_total_num_tokens,
-            "max_req_input_len": self.max_req_input_len,
-            "startup_time": self.startup_time,
-        }
-        layout = merge_l3_layouts(
-            [info.get("hicache_object_layout") for info in self._scheduler_init_infos]
-        )
+        with self._scheduler_init_info_lock:
+            init_info = {
+                "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_input_len": self.max_req_input_len,
+                "startup_time": self.startup_time,
+            }
+            layout = merge_l3_layouts(
+                [
+                    info.get("hicache_object_layout")
+                    for info in self._scheduler_init_infos
+                ]
+            )
         if layout is not None:
-            info["hicache_object_layout"] = layout
-        return info
+            init_info["hicache_object_layout"] = layout
+        return init_info
 
     def dispatch_health_check(self, req: Req) -> None:
         # This policy routes by request metadata, not shared load-balancing state.
