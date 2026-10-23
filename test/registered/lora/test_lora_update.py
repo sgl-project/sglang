@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -230,12 +230,19 @@ class LoRAUpdateServerTestSession:
             self.lora_backend,
             "--random-seed",
             "42",
-            "--max-running-request",
-            "1",
             "--mem-fraction-static",
             str(MEM_FRACTION_STATIC),
             "--disable-radix-cache",
         ]
+        # A forward's requests now batch together. Deterministic inference is
+        # meant to keep each output independent of its batch-mates, so the
+        # evicting and the static pass stay comparable; whether it does under
+        # this backend is what the first CUDA runs must show. Its fallback
+        # attention backend (fa3) does not exist on ROCm, which stays serial.
+        if is_hip():
+            other_args += ["--max-running-request", "1"]
+        else:
+            other_args.append("--enable-deterministic-inference")
         if self.enable_lora:
             other_args.append("--enable-lora")
         if self.lora_paths:
