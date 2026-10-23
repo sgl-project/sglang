@@ -19,6 +19,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
+from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,6 +108,32 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             sum(t.numel() * t.element_size() for t in rings if t is not None),
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL)
             * (spec_state_size + 1),
+        )
+
+    def test_kda_spec_ring_skips_decode_extra_slots(self):
+        running = 2
+        pool = HybridMambaDecodeReqToTokenPool(
+            size=running,
+            pre_alloc_size=3,
+            max_context_len=16,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=_kda_params(),
+            mamba_layer_ids=LAYERS,
+            speculative_num_draft_tokens=4,
+            enable_mamba_extra_buffer=False,
+            enable_overlap_schedule=False,
+            linear_replayssm_cache_len=RL,
+            enable_linear_replayssm_spec=True,
+        )
+        cache = pool.mamba_pool.mamba_cache
+        rings = [
+            getattr(cache, f"replayssm_{name}")
+            for name in ("d", "k", "g", "rawv", "rawk", "beta")
+        ]
+        self.assertEqual(
+            sum(t.numel() * t.element_size() for t in rings if t is not None),
+            _kda_params().replayssm_ring_bytes_per_req(record_len=RL) * (running + 1),
         )
 
     def test_zero_len_ring(self):
