@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention import layer
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2AudioVideoRotaryPosEmbed,
     _ltx2_build_batched_perturbation_states,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
@@ -52,6 +53,7 @@ class TestLTX2BCGCoords(CustomTestCase):
             video_coords=video_coords,
             audio_coords=audio_coords,
             num_frames=16,
+            video_start_frame=0,
             height=32,
             width=48,
             audio_num_frames=126,
@@ -70,6 +72,7 @@ class TestLTX2BCGCoords(CustomTestCase):
             width=48,
             device=self.video_latents.device,
             fps=24,
+            start_frame=0,
         )
         self.model.audio_rope.prepare_audio_coords.assert_called_once_with(
             batch_size=2,
@@ -148,6 +151,57 @@ class TestLTX2BCGCoords(CustomTestCase):
         self.assertIs(first[1], second[1])
         pipeline_config.prepare_video_rope_coords_for_sp.assert_called_once()
         pipeline_config.prepare_audio_rope_coords_for_sp.assert_called_once()
+
+    def test_legacy_bcg_coords_keep_the_sp_shard_start_frame(self):
+        rope = LTX2AudioVideoRotaryPosEmbed(dim=64)
+        model = SimpleNamespace(
+            rope=rope,
+            audio_rope=LTX2AudioVideoRotaryPosEmbed(
+                dim=64, scale_factors=(4,), modality="audio"
+            ),
+        )
+        stage = object.__new__(LTX2DenoisingStage)
+        stage._ltx2_coords_cache = OrderedDict()
+        stage._ltx2_coords_cache_max_entries = 4
+        local_frames = 4
+        ctx = SimpleNamespace(
+            latent_num_frames_for_model=local_frames,
+            latent_height=2,
+            latent_width=3,
+            use_ltx23_legacy_one_stage=True,
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(), enable_breakable_cuda_graph=True
+        )
+        video_latents = torch.zeros(1, local_frames * 2 * 3, 16)
+        for sp_rank in (0, 1):
+            with self.subTest(sp_rank=sp_rank):
+                batch = SimpleNamespace(
+                    fps=24,
+                    did_sp_shard_latents=True,
+                    sp_video_start_frame=sp_rank * local_frames,
+                    did_sp_shard_audio_latents=False,
+                )
+                video_coords, _ = stage._get_ltx2_rope_coords(
+                    ctx,
+                    SimpleNamespace(current_model=model),
+                    batch,
+                    server_args,
+                    video_latents,
+                    self.audio_latents,
+                    audio_num_frames_latent=126,
+                )
+                # the eager forward shifts each shard by sp_rank * local frames
+                expected = rope.prepare_video_coords(
+                    batch_size=1,
+                    num_frames=local_frames,
+                    height=2,
+                    width=3,
+                    device=video_latents.device,
+                    fps=24,
+                    start_frame=sp_rank * local_frames,
+                )
+                torch.testing.assert_close(video_coords, expected, rtol=0, atol=0)
 
 
 class TestLTX2GuidanceBCG(CustomTestCase):

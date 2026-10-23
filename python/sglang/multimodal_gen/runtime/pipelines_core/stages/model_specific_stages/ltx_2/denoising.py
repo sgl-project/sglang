@@ -114,6 +114,7 @@ def _prepare_ltx2_rope_coords_for_bcg(
     video_coords: torch.Tensor | None,
     audio_coords: torch.Tensor | None,
     num_frames: int,
+    video_start_frame: int,
     height: int,
     width: int,
     audio_num_frames: int,
@@ -137,6 +138,7 @@ def _prepare_ltx2_rope_coords_for_bcg(
             width=width,
             device=latent_model_input.device,
             fps=fps,
+            start_frame=video_start_frame,
         )
     if audio_coords is None:
         audio_coords = current_model.audio_rope.prepare_audio_coords(
@@ -1120,6 +1122,7 @@ class LTX2DenoisingStage(DenoisingStage):
             video_coords=video_coords,
             audio_coords=audio_coords,
             num_frames=ctx.latent_num_frames_for_model,
+            video_start_frame=video_sp_start or 0,
             height=ctx.latent_height,
             width=ctx.latent_width,
             audio_num_frames=audio_num_frames_latent,
