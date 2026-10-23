@@ -138,6 +138,42 @@ def test_async_scheduler_client_closes_socket_when_cancelled():
     asyncio.run(run_test())
 
 
+def test_worker_failure_aborts_concurrent_requests_without_rpc_deadline():
+    async def run_test():
+        context = zmq.asyncio.Context()
+        endpoint = f"inproc://scheduler-{uuid.uuid4().hex}"
+        server = context.socket(zmq.ROUTER)
+        server.bind(endpoint)
+        client = AsyncSchedulerClient()
+        client.context = context
+        client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+        tasks = [
+            asyncio.create_task(client._forward_one(endpoint, i, None))
+            for i in range(3)
+        ]
+        try:
+            # All requests reached the worker; none has received a reply.
+            for _ in tasks:
+                await asyncio.wait_for(server.recv_multipart(), timeout=5)
+            client.mark_failed("Scheduler worker exited; restart the server.")
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=5
+            )
+            assert all(isinstance(result, RuntimeError) for result in results)
+            assert all("restart the server" in str(result) for result in results)
+            with pytest.raises(RuntimeError, match="restart the server"):
+                await client._forward_one(endpoint, "new request", None)
+            assert not client._pending_requests
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            server.close(linger=0)
+            context.destroy(linger=0)
+
+    asyncio.run(run_test())
+
+
 def test_broker_closes_socket_and_context_when_cancelled(monkeypatch):
     async def run_test():
         socket = MagicMock()
