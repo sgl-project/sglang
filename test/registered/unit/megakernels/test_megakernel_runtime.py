@@ -112,7 +112,7 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertIs(runtime.megakernel_draft_sampler(lm), print)
 
     def test_each_architecture_gets_its_registered_binding(self):
-        with patch.dict(runtime._BINDINGS, {ARCH: f"{__name__}:OtherBinding"}):
+        with patch.dict(runtime._BINDINGS, {ARCH: OtherBinding}):
             lm = install(tokens=1)
         self.assertIsInstance(lm.context.binding, OtherBinding)
         self.assertIs(lm.context.binding.model, lm)

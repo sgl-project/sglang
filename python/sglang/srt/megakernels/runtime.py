@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import functools
-import importlib
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
@@ -15,6 +14,7 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.megakernels.binding import MegakernelBinding
+from sglang.srt.megakernels.eagle_binding import EagleBinding
 from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
     ENTRIES,
@@ -48,10 +48,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# HF architecture -> the "module:attribute" path of the binding its megakernel gets;
-# every other architecture gets MegakernelBinding
-_BINDINGS: dict[str, str] = {
-    arch: "sglang.srt.megakernels.eagle_binding:EagleBinding"
+# HF architecture -> the binding its megakernel gets; every other architecture gets
+# MegakernelBinding
+_BINDINGS: dict[str, type] = {
+    arch: EagleBinding
     for arch in (
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -236,10 +236,8 @@ def _offered_graph_variants(
 def _binding_class(architectures: Optional[list[str]]) -> type:
     """The binding SGLang hands the megakernel of a model of these architectures."""
     for arch in architectures or ():
-        path = _BINDINGS.get(arch)
-        if path is not None:
-            module, _, attr = path.partition(":")
-            return getattr(importlib.import_module(module), attr)
+        if arch in _BINDINGS:
+            return _BINDINGS[arch]
     return MegakernelBinding
 
 
