@@ -8,7 +8,13 @@ requests per rank and times --measure-steps steps.
 Throughput counts whole steps only: the window starts and ends at step boundaries
 (the scheduler's stamps under --enable-metrics, else response arrival gaps).
 --server-log cross-checks the engine's per-step log lines over the same window; it
-needs the server on this host's clock, with SGLANG_LOG_MS=1.
+needs the server on this host's clock, with SGLANG_LOG_MS=1. A requested check
+fails unless every rank logs the whole window at the fixed batch size and agrees
+within 0.5%. Requests go round-robin over the ranks, and a window in which the
+ranks served unequal tokens fails.
+The GPU denominator comes from the server's TP/PP/DP topology, unless overridden
+with --num-gpus. Local package/GPU/environment metadata belongs to the client
+host in HTTP mode; server configuration is recorded separately.
 
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
@@ -24,6 +30,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -60,6 +67,8 @@ def step_groups(times, size):
 def group_window(groups, lo, hi):
     """(t0, t1, items, ms between group ends) of the groups that end between the lo
     and hi fractions of all items."""
+    if not groups or not 0 <= lo < hi <= 1:
+        raise SystemExit("need step groups and 0 <= --lo < --hi <= 1")
     total, cum, ends = sum(c for _, c in groups), 0, []
     for end, c in groups:
         cum += c
@@ -107,14 +116,13 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
             for r, ts in edges.items()
             if len(ts) > 1 and ts[0] - t0 <= tol and t1 - ts[-1] <= tol
         }
-        check = {
+        return {
             "ms_per_step_per_rank": {
                 r: (ts[-1] - ts[0]) / (len(ts) - 1) * 1000 for r, ts in whole.items()
             },
             "complete": bool(prev) and whole.keys() == prev.keys(),
             "sizes_seen": sorted(seen),
         }
-        return check
     check = {
         "ms_per_step_per_rank": {r: statistics.mean(v) for r, v in per_rank.items()}
     }
@@ -123,6 +131,61 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
     check["sizes_seen"] = sorted(seen)
     if accept:
         check["accept_len"] = statistics.mean(accept)
+    return check
+
+
+def gpu_count(info, dp, explicit=None):
+    """Attention DP partitions TP; ordinary DP replicates the TP/PP group."""
+    replicas = info.get("dp_size", 1)
+    if "attn_dp_size" in info:
+        ranks = replicas * info["attn_dp_size"]
+    elif info.get("enable_dp_attention"):
+        ranks, replicas = replicas, 1  # legacy attention-DP server arguments
+    else:
+        ranks = replicas
+    if "dp_size" in info and dp != ranks:
+        raise SystemExit(f"--dp {dp} does not match the server's {ranks} ranks")
+    if explicit is not None:
+        return explicit
+    if "tp_size" not in info or "dp_size" not in info:
+        raise SystemExit("server topology is unavailable; pass --num-gpus explicitly")
+    return info["tp_size"] * info.get("pp_size", 1) * replicas
+
+
+def check_cache(meta, new_tokens):
+    new = meta["prompt_tokens"] - meta["cached_tokens"]
+    if new != new_tokens:
+        raise RuntimeError(
+            f"expected {new_tokens} uncached suffix tokens, got {new}: "
+            "the shared prefix was evicted/missed or part of a suffix was cached"
+        )
+    return new
+
+
+def check_logs(check, result, size, dp, blurred):
+    """A requested cross-check must cover every rank and the fixed batch."""
+    per_rank = check["ms_per_step_per_rank"]
+    errors = []
+    if set(per_rank) != set(range(dp)):
+        errors.append(f"expected ranks {list(range(dp))}, got {sorted(per_rank)}")
+    if set(check["sizes_seen"]) != {size}:
+        errors.append(f"expected batch size {size}, got {check['sizes_seen']}")
+    if not check["complete"]:
+        errors.append(
+            "engine lines miss part of the window on some rank; set SGLANG_LOG_MS=1 "
+            "(and --enable-metrics for prefill) on the server"
+        )
+    if blurred:
+        errors.append(
+            "decode steps stray past 0.6-1.6x their median: streamed chunks blur the "
+            "step boundaries at this step length, so ms/step is unreliable"
+        )
+    if per_rank:
+        check["ms_per_step"] = statistics.mean(per_rank.values())
+        check["diff_pct"] = (result["ms_per_step"] / check["ms_per_step"] - 1) * 100
+        if abs(check["diff_pct"]) > 0.5:
+            errors.append("engine log disagrees by more than 0.5%")
+    check.update(agree=not errors, errors=errors)
     return check
 
 
@@ -156,8 +219,12 @@ class EngineTransport:
         return None if ret.success else ret.message or "flush failed"
 
     def finish(self):
-        self.engine.tokenizer_manager.abort_request(abort_all=True)  # decode leftovers
-        self.engine.shutdown()
+        try:
+            self.engine.tokenizer_manager.abort_request(
+                abort_all=True
+            )  # decode leftovers
+        finally:
+            self.engine.shutdown()
 
 
 class HttpTransport:
@@ -166,11 +233,13 @@ class HttpTransport:
         import orjson  # a 128K-id body: json.dumps would starve the server
 
         self.url, self.session, self.dumps = url.rstrip("/"), None, orjson.dumps
+        self.timeout = timeout
         self.new_session = lambda: aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, sock_read=timeout),
             connector=aiohttp.TCPConnector(limit=0),
         )
-        self.run = asyncio.new_event_loop().run_until_complete
+        self.loop = asyncio.new_event_loop()
+        self.run = self.loop.run_until_complete
 
     def post(self, path, body):
         self.session = self.session or self.new_session()
@@ -196,16 +265,24 @@ class HttpTransport:
             resp.raise_for_status()
 
     def server_info(self):
-        return json.load(urlopen(self.url + "/server_info"))
+        with urlopen(self.url + "/server_info", timeout=self.timeout) as response:
+            return json.load(response)
 
     def flush_cache(self):
         try:
-            urlopen(Request(self.url + "/flush_cache", method="POST"))
+            with urlopen(
+                Request(self.url + "/flush_cache", method="POST"), timeout=self.timeout
+            ):
+                pass
         except HTTPError as e:
             return e.read().decode()
 
     def finish(self):
-        self.run(self.session.close())
+        try:
+            if self.session is not None:
+                self.run(self.session.close())
+        finally:
+            self.loop.close()
 
 
 def nvidia_smi(*args):
@@ -236,17 +313,22 @@ def environment():
     )
 
 
-async def batch(args, tp, prompt, n_each, params, done, what):
+async def batch(args, tp, prompt, n_each, params, done, what, *, check_prefix=False):
     """n_each requests per rank, submitted round-robin over the ranks so none starts
     ahead, about eight steps' worth in flight on each."""
     in_flight = max(1, args.tokens_per_step // args.new_tokens) * 8 + 1
     limits = [asyncio.Semaphore(in_flight) for _ in range(args.dp)]
 
+    async def collect(r):
+        async for t, meta in tp.generate(prompt(r), params, r, False):
+            new = meta["prompt_tokens"] - meta["cached_tokens"]
+            if check_prefix:
+                check_cache(meta, args.new_tokens)
+            done.append((t, meta.get("prefill_finished_time"), new, r))
+
     async def one(r):
         async with limits[r]:
-            async for t, meta in tp.generate(prompt(r), params, r, False):
-                new = meta["prompt_tokens"] - meta["cached_tokens"]
-                done.append((t, meta.get("prefill_finished_time"), new, r))
+            await asyncio.wait_for(collect(r), timeout=args.timeout)
 
     tasks = [
         asyncio.ensure_future(one(r)) for _ in range(n_each) for r in range(args.dp)
@@ -278,14 +360,12 @@ async def prefill(args, tp, prompt):
     nc, B = args.new_tokens, args.tokens_per_step
     per_step = max(1, B // nc)
     params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
-    await batch(args, tp, prompt, args.warmup_steps * per_step, params, [], "warmup")
+    n_warmup = args.warmup_steps * per_step
+    await batch(args, tp, prompt, n_warmup, params, [], "warmup", check_prefix=True)
     done = []
-    await batch(args, tp, prompt, args.requests, params, done, "measured")
-    if min(n for _, _, n, _ in done) < nc:
-        raise SystemExit(
-            "part of a suffix was cached: a warm cache, e.g. --no-flush after an "
-            "earlier run with the same --seed"
-        )
+    await batch(
+        args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
+    )
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
     t0, t1, _, group_ms = group_window(
@@ -326,8 +406,14 @@ async def decode(args, tp, prompt):
     async def one(r, k):
         seen = 0
         async for t, meta in tp.generate(prompt(r), params, r, True):
-            events.append((t, meta["completion_tokens"] - seen))
-            seen = meta["completion_tokens"]
+            if (r, k) not in first:
+                check_cache(meta, args.new_tokens)
+            count = meta["completion_tokens"]
+            if count < seen:
+                raise RuntimeError("stream completion_tokens decreased")
+            if count > seen:
+                events.append((t, count - seen))
+            seen = count
             first.add((r, k))
 
     async def wait(cond, why):
@@ -386,7 +472,12 @@ async def decode(args, tp, prompt):
 OPTIONS = [  # flag, type, default, help
     ("--base-url", str, None, "a running server (or pass --engine)"),
     ("--dp", int, None, "attention DP ranks to pin requests to"),
-    ("--num-gpus", int, None, "GPUs to divide throughput by (default --dp)"),
+    (
+        "--num-gpus",
+        int,
+        None,
+        "GPUs to divide throughput by (default: server topology)",
+    ),
     ("--context", int, 131072, "prompt tokens: shared prefix plus suffix"),
     ("--new-tokens", int, 4096, "random, uncached suffix tokens per request"),
     ("--tokens-per-step", int, 65536, "prefill: new tokens per rank per step"),
@@ -414,7 +505,7 @@ def main():
     for flag, typ, default, help_ in OPTIONS:
         ap.add_argument(flag, type=typ, default=default, help=help_)
     ap.add_argument("--engine", action="store_true", help="in-process engine")
-    ap.add_argument("--server-log", nargs="*", default=[], help="logs to cross-check")
+    ap.add_argument("--server-log", nargs="+", default=[], help="logs to cross-check")
     ap.add_argument("--sample-gpu", action="store_true", help="local SM clock, power")
     ap.add_argument("--no-flush", action="store_true", help="keep the server's cache")
     if "--engine" in sys.argv:
@@ -424,8 +515,28 @@ def main():
     args = ap.parse_args()
     if args.engine == bool(args.base_url) or not args.dp:
         ap.error("pass --dp and exactly one of --engine and --base-url")
-    args.num_gpus = args.num_gpus or args.dp
-    args.warmup_steps = args.warmup_steps or (5 if args.mode == "prefill" else 50)
+    for key in (
+        "dp",
+        "num_gpus",
+        "new_tokens",
+        "tokens_per_step",
+        "requests",
+        "batch_per_rank",
+        "output_len",
+        "measure_steps",
+        "timeout",
+    ):
+        value = getattr(args, key)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            ap.error(f"--{key.replace('_', '-')} must be positive and finite")
+    if args.context < args.new_tokens or not 0 <= args.lo < args.hi <= 1:
+        ap.error("need --context >= --new-tokens and 0 <= --lo < --hi <= 1")
+    if args.mode == "prefill" and args.tokens_per_step % args.new_tokens:
+        ap.error("--tokens-per-step must be a multiple of --new-tokens")
+    if args.warmup_steps is None:
+        args.warmup_steps = 5 if args.mode == "prefill" else 50
+    if args.warmup_steps < 0 or args.profile_steps < 0:
+        ap.error("warmup and profile step counts must be nonnegative")
     nc, B = args.new_tokens, args.tokens_per_step
     args.requests = args.requests or min(math.ceil(31 * B / nc), 512)
     args.profile = dict(output_dir=args.profile_dir, num_steps=args.profile_steps)
@@ -436,8 +547,16 @@ def main():
     else:
         tp = HttpTransport(args.base_url, args.timeout)
 
+    try:
+        run_benchmark(args, tp)
+    finally:
+        tp.finish()
+
+
+def run_benchmark(args, tp):
     import numpy as np
 
+    nc = args.new_tokens
     rng = np.random.default_rng(args.seed)
 
     def ids(n):  # plain vocabulary ids, clear of special tokens
@@ -449,6 +568,7 @@ def main():
         return prefixes[r] + ids(nc)
 
     info = tp.server_info()
+    args.num_gpus = gpu_count(info, args.dp, args.num_gpus)
     if info.get("enable_eplb"):
         raise SystemExit("EPLB is on: rebalance steps would land in the window")
     if args.mode == "decode" and info.get("stream_interval", 1) != 1:
@@ -469,14 +589,26 @@ def main():
     ]
     if devices := os.environ.get("CUDA_VISIBLE_DEVICES"):
         query += ["-i", devices]  # nvidia-smi itself ignores the variable
-    sampler = args.sample_gpu and subprocess.Popen(
-        ["nvidia-smi", *query, "-lms", "250"], stdout=subprocess.PIPE, text=True
-    )
+    sample_output = tempfile.TemporaryFile(mode="w+t") if args.sample_gpu else None
+    sampler, sample_text = None, ""
     try:
+        if sample_output is not None:
+            sampler = subprocess.Popen(
+                ["nvidia-smi", *query, "-lms", "250"], stdout=sample_output, text=True
+            )
         res = tp.run(run())
-    except BaseException:
-        tp.finish()
-        raise
+    finally:
+        if sampler:
+            sampler.terminate()
+            try:
+                sampler.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                sampler.kill()
+                sampler.wait()
+        if sample_output is not None:
+            sample_output.seek(0)
+            sample_text = sample_output.read()
+            sample_output.close()
     size = res.pop("size")
     steps, span, tokens = res["steps"], res["seconds"], res["tokens"]
     res.update(
@@ -485,10 +617,7 @@ def main():
     if args.mode == "decode":
         res["accept_len"] = tokens / (steps * size * args.dp)
     if sampler:
-        sampler.terminate()
-        rows = [
-            r.split(", ") for r in sampler.communicate()[0].splitlines() if ", " in r
-        ]
+        rows = [r.split(", ") for r in sample_text.splitlines() if ", " in r]
         t0, t1 = res["wall"]
         in_window = [
             r[1:]
@@ -499,26 +628,18 @@ def main():
             res[key + "_median"] = statistics.median(float(x) for x in col)
     lines = [line for path in args.server_log for line in open(path, errors="replace")]
     tol = min(res["group_ms"]) / 4000 if res["stamp"] == "scheduler" else None
-    check = log_steps(lines, args.mode, *res["wall"], size, tol) if lines else {}
     median = statistics.median(res["group_ms"])
-    # Streamed chunks of short decode steps blur the step boundaries
     blurred = args.mode == "decode" and any(
         not 0.6 * median <= ms <= 1.6 * median for ms in res["group_ms"]
     )
-    if per_rank := check.get("ms_per_step_per_rank"):
-        check["ms_per_step"] = statistics.mean(per_rank.values())
-        check["diff_pct"] = (res["ms_per_step"] / check["ms_per_step"] - 1) * 100
-        # Lines that miss part of the window on some rank cannot vouch for it
-        if check["complete"] and not blurred:
-            check["agree"] = abs(check["diff_pct"]) <= 0.5
-    elif lines:
-        check["no_match"] = "no engine line matches the window"
-    odd = args.mode == "prefill" and set(check.get("sizes_seen", [size])) != {size}
-    if odd:  # the window held prefill steps of another size
-        check["agree"] = False
+    check = {}
+    if args.server_log:
+        check = log_steps(lines, args.mode, *res["wall"], size, tol)
+        check = check_logs(check, res, size, args.dp, blurred)
     record = dict(
         mode=args.mode,
         transport="engine" if args.engine else "http",
+        environment_scope="engine_host" if args.engine else "benchmark_client",
         argv=sys.argv,
         workload={k: getattr(args, k) for k in WORKLOAD},
         result=res,
@@ -535,23 +656,8 @@ def main():
         print(
             f"engine log: {check['ms_per_step']:.2f} ms/step, {check['diff_pct']:+.2f}%"
         )
-        if blurred:
-            print(
-                "WARNING: decode steps stray past 0.6-1.6x their median, so the step "
-                "count is unreliable at this step length; tok/s still holds"
-            )
-        elif "agree" not in check:
-            print(
-                "WARNING: the engine lines miss part of the window on some rank; set "
-                "SGLANG_LOG_MS=1 (and --enable-metrics for prefill) on the server"
-            )
-        elif not check["agree"]:
-            print("WARNING: the engine log disagrees by more than 0.5%")
-    if odd:
-        print(f"WARNING: prefill steps of {check['sizes_seen']} tokens in the window")
-    if "no_match" in check:
-        print(f"WARNING: {check['no_match']}")
-    tp.finish()
+    for error in check.get("errors", []):
+        print(f"ERROR: {error}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(record, f, indent=1, default=str)
