@@ -339,6 +339,10 @@ struct InspectionMatchResultInput {
     #[pyo3(attribute)]
     best_match_node: NodeId,
     #[pyo3(attribute)]
+    last_visited_node_id: Option<NodeId>,
+    #[pyo3(attribute)]
+    full_device_match_len: Option<usize>,
+    #[pyo3(attribute)]
     host_hit_length: usize,
     #[pyo3(attribute)]
     swa_host_hit_length: usize,
@@ -665,6 +669,8 @@ pub struct MatchResultBinding {
     last_device_node_id: NodeId,
     last_host_node_id: NodeId,
     best_match_node_id: NodeId,
+    last_visited_node_id: Option<NodeId>,
+    full_device_match_len: Option<usize>,
     host_hit_length: usize,
     swa_host_hit_length: usize,
     swa_branching_seqlen: Option<usize>,
@@ -682,6 +688,8 @@ impl MatchResultBinding {
             last_device_node_id: result.last_device_node_id,
             last_host_node_id: result.last_host_node_id,
             best_match_node_id: result.best_match_node_id,
+            last_visited_node_id: result.last_visited_node_id,
+            full_device_match_len: result.full_device_match_len,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
             swa_branching_seqlen: result.swa_branching_seqlen,
@@ -2709,6 +2717,8 @@ macro_rules! tree_core_methods {
                     last_device_node: last_device_node_id,
                     last_host_node: last_host_node_id,
                     best_match_node: best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,
@@ -2721,6 +2731,8 @@ macro_rules! tree_core_methods {
                     last_device_node_id,
                     last_host_node_id,
                     best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,

@@ -39,6 +39,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
@@ -54,11 +57,14 @@ FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
 
 
 def fused_mxfp8_rows(rows: int) -> bool:
-    """Decode and verify batches the fused MXFP8 producers cover."""
+    """Batches the fused MXFP8 producers cover: decode and verify, and eager
+    prefill (not inside a breakable prefill graph)."""
     fwd = get_forward()
-    return 0 < rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS and not (
-        fwd.is_extend_in_batch or fwd.sp_active
-    )
+    if rows <= 0 or fwd.sp_active:
+        return False
+    if fwd.is_extend_in_batch:
+        return not is_in_breakable_cuda_graph()
+    return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
 def empty_deepgemm_mxfp8_pair(
