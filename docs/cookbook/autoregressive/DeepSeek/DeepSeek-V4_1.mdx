@@ -202,7 +202,7 @@ What to expect:
 
 Prefill/decode disaggregation is validated token-identical against a single server across 32 greedy prompts, with GSM8K matching through the router. Use the **PD Disaggregation** card in the Playground to generate the prefill role, the decode role and the router command.
 
-Both roles run MegaAttention (`--dsv4-attn-backend flashmla_mega`) by default on SM100/SM103, as a single server does. Prefill and decode must store KV in the same layout, so they must agree on `--dsv4-attn-backend` and `SGLANG_DSV4_KV_LAYOUT`; a decode server paired with a prefill whose layout differs fails its first request with a `KV layout mismatch` error. A decode on a GPU other than SM100/SM103 therefore needs `--dsv4-attn-backend flashmla` on the prefill too.
+Both roles run MegaAttention (`--dsv4-attn-backend flashmla_mega`) by default on SM100/SM103, whatever their attention TP size. Prefill and decode must store KV in the same layout, so they must agree on `--dsv4-attn-backend` and `SGLANG_DSV4_KV_LAYOUT`; a decode server paired with a prefill whose layout differs fails its first request with a `KV layout mismatch` error. A decode on a GPU other than SM100/SM103 therefore needs `--dsv4-attn-backend flashmla` on the prefill too.
 
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
