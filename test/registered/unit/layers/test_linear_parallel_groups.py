@@ -21,15 +21,20 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 class TestLinearParallelGroups(CustomTestCase):
     def setUp(self):
+        # The attention modules are built only for their projections. Off CUDA
+        # their RoPE would import vllm's kernel unless the CPU path is chosen.
+        rope_on_cpu = patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+        rope_on_cpu.start()
+        self.addCleanup(rope_on_cpu.stop)
         reset_context()
         self.addCleanup(reset_context)
         publish(

@@ -133,5 +133,176 @@ class TestMaterializedFinalize(CustomTestCase):
         self.assertIs(call.kwargs["lora_delta"], delta)
 
 
+class TestRunnerAdmission(CustomTestCase):
+    """Layers the runner would otherwise serve with silently wrong numerics,
+    and the plan check binding must surface. The device capability is the
+    only GPU boundary, pinned to SM90."""
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(9, 0)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _base_layer(**overrides):
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        quant_method = object.__new__(UnquantizedFusedMoEMethod)
+        dispatcher = object.__new__(StandardDispatcher)
+        dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
+        return SimpleNamespace(
+            quant_method=quant_method,
+            dispatcher=dispatcher,
+            w13_weight=torch.zeros(2, 8, 4, dtype=torch.bfloat16),
+            w2_weight=torch.zeros(2, 4, 4, dtype=torch.bfloat16),
+            num_local_experts=2,
+            should_fuse_routed_scaling_factor_in_topk=overrides.get(
+                "fused_scaling", False
+            ),
+            with_bias=overrides.get("with_bias", False),
+            moe_runner_config=SimpleNamespace(
+                activation="silu",
+                is_gated=True,
+                gemm1_alpha=None,
+                gemm1_clamp_limit=None,
+                swiglu_limit=None,
+                apply_router_weight_on_input=overrides.get(
+                    "apply_router_weight_on_input", False
+                ),
+                no_combine=overrides.get("no_combine", False),
+                num_fused_shared_experts=overrides.get("num_fused_shared_experts", 0),
+                top_k=2,
+                routed_scaling_factor=1.0,
+            ),
+        )
+
+    def test_rejects_layers_it_would_serve_wrongly(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        cases = {
+            # Global expert IDs would index the wrong rank's experts.
+            "global_expert_ids": (dict(skip_local=True), "EP-local"),
+            # Scaling folded into top-k would be applied twice.
+            "prefolded_routed_scaling": (dict(fused_scaling=True), "routed scaling"),
+            # Providers add no bias term; a biased layer would lose it.
+            "expert_biases": (dict(with_bias=True), "expert biases"),
+            # The runner weights routes in finalize, never on the input rows.
+            "router_weight_on_input": (
+                dict(apply_router_weight_on_input=True),
+                "owned by finalize",
+            ),
+            # The runner's finalize always combines the top-k rows.
+            "no_combine": (dict(no_combine=True), "owned by finalize"),
+            "fused_shared_experts": (
+                dict(num_fused_shared_experts=1),
+                "fused shared experts",
+            ),
+        }
+        for name, (overrides, message) in cases.items():
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(NotImplementedError, message),
+            ):
+                MoeLoraRunner._admit(self._base_layer(**overrides))
+
+    def test_binding_surfaces_plan_validation(self):
+        """A provider exposing one gate/up slice cannot serve a gated layer."""
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+        from sglang.srt.runtime_context import get_context, get_flags
+
+        provider = SimpleNamespace(
+            hidden_size=2048,
+            intermediate_size=768,
+            num_local_experts=256,
+            gate_up_slices=1,
+            contract=SimpleNamespace(lora_delta_dtype=torch.bfloat16),
+        )
+        layer = SimpleNamespace(
+            w2_weight=SimpleNamespace(
+                device=torch.device("cuda"), shape=(256, 2048, 768)
+            ),
+            num_local_experts=256,
+            hidden_size=2048,
+            moe_runner_config=SimpleNamespace(
+                activation="silu", top_k=8, routed_scaling_factor=1.0, is_gated=True
+            ),
+        )
+        # from_layer reads the published MoE runner backend for its vendor.
+        with (
+            mock.patch.object(MoeLoraRunner, "_admit", return_value="bf16"),
+            mock.patch.object(MoeLoraRunner, "_build_provider", return_value=provider),
+            get_context().override_server_args(),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),
+            self.assertRaisesRegex(ValueError, "gate/up slices"),
+        ):
+            MoeLoraRunner.from_layer(
+                layer, workspace=object(), is_shared_outer=False, physical_rank=64
+            )
+
+
+class TestLayerRunnerBackendResolution(CustomTestCase):
+    """The selected lora runner backend binds the new MoE runner and rebinds
+    run_moe_core."""
+
+    def test_v2_accepts_each_new_moe_runner(self):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        base_layer = SimpleNamespace(
+            quant_method=mock.MagicMock(),
+            moe_runner_config=MoeRunnerConfig(
+                num_experts=8,
+                num_local_experts=8,
+                hidden_size=64,
+                intermediate_size_per_partition=32,
+                layer_id=0,
+                top_k=2,
+                num_fused_shared_experts=0,
+                params_dtype=torch.bfloat16,
+                activation="silu",
+                inplace=True,
+            ),
+            dispatcher=None,
+            num_local_experts=8,
+            should_fuse_routed_scaling_factor_in_topk=False,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            intermediate_size_per_partition=32,
+            runner=SimpleNamespace(runner_backend=MoeRunnerBackend.DEEP_GEMM),
+            run_moe_core=mock.Mock(),
+        )
+        backend = SimpleNamespace(name="triton_v2", lora_workspace=object())
+        original_run_moe_core = base_layer.run_moe_core
+        with (
+            mock.patch(
+                "sglang.srt.layers.moe.utils.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.LORA_CUTEDSL,
+            ),
+            mock.patch.object(MoeLoraRunner, "from_layer") as bind,
+        ):
+            layer = FusedMoEWithLoRA(
+                base_layer,
+                backend,
+                experts_shared_outer_loras=True,
+                max_lora_rank=16,
+            )
+        self.assertIs(layer._lora_runner_backend, MoeRunnerBackend.LORA_CUTEDSL)
+        bind.assert_called_once_with(
+            base_layer,
+            workspace=backend.lora_workspace,
+            is_shared_outer=True,
+            physical_rank=16,
+        )
+        self.assertIs(layer._moe_lora_runner, bind.return_value)
+        self.assertIs(layer._base_run_moe_core, original_run_moe_core)
+        self.assertEqual(base_layer.run_moe_core, layer._run_moe_core_with_lora)
+
+
 if __name__ == "__main__":
     unittest.main()
