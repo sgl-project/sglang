@@ -30,17 +30,17 @@ Precision mode is driven by whether the PR is JUDGEABLE, not by whether some
 bucket happens to be non-empty. Every changed path from --changed-files is
 classified:
 
-    product     python/sglang/** (minus the test trees below) -> the coverage
-                baseline decides which tests are affected
+    product     python/sglang/** (minus the registered test files below) ->
+                the coverage baseline decides which tests are affected. The
+                coverage include is */python/sglang/*, so test helpers and
+                case configs under python/sglang are judged too.
     test_case   a registered / NPU-regression test file -> recommended as a
                 whole file (any touched test is worth running)
-    test_infra  test/** and python/sglang/{,multimodal_gen/}test/** helpers,
-                conftest.py, case configs -> not judged, and NOT a full-run
-                trigger: the rest of the diff decides which suites run
     ci_infra    only _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml,
                 npu_ci_install_dependency.sh): the non-test paths that trigger
                 this workflow and shape its environment/selection logic
-    ignored     docs/examples/other CI files -> cannot affect tests
+    ignored     docs/examples/test helpers outside python/sglang/... ->
+                invisible to the coverage baseline, cannot recommend anything
 
 Precision mode stays ON for judgeable PRs even when EVERY bucket is empty.
 A recommended test that no scheduled suite contains (a base-a CPU unit test, a
@@ -168,12 +168,6 @@ _FULL_RUN_PATHS = {
     "python/pyproject_npu.toml",
     "scripts/ci/npu/npu_ci_install_dependency.sh",
 }
-# Test trees that are imported by tests but are not test cases themselves.
-_TEST_INFRA_PREFIXES = (
-    "test/",
-    "python/sglang/test/",
-    "python/sglang/multimodal_gen/test/",
-)
 
 
 def classify_changed_path(path: str) -> str:
@@ -181,17 +175,14 @@ def classify_changed_path(path: str) -> str:
 
     product     : coverage baseline judges which tests are affected
     test_case   : touched test file, recommended as a whole file
-    test_infra  : test helpers/conftest/configs -> not judged, no full run
     ci_infra    : one of _FULL_RUN_PATHS -> full run
-    ignored     : docs, examples, other CI files -> cannot affect tests
+    ignored     : docs, examples, test helpers outside python/sglang/ ...
     """
     p = path.strip().replace("\\", "/").removeprefix("./")
     if p in _FULL_RUN_PATHS:
         return "ci_infra"
     if _TEST_CASE_RE.match(p):
         return "test_case"
-    if p.startswith(_TEST_INFRA_PREFIXES):
-        return "test_infra"
     if p.startswith("python/sglang/"):
         return "product"
     return "ignored"
@@ -436,13 +427,11 @@ def write_github_summary(
     decision: str = "",
     decision_reason: str = "",
     non_judgeable: list | None = None,
-    test_infra_changes: list | None = None,
     unknown_recommended: list | None = None,
 ) -> None:
     """Append a markdown section with the recommendation results to every
     target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
     non_judgeable = non_judgeable or []
-    test_infra_changes = test_infra_changes or []
     unknown_recommended = unknown_recommended or []
     lines = []
     lines.append("### Recommended tests from coverage")
@@ -466,14 +455,6 @@ def write_github_summary(
         )
         lines.append("")
         lines.extend(f"- `{p}`" for p in non_judgeable)
-    if test_infra_changes:
-        lines.append("")
-        lines.append(
-            "**Test-infrastructure changes (not judged; no full-run fallback)** "
-            "— suites are decided by the rest of the diff:"
-        )
-        lines.append("")
-        lines.extend(f"- `{p}`" for p in test_infra_changes)
     lines.append("")
     lines.append(
         f"Recommended **{len(raw_entries)}** test cases "
@@ -631,8 +612,7 @@ def main():
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
 
     # Classify every changed path. Only the three ci_infra paths force a full
-    # run; test infrastructure (conftest/helpers/case configs) is listed for
-    # the report but does not change the run/skip decision.
+    # run; everything else is decided by the coverage recommendation.
     changed_files: list[str] = []
     if args.changed_files:
         cf = Path(args.changed_files)
@@ -643,9 +623,6 @@ def main():
     changed_classes = {p: classify_changed_path(p) for p in changed_files}
     non_judgeable = sorted(
         p for p, kind in changed_classes.items() if kind == "ci_infra"
-    )
-    test_infra_changes = sorted(
-        p for p, kind in changed_classes.items() if kind == "test_infra"
     )
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
@@ -833,7 +810,6 @@ def main():
             decision=decision,
             decision_reason=decision_reason,
             non_judgeable=non_judgeable,
-            test_infra_changes=test_infra_changes,
             unknown_recommended=unknown_recommended,
         )
 
