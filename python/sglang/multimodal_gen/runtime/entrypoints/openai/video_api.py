@@ -53,6 +53,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     sanitize_upload_filename,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    VIDEO_PROGRESS,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -455,6 +458,7 @@ async def _dispatch_job_async(
             },
         )
     finally:
+        VIDEO_PROGRESS.unregister(job_id)
         try:
             await asyncio.to_thread(
                 batch.sampling_params.cleanup_video_request,
@@ -806,6 +810,11 @@ async def create_video(
         raise
 
     assert batch is not None
+    # the outputs may run as "{job}:{i}" requests, queued here or expanded later
+    VIDEO_PROGRESS.register(
+        request_id,
+        num_outputs=max(len(scheduler_batches or ()), batch.num_outputs_per_prompt),
+    )
     # Enqueue the job asynchronously and return immediately
     _start_video_job(
         request_id,

@@ -1,7 +1,23 @@
 import asyncio
 import os
+import threading
+import uuid
+from contextlib import suppress
 
-from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
+import pytest
+import zmq
+import zmq.asyncio
+from tqdm.auto import tqdm
+
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_progress
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    ProgressReporter,
+    ReportingTqdm,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import base as stage_base
 
 
 def test_video_job_registry_holds_task_until_completion():
@@ -173,3 +189,152 @@ def test_content_variant_serves_lidar_artifacts_by_key(tmp_path):
     assert video_api._select_video_variant_path(job, None) == str(video)
     assert video_api._select_video_variant_path(job, "rangemap") is None
     assert video_api._ARTIFACT_MEDIA_TYPES[".safetensors"] == "application/octet-stream"
+
+
+@pytest.fixture
+def progress_channel():
+    context = zmq.Context()
+    endpoint = f"inproc://progress-{uuid.uuid4().hex}"
+    pull = context.socket(zmq.PULL)
+    pull.bind(endpoint)
+    yield ProgressReporter(context, endpoint), pull
+    context.destroy(linger=0)
+
+
+def _received(pull):
+    messages = []
+    while pull.poll(200):
+        messages.append(pull.recv_json())
+    return messages
+
+
+def test_progress_bar_reports_once_per_percent(progress_channel):
+    reporter, pull = progress_channel
+    with ReportingTqdm(
+        total=1000, disable=True, reporter=reporter, request_ids=["job"]
+    ) as bar:
+        for _ in range(1000):
+            bar.update()
+
+    assert [m[1] for m in _received(pull)] == list(range(10, 1001, 10))
+
+
+def test_visible_progress_bar_counts_each_step_once(progress_channel):
+    reporter, pull = progress_channel
+    # mininterval=0 makes tqdm call update() from its own __iter__ every step
+    bar = ReportingTqdm(
+        enumerate("wxyz"), total=4, mininterval=0, reporter=reporter, request_ids=["a"]
+    )
+
+    sent = []
+    for i, _ in bar:
+        sent.append([m[1] for m in _received(pull)])
+        if i == 1:
+            break
+    bar.close()
+
+    assert sent == [[], [1]]
+
+
+@pytest.mark.parametrize("peer", ["no-peer", "never-reads"])
+def test_progress_reporter_never_blocks(peer):
+    context = zmq.Context()
+    endpoint = f"inproc://progress-{uuid.uuid4().hex}"
+    pull = context.socket(zmq.PULL)
+    pull.setsockopt(zmq.RCVHWM, 10)
+    if peer == "never-reads":
+        pull.bind(endpoint)
+    reporter = ProgressReporter(context, endpoint)
+
+    def send_all():
+        for k in range(50_000):
+            reporter.step(request_ids=["job"], completed=k, total=50_000)
+
+    sender = threading.Thread(target=send_all, daemon=True)
+    try:
+        sender.start()
+        sender.join(timeout=10)
+        assert not sender.is_alive()
+    finally:
+        context.destroy(linger=0)
+
+
+@pytest.mark.parametrize("is_warmup", [False, True], ids=["request", "warmup"])
+def test_progress_bar_reports_only_real_requests(monkeypatch, is_warmup):
+    monkeypatch.setattr(stage_base, "get_progress_reporter", lambda: object())
+    batch = Req(
+        sampling_params=SamplingParams(prompt="p", seed=1, request_id="job"),
+        is_warmup=is_warmup,
+    )
+
+    bar = stage_base.PipelineStage.progress_bar(None, total=3, batch=batch)
+
+    assert type(bar) is (tqdm if is_warmup else ReportingTqdm)
+
+
+def test_progress_tracker_averages_outputs():
+    tracker = video_progress.VideoProgressTracker()
+    tracker.register("job", num_outputs=2)
+
+    assert tracker.update("job:0", completed=10, total=10) == ("job", 50)
+    assert tracker.update("job:1", completed=5, total=10) == ("job", 75)
+    assert tracker.update("job:1", completed=3, total=10) == ("job", 75)
+    assert tracker.update("job", completed=10, total=10) == ("job", 100)
+    assert tracker.update("job:2", completed=1, total=2) is None
+    assert tracker.update("other", completed=1, total=2) is None
+    tracker.unregister("job")
+    assert tracker.update("job:0", completed=1, total=2) is None
+
+
+def test_apply_progress_only_moves_running_jobs(monkeypatch):
+    store = AsyncDictStore()
+    monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
+
+    async def run_test():
+        await store.upsert("job", {"status": "queued", "progress": 0})
+        await video_progress.apply_progress("job", progress=30)
+        await video_progress.apply_progress("job", progress=20)
+        assert await store.get("job") == {"status": "in_progress", "progress": 30}
+        await video_progress.apply_progress("job", progress=100)
+        assert (await store.get("job"))["progress"] == 99
+
+        await store.upsert("done", {"status": "completed", "progress": 100})
+        await video_progress.apply_progress("done", progress=40)
+        assert await store.get("done") == {"status": "completed", "progress": 100}
+        await video_progress.apply_progress("deleted", progress=40)
+
+    asyncio.run(run_test())
+
+
+def test_progress_listener_updates_store(monkeypatch):
+    store = AsyncDictStore()
+    tracker = video_progress.VideoProgressTracker()
+    monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
+    # macOS limits an ipc path to 103 bytes, which pytest's tmp_path exceeds
+    endpoint = f"ipc:///tmp/sglang-progress-test-{uuid.uuid4().hex[:8]}"
+
+    async def run_test():
+        await store.upsert("job", {"status": "queued", "progress": 0})
+        tracker.register("job", num_outputs=1)
+        listener = asyncio.create_task(video_progress.run_progress_listener(endpoint))
+        context = zmq.asyncio.Context()
+        push = context.socket(zmq.PUSH)
+        push.connect(endpoint)
+        try:
+            await push.send(b"not json")
+            await push.send_json(["job", 5, 10])
+            for _ in range(200):
+                if (await store.get("job"))["progress"] == 50:
+                    break
+                await asyncio.sleep(0.01)
+            assert await store.get("job") == {"status": "in_progress", "progress": 50}
+            assert not listener.done()
+        finally:
+            context.destroy(linger=0)
+            listener.cancel()
+            with suppress(asyncio.CancelledError):
+                await listener
+
+    asyncio.run(run_test())
+    assert not os.path.exists(endpoint.removeprefix("ipc://"))

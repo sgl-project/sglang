@@ -128,6 +128,9 @@ async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
         shutdown_video_jobs,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+        run_progress_listener,
+    )
     from sglang.multimodal_gen.runtime.scheduler_client import (
         async_scheduler_client,
         run_zeromq_broker,
@@ -142,6 +145,12 @@ async def lifespan(app: FastAPI):
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    # 3. Receive per-step progress of video jobs from the replica drivers
+    progress_task = None
+    if server_args.progress_endpoint is not None:
+        progress_task = asyncio.create_task(
+            run_progress_listener(server_args.progress_endpoint)
+        )
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
@@ -171,6 +180,10 @@ async def lifespan(app: FastAPI):
         broker_task.cancel()
         with suppress(asyncio.CancelledError):
             await broker_task
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
         async_scheduler_client.close()
 
 

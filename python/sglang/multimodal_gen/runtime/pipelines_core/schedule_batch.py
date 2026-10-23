@@ -212,6 +212,9 @@ class Req:
 
     is_warmup: bool = False
 
+    # request ids merged into this dynamic batch
+    merged_request_ids: list[str] | None = None
+
     # STA parameters
     STA_param: list | None = None
     is_cfg_negative: bool = False
@@ -347,6 +350,11 @@ class Req:
         if width is None or height is None:
             return None
         return f"{int(width)}x{int(height)}"
+
+    def client_request_ids(self) -> list[str]:
+        if self.merged_request_ids:
+            return self.merged_request_ids
+        return [self.request_id] if self.request_id else []
 
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True

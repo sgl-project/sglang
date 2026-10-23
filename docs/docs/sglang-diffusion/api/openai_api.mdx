@@ -362,6 +362,29 @@ curl -sS -X GET "http://localhost:30010/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890"
 ```
 
+**Retrieve a video**
+
+**Endpoint:** `GET /v1/videos/&#123;video_id&#125;`
+
+A job is `queued` until the scheduler starts it, then `in_progress`, then
+`completed` or `failed`. `progress` follows the denoising steps (at most 99
+until the job is `completed`). A pipeline with a second denoising pass, such as
+two-stage refinement, stays at 99 during that pass.
+
+**Python Example:**
+
+```python Python
+video = client.videos.retrieve(video_id)
+print(video.status, video.progress)
+```
+
+**Curl Example:**
+
+```bash curl
+curl -sS -X GET "http://localhost:30010/v1/videos/<VIDEO_ID>" \
+  -H "Authorization: Bearer sk-proj-1234567890"
+```
+
 **Download video content**
 
 **Endpoint:** `GET /v1/videos/&#123;video_id&#125;/content`
