@@ -61,6 +61,9 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
         translate_loc_from_full_to_swa=lambda idx: full_to_swa[idx.to(torch.int64)],
         unified_swa_pages=0,
         request_window=None,
+        # paged SWA: no DSpark draft ring, no valid-from floor
+        swa_req_ring_size=None,
+        swa_valid_from=None,
     )
     backend.index_topk = 512
     backend.present_ratios = tuple(sorted(low_ratios))
