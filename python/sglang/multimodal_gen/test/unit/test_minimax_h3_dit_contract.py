@@ -505,6 +505,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     attention.softmax_scale = 128**-0.5
     attention.prefix = "test.attn"
     attention._cube_sparse_capable = False
+    attention._quant_config = None
 
     with patch(
         "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
