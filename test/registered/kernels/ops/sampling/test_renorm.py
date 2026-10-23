@@ -21,7 +21,9 @@ if is_hip():
     )
 else:
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])

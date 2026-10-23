@@ -5,6 +5,8 @@ python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import HumanEvalMixin, MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
@@ -16,6 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEvalAccuracyLarge(CustomTestCase, MMLUMixin, HumanEvalMixin, MGSMEnMixin):
     mmlu_score_threshold = 0.70
     humaneval_score_threshold = 0.64

@@ -1,6 +1,8 @@
 import os
 import unittest
 
+import torch
+
 from sglang.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -17,6 +19,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNpuHierarchicalCacheMutuallyExclusive(CustomTestCase):
     """Testcase: The test parameter disable-radix-cache and enable-hierarchical-cache
                 are mutually exclusive and cannot be used simultaneously.

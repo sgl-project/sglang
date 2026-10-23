@@ -25,8 +25,7 @@ register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
 
 
 PAGE_BYTES = 16
-
-
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
 
@@ -63,6 +62,7 @@ class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
         return server_args, env_vars
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHf3fsBackendLayerFirstLayout(
     HiCacheStorage3FSBackendBaseMixin, CustomTestCase
 ):
@@ -78,6 +78,7 @@ class TestHf3fsBackendLayerFirstLayout(
         return server_args, env_vars
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase):
     """Accuracy tests for HiCache-Hf3fs backend"""
 
