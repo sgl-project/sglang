@@ -136,7 +136,7 @@ struct MultiCastImpl {
 
 #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)
 
-template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
+template <typename T, uint32_t kWorldSize, bool kUsePDL>
 ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
@@ -224,25 +224,26 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
   using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
   const auto r = params.rank;
   const auto num_vecs = params.num_vecs;
-  const auto chunk_vecs = (num_vecs + kWorldSize - 1) / kWorldSize;
-  const auto chunk_len = [&](uint32_t c) { return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs)); };
+  const auto chunk_vecs = div_ceil(num_vecs, kWorldSize);
+  const auto get_chunk_len = [&](uint32_t c) {  //
+    return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs));
+  };
   const auto num_threads = blockDim.x * gridDim.x;
   const auto num_warps = num_threads / kWarpThreads;
   const auto warp_in_block = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
   const auto global_tid = global_warp_id * kWarpThreads + lane_id;
-  PDLWaitPrimary<kUsePDL>();
-  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 
-  // Each warp serves one peer, starting at r + 1 so every peer's ingress is
-  // busy from the first wave and the slot pointer stays warp-uniform.
-  auto peer = r + 1 + global_warp_id % kFan;
-  if (peer >= kWorldSize) peer -= kWorldSize;
+  // peer will cover 0..kWorldSize - 1, except for local rank `r`
+  const auto peer = (r + 1 + global_warp_id % kFan) % kWorldSize;
   const auto group_warps = num_warps / kFan + (global_warp_id % kFan < num_warps % kFan ? 1 : 0);
   const auto group_tid = (global_warp_id / kFan) * kWarpThreads + lane_id;
   const auto group_stride = group_warps * kWarpThreads;
-  const auto peer_len = chunk_len(peer);
+  const auto peer_len = get_chunk_len(peer);
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 
   // reduce-scatter: my partial of the peer's chunk to its owner
   {
@@ -265,17 +266,12 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
   }
 
   // reduce my chunk, keep it and fan it out
-  const auto my_len = chunk_len(r);
+  const auto my_len = get_chunk_len(r);
   for (auto j = global_tid; j < my_len; j += num_threads) {
     const auto vid = r * chunk_vecs + j;
     vec_t vec[kWorldSize];
-#pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      if (i == r) {
-        vec[i].load(params.input, vid);
-        Lamport::clear_pos_zero(vec[i].data());
-      }
-    }
+    vec_t local_vec;
+    local_vec.load(params.input, vid);
     do {
       bool has_zero = false;
 #pragma unroll
@@ -284,10 +280,14 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
       }
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        if (i != r) has_zero |= Lamport::has_pos_zero(vec[i].data());
+        has_zero |= ((i != r) & Lamport::has_pos_zero(vec[i].data()));
       }
       if (!has_zero) break;
     } while (true);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i == r) vec[i] = local_vec;
+    }
     auto out_vec = reduce_vec(vec);
     // remap before the local store too, so every rank holds identical bits
     Lamport::clear_pos_zero(out_vec.data());
@@ -451,13 +451,12 @@ struct AllReduceKernel {
           .rank = push.rank,
           .ws = push.get_workspace<kWorldSize>(two_shot ? int64_t{2} * chunk_vecs * 16 : nbytes),
       };
-      using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
       const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
-                                   : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
+                                   : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
       if (two_shot) {
-        // Every peer needs a warp, including when callers use a small grid.
+        // at least `kWorldSize - 1` warps in all, 1 for each peer
         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
       }
       LaunchKernel(push.num_blocks, block_size, stream)  //

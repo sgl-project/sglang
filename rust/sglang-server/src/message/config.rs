@@ -13,15 +13,16 @@
 //! pyo3 enforces it at construction: every field is a required, typed
 //! constructor argument, so a drifted caller fails at boot rather than running
 //! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
-//! each struct — plus the one hand-written extraction,
-//! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
+//! each struct — plus the hand-written extractions,
+//! [`PreferredSamplingParams`] and [`LaunchServerInfo`] — are the only
+//! Python-facing code in this file;
 //! the rest is pure Rust.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -105,6 +106,14 @@ pub struct ServerArgs {
     /// `"default"` on the Python side, so it is present in every blob; `None`
     /// only when the blob omits the key.
     pub weight_version: Option<String>,
+    /// HiCache storage backend configured at startup.
+    pub hicache_storage_backend: Option<String>,
+    /// Backend-specific configuration as a JSON string.
+    pub hicache_storage_backend_extra_config: Option<String>,
+    /// Policy for prefetching cached entries from HiCache storage.
+    pub hicache_storage_prefetch_policy: Option<String>,
+    /// Write policy for the hierarchical cache.
+    pub hicache_write_policy: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
@@ -155,8 +164,18 @@ pub struct ServerArgs {
     /// Launch-time sampling defaults merged beneath per-request values and
     /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
-    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
-    pub limit_mm_data_per_request: BTreeMap<String, usize>,
+    /// What a `/generate` request that sends no `max_new_tokens` (and gets
+    /// none from `preferred_sampling_params`) asks for: Python's
+    /// `SamplingParams` default unless the launcher overrides it. `None` is
+    /// no limit, which the scheduler clamps to the context window.
+    pub default_max_new_tokens: Option<i64>,
+    /// Native-generation launch policy normally applied by Python ingress.
+    pub lora_ids: BTreeMap<String, String>,
+    pub enable_strict_thinking: bool,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`, in
+    /// configured order: Python checks them in that order and reports the first
+    /// one exceeded. Empty means no per-modality limit.
+    pub limit_mm_data_per_request: Vec<(String, usize)>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -169,10 +188,19 @@ pub struct ServerArgs {
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
     pub num_reserved_tokens: u64,
+    /// `/v1/tokenize`'s `max_model_len`: the Python tokenizer's
+    /// `model_max_length` (`-1` when it has none), or the context length when
+    /// that is not a 64-bit integer.
+    pub tokenizer_model_max_length: i64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Resolved deployment metadata used by out-of-process orchestrators.
+    pub deployment_info: DeploymentInfo,
+    /// Python's `/server_info` fields that are fixed at launch, which
+    /// `/server_info` reports beneath its runtime fields.
+    pub launch_server_info: LaunchServerInfo,
     /// The scheduler's shared-memory load snapshot file, its DP rank count and
     /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
     /// go over ZMQ instead), plus the accelerator name and per-rank count that
@@ -196,6 +224,10 @@ impl ServerArgs {
         revision,
         load_format,
         weight_version,
+        hicache_storage_backend,
+        hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy,
+        hicache_write_policy,
         host,
         port,
         grpc_port,
@@ -216,12 +248,18 @@ impl ServerArgs {
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        default_max_new_tokens,
+        lora_ids,
+        enable_strict_thinking,
         limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
+        tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        deployment_info,
+        launch_server_info,
         load_snapshot_path,
         load_snapshot_dp_size,
         load_snapshot_dp_rank,
@@ -238,6 +276,10 @@ impl ServerArgs {
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
+        hicache_storage_backend: Option<String>,
+        hicache_storage_backend_extra_config: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
         host: String,
         port: u16,
         grpc_port: Option<u16>,
@@ -258,12 +300,18 @@ impl ServerArgs {
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
-        limit_mm_data_per_request: BTreeMap<String, usize>,
+        default_max_new_tokens: Option<i64>,
+        lora_ids: BTreeMap<String, String>,
+        enable_strict_thinking: bool,
+        limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
+        tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        deployment_info: DeploymentInfo,
+        launch_server_info: LaunchServerInfo,
         load_snapshot_path: Option<String>,
         load_snapshot_dp_size: usize,
         load_snapshot_dp_rank: usize,
@@ -278,6 +326,10 @@ impl ServerArgs {
             revision,
             load_format,
             weight_version,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
             host,
             port,
             grpc_port,
@@ -298,12 +350,18 @@ impl ServerArgs {
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            default_max_new_tokens,
+            lora_ids,
+            enable_strict_thinking,
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
+            tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            deployment_info,
+            launch_server_info,
             load_snapshot_path,
             load_snapshot_dp_size,
             load_snapshot_dp_rank,
@@ -326,6 +384,10 @@ impl Default for ServerArgs {
             revision: None,
             load_format: None,
             weight_version: None,
+            hicache_storage_backend: None,
+            hicache_storage_backend_extra_config: None,
+            hicache_storage_prefetch_policy: None,
+            hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
@@ -346,12 +408,18 @@ impl Default for ServerArgs {
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
-            limit_mm_data_per_request: BTreeMap::new(),
+            default_max_new_tokens: Some(128),
+            lora_ids: BTreeMap::new(),
+            enable_strict_thinking: false,
+            limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
+            tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            deployment_info: DeploymentInfo::default(),
+            launch_server_info: LaunchServerInfo::default(),
             load_snapshot_path: None,
             load_snapshot_dp_size: 0,
             load_snapshot_dp_rank: 0,
@@ -359,6 +427,51 @@ impl Default for ServerArgs {
             num_accelerators: 0,
             metrics: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeploymentInfo {
+    pub disaggregation_bootstrap_port: Option<u16>,
+    pub node_rank: u32,
+    pub nnodes: u32,
+    pub dp_size: u32,
+    pub dp_rank: Option<u32>,
+    pub dist_init_addr: Option<String>,
+    pub base_gpu_id: u32,
+    pub page_size: Option<u32>,
+    pub dcp_size: u32,
+    pub max_running_requests: Option<u64>,
+    pub max_prefill_tokens: u64,
+    pub enable_dp_attention: bool,
+    pub speculative_algorithm: Option<String>,
+    pub enable_hierarchical_cache: bool,
+    pub hicache_ratio: Option<f64>,
+    pub hicache_size: u64,
+    pub hicache_write_policy: Option<String>,
+    pub hicache_host_total_tokens: Option<u64>,
+    pub kv_event_sources: Vec<KvEventSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KvEventSource {
+    pub dp_rank: u32,
+    pub endpoint: String,
+    pub topic: String,
+    pub block_size: u32,
+}
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "deployment_info is not valid JSON: {e}"
+            ))
+        })
     }
 }
 
@@ -397,6 +510,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
                 "preferred_sampling_params is not valid JSON: {e}"
             ))
         })
+    }
+}
+
+/// Python's launch-time `/server_info` fields (`rust_server/config.py`'s
+/// `_launch_server_info`: the resolved `server_args`, `launch_command`, the
+/// scheduler's init info, `kv_events`), carried verbatim as one JSON object.
+/// `Arc` because every `/server_info` response starts from a copy.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchServerInfo(pub Arc<serde_json::Map<String, serde_json::Value>>);
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        match serde_json::from_str(&text) {
+            Ok(serde_json::Value::Object(fields)) => Ok(Self(Arc::new(fields))),
+            Ok(_) => Err(pyo3::exceptions::PyValueError::new_err(
+                "launch_server_info must be a JSON object",
+            )),
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "launch_server_info is not valid JSON: {e}"
+            ))),
+        }
     }
 }
 
