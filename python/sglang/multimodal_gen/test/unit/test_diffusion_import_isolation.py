@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import textwrap
 import unittest
 
 from sglang.test.test_utils import CustomTestCase
@@ -60,6 +61,37 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
             0,
             msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
         )
+
+    def test_flux2_imports_without_intel_triton(self):
+        # Importing flux_2 must not need Intel Triton; a subprocess keeps the
+        # blocked import from leaking into this interpreter.
+        script = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+
+            import triton
+            import triton.language  # import triton fully first, as CUDA would
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.startswith("triton.language.extra.intel"):
+                        raise ImportError(name)
+                    return None
+
+            for mod in [m for m in sys.modules if "extra.intel" in m]:
+                del sys.modules[mod]
+            if hasattr(triton.language.extra, "intel"):
+                del triton.language.extra.intel
+            sys.meta_path.insert(0, Blocker())
+
+            import sglang.multimodal_gen.runtime.models.dits.flux_2  # noqa: F401
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
 
 if __name__ == "__main__":

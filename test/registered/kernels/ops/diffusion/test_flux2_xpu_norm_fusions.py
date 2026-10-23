@@ -1,12 +1,5 @@
-"""FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths.
+"""FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths."""
 
-The fusion cases need an Intel XPU; the Intel-Triton import regression runs
-on any device, so the file is also registered on the CPU suite.
-"""
-
-import subprocess
-import sys
-import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -21,10 +14,9 @@ from sglang.kernels.ops.diffusion import (
     xpu_gated_resnorm,
     xpu_layernorm_modulate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 _HIDDEN = 6144
@@ -49,39 +41,6 @@ def _inputs(rows: int, magnitude: float, seed: int, batch: int = 1):
 
 
 _CASES = ((512, 1.0, 0, 1), (17, 30.0, 1, 1), (64, 0.05, 2, 1), (64, 1.0, 3, 2))
-
-
-class TestFlux2ImportWithoutIntelTriton(CustomTestCase):
-    def test_flux2_imports_without_intel_triton(self):
-        # Importing flux_2 must not need Intel Triton; a subprocess keeps the
-        # blocked import from leaking into this interpreter.
-        script = textwrap.dedent(
-            """
-            import importlib.abc
-            import sys
-
-            import triton
-            import triton.language  # import triton fully first, as CUDA would
-
-            class Blocker(importlib.abc.MetaPathFinder):
-                def find_spec(self, name, path=None, target=None):
-                    if name.startswith("triton.language.extra.intel"):
-                        raise ImportError(name)
-                    return None
-
-            for mod in [m for m in sys.modules if "extra.intel" in m]:
-                del sys.modules[mod]
-            if hasattr(triton.language.extra, "intel"):
-                del triton.language.extra.intel
-            sys.meta_path.insert(0, Blocker())
-
-            import sglang.multimodal_gen.runtime.models.dits.flux_2  # noqa: F401
-            """
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True
-        )
-        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
 
 @unittest.skipUnless(_has_xpu(), "requires an Intel XPU")
