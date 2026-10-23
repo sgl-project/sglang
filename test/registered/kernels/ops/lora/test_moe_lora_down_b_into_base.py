@@ -25,11 +25,9 @@ from sglang.test.kits.moe_lora_down_b_kit import (
     cutedsl_cuda_only,
 )
 
+# H100 only: the shipped SM100 plan table selects no fold row (overrides and
+# the default table still can).
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-# Also exercise the Blackwell implementation in per-PR CI.
-# The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
-# its four GPUs are allocation granularity, not multi-GPU coverage.
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 cuda_only = pytest.mark.skipif(
