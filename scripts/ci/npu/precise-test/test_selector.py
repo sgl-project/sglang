@@ -149,6 +149,26 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
     return deleted_test_files
 
 
+def _get_all_changed_paths_from_diff(diff_file: str) -> list[str]:
+    """
+    Extract every changed path (added/modified/deleted/renamed, product code or
+    not) from a PR diff. Consumed by bucket_recommended_tests.py to check that
+    an empty recommendation is trustworthy (all changes under python/sglang/).
+    """
+    paths: list[str] = []
+    try:
+        with open(diff_file, encoding="utf-8-sig") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"  Warning: Failed to read diff file for changed-path listing: {e}")
+        return paths
+    for match in re.finditer(r"^diff --git a/(.+) b/(.+)$", content, re.MULTILINE):
+        for p in (match.group(1), match.group(2)):
+            if p and p != "/dev/null" and p not in paths:
+                paths.append(p)
+    return paths
+
+
 class CoverageSelector:
     """Coverage-based test selector"""
 
@@ -1942,6 +1962,16 @@ def main():
         for test_name in test_names:
             f.write(test_name + "\n")
     print(f"\nResults saved to: {output_file}")
+
+    # Changed-path list for bucket_recommended_tests.py's empty-recommendation
+    # confinement check (PR mode only; empty/missing when the diff is absent).
+    if args.github_pr and diff_file:
+        changed_paths_file = BASE_DIR / "pr_changed_files.txt"
+        all_changed_paths = _get_all_changed_paths_from_diff(diff_file)
+        with open(changed_paths_file, "w", encoding="utf-8") as f:
+            for path in all_changed_paths:
+                f.write(path + "\n")
+        print(f"Changed paths saved to: {changed_paths_file}")
 
 
 if __name__ == "__main__":

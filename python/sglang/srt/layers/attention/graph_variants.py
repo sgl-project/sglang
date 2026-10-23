@@ -69,6 +69,10 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
+DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
+# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants (requests
+# up to the candidate span); longer ones keep the in-graph metadata upgrade.
+DSV41_EARLY_VERIFY_VARIANTS = frozenset({DSV41_CANDIDATE_UNFILTERED})
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,11 @@ class Dsv41CandidateGraphVariants:
                 "candidate_max_seq_len_upper_bound",
                 None,
             )
+        return self.select_for_max_seq_len(max_seq_len)
+
+    def select_for_max_seq_len(self, max_seq_len: Optional[int]) -> str:
+        """The variant for a batch whose longest request (before this step's verify
+        tokens) is ``max_seq_len``; None, when unknown, takes the fallback."""
         if max_seq_len is not None:
             max_seq_len += self.verify_extra_tokens
             for variant, limit in self.graph_limits:
@@ -139,7 +148,7 @@ def create_dsv41_candidate_graph_variants(
         variants.append(("candidate_all", topk * min(ratios)))
         if ratios == {1, 2}:
             variants.append(("candidate_c2_all", topk * 2))
-    variants.append(("candidate_unfiltered", span))
+    variants.append((DSV41_CANDIDATE_UNFILTERED, span))
     graph_limits = []
     for variant, limit in variants:
         graph_limits.append((variant, min(limit, span)))

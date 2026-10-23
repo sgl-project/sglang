@@ -2,9 +2,19 @@ name: Release Docker Images Nightly gfx1151 (AMD)
 
 on:
   workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image to Docker Hub (uncheck to only check that the branch builds)"
+        required: false
+        type: boolean
+        default: true
   schedule:
     # Stagger this build from the CDNA ROCm nightlies at 12:00 UTC.
     - cron: "0 14 * * *"
+
+# Scheduled runs always push; a manual dispatch can turn the push off.
+env:
+  PUSH_IMAGES: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,5 +69,9 @@ jobs:
             --no-cache \
             --progress=plain \
             -t "rocm/sgl-dev:${IMAGE_TAG}"
-          docker push "rocm/sgl-dev:${IMAGE_TAG}"
-          echo "Published rocm/sgl-dev:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${PUSH_IMAGES}" = "true" ]; then
+            docker push "rocm/sgl-dev:${IMAGE_TAG}"
+            echo "Published rocm/sgl-dev:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Build-only run: not pushing rocm/sgl-dev:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          fi
