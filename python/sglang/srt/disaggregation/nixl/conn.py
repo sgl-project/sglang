@@ -3491,6 +3491,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> Callable[[bool], List[bytes]]:
         def encode_message(is_dummy: bool) -> List[bytes]:
             packed_state_indices = (

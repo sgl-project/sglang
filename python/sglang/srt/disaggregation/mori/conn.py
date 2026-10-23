@@ -2100,6 +2100,7 @@ class MoriKVManager(CommonKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> Callable[[bool], List[bytes]]:
         kv_indices_bytes = (
             np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""

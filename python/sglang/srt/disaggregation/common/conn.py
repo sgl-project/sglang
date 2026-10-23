@@ -621,7 +621,7 @@ class CommonKVManager(BaseKVManager):
         aux_index: Optional[int],
         state_indices: Optional[List],
         decode_prefix_len: Optional[int],
-        **backend_kwargs,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> Callable[[bool], List[bytes]]:
         raise NotImplementedError
 
@@ -2800,7 +2800,7 @@ class CommonKVReceiver(BaseKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
-        **backend_kwargs,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2828,7 +2828,7 @@ class CommonKVReceiver(BaseKVReceiver):
             aux_index=aux_index,
             state_indices=state_indices,
             decode_prefix_len=decode_prefix_len,
-            **backend_kwargs,
+            device_kv_indices=device_kv_indices,
         )
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
