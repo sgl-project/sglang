@@ -548,5 +548,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_megamoe_for_layernorm_sp",
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
+    "disable_normalize_embedding",
+    "log_schedule_decisions",
 )
 # fmt: on
