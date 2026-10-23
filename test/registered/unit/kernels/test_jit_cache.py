@@ -345,6 +345,21 @@ def test_build_directory_entries_are_dropped(tmp_path):
     assert [entry.relpath for entry in entries] == [str(outside)]
 
 
+def test_build_directory_entries_are_dropped_behind_a_symlink(tmp_path):
+    """The staging dir's own files are dropped even behind a symlinked cache root.
+    Recorded, they vanish when the leaf is published, so the leaf never hits."""
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    (tmp_path / "cache").symlink_to(volume)
+    build_dir = tmp_path / "cache" / "build"
+    _write(build_dir / "cuda.cu", "// generated")
+    outside = _write(tmp_path / "real.h", "// real")
+    entries = cache._to_entries(
+        dependencies=[pathlib.Path("cuda.cu"), outside], build_dir=build_dir
+    )
+    assert [entry.relpath for entry in entries] == [str(outside)]
+
+
 def test_publish_loses_the_race_gracefully(tmp_path):
     """Two processes building identical content: the loser adopts the winner's leaf."""
     winner = tmp_path / "leaf"
