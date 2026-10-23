@@ -2772,12 +2772,6 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla_dcp_verify = (
             self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify()
         )
-        if dense_mla_dcp_verify and q.shape[0] == 0:
-            # Hybrid DP idle batches may be relabeled as zero-token target verify.
-            return (
-                q.new_zeros((0, layer.tp_q_head_num * self.kv_lora_rank)),
-                q.new_zeros((0, layer.tp_q_head_num), dtype=torch.float32),
-            )
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
