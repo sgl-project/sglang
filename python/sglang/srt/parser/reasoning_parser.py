@@ -118,6 +118,12 @@ class BaseReasoningFormatDetector:
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
+    def get_self_opened_think_start_token_ids(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[List[int]]:
+        """Start tag the model emits itself when it chooses to think unforced; None if it never does."""
+        return None
+
     def get_answer_frame(self) -> Optional[AnswerFrame]:
         return None
 
@@ -1214,6 +1220,13 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
         self._lead_buffer = ""
         self._checked_leading_close = False
         self._force_nonempty_content = force_nonempty_content
+
+    def get_self_opened_think_start_token_ids(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[List[int]]:
+        # Without thinking_mode=enabled the template does not prefill <mm:think>,
+        # so an adaptive reply that thinks opens with it.
+        return tokenizer.encode(self.think_start_token, add_special_tokens=False)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         if not self._in_reasoning and text.lstrip().startswith(self.think_end_token):
