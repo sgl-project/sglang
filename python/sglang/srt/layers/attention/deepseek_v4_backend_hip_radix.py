@@ -57,10 +57,6 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    Fp8GridActivation,
-    Mxfp8Activation,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -68,6 +64,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
+    _first_rows,
     _tail_rows,
     late_layer_num_tokens,
     late_layer_whole_extend,
@@ -158,18 +155,6 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
-
-
-def _first_rows(act, n: int):
-    """The first n rows of a q_lora operand: a tensor, or the gfx950 fp8-grid form the
-    indexer's wq_b takes (row-major, scales included), which refuses plain slicing."""
-    if isinstance(act, torch.Tensor):
-        return act[:n]
-    if isinstance(act, Fp8GridActivation):
-        return Fp8GridActivation(act.x[:n])
-    if isinstance(act, Mxfp8Activation):
-        return Mxfp8Activation(act.q[:n], act.scale[:n])
-    raise TypeError(f"cannot take rows of {type(act).__name__}")
 
 
 # OPUS prefill applies from this many query rows; below it the decode kernel splits KV

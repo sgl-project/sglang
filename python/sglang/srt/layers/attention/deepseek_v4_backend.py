@@ -961,6 +961,25 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _first_rows(act, n: int):
+    """The first n rows of a q_lora operand: a tensor, or the gfx950 fp8-grid or MXFP8
+    form the indexer's wq_b takes (row-major, scales included), which refuses plain
+    slicing."""
+    if isinstance(act, torch.Tensor):
+        return act[:n]
+    # Only gfx950 hands these wrappers over.
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+    )
+
+    if isinstance(act, Fp8GridActivation):
+        return Fp8GridActivation(act.x[:n])
+    if isinstance(act, Mxfp8Activation):
+        return Mxfp8Activation(act.q[:n], act.scale[:n])
+    raise TypeError(f"cannot take rows of {type(act).__name__}")
+
+
 def _late_layer_whole_extend(
     *,
     extend_lens: List[int],
@@ -3382,7 +3401,7 @@ class DeepseekV4AttnBackend(
             n = min(hoisted_pos.shape[0], positions.shape[0])
             x, positions = x[:n], positions[:n]
             if q_lora is not None:
-                q_lora = q_lora[:n]
+                q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
