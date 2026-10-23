@@ -26,7 +26,66 @@ from sglang.multimodal_gen.test.test_utils import (
 
 CASE_ID = "nomas_offline_two_events"
 MODEL_ID = "tencent/Hy-Nomas"
-REQUEST_PATH = Path(__file__).parent / "fixtures/nomas_two_events.json"
+FIRST_EVENT = json.dumps(
+    {
+        "Style": "Cinematic fantasy",
+        "perspective_view": "Third-person view",
+        "subject_list": [
+            {
+                "subject_id": "fox",
+                "display_name": "a small orange fox",
+                "subject_attribute": "Orange fur, white chest, and a fluffy tail.",
+            }
+        ],
+        "segments": [
+            {
+                "visual_description_long": "A small orange fox stands on a stone path"
+                " in a luminous forest. Blue fireflies drift between the trees.",
+                "contained_actions": [
+                    {
+                        "start_time": "00:00.000",
+                        "end_time": "00:05.000",
+                        "action_description": "The fox walks slowly along the path.",
+                    }
+                ],
+            }
+        ],
+    }
+)
+SECOND_EVENT = json.dumps(
+    {
+        "segments": [
+            {
+                "description_change": "Glowing blue flowers open beside the path"
+                " as the fox continues forward.",
+                "contained_actions": [
+                    {
+                        "start_time": "00:00.000",
+                        "end_time": "00:05.000",
+                        "action_description": "The fox passes the flowers and looks around.",
+                    }
+                ],
+            }
+        ]
+    }
+)
+# Two 120-frame events at 352x640; changing any field invalidates the goldens.
+REQUEST = {
+    "prompt": FIRST_EVENT,
+    "prompt_format": "json",
+    "max_sequence_length": 1280,
+    "height": 352,
+    "width": 640,
+    "num_frames": 240,
+    "fps": 24,
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "seed": 42,
+    "segments": [
+        {"frames": 120, "caption": FIRST_EVENT},
+        {"frames": 120, "caption": SECOND_EVENT},
+    ],
+}
 
 
 @pytest.mark.skipif(
@@ -34,7 +93,6 @@ REQUEST_PATH = Path(__file__).parent / "fixtures/nomas_two_events.json"
     reason="Nomas pretrained regression requires NVIDIA CUDA",
 )
 def test_nomas_offline_two_events(tmp_path):
-    request = json.loads(REQUEST_PATH.read_text())
     with DiffGenerator.from_pretrained(
         model_path=MODEL_ID,
         num_gpus=1,
@@ -43,7 +101,7 @@ def test_nomas_offline_two_events(tmp_path):
     ) as generator:
         result = generator.generate(
             {
-                **request,
+                **REQUEST,
                 "save_output": True,
                 "output_path": str(tmp_path),
                 "output_file_name": CASE_ID + ".mp4",

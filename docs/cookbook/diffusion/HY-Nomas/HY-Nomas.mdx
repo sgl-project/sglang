@@ -64,25 +64,61 @@ The overlay does not include Nomas-PE, LoRA adapters, or FP8/INT8 variants.
 
 ## 4. Offline and HTTP generation
 
-A request lists its events in `segments`. The checked-in fixture is a two-event request: 240 frames at 352×640, eight steps, seed 42. Send it to the HTTP video API:
+A request lists its events in `segments`. Each caption is a JSON string in the official event schema; later events usually describe only what changes. This two-event request makes 240 frames at 352×640 and saves it as `request.json`:
+
+```python Python
+import json
+
+first = {
+    "Style": "Cinematic fantasy",
+    "perspective_view": "Third-person view",
+    "subject_list": [{"subject_id": "fox", "display_name": "a small orange fox",
+                      "subject_attribute": "Orange fur, white chest, and a fluffy tail."}],
+    "segments": [{
+        "visual_description_long": "A small orange fox stands on a stone path in a luminous forest.",
+        "contained_actions": [{"start_time": "00:00.000", "end_time": "00:05.000",
+                               "action_description": "The fox walks slowly along the path."}],
+    }],
+}
+second = {
+    "segments": [{
+        "description_change": "Glowing blue flowers open beside the path.",
+        "contained_actions": [{"start_time": "00:00.000", "end_time": "00:05.000",
+                               "action_description": "The fox passes the flowers and looks around."}],
+    }],
+}
+request = {
+    "prompt": json.dumps(first),
+    "prompt_format": "json",
+    "segments": [
+        {"frames": 120, "caption": json.dumps(first)},
+        {"frames": 120, "caption": json.dumps(second)},
+    ],
+    "num_frames": 240,
+    "height": 352,
+    "width": 640,
+    "fps": 24,
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "seed": 42,
+}
+with open("request.json", "w") as f:
+    json.dump(request, f)
+```
+
+Send it to the HTTP video API, then poll `GET /v1/videos/{id}` and download from `GET /v1/videos/{id}/content`:
 
 ```bash Command
 curl -sS http://127.0.0.1:30000/v1/videos \
   -H 'Content-Type: application/json' \
-  --data-binary @python/sglang/multimodal_gen/test/single_test_file/fixtures/nomas_two_events.json
+  --data-binary @request.json
 ```
 
-Poll `GET /v1/videos/{id}` and download from `GET /v1/videos/{id}/content`. The same request runs without a server through the Python API:
+The same request runs without a server through the Python API:
 
 ```python Python
-import json
-from pathlib import Path
-
 from sglang.multimodal_gen import DiffGenerator
 
-request = json.loads(Path(
-    "python/sglang/multimodal_gen/test/single_test_file/fixtures/nomas_two_events.json"
-).read_text())
 with DiffGenerator.from_pretrained(model_path="tencent/Hy-Nomas") as generator:
     result = generator.generate({**request, "save_output": True})
 ```

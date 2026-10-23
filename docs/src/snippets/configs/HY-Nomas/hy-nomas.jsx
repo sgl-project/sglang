@@ -149,7 +149,7 @@ export const config = (() => {
         : [
             "curl -sS http://{{CURL_HOST}}:{{CURL_PORT}}/v1/videos",
             "-H 'Content-Type: application/json'",
-            "--data-binary @python/sglang/multimodal_gen/test/single_test_file/fixtures/nomas_two_events.json",
+            "--data-binary @request.json",
           ].join(" \\\n  "),
     runModes: ["python"],
     showPlaygroundLink: false,
