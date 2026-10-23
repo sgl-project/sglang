@@ -26,6 +26,7 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
@@ -3549,7 +3550,17 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            for req in self.waiting_queue:
+            waiting_reqs = self.waiting_queue
+            if self.dllm_config is not None:
+                waiting_reqs = chain(
+                    waiting_reqs,
+                    (
+                        req
+                        for req in self.dllm_manager.waiting_queue
+                        if req.time_stats.forward_entry_time == 0.0
+                    ),
+                )
+            for req in waiting_reqs:
                 entry_time = req.time_stats.wait_queue_entry_time
                 if 0 < entry_time < deadline:
                     aborts.append(
@@ -5613,7 +5624,7 @@ class Scheduler(
             ):
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
