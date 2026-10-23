@@ -40,6 +40,7 @@ class EngineScoreMixin:
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -84,6 +85,9 @@ class EngineScoreMixin:
                 softmax. Requires apply_softmax=True when different from 1.
             return_token_logprobs: Include uncalibrated full-vocabulary logprobs for
                 each item's candidates. Only supported for CausalLM, not raw logits.
+            stacked_query_item_embed_overrides: Alternative to query_/item_embed_overrides:
+                one already-stacked [N, hidden] tensor per output sequence, used without
+                a restack. See score_request.
 
         Returns:
             ScoreResult with scores (flat ``[num_items x num_labels]`` for pointwise
@@ -102,6 +106,7 @@ class EngineScoreMixin:
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
                 score_extraction_token_id=score_extraction_token_id,
+                stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 temperature=temperature,
@@ -123,6 +128,7 @@ class EngineScoreMixin:
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -135,6 +141,7 @@ class EngineScoreMixin:
             query_embed_overrides=query_embed_overrides,
             item_embed_overrides=item_embed_overrides,
             score_extraction_token_id=score_extraction_token_id,
+            stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
             temperature=temperature,
