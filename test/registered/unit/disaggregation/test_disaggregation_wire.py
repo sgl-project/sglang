@@ -597,6 +597,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        sender.conclude_state = None
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):

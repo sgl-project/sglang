@@ -2373,7 +2373,7 @@ class CommonKVSender(BaseKVSender):
                 == KVPoll.Success,
             )
             self._owns_bootstrap_room = False
-        if getattr(self, "conclude_state", None) is None:
+        if self.conclude_state is None:
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
@@ -2403,9 +2403,7 @@ class CommonKVSender(BaseKVSender):
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         self.conclude_state = KVPoll.Failed
         self.clear()
-        trace_ctx = getattr(self, "trace_ctx", None)
-        if trace_ctx is not None:
-            trace_ctx.trace_req_finish()
+        self.trace_ctx.trace_req_finish()
         raise KVTransferError(
             self.bootstrap_room,
             failure_reason or "Failed due to an unknown reason from another rank",
