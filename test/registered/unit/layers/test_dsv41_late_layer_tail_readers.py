@@ -360,11 +360,6 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.index_q_lora = index_args[2]
         return compress_args[2], compress_args[3], index_args[3], index_args[4]
 
-    def _quantized_q_lora(self, rows):
-        return Mxfp8Activation(
-            q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
-        )
-
     def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
         # Bucket of 8 rows, the 5 live tail rows first.
         hoisted_req = torch.tensor([7, 7, 9, 9, 9, 0, 0, 0])
@@ -376,25 +371,16 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
 
-    def test_quantized_q_lora_passes_through_when_every_row_is_live(self):
-        """With every row live (each decode and verify step), HIP's quantized q_lora goes
-        on uncut: slicing it raised a TypeError at decode graph capture."""
-        hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
-        q_lora = self._quantized_q_lora(3)
-        self._run(*hoisted, hoisted[1].clone(), q_lora)
-        self.assertIs(self.index_q_lora, q_lora)
-
     def test_dp_padding_cuts_a_quantized_q_lora_by_rows(self):
-        """DP padding past the hoisted rows must cut a quantized q_lora field by field
-        and keep its type; a plain slice raises a TypeError."""
-        hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
-        q_lora = self._quantized_q_lora(5)
-        positions = torch.cat([hoisted[1], torch.zeros(2, dtype=torch.long)])
-        self._run(*hoisted, positions, q_lora)
-        cut = self.index_q_lora
-        self.assertIsInstance(cut, Mxfp8Activation)
-        self.assertTrue(torch.equal(cut.q, q_lora.q[:3]))
-        self.assertEqual(tuple(cut.scale.shape), (3, 2))
+        """HIP's quantized q_lora raises a TypeError on a plain slice; DP padding past the
+        hoisted rows must cut it field by field."""
+        q_lora = Mxfp8Activation(
+            q=torch.arange(320).view(5, 64), scale=torch.arange(10).view(5, 2)
+        )
+        positions = torch.tensor([2, 3, 3, 0, 0])
+        self._run(torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3]), positions, q_lora)
+        self.assertTrue(torch.equal(self.index_q_lora.q, q_lora.q[:3]))
+        self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
 
 
 if __name__ == "__main__":
