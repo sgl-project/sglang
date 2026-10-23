@@ -467,10 +467,13 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
+        get_platform().is_sm100
+        or get_platform().is_sm120
+        or is_gfx95_supported()
+        or get_platform().is_xpu
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, gfx95, or XPU GPUs "
             "with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can

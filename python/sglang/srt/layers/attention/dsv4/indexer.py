@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4 import (
-    fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
     topk_transform_paged,
@@ -854,9 +853,14 @@ class C4IndexerBackendMixin:
             weights = weights.squeeze(2)
         if use_fp4_indexer and not use_aiter_fp4:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            if is_xpu():
+                from sgl_kernel import fp4_paged_mqa_logits
+
+                fn = fp4_paged_mqa_logits
+            elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            else:
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif use_aiter_fp4:
             fn = None
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
@@ -1235,7 +1239,44 @@ class C4Indexer(nn.Module):
                 positions,
             )
             return (q_fp4, q_scale), weight
+        if self.use_fp4_indexer and is_xpu():
+            from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
+
+            q_fp4 = torch.empty(
+                (*q.shape[:-1], self.head_dim // 2),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+            q_scale_bytes = torch.empty(
+                (*q.shape[:-1], self.head_dim // 32),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+            weights_out = torch.empty(
+                (*weight.shape, 1), dtype=torch.float32, device=weight.device
+            )
+            # The SYCL op expects the rope cache as real float32 [max_pos, rope_dim],
+            # not the complex64 [max_pos, rope_dim // 2] freqs_cis storage.
+            rope_cache = torch.view_as_real(self.freqs_cis).flatten(-2)
+            fused_q_indexer_rope_hadamard_fp4_quant(
+                q.contiguous(),
+                q_fp4,
+                q_scale_bytes,
+                weight,
+                weights_out,
+                self.weight_scale,
+                rope_cache,
+                positions,
+            )
+            # Callers expect one packed int32 scale per (token, head), matching
+            # the CUDA kernel's q_sf layout, not the raw per-group uint8 bytes.
+            q_scale = q_scale_bytes.view(torch.int32).squeeze(-1)
+            return (q_fp4, q_scale), weights_out
         if self.use_fp4_indexer:
+            from sglang.kernels.ops.attention.dsv4 import (
+                fused_q_indexer_rope_hadamard_fp4_quant,
+            )
+
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
