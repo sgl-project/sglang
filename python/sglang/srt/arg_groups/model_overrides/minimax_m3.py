@@ -58,6 +58,12 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError("M3.1 NVFP4 only supports DSPARK or DFLASH speculation")
         if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
             algorithm = cfg.speculative_algorithm
+            # Only the vision-language wrapper exposes the draft's hidden-state capture.
+            if hf_config.architectures[0] != "MiniMaxM3SparseForConditionalGeneration":
+                raise ValueError(
+                    f"M3.1 NVFP4 {algorithm} requires MiniMaxM3SparseForConditionalGeneration, "
+                    f"got {hf_config.architectures[0]}"
+                )
             if not get_platform().is_blackwell:
                 raise ValueError(f"M3.1 NVFP4 {algorithm} requires Blackwell")
             if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":

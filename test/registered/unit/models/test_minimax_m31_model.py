@@ -34,7 +34,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-NVFP4 = SimpleNamespace(quantization_config={"quant_method": "minimax_m3_nvfp4"})
+ARCH = ["MiniMaxM3SparseForConditionalGeneration"]
+NVFP4 = SimpleNamespace(
+    architectures=ARCH, quantization_config={"quant_method": "minimax_m3_nvfp4"}
+)
 
 
 def draft_config():
@@ -91,7 +94,7 @@ def packed_moe_hf(**quant_overrides):
     }
     # None drops the field, matching checkpoints that do not carry it.
     quant = {k: v for k, v in (quant | quant_overrides).items() if v is not None}
-    return SimpleNamespace(quantization_config=quant)
+    return SimpleNamespace(architectures=ARCH, quantization_config=quant)
 
 
 class TestMiniMaxM31ConfigResolution(CustomTestCase):
@@ -182,6 +185,16 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
             "compact verify": ("compact", resolve(speculative_algorithm="DSPARK")),
             "dspark pp": ("static", resolve(speculative_algorithm="DSPARK", pp_size=2)),
             "eagle": ("static", resolve(speculative_algorithm="EAGLE")),
+            "text-only dspark": (
+                "static",
+                lambda: _minimax_m3_overrides(
+                    server_args(speculative_algorithm="DSPARK"),
+                    SimpleNamespace(
+                        architectures=["MiniMaxM3SparseForCausalLM"],
+                        quantization_config=NVFP4.quantization_config,
+                    ),
+                ),
+            ),
         }
         for name, (verify_mode, call) in cases.items():
             with (

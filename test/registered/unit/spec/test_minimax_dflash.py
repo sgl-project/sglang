@@ -25,7 +25,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-NVFP4 = SimpleNamespace(quantization_config={"quant_method": "minimax_m3_nvfp4"})
+NVFP4 = SimpleNamespace(
+    architectures=["MiniMaxM3SparseForConditionalGeneration"],
+    quantization_config={"quant_method": "minimax_m3_nvfp4"},
+)
 
 
 @pytest.fixture(autouse=True)
