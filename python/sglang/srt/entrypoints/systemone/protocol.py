@@ -99,6 +99,10 @@ class SystemOneRequest(BaseModel):
     questions: Dict[str, SystemOneQuestion] = Field(min_length=1)
     # SGLang extension, for chat templates whose reasoning toggle needs a kwarg.
     chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    # For request id, like /v1/chat/completions. Multi-question requests derive
+    # per-question rids ("<rid>_<i>"), and /abort_request matches by rid
+    # prefix, so aborting with this rid stops the whole request.
+    rid: Optional[str] = None
 
     # /v1/decisions fields, which would change the answers if honored or ignored.
     # Declared only to refuse them by name, and hidden from the schema.

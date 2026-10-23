@@ -399,6 +399,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         adapted_request: Iterator[EncodedQuestion],
         raw_request: Request,
         temperature: float = 1.0,
+        rid: Optional[str] = None,
     ):
         """Encode every question, then score them all in one call."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
@@ -410,6 +411,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
             temperature=temperature,
             return_token_logprobs=True,
             image_data=image_data if any(image_data) else None,
+            rid=rid,
         )
         return prompts, label_token_ids, result
 
