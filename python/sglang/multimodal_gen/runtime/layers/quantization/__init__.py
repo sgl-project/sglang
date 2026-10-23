@@ -5,9 +5,6 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
-    canonical_quantization_method,
-)
 
 QuantizationMethods = Literal[
     "auto-round",
@@ -21,15 +18,12 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "convrot_int8",
-    # deprecated alias of convrot_int8
-    "kitchen_int8",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
-    quantization = canonical_quantization_method(quantization)
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 

@@ -52,6 +52,15 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -257,6 +266,8 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # Host copies of the hash buffers, for windows built on the CPU.
+        self._cpu_hash_params: Optional[tuple[torch.Tensor, ...]] = None
         # typing only
         self.token_map: torch.Tensor
         self.multipliers: torch.Tensor
@@ -453,7 +464,9 @@ class EngramHasher(nn.Module):
         starts: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
-        ``history`` is already the per-request [bs, n - 1] rows of this batch."""
+        ``history`` is already the per-request [bs, n - 1] rows of this batch.
+        EngramRowStager builds the same windows on the host from the requests'
+        fill ids."""
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
         device = input_ids.device
@@ -485,6 +498,15 @@ class EngramHasher(nn.Module):
         blocked = positions.unsqueeze(-1) < shifts
         if num_real < num_tokens:
             blocked[num_real:] = True
+        return self.hash_windows(tokens, blocked)
+
+    def hash_windows(
+        self, tokens: torch.Tensor, blocked: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hash ids [T, n_engram_layers, n_hash_cols] of predecessor windows on the
+        device of ``tokens``: tokens [T, n] holds the s-th predecessor in column s,
+        blocked [T, n] the look-back past the sequence start. Also returns tokens
+        with multimodal pad ids read as the image token."""
         if self.image_token_id is not None:
             # Scheduler-provided history still carries the multimodal pad ids.
             tokens = tokens.masked_fill(
@@ -497,16 +519,12 @@ class EngramHasher(nn.Module):
                 .cummax(-1)
                 .values.bool()
             )
-        hash_ids = compute_engram_hash_ids(
-            tokens,
-            blocked,
-            self.pad_id,
-            self.token_map,
-            self.multipliers,
-            self.primes,
-            self.offsets,
-        )
-        return hash_ids, tokens
+        params = (self.token_map, self.multipliers, self.primes, self.offsets)
+        if tokens.device != self.token_map.device:
+            if self._cpu_hash_params is None:
+                self._cpu_hash_params = tuple(t.cpu() for t in params)
+            params = self._cpu_hash_params
+        return compute_engram_hash_ids(tokens, blocked, self.pad_id, *params), tokens
 
     def commit_after_verify(
         self,
@@ -625,6 +643,21 @@ def _hip_runtime() -> ctypes.CDLL:
         ctypes.c_uint,
     ]
     return lib
+
+
+@functools.cache
+def _sorted_host_reads(device: int) -> bool:
+    """Whether host-table rows are read in address order. Without ATS (no
+    NVLink-C2C) the GPU maps pinned host memory in its own page tables, and
+    random rows of a table far larger than its translation reach miss on nearly
+    every row; with ATS the host page tables serve the reads and order costs."""
+    if _is_hip:
+        return False
+    from cuda.bindings import driver
+
+    attr = driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+    err, uses_host_page_tables = driver.cuDeviceGetAttribute(attr, device)
+    return err == driver.CUresult.CUDA_SUCCESS and uses_host_page_tables == 0
 
 
 def _registered_device_ptr(host_ptr: int) -> int:
@@ -813,6 +846,8 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self._sort_host_reads = False
+        self.staged_by_scheduler = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -847,10 +882,22 @@ class EngramEmbedding(nn.Module):
         self.scale = nn.Parameter(scale, requires_grad=False)
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
+        self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
 
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
+
+    @property
+    def shared_host_table_without_ats(self) -> bool:
+        """The shared host layout (every row mapped here) on a GPU without ATS."""
+        return self._shared and self._sort_host_reads
+
+    def enable_scheduler_staging(self) -> None:
+        """Read the rows the scheduler stages (EngramRowStager) instead of
+        gathering them in the forward."""
+        assert self.shared_host_table_without_ats
+        self.staged_by_scheduler = True
 
     def _table_ptrs(self) -> tuple[int, int]:
         if self.host_table is None:
@@ -888,6 +935,7 @@ class EngramEmbedding(nn.Module):
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
+                sort_ids=self._sort_host_reads,
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -904,6 +952,35 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def dequant_staged(
+        self,
+        rows: torch.Tensor,
+        scales: torch.Tensor,
+        copied: torch.cuda.Event,
+        hash_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Dequantize this layer's staged rows into [*hash_shape, dim]; rows past the
+        staged ones (prefill graph padding) are zero."""
+        stream = torch.cuda.current_stream()
+        stream.wait_event(copied)
+        rows.record_stream(stream)
+        scales.record_stream(stream)
+        out = torch.empty(
+            *hash_shape, self.dim, dtype=torch.bfloat16, device=rows.device
+        )
+        flat = out.view(-1, self.dim)
+        assert rows.shape[0] <= flat.shape[0], (rows.shape, flat.shape)
+        engram_gather(
+            rows.data_ptr(),
+            scales.data_ptr(),
+            torch.arange(flat.shape[0], dtype=torch.int32, device=rows.device),
+            flat,
+            self.dim,
+            FP8_BLOCK_SIZE,
+            row_hi=rows.shape[0],
+        )
+        return out
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
@@ -949,6 +1026,7 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
+            sort_ids=self._sort_host_reads,
         )
         return out
 
@@ -996,9 +1074,12 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    input_ids: Optional[torch.Tensor] = None,
+    image_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy."""
+    followed by the shared value. Adds the gated value to every copy, except in rows
+    whose ``input_ids`` entry is ``image_token_id``, which keep ``x``."""
     # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
     # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
@@ -1010,7 +1091,9 @@ def engram_gate(
         and k_weight.dtype in (torch.bfloat16, torch.float32)
         and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -1023,7 +1106,10 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if input_ids is not None:
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
 
 
 class Engram(nn.Module):
@@ -1034,9 +1120,12 @@ class Engram(nn.Module):
         layout: EngramLayout,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        image_token_id: Optional[int] = None,
     ):
         super().__init__()
         self.layer_hash_index = layout.layer_ids.index(layer_id)
+        self.image_token_id = image_token_id
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
@@ -1063,17 +1152,59 @@ class Engram(nn.Module):
         hash_ids: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         *,
+        input_ids: torch.Tensor,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
+        layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
-        emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        if (
+            self.embed.staged_by_scheduler
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and is_in_breakable_cuda_graph()
+        ):
+            # Every replay stages new rows, so the lookup runs between segments.
+            emb = _bcg_engram_embed(self, hash_ids, cp_all_tokens)
+        else:
+            emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        image_ids = input_ids if self.image_token_id is not None else None
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            image_ids,
+            self.image_token_id,
         )
+
+    def embed_rows(
+        self,
+        hash_ids: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        cp_all_tokens: bool,
+    ) -> torch.Tensor:
+        """The rows the scheduler staged for this batch, else the table lookup."""
+        staged = None if forward_batch is None else forward_batch.engram_staged_rows
+        if staged is not None:
+            return self.embed.dequant_staged(
+                *staged[self.layer_hash_index], hash_ids.shape
+            )
+        return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+
+
+@eager_on_graph
+def _bcg_engram_embed(
+    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool
+) -> torch.Tensor:
+    # A replay builds a fresh batch; the capture-time one stages no rows.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    return engram.embed_rows(hash_ids, forward_batch, cp_all_tokens)
