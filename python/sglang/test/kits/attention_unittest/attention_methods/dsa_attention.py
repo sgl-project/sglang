@@ -1128,13 +1128,6 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
     major, minor = _torch.cuda.get_device_capability()
 
     if impl == "flashmla_sparse" or impl == "flashmla_kv":
-        try:
-            from sgl_kernel.flash_mla import (  # noqa: F401
-                flash_mla_sparse_fwd,
-                flash_mla_with_kvcache,
-            )
-        except ImportError as exc:
-            return False, f"sgl_kernel.flash_mla unavailable: {exc}"
         if major < 9:
             return False, f"{impl} requires SM>=9.0, got SM{major}.x"
         return True, ""

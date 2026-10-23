@@ -9,8 +9,6 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
-    _fill_evict_result,
-    _match_result_from_binding,
     _radix_key_buffer,
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
@@ -189,7 +187,7 @@ class RustUnifiedTreeCoreInspector(
         binding_result = self._binding.inspect_evict_component(
             node_id, int(component_type), int(target)
         )
-        return _fill_evict_result(binding_result, BaseEvictionResult())
+        return self._fill_evict_result(binding_result, BaseEvictionResult())
 
     def validate_cascade_evict(
         self,
@@ -203,7 +201,7 @@ class RustUnifiedTreeCoreInspector(
 
     def cleanup_tombstone_ancestors(self, node_id: NodeId) -> BaseEvictionResult:
         binding_result = self._binding.inspect_cleanup_tombstone_ancestors(node_id)
-        return _fill_evict_result(binding_result, BaseEvictionResult())
+        return self._fill_evict_result(binding_result, BaseEvictionResult())
 
     def finalize_component_match_result(
         self,
@@ -222,7 +220,7 @@ class RustUnifiedTreeCoreInspector(
             value_chunks,
             best_value_len,
         )
-        return _match_result_from_binding(binding_result)._replace(
+        return self._match_result_from_binding(binding_result)._replace(
             cache_protected_len=result.cache_protected_len,
             cache_actions=result.cache_actions,
         )
