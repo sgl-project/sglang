@@ -170,18 +170,18 @@ class RecipeEncoder:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
-    def _ids(self, text: str) -> list[int]:
+    def encode_text(self, text: str) -> list[int]:
         return self.hf_tokenizer.encode(text, add_special_tokens=False).ids
 
     def _replace_effort_budget(self, prompt_ids: list[int], budget: int) -> list[int]:
         # The effort line opens the prompt, so its first match is the line itself.
-        rendered = self._ids(BUDGET_LINE.format(budget=BUDGET_TIER_VALUE))
+        rendered = self.encode_text(BUDGET_LINE.format(budget=BUDGET_TIER_VALUE))
         for start in range(len(prompt_ids) - len(rendered) + 1):
             if prompt_ids[start : start + len(rendered)] == rendered:
                 end = start + len(rendered)
                 return (
                     prompt_ids[:start]
-                    + self._ids(BUDGET_LINE.format(budget=budget))
+                    + self.encode_text(BUDGET_LINE.format(budget=budget))
                     + prompt_ids[end:]
                 )
         raise ValueError("deepseek-recipe rendered no reasoning effort line")

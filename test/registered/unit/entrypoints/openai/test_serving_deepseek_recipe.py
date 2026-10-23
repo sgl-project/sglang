@@ -199,6 +199,27 @@ class TestHandlerRequestSemantics(CustomTestCase):
             self._prompt(chat, reasoning_effort="low", **thinking).prompt_ids, low
         )
 
+    def test_trailing_assistant_follows_sglang_rules(self):
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        chat = _serving(self, self.tokenizer)
+
+        def prompt(messages, **fields):
+            request = ChatCompletionRequest(messages=messages, **fields)
+            return chat._process_messages(request, False).prompt_ids
+
+        answer = {"role": "assistant", "content": "Hel"}
+        # Without continue_final_message the trailing turn becomes a user turn.
+        self.assertEqual(
+            prompt([_user("hi"), answer]), prompt([_user("hi"), _user("Hel")])
+        )
+        # A task renders its own tail; the continued prefix follows it.
+        self.assertEqual(
+            prompt([_user("hi"), answer], task="title", continue_final_message=True),
+            prompt([_user("hi")], task="title")
+            + self.tokenizer.encode("Hel", add_special_tokens=False),
+        )
+
     def test_request_reaches_the_engine_with_sglang_semantics(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 

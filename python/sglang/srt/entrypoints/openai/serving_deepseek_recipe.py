@@ -59,10 +59,26 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> list[int]:
         # The wire request: the handler's message dumps carry None for unset fields.
         wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
+        wire_messages = wire["messages"]
+        continue_final = request.continue_final_message
+        task_prefix = None
+        # SGLang's trailing-assistant rule, as `_handle_last_assistant_message`.
+        last = wire_messages[-1] if wire_messages else None
+        if (
+            last
+            and last["role"] == "assistant"
+            and isinstance(last.get("content"), str)
+        ):
+            if not continue_final:
+                wire_messages[-1] = {"role": "user", "content": last["content"]}
+            elif request.task is not None:
+                # A task renders its own tail, so the prefix follows it.
+                task_prefix = wire_messages.pop()["content"]
+                continue_final = False
         body = {
-            "messages": wire["messages"],
+            "messages": wire_messages,
             "thinking": thinking,
-            "continue_final_message": request.continue_final_message,
+            "continue_final_message": continue_final,
             "response_format": wire.get("response_format"),
         }
         if tools is not None:
@@ -78,7 +94,12 @@ class DeepSeekRecipeChatEncodingAdapter:
             ]
             body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
-        return self._encode(body, effort=request.reasoning_effort, task=request.task)
+        prompt_ids = self._encode(
+            body, effort=request.reasoning_effort, task=request.task
+        )
+        if task_prefix:
+            prompt_ids += self.encoder.encode_text(task_prefix)
+        return prompt_ids
 
     def _encode(
         self,
