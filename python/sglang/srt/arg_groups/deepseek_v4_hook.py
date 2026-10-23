@@ -273,8 +273,12 @@ def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
     for feature, enabled in unsupported:
         if enabled:
             raise ValueError(f"CP encoder replay does not support {feature} yet")
-    if cfg.disaggregation_mode != "null":
-        raise ValueError("CP encoder replay P/D requires the handoff extension")
+    if cfg.disaggregation_mode == "prefill" and (
+        cfg.disaggregation_transfer_backend != "mooncake"
+        or str(cfg.speculative_algorithm).upper() != "DSPARK"
+    ):
+        raise ValueError("CP encoder replay PD requires Mooncake and static DSpark")
+    # The common V4.1 checks already validate static verify and reject replay on Decode.
     if cfg.enable_hierarchical_cache:
         if cfg.hicache_host_memory_mode != "cache":
             raise ValueError("CP encoder replay requires cache host memory mode")

@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -55,6 +56,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     request_scoped_state_transfer_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
@@ -810,6 +812,82 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
+
+
+class TestDSV41CPReplayWire(CustomTestCase):
+    @staticmethod
+    def _handoff():
+        window = object.__new__(RequestWindow)
+        window.capacity, window.num_slots, window.page_size = 256, 8, 256
+        window.tags = torch.full((3, 2304), -1, dtype=torch.int64)
+        positions = torch.arange(129, 257)
+        window.tags[:, window.row_loc(3, positions)] = positions
+        pending = np.array([51], dtype=np.int32)
+        pool = SimpleNamespace(
+            request_window=window,
+            sliding_window=128,
+            request_state_transfer_indices=Mock(return_value=pending),
+        )
+        manager = object.__new__(CommonKVManager)
+        manager.dsv41_spec_layout = {"cp_encoder_replay_version": 1}
+        manager.kv_args = SimpleNamespace(
+            state_types=[
+                StateType.SWA,
+                StateType.DSA,
+                StateType.DSV4_REQUEST_STATE,
+                StateType.SWA,
+                StateType.REQUEST_ROW,
+            ]
+        )
+        manager.conclude_failure = Mock()
+        req = SimpleNamespace(
+            start_send_idx=0,
+            origin_input_ids=[0] * 257,
+            extend_end=257,
+            disagg_decode_prefix_len=0,
+            kv=SimpleNamespace(req_pool_idx=3),
+            disagg_kv_sender=SimpleNamespace(
+                get_max_transfer_tokens=lambda: None,
+                should_send_kv_chunk=lambda *args: True,
+                send=Mock(),
+            ),
+            rid="replay",
+            bootstrap_room=17,
+        )
+        scheduler = object.__new__(SchedulerDisaggregationPrefillMixin)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=256,
+            get_kvcache=lambda: pool,
+            translate_kv_indices_for_transfer=lambda x: x,
+        )
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8 * 512).reshape(8, 512)
+        )
+        scheduler.enable_staging = False
+        scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=Mock())
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=manager)
+        scheduler.disagg_prefill_pending_chunk_rids = {req.rid}
+        scheduler.attn_cp_cpu_group = None
+        return scheduler, req, pool, manager, pending
+
+    def test_final_payload_retains_both_windows_and_pending_state(self):
+        scheduler, req, pool, manager, pending = self._handoff()
+        # Missing tags in page-alignment padding are not missing SWA history.
+        self.assertTrue(
+            pool.request_window.validate_transfer(3, 0, 257, window_size=128)
+        )
+        with patch.object(dist, "all_reduce"):
+            scheduler._send_kv_chunk(req, last_chunk=True)
+        payload = req.disagg_kv_sender.send.call_args.args[1]
+        expected = np.array([3, 3], dtype=np.int32)
+        np.testing.assert_array_equal(payload[0], expected)
+        np.testing.assert_array_equal(payload[3], expected)
+        np.testing.assert_array_equal(payload[1], [6, 7])
+        self.assertIs(payload[2], pending)
+        np.testing.assert_array_equal(payload[4], [3])
+        scheduler.disagg_metadata_buffers.set_buf.assert_called_once_with(req)
+        manager.conclude_failure.assert_not_called()
+        self.assertFalse(scheduler.disagg_prefill_pending_chunk_rids)
 
 
 class TestQwen4StateWire(unittest.TestCase):

@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_cp_replay_enabled,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -1561,6 +1562,33 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
+            manager = self.disagg_prefill_bootstrap_queue.kv_manager
+            if isinstance(manager, CommonKVManager) and dsv41_cp_replay_enabled(
+                manager.dsv41_spec_layout
+            ):
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                window = kvcache.request_window
+                valid = window is not None and window.validate_transfer(
+                    int(req.kv.req_pool_idx),
+                    req.disagg_decode_prefix_len,
+                    min(req.extend_end, transfer_input_len),
+                    window_size=kvcache.sliding_window,
+                )
+                valid = torch.tensor(int(valid), dtype=torch.int32, device="cpu")
+                torch.distributed.all_reduce(
+                    valid,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.attn_cp_cpu_group,
+                )
+                if not valid.item():
+                    manager.conclude_failure(
+                        bootstrap_room=req.bootstrap_room,
+                        failure_reason="CP replay PD handoff has missing SWA history",
+                    )
+                    # The existing inflight Failed path notifies the client and
+                    # releases KV/metadata; no success metadata may be published.
+                    self.clear_pending_chunk_send(req)
+                    return
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV

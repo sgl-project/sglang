@@ -273,6 +273,26 @@ class RequestWindow:
         # and pair with decode's paged SWA pages one for one.
         return (self.row_loc(slot, positions) // self.page_size).to(torch.int32).numpy()
 
+    def validate_transfer(
+        self, slot: int, start: int, end: int, *, window_size: int
+    ) -> bool:
+        """Check committed history before the paged PD handoff.
+
+        Page alignment may include rows before the logical attention window;
+        those rows are not history. Tags remain local and are not sent by PD.
+        """
+        if (
+            not 0 <= slot < self.num_slots
+            or not 0 <= start <= end
+            or not 0 < window_size <= self.capacity
+        ):
+            return False
+        positions = torch.arange(
+            max(start, end - window_size), end, device=self.tags.device
+        )
+        rows = self.row_loc(slot, positions)
+        return torch.equal(self.tags[:, rows], positions.expand(self.tags.shape[0], -1))
+
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
