@@ -82,7 +82,21 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
     else:
-        unsupported["disaggregation-mode"] = cfg.disaggregation_mode != "null"
+        # GLM prefill transfers replicated DSA KV and TP-sharded KDA state.
+        # The decode worker uses ordinary TP; it must not enable prefill CP.
+        unsupported |= {
+            "disaggregation-mode": cfg.disaggregation_mode not in ("null", "prefill"),
+            "PD prefill requires NIXL": (
+                cfg.disaggregation_mode == "prefill"
+                and cfg.disaggregation_transfer_backend != "nixl"
+            ),
+            "PD prefill speculative decoding": (
+                cfg.disaggregation_mode == "prefill"
+                and cfg.speculative_algorithm is not None
+            ),
+            "pipeline parallelism": cfg.pp_size != 1,
+            "data parallelism": cfg.dp_size != 1,
+        }
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

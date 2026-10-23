@@ -27,6 +27,12 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         result.input_ids_global = torch.zeros(
             capacity, dtype=torch.int64, device=runner.device
         )
+        # EP dispatch consumes a device scalar. All captured buckets retain
+        # this address, refreshed before each replay rather than bound to
+        # a tensor allocated for a capture's temporary metadata object.
+        result.moe_local_token_count = torch.zeros(
+            (), dtype=torch.int32, device=runner.device
+        )
         return result
 
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
@@ -43,7 +49,9 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         cfg = resolving_view(server_args)
         return (
             cfg.dp_size == 1
-            and cfg.ep_size == 1
+            and (
+                cfg.ep_size == 1 or resolved_view(server_args).moe_a2a_backend == "none"
+            )
             and resolved_view(server_args).attn_cp_size > 1
             and "Glm5NextForConditionalGeneration"
             in model_config_of(server_args).hf_config.architectures
@@ -69,6 +77,10 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         metadata.per_rank_logical_token = [
             base + int(rank < remainder) for rank in range(cp_size)
         ]
+        self.moe_local_token_count.fill_(
+            metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+        )
+        metadata.moe_local_token_count = self.moe_local_token_count
         forward_batch.out_cache_loc = out_cache_loc
         # KPool compresses consecutive global tokens; only the model argument
         # (DSA RoPE) is local. Do not replace ForwardBatch's global positions.

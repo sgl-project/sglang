@@ -3171,6 +3171,48 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
 
+        if (
+            get_parallel().enable_cp_tp_group_sharing
+            and self.is_hybrid_mla_backend
+            and StateType.MAMBA in state_types
+        ):
+            # CommonKVManager advertises CP rank r as TP rank r. Validate before
+            # either prepared or generic transfers can post a recurrent shard.
+            if self.state_tp_size != decode_tp_size:
+                raise RuntimeError(
+                    "GLM CP NIXL requires matching recurrent-state TP sizes"
+                )
+            if self.attn_cp_rank != decode_tp_rank:
+                raise RuntimeError("GLM CP NIXL connected mismatched state ranks")
+            for i, state_type in enumerate(state_types):
+                if state_type != StateType.MAMBA:
+                    continue
+                src_ptrs = _nth(src_state_data_ptrs, i)
+                dst_ptrs = _nth(dst_state_data_ptrs, i)
+                src_lens = _nth(src_state_item_lens, i)
+                dst_lens = _nth(dst_state_item_lens, i)
+                src_dims = _nth(src_state_dim_per_tensor, i)
+                dst_dims = _nth(dst_state_dim_per_tensor, i)
+                pairs = build_transfer_entry_pairs(
+                    _nth(src_state_layer_ids, i),
+                    _nth(dst_state_layer_ids, i),
+                    len(src_ptrs),
+                    len(dst_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+                for si, di in pairs:
+                    if (
+                        si >= len(src_lens)
+                        or di >= len(dst_lens)
+                        or si >= len(src_dims)
+                        or di >= len(dst_dims)
+                        or src_lens[si] != dst_lens[di]
+                        or src_dims[si] != dst_dims[di]
+                    ):
+                        raise RuntimeError(
+                            f"GLM CP KDA state layout mismatch at {si}->{di}"
+                        )
+
         plan = self._prepared_state_plans.get(peer_name)
         if plan is not None:
             yield from self._send_prepared_states(
@@ -3773,6 +3815,10 @@ class NixlKVSender(CommonKVSender):
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
+            return
+        # An empty non-final CP shard emits no KV notification: do not advance
+        # its receiver-visible chunk ID. Final empty sends still carry state.
+        if len(kv_indices) == 0 and not is_last_chunk:
             return
 
         if self._transfer_start_time is None and (
