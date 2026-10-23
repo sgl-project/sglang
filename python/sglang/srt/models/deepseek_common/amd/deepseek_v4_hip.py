@@ -180,6 +180,26 @@ def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
     return mhc_post_split_h(x, residual, post, comb, block_size=2048)
 
 
+def _x_quant_e8m0(layer) -> bool:
+    """Whether input_layernorm's fp8 operand goes out with ue8m0 scales: only when
+    every dense projection reading it (wqkv_a, or wq_a + wkv) runs the e8m0 mxscale
+    GEMM (SGLANG_DSV4_DENSE_MXSCALE). Resolved on first use, after weight load."""
+    cached = layer.__dict__.get("_x_quant_e8m0")
+    if cached is None:
+        from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+        attn = layer.self_attn
+        if getattr(attn, "fuse_wqa_wkv", False):
+            consumers = (getattr(attn, "wqkv_a", None),)
+        else:
+            consumers = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+        cached = all(c is not None for c in consumers) and dense_mxscale_ready(
+            *consumers
+        )
+        layer.__dict__["_x_quant_e8m0"] = cached
+    return cached
+
+
 def input_norm(
     layer,
     hidden_states: torch.Tensor,
@@ -194,7 +214,10 @@ def input_norm(
         if coefficients is not None:
             coefficients.materialize()
         x_quant, hidden_states = fused_rmsnorm_fp8_quant(
-            hidden_states, layer.input_layernorm.weight, layer.rms_norm_eps
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.rms_norm_eps,
+            e8m0=_x_quant_e8m0(layer),
         )
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:
