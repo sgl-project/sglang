@@ -6,17 +6,12 @@
 import ast
 import importlib
 import os
-import pickle
-import subprocess
-import sys
-import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Set
+from collections.abc import Set
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import NoReturn, TypeVar, cast
+from typing import NoReturn, cast
 
-import cloudpickle
 from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.external_model_package import (
@@ -156,31 +151,8 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
 
 _SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
 
-_SUBPROCESS_COMMAND = [
-    sys.executable,
-    "-m",
-    "sglang.multimodal_gen.runtime.models.dits.registry",
-]
-
-_T = TypeVar("_T")
-
-
-@dataclass(frozen=True)
-class _ModelInfo:
-    architecture: str
-
-    @staticmethod
-    def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
-        return _ModelInfo(
-            architecture=model.__name__,
-        )
-
 
 class _BaseRegisteredModel(ABC):
-    @abstractmethod
-    def inspect_model_cls(self) -> _ModelInfo:
-        raise NotImplementedError
-
     @abstractmethod
     def load_model_cls(self) -> type[nn.Module]:
         raise NotImplementedError
@@ -192,49 +164,10 @@ class _RegisteredModel(_BaseRegisteredModel):
     Represents a model that has already been imported in the main process.
     """
 
-    interfaces: _ModelInfo
     model_cls: type[nn.Module]
-
-    @staticmethod
-    def from_model_cls(model_cls: type[nn.Module]):
-        return _RegisteredModel(
-            interfaces=_ModelInfo.from_model_cls(model_cls),
-            model_cls=model_cls,
-        )
-
-    def inspect_model_cls(self) -> _ModelInfo:
-        return self.interfaces
 
     def load_model_cls(self) -> type[nn.Module]:
         return self.model_cls
-
-
-def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
-    # NOTE: We use a temporary directory instead of a temporary file to avoid
-    # issues like https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
-    with tempfile.TemporaryDirectory() as tempdir:
-        output_filepath = os.path.join(tempdir, "registry_output.tmp")
-
-        # `cloudpickle` allows pickling lambda functions directly
-        input_bytes = cloudpickle.dumps((fn, output_filepath))
-
-        # cannot use `sys.executable __file__` here because the script
-        # contains relative imports
-        returned = subprocess.run(
-            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
-        )
-
-        # check if the subprocess is successful
-        try:
-            returned.check_returncode()
-        except Exception as e:
-            # wrap raised exception to provide more information
-            raise RuntimeError(
-                f"Error raised in subprocess:\n{returned.stderr.decode()}"
-            ) from e
-
-        with open(output_filepath, "rb") as f:
-            return cast(_T, pickle.load(f))
 
 
 @dataclass(frozen=True)
@@ -245,12 +178,6 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     module_name: str
     class_name: str
-
-    # Performed in another process to avoid initializing CUDA
-    def inspect_model_cls(self) -> _ModelInfo:
-        return _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls())
-        )
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
@@ -269,18 +196,6 @@ def _try_load_model_cls(
         return model.load_model_cls()
     except Exception:
         logger.exception("Ignore import error when loading '%s'", model_arch)
-        return None
-
-
-@lru_cache(maxsize=128)
-def _try_inspect_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
-) -> _ModelInfo | None:
-    try:
-        return model.inspect_model_cls()
-    except Exception:
-        logger.exception("Error in inspecting model architecture '%s'", model_arch)
         return None
 
 
@@ -335,7 +250,7 @@ class _ModelRegistry:
                 module_name=split_str[0], class_name=split_str[1]
             )
         else:
-            model = _RegisteredModel.from_model_cls(model_cls)
+            model = _RegisteredModel(model_cls=model_cls)
 
         self.registered_models[model_arch] = model
 
@@ -358,12 +273,6 @@ class _ModelRegistry:
             return None
 
         return _try_load_model_cls(model_arch, self.registered_models[model_arch])
-
-    def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
-        if model_arch not in self.registered_models:
-            return None
-
-        return _try_inspect_model_cls(model_arch, self.registered_models[model_arch])
 
     def _normalize_archs(
         self,
@@ -391,19 +300,6 @@ class _ModelRegistry:
                 )
             normalized_arch.append(arch)
         return normalized_arch
-
-    def inspect_model_cls(
-        self,
-        architectures: str | list[str],
-    ) -> tuple[_ModelInfo, str]:
-        architectures = self._normalize_archs(architectures)
-
-        for arch in architectures:
-            model_info = self._try_inspect_model_cls(arch)
-            if model_info is not None:
-                return (model_info, arch)
-
-        return self._raise_for_unsupported(architectures)
 
     def resolve_model_cls(
         self,

@@ -444,13 +444,18 @@ class IpcA2AMultiState:
         self.ops = load_ipc_a2a_sync()
         self.memops = memops
         # flags[p] is written by peer p; seq[p] counts the calls sent to p
-        self.flags = torch.zeros(self.world, dtype=torch.int32, device="cuda")
+        self.flags = ipc_shareable_zeros(self.world, dtype=torch.int32)
         self.seq = torch.zeros(self.world, dtype=torch.int32, device="cuda")
-        self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.timed_out = ipc_shareable_zeros(1, dtype=torch.int32)
         self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
-        self.peer_flags = self._share(self.flags, group)
-        self.peer_timed_out = self._share(self.timed_out, group)
+        try:
+            self.peer_flags = self._share(self.flags, group)
+            self.peer_timed_out = self._share(self.timed_out, group)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"sharing the signal flags over CUDA IPC failed: {e}"
+            ) from e
         self.inited = True
 
     def get_staging(self, chunk: int, dtype: torch.dtype) -> list[torch.Tensor] | None:
@@ -462,7 +467,7 @@ class IpcA2AMultiState:
         if buffers is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            local = torch.zeros(2, self.world, chunk, dtype=dtype, device="cuda")
+            local = ipc_shareable_zeros(2, self.world, chunk, dtype=dtype)
             buffers = self._share(local, self.group)
             self._insert(key, buffers)
         return buffers
