@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/Tencent-Hunyuan/Hy-Nomas
 # Original PatchEmbed: Copyright 2020 Ross Wightman.
-"""Nomas DiT building blocks; upstream options Nomas never sets are removed, parameter names are unchanged."""
+"""Nomas DiT building blocks whose numerics differ from the shared SGLang layers."""
 
 import math
 
@@ -11,6 +11,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import modulate_scale_shift, residual_gate_add
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
 
 
 def attention(q, k, v, attn_mask):
@@ -35,16 +37,6 @@ class RMSNorm(nn.Module):
         return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(
             x
         ) * self.weight
-
-
-class ModulateDiT(nn.Module):
-    def __init__(self, hidden_size: int, factor: int, act_layer):
-        super().__init__()
-        self.act = act_layer()
-        self.linear = nn.Linear(hidden_size, factor * hidden_size)
-
-    def forward(self, x):
-        return self.linear(self.act(x))
 
 
 def modulate(x, shift, scale):
@@ -73,17 +65,6 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         return self.proj(x).flatten(2).transpose(1, 2)
-
-
-class TextProjection(nn.Module):
-    def __init__(self, in_channels, hidden_size, act_layer):
-        super().__init__()
-        self.linear_1 = nn.Linear(in_channels, hidden_size)
-        self.act_1 = act_layer()
-        self.linear_2 = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, caption):
-        return self.linear_2(self.act_1(self.linear_1(caption)))
 
 
 def timestep_embedding(t, dim, max_period=10000):
@@ -119,26 +100,15 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(t_freq.type(self.mlp[0].weight.dtype))
 
 
-class MLP(nn.Module):
-    def __init__(self, in_channels, hidden_channels, act_layer):
-        super().__init__()
-        self.fc1 = nn.Linear(in_channels, hidden_channels)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_channels, in_channels)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-
 class FinalLayerPerBlock(nn.Module):
     """adaLN final layer; ``c`` is the per-request timestep vector [B, D]."""
 
-    def __init__(self, hidden_size, patch_size, out_channels, act_layer):
+    def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, math.prod(patch_size) * out_channels)
-        self.adaLN_modulation = nn.Sequential(
-            act_layer(), nn.Linear(hidden_size, 2 * hidden_size)
+        self.adaLN_modulation = ModulateProjection(
+            hidden_size, factor=2, act_layer="silu"
         )
 
     def forward(self, x, c):
@@ -154,9 +124,9 @@ class IndividualTokenRefinerBlock(nn.Module):
         self.self_attn_qkv = nn.Linear(hidden_size, hidden_size * 3)
         self.self_attn_proj = nn.Linear(hidden_size, hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
-        self.mlp = MLP(hidden_size, 4 * hidden_size, nn.SiLU)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size)
+        self.mlp = MLP(hidden_size, 4 * hidden_size, act_type="silu")
+        self.adaLN_modulation = ModulateProjection(
+            hidden_size, factor=2, act_layer="silu"
         )
 
     def forward(self, x, c, attn_mask):

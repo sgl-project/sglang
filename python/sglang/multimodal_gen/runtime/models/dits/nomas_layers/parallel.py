@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tensor and Ulysses sequence parallelism for the Nomas DiT.
 
-TP uses the framework's ColumnParallelLinear / RowParallelLinear, so weight
-sharding, loading and the all-reduce follow every other DiT. Ulysses SP is
-model-specific: Nomas attention is a FlexAttention block mask over its own
-segment KV cache, which USPAttention cannot express, so the head/sequence
-exchange around attention is done here with the shared collectives.
+TP uses the framework's parallel linear layers. Ulysses SP is model-specific:
+Nomas attention is a FlexAttention block mask over its own segment KV cache,
+which USPAttention cannot express, so the head/sequence exchange around
+attention is done here with the shared collectives.
 """
 
 import torch
 from msgspec import Struct
-from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -22,10 +20,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_world_size,
     get_ulysses_ctx,
     model_parallel_is_initialized,
-)
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
 )
 
 
@@ -47,25 +41,6 @@ def current_parallel_info() -> ParallelInfo:
         raise ValueError("Nomas supports Ulysses sequence parallelism only, not ring")
     sp_size, sp_rank = get_ulysses_ctx()
     return ParallelInfo(get_tp_world_size(), get_tp_rank(), sp_size, sp_rank)
-
-
-class TensorParallelMLP(nn.Module):
-    """fc1 column-sharded, fc2 row-sharded with all-reduce; upstream parameter names."""
-
-    def __init__(self, dim, hidden, act_layer, prefix=""):
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            dim, hidden, bias=True, gather_output=False, prefix=f"{prefix}.fc1"
-        )
-        self.act = act_layer()
-        self.fc2 = RowParallelLinear(
-            hidden, dim, bias=True, input_is_parallel=True, prefix=f"{prefix}.fc2"
-        )
-
-    def forward(self, x):
-        hidden, _ = self.fc1(x)
-        out, _ = self.fc2(self.act(hidden))
-        return out
 
 
 def seq_to_heads(x: torch.Tensor, info: ParallelInfo) -> torch.Tensor:

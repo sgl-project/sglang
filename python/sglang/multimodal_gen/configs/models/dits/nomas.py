@@ -18,6 +18,14 @@ class NomasArchConfig(DiTArchConfig):
     rope_dim_list: tuple[int, int, int] = (16, 56, 56)
     rope_theta: float = 256.0
     camera_chunk_size: int = 1
+    # Upstream checkpoint names -> the shared MLP / ModulateProjection layers.
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^(.*)\.fc1\.(.*)$": r"\1.fc_in.\2",
+            r"^(.*)\.fc2\.(.*)$": r"\1.fc_out.\2",
+            r"^(.*)\.adaLN_modulation\.1\.(.*)$": r"\1.adaLN_modulation.linear.\2",
+        }
+    )
 
     def __post_init__(self):
         if self.hidden_size <= 0 or self.num_attention_heads <= 0:

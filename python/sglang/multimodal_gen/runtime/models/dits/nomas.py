@@ -10,15 +10,21 @@ each rank holds its local heads only.
 """
 
 import torch
+from diffusers.models.embeddings import PixArtAlphaTextProjection
 from msgspec import Struct
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.multimodal_gen.configs.models.dits.nomas import NomasConfig
+from sglang.multimodal_gen.configs.models.dits.nomas import (
+    NomasArchConfig,
+    NomasConfig,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -26,10 +32,8 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.nomas_layers.blocks import (
     FinalLayerPerBlock,
     IndividualTokenRefiner,
-    ModulateDiT,
     PatchEmbed,
     RMSNorm,
-    TextProjection,
     TimestepEmbedder,
     gated_residual,
     modulate,
@@ -40,7 +44,6 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_layers.kv import (
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas_layers.parallel import (
     ParallelInfo,
-    TensorParallelMLP,
     current_parallel_info,
     gather_heads,
     gather_seq,
@@ -72,7 +75,9 @@ class NomasTextRefiner(nn.Module):
         d = config.hidden_size
         self.input_embedder = nn.Linear(config.text_states_dim, d)
         self.t_embedder = TimestepEmbedder(d, nn.SiLU)
-        self.c_embedder = TextProjection(config.text_states_dim, d, nn.SiLU)
+        self.c_embedder = PixArtAlphaTextProjection(
+            config.text_states_dim, d, act_fn="silu"
+        )
         self.individual_token_refiner = IndividualTokenRefiner(
             d, config.num_attention_heads, depth=2
         )
@@ -93,7 +98,11 @@ class NomasDoubleStreamBlock(nn.Module):
         self.heads = heads // info.tp_size
         self.attn_heads = heads // info.head_shards
         for stream in ("img", "txt"):
-            setattr(self, f"{stream}_mod", ModulateDiT(d, 6, nn.SiLU))
+            setattr(
+                self,
+                f"{stream}_mod",
+                ModulateProjection(d, factor=6, act_layer="silu"),
+            )
             for i in (1, 2):
                 setattr(
                     self,
@@ -128,12 +137,7 @@ class NomasDoubleStreamBlock(nn.Module):
             setattr(
                 self,
                 f"{stream}_mlp",
-                TensorParallelMLP(
-                    d,
-                    4 * d,
-                    lambda: nn.GELU(approximate="tanh"),
-                    prefix=f"{stream}_mlp",
-                ),
+                MLP(d, 4 * d, act_type="gelu_pytorch_tanh", prefix=f"{stream}_mlp"),
             )
 
     def forward(
@@ -249,7 +253,7 @@ class NomasCameraAttention(nn.Module):
 class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = []
     _compile_conditions = []
-    param_names_mapping = {}
+    param_names_mapping = NomasArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
     # The optional Flex mask is model-specific, not a general SGL attention backend.
     _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
@@ -295,7 +299,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self.single_blocks = nn.ModuleList()
         self.final_layer = FinalLayerPerBlock(
-            c.hidden_size, list(c.patch_size), c.out_channels, nn.SiLU
+            c.hidden_size, list(c.patch_size), c.out_channels
         )
         self.action_modules = nn.ModuleList(
             [NomasCameraAttention(c) for _ in range(c.num_layers)]
