@@ -174,20 +174,24 @@ def test_worker_failure_aborts_concurrent_requests_without_rpc_deadline():
     asyncio.run(run_test())
 
 
-def test_broker_closes_socket_and_context_when_cancelled(monkeypatch):
+@pytest.mark.parametrize("bind_fails", [False, True])
+def test_broker_closes_socket_and_context(monkeypatch, bind_fails):
     async def run_test():
         socket = MagicMock()
         socket.recv = AsyncMock(side_effect=asyncio.Event().wait)
         context = MagicMock()
         context.socket.return_value = socket
         monkeypatch.setattr(zmq.asyncio, "Context", lambda: context)
+        if bind_fails:
+            socket.bind.side_effect = zmq.ZMQError(zmq.EADDRINUSE)
 
         task = asyncio.create_task(
             run_zeromq_broker(SimpleNamespace(broker_port=12345))
         )
         await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        if not bind_fails:
+            task.cancel()
+        with pytest.raises(zmq.ZMQError if bind_fails else asyncio.CancelledError):
             await task
 
         socket.close.assert_called_once_with(linger=0)

@@ -92,10 +92,9 @@ async def run_zeromq_broker(server_args: ServerArgs):
     ctx = zmq.asyncio.Context()
     socket = ctx.socket(zmq.REP)
     broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
-
     try:
+        socket.bind(broker_endpoint)
+        logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
         while True:
             try:
                 # 1. Receive a request from an offline client

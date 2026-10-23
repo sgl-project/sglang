@@ -470,7 +470,9 @@ def launch_pool_disagg_server(
         )
         try:
             launch_http_server_only(
-                server_args, worker_pids=tuple(p.pid for p in all_processes)
+                server_args,
+                worker_pids=tuple(p.pid for p in all_processes),
+                disagg_server=diffusion_server,
             )
         finally:
             diffusion_server.stop()
@@ -481,12 +483,17 @@ def launch_pool_disagg_server(
     return all_processes
 
 
-def launch_http_server_only(server_args, *, worker_pids: tuple[int, ...] = ()):
+def launch_http_server_only(
+    server_args,
+    *,
+    worker_pids: tuple[int, ...] = (),
+    disagg_server: DiffusionServer | None = None,
+):
     init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
-    app = create_app(server_args, worker_pids=worker_pids)
+    app = create_app(server_args, worker_pids=worker_pids, disagg_server=disagg_server)
     uvicorn.run(
         app,
         use_colors=True,
@@ -614,7 +621,7 @@ def launch_disagg_server(server_args: ServerArgs):
         base_port,
     )
     try:
-        launch_http_server_only(server_args)
+        launch_http_server_only(server_args, disagg_server=diffusion_server)
     finally:
         diffusion_server.stop()
 
