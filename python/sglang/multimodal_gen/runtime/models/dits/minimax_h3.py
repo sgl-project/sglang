@@ -849,7 +849,12 @@ class MiniMaxH3Attention(nn.Module):
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.RAIN_FUSION_ATTN_V2
+            and "token_refiner" in self.prefix.split(".")
         ):
+            # The text-only refiner has its own packed sequence and stays on
+            # dense FA; Rain Fusion V2 applies to the multimodal DiT blocks.
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,

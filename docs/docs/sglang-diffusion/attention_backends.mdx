@@ -139,6 +139,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>RAIN_FUSION_ATTN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>attentions</code> which can be installed with <code>sgl_kernel_npu</code>; available only for NPU.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>rain_fusion_attn_v2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>RAIN_FUSION_ATTN_V2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NPU-only MindIE-SD <code>sparse_attention</code> entry point, with configurable <code>quant_attention</code> for dense steps. Requires compatible MindIE-SD and CANN operators.</td>
+    </tr>
 </tbody>
 </table>
 
@@ -517,6 +522,57 @@ Hybrid window attention constraints:
   </tbody>
 </table>
 
+**MindIE-SD sparse attention (`rain_fusion_attn_v2`)**
+
+On Ascend NPU, install the [NPU software stack](/docs/sglang-diffusion/installation#platform-specific-ascend-npu)
+and a compatible [MindIE-SD](https://github.com/Ascend/MindIE-SD) build exposing
+`sparse_attention` and `quant_attention`, including the operators for your selected
+precision. This backend uses MindIE-SD directly; it is separate from the
+`attentions`-based `rain_fusion_attn` backend.
+
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `sparse_type` | MindIE sparse dispatcher: `rf_v2`, `rf_v3`, `ada_bsa`, or JSON `null`. | `rf_v3` |
+| `precision` | RFv3 precision: `bf16` (unquantized BSA), `mix` (EagleQBSA, INT8 Q/K and FP8 V), `fp8`, or `mxfp4`. Other sparse types follow the SDK's behavior. | `mix` |
+| `sparsity` | Sparse ratio passed to MindIE-SD. Zero uses the configured dense route. | `0.2` |
+| `block_size` | Sparse Q block size. An explicit value is passed unchanged; MindIE-SD validates its compatibility with the selected mode and layout. | `256` for RFv3 `fp8`/`mxfp4`; otherwise `128` |
+| `inner_precise` | Operator precision control passed to the sparse entry point. | `4` |
+| `skip_first_steps` | Use the configured dense route for this many initial denoising steps. | `10` |
+| `dense_last_steps` | Use the configured dense route for this many final denoising steps. Pipelines supply `num_steps` from the actual timestep or sigma schedule. | `0` |
+| `dense_precision` | Dense `quant_attention` precision: `fp8`, `mxfp8`, or `mxfp4`. The public API does not accept `float` or `null` as a precision. | `fp8` |
+| `dense_kwargs` | Dictionary of additional options accepted by the installed `quant_attention` API, such as `fp8_fa_mode` or MXFP4 quantization options. | Empty dictionary; FP8 defaults to `HIGH_PRECISION` |
+
+Pass other public sparse options, such as `keep_sink`, `keep_recent`,
+`cdf_threshold`, `mxfp4_dst_type_max`, and `mxfp4_scale_alg`, as
+additional top-level configuration keys. Options are forwarded to MindIE-SD;
+their effect and supported combinations depend on the installed SDK.
+
+For RFv3, FP8 and MXFP4 use a default KV block size of 256 in MindIE-SD. Its
+video-span route requires matching Q/KV blocks, so this adapter defaults
+`block_size` to 256 for those two modes. The SDK's public sparse entry point does
+not forward a separate `block_size_kv` override. On Ascend A5, the SDK remaps
+`rf_v2` to `rf_v3` with `inner_precise=4`, and rejects `ada_bsa`; choose settings
+compatible with the resulting route.
+
+The adapter supplies BSND layout and the layer's softmax scale. For dense MXFP4,
+it also keeps `layout_kv` and `layout_out` as BSND. These layout settings are not
+overridden through `dense_kwargs`. If the SDK returns attention and LSE together,
+the adapter uses the attention tensor.
+Python callers can also pass SDK options requiring tensors, such as `q_rot` and
+`k_rot`, through `dense_kwargs`; JSON configuration cannot construct those tensors.
+
+MindIE-SD and CANN validate modes, hardware, dtypes, head dimensions, and input
+shapes. SGLang forwards options without additional input validation.
+Do not assume every sparse type honors causal masks: keep causal components on
+a backend that preserves their mask semantics. For MiniMax-H3, the model binding
+keeps the token refiner on dense FA and defaults the text encoder to SDPA unless
+you explicitly override it.
+
+Packed documents and physical alignment segments execute independently. Video
+span offsets describe the original packed token positions; the adapter rebases
+them within each document. MiniMax-H3 supplies its video spans automatically,
+including layouts used with Ulysses sequence parallelism.
+
 **Sol-Attn (`sol_attn`)**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -790,6 +846,16 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Requires <code>attentions</code> from <code>sgl_kernel_npu</code> Configuration via <code>--attention-backend-config</code>.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>rain_fusion_attn_v2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Requires MindIE-SD public sparse and quantized attention APIs plus compatible CANN kernels. Mode support depends on your installed SDK and device.</td>
+    </tr>
 </tbody>
 </table>
 
@@ -810,6 +876,26 @@ sglang generate \
   --prompt "..." \
   --attention-backend torch_sdpa
 ```
+
+### Use MindIE-SD sparse attention on Ascend NPU
+
+Replace `MODEL_PATH` with a supported model's Hugging Face repository ID or local
+pipeline directory. This example uses one NPU with Ulysses degree 1 and RFv3 MIX;
+the initial 10 steps and final 2 steps use FP8 dense attention:
+
+```bash
+sglang generate \
+  --model-path MODEL_PATH \
+  --num-gpus 1 \
+  --ulysses-degree 1 \
+  --attention-backend rain_fusion_attn_v2 \
+  --attention-backend-config '{"sparse_type":"rf_v3","precision":"mix","sparsity":0.2,"skip_first_steps":10,"dense_last_steps":2,"dense_precision":"fp8","dense_kwargs":{"fp8_fa_mode":"HIGH_PRECISION"}}' \
+  --prompt "A sailboat crossing a calm lake at sunrise"
+```
+
+To select MXFP4 for the dense steps, set `dense_precision` to `mxfp4` and remove
+the FP8-specific `fp8_fa_mode` option from `dense_kwargs`. Use only options
+supported by your installed MindIE-SD version.
 
 ### Override one component
 

@@ -928,6 +928,108 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def _routing_args(self, kwargs):
+        # These tests cover ServerArgs routing, not device/backend validation.
+        # _from_dict_without_model_resolution mocks CUDA; Rain Fusion V2 is NPU-only.
+        with patch.object(
+            MiniMaxH3PipelineConfig, "validate_server_args", return_value=None
+        ):
+            return _from_dict_without_model_resolution(
+                kwargs,
+                pipeline_config=MiniMaxH3PipelineConfig(),
+            )
+
+    def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
+        for backend in ("laser_attn", "rain_fusion_attn_v2"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "torch_sdpa"},
+                )
+                self.assertTrue(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
+    def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
+        for backend in ("laser_attn", "rain_fusion_attn_v2"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                        "component_attention_backends": {"text_encoder": "fa"},
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "fa"},
+                )
+                self.assertFalse(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
+    def test_rain_fusion_v2_native_config_is_preserved(self):
+        configs = (
+            {"sparse_type": "rf_v1", "precision": "bf16", "block_size": 64},
+            {"sparse_type": "rf_v2", "precision": "fp8", "block_size_kv": 256},
+            {"sparse_type": "rf_v3", "precision": "mix", "block_size": 128},
+            {"sparse_type": "rf_v3", "precision": "mxfp4", "inner_precise": 2},
+            {
+                "dense_precision": "mxfp8",
+                "dense_kwargs": {"pre_tokens": 2147483647},
+            },
+        )
+        for config in configs:
+            with self.subTest(config=config):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": "rain_fusion_attn_v2",
+                        "attention_backend_config": config,
+                    }
+                )
+                self.assertEqual(dict(args.attention_backend_config), config)
+
+    def test_component_rain_fusion_v2_keeps_native_config(self):
+        config = {"sparse_type": "rf_v2", "precision": "bf16", "block_size": 256}
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "fa",
+                "component_attention_backends": {"transformer": "rain_fusion_attn_v2"},
+                "attention_backend_config": config,
+            }
+        )
+        self.assertEqual(dict(args.attention_backend_config), config)
+        self.assertEqual(
+            args.component_attention_backends["transformer"], "rain_fusion_attn_v2"
+        )
+
+    def test_rain_fusion_v2_dense_tail_config_is_preserved(self):
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "rain_fusion_attn_v2",
+                "attention_backend_config": {"precision": "mix", "dense_last_steps": 3},
+            }
+        )
+        self.assertEqual(args.attention_backend_config["dense_last_steps"], 3)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"

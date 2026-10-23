@@ -2446,13 +2446,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN_V2,
         ]:
-            sparse_config = server_args.attention_backend_config
-
-            current_timestep = i
-            skip_first_steps = sparse_config.get("skip_first_steps", 10)
-            sparsity = sparse_config.get("sparsity", 0.2)
-
+            sparse_config = server_args.attention_backend_config or {}
             raw_latent_shape = batch.raw_latent_shape
             patch_size = server_args.pipeline_config.dit_config.patch_size
 
@@ -2465,13 +2461,27 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 else:
                     patch_size = (patch_size, patch_size, patch_size)
 
-            attn_metadata = self.attn_metadata_builder.build(
-                current_timestep=current_timestep,
-                skip_first_steps=skip_first_steps,
-                sparsity=sparsity,
-                raw_latent_shape=raw_latent_shape,
-                patch_size=patch_size,
-            )
+            if self.attn_backend.get_enum() == AttentionBackendEnum.RAIN_FUSION_ATTN_V2:
+                # Pure-video attention uses the patch grid. Joint attention
+                # must supply the actual layout, never infer text from S-T*H*W.
+                metadata_kwargs = dict(sparse_config)
+                metadata_kwargs.update(
+                    current_timestep=i,
+                    num_steps=None if timesteps is None else len(timesteps),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
+                if metadata_kwargs.get("video_spans") is not None:
+                    metadata_kwargs["raw_latent_shape"] = None
+                attn_metadata = self.attn_metadata_builder.build(**metadata_kwargs)
+            else:
+                attn_metadata = self.attn_metadata_builder.build(
+                    current_timestep=i,
+                    skip_first_steps=sparse_config.get("skip_first_steps", 10),
+                    sparsity=sparse_config.get("sparsity", 0.2),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
         else:
             # attn_metadata can be None for SDPA attention backend
             return None

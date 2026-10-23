@@ -801,6 +801,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                         attn_metadata=attn_metadata,
                         build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                        num_steps=len(sigmas_video) - 1,
                     ),
                     positive=positive,
                     initial_video_rows=initial_video,
@@ -855,6 +856,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         batch: Req,
         attn_metadata: CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
+        num_steps: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -862,6 +864,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             set_forward_context,
         )
 
+        # H3 resolves transformer component overrides lazily, so its actual
+        # model backend may differ from the stage's default metadata backend.
+        backend_enum = getattr(model, "_resolved_attention_backend", None)
+        if not isinstance(backend_enum, AttentionBackendEnum):
+            backend = getattr(self, "attn_backend", None)
+            backend_enum = backend.get_enum() if backend is not None else None
+        if backend_enum == AttentionBackendEnum.RAIN_FUSION_ATTN_V2:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn_v2 import (
+                RainFusionAttentionV2MetadataBuilder,
+            )
+
+            packed_params = call_kwargs["packed_seq_params"]
+            metadata_kwargs = dict(self.server_args.attention_backend_config or {})
+            metadata_kwargs.update(
+                current_timestep=step_index,
+                num_steps=num_steps,
+                video_spans=packed_params.get("video_spans"),
+            )
+            attn_metadata = RainFusionAttentionV2MetadataBuilder().build(
+                **metadata_kwargs
+            )
         with set_forward_context(
             current_timestep=step_index,
             attn_metadata=(
@@ -1072,7 +1095,7 @@ def _build_packed_layout(
     emb: Mapping[str, Any],
     *,
     include_video_pos: bool = False,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Build the per-task packed layout for the positive branch."""
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (

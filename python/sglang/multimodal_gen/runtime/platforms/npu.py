@@ -137,6 +137,14 @@ class NPUPlatformBase(Platform):
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
+        elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN_V2:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn_v2 import (  # noqa: F401
+                RainFusionAttentionV2Backend,
+            )
+
+            logger.info("Using MindIE-SD Rain Fusion Attention V2 backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn_v2.RainFusionAttentionV2Backend"
+
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
