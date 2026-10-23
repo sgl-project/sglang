@@ -24,7 +24,8 @@ from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_
 @pytest.mark.parametrize(
     "invalid", ["pickle", "truncated", "protocol", "module", "empty", "cuda"]
 )
-def test_scheduler_isolates_invalid_messages_and_replies(invalid):
+@pytest.mark.parametrize("reply_blocked", [False, True])
+def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked):
     bad_ref = CudaIpcRef(
         dtype="invalid_dtype",
         shape=(1,),
@@ -67,14 +68,20 @@ def test_scheduler_isolates_invalid_messages_and_replies(invalid):
         after = Req(sampling_params=SamplingParams(prompt="after"))
         for message in (pickle.dumps([before]), payload, pickle.dumps([after])):
             client.send_multipart([b"", message])
+        if reply_blocked:
+            scheduler.receiver = MagicMock(wraps=receiver)
+            scheduler.receiver.send_multipart.side_effect = zmq.Again()
         items = scheduler.recv_reqs()
         assert [req.prompt for _, req in items] == ["before", "after"]
-        assert client.poll(1000)
-        reply = client.recv_multipart()
-        assert reply[0] == b""
-        result = pickle.loads(reply[1])
-        assert isinstance(result, OutputBatch)
-        assert result.error.startswith("Invalid scheduler request:")
+        if reply_blocked:
+            scheduler.receiver.send_multipart.assert_called_once()
+        else:
+            assert client.poll(1000)
+            reply = client.recv_multipart()
+            assert reply[0] == b""
+            result = pickle.loads(reply[1])
+            assert isinstance(result, OutputBatch)
+            assert result.error.startswith("Invalid scheduler request:")
         client.send_multipart([b"", pickle.dumps([after])])
         assert scheduler.recv_reqs()[0][1].prompt == "after"
     finally:
