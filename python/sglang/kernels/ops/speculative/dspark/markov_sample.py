@@ -9,8 +9,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
-from sglang.srt.utils import is_npu
+from sglang.kernels.ops.sampling import renorm
+from sglang.kernels.ops.speculative.dspark.dispatch import (
+    inputs_on_cuda,
+    inputs_on_npu,
+)
 
 # Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
@@ -19,8 +22,6 @@ _NO_INDEX = tl.constexpr(2147483647)
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _PHILOX_ROUNDS = 10
 _ROUND_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
-
-_is_npu = is_npu()
 
 
 @triton.jit
@@ -245,12 +246,8 @@ class MarkovSampleStep:
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(**kwargs):
-            return cls.triton(**kwargs)
-        if _is_npu and kwargs["base_logits"].device.type == "npu":
-            from sglang.kernels.ops.sampling.renorm import markov_sample_step
-
-            return markov_sample_step(**kwargs)
+        if inputs_on_cuda(**kwargs) or inputs_on_npu(**kwargs):
+            return renorm.markov_sample_step(**kwargs)
         return cls.torch(**kwargs)
 
     @staticmethod
@@ -451,6 +448,3 @@ class MarkovSampleStep:
         maximum = finite.amax(dim=-1, keepdim=True)
         wins = torch.where(has_nan, nan, valid & (finite == maximum))
         return torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
-
-
-markov_sample_step = MarkovSampleStep.execute

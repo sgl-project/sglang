@@ -8,9 +8,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
+from sglang.kernels.ops.sampling import renorm
+from sglang.kernels.ops.speculative.dspark.dispatch import (
+    inputs_on_cuda,
+    inputs_on_npu,
+)
 
 _IDX_SENTINEL = tl.constexpr(2147483647)
 _MARKOV_BLOCK_V = 256
@@ -38,13 +40,7 @@ class MarkovGreedyStep:
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
-        if _is_npu and base_logits.device.type == "npu":
-            from sglang.kernels.ops.sampling.renorm import markov_greedy_step_triton
-
-            return markov_greedy_step_triton(
-                base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
-            )
-        if base_logits.is_cuda:
+        if inputs_on_cuda(base_logits) or inputs_on_npu(base_logits):
             return cls.triton(
                 base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
             )
@@ -72,7 +68,7 @@ class MarkovGreedyStep:
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
-        return markov_greedy_step_triton(
+        return renorm.markov_greedy_step_triton(
             base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
         )
 

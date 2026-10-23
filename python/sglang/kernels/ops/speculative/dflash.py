@@ -4,6 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling import renorm
+from sglang.kernels.ops.speculative.dspark.dispatch import (
+    inputs_on_cuda,
+    inputs_on_npu,
+)
+
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
@@ -380,31 +386,31 @@ def compute_dflash_correct_drafts_and_bonus(
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
-    if candidates.device.type == "npu":
-        from sglang.kernels.ops.sampling.renorm import (
-            compute_dflash_correct_drafts_and_bonus as npu_correct_drafts_and_bonus,
-        )
-
-        return npu_correct_drafts_and_bonus(
+    if inputs_on_cuda(candidates) or inputs_on_npu(candidates):
+        return renorm.compute_dflash_correct_drafts_and_bonus(
             candidates=candidates, target_predict=target_predict
         )
-
-    if candidates.is_cuda:
-        num_correct_drafts = torch.empty(
-            bs, dtype=torch.int32, device=candidates.device
-        )
-        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
-        _fused_correct_drafts_and_bonus_kernel[(bs,)](
-            candidates.contiguous(),
-            target_predict.contiguous(),
-            num_correct_drafts,
-            bonus_tokens,
-            block_size,
-            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
-        )
-        return num_correct_drafts, bonus_tokens
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+
+def _compute_dflash_correct_drafts_and_bonus_triton(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bs, block_size = candidates.shape
+    num_correct_drafts = torch.empty(bs, dtype=torch.int32, device=candidates.device)
+    bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
+    _fused_correct_drafts_and_bonus_kernel[(bs,)](
+        candidates.contiguous(),
+        target_predict.contiguous(),
+        num_correct_drafts,
+        bonus_tokens,
+        block_size,
+        BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
+    )
+    return num_correct_drafts, bonus_tokens

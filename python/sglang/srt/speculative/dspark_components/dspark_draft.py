@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.sampling.renorm import markov_sample_step
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -220,7 +220,7 @@ def _draft_step(
             gather_logits=shard.gather,
         )
     )
-    tokens = markov_sample_step(
+    tokens = MarkovSampleStep.execute(
         base_logits=base_logits,
         bias=bias,
         temperatures=temperatures,

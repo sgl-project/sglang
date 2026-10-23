@@ -50,9 +50,12 @@ if is_npu():
     )
     softmax_temp_triton = LazyImport("sgl_kernel_npu.sample", "softmax_temp_triton")
 else:
-    markov_sample_step = LazyImport(
-        "sglang.kernels.ops.speculative.dspark.markov_sample", "markov_sample_step"
-    )
+
+    def markov_sample_step(**kwargs):
+        from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+
+        return MarkovSampleStep.triton(**kwargs)
+
     markov_greedy_step_triton = LazyImport(
         "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
         "markov_greedy_step_triton",
@@ -60,7 +63,7 @@ else:
     row_argmax = LazyImport("sglang.kernels.ops.speculative.row_argmax", "row_argmax")
     compute_dflash_correct_drafts_and_bonus = LazyImport(
         "sglang.kernels.ops.speculative.dflash",
-        "compute_dflash_correct_drafts_and_bonus",
+        "_compute_dflash_correct_drafts_and_bonus_triton",
     )
     softmax_temp_triton = LazyImport(
         "sglang.kernels.ops.speculative.dspark.dspark_accept", "softmax_temp_triton"

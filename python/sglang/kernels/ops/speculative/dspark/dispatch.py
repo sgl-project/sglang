@@ -12,3 +12,11 @@ def inputs_on_cuda(*args, **kwargs) -> bool:
         if isinstance(value, torch.Tensor):
             return value.is_cuda
     raise AssertionError("kernel dispatch requires at least one tensor argument")
+
+
+def inputs_on_npu(*args, **kwargs) -> bool:
+    """Return whether the first tensor argument is on an NPU."""
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, torch.Tensor):
+            return value.device.type == "npu"
+    raise AssertionError("kernel dispatch requires at least one tensor argument")

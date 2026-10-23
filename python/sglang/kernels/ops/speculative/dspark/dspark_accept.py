@@ -8,10 +8,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling import renorm
 from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import (
+    inputs_on_cuda,
+    inputs_on_npu,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -278,11 +282,8 @@ except ImportError:
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        logits = kwargs.get("logits", args[0] if args else None)
-        if _is_npu and logits.device.type == "npu":
-            from sglang.kernels.ops.sampling.renorm import softmax_temp_triton
-
-            return softmax_temp_triton(*args, **kwargs)
+        if inputs_on_npu(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
@@ -311,7 +312,7 @@ class SoftmaxTemp:
         temperatures: torch.Tensor,
         rows_per_request: int,
     ) -> torch.Tensor:
-        return softmax_temp_triton(
+        return renorm.softmax_temp_triton(
             logits=logits,
             temperatures=temperatures,
             rows_per_request=rows_per_request,
@@ -689,34 +690,27 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
-    if (
-        _is_npu
-        and logits.device.type == "npu"
-        and logits.ndim == 2
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
-    ):
-        from sglang.kernels.ops.sampling.renorm import row_argmax
-
-        return row_argmax(logits)
     # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
     # off the memory the reduction touches. The fused kernel does not reproduce
     # torch.argmax's NaN selection, hence the opt-in.
     if (
-        fused
-        and logits.is_cuda
-        and logits.dim() == 2
+        logits.dim() == 2
         and logits.dtype == torch.float32
         and logits.stride(1) == 1
         and (
-            logits.shape[0] <= 64
-            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+            inputs_on_npu(logits)
+            or (
+                fused
+                and logits.is_cuda
+                and (
+                    logits.shape[0] <= 64
+                    or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+                )
+                and logits.shape[1] >= 4096
+            )
         )
-        and logits.shape[1] >= 4096
     ):
-        from sglang.kernels.ops.speculative.row_argmax import row_argmax
-
-        return row_argmax(logits)
+        return renorm.row_argmax(logits)
     return torch.argmax(logits, dim=-1)
 
 
