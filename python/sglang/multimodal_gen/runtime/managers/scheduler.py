@@ -1162,6 +1162,9 @@ class Scheduler(
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
+                output_image_bytes=self._slice_batched_value(
+                    output_batch.output_image_bytes, start, end, total_items
+                ),
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items

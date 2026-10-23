@@ -1013,6 +1013,11 @@ jobs:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           #
+          # Skips ltx_2_5_diffusion_decoder_2gpus: on mi300 its server has never
+          # finished warmup inside the 1200s startup deadline, and the harness
+          # retries that TimeoutError six times, running the shard into the
+          # step timeout.
+          #
           # Retry deadline: see the 1-GPU job.
           RETRY_DEADLINE=$(( $(date +%s) + (STEP_TIMEOUT_MINUTES - 5) * 60 ))
           docker exec \
@@ -1035,6 +1040,7 @@ jobs:
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
+              -k "not ltx_2_5_diffusion_decoder" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
