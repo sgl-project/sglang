@@ -1,5 +1,6 @@
 import pickle
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
@@ -25,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
+    msgpack_decode,
+    msgpack_encode,
     unwrap_from_pickle,
     wrap_as_pickle,
 )
@@ -293,6 +296,31 @@ class TestMultiTokenizerMixin(CustomTestCase):
             self.assertEqual(
                 _handle_output_by_index(output, i).indexer_topk_num_layers, 7
             )
+
+    def test_batch_str_output_keeps_raw_replay_tensors(self):
+        """Output-store requests read these tensors after IPC and the per-worker split."""
+        output = _make_batch_str_output()
+        output.output_ids = [array("q", [1]), array("q", [2])]
+        routed = torch.tensor([[[3, 4]]], dtype=torch.int32)
+        indexer = torch.zeros((1, 2, 3), dtype=torch.int32)
+        output.routed_experts_raw = [routed, None]
+        output.indexer_topk_raw = [None, indexer]
+
+        for codec, round_trip in {
+            "pickle": lambda x: pickle.loads(pickle.dumps(x)),
+            "msgpack": lambda x: msgpack_decode(msgpack_encode(x)),
+        }.items():
+            with self.subTest(codec=codec):
+                received = round_trip(output)
+                first = _handle_output_by_index(received, 0)
+                second = _handle_output_by_index(received, 1)
+                self.assertTrue(torch.equal(first.routed_experts_raw[0], routed))
+                self.assertEqual(first.indexer_topk_raw, [None])
+                self.assertEqual(second.routed_experts_raw, [None])
+                self.assertTrue(torch.equal(second.indexer_topk_raw[0], indexer))
+                grouped = _handle_output_by_indices(received, [1, 0])
+                self.assertEqual(grouped.routed_experts_raw[0], None)
+                self.assertTrue(torch.equal(grouped.routed_experts_raw[1], routed))
 
     def test_batch_str_output_without_weight_versions_stays_none(self):
         """An output from an older server without the field splits into None."""

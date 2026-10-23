@@ -109,6 +109,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.output_store import OUTPUT_STORE_REF_KEY
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -1121,6 +1122,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_indexer_topk and not request.return_meta_info:
             return "return_indexer_topk requires return_meta_info=true."
 
+        if request.return_outputs_via_store and not request.return_meta_info:
+            return "return_outputs_via_store requires return_meta_info=true."
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
@@ -1396,6 +1400,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             return_indexer_topk=request.return_indexer_topk,
+            return_outputs_via_store=request.return_outputs_via_store,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,
@@ -2825,13 +2830,28 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
-
+        try:
+            response = self._build_chat_response(
+                request,
+                ret,
+                int(time.time()),
+            )
+        except Exception:
+            self._cleanup_stored_outputs(ret)
+            raise
+        if not isinstance(response, ChatCompletionResponse):
+            self._cleanup_stored_outputs(ret)
         return response
+
+    def _cleanup_stored_outputs(self, ret: list[dict[str, Any]]) -> None:
+        """The response is an error, so nobody can read the outputs it stored."""
+        refs = [
+            item["meta_info"][OUTPUT_STORE_REF_KEY]
+            for item in ret
+            if OUTPUT_STORE_REF_KEY in item["meta_info"]
+        ]
+        if refs:
+            self.tokenizer_manager.output_store.cleanup_refs(refs)
 
     def _build_chat_response(
         self,
