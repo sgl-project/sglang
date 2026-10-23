@@ -1870,14 +1870,14 @@ class CheckpointReqType(Enum):
 
 
 class CheckpointState(str, Enum):
-    """Process checkpoint lifecycle of a scheduler; it serves only while
-    RUNNING, and may go through the cycle any number of times."""
+    """Process checkpoint state of a scheduler. It serves only while RUNNING
+    and may go through the cycle any number of times."""
 
     RUNNING = "running"
     PREPARING = "preparing"
     # Safe to capture.
     PREPARED = "prepared"
-    # Only across DP ranks: some resumed, others still prepared.
+    # Only across ranks, while some resumed and others are still prepared.
     RESUMING = "resuming"
     FAILED = "failed"
 
@@ -1889,9 +1889,26 @@ class CheckpointReqInput(BaseReq, kw_only=True):
 class CheckpointReqOutput(BaseReq, kw_only=True):
     # False when the request was refused, with nothing changed.
     success: bool
-    # Why it was refused, or why the lifecycle failed.
+    # Why it was refused, or why preparing or resuming failed.
     message: str = ""
     state: CheckpointState
+
+    @staticmethod
+    def merge(outputs: List[CheckpointReqOutput]) -> CheckpointReqOutput:
+        """One output for several ranks, which may be mid-transition. Failed if
+        any failed, otherwise the state all share or the transition."""
+        states = {out.state for out in outputs}
+        if CheckpointState.FAILED in states:
+            state = CheckpointState.FAILED
+        elif len(states) == 1:
+            state = states.pop()
+        elif CheckpointState.PREPARING in states:
+            state = CheckpointState.PREPARING
+        else:
+            state = CheckpointState.RESUMING
+        refused = [out for out in outputs if not out.success]
+        message = next((out.message for out in refused or outputs if out.message), "")
+        return CheckpointReqOutput(success=not refused, message=message, state=state)
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
