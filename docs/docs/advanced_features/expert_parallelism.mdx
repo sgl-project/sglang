@@ -138,10 +138,6 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
   </tbody>
 </table>
 
-On NVIDIA SM100/SM103 GPUs, you can keep MoE activations in BF16 while storing weights in NVFP4 (W4A16). Set `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1` with `--moe-runner-backend flashinfer_cutedsl` and `--moe-a2a-backend none` or `flashinfer`. The FlashInfer all-to-all path requires BF16 dispatch. The same switch also supports `flashinfer_megamoe`; see the [environment-variable reference](/docs/references/environment_variables) for its backend and parallelism requirements.
-
-This mode avoids activation quantization while retaining four-bit weight storage. FlashInfer dequantizes weights inside the MoE kernels and overlaps weight preparation with computation, targeting memory-bound decode. For the kernel design and benchmarks, see [Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode), by Ziang Li at humans& ai.
-
 ### Examples
 
 Launch with DeepEP and DeepGEMM for DeepSeek-V3:
