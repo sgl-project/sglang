@@ -3,9 +3,9 @@
 Two capture-trace modes plus their precedence:
 
   * **Original single-trace** (``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE``):
-    ``_init_profile_context_and_memory_record`` builds an *unscheduled* profiler
+    ``create_cuda_capture_profile`` builds an *unscheduled* profiler
     (``record_shapes`` only, no schedule / no ``on_trace_ready``); the combined
-    trace is exported in ``_post_process_after_profile`` via
+    trace is exported in ``finish_cuda_capture_profile`` via
     ``export_cuda_graph_capture_trace``.
   * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
     profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
@@ -29,10 +29,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner_backend import capture_profile as mod
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,7 +45,7 @@ _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
 
 def _make_fake_self(capture_bs):
     """Stand-in ``self`` with the real precedence helper bound so the env-var
-    gating in ``_init_profile_context_and_memory_record`` applies."""
+    gating in ``create_cuda_capture_profile`` applies."""
     fake_self = SimpleNamespace(capture_bs=list(capture_bs))
     fake_self._graph_batch_capture_active = (
         DecodeCudaGraphRunner._graph_batch_capture_active.__get__(fake_self)
@@ -59,6 +59,17 @@ def _make_fake_self(capture_bs):
         fake_self
     )
     return fake_self
+
+
+def _profile_options(runner):
+    per_shape = runner._graph_batch_capture_active()
+    if per_shape:
+        runner._profile_trace_tag = None
+    return mod.CaptureProfileOptions(
+        runner_name=runner._profile_runner_name(),
+        per_shape=per_shape,
+        get_trace_tag=lambda: getattr(runner, "_profile_trace_tag", None),
+    )
 
 
 def _make_runner(cls, *, is_draft_worker):
@@ -91,9 +102,7 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.environ.pop(_CAPTURE_TRACE, None)  # original flag off
             if profiler_dir is None:
                 os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
-            ctx = DecodeCudaGraphRunner._init_profile_context_and_memory_record(
-                fake_self
-            )
+            ctx = mod.create_cuda_capture_profile(_profile_options(fake_self))
         self.assertIs(ctx, mock_profile.return_value)
         return fake_self, mock_profile, mock_schedule, mock_record_history
 
@@ -129,7 +138,7 @@ class TestInitProfileOriginalMode(CustomTestCase):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
                         os.environ.pop(k, None)
-                DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
+                mod.create_cuda_capture_profile(_profile_options(fake_self))
             kwargs = mock_profile.call_args.kwargs
             # Unscheduled pass: record_shapes only, no schedule / on_trace_ready.
             self.assertTrue(kwargs["record_shapes"])
@@ -169,7 +178,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             mock.patch("torch.cuda.memory._record_memory_history"),
         ):
             os.environ.pop(_CAPTURE_TRACE, None)
-            DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
+            mod.create_cuda_capture_profile(_profile_options(fake_self))
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
         return fake_self, on_trace_ready
 
@@ -366,6 +375,24 @@ class TestOriginalTraceExport(CustomTestCase):
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
                 )
+
+
+class TestCudaProfileFinalization(CustomTestCase):
+    def test_snapshot_history_and_trace_export_are_backend_owned(self):
+        options = mod.CaptureProfileOptions(
+            runner_name="TargetRunner", per_shape=False, get_trace_tag=lambda: None
+        )
+        prof = mock.Mock()
+        prof.key_averages.return_value.table.return_value = "profile summary"
+        with (
+            mock.patch("torch.cuda.memory._dump_snapshot") as dump,
+            mock.patch("torch.cuda.memory._record_memory_history") as history,
+            mock.patch.object(mod, "export_cuda_graph_capture_trace") as export,
+        ):
+            mod.finish_cuda_capture_profile(options, prof)
+        dump.assert_called_once_with("cuda_graph_runner_memory_usage.pickle")
+        history.assert_called_once_with(enabled=None)
+        export.assert_called_once_with(prof, runner_name="TargetRunner")
 
 
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):
