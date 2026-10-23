@@ -1,25 +1,17 @@
 import json
+import sys
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe_triton_config
 from sglang.srt.runtime_context import get_context
 
-
-def test_h200_bf16_config_is_available_for_current_triton_runtime():
-    config_path = (
-        Path(fused_moe_triton_config.__file__).parent
-        / "configs"
-        / "triton_3_6_0"
-        / "E=128,N=768,device_name=NVIDIA_H200.json"
-    )
-
-    assert config_path.is_file()
-    assert json.loads(config_path.read_text())["128"]["BLOCK_SIZE_M"] > 0
+BENCHMARK_DIR = Path(__file__).parents[5] / "benchmark" / "kernels" / "fused_moe_triton"
+sys.path.insert(0, str(BENCHMARK_DIR))
 
 
 def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -55,12 +56,8 @@ def _runtime_scaffolding():
     if not torch.distributed.is_initialized():
         init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
     if not model_parallel_is_initialized():
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
+        publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
+        initialize_model_parallel(backend="gloo")
 
 
 def _interleave_w13_rows(w13: torch.Tensor) -> torch.Tensor:
@@ -277,9 +274,9 @@ def test_fused_swiglu_alpha_matches_unfused_bitwise(
     # no-ops, so an unchanged output would mean these cases never clamped and
     # would pass even if the kernel dropped the clamps entirely.
     unclamped = _run(True, 1.0e30)
-    assert not torch.equal(
-        got, unclamped
-    ), "clamp never engaged; raise the weight scale"
+    assert not torch.equal(got, unclamped), (
+        "clamp never engaged; raise the weight scale"
+    )
 
     mismatch = (got.view(torch.int16) != ref.view(torch.int16)).sum().item()
     assert mismatch == 0, f"{mismatch}/{ref.numel()} output elements differ"

@@ -234,8 +234,7 @@ class Magi2MultiHeadMoE(nn.Module):
         super().__init__()
         if hidden_size % num_heads:
             raise ValueError(
-                f"hidden_size {hidden_size} must be divisible by num_heads "
-                f"{num_heads}"
+                f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
             )
 
         self.ep_group = ep_group

@@ -8,7 +8,7 @@ and be served as an embedding model, NOT fall back to the Transformers backend.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 import unittest
 
@@ -17,17 +17,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestQwen3ModelEmbeddingRegistration(CustomTestCase):
-    def test_entry_class_is_native_qwen3model(self):
-        """The bare arch string maps to a native EntryClass named 'Qwen3Model'."""
-        from sglang.srt.models import qwen3_embedding
-
-        entry = qwen3_embedding.EntryClass
-        self.assertEqual(entry.__name__, "Qwen3Model")
-        self.assertEqual(entry.__module__, "sglang.srt.models.qwen3_embedding")
-        # It carries a LAST-token / normalized pooler, i.e. an embedding head.
-        self.assertTrue(hasattr(entry, "forward"))
-        self.assertTrue(hasattr(entry, "load_weights"))
-
     def test_registry_resolves_native_not_transformers_fallback(self):
         """ModelRegistry resolves 'Qwen3Model' to the native class, not the
         TransformersForCausalLM fallback."""

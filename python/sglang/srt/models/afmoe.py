@@ -46,7 +46,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -78,7 +78,6 @@ def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]
 
 
 class AfmoeMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -118,7 +117,6 @@ class AfmoeMLP(nn.Module):
 
 
 class AfmoeMoE(nn.Module):
-
     @staticmethod
     def _custom_routing_function(
         hidden_states: torch.Tensor,
@@ -154,12 +152,12 @@ class AfmoeMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
 
         self.n_routed_experts = getattr(config, "num_experts", None)
@@ -236,6 +234,7 @@ class AfmoeMoE(nn.Module):
         renormalize = self.route_norm if self.score_func == "sigmoid" else False
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=renormalize,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.n_group if self.use_grouped_topk else None,
@@ -251,6 +250,7 @@ class AfmoeMoE(nn.Module):
                 if _is_npu
                 else {}
             ),
+            output_format=TopKOutputFormat.STANDARD,
         )
 
     def pack_params(self) -> None:
@@ -300,7 +300,6 @@ class AfmoeMoE(nn.Module):
 
 
 class AfmoeAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -421,7 +420,6 @@ class AfmoeAttention(nn.Module):
 
 
 class AfmoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -459,6 +457,7 @@ class AfmoeDecoderLayer(nn.Module):
         if use_moe:
             self.mlp = AfmoeMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -499,7 +498,6 @@ class AfmoeDecoderLayer(nn.Module):
 
 
 class AfmoeModel(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -555,7 +553,6 @@ class AfmoeModel(nn.Module):
 
 
 class AfmoeForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

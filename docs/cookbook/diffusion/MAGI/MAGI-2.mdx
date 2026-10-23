@@ -5,7 +5,35 @@ metatags:
     description: "Serve MAGI-2-preview with SGLang Diffusion for text-to-video-and-audio and image+text-to-video-and-audio, with expert parallelism over its multi-head MoE DiT and a two-stage 1080p refiner."
 ---
 
-## 1. Model introduction
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video + audio", "T2VA / TI2V", "mixture-of-experts", "114B-A6B", "1080p"]} />
+
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/SandAI/magi-2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform. On CUDA:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+<a id="2-installation" />
+
+<Deployment config={config} />
+
+The 8-GPU recipe reads its expert-parallel degree from a pipeline configuration
+file, since `ep_size` has no CLI flag. Create it before launching:
+
+```bash Command
+echo '{"ep_size": 4}' > magi2-ep4.json
+```
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [MAGI-2-preview](https://huggingface.co/sand-ai/MAGI-2-preview) is a 114B-parameter
 mixture-of-experts diffusion model from SandAI that generates a video and its
@@ -18,13 +46,49 @@ Generation is text-to-video-and-audio, or image-plus-text-to-video-and-audio
 finished video: the video and audio latents share one packed sequence and one
 denoise loop.
 
+<Warning>
+Review the license and usage terms on the MAGI-2-preview model card before
+production or commercial use. SGLang support does not grant additional model
+usage rights.
+</Warning>
+
 One root checkpoint holds two DiT partitions, which SGLang loads as separate
 components rather than as separate model IDs:
 
-| Partition | Layers | Hidden | Attention | MLP |
-| --- | ---: | ---: | --- | --- |
-| Preview DiT | 40 | 3072 | 24 heads with attention sinks, 4-stream hyper-connections | 12-head MoE over 256 experts, top-6 |
-| Refiner DiT | 30 | 4096 | 32 heads, GQA with 8 query groups, block-window local attention in every layer | Dense |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Partition</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Layers</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hidden</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>MLP</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>40</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3072</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>24 heads with attention sinks, 4-stream hyper-connections</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>12-head MoE over 256 experts, top-6</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4096</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 heads, GQA with 8 query groups, block-window local attention in every layer</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense</td>
+    </tr>
+  </tbody>
+</table>
 
 Use the root model ID `sand-ai/MAGI-2-preview`. SGLang owns the mapping from that
 root to the preview weights, refiner weights, video VAE, distilled turbo decoder,
@@ -33,10 +97,36 @@ subdirectory.
 
 ### Quality tiers
 
-| Tier | Delivered geometry | Delivered rate | Passes |
-| --- | --- | ---: | --- |
-| Preview only | 896x512 | 12.5 fps | Preview DiT |
-| Two-stage 1080p (default) | 1920x1088 | 25 fps | Preview DiT, then refiner |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Tier</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Delivered geometry</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Delivered rate</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Passes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview only</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>896x512</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>12.5 fps</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Preview DiT</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Two-stage 1080p (default)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1920x1088</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>25 fps</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Preview DiT, then refiner</td>
+    </tr>
+  </tbody>
+</table>
 
 Both tiers produce a 10-second clip with joint stereo audio at 44100 Hz. The
 default two-stage tier delivers 249 frames: the preview pass generates at
@@ -46,22 +136,6 @@ stride, which doubles the delivered frame rate.
 The output canvas is 1088 tall rather than 1080 because the VAE stride forces
 every spatial dimension to a multiple of 16. Only the two resolutions above are
 accepted; any other `width`/`height` pair is rejected before denoising.
-
-<Warning>
-Review the license and usage terms on the MAGI-2-preview model card before
-production or commercial use. SGLang support does not grant additional model
-usage rights.
-</Warning>
-
-## 2. Installation
-
-Install SGLang with the diffusion dependencies:
-
-```bash Command
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
 ## 3. Parallelism
 
@@ -75,12 +149,42 @@ makes 8 ranks work, since 8 does not divide the 12 MoE heads.
 on all of them. The MoE heads are sharded by `ep_size` instead, so they are checked
 against that. All four are checked at launch rather than deep inside a collective:
 
-| Axis | Count | Divided by |
-| --- | ---: | --- |
-| Preview attention heads | 24 | `--num-gpus` |
-| Refiner attention heads | 32 | `--num-gpus` |
-| Refiner key/value heads (GQA) | 8 | `--num-gpus` |
-| Preview MoE heads | 12 | `ep_size` |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Axis</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Count</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Divided by</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview attention heads</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-gpus`</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner attention heads</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-gpus`</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner key/value heads (GQA)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-gpus`</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview MoE heads</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>12</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`ep_size`</td>
+    </tr>
+  </tbody>
+</table>
 
 Divisibility alone does not make a count usable, because the expert weights also
 have to fit. The 114B headline is the preview partition — 113.9B parameters, 228 GB
@@ -88,12 +192,42 @@ in BF16 — and only its expert tensors shard; the 6.7B refiner is separate and 
 replicated on every rank. Measured on 143 GB H200 cards, two-stage 1080p tier, 100
 preview plus 5 refiner steps, steady-state clip:
 
-| GPUs | `ep_size` | Result |
-| ---: | ---: | --- |
-| 8 | 4 | **253s**, run eager — see below |
-| 4 | 4 (default) | **348s** compiled, the recommended default |
-| 2 | 2 | **689s**, requires `--dit-layerwise-offload` |
-| 1 | 1 | out of memory while loading weights |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>`ep_size`</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Result</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>**253s**, run eager — see below</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 (default)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>**348s** compiled, the recommended default</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>**689s**, requires `--dit-layerwise-offload`</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>out of memory while loading weights</td>
+    </tr>
+  </tbody>
+</table>
 
 **Use 4 GPUs unless you have a reason not to.** 8 is 1.37x faster per clip but
 spends 46% more GPU-time to get there, so it buys latency rather than throughput;
@@ -116,17 +250,46 @@ The denoise loop runs both CFG branches itself, so SGLang must not also split CF
 across ranks. Passing `--enable-cfg-parallel` is rejected rather than silently
 double-applied.
 
+Data parallelism (`--dp-size` greater than 1) and every attention backend other
+than FlashAttention are also rejected at startup.
+
 Tensor parallelism is rejected too. No layer in either DiT is column- or
 row-parallel, so `--tp-size` shards nothing and only takes ranks away from
 Ulysses. Measured at 896x512, 20 steps on 4x H200. These are whole-stage times
 including per-process warmup, so do not divide them into a per-step cost and
 compare against the 100-step figures in section 8:
 
-| Configuration | Time | Per-rank memory |
-| --- | ---: | ---: |
-| `--ulysses-degree 4` | **124s** | 85 GB |
-| `--tp-size 2 --ulysses-degree 2` | 206s | 120-133 GB |
-| `--tp-size 4 --ulysses-degree 1` | 608s | 135 GB |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Configuration</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Time</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Per-rank memory</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ulysses-degree 4`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**124s**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>85 GB</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tp-size 2 --ulysses-degree 2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>206s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>120-133 GB</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tp-size 4 --ulysses-degree 1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>608s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>135 GB</td>
+    </tr>
+  </tbody>
+</table>
 
 The memory column is per-rank device memory observed during denoise, which is a
 different metric from the runtime's own `Max peak` quoted in section 8; read the
@@ -346,18 +509,84 @@ refiner steps, one 10-second clip, seed and prompt held fixed. Each column is th
 topology's best configuration, and all are steady state, so the first clip of a
 process costs more while its graphs build:
 
-| Phase | 2 GPUs | 4 GPUs | 8 GPUs |
-| --- | ---: | ---: | ---: |
-| `ep_size` | 2 | 4 | 4 |
-| Compile | regional | regional | **none** |
-| Offload | layerwise | none | none |
-| Preview denoise (100 steps) | 590.4 s | 286.9 s | 183.9 s |
-| Preview-to-refiner handoff | &lt;0.2 s | &lt;0.2 s | &lt;0.2 s |
-| Refiner denoise (5 steps) | 79.4 s | 41.3 s | 31.6 s |
-| Decode (video and audio) | 7.1 s | 8.8 s | 12.2 s |
-| **Total** | **689 s** | **348 s** | **253 s** |
-| Peak memory | 132208 MiB | 85274 MiB | 126572 MiB |
-| GPU-seconds per clip | 1378 | 1393 | 2028 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Phase</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>2 GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>4 GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>8 GPUs</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`ep_size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Compile</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>regional</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>regional</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**none**</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Offload</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>layerwise</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>none</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>none</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview denoise (100 steps)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>590.4 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>286.9 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>183.9 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Preview-to-refiner handoff</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>&lt;0.2 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>&lt;0.2 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>&lt;0.2 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner denoise (5 steps)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>79.4 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>41.3 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>31.6 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Decode (video and audio)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>7.1 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8.8 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>12.2 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Total**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**689 s**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>**348 s**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**253 s**</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Peak memory</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>132208 MiB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>85274 MiB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>126572 MiB</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GPU-seconds per clip</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1378</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1393</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2028</td>
+    </tr>
+  </tbody>
+</table>
 
 Read the last row before choosing 8 GPUs: it is 1.37x faster per clip but spends 46%
 more GPU-time, while 2 and 4 GPUs cost the same GPU-seconds. Decode also moves the
@@ -389,3 +618,13 @@ a short caption costs about a second once those weights are in the page cache, w
 The preview pass — 2.9 s/step on four cards, 1.8 s/step on eight — dominates, so step
 count is the first knob for trading quality against latency; the refiner's 5 steps are
 not worth tuning first.
+
+## 9. Run in ComfyUI
+
+MAGI-2 has no ComfyUI route. The
+[SGLDiffusion plugin](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion)
+ships no MAGI-2 node and no integrated-mode executor for it. The generic
+`SGLDiffusion Generate Video` node has not been validated against this model,
+and its default request of 1280x720 and 120 frames at 24 fps is rejected by the
+geometry and clip-length checks in section 7. Use `sglang serve` or
+`sglang generate` directly.

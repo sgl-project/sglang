@@ -3,9 +3,12 @@
 
 Encoding recipes for user-provided reference materials:
 
-- image reference: independent 2048px short-edge resize with upscale enabled,
-  LANCZOS, and nearest-32 dimensions, then the SAME keyframe tokenizer recipe
-  as fl2va (seed-42 sampled encode, normalize, [1,2,2] patchify);
+- image reference: configurable ``match``, ``max``, or ``diffusers`` resizing
+  while preserving the display ratio, followed by LANCZOS and nearest-32
+  dimensions, then the SAME keyframe tokenizer recipe as fl2va (seed-42
+  sampled encode, normalize, [1,2,2] patchify). ``match`` follows the target
+  canvas pixel area without upscaling, ``max`` caps the short edge at 2048
+  without upscaling, and ``diffusers`` forces the short edge to 2048;
 - audio reference: the audio material chain (pure
   audio is losslessly normalized
   to stereo; video soundtracks are extracted as 44.1 kHz stereo), then a
@@ -34,8 +37,10 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica_group
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
@@ -125,21 +130,27 @@ def minimax_h3_resolve_reference_image_shape(
     *,
     width: int | float,
     height: int | float,
+    canvas_width: int | float,
+    canvas_height: int | float,
+    mode: str = "diffusers",
 ) -> dict[str, Any]:
-    """Resolve a ref2va image independently from the target canvas.
+    """Resolve a ref2va image with a selectable resize policy.
 
-    The image keeps its display ratio, always targets a 2048px short edge (even
-    when that requires upscaling), and rounds both dimensions independently to
-    the nearest 32px grid. Unlike target/video ``adapt_shape_v1``, reference
-    images have no area-cap branch.
+    All modes preserve the reference display ratio and round both dimensions
+    independently to the nearest 32px grid. ``match`` follows the target canvas
+    pixel area without upscaling a smaller reference, ``max`` only downsizes a
+    reference whose short edge exceeds 2048px, and ``diffusers`` always targets
+    a 2048px short edge, including by upscaling.
     """
 
     try:
         source_width = float(width)
         source_height = float(height)
+        canvas_width = float(canvas_width)
+        canvas_height = float(canvas_height)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "reference image width and height must be positive finite numbers"
+            "reference image and target canvas dimensions must be finite numbers"
         ) from exc
     if (
         not math.isfinite(source_width)
@@ -150,30 +161,67 @@ def minimax_h3_resolve_reference_image_shape(
         raise ValueError(
             "reference image width and height must be positive finite numbers"
         )
+    if (
+        not math.isfinite(canvas_width)
+        or not math.isfinite(canvas_height)
+        or canvas_width <= 0.0
+        or canvas_height <= 0.0
+    ):
+        raise ValueError(
+            "target canvas width and height must be positive finite numbers"
+        )
     if source_width > 4.0 * source_height or source_height > 4.0 * source_width:
         raise ValueError(
             "reference image ratio must be within the inclusive range "
             f"1:4 to 4:1, got {source_width:g}x{source_height:g}"
         )
+    mode = str(mode).strip().lower()
+    if mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+        raise ValueError(
+            "reference_resize_mode must be one of "
+            f"{sorted(MINIMAX_H3_REFERENCE_RESIZE_MODES)}, got {mode!r}"
+        )
 
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(source_width, source_height)
-    target_width = _nearest_multiple(
+    short_edge = min(source_width, source_height)
+    if mode == "match":
+        scale = min(
+            1.0,
+            math.sqrt((canvas_width * canvas_height) / (source_width * source_height)),
+        )
+    elif mode == "max":
+        scale = min(1.0, MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge)
+    else:  # diffusers
+        scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge
+
+    resolved_width = _nearest_multiple(
         source_width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
-    target_height = _nearest_multiple(
+    resolved_height = _nearest_multiple(
         source_height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
+    size_mode = {
+        "match": "target_area",
+        "max": "short_edge_cap",
+        "diffusers": "short_edge",
+    }[mode]
     return {
         "geometry": "reference_image_resolved",
-        "shape_policy_version": "reference_image_short_edge_v1",
+        "shape_policy_version": (
+            "reference_image_short_edge_v1"
+            if mode == "diffusers"
+            else f"reference_image_{mode}_v1"
+        ),
+        # Keep the legacy short-edge metadata for shape-schema compatibility.
+        # ``match`` does not use this value in its scale calculation.
         "base_short_edge": MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
-        "effective_short_edge": min(target_width, target_height),
-        "size_mode": "short_edge",
+        "effective_short_edge": min(resolved_width, resolved_height),
+        "reference_resize_mode": mode,
+        "size_mode": size_mode,
         "multiple": MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
         "rounding": "nearest",
-        "allow_upscale": True,
-        "width": target_width,
-        "height": target_height,
+        "allow_upscale": mode == "diffusers",
+        "width": resolved_width,
+        "height": resolved_height,
     }
 
 
@@ -321,7 +369,10 @@ def minimax_h3_encode_reference_audio_rows(
         waveform = _audio_resampler(int(source_rate))(waveform)
     waveform = waveform.to(device)
 
-    with _AudioVAEDeterminismContext():
+    with (
+        _AudioVAEDeterminismContext(),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
         audio_data = model.preprocess(
             waveform.unsqueeze(1), MINIMAX_H3_AUDIO_SAMPLE_RATE
         )
@@ -487,7 +538,7 @@ def _write_reference_video_to_fd(command: list[str], output_fd: int) -> int:
     return os.lseek(output_fd, 0, os.SEEK_CUR)
 
 
-def _all_gather_world_objects(group: Any, value: Any) -> list[Any]:
+def _all_gather_group_objects(group: Any, value: Any) -> list[Any]:
     values = [None] * group.world_size
     torch.distributed.all_gather_object(
         values,
@@ -499,14 +550,18 @@ def _all_gather_world_objects(group: Any, value: Any) -> list[Any]:
 
 @functools.lru_cache(maxsize=1)
 def _reference_video_host_leader() -> int:
-    group = get_world_group()
-    hostnames = _all_gather_world_objects(group, socket.gethostname())
+    group = get_replica_group()
+    hostnames = _all_gather_group_objects(group, socket.gethostname())
     return hostnames.index(hostnames[group.rank_in_group])
 
 
 def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
-    """Decode once per host and map the same RGB pages on its worker ranks."""
-    group = get_world_group()
+    """Decode once per host per replica; its worker ranks map the same RGB pages.
+
+    Collectives stay inside the request's pipeline replica: the world group
+    spans replicas when dp_size > 1 and only one replica runs this request.
+    """
+    group = get_replica_group()
     if (
         group.world_size <= 1
         or not sys.platform.startswith("linux")
@@ -544,7 +599,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
             owner_exception = exc
             leader_state = (None, 0, f"{type(exc).__name__}: {exc}")
 
-    states = _all_gather_world_objects(group, leader_state)
+    states = _all_gather_group_objects(group, leader_state)
     host_states = [state for state in states if state is not None]
     owner_error = next(
         (state[2] for state in host_states if state[2] is not None),
@@ -589,7 +644,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     except Exception as exc:
         map_error = f"{type(exc).__name__}: {exc}"
 
-    map_errors = _all_gather_world_objects(group, map_error)
+    map_errors = _all_gather_group_objects(group, map_error)
     failed = next((error for error in map_errors if error is not None), None)
     if is_leader:
         os.close(leader_fd)

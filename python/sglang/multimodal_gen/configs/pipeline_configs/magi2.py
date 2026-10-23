@@ -38,7 +38,7 @@ class Magi2PipelineConfig(PipelineConfig):
     skip_input_image_preprocess: bool = True
 
     # No model_index.json, so nothing loads through sglang's diffusers loaders.
-    native_only_components = (
+    native_only_components: tuple[str, ...] = (
         "text_encoder",
         "tokenizer",
         "transformer",
@@ -119,6 +119,20 @@ class Magi2PipelineConfig(PipelineConfig):
                 "--enable-cfg-parallel would double-apply the guidance"
             )
 
+        if server_args.attention_backend not in (None, "fa"):
+            raise ValueError(
+                "MAGI-2's preview DiT needs FlashAttention for its per-head sink "
+                f"logits; --attention-backend {server_args.attention_backend!r} "
+                "would drop them. Use --attention-backend fa or leave it unset."
+            )
+
+        if server_args.dp_size > 1:
+            raise ValueError(
+                "MAGI-2 builds its expert-parallel groups and head checks over the "
+                f"global world, which spans data-parallel replicas; --dp-size "
+                f"({server_args.dp_size}) must be 1"
+            )
+
         if server_args.tp_size > 1:
             raise ValueError(
                 f"MAGI-2 has no tensor-parallel layers; --tp-size "
@@ -165,3 +179,20 @@ class Magi2PipelineConfig(PipelineConfig):
                     f"({num_gpus}) must divide it. Valid counts are "
                     f"{[n for n in range(1, max(axes.values()) + 1) if all(c % n == 0 for c in axes.values())]}"
                 )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.magi2 import Magi2SamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Magi2SamplingParams,
+        pipeline_config_cls=Magi2PipelineConfig,
+        hf_model_paths=["sand-ai/MAGI-2-preview"],
+        model_detectors=[
+            lambda model_id: (
+                "magi-2-preview" in model_id.lower()
+                or "magi2-preview" in model_id.lower()
+            )
+        ],
+    )

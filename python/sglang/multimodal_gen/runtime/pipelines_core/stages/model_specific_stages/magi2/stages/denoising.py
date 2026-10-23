@@ -90,9 +90,13 @@ class Magi2DenoisingStage(DenoisingStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        _reject_unsupported_overrides(batch)
         if self.refiner_only and not batch.extra["magi2_enable_refiner"]:
             return batch
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
 
+    def _denoise(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
         video_scale, audio_scale, skimmed_scale = self._scales(batch)
         use_guidance = server_args.pipeline_config.should_use_guidance
@@ -175,3 +179,16 @@ class Magi2DenoisingStage(DenoisingStage):
         batch.latents = video
         batch.audio_latents = audio
         return batch
+
+
+def _reject_unsupported_overrides(batch: Req) -> None:
+    # The base stage applies these in _prepare_denoising_loop, which this loop never calls.
+    params = batch.sampling_params
+    for name, value in (
+        ("attention_backend_override", params.attention_backend_override),
+        ("skip_softmax_params", params.skip_softmax_params),
+    ):
+        if value is not None:
+            raise ValueError(
+                f"MAGI-2 does not support per-request {name}; got {value!r}"
+            )

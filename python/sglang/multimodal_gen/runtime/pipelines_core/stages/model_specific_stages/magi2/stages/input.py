@@ -32,12 +32,16 @@ def latent_grid(
     )
 
 
+def prompt_is_non_empty(value) -> bool:
+    return isinstance(value, str) and len(value.strip()) > 0
+
+
 class Magi2InputStage(PipelineStage):
     """Its own stage because the packing stage runs once per denoise pass and both instances need these numbers."""
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
-        result.add_check("prompt", batch.prompt, V.string_not_empty)
+        result.add_check("prompt", batch.prompt, prompt_is_non_empty)
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
         return result

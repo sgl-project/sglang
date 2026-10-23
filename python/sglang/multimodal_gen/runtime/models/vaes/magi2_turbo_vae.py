@@ -75,7 +75,6 @@ class Magi2TurboConv3d(nn.Module):
 
 
 class Magi2TurboDepthwiseConv3d(nn.Module):
-
     def __init__(
         self,
         *,
@@ -151,7 +150,6 @@ class Magi2TurboResnetBlock(nn.Module):
 
 
 class Magi2TurboUpsample(nn.Module):
-
     def __init__(self, *, dim: int, temporal: bool) -> None:
         super().__init__()
         self.temporal = temporal

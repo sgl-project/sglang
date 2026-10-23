@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=75, stage="base-b", runner_config="1-gpu-large")
 
 STDOUT_FILENAME = "post_capture_kv_sizing_stdout.log"
 STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"
@@ -47,6 +47,13 @@ class TestPostCaptureKVSizing(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={**os.environ, "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "1"},
             return_stdout_stderr=(cls.stdout, cls.stderr),
+            other_args=[
+                "--enable-hierarchical-cache",
+                "--hicache-mem-layout",
+                "page_first",
+                "--hicache-size",
+                "1",
+            ],
         )
 
     @classmethod
@@ -78,6 +85,10 @@ class TestPostCaptureKVSizing(CustomTestCase):
             "or the resize path did not run.",
         )
         self.assertGreater(float(m.group(1)), 0)
+        logs = self._server_logs()
+        staging = logs.find("HiCache staging prepared before KV sizing:")
+        self.assertGreaterEqual(staging, 0, "HiCache staging was not prepared")
+        self.assertLess(staging, m.start())
 
     def test_server_info_pool_sized(self):
         info = requests.get(f"{self.base_url}/server_info").json()

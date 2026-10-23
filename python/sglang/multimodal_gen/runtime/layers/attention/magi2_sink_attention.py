@@ -12,7 +12,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class Magi2SinkAttention(nn.Module):
@@ -67,20 +71,29 @@ class Magi2SinkAttention(nn.Module):
         backend = get_attn_backend(
             self.head_dim,
             dtype,
+            supported_attention_backends={AttentionBackendEnum.FA},
+            selected_attention_backend=AttentionBackendEnum.FA,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+        impl_cls = backend.get_impl_cls()
+        # The platform FA resolver can still hand back SDPA, which drops sinks.
+        if not issubclass(impl_cls, FlashAttentionImpl):
+            raise RuntimeError(
+                "MAGI-2 attention needs FlashAttention for its sink logits and "
+                f"window, but the platform resolved {backend.get_enum().name}; "
+                "run on a GPU with FA support"
+            )
         world_size = get_ulysses_parallel_world_size()
         local_heads = self.num_heads // world_size
         local_kv_heads = max(1, self.num_kv_heads // world_size)
         sinks = self._local_sinks()
-        self._impl = backend.get_impl_cls()(
+        self._impl = impl_cls(
             num_heads=local_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=local_kv_heads,
-            # Only FlashAttentionImpl forwards these; other backends drop the sink
-            # silently. The parameter stays fp32, but FA3 wants sinks in the q dtype.
+            # The parameter stays fp32, but FA3 wants sinks in the q dtype.
             sinks=None if sinks is None else sinks.to(dtype).contiguous(),
             window_size=self.window_size,
         )

@@ -10,13 +10,16 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_group,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
     ref_images as magi2_ref_images,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
-    StageValidators as V,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2.stages.input import (
+    prompt_is_non_empty,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -25,7 +28,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class Magi2TextEncodingStage(PipelineStage):
-
     def __init__(
         self,
         *,
@@ -46,15 +48,32 @@ class Magi2TextEncodingStage(PipelineStage):
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
-        result.add_check("prompt", batch.prompt, V.string_not_empty)
+        result.add_check("prompt", batch.prompt, prompt_is_non_empty)
         return result
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Non-source SP ranks never run the encoder, so the use is not opened at entry.
+        return [
+            ComponentUse(
+                stage_name=self._component_stage_name(stage_name),
+                component_name="text_encoder",
+                start_at_stage_entry=False,
+            )
+        ]
 
     def _encode(
         self, prompts: list[str], *, device: torch.device
     ) -> list[torch.Tensor]:
         """Batching pads to the longest prompt; only the real tokens may be packed."""
         tokens = self.tokenizer(prompts, **self.tokenizer_kwargs).to(device)
-        with torch.no_grad():
+        with (
+            self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ),
+            torch.no_grad(),
+        ):
             output = self.text_encoder(**tokens, output_hidden_states=True)
 
         # Not the final state: the DiT was trained on features from that depth.
@@ -142,15 +161,21 @@ class Magi2ImageEncodingStage(PipelineStage):
         self.latents_mean = torch.tensor(latents_mean).view(1, -1, 1, 1, 1)
         self.latents_std = torch.tensor(latents_std).view(1, -1, 1, 1, 1)
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        images = _condition_images(batch)
-        batch.extra["magi2_ref_patches"] = None
-        batch.extra["magi2_ref_latent_hw"] = []
-        batch.extra["magi2_ref_patch_counts"] = []
-        if not images:
-            return batch
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Opened only when the request carries images.
+        return [
+            ComponentUse(
+                stage_name=self._component_stage_name(stage_name),
+                component_name="vae",
+                start_at_stage_entry=False,
+            )
+        ]
 
-        params = batch.sampling_params
+    def _encode_images(
+        self, images: list[Image.Image], *, params
+    ) -> tuple[list[torch.Tensor], list[tuple[int, int]]]:
         device = get_local_torch_device()
         weight = next(self.vae.parameters())
 
@@ -182,6 +207,20 @@ class Magi2ImageEncodingStage(PipelineStage):
             channels, latent_h, latent_w = latent.shape[1:]
             patches.append(latent.reshape(channels, latent_h * latent_w).t().float())
             latent_hw.append((latent_h, latent_w))
+        return patches, latent_hw
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        images = _condition_images(batch)
+        batch.extra["magi2_ref_patches"] = None
+        batch.extra["magi2_ref_latent_hw"] = []
+        batch.extra["magi2_ref_patch_counts"] = []
+        if not images:
+            return batch
+
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            patches, latent_hw = self._encode_images(
+                images, params=batch.sampling_params
+            )
 
         batch.extra["magi2_ref_patches"] = torch.cat(patches, dim=0)
         batch.extra["magi2_ref_latent_hw"] = latent_hw

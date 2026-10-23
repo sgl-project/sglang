@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.magi2 import Magi2PipelineConfig
 from sglang.multimodal_gen.configs.sample.magi2 import Magi2SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -32,13 +35,13 @@ def _build_expert_parallel_group(server_args: ServerArgs):
     import torch.distributed as dist
 
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_dit_world_size,
+        get_dit_group,
     )
 
     if not dist.is_initialized():
         return None
 
-    world_size = get_dit_world_size()
+    world_size = dist.get_world_size(group=get_dit_group())
     ep_size = server_args.pipeline_config.ep_size or world_size
     if ep_size <= 1:
         return None
@@ -57,7 +60,6 @@ def _build_expert_parallel_group(server_args: ServerArgs):
 
 
 class Magi2Pipeline(ComposedPipelineBase):
-
     pipeline_name = "Magi2Pipeline"
     is_video_pipeline = True
     pipeline_config_cls = Magi2PipelineConfig
@@ -108,6 +110,11 @@ class Magi2Pipeline(ComposedPipelineBase):
                 latents_std=config.vae_config.arch_config.latents_std,
             )
         )
+        # The no-op base strategy keeps the encoder where the loader put it: on the
+        # CPU, which is where Magi2TextEncodingStage runs its forward.
+        self.component_residency_strategies["text_encoder"] = (
+            ComponentResidencyStrategy()
+        )
         self.add_stage(
             Magi2TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
@@ -126,7 +133,9 @@ class Magi2Pipeline(ComposedPipelineBase):
             stage_name="magi2_packing_preview",
         )
         self.add_stage(
-            Magi2DenoisingStage(transformer=self.get_module("transformer")),
+            Magi2DenoisingStage(
+                transformer=self.get_module("transformer"), pipeline=self
+            ),
             stage_name="magi2_denoising_preview",
         )
 
@@ -139,6 +148,7 @@ class Magi2Pipeline(ComposedPipelineBase):
             self.add_stage(
                 Magi2DenoisingStage(
                     transformer=self.get_module("transformer_2"),
+                    pipeline=self,
                     guidance_key="refiner",
                     refiner_only=True,
                 ),

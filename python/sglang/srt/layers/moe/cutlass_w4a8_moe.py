@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_cuda_alike
 
 _is_cuda = is_cuda()
@@ -128,8 +127,8 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_parallel().moe_ep_size > 1:
-        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    # Both graph padding and nonlocal routes use -1, including without EP.
+    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
@@ -144,7 +143,11 @@ def cutlass_w4a8_moe(
     # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
     if a1_scale is None:
         a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        per_tensor_absmax_fp8(a, a1_scale)
+        # Inactive rows must not change the quantization of live expert inputs.
+        inactive_rows = (topk_ids == num_local_experts).all(dim=-1, keepdim=True)
+        scale_input = a.masked_fill(inactive_rows, 0.0)
+        per_tensor_absmax_fp8(scale_input, a1_scale)
+        a1_scale.clamp_(min=1e-10 / torch.finfo(torch.float8_e4m3fn).max)
 
     pre_reorder_for_cutlass_moe(
         a,
@@ -456,6 +459,7 @@ def cutlass_w4a8_moe_deepep_ll(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -492,6 +496,8 @@ def cutlass_w4a8_moe_deepep_ll(
         Shape: scalar or [1, N]
     - apply_router_weight_on_input (bool): When true, the topk weights are
         applied directly on the inputs. This is only applicable when topk is 1.
+    - expected_m (Optional[int]): Dispatcher's expected rows per expert; a
+        requant launch hint only, any value is correct.
 
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
@@ -532,6 +538,7 @@ def cutlass_w4a8_moe_deepep_ll(
         masked_m=masked_m,
         output_scale=a1_scale,
         output=gateup_input,
+        expected_rows=expected_m,
     )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)

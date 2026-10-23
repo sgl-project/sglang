@@ -34,7 +34,10 @@ _DEFAULT_REALESRGAN_FILENAMES_BY_SCALE = {
     4: "RealESRGAN_x4.pth",
     8: "RealESRGAN_x8.pth",
 }
-_LOW_MEMORY_TILED_UPSCALE_FREE_BYTES = 2 * 1024**3
+# RRDBNet full-frame 1024x1024 inference can request several GiB of cuDNN
+# workspace beyond its output tensor. Keep enough headroom to avoid using an
+# allocator OOM as the normal tiled-dispatch mechanism.
+_FULL_FRAME_UPSCALE_MIN_FREE_BYTES = 12 * 1024**3
 _REALESRGAN_TILE_SIZE = 256
 _REALESRGAN_TILE_PAD = 32
 
@@ -74,12 +77,7 @@ class SRVGGNetCompact(nn.Module):
         act_type: str = "prelu",
     ):
         super().__init__()
-        self.num_in_ch = num_in_ch
-        self.num_out_ch = num_out_ch
-        self.num_feat = num_feat
-        self.num_conv = num_conv
         self.upscale = upscale
-        self.act_type = act_type
 
         self.body = nn.ModuleList()
         # first conv
@@ -299,9 +297,6 @@ class UpscalerModel:
     def dtype(self) -> torch.dtype:
         return next(self.net.parameters()).dtype
 
-    def _copy_input_to_device(self, frames: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(frames).to(self.device)
-
     def _preprocess_input_tensor(self, imgs_t: torch.Tensor) -> torch.Tensor:
         imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul_(1.0 / 255.0)
         if self.device.type == "cuda":
@@ -312,10 +307,6 @@ class UpscalerModel:
     def _postprocess_output_tensor(out: torch.Tensor) -> torch.Tensor:
         out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul_(255.0)
         return out.to(torch.uint8).contiguous()
-
-    @staticmethod
-    def _copy_output_to_host(out: torch.Tensor) -> np.ndarray:
-        return out.cpu().numpy()
 
     def _start_cuda_timer(self):
         if self.device.type != "cuda":
@@ -343,7 +334,7 @@ class UpscalerModel:
         free_bytes, _ = torch.cuda.mem_get_info(self.device)
         output_bytes = h * w * self.scale * self.scale * 3 * 4
         required_free_bytes = max(
-            _LOW_MEMORY_TILED_UPSCALE_FREE_BYTES,
+            _FULL_FRAME_UPSCALE_MIN_FREE_BYTES,
             output_bytes * 4,
         )
         return free_bytes < required_free_bytes
@@ -460,7 +451,7 @@ class UpscalerModel:
 
         start_time = time.perf_counter()
         h2d_timer = self._start_cuda_timer()
-        imgs_t = self._copy_input_to_device(imgs)
+        imgs_t = torch.from_numpy(imgs).to(self.device)
         self._stop_cuda_timer(h2d_timer)
         h2d_wall_duration_s = time.perf_counter() - start_time
 
@@ -498,7 +489,7 @@ class UpscalerModel:
 
         start_time = time.perf_counter()
         output_d2h_timer = self._start_cuda_timer()
-        out_np = self._copy_output_to_host(out)
+        out_np = out.cpu().numpy()
         self._stop_cuda_timer(output_d2h_timer)
         output_d2h_wall_duration_s = time.perf_counter() - start_time
 

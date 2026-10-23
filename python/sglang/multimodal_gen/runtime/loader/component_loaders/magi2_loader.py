@@ -46,7 +46,11 @@ from sglang.multimodal_gen.runtime.models.vaes.magi2_turbo_vae import (
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_component_precision_override,
+    resolve_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -662,6 +666,27 @@ def load_magi2_text_encoder(
     return text_encoder, tokenizer
 
 
+def _resolve_magi2_dtypes(server_args: ServerArgs) -> dict[str, torch.dtype]:
+    """Honour ``--component-precisions.<name>`` over the pipeline-config defaults."""
+    dit_dtype = resolve_precision(
+        server_args, "transformer", precision_attr="dit_precision"
+    )
+    return {
+        "transformer": dit_dtype,
+        "transformer_2": resolve_precision(
+            server_args, "transformer_2", precision_attr="dit_precision"
+        ),
+        "text_encoder": resolve_component_precision(server_args, "text_encoder"),
+        "vae": resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+        # No turbo_vae_precision field: it defaults to the DiT dtype.
+        "turbo_vae": resolve_component_precision_override(server_args, "turbo_vae")
+        or dit_dtype,
+        "audio_vae": resolve_precision(
+            server_args, "audio_vae", precision_attr="audio_vae_precision"
+        ),
+    }
+
+
 def load_magi2_modules(
     *,
     server_args: ServerArgs,
@@ -672,7 +697,7 @@ def load_magi2_modules(
     config: Magi2PipelineConfig = server_args.pipeline_config
     checkpoint_root = pipeline.model_path
     device = get_local_torch_device()
-    dit_dtype = PRECISION_TO_TYPE[config.dit_precision]
+    dtypes = _resolve_magi2_dtypes(server_args)
 
     # The text encoder runs once per request before either DiT, and as a plain
     # transformers module sglang's layerwise offload cannot hook it. Staged in by
@@ -684,14 +709,14 @@ def load_magi2_modules(
         config=config.dit_config,
         ep_group=ep_group,
         device=device,
-        param_dtype=dit_dtype,
+        param_dtype=dtypes["transformer"],
     )
     transformer_2 = (
         load_magi2_refiner_dit(
             checkpoint_root=checkpoint_root,
             config=config.refiner_dit_config,
             device=device,
-            param_dtype=dit_dtype,
+            param_dtype=dtypes["transformer_2"],
         )
         if config.enable_refiner
         else None
@@ -700,21 +725,21 @@ def load_magi2_modules(
     text_encoder, tokenizer = load_magi2_text_encoder(
         checkpoint_root=checkpoint_root,
         device=text_encoder_device,
-        param_dtype=PRECISION_TO_TYPE[config.text_encoder_precisions[0]],
+        param_dtype=dtypes["text_encoder"],
     )
 
     vae = load_magi2_video_vae(
         checkpoint_root=checkpoint_root,
         config=config.vae_config,
         device=device,
-        param_dtype=PRECISION_TO_TYPE[config.vae_precision],
+        param_dtype=dtypes["vae"],
     )
     turbo_vae = (
         load_magi2_turbo_vae(
             checkpoint_root=checkpoint_root,
             config=config.turbo_vae_config,
             device=device,
-            param_dtype=dit_dtype,
+            param_dtype=dtypes["turbo_vae"],
         )
         if config.use_turbo_vae
         else None
@@ -723,7 +748,7 @@ def load_magi2_modules(
         checkpoint_root=checkpoint_root,
         config=config.audio_vae_config,
         device=device,
-        param_dtype=PRECISION_TO_TYPE[config.audio_vae_precision],
+        param_dtype=dtypes["audio_vae"],
     )
 
     # transformer_2 and turbo_vae must be present as keys even when disabled: the

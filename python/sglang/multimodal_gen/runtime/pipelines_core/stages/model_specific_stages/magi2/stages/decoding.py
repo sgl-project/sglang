@@ -9,6 +9,9 @@ from sglang.multimodal_gen.configs.sample.magi2 import (
     MAGI2_REFINER_FPS,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -46,6 +49,23 @@ class Magi2DecodingStage(PipelineStage):
     def role_affinity(self) -> RoleType:
         return RoleType.DECODER
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        # No target_dtype: the turbo decoder is loaded in the DiT dtype, not vae_precision.
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name=name,
+                keep_ready_after_warmup=True,
+            )
+            for name in (
+                _video_decoder_name(server_args.pipeline_config.use_turbo_vae),
+                "audio_vae",
+            )
+        ]
+
     def _decode_video(
         self, batch: Req, *, use_turbo: bool, server_args: ServerArgs
     ) -> torch.Tensor:
@@ -59,15 +79,14 @@ class Magi2DecodingStage(PipelineStage):
         std = self.latents_std.to(device=grid.device, dtype=grid.dtype)
         mean = self.latents_mean.to(device=grid.device, dtype=grid.dtype)
         grid = grid * std + mean
-        decoder = (
-            self.turbo_vae
-            if use_turbo and self.turbo_vae is not None
-            else self.video_vae
-        )
-        weight = next(decoder.parameters())
-        decode = self._decode_fn(decoder, server_args)
-        with torch.no_grad():
-            return decode(grid.to(device=weight.device, dtype=weight.dtype))
+        decoder = self.turbo_vae if use_turbo else self.video_vae
+        with self.use_declared_component(
+            component_name=_video_decoder_name(use_turbo), module=decoder
+        ):
+            weight = next(decoder.parameters())
+            decode = self._decode_fn(decoder, server_args)
+            with torch.no_grad():
+                return decode(grid.to(device=weight.device, dtype=weight.dtype))
 
     def _decode_fn(self, decoder, server_args: ServerArgs):
         """The decoder runs 9 windowed calls per clip, so a compiled graph
@@ -89,7 +108,12 @@ class Magi2DecodingStage(PipelineStage):
     def _decode_audio(self, latents: torch.Tensor | None) -> torch.Tensor | None:
         if latents is None or latents.numel() == 0:
             return None
-        with torch.no_grad():
+        with (
+            self.use_declared_component(
+                component_name="audio_vae", module=self.audio_vae
+            ),
+            torch.no_grad(),
+        ):
             return self.audio_vae.decode(latents.t().unsqueeze(0))
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
@@ -129,8 +153,14 @@ class Magi2DecodingStage(PipelineStage):
             output=[sample],
             audio=audio_np,
             audio_sample_rate=sample_rate,
+            # Client-side saves read this before the request's 25 fps default.
+            fps=fps,
             metrics=batch.metrics,
         )
+
+
+def _video_decoder_name(use_turbo: bool) -> str:
+    return "turbo_vae" if use_turbo else "vae"
 
 
 def _to_thwc_uint8(pixels: torch.Tensor):

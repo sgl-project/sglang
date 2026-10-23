@@ -2,12 +2,18 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    align_num_frames_for_num_gpus,
+)
 
 # 1088 rather than 1080: the VAE stride forces multiples of 16.
 MAGI2_RESOLUTIONS = [(1920, 1088), (896, 512)]
 
 MAGI2_CLIP_SECONDS = 10.0
+
+# (63 - 1) * 4 + 1, from a causal decoder over 63 refiner latent frames.
+MAGI2_NUM_FRAMES = 249
 
 MAGI2_PREVIEW_FPS = 12.5
 MAGI2_REFINER_FPS = 25
@@ -49,6 +55,8 @@ class Magi2SamplingParams(SamplingParams):
 
     _default_width: ClassVar[int | None] = 1920
     _default_height: ClassVar[int | None] = 1088
+    # Fixed-length clips at two fixed sizes: a halved probe fails _validate.
+    supports_warmup_lightening: ClassVar[bool] = False
 
     negative_prompt: str = MAGI2_NEGATIVE_PROMPT
 
@@ -58,8 +66,7 @@ class Magi2SamplingParams(SamplingParams):
     preview_width: int = 896
     preview_height: int = 512
 
-    # (63 - 1) * 4 + 1, from a causal decoder over 63 refiner latent frames.
-    num_frames: int = 249
+    num_frames: int = MAGI2_NUM_FRAMES
     fps: int = MAGI2_REFINER_FPS
 
     guidance_scale: float = 5.0
@@ -82,8 +89,7 @@ class Magi2SamplingParams(SamplingParams):
 
         if (self.width, self.height) not in MAGI2_RESOLUTIONS:
             raise ValueError(
-                f"MAGI-2 supports {MAGI2_RESOLUTIONS}, got "
-                f"{self.width}x{self.height}"
+                f"MAGI-2 supports {MAGI2_RESOLUTIONS}, got {self.width}x{self.height}"
             )
 
         # Tolerance: causal decode yields 4k+1 frames, and num_frames is rounded up
@@ -100,6 +106,28 @@ class Magi2SamplingParams(SamplingParams):
             raise ValueError("num_inference_steps must be >= 1")
         if self.refiner_num_inference_steps < 1:
             raise ValueError("refiner_num_inference_steps must be >= 1")
+
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        # The generic default picks the 896x512 preview-only tier, which never
+        # runs the refiner or the 1080p decode.
+        if server_args.warmup_resolutions is not None:
+            return
+        req.width, req.height = self._default_width, self._default_height
+        if server_args.warmup_num_frames is not None:
+            return
+        # Warmup skips _adjust, so apply the same per-GPU rounding real requests get.
+        req.num_frames = (
+            align_num_frames_for_num_gpus(
+                MAGI2_NUM_FRAMES,
+                num_gpus=server_args.num_gpus,
+                vae_config=server_args.pipeline_config.vae_config,
+                round_down=self.num_frames_round_down,
+            )
+            if self.adjust_frames
+            else MAGI2_NUM_FRAMES
+        )
 
     @classmethod
     def lower_video_request_kwargs(
