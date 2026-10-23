@@ -85,6 +85,19 @@ class TestBlockVerificationArgs(unittest.TestCase):
                     use_rejection_sampling,
                 )
 
+    def test_reduced_draft_vocab_token_map_is_allowed(self):
+        # FR-Spec token maps are scattered into the target vocab before verify.
+        for use_rejection_sampling in (False, True):
+            with self.subTest(use_rejection_sampling=use_rejection_sampling):
+                args = self._args(
+                    speculative_token_map="/tmp/top49152.pt",
+                    speculative_use_rejection_sampling=use_rejection_sampling,
+                )
+                handle_speculative_decoding(args)
+                self.assertTrue(
+                    resolution_result(args, "speculative_use_rejection_sampling")
+                )
+
     def test_unsupported_configurations(self):
         cases = [
             ({"speculative_algorithm": None}, "only supports EAGLE"),
