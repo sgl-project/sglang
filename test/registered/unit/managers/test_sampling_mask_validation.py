@@ -69,6 +69,22 @@ class TestSamplingMaskValidation(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
 
+    def test_top_logprobs_num_is_validated_per_item_in_a_mixed_batch(self):
+        """The batch path validates obj[i], so each item's own flag decides."""
+        self.manager.model_config.vocab_size = 32
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            sampling_params={},
+            return_logprob=[True, False, True],
+            top_logprobs_num=[33, 33, 5],
+        )
+        req.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(ValueError, "top_logprobs"):
+            self.manager._validate_one_request(req[0], req[0].input_ids)
+        # logprobs are off for this item, so its count is never read
+        self.manager._validate_one_request(req[1], req[1].input_ids)
+        self.manager._validate_one_request(req[2], req[2].input_ids)
+
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):
             def __call__(self, logits, custom_param_list=None):
