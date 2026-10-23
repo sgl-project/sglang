@@ -96,11 +96,9 @@ def validate_positional_embed_overrides(value: object, *, hidden_size: int) -> N
     A bad value would otherwise fail msgpack decode or the embed scatter inside the
     scheduler and abort every co-batched request; raising here surfaces as HTTP 400.
     """
-    if value is None:
-        return
     if not isinstance(value, PositionalEmbeds):
         raise ValueError(
-            "positional_embed_overrides must be a PositionalEmbeds or null, got "
+            "positional_embed_overrides must be a PositionalEmbeds, got "
             f"{type(value).__name__}."
         )
     actual = value.embeds.shape[-1]
