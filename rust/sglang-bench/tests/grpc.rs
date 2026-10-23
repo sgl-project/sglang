@@ -107,6 +107,34 @@ impl SglangService for Mock {
         }))
     }
 
+    async fn get_hi_cache_storage(
+        &self,
+        _: Request<api::GetHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStatus>, Status> {
+        Err(Status::unimplemented("get_hi_cache_storage"))
+    }
+
+    async fn attach_hi_cache_storage(
+        &self,
+        _: Request<api::AttachHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        Err(Status::unimplemented("attach_hi_cache_storage"))
+    }
+
+    async fn detach_hi_cache_storage(
+        &self,
+        _: Request<api::DetachHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        Err(Status::unimplemented("detach_hi_cache_storage"))
+    }
+
+    async fn clear_hi_cache_storage(
+        &self,
+        _: Request<api::ClearHiCacheStorageRequest>,
+    ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        Err(Status::unimplemented("clear_hi_cache_storage"))
+    }
+
     async fn list_models(
         &self,
         _: Request<api::ListModelsRequest>,
