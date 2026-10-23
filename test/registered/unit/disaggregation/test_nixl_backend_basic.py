@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import requests
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -540,6 +541,7 @@ class TestNixlNodeFailure(CustomTestCase):
         }
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["10.0.0.1:8998"] = {3, 4, 5}
+        mgr.heartbeat_failures = {"10.0.0.1:8998": 2, "10.0.0.2:8998": 1}
         mgr.request_status = {
             3: KVPoll.WaitingForInput,
             4: KVPoll.Transferring,
@@ -570,6 +572,45 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertIn(3, mgr.failure_records)
         self.assertIn(4, mgr.failure_records)
         self.assertNotIn(5, mgr.failure_records)
+        self.assertEqual(mgr.heartbeat_failures, {"10.0.0.2:8998": 1})
+
+    def test_a_prefill_reached_again_after_a_loss_needs_its_misses_again(self):
+        """A prefill dropped after max_failures missed heartbeats, then reached
+        again by a new request, is dropped again only after as many: one
+        missed heartbeat of a prefill busy for a few seconds is no loss."""
+        mgr = self._make_manager()
+        addr = "10.0.0.1:8998"
+        mgr.prefill_info_table = {addr: object()}
+        mgr.heartbeat_interval = 0
+        mgr.max_failures = 2
+        mgr.heartbeat_failures = {}
+        mgr.session_pool_lock = threading.Lock()
+        probes = ["miss", "miss", "miss", 200, "miss", 200]
+        ok = SimpleNamespace(status_code=200)
+
+        def get(*_args, **_kwargs):
+            if probes.pop(0) == "miss":
+                raise requests.Timeout("prefill busy")
+            return ok
+
+        mgr.session_pool = defaultdict(lambda: SimpleNamespace(get=get))
+        rounds = iter(range(len(probes)))
+        mgr._heartbeat_shutdown = SimpleNamespace(
+            is_set=lambda: False, wait=lambda _s: next(rounds, None) is None
+        )
+        losses = []
+        handle = mgr._handle_node_failure
+
+        def lost(failed):
+            losses.append(failed)
+            handle(failed)
+            # The next request to it registers it again.
+            mgr.prefill_info_table[failed] = object()
+
+        mgr._handle_node_failure = lost
+        mgr._start_heartbeat_checker_thread().join(10)
+        self.assertEqual(probes, [])
+        self.assertEqual(losses, [addr])
 
 
 class TestNixlStaging(CustomTestCase):
