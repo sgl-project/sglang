@@ -427,9 +427,7 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
     arch = (config.architectures or [None])[0]
     return arch in (
         "MiniMaxM3SparseForCausalLM",
-        "MiniMaxM3TinyForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
-        "MiniMaxM3TinyForConditionalGeneration",
     )
 
 
@@ -1023,7 +1021,7 @@ class ModelConfig:
             is_draft_model
             and self.speculative_algorithm == "DSPARK"
             and self.hf_config.architectures[0]
-            in ("MiniMaxM3TinyForConditionalGeneration", "DSparkMiniMaxDraftModel")
+            == "DSparkMiniMaxDraftModel"
         ):
             from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
 
@@ -2398,7 +2396,6 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
-    "MiniMaxM3TinyForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
@@ -2503,7 +2500,6 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
-    "MiniMaxM3TinyForConditionalGeneration",
     "MiniMaxM3VLForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",

@@ -76,7 +76,7 @@ _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNa
 
 # Targets whose greedy accept reads the split-vocab row argmax; it does not
 # reproduce torch.argmax's NaN choice, so it stays opt-in per target.
-_FUSED_ARGMAX_TARGETS = frozenset({"deepseek_v41", "minimax_m3_tiny", "minimax_m3_vl"})
+_FUSED_ARGMAX_TARGETS = frozenset({"deepseek_v41", "minimax_m3_vl"})
 
 
 def target_model_type(target_worker) -> Optional[str]:

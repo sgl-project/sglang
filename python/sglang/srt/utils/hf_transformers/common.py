@@ -70,7 +70,6 @@ from sglang.srt.configs import (
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
     MiniCPMV4_7Config,
-    MiniMaxM3TinyConfig,
     MiniMaxM3VLConfig,
     MultiModalityConfig,
     MuseGlimmerAssistantConfig,
@@ -184,7 +183,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingVisionConfig,
         InklingMMConfig,
         MiniMaxM3VLConfig,
-        MiniMaxM3TinyConfig,
         XllmConfig,
     ]
 }

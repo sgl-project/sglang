@@ -19,10 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.minimax_m3_vl import (
-    MiniMaxM3SparseForConditionalGeneration,
-    MiniMaxM3TinyForConditionalGeneration,
-)
+from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -478,10 +475,7 @@ def _media_token_runs(input_ids: List[int], token_id: int) -> List[Tuple[int, in
 
 
 class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
-    models = [
-        MiniMaxM3SparseForConditionalGeneration,
-        MiniMaxM3TinyForConditionalGeneration,
-    ]
+    models = [MiniMaxM3SparseForConditionalGeneration]
 
     gpu_image_decode = False
     # The tokenizer process shares GPU 0 with the scheduler; long videos

@@ -61,40 +61,8 @@ class MiniMaxM3VLConfig(MiniMaxVLBaseConfig):
     model_type = "minimax_m3_vl"
 
 
-class MiniMaxM3TinyConfig(MiniMaxM3VLConfig):
-    model_type = "minimax_m3_tiny"
-
-    def __init__(self, **kwargs):
-        # Transformers 5 generates an initializer for subclasses without one.
-        MiniMaxVLBaseConfig.__init__(self, **kwargs)
-        sparse = getattr(
-            getattr(self, "text_config", None), "sparse_attention_config", None
-        )
-        if sparse:
-            # M3.1 checkpoints contain index Q/K projections only.
-            sparse.setdefault(
-                "sparse_disable_index_value", sparse["sparse_attention_freq"].copy()
-            )
-
-    @classmethod
-    def from_dict(cls, config_dict, **kwargs):
-        config_dict = copy.deepcopy(config_dict)
-        text = config_dict.get("text_config", {})
-        layer_types = text.get("layer_types")
-        draft = text.get("dflash_config", {})
-        if layer_types and len(layer_types) != text.get("num_hidden_layers"):
-            if len(layer_types) != draft.get("num_hidden_layers"):
-                raise ValueError(
-                    "MiniMax layer_types does not match target or draft depth"
-                )
-            # Bundled checkpoints attach draft windows to the target text config.
-            draft["layer_types"] = text.pop("layer_types")
-        return super().from_dict(config_dict, **kwargs)
-
-
 def configure_minimax_m3_dspark(config):
-    """Translate M3.1 DSpark checkpoints to the public draft config contract."""
-    standalone = config.architectures == ["DSparkMiniMaxDraftModel"]
+    """Translate an M3.1 DSpark draft checkpoint to the public draft config contract."""
     text = copy.deepcopy(getattr(config, "text_config", config))
     if isinstance(text, dict):
         text = PretrainedConfig(**text)
@@ -104,11 +72,7 @@ def configure_minimax_m3_dspark(config):
     draft = dict(getattr(text, "dspark_config", {}))
     if not draft.get("use_dense_ffn", getattr(text, "dspark_use_dense_ffn", False)):
         raise ValueError("M3.1 DSpark requires the dense draft FFN checkpoint")
-    target_depth = (
-        int(text.dflash_config["num_target_layers"])
-        if standalone
-        else text.num_hidden_layers
-    )
+    target_depth = int(text.dflash_config["num_target_layers"])
     text.num_hidden_layers = int(text.dflash_config["num_hidden_layers"])
     text.num_nextn_predict_layers = 0
     text.num_mtp_modules = 0
@@ -125,11 +89,7 @@ def configure_minimax_m3_dspark(config):
     draft_layer_types = text.dflash_config.get("layer_types")
     if draft_layer_types:
         text.layer_types = draft_layer_types
-    if standalone:
-        target_ids = [int(i) for i in text.dflash_config["target_layer_ids"]]
-    else:
-        # Bundled checkpoints use one-based output-layer IDs.
-        target_ids = sorted(int(i) - 1 for i in text.dspark_target_layer_ids)
+    target_ids = [int(i) for i in text.dflash_config["target_layer_ids"]]
     if (
         not target_ids
         or len(set(target_ids)) != len(target_ids)

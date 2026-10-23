@@ -11,12 +11,11 @@ from torch import nn
 
 from sglang.srt.arg_groups.model_overrides.minimax_m3 import _minimax_m3_overrides
 from sglang.srt.configs.minimax_vl import (
-    MiniMaxM3TinyConfig,
+    MiniMaxM3VLConfig,
     configure_minimax_m3_dspark,
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    get_minimax_sparse_disable_value_layer_ids,
     is_dspark_draft,
 )
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
@@ -38,23 +37,27 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 NVFP4 = SimpleNamespace(quantization_config={"quant_method": "minimax_m3_nvfp4"})
 
 
-def tiny_config():
-    return MiniMaxM3TinyConfig.from_dict(
+def draft_config():
+    """A small DSpark draft in the layout of the released checkpoint's dspark/ folder."""
+    return MiniMaxM3VLConfig.from_dict(
         {
-            "architectures": ["MiniMaxM3TinyForConditionalGeneration"],
+            "architectures": ["DSparkMiniMaxDraftModel"],
             "quantization_config": {"quant_method": "minimax_m3_nvfp4"},
             "text_config": {
-                "model_type": "minimax_m3_tiny_text",
-                "num_hidden_layers": 6,
-                "sparse_attention_config": {"sparse_attention_freq": [1] * 6},
-                "dflash_config": {"num_hidden_layers": 2, "num_target_layers": 6},
-                "layer_types": ["sliding_attention"] * 2,
+                "model_type": "",
+                "num_hidden_layers": 2,
+                "dflash_config": {
+                    "num_hidden_layers": 2,
+                    "num_target_layers": 6,
+                    "target_layer_ids": [1, 5],
+                    "layer_types": ["sliding_attention"] * 2,
+                },
                 "dspark_use_dense_ffn": True,
                 "dspark_ffn_hidden_size": 256,
                 "dspark_block_size": 7,
                 "dspark_markov_rank": 16,
                 "dspark_noise_token_id": 1,
-                "dspark_target_layer_ids": [6, 2],
+                "dspark_target_layer_ids": [1, 5],
             },
         }
     )
@@ -166,16 +169,15 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
 
     def test_unsupported_combinations_are_rejected(self):
         def capture_ids(ids):
-            config = tiny_config()
-            config.text_config.dspark_target_layer_ids = ids
+            config = draft_config()
+            config.text_config.dflash_config["target_layer_ids"] = ids
             return lambda: configure_minimax_m3_dspark(config)
 
         def resolve(**kwargs):
             return lambda: _minimax_m3_overrides(server_args(**kwargs), NVFP4)
 
         cases = {
-            # One-based ids: 0 would wrap to the last target layer.
-            "capture id 0": ("static", capture_ids([0, 2])),
+            "capture id past the target depth": ("static", capture_ids([1, 6])),
             "duplicate capture id": ("static", capture_ids([2, 2])),
             "compact verify": ("compact", resolve(speculative_algorithm="DSPARK")),
             "dspark pp": ("static", resolve(speculative_algorithm="DSPARK", pp_size=2)),
@@ -192,8 +194,8 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
 
 
 class TestMiniMaxM31DSparkDraft(CustomTestCase):
-    def test_bundled_ids_are_one_based_and_standalone_ids_zero_based(self):
-        config = tiny_config()
+    def test_draft_target_ids_are_zero_based_and_the_input_is_kept(self):
+        config = draft_config()
         before = copy.deepcopy(config.to_dict())
         obj = object.__new__(ModelConfig)
         obj.is_draft_model = True
@@ -207,31 +209,20 @@ class TestMiniMaxM31DSparkDraft(CustomTestCase):
         self.assertEqual(obj.hf_config.num_hidden_layers, 2)
         parsed = parse_dflash_draft_config(draft_hf_config=obj.hf_config)
         self.assertEqual(parsed.resolve_target_layer_ids(target_num_layers=6), [1, 5])
-        # The target keeps its depth and its K-only index layers.
         self.assertEqual(config.to_dict(), before)
-        restored = MiniMaxM3TinyConfig.from_dict(before).text_config
-        self.assertEqual(
-            get_minimax_sparse_disable_value_layer_ids(
-                restored.sparse_attention_config
-            ),
-            list(range(6)),
-        )
 
-        standalone = tiny_config()
-        standalone.architectures = ["DSparkMiniMaxDraftModel"]
-        standalone.text_config.dflash_config["target_layer_ids"] = [0, 5]
-        draft = configure_minimax_m3_dspark(standalone)
-        self.assertEqual(draft.dspark_target_layer_ids, [0, 5])
-
-    def test_bundled_draft_path_and_verify_window_come_from_the_checkpoint(self):
+    def test_verify_window_comes_from_the_draft_checkpoint(self):
         from sglang.srt.arg_groups.overrides import resolution_result
         from sglang.srt.arg_groups.speculative_hook import _handle_dspark
         from sglang.srt.server_args import ServerArgs
 
-        config = tiny_config()
+        config = draft_config()
         config.text_config.dspark_block_size = 5
         args = ServerArgs(
-            model_path="dummy", speculative_algorithm="DSPARK", device="cuda"
+            model_path="dummy",
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path="dummy-draft",
+            device="cuda",
         )
         args._model_config = SimpleNamespace(hf_config=config)
         with patch(
@@ -239,7 +230,7 @@ class TestMiniMaxM31DSparkDraft(CustomTestCase):
         ):
             _handle_dspark(args)
         self.assertEqual(
-            resolution_result(args, "speculative_draft_model_path"), "dummy"
+            resolution_result(args, "speculative_draft_model_path"), "dummy-draft"
         )
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 6)
 

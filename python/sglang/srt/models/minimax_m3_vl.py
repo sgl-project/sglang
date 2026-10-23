@@ -476,11 +476,4 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             logger.warning(f"Error loading weight {remapped}: {e}")
 
 
-class MiniMaxM3TinyForConditionalGeneration(MiniMaxM3SparseForConditionalGeneration):
-    pass
-
-
-EntryClass = [
-    MiniMaxM3SparseForConditionalGeneration,
-    MiniMaxM3TinyForConditionalGeneration,
-]
+EntryClass = [MiniMaxM3SparseForConditionalGeneration]

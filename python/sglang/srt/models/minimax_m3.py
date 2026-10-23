@@ -2271,8 +2271,4 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-class MiniMaxM3TinyForCausalLM(MiniMaxM3SparseForCausalLM):
-    pass
-
-
-EntryClass = [MiniMaxM3SparseForCausalLM, MiniMaxM3TinyForCausalLM]
+EntryClass = [MiniMaxM3SparseForCausalLM]

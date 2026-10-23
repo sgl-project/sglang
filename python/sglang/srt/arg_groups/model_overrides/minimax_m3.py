@@ -37,8 +37,6 @@ def _resolve_quant_method(hf_config: Any) -> str | None:
 @_register_for(
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
-    "MiniMaxM3TinyForCausalLM",
-    "MiniMaxM3TinyForConditionalGeneration",
 )
 def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
 

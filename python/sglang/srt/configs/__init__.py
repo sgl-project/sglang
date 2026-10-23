@@ -57,10 +57,7 @@ from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from sglang.srt.configs.minicpmv4_7 import MiniCPMV4_7Config
-from sglang.srt.configs.minimax_vl import (
-    MiniMaxM3TinyConfig,
-    MiniMaxM3VLConfig,
-)
+from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
 from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
@@ -172,7 +169,6 @@ __all__ = [
     "MiniCPMHybridConfig",
     "Step3p5Config",
     "MiniMaxM3VLConfig",
-    "MiniMaxM3TinyConfig",
     "Spark2_5Config",
     "Step3p7Config",
     "Qwen3ASRConfig",

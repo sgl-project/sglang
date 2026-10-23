@@ -352,7 +352,6 @@ def handle_encoder_disaggregation(server_args: Any):
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
-        "MiniMaxM3TinyForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
     ]:
         raise ValueError(

@@ -152,10 +152,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
     )
-    if _cfg_get(draft_hf_config, "architectures", []) in (
-        ["MiniMaxM3TinyForConditionalGeneration"],
-        ["DSparkMiniMaxDraftModel"],
-    ):
+    if _cfg_get(draft_hf_config, "architectures", []) == ["DSparkMiniMaxDraftModel"]:
         from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
 
         draft_hf_config = configure_minimax_m3_dspark(draft_hf_config)
@@ -164,11 +161,10 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
 
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
-    prefixed dspark_* keys on the target or its text config. Single source of truth
+    prefixed dspark_* keys on the target hf config. Single source of truth
     for the bundling convention (draft-path defaulting, draft-arch remap)."""
     return any(
-        _cfg_get(config, key, None) is not None
-        for config in (hf_config, _get_text_config(hf_config))
+        _cfg_get(hf_config, key, None) is not None
         for key in (
             "dspark_block_size",
             "dspark_markov_rank",
