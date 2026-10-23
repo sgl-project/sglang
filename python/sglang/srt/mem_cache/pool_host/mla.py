@@ -118,7 +118,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
         host_token_capacity: int | None = None,
-        is_dummy: bool = False,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim

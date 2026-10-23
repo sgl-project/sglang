@@ -313,9 +313,6 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
-    if config.model_type == "minimax_m3_vl":
-        trust_remote_code = False
-
     try:
         if config.model_type == "minimax_m3_vl":
             processor = _get_minimax_m31_processor(tokenizer_name, config, revision)
