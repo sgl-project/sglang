@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.msa_v1.compact_dequant import (
 )
 from sglang.kernels.ops.kvcache.nvfp4_store_kv_index import nvfp4_store_kv_index
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
+    MSA_V1_DECODE_INDEXER_AVAILABLE,
     MSAV1DecodeAttentionPlan,
     MSAV1DecodeIndexerPlan,
     MSAV1PrefillPlan,
@@ -29,6 +30,12 @@ from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+# The fused store and dequant kernels are sglang's own; the plans call into MSA.
+requires_msa = pytest.mark.skipif(
+    not MSA_V1_DECODE_INDEXER_AVAILABLE,
+    reason="needs the MiniMax MSA package (minimax-msa)",
+)
 
 PAGE = 128
 KV_HEADS = 2
@@ -175,6 +182,7 @@ def test_dequant_kernels_match(caches):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+@requires_msa
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("query_length", [1, 4])
 def test_decode_indexer_and_attention_match(caches, fallback, query_length):
@@ -225,6 +233,7 @@ def test_decode_indexer_and_attention_match(caches, fallback, query_length):
         assert torch.equal(a, b)
 
 
+@requires_msa
 @pytest.mark.parametrize("prefer_qmul4", [True, False])
 def test_prefill_indexer_and_attention_match(caches, prefer_qmul4):
     gs = caches.main.global_scale

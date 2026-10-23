@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.attention.msa_v1.compact_dequant import dequant_nvfp4_page_table
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
+    MSA_V1_DECODE_INDEXER_AVAILABLE,
     MSAV1DecodeAttentionPlan,
     MSAV1DecodeIndexerPlan,
     MSAV1PrefillPlan,
@@ -21,6 +22,11 @@ from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+pytestmark = pytest.mark.skipif(
+    not MSA_V1_DECODE_INDEXER_AVAILABLE,
+    reason="needs the MiniMax MSA package (minimax-msa)",
+)
 
 BS = 3
 PAGE = 128
