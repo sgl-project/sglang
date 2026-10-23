@@ -36,6 +36,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MAX_LOADED_LORAS = 2
+# Upper bound for steps that finish at once when correct; a broken counter or
+# notification fails here instead of hanging the CPU job.
+STEP_TIMEOUT_S = 5
 
 
 class _Ranks:
@@ -134,14 +137,16 @@ class TestLoRALRUUnload(CustomTestCase):
 
     def test_unload_waits_for_active_requests(self):
         """The unload parks until the last request holding the adapter releases
-        it, then sends the ranks the ID that request acquired."""
+        it, then sends the ranks the ID those requests acquired."""
 
         async def scenario(from_tensors):
             ranks = _Ranks()
             manager = _manager(ranks)
             registry = manager.lora_registry
             self.assertTrue((await _load(manager, "a", from_tensors)).success)
+            # Two requests hold "a".
             lora_id = await registry.acquire("a")
+            self.assertEqual(await registry.acquire("a"), lora_id)
 
             waiting = asyncio.Event()
             wait_for_unload = registry.wait_for_unload
@@ -154,19 +159,33 @@ class TestLoRALRUUnload(CustomTestCase):
             unload = asyncio.create_task(
                 manager.unload_lora_adapter(UnloadLoRAAdapterReqInput(lora_name="a"))
             )
-            # Resume once the unload starts waiting or, if it never waits, ends.
-            await asyncio.wait(
-                {unload, asyncio.create_task(waiting.wait())},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            self.assertTrue(waiting.is_set(), "the unload never waited")
-            # The fan-out stub never yields, so an unload that did not block on
-            # the request would have finished before this coroutine resumed.
-            self.assertFalse(unload.done())
-            self.assertEqual(ranks.unloaded_ids, [])
+            waited = asyncio.create_task(waiting.wait())
+            try:
+                # Resume once the unload starts waiting or, if it never waits, ends.
+                await asyncio.wait(
+                    {unload, waited},
+                    timeout=STEP_TIMEOUT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                self.assertTrue(waiting.is_set(), "the unload never waited")
+                # The fan-out stub never yields, so an unload that did not block on
+                # the requests would have finished before this coroutine resumed.
+                self.assertFalse(unload.done())
 
-            await registry.release(lora_id)
-            result = await unload
+                await registry.release(lora_id)
+                # Event-loop turns, not wall time: the woken unload re-checks the
+                # count and must park again behind the second request.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertFalse(unload.done(), "unloaded while a request held it")
+                self.assertEqual(ranks.unloaded_ids, [])
+
+                await registry.release(lora_id)
+                result = await asyncio.wait_for(unload, STEP_TIMEOUT_S)
+            finally:
+                for task in (unload, waited):
+                    task.cancel()
+                await asyncio.gather(unload, waited, return_exceptions=True)
 
             self.assertTrue(result.success, result.error_message)
             self.assertEqual(ranks.unloaded_ids, [lora_id])
