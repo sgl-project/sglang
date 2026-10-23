@@ -209,9 +209,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096, encoder_replay=False):
         override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
+            schedule_policy="shortest-prefill-first",
+            enable_encoder_swa_bounded_replay=encoder_replay,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -249,6 +250,48 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_reserves_encoder_replay_rows_of_hits(self):
+        # Admission charges a hit's replay rows to the chunk. A reservation
+        # without them leaves the last hit unable to fit whole, so it waits
+        # and the room reserved for it goes unused.
+        for encoder_replay, cached, continuation_len in (
+            (False, 4096, 2560),
+            (True, 0, 2560),
+            (True, 4096, 2304),
+        ):
+            with self.subTest(encoder_replay=encoder_replay, cached=cached):
+                adder = self.create_shortest_prefill_adder(
+                    encoder_replay=encoder_replay
+                )
+                policy = SchedulePolicy(
+                    policy="shortest-prefill-first",
+                    tree_cache=RadixCache.create_simulated(),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
+                continuation = self.create_shared_req("continuation")
+                continuation.full_untruncated_fill_ids = list(range(16384))
+                waiting = [self.create_shared_req("a"), self.create_shared_req("b")]
+                for req, uncached in zip(waiting, [512, 1024]):
+                    req.origin_input_ids = list(range(cached + uncached))
+                    req.full_untruncated_fill_ids = req.origin_input_ids
+                    req.num_matched_prefix_tokens = req.prefix_len = cached
+                adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+                )
+                adder.add_chunked_req(continuation)
+                for req in waiting:
+                    adder.add_one_req(
+                        req, has_chunked_req=True, truncation_align_size=None
+                    )
+                self.assertEqual(
+                    [req.rid for req in adder.can_run_list],
+                    ["continuation", "a", "b"],
+                )
+                self.assertEqual(adder.rem_chunk_tokens, 0)
+                self.assertEqual(continuation.extend_len, continuation_len)
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
