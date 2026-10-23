@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -26,6 +27,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.data_parallel_controller import (
+    AdvertisedKvEventSources,
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
@@ -172,19 +174,32 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
+        publisher.describe_advertised_source.return_value = {
+            **self._source(4, 256),
+            "endpoint": "tcp://10.0.0.2:5561",
+        }
         for owned_publisher, expected in (
             (publisher, [self._source(4, 256)]),
             (None, []),
         ):
             with (
                 self.subTest(has_publisher=owned_publisher is not None),
-                get_context().override_server_args(grpc_port=50051, dcp_size=4),
+                get_context().override_server_args(
+                    grpc_port=50051, dcp_size=4, nnodes=2, node_rank=1
+                ),
             ):
                 component.kv_event_publisher = owned_publisher
+                info = scheduler.get_init_info()
+                self.assertEqual(info["kv_event_sources"], expected)
                 self.assertEqual(
-                    scheduler.get_init_info()["kv_event_sources"], expected
+                    info["advertised_kv_event_sources"],
+                    [
+                        {**source, "endpoint": "tcp://10.0.0.2:5561", "node_rank": 1}
+                        for source in expected
+                    ],
                 )
         publisher.describe_local_source.assert_called_once_with(256)
+        publisher.describe_advertised_source.assert_called_once_with(256)
 
     def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
@@ -193,6 +208,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.env_lock = threading.Lock()
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
+        controller.local_advertised_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
@@ -204,6 +220,9 @@ class TestLocalKvEventSources(CustomTestCase):
                         "max_total_num_tokens": 64,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
+                        "advertised_kv_event_sources": [
+                            self._advertised(source["dp_rank"]) for source in sources
+                        ],
                     }
                 )
             )
@@ -238,6 +257,115 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+        self.assertEqual(
+            controller.local_advertised_kv_event_sources,
+            [self._advertised(2), self._advertised(3)],
+        )
+
+    @staticmethod
+    def _advertised(rank, node_rank=1):
+        return {
+            "dp_rank": rank,
+            "node_rank": node_rank,
+            "endpoint": f"tcp://10.0.0.{node_rank + 1}:{5557 + rank}",
+            "topic": "kv",
+            "block_size": 64,
+        }
+
+    def _controller(self, sources, node_rank, nnodes, dist_init_addr, joiner=False):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.context = zmq.Context()
+        self.addCleanup(controller.context.term)
+        controller.local_advertised_kv_event_sources = list(sources)
+        parallel = SimpleNamespace(
+            nnodes=nnodes, node_rank=node_rank, dist_init_addr=dist_init_addr
+        )
+        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=joiner))
+        patches = (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=execution,
+            ),
+        )
+        return controller, patches
+
+    def test_single_node_returns_local_sources_sorted(self):
+        controller, patches = self._controller(
+            [self._advertised(3, 0), self._advertised(1, 0)], 0, 1, None
+        )
+        with patches[0], patches[1]:
+            self.assertEqual(
+                controller.exchange_advertised_kv_event_sources(),
+                [self._advertised(1, 0), self._advertised(3, 0)],
+            )
+
+    def test_joiner_does_not_report_to_node_zero(self):
+        controller, patches = self._controller(
+            [self._advertised(5, 1)], 1, 2, "127.0.0.1:20000", joiner=True
+        )
+        controller._send_advertised_sources_as_client = MagicMock()
+        with patches[0], patches[1]:
+            self.assertEqual(
+                controller.exchange_advertised_kv_event_sources(),
+                [self._advertised(5, 1)],
+            )
+        controller._send_advertised_sources_as_client.assert_not_called()
+
+    def test_node_zero_merges_every_follower_report(self):
+        from sglang.srt.server_args import KV_EVENT_SOURCES_HANDSHAKE_PORT_DELTA
+        from sglang.srt.utils.network import get_free_port
+
+        base_port = get_free_port() - KV_EVENT_SOURCES_HANDSHAKE_PORT_DELTA
+        dist_init_addr = f"127.0.0.1:{base_port}"
+        leader, leader_patches = self._controller(
+            [self._advertised(0, 0), self._advertised(1, 0)], 0, 3, dist_init_addr
+        )
+        followers = [
+            self._controller(
+                [self._advertised(2, 1), self._advertised(3, 1)], 1, 3, dist_init_addr
+            ),
+            self._controller(
+                [self._advertised(4, 2), self._advertised(5, 2)], 2, 3, dist_init_addr
+            ),
+        ]
+        results = {}
+
+        def run(name, controller, patches):
+            with patches[0], patches[1]:
+                results[name] = controller.exchange_advertised_kv_event_sources()
+
+        threads = [
+            threading.Thread(target=run, args=(f"follower{i}", c, p))
+            for i, (c, p) in enumerate(followers)
+        ]
+        for thread in threads:
+            thread.start()
+        run("leader", leader, leader_patches)
+        for thread in threads:
+            thread.join(timeout=30)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(
+            results["leader"],
+            [self._advertised(rank, rank // 2) for rank in range(6)],
+        )
+        # Followers keep advertising only their own publishers.
+        self.assertEqual(
+            results["follower0"], [self._advertised(2, 1), self._advertised(3, 1)]
+        )
+        self.assertEqual(
+            results["follower1"], [self._advertised(4, 2), self._advertised(5, 2)]
+        )
+
+    def test_report_is_picklable_for_the_handshake(self):
+        import pickle
+
+        report = AdvertisedKvEventSources(node_rank=1, sources=[self._advertised(2)])
+        self.assertEqual(pickle.loads(pickle.dumps(report)), report)
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):

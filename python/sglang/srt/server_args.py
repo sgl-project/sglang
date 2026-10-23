@@ -713,6 +713,9 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+# Node 0 collects every node's advertised KV-event sources at this offset from
+# dist_init_addr once the schedulers are ready (see DataParallelController).
+KV_EVENT_SOURCES_HANDSHAKE_PORT_DELTA = 14
 
 
 @dataclasses.dataclass

@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    KV_EVENT_SOURCES_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
@@ -99,6 +100,19 @@ class WorkerPortHandshake:
     worker_ports: list[int]
     attn_tp_size: int
     attn_cp_size: int
+
+
+@dataclass(frozen=True)
+class AdvertisedKvEventSources:
+    """A follower node's KV-event publishers, reported to node 0 once ready."""
+
+    node_rank: int
+    sources: list[dict]
+
+
+# Followers report once their schedulers are ready; node 0 waits at most this
+# long per report, as the worker-port handshake does.
+KV_EVENT_SOURCES_HANDSHAKE_TIMEOUT_MS = 600 * 1000
 
 
 class LoadBalanceMethod(Enum):
@@ -233,6 +247,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.local_kv_event_sources = []
+        self.local_advertised_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -514,6 +529,92 @@ class DataParallelController:
         else:
             # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint).worker_ports
+
+    def exchange_advertised_kv_event_sources(self) -> list[dict]:
+        """Merge every node's advertised KV-event sources onto node 0.
+
+        Followers send their list once their schedulers are ready; node 0
+        collects one report per follower and acknowledges it. Node 0 returns
+        the merged list, which its server advertises as ``kv_events.sources``
+        so a router holding only node 0's URL can subscribe to the ranks on
+        every node. Followers, single-node deployments and elastic joiners
+        return their local list.
+        """
+        parallel = get_parallel()
+        local = sorted(
+            self.local_advertised_kv_event_sources, key=lambda source: source["dp_rank"]
+        )
+        if (
+            parallel.nnodes <= 1
+            or parallel.dist_init_addr is None
+            or get_exec().moe.is_ep_scale_joiner
+        ):
+            return local
+        na = NetworkAddress.parse(parallel.dist_init_addr)
+        endpoint = NetworkAddress(
+            na.host, na.port + KV_EVENT_SOURCES_HANDSHAKE_PORT_DELTA
+        ).to_tcp()
+        if parallel.node_rank == 0:
+            return self._collect_advertised_sources_as_server(
+                endpoint, parallel.nnodes - 1, local
+            )
+        self._send_advertised_sources_as_client(endpoint, parallel.node_rank, local)
+        return local
+
+    def _collect_advertised_sources_as_server(
+        self, endpoint: str, expected_clients: int, local: list[dict]
+    ) -> list[dict]:
+        merged = list(local)
+        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+        rep_socket.setsockopt(zmq.RCVTIMEO, KV_EVENT_SOURCES_HANDSHAKE_TIMEOUT_MS)
+        try:
+            received = 0
+            while received < expected_clients:
+                try:
+                    report = sock_recv(rep_socket)
+                except zmq.Again:
+                    logger.warning(
+                        "%d of %d follower nodes did not report KV-event sources "
+                        "in time; advertising the %d sources collected so far",
+                        expected_clients - received,
+                        expected_clients,
+                        len(merged),
+                    )
+                    break
+                if not isinstance(report, AdvertisedKvEventSources):
+                    raise RuntimeError("Invalid KV-event source report from a follower")
+                logger.debug(
+                    "Node %d reported %d KV-event sources",
+                    report.node_rank,
+                    len(report.sources),
+                )
+                merged.extend(report.sources)
+                sock_send(rep_socket, wrap_as_pickle("ack"))
+                received += 1
+        finally:
+            rep_socket.close()
+        return sorted(merged, key=lambda source: source["dp_rank"])
+
+    def _send_advertised_sources_as_client(
+        self, endpoint: str, node_rank: int, sources: list[dict]
+    ) -> None:
+        req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
+        req_socket.setsockopt(zmq.RCVTIMEO, KV_EVENT_SOURCES_HANDSHAKE_TIMEOUT_MS)
+        req_socket.setsockopt(zmq.SNDTIMEO, KV_EVENT_SOURCES_HANDSHAKE_TIMEOUT_MS)
+        try:
+            sock_send(
+                req_socket,
+                wrap_as_pickle(AdvertisedKvEventSources(node_rank, sources)),
+            )
+            sock_recv(req_socket)
+        except zmq.Again:
+            logger.warning(
+                "Node 0 did not acknowledge this node's KV-event sources in time; "
+                "DP ranks %s will be missing from node 0's kv_events.sources",
+                [source["dp_rank"] for source in sources],
+            )
+        finally:
+            req_socket.close()
 
     @staticmethod
     def _make_worker_port_handshake(worker_ports: list[int]) -> WorkerPortHandshake:
@@ -809,6 +910,11 @@ class DataParallelController:
                 for info in scheduler_info
                 for source in info.get("kv_event_sources", [])
             )
+            self.local_advertised_kv_event_sources.extend(
+                source
+                for info in scheduler_info
+                for source in info.get("advertised_kv_event_sources", [])
+            )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -969,6 +1075,9 @@ def run_data_parallel_controller_process(
         ):
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            )
+            init_info["advertised_kv_event_sources"] = (
+                controller.exchange_advertised_kv_event_sources()
             )
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
