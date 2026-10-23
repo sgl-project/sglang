@@ -1454,6 +1454,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
+                if self.tool_call_parser == "muse" and request._template_tools:
+                    tools = request._template_tools
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
