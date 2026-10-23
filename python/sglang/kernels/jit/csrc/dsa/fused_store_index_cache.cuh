@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
-namespace {
+namespace sglang {
 
 struct FusedStoreCacheParam {
   const void* __restrict__ input;
@@ -121,4 +121,4 @@ struct FusedStoreCacheIndexerKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

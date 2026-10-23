@@ -27,6 +27,8 @@
 
 #include "marlin.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -358,5 +360,7 @@ void gptq_marlin_repack(
     Panic("Unsupported repack config: num_bits = ", num_bits, ", has_perm = ", has_perm);
   }
 }
+
+}  // namespace sglang
 
 #undef CALL_IF_REPACK

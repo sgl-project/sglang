@@ -1,13 +1,8 @@
-"""Unit tests for the flat raw prompt top logprob response format
-(`return_flat_raw_top_logprobs` / `return_flat_raw_top_logprobs_b64`).
-"""
+"""Unit tests for the flat raw top logprob response format (prompt and output)."""
 
 import asyncio
 import base64
-import json
-import os
 import pickle
-import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -23,7 +18,7 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GenerateReqInput,
-    build_flat_input_top_logprobs_arrays,
+    build_flat_top_logprobs_arrays,
     msgpack_decode,
     msgpack_encode,
 )
@@ -34,13 +29,13 @@ from sglang.srt.managers.scheduler_components.logprob_result_processor import (
 from sglang.srt.managers.tokenizer_manager import (
     ReqState,
     TokenizerManager,
-    _build_flat_input_top_logprobs_fields,
-    _build_flat_input_top_logprobs_fields_from_arrays,
+    _build_flat_top_logprobs_fields,
+    _build_flat_top_logprobs_fields_from_arrays,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # Synthetic per-position top-k rows (k=2). The leading None mirrors the first
 # prompt position, which has no top logprobs.
@@ -57,6 +52,7 @@ _EXACT_VAL_ROWS = [None, [-0.5, -2.5], [-0.25, -1.5], [-0.125, -4.0]]
 class _TokenizerManagerStub:
     """Borrow the real logprob meta_info methods without a full manager."""
 
+    convert_logprob_style = TokenizerManager.convert_logprob_style
     add_logprob_to_meta_info = TokenizerManager.add_logprob_to_meta_info
     detokenize_logprob_tokens = TokenizerManager.detokenize_logprob_tokens
     detokenize_top_logprobs_tokens = TokenizerManager.detokenize_top_logprobs_tokens
@@ -82,6 +78,7 @@ def _add_logprob_meta_info(state: ReqState, top_logprobs_num: int = 2) -> dict:
         top_logprobs_num=top_logprobs_num,
         token_ids_logprob=None,
         return_text_in_logprobs=False,
+        finished=False,
     )
     return meta_info
 
@@ -128,11 +125,29 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
         for i in range(2):
             self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
 
+    def test_output_flag_enables_b64_and_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            return_flat_raw_output_top_logprobs=True,
+            return_flat_raw_top_logprobs_b64=True,
+        )
+        req.normalize_batch_and_arguments()
+        for i in range(2):
+            self.assertTrue(req[i].return_flat_raw_output_top_logprobs)
+            self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
+
+    def test_output_flag_rejects_stream(self):
+        req = GenerateReqInput(
+            text="hello", stream=True, return_flat_raw_output_top_logprobs=True
+        )
+        with self.assertRaisesRegex(ValueError, "stream"):
+            req.normalize_batch_and_arguments()
+
 
 class TestFlatAssembly(CustomTestCase):
     def test_flat_matches_nested_rows(self):
-        fields = _build_flat_input_top_logprobs_fields(
-            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
+        fields = _build_flat_top_logprobs_fields(
+            "input", _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
         )
         self.assertEqual(fields["input_top_logprobs_shape"], [3, 2])
         self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
@@ -155,8 +170,8 @@ class TestFlatAssembly(CustomTestCase):
             self.assertEqual(flat_val[start : start + k], _VAL_ROWS[i])
 
     def test_b64_roundtrip(self):
-        fields = _build_flat_input_top_logprobs_fields(
-            _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=True
+        fields = _build_flat_top_logprobs_fields(
+            "input", _VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=True
         )
         self.assertEqual(fields["input_top_logprobs_shape"], [3, 2])
         self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
@@ -175,8 +190,8 @@ class TestFlatAssembly(CustomTestCase):
         np.testing.assert_array_equal(idx, np.asarray(_IDX_ROWS[1:], dtype=np.int32))
 
     def test_all_null_rows(self):
-        fields = _build_flat_input_top_logprobs_fields(
-            [None], [None], top_logprobs_num=2
+        fields = _build_flat_top_logprobs_fields(
+            "input", [None], [None], top_logprobs_num=2
         )
         self.assertEqual(fields["input_top_logprobs_shape"], [0, 2])
         self.assertEqual(fields["input_top_logprobs_null_prefix"], 1)
@@ -185,7 +200,8 @@ class TestFlatAssembly(CustomTestCase):
 
     def test_rejects_null_row_after_prefix(self):
         with self.assertRaisesRegex(ValueError, "leading prefix"):
-            _build_flat_input_top_logprobs_fields(
+            _build_flat_top_logprobs_fields(
+                "input",
                 [None, [-0.1, -2.5], None, [-0.3, -1.5]],
                 [None, [11, 22], None, [33, 44]],
                 top_logprobs_num=2,
@@ -193,7 +209,8 @@ class TestFlatAssembly(CustomTestCase):
 
     def test_rejects_ragged_rows(self):
         with self.assertRaisesRegex(ValueError, "rectangular"):
-            _build_flat_input_top_logprobs_fields(
+            _build_flat_top_logprobs_fields(
+                "input",
                 [None, [-0.1, -2.5], [-0.3]],
                 [None, [11, 22], [33]],
                 top_logprobs_num=2,
@@ -316,6 +333,101 @@ class TestB64MetaInfo(CustomTestCase):
             again["input_top_logprobs_val_flat_b64"],
             meta_info["input_top_logprobs_val_flat_b64"],
         )
+
+
+class TestFlatOutputTopLogprobs(CustomTestCase):
+    def _state(self, val_rows=None, **obj_kwargs) -> ReqState:
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_output_top_logprobs=True,
+            **obj_kwargs,
+        )
+        state.output_top_logprobs_val.extend(val_rows or _EXACT_VAL_ROWS[1:])
+        state.output_top_logprobs_idx.extend(_IDX_ROWS[1:])
+        return state
+
+    def _meta_info(self, state: ReqState, finished: bool) -> dict:
+        meta_info = {}
+        _TokenizerManagerStub().add_logprob_to_meta_info(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            finished=finished,
+        )
+        return meta_info
+
+    def test_unfinished_output_carries_no_top_logprobs(self):
+        state = self._state()
+
+        meta_info = self._meta_info(state, finished=False)
+
+        self.assertFalse(any(k.startswith("output_top_logprobs") for k in meta_info))
+        self.assertEqual(state.output_top_logprobs, [])
+
+    def test_finished_output_replaces_nested(self):
+        meta_info = self._meta_info(self._state(), finished=True)
+
+        self.assertNotIn("output_top_logprobs", meta_info)
+        self.assertEqual(meta_info["output_top_logprobs_shape"], [3, 2])
+        self.assertEqual(meta_info["output_top_logprobs_null_prefix"], 0)
+        self.assertEqual(
+            meta_info["output_top_logprobs_val_flat"],
+            [v for row in _EXACT_VAL_ROWS[1:] for v in row],
+        )
+        self.assertEqual(
+            meta_info["output_top_logprobs_idx_flat"],
+            [i for row in _IDX_ROWS[1:] for i in row],
+        )
+        # The prompt side keeps its own format.
+        self.assertIn("input_top_logprobs", meta_info)
+
+    def test_plain_json_flattens_the_original_rows(self):
+        val_rows = [None, [-0.5, -2.5], [-0.25, -1.5]]
+        state = _make_state(
+            return_logprob=True,
+            top_logprobs_num=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+        state.output_top_logprobs_val.extend(val_rows)
+        state.output_top_logprobs_idx.extend([None, [11, 22], [33, 44]])
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertEqual(meta_info["output_top_logprobs_shape"], [2, 2])
+        self.assertEqual(meta_info["output_top_logprobs_null_prefix"], 1)
+        self.assertEqual(meta_info["output_top_logprobs_idx_flat"], [11, 22, 33, 44])
+        # Plain JSON reuses the engine's floats; no NumPy round trip.
+        self.assertIs(meta_info["output_top_logprobs_val_flat"][0], val_rows[1][0])
+
+    def test_b64_roundtrip_keeps_non_finite_logprobs(self):
+        val_rows = [[-0.5, float("-inf")], [-0.25, -1.5], [-0.125, -4.0]]
+        state = self._state(val_rows, return_flat_raw_top_logprobs_b64=True)
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertNotIn("output_top_logprobs_val_flat", meta_info)
+        shape = meta_info["output_top_logprobs_shape"]
+        val = np.frombuffer(
+            base64.b64decode(meta_info["output_top_logprobs_val_flat_b64"]),
+            dtype=meta_info["output_top_logprobs_val_flat_b64_dtype"],
+        ).reshape(shape)
+        idx = np.frombuffer(
+            base64.b64decode(meta_info["output_top_logprobs_idx_flat_b64"]),
+            dtype=meta_info["output_top_logprobs_idx_flat_b64_dtype"],
+        ).reshape(shape)
+        np.testing.assert_array_equal(val, np.asarray(val_rows, dtype=np.float32))
+        np.testing.assert_array_equal(idx, np.asarray(_IDX_ROWS[1:], dtype=np.int32))
+
+    def test_unrepresentable_rows_fall_back_to_nested(self):
+        state = self._state([[-0.5, -2.5], [-0.25], [-0.125, -4.0]])
+
+        meta_info = self._meta_info(state, finished=True)
+
+        self.assertNotIn("output_top_logprobs_shape", meta_info)
+        self.assertEqual(len(meta_info["output_top_logprobs"]), 3)
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
@@ -463,14 +575,18 @@ class TestFromArraysMatchesFromRows(CustomTestCase):
     response fields as the rows-based builder."""
 
     def _both(self, return_b64: bool):
-        from_rows = _build_flat_input_top_logprobs_fields(
-            _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2, return_b64=return_b64
+        from_rows = _build_flat_top_logprobs_fields(
+            "input",
+            _EXACT_VAL_ROWS,
+            _IDX_ROWS,
+            top_logprobs_num=2,
+            return_b64=return_b64,
         )
-        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        val_arr, idx_arr, null_prefix = build_flat_top_logprobs_arrays(
             _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
         )
-        from_arrays = _build_flat_input_top_logprobs_fields_from_arrays(
-            val_arr, idx_arr, null_prefix, return_b64=return_b64
+        from_arrays = _build_flat_top_logprobs_fields_from_arrays(
+            "input", val_arr, idx_arr, null_prefix, return_b64=return_b64
         )
         return from_rows, from_arrays
 
@@ -483,17 +599,19 @@ class TestFromArraysMatchesFromRows(CustomTestCase):
         self.assertEqual(from_rows, from_arrays)
 
     def test_all_null_rows(self):
-        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        val_arr, idx_arr, null_prefix = build_flat_top_logprobs_arrays(
             [None], [None], top_logprobs_num=2
         )
         self.assertEqual(val_arr.shape, (0, 2))
         self.assertEqual(null_prefix, 1)
-        fields = _build_flat_input_top_logprobs_fields_from_arrays(
-            val_arr, idx_arr, null_prefix
+        fields = _build_flat_top_logprobs_fields_from_arrays(
+            "input", val_arr, idx_arr, null_prefix
         )
         self.assertEqual(
             fields,
-            _build_flat_input_top_logprobs_fields([None], [None], top_logprobs_num=2),
+            _build_flat_top_logprobs_fields(
+                "input", [None], [None], top_logprobs_num=2
+            ),
         )
 
 
@@ -519,7 +637,7 @@ class TestMetaInfoFromSchedulerArrays(CustomTestCase):
             **state_kwargs,
         )
         # Scheduler-flat requests arrive with empty nested rows and the arrays.
-        state.input_top_logprobs_scheduler_flat = build_flat_input_top_logprobs_arrays(
+        state.input_top_logprobs_scheduler_flat = build_flat_top_logprobs_arrays(
             _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
         )
         return state
@@ -541,6 +659,69 @@ class TestMetaInfoFromSchedulerArrays(CustomTestCase):
         self.assertIs(
             again["input_top_logprobs_val_flat"], first["input_top_logprobs_val_flat"]
         )
+
+
+class TestTokenizerManagerLogprobs(CustomTestCase):
+    def test_output_logprobs_without_input_logprobs(self):
+        state = _make_state(return_logprob=True, top_logprobs_num=0)
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            input_token_logprobs_idx=None,
+            output_token_logprobs_val=[[-0.25]],
+            output_token_logprobs_idx=[[42]],
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+            finished=False,
+        )
+
+        self.assertEqual(meta_info["input_token_logprobs"], [])
+        self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
+        self.assertEqual(meta_info["output_token_logprobs_length"], 1)
+
+    def test_top_and_token_ids_logprobs_without_logprob_lists(self):
+        """An output without logprob lists, as sent for a request aborted before
+        prefill, must not crash a request that asked for top or token id logprobs."""
+        state = _make_state(
+            return_logprob=True, top_logprobs_num=2, token_ids_logprob=[42]
+        )
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            output_token_logprobs_val=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_val_flat=None,
+            output_top_logprobs_val=None,
+            input_token_ids_logprobs_val=None,
+            output_token_ids_logprobs_val=None,
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=[42],
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+            finished=True,
+        )
+
+        for key in (
+            "input_top_logprobs",
+            "output_top_logprobs",
+            "input_token_ids_logprobs",
+            "output_token_ids_logprobs",
+        ):
+            self.assertEqual(meta_info[key], [])
 
 
 def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
@@ -574,7 +755,6 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=None,
         output_token_sampling_mask=None,
-        output_token_sampling_logprobs=None,
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
@@ -590,7 +770,7 @@ class TestBatchOutputTransport(CustomTestCase):
     (SGLANG_USE_PICKLE_IPC, the default) and msgpack (enc/dec hooks)."""
 
     def _flat_output(self) -> BatchTokenIDOutput:
-        val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        val_arr, idx_arr, null_prefix = build_flat_top_logprobs_arrays(
             _EXACT_VAL_ROWS, _IDX_ROWS, top_logprobs_num=2
         )
         return _make_batch_token_id_output(
@@ -627,134 +807,6 @@ class TestBatchOutputTransport(CustomTestCase):
         output = self._flat_output()
         decoded = msgpack_decode(msgpack_encode(output))
         self._check_roundtrip(decoded, output)
-
-    def test_fields_default_none(self):
-        output = _make_batch_token_id_output()
-        self.assertIsNone(output.input_top_logprobs_val_flat)
-        self.assertIsNone(output.input_top_logprobs_idx_flat)
-        self.assertIsNone(output.input_top_logprobs_flat_null_prefix)
-
-
-@unittest.skipUnless(
-    os.environ.get("SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS"),
-    "Serialization microbenchmark; set SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS=1 to run.",
-)
-class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
-    """Round-trip cost of the formats: server assembly + json.dumps, then
-    client json.loads + reconstruction into [rows, k] arrays."""
-
-    def test_bench(self):
-        num_positions, k = 32768, 2
-        rng = np.random.default_rng(0)
-        vals = rng.standard_normal((num_positions, k)).astype(np.float32)
-        idxs = rng.integers(0, 150000, size=(num_positions, k), dtype=np.int32)
-        val_rows = [None] + vals[1:].tolist()
-        idx_rows = [None] + idxs[1:].tolist()
-
-        def best_of(fn, iters=5):
-            result = fn()
-            elapsed = min(
-                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
-                for _ in range(iters)
-            )
-            return elapsed * 1e3, result
-
-        def bench(name, build, decode):
-            encode_ms, payload = best_of(lambda: json.dumps(build()))
-            decode_ms, arrays = best_of(lambda: decode(payload))
-            self.assertEqual(arrays[0].shape, (num_positions - 1, k))
-            print(
-                f"{name}: encode {encode_ms:.1f} ms, decode {decode_ms:.1f} ms, "
-                f"{len(payload)} bytes"
-            )
-
-        def decode_nested(payload):
-            rows = [r for r in json.loads(payload) if r is not None]
-            return (
-                np.array([[e[0] for e in r] for r in rows], dtype=np.float32),
-                np.array([[e[1] for e in r] for r in rows], dtype=np.int32),
-            )
-
-        def decode_flat(payload):
-            d = json.loads(payload)
-            shape = d["input_top_logprobs_shape"]
-            return (
-                np.asarray(d["input_top_logprobs_val_flat"], np.float32).reshape(shape),
-                np.asarray(d["input_top_logprobs_idx_flat"], np.int32).reshape(shape),
-            )
-
-        bench(
-            "nested triples",
-            lambda: [
-                (None if row is None else [(v, i, None) for v, i in zip(row, idx_row)])
-                for row, idx_row in zip(val_rows, idx_rows)
-            ],
-            decode_nested,
-        )
-        bench(
-            "flat lists",
-            lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k
-            ),
-            decode_flat,
-        )
-
-        def decode_b64(payload):
-            d = json.loads(payload)
-            shape = d["input_top_logprobs_shape"]
-            return (
-                np.frombuffer(
-                    base64.b64decode(d["input_top_logprobs_val_flat_b64"]),
-                    np.dtype(d["input_top_logprobs_val_flat_b64_dtype"]),
-                ).reshape(shape),
-                np.frombuffer(
-                    base64.b64decode(d["input_top_logprobs_idx_flat_b64"]),
-                    np.dtype(d["input_top_logprobs_idx_flat_b64_dtype"]),
-                ).reshape(shape),
-            )
-
-        bench(
-            "flat b64",
-            lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k, return_b64=True
-            ),
-            decode_b64,
-        )
-
-    def test_bench_ipc_pickle(self):
-        """Inter-process cost of BatchTokenIDOutput input-top fields: nested
-        per-position rows vs scheduler-flat arrays (two ZMQ pickle hops each
-        pay dumps + loads)."""
-        num_positions, k = 32768, 2
-        rng = np.random.default_rng(0)
-        vals = rng.standard_normal((num_positions, k)).astype(np.float32)
-        idxs = rng.integers(0, 150000, size=(num_positions, k), dtype=np.int32)
-
-        def best_of(fn, iters=10):
-            return min(
-                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
-                for _ in range(iters)
-            )
-
-        nested = _make_batch_token_id_output(
-            input_top_logprobs_val=[[None] + vals[1:].tolist(), []],
-            input_top_logprobs_idx=[[None] + idxs[1:].tolist(), []],
-        )
-        flat = _make_batch_token_id_output(
-            input_top_logprobs_val_flat=[vals[1:], None],
-            input_top_logprobs_idx_flat=[idxs[1:], None],
-            input_top_logprobs_flat_null_prefix=[1, None],
-        )
-        for name, obj in (("nested rows", nested), ("flat arrays", flat)):
-            payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-            dumps_ms = best_of(
-                lambda o=obj: pickle.dumps(o, protocol=pickle.HIGHEST_PROTOCOL)
-            )
-            loads_ms = best_of(lambda p=payload: pickle.loads(p))
-            print(
-                f"{name}: pickle.dumps {dumps_ms * 1e3:.2f} ms, "
-                f"pickle.loads {loads_ms * 1e3:.2f} ms, {len(payload) / 1e6:.2f} MB"
-            )
 
 
 if __name__ == "__main__":

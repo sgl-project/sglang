@@ -74,14 +74,19 @@ def covered(
     scores: torch.Tensor, bias: torch.Tensor, topk: int, x: torch.Tensor
 ) -> bool:
     """route_radix coverage plus the quant half: [M<=64, 3584] bf16 rows with
-    32B-aligned starts (base and stride), same token count as the scores."""
+    32B-aligned starts (base and stride).
+
+    Activations disagreeing with the scores on token count is a caller bug, not
+    an unsupported layout (the only staging site splits both from one GEMM
+    output), so it is left to the launcher, which reports it as "scores and
+    activations must have the same token count".
+    """
     return (
         moe_route_radix.covered(scores, bias, topk)
         and x.dim() == 2
-        and x.shape[0] == scores.shape[0]
         and 0 < x.shape[0] <= _MAX_TOKENS
         and x.shape[1] == _HIDDEN
-        and x.dtype == torch.bfloat16
+        and x.dtype in (torch.bfloat16, torch.float32)
         and x.stride(1) == 1
         and x.data_ptr() % 32 == 0
         and (x.stride(0) * x.element_size()) % 32 == 0

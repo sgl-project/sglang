@@ -8,15 +8,16 @@ from typing import Any
 
 def minimax_h3_replica_ctx() -> tuple[int, int]:
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_world_group,
+        get_replica_group,
         model_parallel_is_initialized,
     )
 
     if not model_parallel_is_initialized():
         return 1, 0
-    # ServerArgs currently rejects DP>1 and H3 rejects disaggregation, so the
-    # world group contains exactly one request replica (TP/CFG/SP ranks).
-    group = get_world_group()
+    # A request lives in one pipeline replica (TP/CFG/SP ranks); the world
+    # group spans replicas when dp_size > 1, so a world-group collective would
+    # wait on idle replicas forever.
+    group = get_replica_group()
     return int(group.world_size), int(group.rank_in_group)
 
 
@@ -26,10 +27,10 @@ def minimax_h3_replica_broadcast_extra(batch: Any, key: str) -> None:
         return
 
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_world_group,
+        get_replica_group,
     )
 
-    group = get_world_group()
+    group = get_replica_group()
     payload = {"value": batch.extra.get(key)} if rank == 0 else None
     payload = group.broadcast_tensor_dict(payload, src=0)
     value = payload.get("value") if isinstance(payload, dict) else None
@@ -45,10 +46,10 @@ def minimax_h3_replica_broadcast_error(error: str | None) -> str | None:
         return error
 
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_world_group,
+        get_replica_group,
     )
 
-    group = get_world_group()
+    group = get_replica_group()
     return group.broadcast_object(error if rank == 0 else None, src=0)
 
 

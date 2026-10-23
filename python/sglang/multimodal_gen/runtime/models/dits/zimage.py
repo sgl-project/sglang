@@ -5,14 +5,10 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_world_size,
-    sequence_model_parallel_all_gather,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
@@ -46,6 +42,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -88,11 +87,9 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_tanh_residual,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual
 
-        y = zimage_rmsnorm_tanh_residual(
+        y = rmsnorm_tanh_residual(
             x,
             gate,
             residual,
@@ -111,11 +108,9 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
-            zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_scale
 
-        y = fused_zimage_rmsnorm_scale(
+        y = rmsnorm_scale(
             x,
             norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
             scale,
@@ -139,7 +134,7 @@ def zimage_native_qk_rmsnorm(
     with one Triton launch per tensor that reads the strided fused-qkv slices
     directly. Returns contiguous (q, k) or None when unsupported.
     """
-    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+    from sglang.kernels.ops.diffusion import (
         can_use_qk_rmsnorm_native,
         zimage_qk_rmsnorm_native,
     )
@@ -250,6 +245,7 @@ class ZImageAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        norm_cls: type[nn.Module] = ZImageRMSNorm,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -257,15 +253,17 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
-        self.enable_zimage_qk_fusion = quant_config is None
+        self.enable_zimage_qk_fusion = (
+            quant_config is None and norm_cls is ZImageRMSNorm
+        )
 
         tp_size = get_tp_world_size()
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
-        assert (
-            num_kv_heads % tp_size == 0
-        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        assert num_heads % tp_size == 0, (
+            f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        )
+        assert num_kv_heads % tp_size == 0, (
+            f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
 
@@ -308,8 +306,8 @@ class ZImageAttention(nn.Module):
             )
 
         if self.qk_norm:
-            self.norm_q = ZImageRMSNorm(self.head_dim, eps=eps)
-            self.norm_k = ZImageRMSNorm(self.head_dim, eps=eps)
+            self.norm_q = norm_cls(self.head_dim, eps=eps)
+            self.norm_k = norm_cls(self.head_dim, eps=eps)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -524,13 +522,16 @@ class ZImageTransformerBlock(nn.Module):
         modulation=True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        norm_cls: type[nn.Module] = ZImageRMSNorm,
     ):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // n_heads
         self.layer_id = layer_id
         self.modulation = modulation
-        self.enable_zimage_native_norm_fusion = quant_config is None
+        self.enable_zimage_native_norm_fusion = (
+            quant_config is None and norm_cls is ZImageRMSNorm
+        )
 
         self.attention = ZImageAttention(
             dim=dim,
@@ -540,6 +541,7 @@ class ZImageTransformerBlock(nn.Module):
             eps=1e-5,
             quant_config=quant_config,
             prefix=f"{prefix}.attention",
+            norm_cls=norm_cls,
         )
         if not modulation:
             # Context refiner runs on fully replicated caption tokens only.
@@ -579,11 +581,11 @@ class ZImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.feed_forward",
             )
 
-        self.attention_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.attention_norm1 = norm_cls(dim, eps=norm_eps)
+        self.ffn_norm1 = norm_cls(dim, eps=norm_eps)
 
-        self.attention_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.attention_norm2 = norm_cls(dim, eps=norm_eps)
+        self.ffn_norm2 = norm_cls(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -709,9 +711,9 @@ class RopeEmbedder:
         self.theta = theta
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
-        assert len(axes_dims) == len(
-            axes_lens
-        ), "axes_dims and axes_lens must have the same length"
+        assert len(axes_dims) == len(axes_lens), (
+            "axes_dims and axes_lens must have the same length"
+        )
 
         self.cos_cached = None
         self.sin_cached = None
@@ -768,9 +770,10 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    norm_cls = ZImageRMSNorm
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
-    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_zimage_layer]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
@@ -813,8 +816,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
@@ -862,6 +864,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     modulation=True,
                     quant_config=quant_config,
                     prefix=f"noise_refiner.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -878,6 +881,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     modulation=False,
                     quant_config=quant_config,
                     prefix=f"context_refiner.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -887,7 +891,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.cap_embedder = nn.Sequential(
-            ZImageRMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
+            self.norm_cls(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
             ReplicatedLinear(arch_config.cap_feat_dim, self.dim, bias=True),
         )
 
@@ -905,6 +909,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     arch_config.qk_norm,
                     quant_config=quant_config,
                     prefix=f"layers.{layer_id}",
+                    norm_cls=self.norm_cls,
                 )
                 for layer_id in range(arch_config.num_layers)
             ]
@@ -1204,7 +1209,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, "_cached_batched_freqs_cis", None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         freqs_cis = self._build_batched_freqs_cis(
             images,
@@ -1215,7 +1220,32 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_target_len=cap_target_len,
         )
         self._cached_batched_freqs_cis = (cache_key, freqs_cis)
-        return freqs_cis
+        return self._pin_for_active_capture(freqs_cis)
+
+    def _pin_for_active_capture(self, value):
+        """Keep cache values consumed under CUDA graph capture alive forever.
+
+        The single-slot shape-keyed caches below hold tensors that are pure
+        functions of their cache key. Capturing a second signature (e.g. the
+        next BCG caption bucket, whose static input buffers change every
+        ``data_ptr()``-keyed entry) replaces the slot and frees the old
+        tensors -- but a previously captured graph baked their device
+        addresses, so replaying it dereferences freed memory (observed as an
+        illegal memory access or a hang at the first replayed segment).
+        Pinning every value a capture consumes keeps those addresses alive;
+        contents stay correct because a value never changes for its key.
+        Growth is bounded by O(cache sites x captured signatures) small
+        tensors, and nothing is pinned outside graph capture.
+        """
+        if is_in_breakable_cuda_graph() or (
+            _is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            pinned = getattr(self, "_bcg_pinned_cache_values", None)
+            if pinned is None:
+                pinned = []
+                self._bcg_pinned_cache_values = pinned
+            pinned.append(value)
+        return value
 
     def _get_rope_cache(
         self,
@@ -1240,7 +1270,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, cache_attr, None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         if cos.dim() == 3:
             batch_size, seq_len = cos.shape[:2]
@@ -1268,7 +1298,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         rope_cache = (cos_sin_cache, positions)
         setattr(self, cache_attr, (cache_key, rope_cache))
-        return rope_cache
+        return self._pin_for_active_capture(rope_cache)
 
     def _get_attn_mask_and_meta(
         self, cache_attr: str, lengths: list[int], target_len: int, device: torch.device
@@ -1284,7 +1314,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, cache_attr, None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         positions = torch.arange(target_len, device=device).unsqueeze(0)
         length_tensor = torch.as_tensor(
@@ -1294,7 +1324,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         meta = build_varlen_mask_meta_from_lengths(length_key, target_len, device)
         result = (mask, meta)
         setattr(self, cache_attr, (cache_key, result))
-        return result
+        return self._pin_for_active_capture(result)
 
     def _get_joint_attn_mask_and_meta(
         self,
@@ -1320,7 +1350,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         cached = getattr(self, "_cached_joint_attn_mask_meta", None)
         if cached is not None and cached[0] == cache_key:
-            return cached[1]
+            return self._pin_for_active_capture(cached[1])
 
         image_pos = torch.arange(image_target_len, device=device).unsqueeze(0)
         cap_pos = torch.arange(cap_target_len, device=device).unsqueeze(0)
@@ -1347,11 +1377,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         result = (mask, meta)
         self._cached_joint_attn_mask_meta = (cache_key, result)
-        return result
-
-    @staticmethod
-    def _has_padding(valid_lens: list[int], target_len: int) -> bool:
-        return any(int(length) < target_len for length in valid_lens)
+        return self._pin_for_active_capture(result)
 
     @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
@@ -1425,23 +1451,24 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         valid_lens: list[int] | torch.Tensor,
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
-        """Replace padded token rows after each valid sequence length."""
-        if not torch.is_tensor(valid_lens) and all(
-            int(length) >= tensor.shape[1] for length in valid_lens
-        ):
+        """Replace padded token rows after each valid sequence length.
+
+        Selects rather than mask-assigns: a boolean-mask write syncs with the host.
+        """
+        seq_len = tensor.shape[1]
+        pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        if not torch.is_tensor(valid_lens):
+            if all(int(length) >= seq_len for length in valid_lens):
+                return tensor
+            tensor = tensor.clone()
+            for row, length in enumerate(valid_lens):
+                tensor[row, int(length) :] = pad_value
             return tensor
-        positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        if torch.is_tensor(valid_lens):
-            lengths = valid_lens.to(device=tensor.device, dtype=torch.long)
-        else:
-            lengths = torch.tensor(valid_lens, device=tensor.device)
-        if lengths.ndim == 0:
-            lengths = lengths.reshape(1)
-        lengths = lengths.unsqueeze(1)
-        pad_mask = positions >= lengths
-        tensor = tensor.clone()
-        tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
-        return tensor
+        lengths = valid_lens.to(device=tensor.device, dtype=torch.long).reshape(-1, 1)
+        positions = torch.arange(seq_len, device=tensor.device).unsqueeze(0)
+        return torch.where(
+            (positions >= lengths).unsqueeze(-1), pad_value.view(1, 1, -1), tensor
+        )
 
     @staticmethod
     def _replace_padding_with_token_mask(
@@ -1575,24 +1602,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         cap_seq_len = cap_feats.shape[1]
-        use_full_unified_sequence = (
-            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
-        )
-        if use_full_unified_sequence:
-            # Ring support for this attention layout is not implemented; the
-            # full-sequence gather is correct but gives up ring's memory and
-            # overlap benefits.
-            logger.warning_once(
-                "zimage under ring_degree > 1 falls back to a full-sequence "
-                "K/V gather"
-            )
-        x_local_seq_len = x.shape[1]
-        if use_full_unified_sequence:
-            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
-            x_freqs_cis = (
-                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
-                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
-            )
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
             torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=-2),
@@ -1608,7 +1617,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
             "_cached_unified_rope_cache", unified_freqs_cis
         )
-        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
+        num_replicated_suffix = cap_seq_len
 
         for layer in self.layers:
             unified = layer(
@@ -1620,17 +1629,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask=unified_attn_mask,
                 attn_mask_meta=unified_attn_mask_meta,
                 num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=use_full_unified_sequence,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
-        if use_full_unified_sequence:
-            sp_rank = get_sp_parallel_rank()
-            start = sp_rank * x_local_seq_len
-            end = start + x_local_seq_len
-            unified = unified[:, start:end]
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
