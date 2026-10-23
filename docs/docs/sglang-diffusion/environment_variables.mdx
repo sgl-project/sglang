@@ -85,13 +85,13 @@ description: "Configure SGLang diffusion behavior with environment variables."
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KITCHEN_INT8_MAX_ROWS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Max activation rows per <code>convrot_int8</code> fused GEMM on the <code>comfy_kitchen</code> backend. Set <code>0</code> to disable row splitting.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>0</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Max activation rows per <code>convrot_int8</code> fused GEMM on the <code>comfy_kitchen</code> backend. <code>0</code> (default) issues one call; a positive value splits large-M GEMMs by rows.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KITCHEN_INT8_MIN_SPLIT_N</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum output features before <code>convrot_int8</code> (<code>comfy_kitchen</code> backend) splits large-M GEMMs. Narrow outputs stay as a single call.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum output features before <code>convrot_int8</code> (<code>comfy_kitchen</code> backend) splits large-M GEMMs when <code>SGLANG_KITCHEN_INT8_MAX_ROWS</code> is positive. Narrow outputs stay as a single call.</td>
     </tr>
   </tbody>
 </table>
