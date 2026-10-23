@@ -3210,33 +3210,18 @@ class DeepseekV4AttnBackend(
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
-        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
-            # DP attention pads an eager extend past the rows extend_seq_lens cover.
-            num_real = hoisted_pos.shape[0]
-            x, positions = x[:num_real], positions[:num_real]
-            if q_lora is not None:
-                q_lora = q_lora[:num_real]
-        if (
-            hoisted_req is not None
-            and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
-        ):
-            # The hoisted rows are these rows: bucket-sized inside the prefill
-            # graph, or an eager extend's own.
-            req, pos = hoisted_req, hoisted_pos
-        elif (
-            hoisted_req is not None
-            and hoisted_pos is not None
-            and forward_batch.forward_mode.is_extend()
-            and hoisted_pos.shape[0] > positions.shape[0]
-        ):
-            # An eager break in the late-layer tail sees only the tail's live rows,
-            # while extend_seq_lens still spans the whole extend; live rows come first.
-            n = positions.shape[0]
-            req, pos = hoisted_req[:n], hoisted_pos[:n]
-        else:
+        if hoisted_pos is None:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
+        else:
+            # The hoisted rows list the live rows first. DP attention pads an eager
+            # extend past them; an eager break in the late-layer tail sees fewer, and
+            # there extend_seq_lens still spans the whole extend.
+            n = min(hoisted_pos.shape[0], positions.shape[0])
+            x, positions = x[:n], positions[:n]
+            if q_lora is not None:
+                q_lora = q_lora[:n]
+            req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
