@@ -81,7 +81,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -5814,8 +5814,14 @@ def get_minimax_sparse_index_dtype(
     *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
-    # On CUDA, fp8_e4m3 KV stores the index K in fp8 too (fp8 GEMM or widened decode).
-    if fp8_attn_gemm or (_is_cuda and kv_cache_dtype == torch.float8_e4m3fn):
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too. On Hopper, fp8_e4m3 KV
+    # also stores the index K in fp8 for the fp16-widened Triton decode; elsewhere
+    # plain fp8 KV keeps the index K in the model dtype.
+    if fp8_attn_gemm or (
+        _is_cuda
+        and get_platform().is_sm90
+        and kv_cache_dtype == torch.float8_e4m3fn
+    ):
         return kv_cache_dtype
     if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
         return torch.float8_e4m3fn
