@@ -498,9 +498,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         broadcast = []
         forwarded = []
         router.socket_mapping = SimpleNamespace(
-            send_output=lambda ipc_name, obj: broadcast.append(
-                (ipc_name, obj.is_pause)
-            )
+            send_output=lambda ipc_name, obj: broadcast.append((ipc_name, obj.is_pause))
         )
 
         inbox = [
