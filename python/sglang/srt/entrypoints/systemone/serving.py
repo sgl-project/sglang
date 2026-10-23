@@ -7,6 +7,7 @@ import dataclasses
 import json
 import math
 import string
+import uuid
 from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -52,6 +53,12 @@ from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
 _PAIR_LABELS = [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]
+
+# How often a /v1/systemone handler checks the client connection while its
+# (short, non-streaming) scoring requests run. The generic non-streaming wait
+# polls only every SGLANG_REQUEST_STATE_WAIT_TIMEOUT seconds, which a fast
+# scoring request never outlives.
+_DISCONNECT_POLL_SECONDS = 1.0
 
 # The system message of decision_messages in the decision checkpoint's source.
 _DECIDER_SYSTEM = (
@@ -114,23 +121,37 @@ class SystemOneServing(OpenAIServingDecisions):
         raw_request: Request = None,
     ) -> Tuple[
         Iterator[EncodedQuestion],
-        Tuple[SystemOneRequest, List[QuestionView]],
+        Tuple[SystemOneRequest, List[QuestionView], str],
     ]:
         views = [_view(question) for question in request.questions.values()]
+        # One rid per HTTP request: caller-supplied when the proxy wants to
+        # abort via /abort_request (prefix match), generated otherwise.
+        base_rid = request.rid or uuid.uuid4().hex
         if self.joint_head_config is not None:
-            return self._joint_schema_request(request, views), (request, views)
+            return self._joint_schema_request(request, views, base_rid), (
+                request,
+                views,
+                base_rid,
+            )
         if self.pointer_head is not None:
-            return self._pointer_request(request, views), (request, views)
+            return self._pointer_request(request, views, base_rid), (
+                request,
+                views,
+                base_rid,
+            )
         encode = (
             self._encoded_systemone_questions
             if self.decision_config is None
             else self._encoded_decider_questions
         )
         # Lazy, so the async handler can yield to other requests between questions.
-        return encode(request, views), (request, views)
+        return encode(request, views), (request, views, base_rid)
 
     def _joint_schema_request(
-        self, request: SystemOneRequest, views: List[QuestionView]
+        self,
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        base_rid: str,
     ) -> EmbeddingReqInput:
         """All questions in one prompt, which the joint schema head scores in one prefill.
 
@@ -144,10 +165,14 @@ class SystemOneServing(OpenAIServingDecisions):
                 for image in request.images
             ]
             or None,
+            rid=base_rid,
         )
 
     def _pointer_request(
-        self, request: SystemOneRequest, views: List[QuestionView]
+        self,
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        base_rid: str,
     ) -> EmbeddingReqInput:
         """One prompt per question, which the pointer head scores in its own prefill."""
         for question_id, view in zip(request.questions, views):
@@ -167,6 +192,7 @@ class SystemOneServing(OpenAIServingDecisions):
         return EmbeddingReqInput(
             input_ids=[input_ids for input_ids, _ in rows],
             decision_layout=[layout for _, layout in rows],
+            rid=[f"{base_rid}_{i}" for i in range(len(rows))],
         )
 
     async def _answer_pointer(
@@ -175,10 +201,15 @@ class SystemOneServing(OpenAIServingDecisions):
         request: SystemOneRequest,
         views: List[QuestionView],
         raw_request: Request,
+        base_rid: str,
     ) -> ORJSONResponse:
-        rets = await self.tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
+        rets = await self._await_first_with_disconnect_guard(
+            self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__(),
+            raw_request,
+            base_rid,
+        )
         answers = {}
         for question_id, view, ret in zip(request.questions, views, rets):
             logits = ret["embedding"]
@@ -260,11 +291,16 @@ class SystemOneServing(OpenAIServingDecisions):
         request: SystemOneRequest,
         views: List[QuestionView],
         raw_request: Request,
+        base_rid: str,
     ) -> ORJSONResponse:
         await self._encode_joint_schema_prompt(adapted_request, request)
-        ret = await self.tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
+        ret = await self._await_first_with_disconnect_guard(
+            self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__(),
+            raw_request,
+            base_rid,
+        )
         logits = ret["embedding"]
         names = [
             [name for name, _ in joint_schema_options(question)]
@@ -401,29 +437,64 @@ class SystemOneServing(OpenAIServingDecisions):
         # Each final prompt is still checked as a whole in _encode_question.
         return labels
 
+    async def _await_first_with_disconnect_guard(
+        self, awaitable, raw_request: Optional[Request], base_rid: str
+    ):
+        """Pull the first response while watching for the client disconnecting.
+
+        The generic non-streaming wait only polls the connection every
+        SGLANG_REQUEST_STATE_WAIT_TIMEOUT seconds, so a short scoring request
+        that finishes inside one poll interval is never checked and abandoned
+        requests keep the GPU busy to completion. Poll more often here, and
+        abort the request (rid-prefix match covers every derived per-question
+        rid) as soon as the disconnect is observed.
+        """
+        task = asyncio.ensure_future(awaitable)
+        if raw_request is None:
+            return await task
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+                if done:
+                    return task.result()
+                if await raw_request.is_disconnected():
+                    self.tokenizer_manager.abort_request(base_rid)
+                    raise ValueError(
+                        f"Request is disconnected from the client side. "
+                        f"Abort request {base_rid}"
+                    )
+        finally:
+            if not task.done():
+                task.cancel()
+
     async def _handle_non_streaming_request(
         self,
         adapted_request: Iterator[EncodedQuestion],
-        processed: Tuple[SystemOneRequest, List[QuestionView]],
+        processed: Tuple[SystemOneRequest, List[QuestionView], str],
         raw_request: Request,
     ) -> ORJSONResponse:
-        request, views = processed
+        request, views, base_rid = processed
         if self.joint_head_config is not None:
             return await self._answer_joint_schema(
-                adapted_request, request, views, raw_request
+                adapted_request, request, views, raw_request, base_rid
             )
         if self.pointer_head is not None:
             return await self._answer_pointer(
-                adapted_request, request, views, raw_request
+                adapted_request, request, views, raw_request, base_rid
             )
-        _, _, result = await self._score(
-            adapted_request=adapted_request,
-            raw_request=raw_request,
-            temperature=(
-                1.0
-                if self.decision_config is None
-                else self.decision_config["temperature"]
+        _, _, result = await self._await_first_with_disconnect_guard(
+            self._score(
+                adapted_request=adapted_request,
+                raw_request=raw_request,
+                temperature=(
+                    1.0
+                    if self.decision_config is None
+                    else self.decision_config["temperature"]
+                ),
+                rid=base_rid,
             ),
+            raw_request,
+            base_rid,
         )
         answers = {}
         for i, question_id in enumerate(request.questions):

@@ -70,6 +70,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
+        scheduler._pending_abort_pause = False
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
@@ -287,19 +288,101 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         last_batch.filter_batch.assert_not_called()
         scheduler.running_batch.merge_batch.assert_not_called()
 
-    def test_abort_mode_rejected_at_scheduler(self):
-        """abort mode must be rejected by the scheduler-side assert."""
+    def test_abort_mode_defers_engine_pause(self):
+        """abort mode must park the engine only after the drain, via the pending flag."""
         scheduler = self._new_scheduler()
+        scheduler.abort_request = MagicMock()
+        swept = []
 
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        def record_sweep(recv_req):
+            swept.append(recv_req)
 
-    def test_default_mode_rejected_at_scheduler(self):
-        """bare PauseGenerationReqInput defaults to abort and must be rejected."""
+        scheduler.abort_request.side_effect = record_sweep
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+
+        # The engine keeps running so in-flight requests can finish their
+        # aborts; the pending gate carries the pause until full idle.
+        self.assertTrue(scheduler._pending_abort_pause)
+        self.assertFalse(scheduler._engine_paused)
+        # The pause sweeps abort_all once, authoritative at pause-processing
+        # time, so already-queued requests are aborted even if the pausing
+        # tokenizer worker's polling fired its last abort_all early.
+        self.assertEqual(len(swept), 1)
+        self.assertTrue(swept[0].abort_all)
+
+    def test_default_mode_defers_engine_pause(self):
+        """bare PauseGenerationReqInput defaults to abort and defers like abort."""
         scheduler = self._new_scheduler()
+        scheduler.abort_request = MagicMock()
 
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput())
+        scheduler.pause_generation(PauseGenerationReqInput())
+
+        self.assertTrue(scheduler._pending_abort_pause)
+        self.assertFalse(scheduler._engine_paused)
+        scheduler.abort_request.assert_called_once()
+
+    def test_abort_pause_promotes_when_fully_idle(self):
+        scheduler = self._new_scheduler()
+        scheduler.abort_request = MagicMock()
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+
+        scheduler._promote_pending_abort_pause()
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertFalse(scheduler._pending_abort_pause)
+
+    def test_abort_pause_stays_pending_while_not_idle(self):
+        scheduler = self._new_scheduler()
+        scheduler.abort_request = MagicMock()
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.is_fully_idle = MagicMock(return_value=False)
+
+        scheduler._promote_pending_abort_pause()
+
+        self.assertFalse(scheduler._engine_paused)
+        self.assertTrue(scheduler._pending_abort_pause)
+
+    def test_promote_ignores_engine_without_pending_pause(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+
+        scheduler._promote_pending_abort_pause()
+        scheduler._promote_pending_abort_pause()
+
+        scheduler.is_fully_idle.assert_not_called()
+        self.assertFalse(scheduler._engine_paused)
+
+    def test_continue_generation_clears_pending_abort_pause(self):
+        """continue racing ahead of the promotion must drop the pending gate."""
+        scheduler = self._new_scheduler()
+        scheduler.abort_request = MagicMock()
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+
+        scheduler.continue_generation(ContinueGenerationReqInput())
+
+        self.assertFalse(scheduler._pending_abort_pause)
+        self.assertFalse(scheduler._engine_paused)
+
+    def test_late_arrival_aborted_while_abort_pause_pending(self):
+        """A request that slipped past a worker pause gate is aborted, not scheduled."""
+        scheduler = self._new_scheduler()
+        scheduler._handle_generate_request = MagicMock()
+        scheduler.abort_request = MagicMock()
+        recv_req = SimpleNamespace(mm_inputs=None, rid="late-arrival")
+
+        scheduler.handle_generate_request(recv_req)
+
+        scheduler.abort_request.assert_not_called()
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.handle_generate_request(recv_req)
+
+        scheduler._handle_generate_request.assert_called()
+        aborted = scheduler.abort_request.call_args[0][0]
+        self.assertEqual(aborted.rid, "late-arrival")
 
     def test_retract_clears_last_batch_state(self):
         """retract mode should clear last_batch and cur_batch_for_debug."""

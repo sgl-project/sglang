@@ -452,6 +452,10 @@ class Scheduler(
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
 
+    # Class-level default so __new__-constructed subclasses (unit-test
+    # harnesses) read a pending-free engine before __init__ runs.
+    _pending_abort_pause: bool = False
+
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
@@ -1329,6 +1333,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._pending_abort_pause = False
         self._deferred_input_requests: List = []
 
     def init_chunked_prefill(self):
@@ -2177,6 +2182,10 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
+        if self._pending_abort_pause:
+            # Guarded so scheduler-shaped test harnesses that drive this
+            # method without the full Scheduler surface stay functional.
+            self._promote_pending_abort_pause()
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
@@ -2909,6 +2918,13 @@ class Scheduler(
             self._handle_generate_request(
                 recv_req, mm_cleanup, mm_input_error=mm_input_error
             )
+            if self._pending_abort_pause:
+                # A request that slipped past a tokenizer worker's pause gate
+                # while another worker initiated an abort-mode pause. Admit it
+                # through the normal path so per-request state exists, then
+                # abort it immediately: scheduling it would run it against the
+                # KV-cache release that follows the pause.
+                self.abort_request(AbortReq(rid=recv_req.rid))
 
     def _handle_generate_request(
         self,
@@ -3619,6 +3635,9 @@ class Scheduler(
             self._handle_embedding_request(
                 recv_req, mm_cleanup, mm_input_error=mm_input_error
             )
+            if self._pending_abort_pause:
+                # Same late-arrival gate as handle_generate_request.
+                self.abort_request(AbortReq(rid=recv_req.rid))
 
     def _handle_embedding_request(
         self,
@@ -5709,8 +5728,45 @@ class Scheduler(
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
+    def _promote_pending_abort_pause(self):
+        """Flip `_engine_paused` once an abort-mode pause has fully drained.
+
+        Called from `ingest_requests` in every event-loop iteration while the
+        pause is pending, so all event loops (normal, overlap, PD, MLX) share
+        one promotion point. `is_fully_idle(ignore_waiting=False)` guarantees
+        the running batch, waiting queue, and disagg queues are empty at the
+        moment of promotion, so nothing can be scheduled between the promotion
+        and `continue_generation`. Requests that were already queued or
+        running when the pause was processed were swept by the abort_all in
+        `pause_generation`; requests that slipped past a tokenizer worker's
+        pause gate afterwards were aborted by the pending gate in
+        `handle_generate_request`.
+        """
+        if self._pending_abort_pause and self.is_fully_idle(ignore_waiting=False):
+            self._pending_abort_pause = False
+            self._engine_paused = True
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract")
+        assert recv_req.mode in ("in_place", "retract", "abort")
+
+        if recv_req.mode == "abort":
+            # Abort-mode pause: park the engine only after every in-flight
+            # request has drained. Requests in the running batch need forward
+            # passes to finish their aborts, so setting _engine_paused here
+            # would freeze the drain and deadlock the pause. Instead:
+            #   1. raise the pending gate first, so every request admitted
+            #      from now on is aborted by handle_generate_request instead
+            #      of being scheduled;
+            #   2. sweep abort_all once, authoritative at pause-processing
+            #      time, so requests already queued or running are aborted
+            #      even if the pausing tokenizer worker's polling already
+            #      fired its last abort_all;
+            #   3. promote to _engine_paused in _promote_pending_abort_pause
+            #      once the engine is fully idle.
+            self._pending_abort_pause = True
+            self.abort_request(AbortReq(rid="", abort_all=True))
+            return
+
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -5841,6 +5897,10 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
+        # Clear a pending abort pause that never promoted (continue raced
+        # ahead of the drain), so a stale pending gate cannot abort requests
+        # after the engine has resumed.
+        self._pending_abort_pause = False
         self._engine_paused = False
 
     def handle_scale_elastic_ep(

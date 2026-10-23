@@ -100,6 +100,34 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
             torch.testing.assert_close(torch.tensor(scores), expected)
         self.assertIsNone(result.token_logprobs)
 
+    async def test_caller_rid_labels_each_internal_request(self):
+        manager = ScoringManager()
+        await manager.score_prompts(
+            prompts=[[1, 2], [3, 4]], label_token_ids=[[5], [6]], rid="proxy-rid"
+        )
+        (request,) = manager.requests
+        # is_generation: the scalar rid is expanded by GenerateReqInput
+        # normalization into "{rid}_{i}" per request.
+        self.assertEqual(request.rid, ["proxy-rid_0", "proxy-rid_1"])
+
+    async def test_caller_rid_labels_each_embedding_request(self):
+        manager = ScoringManager(generation=False)
+        await manager.score_prompts(
+            prompts=[[1, 2], [3, 4]], label_token_ids=[[5], [6]], rid="proxy-rid"
+        )
+        (request,) = manager.requests
+        self.assertEqual(request.rid, ["proxy-rid_0", "proxy-rid_1"])
+
+    async def test_caller_rid_survives_mis_fused_requests(self):
+        # Multi-item scoring fuses all items into one sequence; the scalar rid
+        # labels that single request as "{rid}_0" after normalization.
+        manager = ScoringManager(enable_mis=True)
+        await manager.score_request(
+            query=[], items=[[1], [2]], label_token_ids=[5, 6], rid="proxy-rid"
+        )
+        (request,) = manager.requests
+        self.assertEqual(request.rid, ["proxy-rid_0"])
+
     async def test_mis_text_items_do_not_add_special_tokens(self):
         vocab = {"[UNK]": 0, "[BOS]": 1, "Rate": 2, ":": 3, "Option": 4, "A": 5, "B": 6}
         tokenizer = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
