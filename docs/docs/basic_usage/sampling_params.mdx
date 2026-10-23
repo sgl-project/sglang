@@ -72,7 +72,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>top_logprobs_num</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[int], int]] = None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If return_logprob, the number of top logprobs to return at each position.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If return_logprob, the number of top logprobs to return at each position. Must be an integer in `[0, vocab_size]`, otherwise the request fails with HTTP 400. It is not capped at OpenAI's limit of 20, and it is ignored when `return_logprob` is not set.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>token_ids_logprob</td>
@@ -162,7 +162,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>stop_token_ids</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[List[int]] = None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled. Each ID must be in `[0, vocab_size)`, otherwise the request fails with HTTP 400.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>stop_regex</td>
@@ -291,7 +291,12 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>n</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int = 1`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.) Must be an integer in `[1, 128]`; larger, zero, negative, non-integer, or boolean values fail with HTTP 400 before the request is expanded.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>logit_bias</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Dict[str, float]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maps token IDs to a bias added to their logits. Each key must be a token ID in `[0, vocab_size)` and each value a finite number with magnitude at most `1e30` (the sampler divides logits by a temperature of at least `1e-6`, so larger values overflow float32); otherwise the request fails with HTTP 400. Values outside OpenAI's `[-100, 100]` range are accepted.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ignore_eos</td>
@@ -320,6 +325,10 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
     </tr>
   </tbody>
 </table>
+
+### Validation
+
+Invalid sampling parameters are rejected with HTTP 400 before the request is scheduled. With `stream` set to `true`, the error is instead sent as a `data: {"error": ...}` server-sent event followed by `data: [DONE]`, under HTTP 200. SGLang deliberately does not impose OpenAI's limits of `temperature <= 2` or `top_logprobs <= 20`.
 
 ## Examples
 
