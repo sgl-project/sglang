@@ -1290,29 +1290,6 @@ class C4Indexer(nn.Module):
             out = out * self.weight_scale
         return out
 
-    def _forward_prepare_normal(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        c4_indexer: C4Indexer,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        skip_compressor: bool = False,
-    ) -> Tuple[IndexerQuery, torch.Tensor]:
-        if TYPE_CHECKING:
-            assert isinstance(self, CompressorBackendMixin)
-
-        weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
-        if not skip_compressor:
-            self.forward_indexer_compressor(
-                x=x,
-                forward_batch=forward_batch,
-                layer_id=c4_indexer.layer_id,
-                compressor=c4_indexer.compressor,
-            )
-        return q, weights
-
     def forward(
         self,
         x: torch.Tensor,

@@ -3485,9 +3485,13 @@ class DeepseekV4AttnBackend(
     ) -> None:
         """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
         (first row, row count) of each request."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
-            index_k_norm_rope_pack_store,
-        )
+        if _is_xpu:
+            from sgl_kernel import index_k_norm_rope_pack_store
+        else:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+                index_k_norm_rope_pack_store,
+            )
+
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
@@ -3669,7 +3673,21 @@ class DeepseekV4AttnBackend(
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
-            if (
+            if _is_xpu:
+                from sgl_kernel import index_k_norm_rope_pack_store
+
+                indexer = layer.indexer
+                index_k_norm_rope_pack_store(
+                    indexer.forward_wk(latent),
+                    indexer.k_norm.weight,
+                    indexer.k_norm.eps,
+                    torch.view_as_real(layer.freqs_cis).flatten(-2),
+                    group_pos,
+                    slots,
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    ratio=layer.compress_ratio,
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and torch.version.cuda is not None

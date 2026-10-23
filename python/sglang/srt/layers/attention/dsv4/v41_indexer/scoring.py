@@ -15,13 +15,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_xpu
 from sglang.srt.utils.common import async_h2d
 
 from .types import DecodeInputs, PrefillInputs
@@ -137,6 +137,13 @@ def _index_q_and_weights(
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
     q, _ = indexer.wq_b(q_lora)
+    if is_xpu():
+        from sgl_kernel import index_q_rope_pack_weights as index_q_rope_pack_weights
+    else:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+            index_q_rope_pack_weights,
+        )
+
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
