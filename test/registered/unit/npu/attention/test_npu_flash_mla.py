@@ -196,24 +196,29 @@ def test_ragged_verify_is_rejected(backend):
 
 
 @pytest.mark.parametrize(
-    "enabled,arch35,dspark,is_draft,force_cpu,needs_cpu",
+    "enabled,arch35,dspark,is_draft,force_cpu,mojo,needs_cpu",
     [
-        (False, False, False, False, False, True),
-        (False, True, False, False, False, True),
-        (True, False, False, False, False, True),
-        (True, False, True, False, False, True),
-        (True, True, False, False, False, False),
-        (True, True, True, False, False, False),
-        (True, True, True, True, False, True),
-        (False, True, True, True, False, True),
-        (True, True, False, False, True, True),
-        (True, True, True, False, True, True),
+        (False, False, False, False, False, False, True),
+        (False, True, False, False, False, False, True),
+        (True, False, False, False, False, False, True),
+        (True, False, True, False, False, False, True),
+        (True, True, False, False, False, False, False),
+        (True, True, True, False, False, False, False),
+        (True, True, True, True, False, False, True),
+        (False, True, True, True, False, False, True),
+        (True, True, False, False, True, False, True),
+        (True, True, True, False, True, False, True),
+        (True, True, True, True, False, True, False),
+        (False, False, True, True, False, True, False),
+        (True, True, True, True, True, True, True),
+        (True, True, True, False, False, True, False),
     ],
 )
 def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
-    enabled, arch35, dspark, is_draft, force_cpu, needs_cpu
+    enabled, arch35, dspark, is_draft, force_cpu, mojo, needs_cpu
 ):
     uses_flash_mla = enabled and arch35 and not is_draft
+    uses_mojo = mojo and is_draft and dspark
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
         is_none=lambda: not dspark,
@@ -273,7 +278,11 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
         patch.object(mod, "AscendAttnMaskBuilder", return_value=masks),
         patch.object(mod.DllmConfig, "from_server_args", return_value=None),
-        patch.object(mod, "get_bool_env_var", return_value=False),
+        patch.object(
+            mod,
+            "get_bool_env_var",
+            side_effect=lambda name, *args: mojo and name == "ASCEND_USE_MOJO_MTP",
+        ),
         patch.object(
             mod,
             "get_flags",
@@ -302,8 +311,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     ):
         obj = mod.AscendAttnBackend(runner)
     assert obj.use_flash_mla is uses_flash_mla
+    assert obj.use_mojo_mtp is uses_mojo
     assert obj.needs_cpu_seq_lens is needs_cpu
-    assert obj.requires_host_seq_lens_update is not uses_flash_mla
+    assert obj.requires_host_seq_lens_update is not (uses_flash_mla or uses_mojo)
 
 
 @pytest.mark.parametrize("draft_needs_cpu", [True, False])

@@ -101,6 +101,7 @@ class ForwardMetadata:
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
+    mojo_cu_q_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
@@ -316,6 +317,7 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
+    use_mojo_mtp: bool = False
     use_flash_mla: bool = False
     requires_host_seq_lens_update: bool = True
 
@@ -391,6 +393,12 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
+            and model_runner.spec_algorithm.is_dspark()
+        )
+        # Independent of the FIA-v2 switch: only the DSpark draft uses GQA.
+        self.use_mojo_mtp = (
+            get_bool_env_var("ASCEND_USE_MOJO_MTP", "False")
+            and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
         flash_mla_requested = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
@@ -484,6 +492,29 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
 
+        if self.use_mojo_mtp:
+            if (
+                self.use_mla
+                or self.use_dsa
+                or self.model_dtype not in (torch.float16, torch.bfloat16)
+                or self.kv_cache_dtype != self.model_dtype
+                or self.page_size < 16
+                or self.page_size & (self.page_size - 1)
+                or self.is_hybrid_swa
+                or self.use_sliding_window_kv_pool
+                or getattr(self, "use_alibi", False)
+                or get_parallel().dcp_enabled
+                or self.attn_cp_size > 1
+                or model_runner.server_args.enable_mixed_chunk
+                or self.enable_sparsity_driven_kv_offload
+            ):
+                raise ValueError(
+                    "Mojo MTP supports static DSpark GQA drafts with matching "
+                    "BF16/FP16 Q/K/V, power-of-two pages >= 16, without "
+                    "SWA, ALiBi, CP/DCP, mixed chunks or KV offload."
+                )
+            self.requires_host_seq_lens_update = False
+
         # Static gate for the scheduler's per-step pinned-D2H seq_lens_cpu
         # mirror. Device-length paths can opt out; host-bound consumers keep it.
         _env_opt_out = not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
@@ -492,8 +523,11 @@ class AscendAttnBackend(AttentionBackend):
         self.is_dsa_model = is_deepseek_dsa(model_runner.model_config.hf_config)
         _host_bound = bool(
             (self.use_mla and not self.is_dsa_model and not self.use_flash_mla)
-            or (self.use_fia and not self.use_flash_mla)
-            or (self.use_fias_v2_bsnd and not self.use_flash_mla)
+            or (
+                (self.use_fia or self.use_fias_v2_bsnd)
+                and not self.use_flash_mla
+                and not self.use_mojo_mtp
+            )
             or self.is_hybrid_swa  # SWA table/mask paths read host max_len
             or getattr(self, "use_alibi", False)  # attn_alibi consumes host lengths
             or get_parallel().dcp_enabled  # DCP local-KV metadata is host-built
@@ -503,10 +537,11 @@ class AscendAttnBackend(AttentionBackend):
                 model_runner.spec_algorithm is not None
                 and model_runner.spec_algorithm.is_dflash_family()
                 and not self.use_flash_mla
+                and not self.use_mojo_mtp
             )  # FIA-based DFlash/DSpark paths consume host verify lengths
         )
-        # The scheduler ORs target and draft capabilities: a FIA draft still
-        # requires the mirror when its FlashMLA target opts out.
+        # The scheduler ORs target and draft capabilities. Only fully supported
+        # device-length paths can skip its per-round CPU mirror.
         self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
         if _env_opt_out and _host_bound:
             logger.warning(
@@ -580,7 +615,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.use_flash_mla:
+        if self.use_flash_mla or self.use_mojo_mtp:
             seq_lens_cpu = None
         elif in_capture:
             seq_lens_cpu = forward_batch.seq_lens.cpu()
@@ -612,7 +647,22 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        # Use a supplied CPU mirror when present; FlashMLA keeps device-only metadata.
+        if self.use_mojo_mtp:
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :: self.page_size
+                ]
+                // self.page_size
+            ).to(torch.int32)
+            self._prepare_mojo_mtp_metadata(
+                self.forward_metadata,
+                forward_batch.seq_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+            self.graph_mode = False
+            return
+        # Use a supplied CPU mirror when present; device-only paths bypass it.
         if forward_batch.seq_lens_cpu is not None and not self.use_flash_mla:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
@@ -966,7 +1016,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        if self.use_flash_mla:
+        if self.use_flash_mla or self.use_mojo_mtp:
             metadata.seq_lens = torch.empty_like(seq_lens)
         else:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
@@ -1042,6 +1092,23 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
+
+        if self.use_mojo_mtp:
+            # The page table is capacity-sized; the kernel masks reads with
+            # the actual device KV end. No host max or length list is needed.
+            pages = metadata.block_tables.shape[1]
+            metadata.block_tables[:bs].copy_(
+                self.req_to_token[
+                    req_pool_indices[:bs], : pages * self.page_size : self.page_size
+                ]
+                // self.page_size
+            )
+            self._prepare_mojo_mtp_metadata(
+                metadata, seq_lens[:bs], forward_mode, spec_info
+            )
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1238,6 +1305,86 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = True
 
+    def _prepare_mojo_mtp_metadata(
+        self,
+        metadata: ForwardMetadata,
+        prefix_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        if not (forward_mode.is_target_verify() or forward_mode.is_idle()):
+            raise ValueError("Mojo MTP requires static DSpark target-verify batches")
+        if getattr(spec_info, "ragged_verify_layout", None) is not None:
+            raise ValueError("Mojo MTP does not support ragged query blocks")
+        width = self.speculative_num_draft_tokens
+        if forward_mode.is_target_verify() and int(spec_info.draft_token_num) != width:
+            raise ValueError(
+                "Mojo MTP query width differs from the captured draft width"
+            )
+        if metadata.seq_lens is None or metadata.seq_lens.dtype != torch.int32:
+            metadata.seq_lens = torch.empty_like(prefix_lens, dtype=torch.int32)
+        # Never mutate/alias the batch's prefix: replay must add the width
+        # exactly once. Zero-length graph/DP slots remain inactive.
+        metadata.seq_lens.copy_(torch.where(prefix_lens > 0, prefix_lens + width, 0))
+        if metadata.mojo_cu_q_lens is None:
+            metadata.mojo_cu_q_lens = torch.arange(
+                0,
+                (prefix_lens.numel() + 1) * width,
+                width,
+                dtype=torch.int32,
+                device=prefix_lens.device,
+            )
+        metadata.seq_lens_cpu_int = metadata.seq_lens_cpu_list = None
+
+    def _forward_mojo_mtp(self, q, layer, forward_batch, sinks):
+        from sglang.srt.hardware_backend.npu.attention.mojo_mtp import (
+            mojo_paged_mtp_decode,
+        )
+
+        if layer.sliding_window_size != -1 or sinks is not None:
+            raise ValueError(
+                "Mojo MTP does not support sliding windows or attention sinks"
+            )
+        if (
+            layer.qk_head_dim != layer.v_head_dim
+            or layer.tp_k_head_num != layer.tp_v_head_num
+        ):
+            raise ValueError("Mojo MTP requires matching K/V head shapes")
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        padded_tokens = query.shape[0]
+        if not self.graph_mode:
+            query = query[: forward_batch.global_num_token_non_padded_cpu]
+        width = self.speculative_num_draft_tokens
+        bs = query.shape[0] // width
+        output = mojo_paged_mtp_decode(
+            query=query,
+            k_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            ),
+            v_cache=self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            ),
+            seq_lens=self.forward_metadata.seq_lens[:bs],
+            cu_q_lens=self.forward_metadata.mojo_cu_q_lens[: bs + 1],
+            block_tables=self.forward_metadata.block_tables[:bs],
+            page_size=self.page_size,
+            num_q_heads=layer.tp_q_head_num,
+            num_kv_heads=layer.tp_k_head_num,
+            head_dim=layer.qk_head_dim,
+            gamma=width,
+            softmax_scale=layer.scaling,
+            max_kv_len=self.max_context_len + width,
+            causal=layer.attn_type != AttentionType.ENCODER_ONLY,
+        ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if output.shape[0] < padded_tokens:
+            output = torch.cat(
+                (
+                    output,
+                    output.new_zeros(padded_tokens - output.shape[0], output.shape[1]),
+                )
+            )
+        return output
+
     def _prepare_flash_mla_metadata(
         self,
         metadata: ForwardMetadata,
@@ -1273,7 +1420,11 @@ class AscendAttnBackend(AttentionBackend):
             or metadata.flash_mla_cu_seqlens_q.numel() != bs + 1
         ):
             metadata.flash_mla_cu_seqlens_q = torch.arange(
-                0, (bs + 1) * query_len, query_len, dtype=torch.int32, device=seq_lens.device
+                0,
+                (bs + 1) * query_len,
+                query_len,
+                dtype=torch.int32,
+                device=seq_lens.device,
             )
         schedule = self.flash_mla_metadata(
             cache_seqlens=metadata.flash_mla_seq_lens,
@@ -2731,6 +2882,9 @@ class AscendAttnBackend(AttentionBackend):
 
         if self.use_flash_mla and forward_batch.forward_mode.is_target_verify():
             return self._forward_flash_mla(q, q_rope, layer, forward_batch)
+
+        if self.use_mojo_mtp:
+            return self._forward_mojo_mtp(q, layer, forward_batch, sinks)
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(

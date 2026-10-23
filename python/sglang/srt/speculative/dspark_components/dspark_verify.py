@@ -315,9 +315,14 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.nxt_kv_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+            elif getattr(
+                self.target_worker.model_runner.attn_backend,
+                "needs_cpu_seq_lens",
+                True,
+            ):
+                # Allocation headroom can include unwritten KV. Device-length
+                # backends accept None; host consumers require the live mirror.
+                raise RuntimeError("DSpark target attention requires valid CPU lengths")
 
         result = self._forward_prepared_verify(
             batch=batch,
