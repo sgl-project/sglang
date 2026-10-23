@@ -58,12 +58,13 @@ class RequestMetrics:
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
+        self.denoising_stages: set[str] = set()
         self.steps: list[float] = []
-        self.steps_by_stage: Dict[str, list[float]] = {}
-        self.stage_iterations: Dict[str, tuple[int, int]] = {}
-        self.active_stage_name: str | None = None
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
+        # Set on the first request after a failed request-based warmup: its
+        # timing includes first-use cost the warmup was meant to absorb.
+        self.warmup_failed: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -81,26 +82,7 @@ class RequestMetrics:
         """Records the duration of a denoising step in execution order."""
         if self.suppress_stage_breakdown:
             return
-        duration_ms = duration_s * 1000
-        self.steps.append(duration_ms)
-        if self.active_stage_name is not None:
-            self.steps_by_stage.setdefault(self.active_stage_name, []).append(
-                duration_ms
-            )
-
-    def record_stage_iterations(
-        self, measured_iterations: int, target_iterations: int
-    ) -> None:
-        """Record calibration and default-workload iterations for this stage."""
-        if self.suppress_stage_breakdown or self.active_stage_name is None:
-            return
-        measured = max(1, int(measured_iterations))
-        target = max(1, int(target_iterations))
-        previous = self.stage_iterations.get(self.active_stage_name, (0, 0))
-        self.stage_iterations[self.active_stage_name] = (
-            previous[0] + measured,
-            previous[1] + target,
-        )
+        self.steps.append(duration_s * 1000)
 
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
@@ -112,8 +94,10 @@ class RequestMetrics:
         return {
             "request_id": self.request_id,
             "stages": self.stages,
+            "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "warmup_failed": self.warmup_failed,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()
@@ -443,8 +427,11 @@ class PerformanceLogger:
         try:
             abs_path = os.path.abspath(file_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
+            # readers poll for this file: never let them see a partial write
+            tmp_path = f"{abs_path}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
+            os.replace(tmp_path, abs_path)
             logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
@@ -461,7 +448,11 @@ class PerformanceLogger:
         Note that this accords to the time spent internally in server, postprocess is not included
         """
         formatted_stages = [
-            {"name": name, "execution_time_ms": duration_ms}
+            {
+                "name": name,
+                "execution_time_ms": duration_ms,
+                "is_denoising": name in metrics.denoising_stages,
+            }
             for name, duration_ms in metrics.stages.items()
         ]
 

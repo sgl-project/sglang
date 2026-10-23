@@ -211,15 +211,6 @@ class TestNormalizeBaseUrl(CustomTestCase):
         url = normalize_base_url("localhost", 3000)
         self.assertEqual(url, "http://localhost:3000")
 
-    def test_deprecated_scheme_passthrough(self):
-        """normalize_base_url should pass through host with scheme (deprecated)."""
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            url = normalize_base_url("http://myhost", 9000)
-        self.assertEqual(url, "http://myhost:9000")
-
 
 if __name__ == "__main__":
     unittest.main()

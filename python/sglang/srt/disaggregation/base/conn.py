@@ -24,11 +24,15 @@ class StateType(str, enum.Enum):
     # only the live subrange of that row for the current open pool.
     DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
+    MINIMAX_DENSE_KV = "minimax_dense_kv"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
+    # DSpark draft's SWA valid-from.
+    REQUEST_ROW = "request_row"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
@@ -45,6 +49,11 @@ class KVTransferMetric:
     transfer_total_bytes: Optional[int] = None
 
 
+class KVTransferDestination(str, enum.Enum):
+    DEVICE = "device"
+    HOST = "host"
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -52,6 +61,14 @@ class KVArgs:
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
+    # KV byte layout both PD roles must share; None for pools with only one.
+    kv_layout: Optional[str] = None
+    host_kv_data_ptrs: Optional[List[int]] = None
+    host_kv_data_lens: Optional[List[int]] = None
+    host_kv_item_lens: Optional[List[int]] = None
+    host_state_data_ptrs: Optional[List[List[int]]] = None
+    host_state_data_lens: Optional[List[List[int]]] = None
+    host_state_item_lens: Optional[List[List[int]]] = None
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -69,6 +86,9 @@ class KVArgs:
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
+    # None when the SWA state is not held in an MHA sub-pool.
+    swa_kv_cache_layout: Optional[str]
     ib_device: str
     gpu_id: int
     kv_head_num: int
@@ -112,6 +132,14 @@ class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
     enable_deferred_decode_kv_release: bool = False
+    supports_host_destination: bool = False
+
+    def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
+        """Whether the checksum sent by the prefill at bootstrap_addr is comparable
+        with one over this rank's local KV. A backend returns False for a peer
+        whose digest covers a different byte range, e.g. a TP width mismatch where
+        each decode rank receives only a slice of what the sender digested."""
+        return True
 
     @abstractmethod
     def __init__(
@@ -131,6 +159,10 @@ class BaseKVManager(ABC):
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
 
+    # Opt-in per backend: set True once the prefill acks a drained abort
+    # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
+    supports_deferred_decode_kv_release: bool = False
+
     def teardown(self) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} does not support PD role switch teardown"
@@ -144,8 +176,6 @@ class BaseKVSender(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
@@ -168,8 +198,16 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def mark_prefill_complete(self) -> None:
+        """Publish retained final-prefill KV for an enabled allocation policy."""
+        raise NotImplementedError
+
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        """Optional page-aligned limit for one scheduler KV send."""
+        return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
@@ -207,6 +245,19 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
+    @property
+    def supports_host_destination(self) -> bool:
+        """Whether this receiver's peer and layout support host KV destinations."""
+        return False
+
+    def is_abort_release_safe(self) -> bool:
+        """Whether all writes to an aborted host destination have drained.
+
+        Host-capable backends must retain this state until ``clear()``. A failed
+        poll or elapsed timeout alone does not prove the buffers can be reused.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def __init__(
         self,
@@ -232,6 +283,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

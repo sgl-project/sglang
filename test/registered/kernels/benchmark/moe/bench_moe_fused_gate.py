@@ -2,7 +2,7 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -31,7 +31,7 @@ def torch_router(scores, bias, topk, scoring_func):
 @marker.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
 @marker.parametrize("num_experts", [128, 256, 384, 512], [256, 384])
 @marker.parametrize("num_tokens", [1, 4, 16, 64, 512, 1024, 8192], [16, 1024])
-@marker.benchmark("provider", ["triton", "jit", "torch"])
+@marker.benchmark("provider", ["triton", "torch"])
 def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: str):
     torch.manual_seed(0)
     scores = create_random(num_tokens, num_experts, dtype=torch.float32)
@@ -47,10 +47,6 @@ def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: st
     if provider == "triton":
         return marker.do_bench(
             moe_fused_gate, input_args=(scores, bias), input_kwargs=common
-        )
-    if provider == "jit":
-        return marker.do_bench(
-            moe_fused_gate_jit, input_args=(scores, bias), input_kwargs=common
         )
     if provider == "torch":
         return marker.do_bench(

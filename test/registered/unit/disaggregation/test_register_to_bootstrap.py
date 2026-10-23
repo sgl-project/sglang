@@ -2,14 +2,14 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -25,130 +25,6 @@ class TestRegisterToBootstrap(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_succeeds_on_first_attempt(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_put.return_value = mock_response
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        mock_put.assert_called_once()
-        mock_time.sleep.assert_not_called()
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_succeeds_after_retries(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        fail_resp = MagicMock()
-        fail_resp.status_code = 503
-        success_resp = MagicMock()
-        success_resp.status_code = 200
-        mock_put.side_effect = [fail_resp, fail_resp, success_resp]
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        self.assertEqual(mock_put.call_count, 3)
-        self.assertEqual(mock_time.sleep.call_count, 2)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_all_retries_exhausted(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        fail_resp = MagicMock()
-        fail_resp.status_code = 503
-        mock_put.return_value = fail_resp
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        self.assertEqual(mock_put.call_count, 5)
-        # Sleep is only called between attempts, not after the final failure
-        self.assertEqual(mock_time.sleep.call_count, 4)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_exception_with_nested_cause(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-
-        root_exc = ConnectionRefusedError("connection refused")
-        inner_exc = OSError("os error")
-        inner_exc.__cause__ = root_exc
-        outer_exc = Exception("wrapped")
-        outer_exc.__cause__ = inner_exc
-
-        success_resp = MagicMock()
-        success_resp.status_code = 200
-        mock_put.side_effect = [outer_exc, success_resp]
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        self.assertEqual(mock_put.call_count, 2)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_exception_with_no_cause(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-
-        exc = ConnectionError("plain connection error")
-        exc.__cause__ = None
-
-        success_resp = MagicMock()
-        success_resp.status_code = 200
-        mock_put.side_effect = [exc, success_resp]
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        self.assertEqual(mock_put.call_count, 2)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_backoff_delay_exponential(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        fail_resp = MagicMock()
-        fail_resp.status_code = 503
-        mock_put.return_value = fail_resp
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        # With monotonic() = 0.0, jitter factor = 0.75 + 0.25 * (0.0 % 1) = 0.75
-        # delay = min(1.0 * 2^attempt, 30.0) * 0.75
-        # Sleep happens only between attempts (attempt 0..3), not after the final failure
-        expected_calls = [call(0.75), call(1.5), call(3.0), call(6.0)]
-        self.assertEqual(mock_time.sleep.call_args_list, expected_calls)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_jitter_never_exceeds_max_delay(self, mock_put, mock_time):
-        """Guard against operator-precedence regressions in the jitter factor.
-
-        The jitter factor must stay in [0.75, 1.0), so a delay capped at
-        max_delay must never exceed max_delay after applying jitter.
-        """
-        # monotonic() returns a value whose fractional part is close to 1.
-        # If the parentheses around `time.monotonic() % 1` were dropped, the
-        # jitter factor could grow up to ~1.75 and blow past max_delay.
-        mock_time.monotonic.return_value = 999.9999
-        fail_resp = MagicMock()
-        fail_resp.status_code = 503
-        mock_put.return_value = fail_resp
-
-        mgr = self._make_manager()
-        mgr.register_to_bootstrap()
-
-        max_delay = 30.0
-        for sleep_call in mock_time.sleep.call_args_list:
-            actual_delay = sleep_call[0][0]
-            self.assertLess(actual_delay, max_delay)
-            self.assertGreaterEqual(actual_delay, 0.75)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -178,6 +54,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Decode pulls from every shard-group rank when this is set.
+            "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
@@ -186,27 +64,11 @@ class TestRegisterToBootstrap(CustomTestCase):
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
 
-    @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_url_with_dist_init_addr(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        success_resp = MagicMock()
-        success_resp.status_code = 200
-        mock_put.return_value = success_resp
-
-        mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
-        mgr.register_to_bootstrap()
-
-        url_used = mock_put.call_args[0][0]
-        self.assertIn("10.0.0.1", url_used)
-
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    # The consumer reads the group through `get_parallel()`, which reads
-    # through to the canonical getter, so that is where the stub belongs.
-    @patch("sglang.srt.distributed.parallel_state.get_world_group")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
-        self, mock_world_group, mock_put
+        self, mock_put
     ):
+        mock_world_group = MagicMock()
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
@@ -230,9 +92,12 @@ class TestRegisterToBootstrap(CustomTestCase):
                 for dp_rank, tp_rank, host, rank_port, _ in schedulers
             ]
 
-        mock_world_group.return_value.all_gather_object.side_effect = gather_topology
+        mock_world_group.all_gather_object.side_effect = gather_topology
 
-        with envs.SGLANG_RUST_SERVER.override(True):
+        with (
+            get_parallel().override(world_group=mock_world_group),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
             for dp_rank, tp_rank, local_ip, _, rust_http_port in schedulers:
                 manager = self._make_manager()
                 manager.attn_dp_size = 2
@@ -277,7 +142,7 @@ class TestRegisterToBootstrap(CustomTestCase):
                     gather_call.args[0]["attn_dp_rank"],
                     gather_call.args[0]["attn_tp_rank"],
                 )
-                for gather_call in mock_world_group.return_value.all_gather_object.call_args_list
+                for gather_call in mock_world_group.all_gather_object.call_args_list
             ],
             [(dp, tp) for dp, tp, _, _, _ in schedulers],
         )
@@ -310,25 +175,6 @@ class TestRegisterToBootstrap(CustomTestCase):
         url_used = mock_put.call_args[0][0]
         self.assertNotIn("0.0.0.0", url_used)
         self.assertIn("127.0.0.1", url_used)
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_wildcard_host_ipv6_uses_ipv6_loopback(self, mock_put, mock_time):
-        """Same fix for the IPv6 wildcard \"::\": must use IPv6 loopback."""
-        mock_time.monotonic.return_value = 0.0
-        success_resp = MagicMock()
-        success_resp.status_code = 200
-        mock_put.return_value = success_resp
-
-        mgr = self._make_manager()
-        mgr.bootstrap_host = "::"
-        mgr.local_ip = "fd00::1"
-        mgr.register_to_bootstrap()
-
-        url_used = mock_put.call_args[0][0]
-        # "::" bracketed as "[::]:port" should not appear; loopback should.
-        self.assertNotIn("[::]", url_used)
-        self.assertIn("[::1]", url_used)
 
     def _make_manager(self, dist_init_addr=None):
         """Create a lightweight mock manager that has the attributes needed

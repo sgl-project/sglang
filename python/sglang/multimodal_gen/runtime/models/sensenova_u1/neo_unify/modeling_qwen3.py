@@ -13,12 +13,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -29,7 +24,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -332,22 +326,11 @@ def create_block_causal_mask(
     return output.unsqueeze(1)
 
 
-def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
-    """
-    mask: (1,1, L, L)
-    """
-    submask = torch.where(mask[0, 0, :, :] == 0, torch.tensor(1.0), torch.tensor(0.0))
-    submask = mask[i:j, i:j].int().cpu().numpy()
-    for row in submask:
-        print(" ".join(map(str, row)))
-
-
 def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
     return RMSNorm(
         hidden_size,
         eps=eps,
         cast_x_before_out_mul=True,
-        force_native=not current_platform.is_npu(),
     )
 
 
@@ -431,6 +414,42 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if (
+        q.is_cuda
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and cos.dtype is torch.bfloat16
+        and sin.dtype is torch.bfloat16
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[2] >= 128
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[-1] in (32, 64)
+        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
+    ):
+        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+            fused_rope_rotate_half_bitexact,
+        )
+
+        # The kernel rounds both products to bf16 before adding, matching
+        # the eager chain. Spatial axes are slices of the normalized HW
+        # heads; materialize those slices in the kernel's BSHD layout.
+        cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
+        sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
+        q_embed = fused_rope_rotate_half_bitexact(
+            q.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        k_embed = fused_rope_rotate_half_bitexact(
+            k.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        return q_embed.transpose(1, 2), k_embed.transpose(1, 2)
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -1106,185 +1125,12 @@ class Qwen3Attention(nn.Module):
                 **kwargs,
             )
 
-        # Mixed und/gen path: mirrors forward_und / forward_gen per token type.
-        # (Fixed per issue #207: the time-dim qk-norm, the `.view(hidden_shape)` before
-        # chunking, and the transpose on the time chunk were previously missing.)
-        # Note: Remove this raise once fully tested.
+        # mixed und/gen sequences have no validated implementation
         raise NotImplementedError(
             "The mixed und/gen forward path is not yet validated (issue #207): known "
             "issues are fixed, but it has no parity test and no production caller. "
             "Split the sequence at token-type boundaries and use forward_und / forward_gen."
         )
-
-        assert self.config._attn_implementation == "eager"
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_attention_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            query_states[~image_gen_indicators] = self.q_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            query_states[image_gen_indicators] = self.q_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        query_states = query_states.view(hidden_shape)  # [B, S, H, D]
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-
-        _query_states_t = query_states_t.new_zeros(query_states_t.shape)
-        if exist_non_image_gen_tokens:
-            _query_states_t[~image_gen_indicators] = self.q_norm(
-                query_states_t[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _query_states_t[image_gen_indicators] = self.q_norm_mot_gen(
-                query_states_t[image_gen_indicators]
-            )
-        query_states_t = _query_states_t.transpose(1, 2)  # [B, H, S, D/2]
-
-        _query_states_hw = query_states_hw.new_zeros(query_states_hw.shape)
-        if exist_non_image_gen_tokens:
-            _query_states_hw[~image_gen_indicators] = self.q_norm_hw(
-                query_states_hw[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _query_states_hw[image_gen_indicators] = self.q_norm_hw_mot_gen(
-                query_states_hw[image_gen_indicators]
-            )
-        query_states_hw = _query_states_hw.transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-        key_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_key_value_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            key_states[~image_gen_indicators] = self.k_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            key_states[image_gen_indicators] = self.k_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        key_states = key_states.view(hidden_shape)  # [B, S, H_kv, D]
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-
-        _key_states_t = key_states_t.new_zeros(key_states_t.shape)
-        if exist_non_image_gen_tokens:
-            _key_states_t[~image_gen_indicators] = self.k_norm(
-                key_states_t[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _key_states_t[image_gen_indicators] = self.k_norm_mot_gen(
-                key_states_t[image_gen_indicators]
-            )
-        key_states_t = _key_states_t.transpose(1, 2)  # [B, H_kv, S, D/2]
-
-        _key_states_hw = key_states_hw.new_zeros(key_states_hw.shape)
-        if exist_non_image_gen_tokens:
-            _key_states_hw[~image_gen_indicators] = self.k_norm_hw(
-                key_states_hw[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _key_states_hw[image_gen_indicators] = self.k_norm_hw_mot_gen(
-                key_states_hw[image_gen_indicators]
-            )
-        key_states_hw = _key_states_hw.transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-        value_states = hidden_states.new_zeros(
-            (*input_shape, self.config.num_key_value_heads * self.head_dim)
-        )
-        if exist_non_image_gen_tokens:
-            value_states[~image_gen_indicators] = self.v_proj(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            value_states[image_gen_indicators] = self.v_proj_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        value_states = value_states.view(hidden_shape).transpose(1, 2)
-
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
-        )
-        query_states_t, key_states_t = apply_rotary_pos_emb(
-            query_states_t, key_states_t, cos_t, sin_t
-        )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
-        query_states_h, key_states_h = apply_rotary_pos_emb(
-            query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
-        )
-        query_states_w, key_states_w = apply_rotary_pos_emb(
-            query_states_w, key_states_w, cos_w, sin_w
-        )
-
-        query_states = torch.cat(
-            [query_states_t, query_states_h, query_states_w], dim=-1
-        )
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            update_cache = kwargs.get("update_cache", True)
-            if update_cache:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs=None
-                )
-            else:
-                # only use the past key values but do not append the current one
-                layer = past_key_values.layers[self.layer_idx]
-                past_k, past_v = layer.keys, layer.values
-
-                if past_k is not None:
-                    key_states = torch.cat(
-                        [past_k, key_states], dim=2
-                    )  # concat on seq_len
-                    value_states = torch.cat([past_v, value_states], dim=2)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-
-        _attn_output = attn_output.new_zeros((*input_shape, self.config.hidden_size))
-        if exist_non_image_gen_tokens:
-            _attn_output[~image_gen_indicators] = self.o_proj(
-                attn_output[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _attn_output[image_gen_indicators] = self.o_proj_mot_gen(
-                attn_output[image_gen_indicators]
-            )
-
-        attn_output = _attn_output
-        return attn_output, attn_weights
 
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
@@ -1294,8 +1140,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
 
-        self.mlp = Qwen3MLP(config)
-        self.mlp_mot_gen = Qwen3MLP(config)
+        self._init_mlps(config, layer_idx)
         self.input_layernorm = make_qwen3_rms_norm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1309,6 +1154,10 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attention_type = config.layer_types[layer_idx]
+
+    def _init_mlps(self, config, layer_idx):
+        self.mlp = Qwen3MLP(config)
+        self.mlp_mot_gen = Qwen3MLP(config)
 
     def forward_und(
         self,
@@ -1438,55 +1287,6 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             "Split the sequence at token-type boundaries and use forward_und / forward_gen."
         )
 
-        residual = hidden_states
-
-        _hidden_states = hidden_states.new_zeros(hidden_states.shape)
-        if exist_non_image_gen_tokens:
-            _hidden_states[~image_gen_indicators] = self.input_layernorm(
-                hidden_states[~image_gen_indicators]
-            )
-        if exist_image_gen_tokens:
-            _hidden_states[image_gen_indicators] = self.input_layernorm_mot_gen(
-                hidden_states[image_gen_indicators]
-            )
-        hidden_states = _hidden_states
-
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            image_gen_indicators=image_gen_indicators,
-            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
-            exist_image_gen_tokens=exist_image_gen_tokens,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-
-        _hidden_states = hidden_states.new_zeros(hidden_states.shape)
-        if exist_non_image_gen_tokens:
-            _hidden_states[~image_gen_indicators] = self.mlp(
-                self.post_attention_layernorm(hidden_states[~image_gen_indicators])
-            )
-
-        if exist_image_gen_tokens:
-            _hidden_states[image_gen_indicators] = self.mlp_mot_gen(
-                self.post_attention_layernorm_mot_gen(
-                    hidden_states[image_gen_indicators]
-                )
-            )
-
-        hidden_states = _hidden_states
-        hidden_states = residual + hidden_states
-        return hidden_states
-
 
 class Qwen3PreTrainedModel(PreTrainedModel):
     config: Qwen3Config
@@ -1507,6 +1307,8 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 
 
 class Qwen3Model(Qwen3PreTrainedModel):
+    _decoder_layer_cls = Qwen3DecoderLayer
+
     def __init__(self, config: Qwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -1517,7 +1319,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(config, layer_idx)
+                self._decoder_layer_cls(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -1659,6 +1461,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
 
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+    _model_cls = Qwen3Model
     _tied_weights_keys = tied_weights_keys(
         "lm_head.weight", "model.embed_tokens.weight"
     )
@@ -1667,7 +1470,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = self._model_cls(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1751,27 +1554,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-class Qwen3ForSequenceClassification(
-    GenericForSequenceClassification, Qwen3PreTrainedModel
-):
-    pass
-
-
-class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
-    pass
-
-
-class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
-    base_model_prefix = (
-        "transformer"  # For BC, where `transformer` was used instead of `model`
-    )
-
-
 __all__ = [
     "Qwen3ForCausalLM",
-    "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
     "Qwen3Model",
-    "Qwen3ForSequenceClassification",
-    "Qwen3ForTokenClassification",
 ]

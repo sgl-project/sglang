@@ -62,7 +62,7 @@ For multi-node deployment, download the weights to a shared directory accessible
 - [Eagle3-Qwen3-32B-zh](https://www.modelscope.cn/models/Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh) (EAGLE3 draft model for speculative decoding)
 
 <Info>
-The BF16 variant (65.54GB) can be deployed on 2 × 64GB of device memory (`--tp-size 2`), which corresponds to 2 cards on A2 Series or 1 card (2 dies) on A3 Series.
+The BF16 variant (65.54GB) can be deployed on 2 × 64GB of device memory (`--tp-size 2`), which corresponds to 1 card (2 dies) on A3 Series.
 
 The W8A8 variant (42.77GB) fits within a single die.
 </Info>
@@ -70,7 +70,7 @@ The W8A8 variant (42.77GB) fits within a single die.
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
+For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -82,14 +82,17 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
+command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
+release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-<Tabs>
-  <Tab title="Ascend A3 Series">
-
+{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
+docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -117,38 +120,8 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+quay.io/ascend/sglang:main-cann9.1.0-a3
 ```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-```
-
-  </Tab>
-</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the

@@ -11,7 +11,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,7 +73,7 @@ def _bf16_rope(n_rows):
 
 
 def _store(kv, pool, state_slot, positions, final_pos=None, **kw):
-    runtime.store_swa_into_unified(
+    dsv4_unified_kv_store.store_swa_into_unified(
         kv=kv,
         state_slot=state_slot,
         positions=positions,
@@ -243,6 +243,23 @@ class TestUnifiedFp8SwaScatter(CustomTestCase):
         )
         with self.assertRaises(AssertionError):
             _store(kv, pool_nope, self.state_slot, self.positions)
+
+    def test_scatter_bf16_still_writes_a_bf16_draft_pool(self):
+        """Cut A: DSpark draft stays on the bf16 ring; scatter_bf16 must not
+        dtype-assert against that pool even when the fp8 env is on."""
+        kv = torch.randn(
+            self.n_rows, BF16_LATENT, device=DEVICE, dtype=torch.bfloat16
+        ).contiguous()
+        loc = (
+            self.state_slot.long() * RING_STRIDE + self.positions.long() % RING_STRIDE
+        ).to(torch.int32)
+        loc[1] = -1
+        pool = torch.zeros(N_PAGES, BF16_LATENT, device=DEVICE, dtype=torch.bfloat16)
+        expected = pool.clone()
+        keep = loc >= 0
+        expected[loc[keep].long()] = kv[keep]
+        dsv4_unified_kv_store.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=pool)
+        self.assertTrue(torch.equal(pool, expected))
 
     def test_empty_batch_is_a_noop(self):
         empty_slot = torch.zeros(0, device=DEVICE, dtype=torch.int32)

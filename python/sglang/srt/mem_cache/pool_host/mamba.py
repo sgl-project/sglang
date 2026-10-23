@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -19,11 +19,12 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 transfer_state_per_layer_direct_pf_lf = None
 transfer_state_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
@@ -72,17 +73,31 @@ def _npu_hicache_mamba_io_mode() -> str:
 
 
 class MambaPoolHost(HostKVCache):
+    mtp_draft_buffer_infos: tuple[MambaStateBufferInfo, ...] = ()
+
+    # Class-level defaults so a model without side state, and the test stubs that
+    # skip __init__, still read an empty pair rather than raising.
+    slot_state_device_tensors: tuple = ()
+    slot_state_buffers: tuple = ()
+
     def __init__(
         self,
-        device_pool: MambaPool,
+        buffer_info: MambaStateBufferInfo,
         host_to_device_ratio: float,
         host_size: int,
+        *,
+        device_capacity: int,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
+        mtp_draft_buffer_infos: Sequence[MambaStateBufferInfo] = (),
     ):
-        self.device_pool = device_pool
+        buffer_info.validate()
+        self.buffer_info = buffer_info
+        self.device_pool = None
+        self._buffer_device = buffer_info.temporal.device
+        self.mtp_draft_buffer_infos = tuple(mtp_draft_buffer_infos)
         self.page_size = 1
 
         assert layout in [
@@ -90,23 +105,62 @@ class MambaPoolHost(HostKVCache):
             "page_first_direct",
         ], f"Unsupported layout: {layout}"
 
+        if _is_xpu:
+            raise ValueError(
+                "HiCache does not support hybrid Mamba models on XPU: the Mamba KV "
+                "transfer kernels are JIT-built from CUDA source. "
+                "Launch without HiCache host offload "
+                "(--enable-hierarchical-cache, "
+                "--disaggregation-decode-retraction-backup=host_pool)."
+            )
+
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.num_mamba_layers = device_pool.num_mamba_layers
+        self.num_mamba_layers = buffer_info.temporal.shape[0] + len(
+            self.mtp_draft_buffer_infos
+        )
+
+        buffer_infos = (buffer_info, *self.mtp_draft_buffer_infos)
+        for draft_info in self.mtp_draft_buffer_infos:
+            draft_info.validate()
+            assert draft_info.temporal.shape[0] == 1
+            assert len(draft_info.conv) == len(buffer_info.conv)
+            for target, draft in zip(
+                (*buffer_info.conv, buffer_info.temporal),
+                (*draft_info.conv, draft_info.temporal),
+                strict=True,
+            ):
+                assert target.shape[1:] == draft.shape[1:]
+                assert target.dtype == draft.dtype
+                assert target.device == draft.device
+
+        self.temporal_device_layers = [
+            layer for info in buffer_infos for layer in info.temporal.unbind(0)
+        ]
+        self.conv_device_layers = [
+            [layer for info in buffer_infos for layer in info.conv[i].unbind(0)]
+            for i in range(len(buffer_info.conv))
+        ]
 
         self.conv_state_shapes = [
-            conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
+            conv_state.shape[2:] for conv_state in self.buffer_info.conv
         ]
-        self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+        self.temporal_state_shape = self.buffer_info.temporal.shape[2:]
         self.temporal_state_elem_size = int(np.prod(self.temporal_state_shape))
         self.conv_state_elem_sizes = [
             int(np.prod(conv_shape)) for conv_shape in self.conv_state_shapes
         ]
-        self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
-        self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
+        self.conv_dtype = self.buffer_info.conv[0].dtype
+        self.temporal_dtype = self.buffer_info.temporal.dtype
         self.dtype = self.conv_dtype
+        # Registered side states share the checkpoint slot with conv/temporal,
+        # so a host round trip that skips them leaves the previous occupant's rows.
+        self.slot_state_device_tensors = [
+            buf for info in buffer_infos for buf in info.extra_checkpoint_buffers
+        ]
+        self.slot_state_buffers = []
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
@@ -114,18 +168,18 @@ class MambaPoolHost(HostKVCache):
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         requested_bytes = self.size * self.size_per_token
@@ -144,20 +198,17 @@ class MambaPoolHost(HostKVCache):
         )
 
         self.temporal_device_ptrs = torch.tensor(
-            [
-                device_pool.mamba_cache.temporal[i].data_ptr()
-                for i in range(self.num_mamba_layers)
-            ],
+            [layer.data_ptr() for layer in self.temporal_device_layers],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._buffer_device,
         )
         self.conv_device_ptrs = [
             torch.tensor(
-                [conv_state[i].data_ptr() for i in range(self.num_mamba_layers)],
+                [layer.data_ptr() for layer in layers],
                 dtype=torch.uint64,
-                device=self.device_pool.device,
+                device=self._buffer_device,
             )
-            for conv_state in device_pool.mamba_cache.conv
+            for layers in self.conv_device_layers
         ]
 
         self.kv_buffer = self.init_kv_buffer()
@@ -192,7 +243,7 @@ class MambaPoolHost(HostKVCache):
         logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
-        _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
 
         def alloc_func(dims, *, dtype, device, pin_memory, allocator):
             # conv-only linear attention has no ssm state: mmap can't map the
@@ -261,11 +312,29 @@ class MambaPoolHost(HostKVCache):
                         allocator=self.allocator,
                     )
                 )
+        # Side state keeps its own dtype and its own slot axis (axis 0 of the
+        # per-layer view the device pool yields).
+        self.slot_state_buffers = [
+            alloc_func(
+                (self.size,) + tuple(state.shape[1:]),
+                dtype=state.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            for state in self.slot_state_device_tensors
+        ]
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
         return [
-            buf for buf in (self.temporal_buffer, *self.conv_buffer) if buf.numel() > 0
+            buf
+            for buf in (
+                self.temporal_buffer,
+                *self.conv_buffer,
+                *self.slot_state_buffers,
+            )
+            if buf.numel() > 0
         ]
 
     def _init_write_back_staging_buffers(self):
@@ -281,7 +350,7 @@ class MambaPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
-        return [self.temporal_buffer, *self.conv_buffer]
+        return [self.temporal_buffer, *self.conv_buffer, *self.slot_state_buffers]
 
     def _iter_page_tensors(self, index: int):
         if self.layout in ["page_first", "page_first_direct"]:
@@ -292,6 +361,8 @@ class MambaPoolHost(HostKVCache):
             yield self.temporal_buffer[:, index : index + self.page_size]
             for conv_buf in self.conv_buffer:
                 yield conv_buf[:, index : index + self.page_size]
+        for state_buf in self.slot_state_buffers:
+            yield state_buf[index : index + self.page_size]
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -340,7 +411,13 @@ class MambaPoolHost(HostKVCache):
             for conv_elem_size in self.conv_state_elem_sizes
         )
         temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
-        return (conv_total_size + temporal_size) * self.num_mamba_layers
+        # Side-state rows are per-slot, not per-layer: each entry is already a
+        # single layer's view, so its own row size is added once.
+        side_size = sum(
+            state[0].numel() * state.element_size()
+            for state in self.slot_state_device_tensors
+        )
+        return (conv_total_size + temporal_size) * self.num_mamba_layers + side_size
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -352,6 +429,15 @@ class MambaPoolHost(HostKVCache):
         return int(tensor[0].numel() * tensor.element_size())
 
     @staticmethod
+    def _slots_are_strided(tensor: torch.Tensor) -> bool:
+        """Whether slot stride differs from the slot size transfer kernels expect."""
+        return (
+            tensor.dim() >= 1
+            and tensor.shape[0] > 0
+            and tensor.stride(0) != tensor[0].numel()
+        )
+
+    @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
         dst: torch.Tensor,
@@ -360,6 +446,34 @@ class MambaPoolHost(HostKVCache):
         io_backend: str,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        # Unified conv/SSM views span a whole state envelope per slot. Stage
+        # contiguously for transfer kernels; torch indexing respects the strides
+        # and runs on the caller's transfer stream.
+        if MambaPoolHost._slots_are_strided(src):
+            staged = src.index_select(0, src_indices.to(src.device))
+            MambaPoolHost._copy_tensor(
+                staged,
+                dst,
+                torch.arange(staged.shape[0], device=staged.device),
+                dst_indices,
+                io_backend,
+            )
+            return
+        if MambaPoolHost._slots_are_strided(dst):
+            staged = torch.empty(
+                (dst_indices.numel(), *dst.shape[1:]),
+                dtype=dst.dtype,
+                device=dst.device,
+            )
+            MambaPoolHost._copy_tensor(
+                src,
+                staged,
+                src_indices,
+                torch.arange(staged.shape[0], device=staged.device),
+                io_backend,
+            )
+            dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
         if io_backend == "kernel":
             # TODO: Rename the interface for clarity.
@@ -401,6 +515,24 @@ class MambaPoolHost(HostKVCache):
         io_backend: str,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        if MambaPoolHost._slots_are_strided(dst):
+            # Transfer into contiguous staging, then scatter into the strided view.
+            staged = torch.empty(
+                (dst_indices.numel(), *dst.shape[1:]),
+                dtype=dst.dtype,
+                device=dst.device,
+            )
+            MambaPoolHost._copy_tensor_pf_lf(
+                src,
+                staged,
+                src_indices,
+                torch.arange(staged.shape[0], device=staged.device),
+                layer_id,
+                num_layers,
+                io_backend,
+            )
+            dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
@@ -448,7 +580,7 @@ class MambaPoolHost(HostKVCache):
 
     @staticmethod
     def _copy_tensor_all_layers_lf_pf(
-        src_layers: torch.Tensor,
+        src_layers: torch.Tensor | Sequence[torch.Tensor],
         dst: torch.Tensor,
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
@@ -459,6 +591,31 @@ class MambaPoolHost(HostKVCache):
         can_use_jit: bool = False,
     ) -> None:
         if src_indices.numel() == 0:
+            return
+        if MambaPoolHost._slots_are_strided(src_layers[0]):
+            # Stage contiguous slots per layer and pass the staging buffer's pointers.
+            staged = torch.stack(
+                [
+                    src_layers[i].index_select(0, src_indices.to(src_layers.device))
+                    for i in range(num_layers)
+                ]
+            )
+            staged_ptrs = torch.tensor(
+                [staged[i].data_ptr() for i in range(num_layers)],
+                dtype=torch.uint64,
+                device=staged.device,
+            )
+            MambaPoolHost._copy_tensor_all_layers_lf_pf(
+                staged,
+                dst,
+                torch.arange(staged.shape[1], device=staged.device),
+                dst_indices,
+                num_layers,
+                io_backend,
+                staged_ptrs,
+                staging=staging,
+                can_use_jit=can_use_jit,
+            )
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
@@ -481,7 +638,17 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if _npu_hicache_mamba_io_mode() == "async":
+            if not isinstance(src_layers, torch.Tensor):
+                # Packed drafts live in separate allocations; the NPU bulk
+                # kernels require a single contiguous layer-first tensor.
+                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                for layer_id, src in enumerate(src_layers):
+                    device_indices = src_indices.to(
+                        dtype=torch.int64, device=src.device
+                    )
+                    values = src.index_select(0, device_indices).to(device=dst.device)
+                    dst[:, layer_id, 0].index_copy_(0, host_indices, values)
+            elif _npu_hicache_mamba_io_mode() == "async":
                 transfer_state_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],
@@ -526,8 +693,28 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        temporal_layers = (
+            self.temporal_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.temporal
+        )
+        conv_layers = (
+            self.conv_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.conv
+        )
+
+        # Side state is not per-layer, so it rides on the first layer's call --
+        # before that layer's completion event, which is what every reader of a
+        # restored slot waits on.
+        if layer_id == 0:
+            self._transfer_slot_states(host_indices, device_indices, to_device=True)
         if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
+            if (
+                io_backend == "kernel_ascend"
+                and transfer_mamba_state is not None
+                and not self.mtp_draft_buffer_infos
+            ):
                 # NPU: transfer all layers at once via dedicated kernel.
                 # layer_id == 0 covers every layer, so later calls must skip.
                 if layer_id == 0:
@@ -535,7 +722,7 @@ class MambaPoolHost(HostKVCache):
                     # transfer errors, same guard as the per-layer path below
                     if self.temporal_state_elem_size > 0:
                         transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.temporal,
+                            device_buf=self.buffer_info.temporal,
                             host_buf=self.temporal_buffer,
                             device_indices=device_indices,
                             host_indices=host_indices,
@@ -543,7 +730,7 @@ class MambaPoolHost(HostKVCache):
                         )
                     for conv_idx in range(len(self.conv_state_shapes)):
                         transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.conv[conv_idx],
+                            device_buf=self.buffer_info.conv[conv_idx],
                             host_buf=self.conv_buffer[conv_idx],
                             device_indices=device_indices,
                             host_indices=host_indices,
@@ -554,7 +741,7 @@ class MambaPoolHost(HostKVCache):
                 if self.temporal_state_elem_size > 0:
                     self._copy_tensor_pf_lf(
                         src=self.temporal_buffer,
-                        dst=device_pool.mamba_cache.temporal[layer_id],
+                        dst=temporal_layers[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         layer_id=layer_id,
@@ -564,7 +751,7 @@ class MambaPoolHost(HostKVCache):
                 for conv_idx in range(len(self.conv_state_shapes)):
                     self._copy_tensor_pf_lf(
                         src=self.conv_buffer[conv_idx],
-                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        dst=conv_layers[conv_idx][layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         layer_id=layer_id,
@@ -574,7 +761,7 @@ class MambaPoolHost(HostKVCache):
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
-                device_pool.mamba_cache.temporal[layer_id],
+                temporal_layers[layer_id],
                 host_indices,
                 device_indices,
                 io_backend,
@@ -582,7 +769,7 @@ class MambaPoolHost(HostKVCache):
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor(
                     self.conv_buffer[conv_idx][layer_id],
-                    device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    conv_layers[conv_idx][layer_id],
                     host_indices,
                     device_indices,
                     io_backend,
@@ -591,6 +778,16 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        temporal_layers = (
+            self.temporal_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.temporal
+        )
+        conv_layers = (
+            self.conv_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.conv
+        )
         if self.layout in ["page_first", "page_first_direct"]:
             if io_backend == "kernel" and host_indices.device != device_indices.device:
                 # The mamba JIT kernel wants both index tensors on the device;
@@ -600,7 +797,7 @@ class MambaPoolHost(HostKVCache):
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
                 self._copy_tensor_all_layers_lf_pf(
-                    src_layers=device_pool.mamba_cache.temporal,
+                    src_layers=temporal_layers,
                     dst=self.temporal_buffer,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -612,7 +809,7 @@ class MambaPoolHost(HostKVCache):
                 )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_all_layers_lf_pf(
-                    src_layers=device_pool.mamba_cache.conv[conv_idx],
+                    src_layers=conv_layers[conv_idx],
                     dst=self.conv_buffer[conv_idx],
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -625,7 +822,7 @@ class MambaPoolHost(HostKVCache):
         else:
             for layer_id in range(self.num_mamba_layers):
                 self._copy_tensor(
-                    device_pool.mamba_cache.temporal[layer_id],
+                    temporal_layers[layer_id],
                     self.temporal_buffer[layer_id],
                     device_indices,
                     host_indices,
@@ -633,12 +830,36 @@ class MambaPoolHost(HostKVCache):
                 )
                 for conv_idx in range(len(self.conv_state_shapes)):
                     self._copy_tensor(
-                        device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        conv_layers[conv_idx][layer_id],
                         self.conv_buffer[conv_idx][layer_id],
                         device_indices,
                         host_indices,
                         io_backend,
                     )
+        self._transfer_slot_states(host_indices, device_indices, to_device=False)
+
+    def _transfer_slot_states(self, host_indices, device_indices, *, to_device):
+        """Copy the registered side-state rows for these slots, one leg or the
+        other. Blocking copies: the rows are a few hundred KB per checkpoint and
+        correctness of the ordering against the completion event matters more
+        than the microseconds."""
+        if not self.slot_state_device_tensors:
+            return
+        for state, host_buf in zip(
+            self.slot_state_device_tensors, self.slot_state_buffers
+        ):
+            dev_idx = device_indices.reshape(-1).to(
+                device=state.device, dtype=torch.long
+            )
+            host_idx = host_indices.reshape(-1).to(
+                device=host_buf.device, dtype=torch.long
+            )
+            if to_device:
+                values = host_buf.index_select(0, host_idx)
+                state.index_copy_(0, dev_idx, values.to(state.device))
+            else:
+                values = state.index_select(0, dev_idx)
+                host_buf.index_copy_(0, host_idx, values.to(host_buf.device))
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(
@@ -663,11 +884,24 @@ class MambaPoolHost(HostKVCache):
         data_page: torch.Tensor,
     ) -> None:
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
+        expected = self.page_size * self.size_per_token
+        if self.slot_state_device_tensors and flat_bytes.numel() != expected:
+            # A page stored by a build without the side state is shorter; say so
+            # instead of failing inside a reshape halfway through the restore.
+            raise ValueError(
+                f"Mamba state page has {flat_bytes.numel()} bytes, expected "
+                f"{expected}: the page predates registered slot side states."
+            )
         start = 0
         for tensor in self._iter_page_tensors(index):
             num_bytes = tensor.numel() * tensor.element_size()
             tensor_bytes = flat_bytes[start : start + num_bytes]
             start += num_bytes
+            if tensor_bytes.storage_offset() % tensor.element_size():
+                # With side state the page holds components of different element
+                # sizes, so a later component can begin at a byte offset its own
+                # dtype cannot be viewed at. A contiguous copy re-bases it at 0.
+                tensor_bytes = tensor_bytes.clone()
             restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
             tensor.copy_(restored)
 
@@ -677,6 +911,11 @@ class MambaPoolHost(HostKVCache):
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
         """
+        if self.slot_state_device_tensors:
+            raise NotImplementedError(
+                "Mamba storage zero-copy does not carry registered slot side "
+                "states; use a whole-page storage backend."
+            )
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
@@ -734,6 +973,10 @@ class MambaPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.slot_state_device_tensors:
+            # Side-state rows are a second, differently-strided buffer: a page is
+            # no longer one contiguous slice, so no zero-copy claim is made.
+            return False
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
         temporal_stride = (

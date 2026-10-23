@@ -182,9 +182,16 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
-_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+    try:
+        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+    except ImportError:
+        # sgl-kernel-npu wheels built before the target-specific Gemma provider
+        # landed expose only the torch_npu operator, which is exactly what that
+        # provider binds to on A2/A3 — so those deployments keep working
+        # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
+        # forward fails loudly, same as before this indirection existed.
+        npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
 
 
 @lru_cache(maxsize=1)
@@ -209,12 +216,14 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
+        from sglang.srt.layers.moe.utils import deferred_post_experts_all_reduce
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
@@ -246,6 +255,16 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                # The kernel declined: all-reduce over the group its workspace
+                # is built on, then add and norm into a new residual tensor, as
+                # the kernel does.
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = deferred_post_experts_all_reduce(x)
+                if post_residual_addition is None:
+                    residual = residual.clone()
+                return norm_module.forward(x, residual, None)
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
@@ -437,6 +456,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 
 
 class RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -487,6 +509,12 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
+        projection that consumes this norm's output, whenever forward_cuda can.
+        The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -494,6 +522,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -637,6 +667,11 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if not x.is_cuda:
+            # AITER kernels dereference activations as GPU pointers; a CPU
+            # input (e.g. unit tests building modules on CPU) aborts the
+            # process with HSA_STATUS_ERROR_MEMORY_FAULT instead of raising.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
@@ -1209,18 +1244,12 @@ class GemmaRMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                gamma = self.gemma_weight.to(x.dtype)
-                norm_out, _, residual = torch_npu.npu_add_rms_norm(
-                    residual, x, gamma, self.variance_epsilon
-                )
-            else:
-                norm_out, residual = add_gemma_rms_norm(
-                    x, self.weight, residual, self.variance_epsilon
-                )
+            norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                residual, x, self.gemma_weight.to(x.dtype), self.variance_epsilon
+            )
             return norm_out, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        x, _ = npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 
     def forward_xpu(
@@ -1324,9 +1353,13 @@ class Gemma3RMSNorm(BaseFusedOp):
             # output and residual becomes x + residual for the next layer.
             gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
             return x, residual
-        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
-        # can all go through it directly without a Python-side reshape.
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs go
+        # through directly without a Python-side reshape. It handles
+        # non-contiguous batch/row strides but requires a contiguous last dim,
+        # which a permuted hidden state may not have.
         elif residual is None and x.dim() in (2, 3, 4):
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x, residual)
 
@@ -1340,9 +1373,11 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+            return self.forward_native(x, residual)
         if residual is not None:
             return self.forward_native(x, residual)
-        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
+        output, _ = npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
     def extra_repr(self):

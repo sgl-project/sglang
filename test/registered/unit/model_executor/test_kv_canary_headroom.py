@@ -11,7 +11,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.model_runner_components import kv_pool_runtime
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,9 +32,23 @@ def _manager(slots, groups):
 
 
 class TestCanaryHeadroom(CustomTestCase):
-    def _resize(self, target, drafts=(), *, graph_borrow=False, eager_gap=False):
+    def _resize(
+        self,
+        target,
+        drafts=(),
+        *,
+        graph_borrow=False,
+        eager_gap=False,
+        pool=None,
+        draft_pools=None,
+    ):
         config = MemoryPoolConfig(max_total_num_tokens=1024)
-        pool = Mock(post_capture_backed_bytes=2 * _GIB, dtype="bfloat16")
+        if pool is None:
+            pool = Mock(post_capture_backed_bytes=2 * _GIB, dtype="bfloat16")
+        if draft_pools is None:
+            draft_pools = tuple(
+                SimpleNamespace(post_capture_active=False) for _ in drafts
+            )
         runner = SimpleNamespace(
             token_to_kv_pool=pool,
             device="cuda",
@@ -60,9 +74,8 @@ class TestCanaryHeadroom(CustomTestCase):
                 ),
             ),
             patch.object(kv_pool_runtime.torch.cuda, "synchronize"),
-            patch(
-                "sglang.srt.distributed.parallel_state.get_world_group",
-                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            get_parallel().override(
+                world_group=SimpleNamespace(world_size=1, cpu_group=None)
             ),
             patch.object(kv_pool_runtime, "get_available_gpu_memory", return_value=20),
             patch.object(kv_pool_runtime, "mambaish_config", return_value=None),
@@ -81,7 +94,10 @@ class TestCanaryHeadroom(CustomTestCase):
         ):
             resize = kv_pool_runtime.compute_post_capture_kv_resize(
                 runner,
-                draft_runners=tuple(SimpleNamespace(canary_manager=m) for m in drafts),
+                draft_runners=tuple(
+                    SimpleNamespace(canary_manager=m, token_to_kv_pool=p)
+                    for m, p in zip(drafts, draft_pools)
+                ),
             )
         pool.finalize_backing.assert_called_once_with(config)
         runner.token_to_kv_pool_allocator.resize.assert_called_once_with(config)
@@ -132,6 +148,27 @@ class TestCanaryHeadroom(CustomTestCase):
                     self._resize(target, drafts),
                     self._resize(None) - large.per_forward_workspace_bytes(),
                 )
+
+    def test_reserved_draft_pools_are_backed_to_the_target_config(self):
+        """A draft pool that reserved post-capture backing is finalized to the
+        target's config and its backed bytes rejoin the budget; an eagerly
+        allocated draft pool and a draft aliasing the target pool are left alone."""
+        pool = Mock(post_capture_backed_bytes=2 * _GIB, dtype="bfloat16")
+        reserved = Mock(
+            post_capture_active=True,
+            post_capture_backed_bytes=_GIB,
+            dtype="bfloat16",
+            size=1024,
+        )
+        eager = Mock(post_capture_active=False)
+        budget = self._resize(
+            None, (None, None, None), pool=pool, draft_pools=(reserved, eager, pool)
+        )
+        self.assertEqual(budget, self._resize(None) + _GIB)
+        reserved.finalize_backing.assert_called_once_with(
+            pool.finalize_backing.call_args.args[0]
+        )
+        eager.finalize_backing.assert_not_called()
 
 
 if __name__ == "__main__":
