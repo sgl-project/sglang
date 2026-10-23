@@ -840,6 +840,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req_label = req.request_id[:8] if req.request_id else "unnamed"
         with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
             self._materialize_output_transport(output_batch, req, save_output_paths)
+        if req.is_warmup and not current_platform.is_cpu():
+            # A warmup saves no output, so nothing waits for its device work;
+            # drain it here or the next request's first blocking op pays for it.
+            torch.get_device_module().synchronize()
+
         self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
 
         collect_perf = (

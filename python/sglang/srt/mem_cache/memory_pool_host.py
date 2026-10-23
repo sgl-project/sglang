@@ -13,6 +13,11 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+    unavailable_stub,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -21,12 +26,33 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+_dsv4_mla_unavailable_reason: Optional[str] = None
 if _is_xpu:
-    from sgl_kernel import transfer_cache_dsv4_mla
+    try:
+        from sgl_kernel import transfer_cache_dsv4_mla
+    except ImportError as e:
+        # Only DSV4 needs this op; a wheel without it must not break scheduler import.
+        _dsv4_mla_unavailable_reason = (
+            f"sgl_kernel.transfer_cache_dsv4_mla failed to import ({e}); XPU "
+            "takes it from the out-of-tree sgl-kernel-xpu wheel"
+        )
+        transfer_cache_dsv4_mla = unavailable_stub(
+            "transfer_cache_dsv4_mla", _dsv4_mla_unavailable_reason
+        )
 else:
     from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -223,6 +249,18 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
     ):
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
+            # Token-granular transfers go through transfer_cache_dsv4_mla whatever
+            # the io backend and layout, so it is checked here, not in the table.
+            if not page_aligned_only and _dsv4_mla_unavailable_reason is not None:
+                raise ValueError(
+                    f"HiCache cannot build the {type(self).__name__} host pool here: "
+                    f"{_dsv4_mla_unavailable_reason}. Launch without HiCache "
+                    "(--enable-hierarchical-cache)."
+                )
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
@@ -454,6 +492,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
         return len(indices)
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -734,6 +777,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
 
         self.pool_name = pool_name
         self.state_pools = state_pools
@@ -955,6 +1002,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
         raise NotImplementedError(
             f"{self.pool_name} reuses SWA transfer indices and has no free list"
         )
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
