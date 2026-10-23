@@ -255,10 +255,14 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
     monkeypatch.setattr(
         mesh_api,
         "_build_sampling_params_from_request",
-        lambda *args: SamplingParams(prompt="mesh", output_path=str(tmp_path)),
+        lambda *args: SamplingParams(
+            prompt="mesh", output_path=str(tmp_path), output_file_name="mesh.glb"
+        ),
     )
+    rejected = asyncio.Event()
 
     def reject(**kwargs):
+        rejected.set()
         raise ValueError("request preparation failed")
 
     monkeypatch.setattr(mesh_api, "prepare_request", reject)
@@ -274,6 +278,7 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
                 "/v1/meshes", json={"input_image": "data:image/png;base64,aW1hZ2U="}
             )
         assert response.status_code == 500
+        assert rejected.is_set()
         assert await store.list_page() == []
 
     asyncio.run(run_test())
