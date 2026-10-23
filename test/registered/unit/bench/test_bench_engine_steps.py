@@ -1,5 +1,3 @@
-"""Unit tests for benchmark/engine_steps/bench_engine_steps.py"""
-
 import importlib.util
 import unittest
 from datetime import datetime

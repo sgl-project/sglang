@@ -1,24 +1,14 @@
 """What one prefill or decode step costs at a fixed, steady batch.
 
-Each DP rank warms a long shared prefix; requests add a random --new-tokens suffix and
-are pinned to their rank (`routed_dp_rank`) on a running server (--base-url) or an
-in-process engine (--engine plus server flags). Prefill sends one-token requests, so a
-step serves --tokens-per-step new tokens per rank; decode streams --batch-per-rank
-requests per rank and times --measure-steps steps after --warmup-steps.
+Each DP rank warms a long shared prefix; every request adds a random, uncached
+--new-tokens suffix and is pinned to its rank. Prefill sends one-token requests,
+--tokens-per-step new tokens per rank per step; decode streams --batch-per-rank
+requests per rank and times --measure-steps steps.
 
-Throughput is the tokens of whole steps over their wall time per GPU, and every step in
-the window counts. Results arrive in groups at step ends (the largest gaps, one per
-expected step, mark them), so the window starts and ends at group ends. A prefill window's
-step count comes from its tokens: a slow step can merge two groups. Prefill times are the
-scheduler's step-end stamps when the server runs with --enable-metrics, so a slow HTTP
-front end cannot blur the groups, and arrival times otherwise. --server-log adds
-the engine's per-step lines over the same window as a cross-check; their timestamps are
-read against this host's clock, so the server runs here or on a synced clock, and
-SGLANG_LOG_MS=1 on the server keeps lines near the window edges. The run
-refuses servers with EPLB on (rebalance steps would land in the window) and, for decode,
-a --stream-interval other than 1 (each streamed chunk must be one step), flushes the
-server's cache first (--no-flush skips it), and exits with 1 when the cross-check
-disagrees by more than 0.5% or the window holds prefill steps of another size.
+Throughput counts whole steps only: the window starts and ends at step boundaries
+(the scheduler's stamps under --enable-metrics, else response arrival gaps).
+--server-log cross-checks the engine's per-step log lines over the same window; it
+needs the server on this host's clock, with SGLANG_LOG_MS=1.
 
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
@@ -51,9 +41,8 @@ LINES = {
 
 
 def step_groups(times, size):
-    """(end, count) groups of arrival times, about `size` to a step. The len / size
-    largest gaps are the step boundaries; a gap over half their median splits, so a
-    stall cannot hide them."""
+    """(end, count) groups of times, about `size` to a step: any gap over half the
+    median of the len / size largest gaps splits, so a stall cannot hide a boundary."""
     t = sorted(times)
     gaps = [b - a for a, b in zip(t, t[1:])]
     if not gaps:
@@ -68,8 +57,8 @@ def step_groups(times, size):
 
 
 def group_window(groups, lo, hi):
-    """(t0, t1, items, ms between group ends) from the first group end at or past the
-    lo fraction of all items to the last one at or before the hi fraction."""
+    """(t0, t1, items, ms between group ends) of the groups that end between the lo
+    and hi fractions of all items."""
     total, cum, ends = sum(c for _, c in groups), 0, []
     for end, c in groups:
         cum += c
@@ -83,11 +72,8 @@ def group_window(groups, lo, hi):
 
 
 def log_steps(lines, mode, t0, t1, size):
-    """The engine lines whose interval, since the rank's previous line, lies inside
-    [t0, t1] (epoch seconds): mean ms per step per rank over prefill steps of `size` new
-    tokens or decode intervals at `size` running requests, their mean accept length,
-    the least fraction of the window they cover on a rank, and the sizes all lines in
-    the window showed."""
+    """Engine lines whose interval since the rank's previous line lies inside [t0, t1]
+    (epoch seconds), reduced to ms per step per rank at batch `size`."""
     per_rank, spans, prev, accept, seen = {}, {}, {}, [], set()
     for m in filter(None, map(LINES[mode].search, lines)):
         ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
@@ -238,7 +224,6 @@ async def batch(args, tp, prompt, n_each, params, done):
 
 
 async def prefill(args, tp, prompt):
-    """The window's steps, seconds, tokens and wall bounds, and the log batch size."""
     nc, B = args.new_tokens, args.tokens_per_step
     per_step = max(1, B // nc)
     params = {"max_new_tokens": 1, "temperature": 0.0, "ignore_eos": True}
@@ -250,7 +235,6 @@ async def prefill(args, tp, prompt):
             "part of a suffix was cached: a warm cache, e.g. --no-flush after an "
             "earlier run with the same --seed"
         )
-    # The scheduler's step-end stamps (--enable-metrics) if present, else arrivals
     stamp = "scheduler" if all(s for _, s, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _ in done]
     t0, t1, _, group_ms = group_window(
@@ -279,7 +263,6 @@ async def prefill(args, tp, prompt):
 
 
 async def decode(args, tp, prompt):
-    """The window's steps, seconds, tokens and wall bounds, and the log batch size."""
     n, events, first = args.batch_per_rank, [], set()
     params = {"max_new_tokens": args.output_len, "temperature": 0.0, "ignore_eos": True}
 
