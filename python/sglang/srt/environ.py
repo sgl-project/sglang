@@ -1134,6 +1134,14 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Triton warps per program for the XPU LayerNorm+modulate kernels. Layout
+    # only, the bit-exact result does not depend on it; 4 measured fastest on
+    # Arc Pro B70.
+    SGLANG_XPU_LN_MOD_NUM_WARPS = EnvInt(4)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -1566,7 +1574,7 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Currently supported by the Kimi-K2.5 image processor only.
+    # Supported by Kimi-K2.5 image and Cosmos3 V2V frame preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.

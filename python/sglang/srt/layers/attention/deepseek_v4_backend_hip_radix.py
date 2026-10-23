@@ -157,6 +157,9 @@ _OPUS_PREFILL_MIN_TOKENS = 1024
 _OPUS_PREFILL_MAX_ROWS_PER_TOKEN = {1: 256, 2: 128}
 # One ratio's bf16 workspace stays within 1 GiB.
 _OPUS_PREFILL_MAX_WORKSPACE_ROWS = 1 << 20
+# DeepSeek-V4.1's prefill graph metadata width when the user sets no
+# cuda_graph_config[prefill].max_seq_len; longer contexts run eager.
+_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
 @dataclass
@@ -893,12 +896,6 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
-    prefill_cuda_graph_default_max_seq_len = (
-        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
-    )
-    _prefill_graph_replays_any_context = (
-        DeepseekV4AttnBackend._prefill_graph_replays_any_context
-    )
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
@@ -2364,6 +2361,12 @@ class DeepseekV4HipRadixBackend(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
         )
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        if self.low_ratios != (1, 2) or get_parallel().attn_cp_size > 1:
+            return None
+        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
 
     def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
