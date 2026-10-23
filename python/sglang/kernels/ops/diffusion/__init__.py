@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.fused_packed_swiglu_fp8_rowwise",
+        KernelBackend.TRITON,
+        "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
+        frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    ),
+    (
         "diffusion.residual_gate_fp32",
         KernelBackend.TRITON,
         "modulate.residual_gate_fp32:residual_gate_fp32",
@@ -618,6 +624,7 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
@@ -629,8 +636,10 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "can_use_fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",

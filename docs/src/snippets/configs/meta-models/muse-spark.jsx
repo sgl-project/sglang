@@ -390,7 +390,9 @@ export const config = {
     {
       match: { hw: "gb300", quant: "bf16" },
       nnodes: 2,
-      env: [],
+      // Expandable segments admit the two-node NVL72 TP8 group to custom
+      // all-reduce v2; without them decode all-reduce falls back to NCCL.
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
