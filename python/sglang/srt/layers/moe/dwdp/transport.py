@@ -5,39 +5,33 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from cuda.bindings import driver as cuda
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     LayerWeightSpecs,
     MnnvlHandleSet,
 )
-from sglang.srt.utils.cuda_vmm_utils import (
-    VmmReservation,
-    align_down,
-    align_up,
-    check_drv,
-    exchange_posix_fds,
-    export_shareable_handles,
-    get_device_granularity,
-    import_peer_handle,
-    make_device_allocation_prop,
-    tensor_from_pointer,
-)
+from sglang.srt.utils.common import align_down, align_up, exchange_posix_fds
+from sglang.srt.utils.vmm_backend import VmmBackend, get_vmm_backend
 
 logger = logging.getLogger(__name__)
 
 
-def _close_fds(fds) -> None:
-    for fd in fds:
+def _close_fds(fds: Iterable[int]) -> None:
+    """Close every fd, then raise the first close error if there was one."""
+    first_error: Optional[OSError] = None
+    for fd in list(fds):
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except OSError as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
 
 
 def _copy_local_weights_to_handles(
@@ -45,10 +39,9 @@ def _copy_local_weights_to_handles(
     local_params: Dict[Tuple[int, str], torch.Tensor],
     layer_weight_specs: LayerWeightSpecs,
     layout: DwdpExpertLayout,
-    device_id: int,
+    backend: VmmBackend,
 ) -> Tuple[Dict[Tuple[int, str], int], Dict[Tuple[int, str], int]]:
-    granularity = get_device_granularity(device_id)
-    prop = make_device_allocation_prop(device_id)
+    granularity = backend.granularity
     handles: Dict[Tuple[int, str], int] = {}
     sizes: Dict[Tuple[int, str], int] = {}
 
@@ -63,15 +56,13 @@ def _copy_local_weights_to_handles(
         phys_size = page_end - page_start
         data_offset = local_start_bytes - page_start
 
-        reservation = VmmReservation(phys_size, prop, device_id, alignment=granularity)
+        reservation = backend.make_reservation(
+            phys_size, exportable=True, alignment=granularity
+        )
         handle = int(reservation.map(0, phys_size, retain_handle=True))
 
-        nbytes = param.numel() * param.element_size()
-        check_drv(
-            cuda.cuMemcpyDtoD(reservation.base + data_offset, param.data_ptr(), nbytes),
-            "cuMemcpyDtoD",
-        )
-        torch.cuda.synchronize()
+        backend.copy_tensor_to_pointer(reservation.base + data_offset, param)
+        backend.synchronize()
 
         reservation.close(release_handles=False)
 
@@ -85,38 +76,37 @@ def _copy_local_weights_to_handles(
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
 
-    torch.cuda.empty_cache()
+    backend.empty_cache()
 
     return handles, sizes
 
 
 class DWDPTransport:
-    def __init__(self):
+    def __init__(self, backend: VmmBackend):
+        self._backend = backend
         self._handle_set: Optional[MnnvlHandleSet] = None
         self._peer_views: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self._imported_handles: List[int] = []
-        self._peer_reservations: List[VmmReservation] = []
+        self._peer_reservations: List = []
 
     @classmethod
     def create(
         cls,
         layer_weight_specs: LayerWeightSpecs,
         local_params: Dict[Tuple[int, str], torch.Tensor],
-        group: dist.ProcessGroup,
+        group: GroupCoordinator,
         layout: DwdpExpertLayout,
         device_id: int,
     ) -> DWDPTransport:
-        transport = cls()
+        transport = cls(get_vmm_backend(device_id))
         sorted_keys = sorted(local_params.keys())
 
         handles, sizes = _copy_local_weights_to_handles(
-            sorted_keys, local_params, layer_weight_specs, layout, device_id
+            sorted_keys, local_params, layer_weight_specs, layout, transport._backend
         )
         transport._handle_set = MnnvlHandleSet(handles=handles, sizes=sizes)
 
-        transport._import_peer_views(
-            sorted_keys, layer_weight_specs, group, layout, device_id
-        )
+        transport._import_peer_views(sorted_keys, layer_weight_specs, group, layout)
 
         dist.barrier(group=group.device_group)
         logger.debug(
@@ -129,88 +119,90 @@ class DWDPTransport:
         self,
         sorted_keys: List[Tuple[int, str]],
         layer_weight_specs: LayerWeightSpecs,
-        group: dist.ProcessGroup,
+        group: GroupCoordinator,
         layout: DwdpExpertLayout,
-        device_id: int,
     ) -> None:
         cpu_group = group.cpu_group
-        granularity = get_device_granularity(device_id)
-        prop = make_device_allocation_prop(device_id)
+        granularity = self._backend.granularity
 
         handle_list = [self._handle_set.get_handle(li, n) for li, n in sorted_keys]
-        fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
+        fabric_handles, local_posix_fds, use_fabric = self._backend.export_handles(
             handle_list, cpu_group, layout.dwdp_rank
         )
         peer_fds: Dict[Tuple[int, int], int] = {}
+        try:
+            key_counts = [None] * layout.dwdp_size
+            dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
+            if any(count != len(sorted_keys) for count in key_counts):
+                raise RuntimeError(
+                    f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+                )
 
-        key_counts = [None] * layout.dwdp_size
-        dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
-        if any(count != len(sorted_keys) for count in key_counts):
-            raise RuntimeError(
-                f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+            if use_fabric:
+                all_fabric = [None] * layout.dwdp_size
+                dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
+            else:
+                all_fabric = None
+                peer_fds = exchange_posix_fds(
+                    cpu_group,
+                    layout.dwdp_rank,
+                    layout.dwdp_size,
+                    local_posix_fds,
+                    key_counts,
+                )
+            logger.info(
+                f"DWDP handle exchange via {'FABRIC' if use_fabric else 'POSIX fd'} "
+                f"({len(sorted_keys)} handles)"
             )
+            for key_idx, (layer_idx, name) in enumerate(sorted_keys):
+                spec = layer_weight_specs[layer_idx][name]
 
-        if use_fabric:
-            all_fabric = [None] * layout.dwdp_size
-            dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
-        else:
-            all_fabric = None
-            peer_fds = exchange_posix_fds(
-                cpu_group,
-                layout.dwdp_rank,
-                layout.dwdp_size,
-                local_posix_fds,
-                key_counts,
-            )
-        logger.info(
-            "DWDP handle exchange via %s (%d handles)",
-            "FABRIC" if use_fabric else "POSIX fd",
-            len(sorted_keys),
-        )
+                for peer_rank in range(layout.dwdp_size):
+                    if peer_rank == layout.dwdp_rank:
+                        continue
 
-        for key_idx, (layer_idx, name) in enumerate(sorted_keys):
-            spec = layer_weight_specs[layer_idx][name]
+                    peer_start, peer_end = layout.peer_ranges[peer_rank]
+                    peer_start_bytes = peer_start * spec.expert_bytes
+                    peer_end_bytes = peer_end * spec.expert_bytes
+                    peer_page_start = align_down(peer_start_bytes, granularity)
+                    peer_page_end = align_up(peer_end_bytes, granularity)
+                    peer_phys_size = peer_page_end - peer_page_start
+                    peer_data_offset = peer_start_bytes - peer_page_start
 
-            for peer_rank in range(layout.dwdp_size):
-                if peer_rank == layout.dwdp_rank:
-                    continue
+                    fabric_handle = (
+                        all_fabric[peer_rank][key_idx] if use_fabric else None
+                    )
+                    fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
+                    # not all backends' handles carry the object's size
+                    peer_handle = self._backend.import_handle(
+                        fabric_handle,
+                        fd,
+                        use_fabric=use_fabric,
+                        peer_rank=peer_rank,
+                        size=peer_phys_size,
+                    )
+                    self._imported_handles.append(int(peer_handle))
 
-                fabric_handle = all_fabric[peer_rank][key_idx] if use_fabric else None
-                fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
-                peer_handle = import_peer_handle(
-                    fabric_handle, fd, use_fabric=use_fabric, peer_rank=peer_rank
-                )
-                self._imported_handles.append(int(peer_handle))
+                    peer_reservation = self._backend.make_reservation(
+                        peer_phys_size,
+                        exportable=True,
+                        alignment=granularity,
+                    )
+                    peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
+                    self._peer_reservations.append(peer_reservation)
 
-                peer_start, peer_end = layout.peer_ranges[peer_rank]
-                peer_start_bytes = peer_start * spec.expert_bytes
-                peer_end_bytes = peer_end * spec.expert_bytes
-                peer_page_start = align_down(peer_start_bytes, granularity)
-                peer_page_end = align_up(peer_end_bytes, granularity)
-                peer_phys_size = peer_page_end - peer_page_start
-                peer_data_offset = peer_start_bytes - peer_page_start
-
-                peer_reservation = VmmReservation(
-                    peer_phys_size,
-                    prop,
-                    device_id,
-                    alignment=granularity,
-                )
-                peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
-                self._peer_reservations.append(peer_reservation)
-
-                num_peer_experts = peer_end - peer_start
-                peer_tensor = tensor_from_pointer(
-                    peer_reservation.base + peer_data_offset,
-                    peer_end_bytes - peer_start_bytes,
-                    shape=(num_peer_experts,) + spec.full_shape[1:],
-                    dtype=spec.dtype,
-                    device_id=device_id,
-                )
-                self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
-
-        _close_fds(local_posix_fds)
-        _close_fds(peer_fds.values())
+                    num_peer_experts = peer_end - peer_start
+                    peer_tensor = self._backend.tensor_from_pointer(
+                        peer_reservation.base + peer_data_offset,
+                        peer_end_bytes - peer_start_bytes,
+                        shape=(num_peer_experts,) + spec.full_shape[1:],
+                        dtype=spec.dtype,
+                    )
+                    self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
+        finally:
+            if self._backend.owns_exported_fds():
+                _close_fds(local_posix_fds)
+            _close_fds(peer_fds.values())
 
     @property
     def handle_set(self) -> MnnvlHandleSet:
@@ -227,7 +219,13 @@ class DWDPTransport:
         self._peer_reservations.clear()
 
         for h in self._imported_handles:
-            check_drv(cuda.cuMemRelease(h), "cuMemRelease")
+            self._backend.release_handle(h)
         self._imported_handles.clear()
+
+        # local shards are mapped by the weight buffer, which is released first
+        if self._handle_set is not None:
+            for handle in self._handle_set.handles.values():
+                self._backend.release_handle(handle)
+            self._handle_set = None
 
         self._peer_views.clear()
