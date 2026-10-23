@@ -2201,9 +2201,10 @@ def _mhc_stream_mean_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     x_row = x_ptr + pid_m.to(tl.int64) * x_stride_m + offs_h
-    # Streams are added in order in fp32, as torch.mean's reduction does.
-    acc = tl.load(x_row, mask=mask, other=0.0).to(tl.float32)
-    for k in tl.static_range(1, HC):
+    # Streams are added in order onto a +0 fp32 accumulator, as torch.mean's
+    # reduction does (so an all -0 row averages to +0).
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
         acc += tl.load(x_row + k * x_stride_k, mask=mask, other=0.0).to(tl.float32)
     tl.store(
         y_ptr + pid_m.to(tl.int64) * y_stride_m + offs_h, acc * (1.0 / HC), mask=mask
@@ -2775,7 +2776,7 @@ def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.T
         or hc != 4
         or h % 1024
         or x.stride(2) != 1
-        or (out is not None and out.stride(1) != 1)
+        or (out is not None and (out.dtype != x.dtype or out.stride(1) != 1))
     ):
         y = x.mean(dim=1)
         return y if out is None else out.copy_(y)
