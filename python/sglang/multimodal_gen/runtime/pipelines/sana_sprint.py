@@ -7,6 +7,7 @@ per-request embedded guidance.
 """
 
 import torch
+from diffusers.image_processor import PixArtImageProcessor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
@@ -16,8 +17,14 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    DecodingStage,
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -72,6 +79,25 @@ class SanaSprintDenoisingStage(DenoisingStage):
         return ctx
 
 
+class SanaSprintDecodingStage(DecodingStage):
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        output_batch = super().forward(batch, server_args)
+        frames = output_batch.output
+        if frames is None or frames.shape[-2:] == (batch.height, batch.width):
+            return output_batch
+        # Resolution binning generated at an aspect-ratio bin; resize and
+        # center-crop back to the requested size as Diffusers does.
+        output_batch.output = _resize_and_crop(frames, batch.width, batch.height)
+        return output_batch
+
+
+def _resize_and_crop(frames: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    # Bilinear resizing is per plane, so every leading dim folds into the batch.
+    planes = frames.flatten(0, -3).unsqueeze(1)
+    planes = PixArtImageProcessor.resize_and_crop_tensor(planes, width, height)
+    return planes.squeeze(1).unflatten(0, frames.shape[:-2])
+
+
 class SanaSprintPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "SanaSprintPipeline"
 
@@ -92,7 +118,16 @@ class SanaSprintPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "prompt_encoding_stage_primary",
         )
-        self.add_standard_timestep_preparation_stage()
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=[
+                lambda batch, server_args: ("max_timesteps", batch.max_timesteps),
+                lambda batch, server_args: (
+                    "intermediate_timesteps",
+                    batch.intermediate_timesteps,
+                ),
+                lambda batch, server_args: ("timesteps", batch.trigflow_timesteps),
+            ]
+        )
         self.add_standard_latent_preparation_stage()
         self.add_stage_factory(
             RoleType.DENOISER,
@@ -104,7 +139,13 @@ class SanaSprintPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "denoising_stage",
         )
-        self.add_standard_decoding_stage()
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: SanaSprintDecodingStage(
+                vae=self.get_module("vae"), pipeline=self, component_name="vae"
+            ),
+            "decoding_stage",
+        )
 
 
 EntryClass = SanaSprintPipeline

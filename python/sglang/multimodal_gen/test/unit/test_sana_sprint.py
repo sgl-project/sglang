@@ -5,7 +5,9 @@ from diffusers import SCMScheduler as DiffusersSCMScheduler
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_sprint import (
+    ASPECT_RATIO_1024_BIN,
     SanaSprintPipelineConfig,
+    classify_height_width_bin,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_sprint import SanaSprintSamplingParams
@@ -13,6 +15,7 @@ from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_scm import (
     SCMScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines.sana_sprint import _resize_and_crop
 
 _SIGMA_DATA = 0.5
 
@@ -24,14 +27,24 @@ def _fake_dit(latent_model_input: torch.Tensor, scm_timestep) -> torch.Tensor:
     return (torch.tanh(mixed) * (1 + scm_timestep)).to(torch.bfloat16)
 
 
-def _diffusers_sprint_loop(steps: int) -> torch.Tensor:
+def _diffusers_sprint_loop(steps: int, schedule: dict) -> torch.Tensor:
     """The SanaSprintPipeline.__call__ denoising loop, reduced to the scheduler math."""
     scheduler = DiffusersSCMScheduler()
-    scheduler.set_timesteps(
-        steps,
-        max_timesteps=1.57080,
-        intermediate_timesteps=1.3 if steps == 2 else None,
-    )
+    if "timesteps" in schedule:
+        scheduler.set_timesteps(
+            steps,
+            timesteps=schedule["timesteps"],
+            max_timesteps=None,
+            intermediate_timesteps=None,
+        )
+    else:
+        scheduler.set_timesteps(
+            steps,
+            max_timesteps=1.57080,
+            intermediate_timesteps=(
+                schedule.get("intermediate_timesteps", 1.3) if steps == 2 else None
+            ),
+        )
     scheduler.set_begin_index(0)
     generator = torch.Generator().manual_seed(0)
     latents = torch.randn(1, 8, 4, 4, generator=generator) * _SIGMA_DATA
@@ -56,10 +69,10 @@ def _diffusers_sprint_loop(steps: int) -> torch.Tensor:
     return denoised / _SIGMA_DATA
 
 
-def _shared_denoising_loop(steps: int) -> torch.Tensor:
+def _shared_denoising_loop(steps: int, schedule: dict) -> torch.Tensor:
     """How LatentPreparationStage and DenoisingStage drive the scheduler."""
     scheduler = SCMScheduler()
-    scheduler.set_timesteps(steps)
+    scheduler.set_timesteps(steps, **schedule)
     # DenoisingStage._reset_scheduler_loop_state runs before every request.
     scheduler._step_index = None
     scheduler._begin_index = None
@@ -74,13 +87,26 @@ def _shared_denoising_loop(steps: int) -> torch.Tensor:
     return latents
 
 
-@pytest.mark.parametrize("steps", [1, 2, 4])
-def test_scm_scheduler_reproduces_diffusers_sprint_loop(steps):
+@pytest.mark.parametrize(
+    "steps, schedule",
+    [
+        (1, {}),
+        (2, {}),
+        (4, {}),
+        (2, {"intermediate_timesteps": 1.1}),
+        (4, {"timesteps": [1.5708, 1.3, 1.0, 0.6, 0.0]}),
+    ],
+)
+def test_scm_scheduler_reproduces_diffusers_sprint_loop(steps, schedule):
     """The SCM scheduler must reproduce Diffusers' SanaSprintPipeline loop exactly:
     the sCM timestep the DiT sees, its input scaling, the fp32 flow-to-TrigFlow
-    conversion of a bf16 DiT output, the step noise and the final /sigma_data."""
+    conversion of a bf16 DiT output, the step noise and the final /sigma_data,
+    for default, intermediate-angle and explicit-angle schedules."""
     torch.testing.assert_close(
-        _shared_denoising_loop(steps), _diffusers_sprint_loop(steps), rtol=0, atol=0
+        _shared_denoising_loop(steps, schedule),
+        _diffusers_sprint_loop(steps, schedule),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -134,3 +160,73 @@ def test_sana_qk_norm_follows_checkpoint_config():
     )
     assert sprint.arch_config.qk_norm == "rms_norm_across_heads"
     assert sprint.arch_config.guidance_embeds_scale == 0.1
+
+
+def test_sana_sprint_schedule_fields_reach_the_image_api():
+    """The image API forwards only declared model fields; an undeclared Sprint
+    field would be dropped from HTTP requests without an error."""
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        ImageGenerationsRequest,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+        request_model_kwargs,
+    )
+
+    fields = {
+        "max_timesteps": 1.5,
+        "intermediate_timesteps": 1.1,
+        "trigflow_timesteps": [1.5, 1.1, 0.0],
+        "use_resolution_binning": False,
+    }
+    request = ImageGenerationsRequest(prompt="a fox", **fields)
+    assert request_model_kwargs(request, SanaSprintSamplingParams, "image") == fields
+
+
+def test_sana_sprint_rejects_unusable_schedules():
+    """Bad sCM schedules must fail request validation, not the worker."""
+    config = SanaSprintPipelineConfig()
+    bad = [
+        {"trigflow_timesteps": [1.5708, 0.0]},  # needs num_inference_steps + 1
+        {"trigflow_timesteps": [1.0, 1.3, 0.0]},  # not decreasing
+        {"intermediate_timesteps": 1.6},  # outside (0, max_timesteps)
+    ]
+    for overrides in bad:
+        with pytest.raises(ValueError):
+            SanaSprintSamplingParams(**overrides)._validate_with_pipeline_config(config)
+    SanaSprintSamplingParams(
+        trigflow_timesteps=[1.5708, 1.3, 0.0]
+    )._validate_with_pipeline_config(config)
+
+
+def test_sana_sprint_resolution_binning_matches_diffusers():
+    """Binning must pick Diffusers' 1024px aspect-ratio bin for the latent grid and
+    resize/crop the decoded frames back exactly as Diffusers' image processor does."""
+    from diffusers.image_processor import PixArtImageProcessor
+    from diffusers.pipelines.pixart_alpha.pipeline_pixart_alpha import (
+        ASPECT_RATIO_1024_BIN as DIFFUSERS_BIN,
+    )
+
+    assert ASPECT_RATIO_1024_BIN == {
+        ratio: (int(h), int(w)) for ratio, (h, w) in DIFFUSERS_BIN.items()
+    }
+    for height, width in [(1000, 700), (800, 1200), (1024, 1024), (512, 2100)]:
+        assert classify_height_width_bin(
+            height, width
+        ) == PixArtImageProcessor.classify_height_width_bin(
+            height, width, ratios=DIFFUSERS_BIN
+        )
+
+    config = SanaSprintPipelineConfig()
+    batch = SanaSprintSamplingParams(height=1000, width=700)
+    # 1000 / 700 = 1.43 is closest to the 1.46 bin, (1216, 832).
+    assert config.prepare_latent_shape(batch, 1, 1) == (1, 32, 1216 // 32, 832 // 32)
+    batch.use_resolution_binning = False
+    assert config.prepare_latent_shape(batch, 1, 1) == (1, 32, 1000 // 32, 700 // 32)
+
+    images = torch.rand(2, 3, 1216, 832)
+    expected = PixArtImageProcessor.resize_and_crop_tensor(images, 700, 1000)
+    torch.testing.assert_close(_resize_and_crop(images, 700, 1000), expected)
+    frames = images.unsqueeze(2)  # [B, C, F=1, H, W] as DecodingStage returns
+    torch.testing.assert_close(
+        _resize_and_crop(frames, 700, 1000), expected.unsqueeze(2)
+    )
