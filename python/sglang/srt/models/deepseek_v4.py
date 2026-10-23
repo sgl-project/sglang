@@ -76,6 +76,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
+    cp_interleave_input_ids,
     cp_materialize_global_token_order,
     is_cp_active,
 )
@@ -3990,6 +3991,7 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        local_input_ids = input_ids
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4140,11 +4142,19 @@ class DeepseekV4Model(nn.Module):
                 state = state.take_rows(tail.rows)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-                input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                if tail.global_token_indices is not None:
+                    local_input_ids = tail.rows(local_input_ids)
+                    tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
+                    input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                    input_ids_global = input_ids
+                else:
+                    input_ids = tail.rows(input_ids)
+                    if not (
+                        get_parallel().attn_dp_size > 1
+                        and get_moe_a2a_backend().is_none()
+                    ):
+                        input_ids_global = tail.rows(input_ids_global)
+                    local_input_ids = input_ids
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4194,7 +4204,8 @@ class DeepseekV4Model(nn.Module):
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
-                    input_ids=input_ids,
+                    # The gate consumes local rows; lookup may gather across CP.
+                    input_ids=local_input_ids,
                     cp_all_tokens=cp_extend,
                 )
                 state = state.with_residual(hidden_states)
@@ -4600,8 +4611,12 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
-            # The logits processor indexes rows by the full extend layout.
+        if (
+            tail is not None
+            and not capture_dspark
+            and tail.global_token_indices is None
+        ):
+            # Without compact output ownership, logits index the full extend.
             num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
                 tail=tail, rows=hidden_states, num_tokens=num_tokens
@@ -4690,7 +4705,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "MoE A2A requires CUDA MegaMoE. Use --language-model-only "
+                    "for text-only CP serving."
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4927,6 +4943,20 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return input_ids, input_embeds
 
+    def get_cp_output_tail(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[LateLayerTail]:
+        """Return the compact output ownership used by the CP runner."""
+        if (
+            self.model.hc_pre_from_prev_sublayer
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+            if tail.global_token_indices is not None:
+                return tail
+        return None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -4995,11 +5025,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
-            )
+            output.hidden_states_token_indices = tail.output_token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

@@ -197,6 +197,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    cp_encoder_replay = False
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -296,6 +298,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        self.cp_encoder_replay = (
+            getattr(
+                params.token_to_kv_pool_allocator.get_kvcache(), "request_window", None
+            )
+            is not None
+            and self.attn_cp_group is not None
+            and torch.distributed.get_world_size(group=self.attn_cp_group) > 1
+        )
         self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
@@ -1161,6 +1171,21 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
+    def _replay_overlaps_unadopted_cache(self, req: Req, key: RadixKey) -> bool:
+        if not self.cp_encoder_replay or not req.kv.encoder_swa_replayed:
+            return False
+        # Inspect the stored snapshot even when a component validator would
+        # reject it (for example, a Host-only tail). No bytes are adopted here.
+        match = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self._apply_cache_actions(match.cache_actions)
+        overlap = torch.tensor(
+            [int(match.full_kv_hit_length > req.kv.cache_protected_len)],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self._all_reduce(overlap, torch.distributed.ReduceOp.MAX)
+        return bool(overlap.item())
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
@@ -1231,6 +1256,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+        if self._replay_overlaps_unadopted_cache(req, radix_key):
+            # Preserve request-owned rows through attention and PD instead of
+            # deduplicating them into a snapshot the request never restored.
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=is_finished, insert_params=insert_params
+                )
+            return
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
