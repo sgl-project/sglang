@@ -13,6 +13,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     invoke_tag_name = " invoke"
     parameter_tag_name = " parameter"
     strip_string_param_value: bool = False
+    # A rejected call must not become an empty successful agent turn. Surface
+    # an API error, never raw DSML that a custom-tool bridge could execute.
+    raise_on_malformed_tool_calls: bool = True
 
     # The encoder joins an assistant turn's content and its calls block with a
     # blank line, and renders it even when there is no content.
