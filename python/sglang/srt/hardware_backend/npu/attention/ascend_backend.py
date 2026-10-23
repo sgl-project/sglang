@@ -698,6 +698,19 @@ class AscendAttnBackend(AttentionBackend):
 
         if self.needs_cpu_seq_lens or dense_mla_dcp_partial:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+
+        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
+        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
+        # only rebind the Host-side IntArray when captured as a Python list.
+
+        if (
+            not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
+            self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+
+        if self.needs_cpu_seq_lens or dense_mla_dcp_partial:
             if forward_batch.forward_mode.is_target_verify():
                 spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is None or not spec_algorithm.is_dflash_family():
@@ -714,17 +727,6 @@ class AscendAttnBackend(AttentionBackend):
                     + self.speculative_step_id
                     + 1
                 )
-
-        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
-        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
-        # only rebind the Host-side IntArray when captured as a Python list.
-
-        if (
-            not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_target_verify()
-        ):
-            seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
-            self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
