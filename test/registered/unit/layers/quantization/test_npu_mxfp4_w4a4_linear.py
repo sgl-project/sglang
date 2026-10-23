@@ -1,10 +1,14 @@
 """CPU regression tests for the Ascend MXFP4 W4A4 online config (Linear gate)."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+# Initialize quantization before its NPU helpers to avoid a cold-import cycle.
+import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUDualLevelMXFP4LinearMethod,
     _prepare_dual_level_weight_l0_scale,
 )
 from sglang.srt.layers.linear import LinearBase
@@ -21,13 +25,15 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestNPUDualLevelMXFP4Linear(CustomTestCase):
-    def test_preserves_single_l0_scale_block(self):
-        weight_l0_scale = torch.arange(4, dtype=torch.float32).reshape(4, 1)
-
-        prepared_scale = _prepare_dual_level_weight_l0_scale(weight_l0_scale)
-
-        self.assertEqual(prepared_scale.shape, (1, 4))
-        self.assertTrue(torch.equal(prepared_scale, weight_l0_scale.transpose(0, 1)))
+    def test_preserves_l0_scale_blocks_and_singleton_dimensions(self):
+        for shape in ((4, 1), (4, 1, 1), (1, 2), (4, 2, 1)):
+            with self.subTest(shape=shape):
+                scale = torch.arange(torch.tensor(shape).prod()).reshape(shape)
+                prepared = _prepare_dual_level_weight_l0_scale(scale)
+                expected = scale.reshape(shape[0], -1).transpose(0, 1)
+                self.assertEqual(prepared.shape, expected.shape)
+                self.assertTrue(torch.equal(prepared, expected))
+                self.assertTrue(prepared.is_contiguous())
 
 
 class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):
@@ -63,6 +69,23 @@ class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):
         )
 
         self.assertIsInstance(method, UnquantizedLinearMethod)
+
+    def test_aligned_npu_linear_uses_dual_level_and_honors_ignored_layers(self):
+        layer = self._make_linear_layer(4096)
+        prefix = "model.layers.0.self_attn.o_proj"
+        with patch(
+            "sglang.srt.layers.quantization.npu_mxfp4_w4a4.is_npu", return_value=True
+        ):
+            self.assertIsInstance(
+                Mxfp4W4A4Config().get_quant_method(layer, prefix),
+                NPUDualLevelMXFP4LinearMethod,
+            )
+            self.assertIsInstance(
+                Mxfp4W4A4Config(ignored_layers=[prefix]).get_quant_method(
+                    layer, prefix
+                ),
+                UnquantizedLinearMethod,
+            )
 
     def test_aligned_linear_not_skipped(self):
         # A 32-aligned K must NOT hit the fallback: on CPU (is_npu() False) the

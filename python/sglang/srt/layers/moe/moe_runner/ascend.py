@@ -40,13 +40,19 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     if isinstance(kernel, NPUW4A4MXFP4MoEMethod):
         if has_clamp:
             raise NotImplementedError(
-                "NPUW4A4MXFP4MoEMethod does not support swiglu_limit; "
-                "its activation paths apply SiLU without clamp."
+                "NPUW4A4MXFP4MoEMethod does not support swiglu_limit."
             )
-        # The FP4 fused GMM1 is only enabled for ascend_tp. DeepEP retains
-        # BF16 dispatch and the unfused activation path until validated.
-        return not get_moe_a2a_backend().is_deepep()
+        # Fuse only plain SiLU under ascend_tp. Keep the runner's unfused
+        # activation for SiTU, custom alpha/clamp, and unvalidated DeepEP.
+        return (
+            config.activation == "silu"
+            and config.gemm1_alpha is None
+            and config.gemm1_clamp_limit is None
+            and not get_moe_a2a_backend().is_deepep()
+        )
 
+    if config.activation == "situ":
+        return False
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if has_clamp:

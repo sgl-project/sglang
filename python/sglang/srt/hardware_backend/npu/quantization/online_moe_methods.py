@@ -17,7 +17,6 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A4MXFP4MoEMethod,
-    NPUW4A8MXFP4MoEMethod,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
@@ -69,49 +68,11 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self._aiter_runner = None
 
 
-class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online W4A8 MXFP FusedMoE entry point (``--quantization mxfp_w4a8``).
-
-    Same shape as ``NPUMXFP8OnlineMoEMethod``: weight creation, post-load
-    orchestration and the forward pass are the unquantized Ascend path, and only
-    the per-gmm kernel differs. ``NPUW4A8MXFP4MoEMethod`` then quantizes the BF16
-    expert weights to packed MXFP4 in ``process_weights_after_loading``.
-    """
-
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
-        super().__init__()
-        self.quant_config = quant_config
-
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        backend = get_moe_runner_backend()
-        if not (backend.is_auto() or backend.is_ascend()):
-            # Same trap as the MXFP8 entry point: subclassing
-            # UnquantizedFusedMoEMethod puts this method on FusedMoE's shard-swap
-            # list, so a flashinfer backend would load every expert with gate and
-            # up swapped and gmm1 would compute silu(up) * gate silently.
-            raise ValueError(
-                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
-                f"'ascend', got {backend.value!r}."
-            )
-
-        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
-        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
-        moe_runner_config.layer = layer
-        self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
-        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
-        self._aiter_runner = None
-
-
 class NPUW4A4MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
     """Online W4A4 MXFP4 FusedMoE entry point (``--quantization mxfp4``).
 
-    Same shape as the two entry points above: only ``create_moe_runner`` differs
-    from the unquantized Ascend path. ``NPUW4A4MXFP4MoEMethod`` then quantizes
-    the BF16 expert weights to packed MXFP4 in ``process_weights_after_loading``
-    and runs fp4 activations against them.
+    Reuse the unquantized weight-loading lifecycle and Ascend runner, installing
+    W4A4 kernels that prepare packed FP4 experts after loading BF16/FP16 weights.
     """
 
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
@@ -123,10 +84,8 @@ class NPUW4A4MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
     ):
         backend = get_moe_runner_backend()
         if not (backend.is_auto() or backend.is_ascend()):
-            # Same trap as the MXFP8 entry point: subclassing
-            # UnquantizedFusedMoEMethod puts this method on FusedMoE's shard-swap
-            # list, so a flashinfer backend would load every expert with gate and
-            # up swapped and gmm1 would compute silu(up) * gate silently.
+            # The unquantized base participates in FusedMoE's shard-swap logic.
+            # A flashinfer backend would silently exchange gate/up weights.
             raise ValueError(
                 "W4A4 MXFP4 MoE on Ascend requires --moe-runner-backend 'auto' "
                 f"or 'ascend', got {backend.value!r}."
