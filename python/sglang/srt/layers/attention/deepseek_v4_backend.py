@@ -961,6 +961,16 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
 
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        if self.global_token_indices is not None:
+            return self.global_token_indices
+        if self.real_rows_count is not None:
+            return self.token_indices[: self.real_rows_count]
+        return self.token_indices
+
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
         if self.pad_rows:
@@ -1823,6 +1833,10 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
     ) -> DSV4Metadata:
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        cp_encoder_replay = (
+            is_cp_active(forward_batch)
+            and get_exec().features.enable_encoder_swa_bounded_replay
+        )
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
@@ -1893,8 +1907,13 @@ class DeepseekV4AttnBackend(
             # are bucket-sized and graph-safe.
             out_cache_loc = loc_buf
         else:
+            # Folded CP replay rows must not overwrite their persistent KV.
             out_cache_loc = _tail_rows(
-                forward_batch.out_cache_loc,
+                (
+                    self._compressor_out_loc(forward_batch)
+                    if cp_encoder_replay
+                    else forward_batch.out_cache_loc
+                ),
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
@@ -1995,6 +2014,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices if cp_encoder_replay else None,
             )
         # Same requests as the extend in use, so the same index-K slots; other rows,
         # so its own plans.
@@ -4811,7 +4831,9 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
-            live = request_window_live_rows
+            # CP gathers KV in logical sequence order. Its window writes and
+            # history stay global; only the attention queries are reindexed.
+            live = num_tokens if num_tokens is not None else request_window_live_rows
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
                 raw_positions[:live],
@@ -4819,10 +4841,23 @@ class DeepseekV4AttnBackend(
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
-                padded_rows=None if live is None else raw_positions.numel(),
+                padded_rows=(
+                    raw_positions.numel()
+                    if request_window_live_rows is not None
+                    else None
+                ),
             )
-            swa_page_indices = _pad_last_dim(request_layout.indices)
+            padding = raw_positions.numel() - request_layout.pos.numel()
+            window_indices = request_layout.indices
             swa_topk_lengths = request_layout.lengths
+            if padding:
+                window_indices = torch.nn.functional.pad(
+                    window_indices, (0, 0, 0, padding), value=-1
+                )
+                swa_topk_lengths = torch.nn.functional.pad(
+                    swa_topk_lengths, (0, padding), value=0
+                )
+            swa_page_indices = _pad_last_dim(window_indices)
             swa_out_cache_loc = request_layout.write_loc
         elif dspark_block_size is not None:
             assert (

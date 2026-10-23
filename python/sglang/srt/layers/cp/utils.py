@@ -28,6 +28,7 @@ from sglang.srt.layers.cp.base import (
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     InterleaveCPStrategy,
+    cp_sequence_to_interleave_order,
 )
 from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.zigzag import (
@@ -231,6 +232,14 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
         return cp_shard_hidden_states(input_ids, forward_batch)
 
     physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    if (
+        isinstance(forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata)
+        and forward_batch.attn_cp_metadata.gather_index is not None
+    ):
+        # Compact replay tails retain the original token owners.
+        return cp_sequence_to_interleave_order(
+            input_ids, forward_batch, physical_tokens
+        )
     padded_input_ids = input_ids.new_zeros(physical_tokens)
     padded_input_ids[: input_ids.shape[0]] = input_ids
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
