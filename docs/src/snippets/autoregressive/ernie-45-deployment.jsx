@@ -61,7 +61,7 @@ export const Ernie45Deployment = () => {
     }
 
     if (strategyArray.includes('dp') && modelsize === '300b' && !isXeon) {
-      cmd += ` \\\n  --attn-dp-size ${dpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${dpValue}`;
     }
 
     if (strategyArray.includes('ep') && modelsize === '300b' && !isXeon) {

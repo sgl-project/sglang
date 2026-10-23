@@ -385,13 +385,14 @@ export const config = {
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
+  runModes: (s) => s.hw === "xeon" ? ["python"] : ["python", "docker"],
+
   dockerImages: {
     h200:    "lmsysorg/sglang:latest",
     rtx6000: "lmsysorg/sglang:latest",
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
-    xeon:    "lmsysorg/sglang:latest",
   },
 
   github: {

@@ -1059,7 +1059,7 @@ return {
 
   // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
-    ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
+    ["mi300x", "mi355x", "gb200", "gb300", "xeon"].includes(s.hw)
       ? ["python"]
       : ["docker", "python"],
 
