@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -318,6 +319,73 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
     )
     assert Path(saved).read_bytes() == b"x" * 512
     assert not any(part_dir.iterdir())
+
+
+def test_cancelled_image_download_leaves_no_partial_file(monkeypatch, tmp_path):
+    """Executor congestion must not orphan a fully downloaded temporary file."""
+    target = tmp_path / "in" / "image.png"
+    finish = threading.Event()
+    payload = b"image bytes"
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        occupied = asyncio.Event()
+        worker = None
+
+        def occupy_executor():
+            loop.call_soon_threadsafe(occupied.set)
+            assert finish.wait(5)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield payload
+
+            async def aclose(self):
+                nonlocal worker
+                worker = loop.run_in_executor(None, occupy_executor)
+                await occupied.wait()
+
+        part_dir = _patch_download(
+            monkeypatch,
+            tmp_path,
+            lambda _: httpx.Response(200, stream=Stream()),
+        )
+        task = asyncio.create_task(
+            utils._save_url_image_to_path("https://x.test/image.png", str(target))
+        )
+        try:
+            await asyncio.wait_for(occupied.wait(), 5)
+            await asyncio.sleep(0)
+            if not task.done():
+                task.cancel()
+            try:
+                saved = await task
+            except asyncio.CancelledError:
+                assert not target.exists()
+            else:
+                assert Path(saved).read_bytes() == payload
+        finally:
+            finish.set()
+            if worker is not None:
+                await worker
+        assert not list(part_dir.iterdir())
+        assert list(target.parent.iterdir()) == ([target] if target.exists() else [])
+
+    asyncio.run(run_test())
+
+
+def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
+    """A path collision must not return a directory or hide an upload inside it."""
+    part_dir = _patch_download(
+        monkeypatch, tmp_path, lambda _: httpx.Response(200, content=b"image")
+    )
+    target = tmp_path / "image.png"
+    target.mkdir()
+    with pytest.raises(OSError):
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert not list(target.iterdir())
+    assert not list(part_dir.iterdir())
 
 
 _CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))
