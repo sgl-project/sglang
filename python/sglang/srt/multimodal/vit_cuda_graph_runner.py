@@ -229,7 +229,12 @@ class ViTCudaGraphRunner:
                 )
         torch.cuda.synchronize()
 
-        with self._capture_context(), torch.cuda.graph(graph):
+        # Captured lazily while the LLM serves; other threads (e.g. the c10d NCCL
+        # watchdog) keep calling the runtime, which global mode turns into an error.
+        with (
+            self._capture_context(),
+            torch.cuda.graph(graph, capture_error_mode="thread_local"),
+        ):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
