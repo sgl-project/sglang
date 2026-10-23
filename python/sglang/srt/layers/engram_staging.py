@@ -19,7 +19,6 @@ from sglang.srt.layers.engram import (
     Engram,
     EngramEmbedding,
     EngramHasher,
-    engram_rows_stageable,
 )
 from sglang.srt.model_executor.encoder_swa_replay import replay_len
 from sglang.srt.runtime_context import get_parallel
@@ -78,7 +77,7 @@ class EngramRowStager:
     def stage(self, batch: ScheduleBatch) -> Optional[StagedRows]:
         """Stage every engram layer's rows for an extend batch, None to leave the
         lookup to the forward."""
-        if not engram_rows_stageable(batch.forward_mode):
+        if not batch.forward_mode.is_extend_without_speculative():
             return None
         windows = self._windows(batch)
         if windows is None:

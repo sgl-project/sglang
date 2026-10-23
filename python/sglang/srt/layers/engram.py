@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -519,20 +519,10 @@ class EngramHasher(nn.Module):
                 .cummax(-1)
                 .values.bool()
             )
-        if tokens.device == self.token_map.device:
-            params = (self.token_map, self.multipliers, self.primes, self.offsets)
-        else:
-            assert tokens.device.type == "cpu", tokens.device
+        params = (self.token_map, self.multipliers, self.primes, self.offsets)
+        if tokens.device != self.token_map.device:
             if self._cpu_hash_params is None:
-                self._cpu_hash_params = tuple(
-                    t.cpu()
-                    for t in (
-                        self.token_map,
-                        self.multipliers,
-                        self.primes,
-                        self.offsets,
-                    )
-                )
+                self._cpu_hash_params = tuple(t.cpu() for t in params)
             params = self._cpu_hash_params
         return compute_engram_hash_ids(tokens, blocked, self.pad_id, *params), tokens
 
@@ -830,23 +820,6 @@ def shard_range(
     )
 
 
-def engram_rows_stageable(forward_mode: ForwardMode) -> bool:
-    """Whether EngramRowStager stages a batch in this mode."""
-    return forward_mode.is_extend_without_speculative()
-
-
-_row_ranges: dict[torch.device, torch.Tensor] = {}
-
-
-def _row_range(n: int, device: torch.device) -> torch.Tensor:
-    """int32 [0, n) on ``device``, cut from one buffer grown on demand."""
-    rows = _row_ranges.get(device)
-    if rows is None or rows.numel() < n:
-        rows = torch.arange(n, dtype=torch.int32, device=device)
-        _row_ranges[device] = rows
-    return rows[:n]
-
-
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -997,17 +970,16 @@ class EngramEmbedding(nn.Module):
             *hash_shape, self.dim, dtype=torch.bfloat16, device=rows.device
         )
         flat = out.view(-1, self.dim)
-        n = rows.shape[0]
-        assert n <= flat.shape[0], (n, flat.shape)
+        assert rows.shape[0] <= flat.shape[0], (rows.shape, flat.shape)
         engram_gather(
             rows.data_ptr(),
             scales.data_ptr(),
-            _row_range(n, rows.device),
-            flat[:n],
+            torch.arange(flat.shape[0], dtype=torch.int32, device=rows.device),
+            flat,
             self.dim,
             FP8_BLOCK_SIZE,
+            row_hi=rows.shape[0],
         )
-        flat[n:].zero_()
         return out
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
@@ -1177,7 +1149,7 @@ class Engram(nn.Module):
         if (
             self.embed.staged_by_scheduler
             and forward_batch is not None
-            and engram_rows_stageable(forward_batch.forward_mode)
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
