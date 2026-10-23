@@ -59,24 +59,35 @@ DECODE_GRAPH_MAX_BS = 12
 WIDE_BATCH = 24
 
 
-def _decode_passes(base_url):
+def _decode_passes(base_url, *, require_samples=False):
     """Decode steps so far by mode. A speculative decode step counts its
     target-verify forward: `decode_cuda_graph` when it replayed the captured
-    graph, `decode_none` when it ran eager."""
-    metrics = requests.get(base_url + "/metrics", timeout=30).text
-    return {
-        mode: sum(
+    graph, `decode_none` when it ran eager. Before any decode the counter may
+    have no samples yet; after one it must."""
+    response = requests.get(base_url + "/metrics", timeout=30)
+    if response.status_code != 200:
+        raise AssertionError(
+            f"/metrics returned HTTP {response.status_code}: {response.text[:200]}"
+        )
+    samples = {
+        mode: [
             float(value)
             for value in re.findall(
                 r'^sglang:cuda_graph_passes_total\{[^}]*mode="'
                 + mode
                 + r'"[^}]*\}\s+([0-9.eE+-]+)$',
-                metrics,
+                response.text,
                 re.MULTILINE,
             )
-        )
+        ]
         for mode in ("decode_cuda_graph", "decode_none")
     }
+    if require_samples and not any(samples.values()):
+        raise AssertionError(
+            "/metrics has no decode samples of sglang:cuda_graph_passes_total; "
+            "the server needs --enable-metrics"
+        )
+    return {mode: sum(values) for mode, values in samples.items()}
 
 
 class TestEagle3MultiLoRA(CustomTestCase):
@@ -152,7 +163,7 @@ class TestEagle3MultiLoRA(CustomTestCase):
             )
 
     def _decode_passes_since(self, before):
-        after = _decode_passes(self.base_url)
+        after = _decode_passes(self.base_url, require_samples=True)
         return {mode: after[mode] - before[mode] for mode in after}
 
     def test_adapters_are_applied_under_speculation(self):
