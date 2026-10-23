@@ -1,6 +1,7 @@
-"""gfx950 one-launch Qwen3.5 MoE router for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
+"""gfx950 one-launch MoE routers. Qwen3.5 for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
 softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights that
-smallm_moe_gfx950 consumes. SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
+smallm_moe_gfx950 consumes; GLM-5.x (sigmoid noaux_tc top-8 + shared slot, [M, 9]) for 1..16 tokens.
+SGLANG_ROCM_SMALLM_ROUTER=0 disables both; a build/load failure disables them too."""
 
 import ctypes
 import logging
@@ -16,6 +17,10 @@ from sglang.srt.utils import is_gfx95_supported
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
+GLM_MAX_TOK = 16  # G_MAX_TOK in smallm_router.hip
+GLM_E, GLM_TOPK = 288, 8
+# (rows per block, tokens per GEMV pass, waves per block = max tokens): GLM_ROUTER instances in smallm_router.hip
+_GLM_VARIANTS = ((2, 4, 4), (2, 8, 8), (2, 8, 16))
 _kernels: dict = {}
 _ws: dict = {}
 _disabled = False
@@ -34,12 +39,49 @@ class Args(ctypes.Structure):
     ]
 
 
-def smallm_router_supported(x: torch.Tensor) -> bool:
+class GlmArgs(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        (n, ctypes.c_void_p)
+        for n in ("x", "wg", "bias", "ids", "wts", "logits", "cnt", "n_valid")
+    ] + [
+        ("tok", ctypes.c_int32),
+        ("x_stride", ctypes.c_int32),
+        ("rsf", ctypes.c_float),
+        ("shared_w", ctypes.c_float),
+    ]
+
+
+def _load() -> bool:
+    global _disabled
+    if _kernels:
+        return True
+    if _disabled:
+        return False
+    co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_router_"), "r.co")
+    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        mod = ctypes.c_void_p()
+        check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+        for r in (1, 2):
+            _kernels[r] = HipKernel(mod, f"smallm_router_r{r}")
+        for v in _GLM_VARIANTS:
+            _kernels[("glm", v)] = HipKernel(mod, "smallm_router_glm_r%d_t%d_w%d" % v)
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
+        logger.warning("smallm_router disabled: %s", e)
+        _kernels.clear()
+        _disabled = True
+        return False
+    return True
+
+
+def smallm_router_supported(x: torch.Tensor, max_tok: int = MAX_TOK) -> bool:
     return (
         not _disabled
         and envs.SGLANG_ROCM_SMALLM_ROUTER.get()
         and is_gfx95_supported()
-        and 1 <= x.shape[0] <= MAX_TOK
+        and 1 <= x.shape[0] <= max_tok
         and x.dtype == torch.bfloat16
         and x.shape[1] == 4096
         and x.stride(1) == 1
@@ -51,7 +93,6 @@ def smallm_router_supported(x: torch.Tensor) -> bool:
 def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
     """(topk_weights [M, 11] fp32, topk_ids [M, 11] int32), or None if unavailable (build failure, first call
     under graph capture)."""
-    global _disabled
     ws = _ws.get(x.device)
     if ws is None:
         if torch.cuda.is_current_stream_capturing():
@@ -60,18 +101,8 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
             torch.empty(MAX_TOK * 520, dtype=torch.float32, device=x.device),
             torch.zeros(64 * 17, dtype=torch.int32, device=x.device),
         )
-    if not _kernels:
-        co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_router_"), "r.co")
-        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            mod = ctypes.c_void_p()
-            check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
-            _kernels.update({r: HipKernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
-        except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-            logger.warning("smallm_router disabled: %s", e)
-            _disabled = True
-            return None
+    if not _load():
+        return None
     tok = x.shape[0]
     ids = torch.empty(tok, 11, dtype=torch.int32, device=x.device)
     wts = torch.empty(tok, 11, dtype=torch.float32, device=x.device)
@@ -130,5 +161,134 @@ def qwen_moe_topk_output(block, hidden_states):
         return None
     routed = out[1][:, :10]
     capture_routed_experts_if_allowed(block.topk.topk_config, block.layer_id, routed)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=routed)
+    return StandardTopKOutput(out[0], out[1], None)
+
+
+def _glm_variant(tok):
+    if tok <= 4:
+        return (2, 4, 4)
+    return (2, 8, 8) if tok <= 8 else (2, 8, 16)
+
+
+def smallm_router_glm(
+    x,
+    gate_weight,
+    bias,
+    rsf,
+    shared_w=1.0,
+    variant=None,
+    num_token_non_padded=None,
+):
+    """GLM-5.x noaux_tc router: (topk_weights [M, 9] fp32, topk_ids [M, 9] int32), slot 8 = shared expert 288, or
+    None if unavailable (build failure, first call under graph capture). Rows from num_token_non_padded (a
+    1-element device tensor) on get routed ids 0 and zero weights, as on the unfused path."""
+    key = ("glm", x.device)
+    ws = _ws.get(key)
+    if ws is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        ws = _ws[key] = (
+            torch.empty(GLM_MAX_TOK * 320, dtype=torch.float32, device=x.device),
+            torch.zeros(64 * 17, dtype=torch.int32, device=x.device),
+        )
+    if not _load():
+        return None
+    tok = x.shape[0]
+    ids = torch.empty(tok, GLM_TOPK + 1, dtype=torch.int32, device=x.device)
+    wts = torch.empty(tok, GLM_TOPK + 1, dtype=torch.float32, device=x.device)
+    n_valid = None
+    if num_token_non_padded is not None:
+        n_valid = num_token_non_padded.to(device=x.device, dtype=torch.int32)
+    ptrs = (x, gate_weight, bias, ids, wts, *ws)
+    args = GlmArgs(
+        *(t.data_ptr() for t in ptrs),
+        None if n_valid is None else n_valid.data_ptr(),
+        tok,
+        x.stride(0),
+        float(rsf),
+        float(shared_w),
+    )
+    variant = variant or _glm_variant(tok)
+    stream = torch.cuda.current_stream().cuda_stream
+    _kernels[("glm", variant)].launch(
+        GLM_E // variant[0], args, stream, block=64 * variant[2]
+    )
+    return wts, ids
+
+
+def glm_moe_topk_output(moe, hidden_states):
+    """StandardTopKOutput for a GLM-5.x DeepseekV2MoE (sigmoid noaux_tc, one fused shared expert) on the aiter
+    path, or None (unfused path)."""
+    from sglang.srt.eplb.expert_distribution import (
+        get_global_expert_distribution_recorder,
+    )
+    from sglang.srt.layers.moe import get_moe_runner_backend
+    from sglang.srt.layers.moe.topk import (
+        StandardTopKOutput,
+        capture_routed_experts_if_allowed,
+        is_expert_remapping_enabled,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    cfg = moe.topk.topk_config
+    ok = getattr(moe, "_smallm_router_glm_ok", None)
+    if ok is None:
+        gw, bias, backend = (
+            moe.gate.weight,
+            cfg.correction_bias,
+            get_moe_runner_backend(),
+        )
+        ok = moe._smallm_router_glm_ok = (
+            moe.num_fused_shared_experts == 1
+            and not getattr(moe, "is_hash", False)
+            and get_parallel().moe_ep_size == 1
+            and (backend.is_auto() or backend.is_aiter())
+            and cfg.top_k == GLM_TOPK + 1
+            and cfg.scoring_func == "sigmoid"
+            and cfg.renormalize
+            and cfg.custom_routing_function is None
+            and not cfg.apply_routed_scaling_factor_on_output
+            and (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1
+            and bias is not None
+            and bias.dtype == torch.float32
+            and bias.shape == (GLM_E,)
+            and bias.is_contiguous()
+            and type(gw.data) is torch.Tensor
+            and gw.dtype == torch.bfloat16
+            and gw.shape == (GLM_E, 4096)
+            and gw.is_contiguous()
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and not is_expert_remapping_enabled()
+        )
+    if (
+        not ok
+        or not smallm_router_supported(hidden_states, GLM_MAX_TOK)
+        or is_in_tc_piecewise_cuda_graph()
+    ):
+        return None
+    num_token_non_padded, dispatch_info = moe.topk.routing_inputs()
+    if dispatch_info is not None:
+        return None
+    rsf = cfg.routed_scaling_factor if cfg.routed_scaling_factor is not None else 1.0
+    shared_w = cfg.fused_shared_experts_scaling_factor
+    shared_w = 1.0 if shared_w is None else shared_w
+    out = smallm_router_glm(
+        hidden_states,
+        moe.gate.weight,
+        cfg.correction_bias,
+        rsf,
+        shared_w,
+        num_token_non_padded=num_token_non_padded,
+    )
+    if out is None:
+        return None
+    routed = out[1][:, :GLM_TOPK]
+    capture_routed_experts_if_allowed(cfg, moe.layer_id, routed)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=routed)
     return StandardTopKOutput(out[0], out[1], None)
