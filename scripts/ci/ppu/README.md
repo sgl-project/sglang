@@ -39,12 +39,12 @@ Use one or more model/format selectors after `/run-ppu-e2e`:
 | Type | Accepted arguments | Meaning |
 | --- | --- | --- |
 | Model family | `test-qwen`, `test-deepseek`, `test-glm`, `test-kimi`, `test-minimax` | Select cases belonging to those families. |
-| Format | `test-w4a8`, `test-w8a8`, `test-bf16`, `test-fp8`, `test-mxfp4` | Select matching formats across all families. `test-fp8` includes FP8 and FP8 channelwise; `test-mxfp4` maps to MXFP4-FP8. |
+| Format | `test-w4a8`, `test-w8a8`, `test-bf16`, `test-fp8`, `test-mxfp4` | Select matching formats across all families. `test-fp8` includes FP8 and FP8 channelwise; `test-mxfp4` maps to MXFP4-FP8. `test-w4a8` is accepted but currently matches no executions (W4A8 left the nightly line), so the request fails closed. |
 | All models/formats | `test-all` | Select every family/format, initially with default coverage. It does not enable every coverage modifier. |
 
 **Selectors use union (OR), not intersection (AND).** For example,
-`test-qwen test-w4a8` selects Qwen cases plus W4A8 cases from any family; it does
-not mean only Qwen W4A8. Duplicate executions are removed. Commands cannot select
+`test-qwen test-glm` selects all Qwen cases plus all GLM cases; it does not mean
+"Qwen AND GLM". Duplicate executions are removed. Commands cannot select
 an arbitrary file path, suite name, catalog entry ID, or shell command.
 
 Without modifiers, coverage is single-node Answer plus Accuracy smoke. Add any
@@ -70,8 +70,8 @@ previous selection rather than adding to it.
 | Goal | Comment |
 | --- | --- |
 | Default Qwen coverage | `/run-ppu-e2e test-qwen` |
-| W4A8 across all families | `/run-ppu-e2e test-w4a8` |
-| Qwen OR W4A8 | `/run-ppu-e2e test-qwen test-w4a8` |
+| BF16 across all families | `/run-ppu-e2e test-bf16` |
+| Qwen OR GLM | `/run-ppu-e2e test-qwen test-glm` |
 | Qwen default plus full Accuracy | `/run-ppu-e2e test-qwen test-accuracy-full` |
 | Qwen default plus single-node performance | `/run-ppu-e2e test-qwen test-perf` |
 | Qwen default plus multi-node Answer | `/run-ppu-e2e test-qwen test-multinode` |
@@ -90,7 +90,7 @@ require PPU hardware, GitHub credentials, or an SGLang installation:
 ```bash
 python3 scripts/ci/ppu/select_pr_e2e.py validate
 python3 scripts/ci/ppu/select_pr_e2e.py preview --selectors test-qwen
-python3 scripts/ci/ppu/select_pr_e2e.py preview --selectors test-qwen test-w4a8
+python3 scripts/ci/ppu/select_pr_e2e.py preview --selectors test-qwen test-glm
 python3 scripts/ci/ppu/select_pr_e2e.py preview --selectors test-qwen test-perf test-multinode
 ```
 

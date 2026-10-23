@@ -616,6 +616,23 @@ class PpuPathSelectionTest(unittest.TestCase):
             )
         self.assertEqual(jobs[cpu]["runs-on"], "ubuntu-latest")
 
+    def test_e2e_waits_for_selected_smoke_lane(self):
+        jobs = self.workflow["jobs"]
+        smoke = "stage-a-test-1-gpu-ppu"
+        e2e = jobs["e2e"]
+        self.assertEqual(
+            set(e2e["needs"]),
+            {"check-changes", "pr-gate", "stage-a-test-cpu-ppu", smoke},
+        )
+        self.assertIn(f"needs.{smoke}.result == 'success'", e2e["if"])
+        # Only a selected smoke lane gates E2E; an unselected lane is skipped.
+        self.assertIn("needs.check-changes.outputs.ppu_single != 'true'", e2e["if"])
+        # A status-check function is mandatory: without it a skipped smoke lane
+        # would implicitly skip authorized E2E execution (implicit success()).
+        self.assertIn("always()", e2e["if"])
+        self.assertIn("!cancelled()", e2e["if"])
+        self.assertIn("e2e", jobs["pr-test-ppu-finish"]["needs"])
+
     def test_summary_reports_documentation_skip_and_manual_override(self):
         step = next(
             step

@@ -13,6 +13,16 @@ from pathlib import Path
 DEFAULT_MODEL = "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct"
 
 
+def weight_files(path):
+    weights = list(path.glob("*.safetensors"))
+    for index in path.glob("*.safetensors.index.json"):
+        # Index shards may live in subdirectories; resolve checkpoint-relative.
+        weights.extend(
+            path / name for name in json.loads(index.read_text())["weight_map"].values()
+        )
+    return weights
+
+
 def small_model():
     path = Path(os.environ.get("PPU_SMALL_MODEL_PATH", DEFAULT_MODEL)).resolve()
     required = [
@@ -20,12 +30,7 @@ def small_model():
         path / "tokenizer_config.json",
         path / "tokenizer.json",
     ]
-    indexes = list(path.glob("*.safetensors.index.json"))
-    weights = list(path.glob("*.safetensors"))
-    for index in indexes:
-        weights.extend(
-            path / name for name in json.loads(index.read_text())["weight_map"].values()
-        )
+    weights = weight_files(path)
     if not weights:
         raise FileNotFoundError(f"No local model weights: {path}")
     for file in required + weights:
@@ -41,6 +46,7 @@ def small_model():
 def model_identity():
     path = Path(small_model())
     # Hash small metadata; record shard size/mtime without scanning a GB per job.
+    # Key shards by checkpoint-relative path so subdirectory shards are included.
     return {
         "path": str(path),
         "metadata_sha256": {
@@ -48,8 +54,11 @@ def model_identity():
             for p in path.glob("*.json")
         },
         "weights": {
-            p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
-            for p in path.glob("*.safetensors")
+            str(p.relative_to(path)): {
+                "bytes": p.stat().st_size,
+                "mtime_ns": p.stat().st_mtime_ns,
+            }
+            for p in weight_files(path)
         },
     }
 

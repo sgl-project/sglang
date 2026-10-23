@@ -160,11 +160,31 @@ class StrictRunnerTest(unittest.TestCase):
         with patch.dict(
             os.environ, {"PPU_ARTIFACTORY_PASSWORD": "private-fixture-value"}
         ):
+            # The credential URI is split so repository secret scanners never
+            # see a literal credential-embedded URL pattern in the source.
             cleaned = RUNNER.sanitize(
                 "https://" + "user:pass" + "@host password=private-fixture-value"
             )
         self.assertNotIn("private-fixture-value", cleaned)
         self.assertNotIn("user:pass", cleaned)
+
+    def test_authorization_headers_are_fully_redacted(self):
+        # Credentials here deliberately match no environment secret: header
+        # redaction must not depend on the environment fallback.
+        cleaned = RUNNER.sanitize(
+            "Authorization: Bearer abc123\n"
+            "Authorization: Basic dXNlcjpwYXNzMTIz\n"
+            "authorization: raw-token-value\n"
+            "authorization=Bearer env-style-789"
+        )
+        for credential in (
+            "abc123",
+            "dXNlcjpwYXNzMTIz",
+            "raw-token-value",
+            "env-style-789",
+        ):
+            self.assertNotIn(credential, cleaned)
+        self.assertEqual(cleaned.count("[REDACTED]"), 4)
 
     def test_cancellation_kills_descendants_and_stays_red(self):
         # The child inherits pytest's session, just like the serving fixtures.
@@ -207,11 +227,21 @@ class StrictRunnerTest(unittest.TestCase):
                 process.kill()
             process.wait()
 
-    def test_mandatory_evidence_is_revalidated(self):
+    def build_cpu_evidence(self):
+        # Fixture files mirror the real CPU suite registrations at their
+        # repository-relative paths: the verifier derives the expected
+        # inventory from the checkout registry, not from worker evidence.
         suite = REPORT.SUITES["cpu"][0]
-        file = self.root / "test_ok.py"
-        file.write_text("def test_ok(): pass\n")
-        self.assertEqual(RUNNER.run_pytest_files([file], self.root / suite, 15), 0)
+        expected = sorted(REPORT.expected_inventory(suite))
+        self.assertGreater(len(expected), 1)
+        with tempfile.TemporaryDirectory() as checkout:
+            files = []
+            for relative in expected:
+                path = Path(checkout) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("def test_ok(): pass\n")
+                files.append(path)
+            self.assertEqual(RUNNER.run_pytest_files(files, self.root / suite, 15), 0)
         metadata = {
             "worker.json": {"exit_code": 0, "elapsed": 1},
             "setup.json": {"lane": "cpu", "setup_seconds": 1},
@@ -222,11 +252,16 @@ class StrictRunnerTest(unittest.TestCase):
         }
         for name, value in metadata.items():
             (self.root / name).write_text(json.dumps(value))
-        self.assertEqual(REPORT.verify(self.root, "cpu")["executed"], 1)
+        return suite, len(expected)
+
+    def test_mandatory_evidence_is_revalidated(self):
+        suite, count = self.build_cpu_evidence()
+        metadata = ("worker.json", "setup.json", "environment.json")
+        self.assertEqual(REPORT.verify(self.root, "cpu")["executed"], count)
         with tempfile.TemporaryDirectory() as temp:
             destination = Path(temp) / "export"
             REPORT.export_evidence(self.root, destination)
-            self.assertEqual(REPORT.verify(destination, "cpu")["executed"], 1)
+            self.assertEqual(REPORT.verify(destination, "cpu")["executed"], count)
             (destination / "worker.json").write_text('{"exit_code":1,"elapsed":1}')
             with self.assertRaises(ValueError):
                 REPORT.verify(destination, "cpu")
@@ -245,6 +280,19 @@ class StrictRunnerTest(unittest.TestCase):
             '<testsuite><testcase name="bad"><failure/></testcase></testsuite>'
         )
         with self.assertRaises(ValueError):
+            REPORT.verify(self.root, "cpu")
+
+    def test_dropped_registered_file_cannot_verify(self):
+        # Remove a registered file from both manifest lists and delete its XML:
+        # internally consistent evidence must still fail against the registry.
+        suite, _ = self.build_cpu_evidence()
+        summary = self.root / suite / "summary.json"
+        report = json.loads(summary.read_text())
+        dropped = report["files"].pop()
+        report["selected"].remove(dropped["file"])
+        (self.root / suite / dropped["junit"]).unlink()
+        summary.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "registration"):
             REPORT.verify(self.root, "cpu")
 
 
@@ -268,7 +316,9 @@ class EvidenceExportTest(unittest.TestCase):
             files = {
                 source / "aot.json": '{"aot_seconds":600}',
                 source / "setup.json": '{"setup_seconds":626}',
-                source / "setup.log": "https://" + "user:pass" + "@host export-fixture-value",
+                source / "setup.log": "https://"
+                + "user:pass"
+                + "@host export-fixture-value",
                 source
                 / "environment-pods.timing.tsv": "2026-01-01T00:00:00Z\t2026-01-01T00:00:03Z\t2026-01-01T00:00:11Z\n",
                 source / "environment-pods.status": "export-fixture-value",
@@ -1247,6 +1297,30 @@ class SetupContractTest(unittest.TestCase):
             )
             with self.assertRaises(FileNotFoundError):
                 MODEL.small_model()
+
+    def test_subdirectory_index_shards_join_model_identity(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"PPU_SMALL_MODEL_PATH": directory}),
+        ):
+            root = Path(directory)
+            for name in (
+                "config.json",
+                "tokenizer_config.json",
+                "tokenizer.json",
+            ):
+                (root / name).write_text("{}")
+            (root / "sub").mkdir()
+            (root / "sub" / "model-1.safetensors").write_text("weights")
+            (root / "model.safetensors.index.json").write_text(
+                '{"weight_map":{"weight":"sub/model-1.safetensors"}}'
+            )
+            MODEL.small_model()
+            identity = MODEL.model_identity()
+            self.assertEqual(set(identity["weights"]), {"sub/model-1.safetensors"})
+            self.assertGreater(
+                identity["weights"]["sub/model-1.safetensors"]["bytes"], 0
+            )
 
     def test_legacy_runner_keeps_default_execution_contract(self):
         # Execute the unchanged legacy branch with mocked infrastructure boundaries;

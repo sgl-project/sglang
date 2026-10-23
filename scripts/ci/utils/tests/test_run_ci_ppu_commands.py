@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import unittest
+import urllib.error
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -317,6 +318,40 @@ class CommandStateTest(unittest.TestCase):
         ), self.assertRaises(RuntimeError):
             commands.resolve_request(api, 123)
 
+    def test_former_collaborator_404_denies_without_blocking_later_commands(self):
+        api = MemoryGitHub()
+        departed = api.add_command("/run-ppu-e2e test-qwen", 10)
+        departed["user"]["login"] = "departed-user"
+        api.add_command("/run-ppu-e2e test-bf16", 20)
+        original = api.get
+
+        def lookup(path):
+            if "departed-user" in path:
+                raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            return original(path)
+
+        with mock.patch.dict(
+            os.environ, {"GITHUB_RUN_ID": "700", "GITHUB_RUN_ATTEMPT": "1"}
+        ), mock.patch.object(api, "get", side_effect=lookup):
+            commands.reconcile(api, 123)
+            resolved = commands.resolve_request(api, 123)
+        self.assertEqual(resolved["comment_id"], 20)
+        self.assertEqual(resolved["selectors"], ["test-bf16"])
+
+        # Other API failures still propagate instead of silently denying.
+        def broken(path):
+            if "departed-user" in path:
+                raise urllib.error.HTTPError(path, 500, "Server Error", {}, None)
+            return original(path)
+
+        api = MemoryGitHub()
+        departed = api.add_command("/run-ppu-e2e test-qwen", 10)
+        departed["user"]["login"] = "departed-user"
+        with mock.patch.object(api, "get", side_effect=broken), self.assertRaises(
+            urllib.error.HTTPError
+        ):
+            commands.reconcile(api, 123)
+
     def test_pagination_and_fail_closed_bound(self):
         api = object.__new__(commands.GitHub)
         with mock.patch.object(
@@ -608,7 +643,11 @@ class CommandWorkflowTest(unittest.TestCase):
         ci = yaml.safe_load((ROOT / commands.PIPELINE).read_text())
         template = ci["concurrency"]["cancel-in-progress"]
         cases = [
+            ("pull_request", "opened", 1, True),
             ("pull_request", "synchronize", 1, True),
+            ("pull_request", "reopened", 1, True),
+            ("pull_request", "ready_for_review", 1, False),
+            ("pull_request", "converted_to_draft", 1, False),
             ("pull_request", "labeled", 1, False),
             ("pull_request", "unlabeled", 1, False),
             ("pull_request", "synchronize", 2, False),

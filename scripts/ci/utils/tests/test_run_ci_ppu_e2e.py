@@ -101,7 +101,7 @@ class E2ESelectionTest(unittest.TestCase):
         return {entry["id"] for entry in entries}
 
     def test_inventory_and_pinned_import_boundary(self):
-        self.assertEqual(len(self.catalog["entries"]), 70)
+        self.assertEqual(len(self.catalog["entries"]), 68)
         imported = [e for e in self.catalog["entries"] if e["family"] == "deepseek"]
         self.assertEqual(len(imported), 11)
         self.assertEqual(
@@ -146,16 +146,24 @@ class E2ESelectionTest(unittest.TestCase):
 
     def test_union_not_intersection_and_overlap_deduplicated(self):
         qwen = self.selected("test-qwen")
-        w4a8 = self.selected("test-w4a8")
-        self.assertTrue(qwen.isdisjoint(w4a8))
-        self.assertEqual(self.selected("test-qwen", "test-w4a8"), qwen | w4a8)
+        glm = self.selected("test-glm")
+        self.assertTrue(qwen.isdisjoint(glm))
+        self.assertEqual(self.selected("test-qwen", "test-glm"), qwen | glm)
         self.assertEqual(self.selected("test-qwen", "test-bf16", "test-qwen"), qwen)
 
     def test_formats_are_checkpoint_metadata_not_runtime_dtype(self):
         for label, formats in selector.FORMATS.items():
-            entries, _ = selector.select(self.catalog, [label])
-            self.assertTrue(entries)
-            self.assertTrue(all(e["format"] in formats for e in entries))
+            entries, errors = selector.select(self.catalog, [label])
+            if entries:
+                self.assertTrue(all(e["format"] in formats for e in entries))
+                blocked = {
+                    f"{e['id']}: {e['blocked']}" for e in entries if e["blocked"]
+                }
+                self.assertEqual(set(errors), blocked)
+            else:
+                # A format whose cases left the catalog must fail closed,
+                # never silently widen to an unrequested execution.
+                self.assertEqual(errors, ["Selectors matched no execution."])
         entries, errors = selector.select(self.catalog, ["test-bf16"])
         self.assertEqual(errors, [])
         self.assertEqual(len(entries), 1)
@@ -1001,6 +1009,33 @@ class E2EWorkflowTest(unittest.TestCase):
             if p.suffix in {".yml", ".yaml"} and "PPU E2E Gate" in p.read_text()
         ]
         self.assertEqual(owners, ["ci.yaml"])
+
+    def test_artifact_retention_outlives_worst_case_plan_budget(self):
+        # Phases run serially with max-parallel 1, so a plan's wall time is
+        # bounded by the sum of its entry job ceilings; union selectors can
+        # select every unblocked entry. Plan and result artifacts must be
+        # downloadable until the final aggregate, so retention must exceed
+        # that worst case.
+        catalog = selector.load_catalog()
+        budget = sum(
+            entry["job_minutes"] for entry in catalog["entries"] if not entry["blocked"]
+        )
+        ci = self.workflow("ci.yaml")
+        entry = self.workflow("pr-test-ppu-e2e-entry.yml")
+        plan_upload = next(
+            step
+            for job in ci["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("with", {}).get("name", "").startswith("ppu-e2e-plan-")
+        )
+        result_upload = next(
+            step
+            for job in entry["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("with", {}).get("name", "").startswith("ppu-e2e-result-")
+        )
+        for upload in (plan_upload, result_upload):
+            self.assertGreater(upload["with"]["retention-days"] * 24 * 60, budget)
 
     def test_cpu_reuse_rejects_other_attempt_or_plan(self):
         cpu = self.workflow("pr-test-ppu.yml")["jobs"]["stage-a-test-cpu-ppu"]

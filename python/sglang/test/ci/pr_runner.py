@@ -15,8 +15,15 @@ from pathlib import Path
 def sanitize(text):
     # Never publish credentials in URLs, headers, environment dumps, or logs.
     text = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[REDACTED]@", text)
+    # Authorization carries scheme + credential ("Bearer abc", "Basic xyz");
+    # redact the whole value, not just the scheme word.
     text = re.sub(
-        r"(?im)((?:authorization|password|token|secret|api[_-]?key)\s*[:=]\s*)[^\s,]+",
+        r"(?im)(authorization\s*[:=][ \t]*)(?:[^\s,]+[ \t]+)?[^\s,]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?im)((?:password|token|secret|api[_-]?key)\s*[:=]\s*)[^\s,]+",
         r"\1[REDACTED]",
         text,
     )

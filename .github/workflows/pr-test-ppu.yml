@@ -645,12 +645,19 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # E2E also waits for the selected smoke lane: it must not compete with smoke
+  # for hardware, and a failed smoke lane must not leave E2E running. The
+  # always() status check keeps an unselected (skipped) smoke lane from
+  # implicitly skipping authorized E2E execution.
   e2e:
-    needs: [check-changes, pr-gate, stage-a-test-cpu-ppu]
+    needs: [check-changes, pr-gate, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: >-
+      always() && !cancelled() &&
       inputs.cpu_only != true && inputs.e2e_requested == true &&
       needs.pr-gate.result == 'success' && needs.stage-a-test-cpu-ppu.result == 'success' &&
-      needs.stage-a-test-cpu-ppu.outputs.evidence_ok == 'true'
+      needs.stage-a-test-cpu-ppu.outputs.evidence_ok == 'true' &&
+      (needs.check-changes.outputs.ppu_single != 'true' ||
+      needs.stage-a-test-1-gpu-ppu.result == 'success')
     uses: ./.github/workflows/pr-test-ppu-e2e.yml
     with:
       plan_hash: ${{ inputs.e2e_plan_hash }}

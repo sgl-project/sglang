@@ -31,6 +31,61 @@ JOBS = {
     "stage-c-test-2-gpu-ppu": "ppu_multi",
 }
 
+# Suite -> registry backend, for deriving the expected file inventory.
+BACKENDS = {
+    "stage-a-test-cpu-ppu": "CPU",
+    "stage-a-test-1-gpu-ppu": "PPU",
+    "stage-b-test-1-gpu-ppu": "PPU",
+    "stage-b-kernel-test-1-gpu-ppu": "PPU",
+    "stage-c-test-2-gpu-ppu": "PPU",
+}
+
+
+def _register():
+    spec = importlib.util.spec_from_file_location(
+        "ci_register", ROOT / "python/sglang/test/ci/ci_register.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def expected_inventory(suite):
+    """Enabled per-commit registrations for *suite*, repository-relative.
+
+    The expected inventory comes from this checkout's own registry, never from
+    worker-produced evidence: a selection pipeline that silently drops a
+    registered file must fail verification, not redefine the inventory.
+    """
+    register = _register()
+    backend = register.HWBackend[BACKENDS[suite]]
+    files = [
+        str(path)
+        for path in (ROOT / "test/registered").rglob("*.py")
+        if path.name not in ("conftest.py", "__init__.py")
+    ]
+    return {
+        str(Path(r.filename).resolve().relative_to(ROOT))
+        for r in register.collect_tests(files, sanity_check=True)
+        if r.backend == backend
+        and r.effective_suite == suite
+        and r.disabled is None
+        and not r.nightly
+    }
+
+
+def _repo_relative(path):
+    """Normalize a worker-reported path to repository-relative form.
+
+    Worker and verifier checkouts differ (pod vs runner), so anchor at the
+    registered-test root instead of trusting the absolute prefix.
+    """
+    parts = Path(path).parts
+    for index in range(len(parts) - 1):
+        if parts[index] == "test" and parts[index + 1] == "registered":
+            return str(Path(*parts[index:]))
+    return None
+
 
 def export_evidence(directory, destination):
     """Read NAS evidence without rewriting it; publish only a complete local export."""
@@ -136,6 +191,9 @@ def verify(directory, lane, kernel=False):
         report = json.loads((directory / suite / "summary.json").read_text())
         if report.get("success") is not True or not report.get("selected"):
             raise ValueError(f"Incomplete suite: {suite}")
+        selected = {_repo_relative(path) for path in report["selected"]}
+        if selected != expected_inventory(suite):
+            raise ValueError(f"Selection/registration mismatch: {suite}")
         if [r["file"] for r in report["files"]] != report["selected"]:
             raise ValueError(f"Missing selected file: {suite}")
         if len(set(report["selected"])) != len(report["selected"]) or report.get(

@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -152,9 +153,18 @@ def maintainer(api, user):
         or type(user.get("id")) is not int
     ):
         return False
-    permission = api.get(
-        "collaborators/" + urllib.parse.quote(user["login"], safe="") + "/permission"
-    )["permission"]
+    try:
+        permission = api.get(
+            "collaborators/"
+            + urllib.parse.quote(user["login"], safe="")
+            + "/permission"
+        )["permission"]
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            # Former collaborator or renamed account: deny the command instead of
+            # aborting reconciliation before later valid commands are reached.
+            return False
+        raise
     return permission in {"write", "maintain", "admin"}
 
 

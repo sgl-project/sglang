@@ -24,7 +24,9 @@ concurrency:
     (github.event_name == 'pull_request' &&
     (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
     !(github.event.action == 'labeled' && github.event.label.name == 'run-ci'))) && github.run_id || 'active' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.run_attempt == 1 }}
+  # Only code-affecting events preempt active CI; metadata transitions such as
+  # ready_for_review/converted_to_draft must not cancel running jobs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened') && github.run_attempt == 1 }}
 
 jobs:
   # Stage 1: 密钥扫描预检（组织级 reusable workflow）
@@ -91,7 +93,9 @@ jobs:
           name: ppu-e2e-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: selection.json
           if-no-files-found: error
-          retention-days: 14
+          # Phases run serially, so a maximal plan can need ~16 days of wall
+          # time; retention must outlive the worst-case selectable budget.
+          retention-days: 30
 
   cpu-precheck:
     name: CPU Shortlist

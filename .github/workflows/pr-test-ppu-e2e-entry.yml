@@ -130,7 +130,8 @@ jobs:
           name: ppu-e2e-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.entry }}
           path: ${{ steps.export.outputs.directory }}
           if-no-files-found: error
-          retention-days: 14
+          # Later phases and the final aggregate can run days after this entry.
+          retention-days: 30
       - name: Upload terminal entry result
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,4 +139,5 @@ jobs:
           name: ppu-e2e-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.entry }}
           path: ${{ runner.temp }}/e2e-result/entry.json
           if-no-files-found: error
-          retention-days: 14
+          # Later phases and the final aggregate can run days after this entry.
+          retention-days: 30

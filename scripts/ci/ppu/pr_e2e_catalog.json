@@ -969,60 +969,6 @@
       }
     },
     {
-      "id": "kimi-k2.6-w4a8-int8-answer-144g",
-      "family": "kimi",
-      "format": "w4a8-int8",
-      "category": "answer",
-      "mode": "answer",
-      "suite": "nightly-answer-8-kimi26-ppu",
-      "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json",
-      "files": [
-        "test/registered/ppu/answer_eval/test_ppu_kimi_k26_answer.py"
-      ],
-      "nodes": 1,
-      "cards_per_node": 8,
-      "board": "ZW-M890P",
-      "timeout_seconds": 10800,
-      "worker_minutes": 210,
-      "job_minutes": 240,
-      "environment": {},
-      "dependencies": [],
-      "blocked": "",
-      "source": {
-        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
-        "workflow": ".github/workflows/test-ppu-answer.yml",
-        "job": "ans-kimi26-w4a8",
-        "config": "test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json"
-      }
-    },
-    {
-      "id": "kimi-k2.6-w4a8-int8-perf-144g",
-      "family": "kimi",
-      "format": "w4a8-int8",
-      "category": "perf",
-      "mode": "perf",
-      "suite": "nightly-perf-8-kimi26-ppu",
-      "config": "test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json",
-      "files": [
-        "test/registered/ppu/perf_eval/test_ppu_kimi_k26_prefill_perf.py"
-      ],
-      "nodes": 1,
-      "cards_per_node": 8,
-      "board": "ZW-M890P",
-      "timeout_seconds": 7800,
-      "worker_minutes": 145,
-      "job_minutes": 170,
-      "environment": {},
-      "dependencies": [],
-      "blocked": "",
-      "source": {
-        "revision": "beeceaa86bc075c0ddc0abe4e50617511cd788a1",
-        "workflow": ".github/workflows/test-ppu-perf.yml",
-        "job": "kimi26-w4a8",
-        "config": "test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json"
-      }
-    },
-    {
       "id": "kimi-k2.6-w8a8-int8-answer-144g-2nodes",
       "family": "kimi",
       "format": "w8a8-int8",
