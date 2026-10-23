@@ -16,6 +16,11 @@ import types
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+# Mock-based NPU dispatch tests; run on CPU CI without Ascend hardware.
+register_cpu_ci(est_time=40, suite="stage-b-test-cpu-intel")
+
 try:
     import torch
 
@@ -96,7 +101,7 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
         def device(self):
             return torch.device("npu:0")
 
-    class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):  # noqa: E501
+    class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):
         """Verify the NPU branch in ``GuidanceGrammar.apply_vocab_mask``."""
 
         def test_npu_branch_dispatches_to_npu_kernel(self):
@@ -183,9 +188,9 @@ else:
                 missing.append("torch")
             if not _HAS_LLGUIDANCE:
                 missing.append("llguidance")
-            assert (
-                missing
-            ), "Expected at least one missing dependency on this environment."
+            assert missing, (
+                "Expected at least one missing dependency on this environment."
+            )
 
 
 if __name__ == "__main__":
