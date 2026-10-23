@@ -147,16 +147,22 @@ jobs:
       fail-fast: false
       matrix:
         test_config:
-          # kimi_k3 aisbench 128k perf, one case covering both phases:
-          # phase 1 cold prefill 131072 in / 1 out, C1, TTFT <= 20 s;
-          # phase 2 pure decode on a 100% shared prefix (131072 in /
-          # 1024 out), C12, mean TPOT <= 30 ms (low-latency tier).
+          # kimi_k3 aisbench 128k acceptance scenarios as two cases: the
+          # pure-prefill and pure-decode server configs are mutually
+          # exclusive (the prefill tuning crashed a DSPARK+decode-graph
+          # server with ACL 507034 in DeepEP dispatch - run 39917316049),
+          # so each scenario gets its own server and job.
           # cann9.1.0-a3-B103 image: the main-cann9.1.0-a3 image fails to
           # compile the kda_target_verify triton kernel (UB overflow) at
           # graph capture.
-          - name: kimi_k3_w4a8_32p_mix_in128k_prefill_decode_aisbench
+          - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill_aisbench
             node_size: 4
-            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_prefill_then_decode.py
+            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
+            test_type: 'perf'
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
+          - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix_aisbench
+            node_size: 4
+            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py
             test_type: 'perf'
             image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
