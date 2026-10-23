@@ -174,6 +174,22 @@ PLANS = {
     "per_row_ab_delta": DensePlan(
         a_family=AFamily.PER_ROW, b_family=BFamily.PER_ROW, overlap=Overlap.AB_DELTA
     ),
+    # Combinations only sm100.plans.json selects. On H100 this checks their
+    # Triton logic, not Blackwell hardware.
+    "all_slots_ab_delta": DensePlan(
+        a_family=AFamily.ALL_SLOTS, b_family=BFamily.PER_ROW, overlap=Overlap.AB_DELTA
+    ),
+    "all_slots_bk256_ov": DensePlan(
+        a_family=AFamily.ALL_SLOTS,
+        b_family=BFamily.PER_ROW,
+        overlap=Overlap.A,
+        b_tiles={**DensePlan().b_tiles, "BLOCK_SIZE_K": 256},
+    ),
+    "sorted16_splitk16_planes_ov": DensePlan(
+        block_size=16,
+        overlap=Overlap.A,
+        a_tiles={**DensePlan().a_tiles, "SPLIT_K": 16, "SPLIT_MODE": "planes"},
+    ),
 }
 
 
