@@ -53,6 +53,6 @@ server to opt into the native shared-prompt decode kernel for all-beam batches
 using FlashInfer MHA, FP16/BF16 KV, and no sliding-window or encoder-decoder
 attention. It buckets groups by their request-specific beam width.
 
-Shared-context batches use eager execution; ordinary batches and supported
-compact-trie-only batches retain their normal CUDA-graph paths. Attention logit
-caps are not supported by the shared-context kernel.
+Shared-context and compact-trie batches use eager execution; ordinary batches
+retain their normal CUDA-graph paths. Attention logit caps are not supported by
+the shared-context kernel.
