@@ -102,11 +102,13 @@ def _repack(layer, base_method, staged, num_slots: int, unpaged):
         for k, v in state.items():
             setattr(layer, k, v)
         # Fresh parameters in the checkpoint layout: the step may replace or rewrite them.
-        # Rows past a short last chunk keep the values the base method created.
+        # Rows past a short last chunk hold experts from the start, not what the base method
+        # created (torch.empty): a step that validates every row would reject those.
         for name, template in templates.items():
             fresh = torch.nn.Parameter(template.data.clone(), requires_grad=False)
             fresh.__dict__.update(template.__dict__)
             fresh.data[:n].copy_(staged.host[name][start : start + n])
+            fresh.data[n:].copy_(staged.host[name][: num_slots - n])
             layer.register_parameter(name, fresh)
         base_method.process_weights_after_loading(layer)
 

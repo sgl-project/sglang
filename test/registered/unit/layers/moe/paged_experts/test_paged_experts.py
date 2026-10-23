@@ -403,6 +403,53 @@ class TestLoading(CustomTestCase):
         self.assertTrue(torch.equal(packed.host["w13_qweight"], expected))
         self.assertTrue(torch.equal(layer.w13_qweight.data, expected[:K]))
 
+    def test_a_short_last_chunk_is_padded_with_experts(self):
+        """With E % K != 0, the rows past the last chunk hold a real expert's weights and scales,
+        not what the base method created (torch.empty): NVFP4A16's post-load step checks that
+        every row's gate and up share one global scale, and passes on a valid checkpoint."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4_moe import (
+            CompressedTensorsW4A16Nvfp4MoE,
+        )
+
+        scheme = CompressedTensorsW4A16Nvfp4MoE()
+        layer = torch.nn.Module()
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        scheme.create_weights(
+            layer,
+            num_experts=K,
+            hidden_size=128,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+        )
+        for param in layer.parameters():
+            if param.is_floating_point():
+                param.data.fill_(float("nan"))  # what torch.empty may hold
+        names = [name for name, _ in layer.named_parameters()]
+        staged = _CpuStore(layer=layer, names=names, num_experts=E + 1, pin=False)
+        for host in staged.host.values():  # a last chunk of 1 expert
+            if host.is_floating_point():
+                host.copy_(torch.rand(host.shape).add(0.5).to(host.dtype))
+            else:
+                host.copy_(torch.randint(0, 256, host.shape, dtype=host.dtype))
+        global_scale = staged.host["w13_weight_global_scale"]
+        global_scale[:, 1] = global_scale[:, 0]  # gate and up share it, as exported
+        with (
+            patch.object(formats, "HostExpertStore", _CpuStore),
+            patch(
+                "sglang.srt.layers.quantization.marlin_utils_fp4."
+                "prepare_moe_nvfp4_layer_for_marlin"
+            ),
+        ):
+            packed = after_loading(
+                layer, scheme, staged, num_slots=K, repacks=True, unpaged=()
+            )
+        self.assertTrue(
+            torch.equal(packed.host["w13_weight_scale_2"], 1 / global_scale[:, 0])
+        )
+        self.assertTrue(
+            torch.equal(packed.host["w13_weight"], staged.host["w13_weight_packed"])
+        )
+
     def test_rejects_a_repack_that_mixes_experts(self):
         """A post-load step that depends on the other experts of its chunk (here, their
         mean) cannot run K at a time."""
