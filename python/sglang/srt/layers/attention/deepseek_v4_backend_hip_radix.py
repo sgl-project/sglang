@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     late_layer_num_tokens,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -908,9 +909,6 @@ class DeepseekV4HipRadixBackend(
 
     forward = DeepseekV4AttnBackend.forward
 
-    # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
-    # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
-    forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _late_layer_tail_cp_layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
     # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
@@ -3585,6 +3583,90 @@ class DeepseekV4HipRadixBackend(
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
             )
+
+    def forward_low_ratio_sources(
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch: ForwardBatch,
+        run_compressor: bool = True,
+        run_indexer: bool = True,
+    ) -> None:
+        """Runs on every ratio 1/2 layer before its attention. The CUDA backend's body,
+        except that the hoisted q_lora rows go through _first_rows: gfx950 hands q_lora
+        over as an fp8-grid or MXFP8 activation, which refuses plain slicing."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        if forward_batch.encoder_swa_replay:
+            run_compressor = False
+        if layer.layer_id == self.tail_source_kv_layer_id:
+            run_compressor = False
+        meta = self.forward_metadata
+        if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
+            self._forward_low_ratio_sources_cp(
+                layer=layer,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_compressor=run_compressor,
+                run_indexer=run_indexer,
+            )
+            return
+        hoisted_req = getattr(meta, "low_ratio_req_indices", None)
+        hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if hoisted_pos is None:
+            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            pos = positions
+        else:
+            # The hoisted rows list the live rows first. DP attention pads an eager
+            # extend past them; an eager break in the late-layer tail sees fewer, and
+            # there extend_seq_lens still spans the whole extend.
+            n = min(hoisted_pos.shape[0], positions.shape[0])
+            x, positions = x[:n], positions[:n]
+            if q_lora is not None:
+                q_lora = _first_rows(q_lora, n)
+            req, pos = hoisted_req[:n], hoisted_pos[:n]
+        if (
+            forward_batch.forward_mode.is_extend()
+            and self._low_ratio_in_prefill_graph()
+        ):
+            bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
+            captured_index = (
+                run_indexer
+                and layer.indexer is not None
+                and layer.indexer.uses_candidates
+            )
+            _cuda_backend._bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, run_compressor, captured_index
+            )
+            if run_compressor and layer.compressor is not None:
+                self._low_ratio_compress_torch(
+                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                )
+            if run_indexer and layer.indexer is not None:
+                if captured_index:
+                    # Captured: sparse scores of the published blocks only, so
+                    # nothing here depends on the context length.
+                    self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+                else:
+                    # Eager break: dense scoring over the live context; the
+                    # candidate source hands its block table to the consumers.
+                    out = _cuda_backend._bcg_prefill_graph_full_topk(
+                        layer, x, q_lora, pos
+                    )
+                    if layer.indexer.is_candidate_source:
+                        self.forward_metadata.candidate_metadata = (
+                            self.prefill_candidates.bind_prefill_graph_table(out)
+                        )
+            return
+        if run_compressor and layer.compressor is not None:
+            self._low_ratio_compress(layer, x, req, pos, forward_batch)
+        if run_indexer and layer.indexer is not None:
+            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer

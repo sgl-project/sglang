@@ -142,7 +142,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -154,7 +154,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -3383,16 +3382,7 @@ class DeepseekV4AttnBackend(
             n = min(hoisted_pos.shape[0], positions.shape[0])
             x, positions = x[:n], positions[:n]
             if q_lora is not None:
-                if _is_hip:
-                    # gfx950 hands q_lora over as an fp8-grid or MXFP8 activation,
-                    # which refuses plain slicing.
-                    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-                        _first_rows,
-                    )
-
-                    q_lora = _first_rows(q_lora, n)
-                else:
-                    q_lora = q_lora[:n]
+                q_lora = q_lora[:n]
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
