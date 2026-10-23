@@ -1145,14 +1145,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        if self.align_corners and self._use_vectorized_pos_embed(len(grid_thw_list)):
-            # The vectorized implementation uses linspace coordinates. In graph mode
-            # the legacy fallback honors enable_precise_embedding_interpolation, so
-            # only use the vectorized path when the active graph interpolation mode
-            # is also linspace; otherwise image count would change the output.
+        # Same interpolation as the eager forward (linspace, as the HF reference), so
+        # turning the ViT graph on does not change the image embeddings.
+        if self._use_vectorized_pos_embed(len(grid_thw_list)):
             pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
         else:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+            pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
