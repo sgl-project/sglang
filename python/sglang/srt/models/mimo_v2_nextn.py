@@ -47,6 +47,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    _resolve_deferred_qkv_scale_inv,
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -286,6 +287,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         ]
 
         params_dict = dict(self.named_parameters())
+        deferred_qkv_scale_inv = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -310,7 +312,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        deferred_scale_inv=deferred_qkv_scale_inv,
                         qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
+                        config=self.config,
                     )
                 continue
 
@@ -358,6 +362,15 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        if deferred_qkv_scale_inv:
+            _resolve_deferred_qkv_scale_inv(
+                params_dict,
+                deferred_qkv_scale_inv,
+                get_mimo_v2_fused_qkv_expected_tp_size(self.config),
+                config=self.config,
+                model=self,
+            )
 
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re

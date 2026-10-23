@@ -171,8 +171,8 @@ def load_mimo_v2_qkv_proj_weight(
             if qkv_sizes is None:
                 raise ValueError(
                     f"qkv_proj weight {name}: attention TP {tp_size} below the "
-                    f"checkpoint's {ckpt_tp} kv-head shards needs the decoder layer "
-                    f"config to regroup q|k|v; MTP layers are not supported here"
+                    f"checkpoint's {ckpt_tp} kv-head shards needs the model config "
+                    f"to regroup q|k|v"
                 )
             q_per_shard, k_per_shard, v_per_shard = qkv_sizes
             merged = _deinterleave_qkv_shards(
@@ -184,17 +184,21 @@ def load_mimo_v2_qkv_proj_weight(
         default_weight_loader(param, merged)
 
 
+def _swa_attention_dims(config):
+    hd = config.swa_head_dim
+    return (
+        config.swa_num_attention_heads,
+        config.swa_num_key_value_heads,
+        hd,
+        getattr(config, "swa_v_head_dim", hd),
+    )
+
+
 def _attention_dims(config, layer_id):
     """(num_heads, num_kv_heads, head_dim, v_head_dim) of a decoder layer."""
     pattern = getattr(config, "hybrid_layer_pattern", None)
     if pattern is not None and pattern[layer_id] == 1:
-        hd = config.swa_head_dim
-        return (
-            config.swa_num_attention_heads,
-            config.swa_num_key_value_heads,
-            hd,
-            getattr(config, "swa_v_head_dim", hd),
-        )
+        return _swa_attention_dims(config)
     hd = config.head_dim
     return (
         config.num_attention_heads,
@@ -205,10 +209,14 @@ def _attention_dims(config, layer_id):
 
 
 def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
-    m = re.search(r"layers\.(\d+)\.", layer_name)
-    if m is None:
-        return None
-    nh, nkv, hd, vhd = _attention_dims(config, int(m.group(1)))
+    if ".mtp_block." in layer_name:
+        # MiMoV2MTPLayer always builds sliding-window attention.
+        nh, nkv, hd, vhd = _swa_attention_dims(config)
+    else:
+        m = re.search(r"layers\.(\d+)\.", layer_name)
+        if m is None:
+            return None
+        nh, nkv, hd, vhd = _attention_dims(config, int(m.group(1)))
 
     q_per_shard = (nh // ckpt_tp) * hd
     k_per_shard = max(1, nkv // ckpt_tp) * hd
