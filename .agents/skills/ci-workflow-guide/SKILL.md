@@ -421,7 +421,7 @@ An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on 
 
 Labels persist for future pushes, which can run every enabled tier. A command scoped to AMD does not disable NVIDIA base on later commits. Scheduled and manual workflow runs retain their label bypasses.
 
-The slash handler reads the registry for tier arguments and `/run-<tier>-ci`. Each registered workflow must follow these conventions, checked by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
+The slash handler reads the registry for tier arguments and `/run-<tier>-ci`. The pre-commit linter `scripts/lint/check_opt_in_ci_tiers.py` checks tier names, label/workflow mappings, and trigger compatibility. Each registered workflow must follow these conventions:
 
 1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>` and require `run-ci` in the same gate call.** `require-run-ci` may be explicitly `true` or omitted to use the default. The gate live-fetches labels, so a missing label fails the gate job and a rerun after labeling passes.
 2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).

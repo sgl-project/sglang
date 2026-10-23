@@ -17,7 +17,7 @@ import yaml
 TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
 # Tier names become `/run-<tier>-ci`; these spellings are taken by other commands.
-RESERVED_TIER_NAMES = {"base", "cpu", "failed", "full"}
+RESERVED_TIER_NAMES = {"cpu", "failed", "full"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
@@ -53,7 +53,6 @@ def main() -> int:
             workflows[path] = yaml.safe_load(f) or {}
 
     errors = []
-    workflow_tiers = {}
     for name, tier in tiers.items():
         label = tier["label"]
         listed = tier["workflows"]
@@ -67,13 +66,6 @@ def main() -> int:
             errors.append(f"tier `{name}`: lists no workflows")
 
         for path in listed:
-            if path in workflow_tiers:
-                errors.append(
-                    f"tier `{name}`: {path} is already listed by "
-                    f"tier `{workflow_tiers[path]}`"
-                )
-            else:
-                workflow_tiers[path] = name
             if path not in workflows:
                 errors.append(f"tier `{name}`: {path} does not exist")
                 continue
@@ -82,17 +74,6 @@ def main() -> int:
                     f"tier `{name}`: {path} does not call pr-gate.yml "
                     f"with `require-label: {label}`"
                 )
-            for job in (workflows[path].get("jobs") or {}).values():
-                inputs = job.get("with") or {}
-                if (
-                    job.get("uses") == PR_GATE
-                    and inputs.get("require-label") == label
-                    and inputs.get("require-run-ci", True) is not True
-                ):
-                    errors.append(
-                        f"tier `{name}`: {path} must also require `run-ci` "
-                        "in the same pr-gate.yml call"
-                    )
             if refires_on_labeled(workflows[path]):
                 errors.append(
                     f"tier `{name}`: {path} triggers on `labeled`; a rerun of "

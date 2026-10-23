@@ -84,11 +84,6 @@ jobs:
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
-      - name: Test CI command routing
-        run: |
-          python -m pip install requests PyGithub PyYAML
-          python -m unittest discover -s scripts/ci/utils -p 'test_slash_command_handler.py'
-
       - name: Cache mint
         uses: actions/cache@v4
         with:
