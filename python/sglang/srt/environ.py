@@ -1011,6 +1011,8 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # gfx1250 only: Laguna fp32 router logits via FlyDSL GEMV/WMMA for M <= 64 (F.linear otherwise).
     SGLANG_OPT_LAGUNA_ROUTER_FLYDSL = EnvBool(False)
+    # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
+    SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)

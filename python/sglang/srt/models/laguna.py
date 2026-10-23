@@ -45,6 +45,7 @@ from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -52,6 +53,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -348,6 +350,13 @@ class LagunaAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
             sliding_window_size=sliding_window_size if use_sliding else -1,
         )
+        # The fused kernel assumes plain neox RoPE over the whole head.
+        self._use_fused_decode_prep = (
+            envs.SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV.get()
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+        )
 
     def forward(
         self,
@@ -361,16 +370,25 @@ class LagunaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
+        fused_q = (
+            self._fused_decode_prep(
+                qkv=qkv, positions=positions, forward_batch=forward_batch
+            )
+            if self._use_fused_decode_prep and forward_batch.forward_mode.is_decode()
+            else None
         )
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v, forward_batch)
+        if fused_q is not None:
+            attn_output = self.attn(fused_q, k, v, forward_batch, save_kv_cache=False)
+        else:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+            )
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.gating and self.g_proj is not None:
             gate, _ = self.g_proj(hidden_states)
@@ -384,6 +402,83 @@ class LagunaAttention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _fused_decode_prep(
+        self, *, qkv: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        target = _fp8_kv_store_target(layer=self.attn, forward_batch=forward_batch)
+        if target is None:
+            return None
+        k_buf, v_buf, loc = target
+        from sglang.srt.layers.attention.laguna_qk_norm_rope_kv import (
+            qk_norm_rope_kv_store,
+        )
+
+        unscaled = self.attn.k_scale is None
+        return qk_norm_rope_kv_store(
+            qkv=qkv,
+            positions=positions,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            eps=self.q_norm.variance_epsilon,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            k_buf=k_buf,
+            v_buf=v_buf,
+            loc=loc,
+            k_scale=1.0 if unscaled else self.attn.k_scale_float,
+            v_scale=1.0 if unscaled else self.attn.v_scale_float,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+
+
+def _fp8_kv_store_target(
+    *, layer: RadixAttention, forward_batch: ForwardBatch
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """(k_buf, v_buf, loc) a fused decode writer scatters into, mirroring the triton backend's
+    set_kv_buffer routing; None whenever that routing is not a plain fp8 NHD MHA pool."""
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    backend = get_attn_backend()
+    if (
+        not isinstance(backend, TritonAttnBackend)
+        or backend.use_mla
+        or backend.dcp_size > 1
+    ):
+        return None
+    pool = backend.token_to_kv_pool
+    loc = forward_batch.out_cache_loc
+    pool_layer_id = layer.layer_id
+    if isinstance(pool, SWAKVPool):
+        pool_layer_id, is_swa = pool.layers_mapping[layer.layer_id]
+        if is_swa:
+            loc = backend.forward_metadata.swa_out_cache_loc
+            pool = pool.swa_kv_pool
+        else:
+            pool = pool.full_kv_pool
+    # Subclasses (e.g. page-major) and non-NHD layouts write through different buffer views.
+    if (
+        type(pool) is not MHATokenToKVPool
+        or pool.kv_cache_layout != "nhd"
+        or loc is None
+        or pool.use_hnd
+        or pool.is_quantized_kv_cache
+        or pool.dtype != torch.float8_e4m3fn
+        or (
+            pool.requires_physical_write_loc
+            and not forward_batch.out_cache_loc_is_physical
+        )
+    ):
+        return None
+    idx = pool_layer_id - pool.start_layer
+    return (
+        pool.k_buffer[idx].view(torch.uint8),
+        pool.v_buffer[idx].view(torch.uint8),
+        loc,
+    )
 
 
 class LagunaDecoderLayer(nn.Module):
