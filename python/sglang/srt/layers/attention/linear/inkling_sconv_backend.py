@@ -628,12 +628,15 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
                 self.full_attn_backend.init_forward_metadata_out_graph(
                     forward_batch, in_capture=True
                 )
-            self.full_attn_backend.stage_draft_extend_metadata(forward_batch)
-            self.short_conv_backend._prepare_slot_indices(forward_batch)
+            self.stage_draft_extend_metadata(forward_batch)
         else:
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        self.full_attn_backend.stage_draft_extend_metadata(forward_batch)
+        self.short_conv_backend._prepare_slot_indices(forward_batch)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if (
