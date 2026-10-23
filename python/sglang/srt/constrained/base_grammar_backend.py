@@ -368,6 +368,17 @@ def register_grammar_backend(name, init_func):
     GRAMMAR_BACKEND_REGISTRY[name] = init_func
 
 
+def grammar_stop_token_ids(tokenizer, eos_token_ids=None) -> Optional[List[int]]:
+    """Every token id the scheduler finishes a request on. A stop token missing
+    here is ordinary text to the grammar, so a constrained request could end on
+    it before the grammar is complete."""
+    ids = set(eos_token_ids or ())
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        ids.add(tokenizer.eos_token_id)
+    ids.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
+    return sorted(ids) or None
+
+
 def create_grammar_backend(
     server_args: ServerArgs,
     tokenizer,
@@ -397,8 +408,7 @@ def create_grammar_backend(
             XGrammarGrammarBackend,
         )
 
-        # Convert Set[int] to List[int] if needed
-        eos_list = list(eos_token_ids) if eos_token_ids else None
+        eos_list = grammar_stop_token_ids(tokenizer, eos_token_ids)
 
         try:
             grammar_backend = XGrammarGrammarBackend(
