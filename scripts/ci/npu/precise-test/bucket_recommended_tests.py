@@ -26,11 +26,14 @@ callers treat as "run the full suite".
 
 Decision model (precision vs full)
 ----------------------------------
-A full run is triggered by only three signals:
+Precision mode has the highest priority: when --precision-mode is not 'true',
+every suite runs in full, no matter what was recommended. Otherwise a full run
+is triggered by only two signals:
 
   - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
   - a missing changed-file list (test_selector.py failed),
-  - the multimodal baseline safety gate described below.
+
+plus the multimodal baseline safety gate described below.
 
 Everything else is decided by the recommendation: an empty one skips every
 suite, a non-empty one runs only the buckets. Precision mode is therefore not
@@ -524,7 +527,9 @@ def main():
         "--precision-mode",
         type=str,
         default="false",
-        help="'true' to enable precision mode (run only the recommended tests)",
+        help="'true' to enable precision mode (run only the recommended tests). "
+        "Any other value has the highest priority and forces every suite to "
+        "run in full",
     )
     parser.add_argument(
         "--changed-files",
@@ -676,7 +681,13 @@ def main():
                 f"{len(tokens)} recommended"
             )
 
-    if not changed_files:
+    precision_switch = args.precision_mode == "true"
+    if not precision_switch:
+        # Highest priority: the switch is the operator's override, so it must
+        # win over every automatic decision below.
+        decision = "full"
+        decision_reason = "precision mode disabled (--precision-mode is not 'true')"
+    elif not changed_files:
         # test_selector.py writes this file on every PR run; missing/empty
         # means it failed, so there is no evidence to narrow anything down.
         decision = "full"
@@ -710,7 +721,7 @@ def main():
 
     if skip_all_suites and not force_full:
         print("::notice::No test recommended — skipping all suites.")
-    precision_mode = args.precision_mode == "true" and decision == "precision"
+    precision_mode = decision == "precision"
     print(
         f"total_count={total_count} decision={decision} precision_mode={precision_mode}"
     )
