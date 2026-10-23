@@ -109,7 +109,11 @@ class TestEmbeddingNemotron35Config(CustomTestCase):
                 "is_causal": False,
                 "pooling": "avg",
             },
-            {"architectures": ["Ministral3Model"], "is_causal": False, "pooling": "avg"},
+            {
+                "architectures": ["Ministral3Model"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
         ):
             with self.subTest(fields=fields):
                 self.assertFalse(is_embedding_nemotron35(SimpleNamespace(**fields)))
