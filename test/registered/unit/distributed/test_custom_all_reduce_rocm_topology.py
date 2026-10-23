@@ -50,3 +50,9 @@ def test_rocm_without_xgmi_skips_ipc_setup(monkeypatch):
 def test_rocm_usable_custom_ar_still_sets_up_ipc(monkeypatch, full_xgmi, deterministic):
     with pytest.raises(_IpcSetupStarted):
         _build(monkeypatch, full_xgmi=full_xgmi, deterministic=deterministic)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
