@@ -1219,6 +1219,28 @@ def build_deepseek_v4_hicache_stack(
     )
 
     host_pool_group = HostPoolGroup(entries)
+    if (
+        kvcache.request_window is not None
+        and params.attn_cp_cache_group is not None
+        and get_parallel().attn_cp_size > 1
+    ):
+        from sglang.srt.mem_cache.dsv41_replay_contract import (
+            replay_storage_tag,
+            runtime_replay_producer,
+        )
+
+        producer = runtime_replay_producer()
+        host_pool_group.storage_layout_tag = replay_storage_tag(
+            kvcache, producer=producer
+        )
+        logger.info(
+            "CP replay storage producer: CP=%s GEMM=%s MoE=%s/%s versions=%s",
+            producer["parallel"]["attn_cp_size"],
+            producer["fp8_gemm"],
+            producer["moe_runner"],
+            producer["moe_precision"],
+            producer["versions"],
+        )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,

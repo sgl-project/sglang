@@ -278,8 +278,8 @@ def validate_cp_encoder_replay(cfg, *, is_cuda: bool, is_sm90: bool) -> None:
     if cfg.enable_hierarchical_cache:
         if cfg.hicache_host_memory_mode != "cache":
             raise ValueError("CP encoder replay requires cache host memory mode")
-        if cfg.hicache_storage_backend is not None:
-            raise ValueError("CP encoder replay L3 requires the restore extension")
+        if cfg.hicache_storage_backend not in (None, "mooncake"):
+            raise ValueError("CP encoder replay L3 currently requires Mooncake Store")
 
 
 def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:

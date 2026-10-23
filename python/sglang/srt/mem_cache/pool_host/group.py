@@ -50,6 +50,7 @@ class HostPoolGroup:
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
         self.logical_size = self.anchor_entry.host_pool.logical_size
+        self.storage_layout_tag: str | None = None
         self._refresh_transfer_capabilities()
 
     def _refresh_transfer_capabilities(self) -> None:
