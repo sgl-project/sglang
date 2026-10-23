@@ -2512,7 +2512,8 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
-        # a fused inverse RoPE leaves no wo_a input for the adapter
+        # a fused inverse RoPE leaves no wo_a input for the adapter, and its delta
+        # must join wo_a's bf16 output before wo_b's input is quantized
         wo_a_lora = isinstance(self.wo_a, ColumnParallelLinearWithLoRA)
         if (
             self.wo_a_fp8
@@ -2537,7 +2538,9 @@ class MQALayer(MqaAttentionBase):
             )
         else:
             fuse_mxfp8_quant = (
-                self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
+                self.use_flashinfer_mxfp8_wo_b
+                and not get_forward().sp_active
+                and not wo_a_lora
             )
             fuse_rope_wo_a = (
                 self.use_fused_wo_a
@@ -2662,8 +2665,11 @@ class MQALayer(MqaAttentionBase):
                             is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
                             fast_path=self.is_dsv41,
                             fuse_mxfp8_quant=fuse_mxfp8_quant,
-                            fp8_grid=_is_hip and _hip.wo_a_emits_fp8_grid(self),
+                            fp8_grid=_is_hip
+                            and not wo_a_lora
+                            and _hip.wo_a_emits_fp8_grid(self),
                             emit_fp8=_is_hip
+                            and not wo_a_lora
                             and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
                         )
                 else:
