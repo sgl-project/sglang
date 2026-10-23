@@ -846,8 +846,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.get_device_module().synchronize()
         finally:
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-            # Saving can fail only on the output rank. It must still join the
-            # metrics collective, or its peers cannot serve the next request.
+            # saving can fail only on the output rank; it must still join the
+            # metrics collective, or its peers cannot serve the next request
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
             )
