@@ -387,8 +387,23 @@ class KVCacheConfigurator:
             return max_total_num_tokens
         # Target rows widen into attn_dcp_size ids; draft sizes already carry
         # loc_space_scale.
+        # HiSparse QSA: `max_total_num_tokens` is only the resident device
+        # window; requests are admitted against the logical pool, which is
+        # host_to_device_ratio times larger.  Without this the admission cap
+        # (max_req_input_len) is stuck at the device window and every prompt
+        # longer than it is refused.
+        hisparse_ratio = 1
+        if get_memory().enable_hisparse:
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            if is_qwen_qsa(self.model_config.hf_config):
+                hisparse_ratio = parse_hisparse_config().host_to_device_ratio
         return (
-            max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
+            max_total_num_tokens
+            * hisparse_ratio
+            * get_parallel().attn_dcp_size
+            // self.loc_space_scale
         )
 
     def _resolve_kv_shard(self) -> None:
