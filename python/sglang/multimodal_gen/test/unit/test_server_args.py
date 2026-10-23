@@ -3164,6 +3164,110 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             parser.parse_known_args(argv)
 
 
+class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
+    """Unset BCG turns on only where the served path keeps fixed DiT weights."""
+
+    LTX2_TWO_STAGE_SERVE = {
+        "model_path": "Lightricks/LTX-2",
+        "num_gpus": 2,
+        "pipeline_class_name": "LTX2TwoStagePipeline",
+        "enable_cfg_parallel": True,
+        "warmup_mode": "server",
+    }
+
+    def _resolve(
+        self,
+        *,
+        memory_gb=141,
+        available_memory_gb=139,
+        device_name="NVIDIA H200",
+        **overrides,
+    ):
+        with (
+            patch.object(
+                current_platform, "device_shares_host_memory", return_value=False
+            ),
+            patch.object(current_platform, "get_device_name", return_value=device_name),
+        ):
+            return TestOffloadDefaults._from_dict_with_pipeline_config(
+                self,
+                LTX2PipelineConfig(),
+                memory_gb=memory_gb,
+                available_memory_gb=available_memory_gb,
+                kwargs={**self.LTX2_TWO_STAGE_SERVE, **overrides},
+            )
+
+    def test_flagless_ltx2_two_stage_serving_captures_the_model_default(self):
+        args = self._resolve()
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        self.assertEqual(args.warmup_resolutions, ["768x512"])
+        self.assertEqual(args.warmup_mode, "server")
+
+    def test_ltx23_needs_both_stage_dits_resident(self):
+        resident = self._resolve(model_path="Lightricks/LTX-2.3")
+        self.assertEqual(resident.ltx2_two_stage_device_mode, "resident")
+        self.assertTrue(resident.enable_breakable_cuda_graph)
+
+        original = self._resolve(
+            model_path="Lightricks/LTX-2.3", ltx2_two_stage_device_mode="original"
+        )
+        self.assertFalse(original.enable_breakable_cuda_graph)
+
+    def test_gates_keep_unset_bcg_off(self):
+        cases = {
+            "explicit off": {"enable_breakable_cuda_graph": False},
+            "offline run": {"warmup_mode": None},
+            "request warmup": {"warmup_mode": "request"},
+            "memory mode": {"performance_mode": "memory"},
+            "manual mode": {"performance_mode": "manual"},
+            "torch.compile": {"enable_torch_compile": True},
+            "dynamic batching": {"batching_max_size": 2},
+            "startup LoRA": {"lora_path": "/loras/style.safetensors"},
+            "ComfyUI": {"comfyui_mode": True},
+            "one-stage pipeline": {"pipeline_class_name": "LTX2Pipeline"},
+            "HQ pipeline": {"pipeline_class_name": "LTX2TwoStageHQPipeline"},
+            "unvalidated checkpoint": {"model_path": "/models/custom-ltx"},
+            "DiT layerwise offload": {"dit_layerwise_offload": True},
+            "DiT component offload": {"dit_cpu_offload": True},
+            "DiT residency selector": {
+                "component_residency": ["transformer=layerwise-offload"]
+            },
+            # below LTX-2's keep-resident threshold auto component-offloads the DiT
+            "low free memory": {"available_memory_gb": 60},
+            # the DiT stays resident, but capture outgrows a speed-mode 80 GB card
+            "80 GB card": {
+                "memory_gb": 80,
+                "available_memory_gb": 79,
+                "device_name": "NVIDIA H100 80GB HBM3",
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self._resolve(**overrides).enable_breakable_cuda_graph)
+
+    def test_platform_gates(self):
+        args = self._resolve(enable_breakable_cuda_graph=False)
+        with patch.object(
+            current_platform, "get_device_total_memory", return_value=141 * 1024**3
+        ):
+            with patch.object(
+                current_platform, "device_shares_host_memory", return_value=False
+            ):
+                self.assertTrue(args._breakable_cuda_graph_default())
+                # ROCm answers torch.cuda.is_available() but not the platform check
+                with patch.object(current_platform, "is_cuda", return_value=False):
+                    self.assertFalse(args._breakable_cuda_graph_default())
+            with patch.object(
+                current_platform, "device_shares_host_memory", return_value=True
+            ):
+                self.assertFalse(args._breakable_cuda_graph_default())
+
+    def test_explicit_enable_elsewhere_is_unchanged(self):
+        args = self._resolve(enable_breakable_cuda_graph=True, warmup_mode=None)
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        self.assertEqual(args.warmup_mode, "server")
+
+
 class TestKVGatherDegree(unittest.TestCase):
     def test_sp2_defaults_to_kv_gather(self):
         args = _from_dict_without_model_resolution(
