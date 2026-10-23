@@ -1383,6 +1383,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3.1",
                       "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
