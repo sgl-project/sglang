@@ -845,9 +845,9 @@ class AscendAttnBackend(AttentionBackend):
             total_context_len += self.speculative_num_draft_tokens
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
+            dcp_page_size = self.page_size * self.dcp_size
             graph_num_pages = max(
-                1,
-                (graph_num_pages + self.dcp_size - 1 - self.dcp_rank) // self.dcp_size,
+                1, (total_context_len + dcp_page_size - 1) // dcp_page_size
             )
         self.graph_metadata = {
             "block_tables": torch.empty(
@@ -1140,78 +1140,31 @@ class AscendAttnBackend(AttentionBackend):
             effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
-            active_num_pages = min(
-                metadata.block_tables.shape[1],
-                max(
-                    1,
-                    (max_seq_pages + self.dcp_size - 1 - self.dcp_rank)
-                    // self.dcp_size,
-                ),
-            )
             # Use the existing Host lengths for table bounds without a device readback.
             _, block_tables = self._get_kv_lens_and_block_tables(
                 attention_kv_lens_cpu,
                 req_pool_indices[:bs],
             )
-            copy_num_pages = min(active_num_pages, block_tables.shape[1])
-            metadata.block_tables[:, :copy_num_pages].copy_(
-                block_tables[:, :copy_num_pages]
-            )
-            metadata.block_tables[:, copy_num_pages:].zero_()
-            local_seq_lens = get_dcp_lens(
-                effective_seq_lens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).int()
-            metadata.seq_lens.copy_(local_seq_lens)
-            # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
-            if in_capture:
-                metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
-
-            if forward_mode.is_target_verify():
-                query_len = self.speculative_num_draft_tokens
-                metadata.dcp_spec_seq_lens.copy_(
-                    get_dcp_chain_spec_lens(
-                        effective_seq_lens,
-                        query_len,
-                        self.dcp_size,
-                        self.dcp_rank,
-                        interleave_size=self.page_size,
-                    )
-                )
-                dcp_mask = build_mla_dcp_mtp_mask(
-                    metadata.dcp_spec_seq_lens,
-                    query_len,
-                    active_num_pages * self.page_size,
-                )
-                active_mask_width = active_num_pages * self.page_size
-                metadata.dcp_mtp_attn_mask[:, :, :active_mask_width].copy_(dcp_mask)
-                metadata.dcp_mtp_attn_mask[:, :, active_mask_width:].fill_(True)
-
-            self.forward_metadata = metadata
-            self.graph_mode = True
-            return
-        if self.needs_cpu_seq_lens:
-            metadata.block_tables[:bs, :max_seq_pages].copy_(
+        elif self.needs_cpu_seq_lens:
+            block_tables = (
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
                 // self.page_size
             )
-
-            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
             total_pages = min(
                 metadata.block_tables.shape[1],
                 (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
-            metadata.block_tables[:bs, :total_pages].copy_(
+            block_tables = (
                 self.req_to_token[
                     req_pool_indices[:bs],
                     0 : total_pages * self.page_size : self.page_size,
                 ]
                 // self.page_size
             )
-            metadata.block_tables[:bs, total_pages:].fill_(0)
+        num_pages = block_tables.shape[1]
+        metadata.block_tables[:bs, :num_pages].copy_(block_tables)
+        metadata.block_tables[:bs, num_pages:].fill_(0)
 
         if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -1266,7 +1219,37 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if forward_mode.is_target_verify():
+        if self.dense_mla_dcp_target:
+            local_seq_lens = get_dcp_lens(
+                effective_seq_lens,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.page_size,
+            ).int()
+            # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
+            if in_capture:
+                metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
+            if forward_mode.is_target_verify():
+                query_len = self.speculative_num_draft_tokens
+                metadata.dcp_spec_seq_lens.copy_(
+                    get_dcp_chain_spec_lens(
+                        effective_seq_lens,
+                        query_len,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        interleave_size=self.page_size,
+                    )
+                )
+                active_mask_width = max(1, num_pages) * self.page_size
+                dcp_mask = build_mla_dcp_mtp_mask(
+                    metadata.dcp_spec_seq_lens,
+                    query_len,
+                    active_mask_width,
+                )
+                metadata.dcp_mtp_attn_mask[:, :, :active_mask_width].copy_(dcp_mask)
+                metadata.dcp_mtp_attn_mask[:, :, active_mask_width:].fill_(True)
+            effective_seq_lens = local_seq_lens
+        elif forward_mode.is_target_verify():
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
             # length; refresh the graph-bound list from that CPU tensor.
             # Other spec algorithms keep the capture-time list (graph_runner
