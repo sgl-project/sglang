@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.verify_sampling import (
+    chain_speculative_sampling_target_only_triton,
     tree_speculative_sampling_target_only,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -1003,29 +1004,51 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             uniform_top_k_value=uniform_top_k_value,
             use_sparse_topk=use_sparse_topk,
         )
-        draft_probs = torch.zeros_like(target_probs)
         candidates_i64 = (
             candidates
             if candidates.dtype == torch.int64
             else candidates.to(torch.int64)
         )
-        tree_speculative_sampling_target_only(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates_i64,
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=threshold_single,
-            threshold_acc=threshold_acc,
-            deterministic=True,
-        )
-        del target_probs, draft_probs, candidates_i64
+        # DFlash proposals are linear (topk == 1): prefer the chain target-only
+        # kernel (pure Triton, no draft_probs allocation) when available; fall
+        # back to the CUDA tree kernel with zeros otherwise.
+        if chain_speculative_sampling_target_only_triton is not None:
+            chain_speculative_sampling_target_only_triton(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates_i64,
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=None,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
+        else:
+            draft_probs = torch.zeros_like(target_probs)
+            tree_speculative_sampling_target_only(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates_i64,
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
+            del draft_probs
+        del target_probs, candidates_i64
         del coins, coins_for_final_sampling
 
     correct_len = accept_token_num

@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     verify_tree_greedy_func,
 )
 from sglang.kernels.ops.speculative.verify_sampling import (
+    chain_speculative_sampling_target_only_triton,
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
@@ -710,10 +711,17 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
     else:
+        use_chain_target_only = (
+            not use_rejection_sampling
+            and verify_input.tree_topk == 1
+            and chain_speculative_sampling_target_only_triton is not None
+        )
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
             if get_spec().speculative_use_block_verification:
                 sampling_fn = partial(sampling_fn, block_verification=True)
+        elif use_chain_target_only:
+            sampling_fn = chain_speculative_sampling_target_only_triton
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
@@ -745,6 +753,8 @@ def eagle_sample(
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
+            else None
+            if use_chain_target_only
             else torch.zeros_like(target_probs)
         )
         # Defense-in-depth behind the spec_hook startup allowlist: validate
