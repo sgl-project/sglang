@@ -611,6 +611,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             finished=lambda: False,
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
+            disagg_local_prefill=False,
         )
         scheduler.running_batch.reqs = [req]
 
@@ -643,6 +644,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 output_ids=[7],
                 time_stats=MagicMock(),
                 kv=SimpleNamespace(holds_kv=req_pool_idx is not None),
+                disagg_local_prefill=False,
             )
 
         running = _req("running", 0)

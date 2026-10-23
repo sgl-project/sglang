@@ -325,6 +325,7 @@ class Session:
             disagg_mode=disagg_mode,
             routed_dp_rank=req.routed_dp_rank,
             disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
+            disagg_local_prefill=req.disagg_local_prefill,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,

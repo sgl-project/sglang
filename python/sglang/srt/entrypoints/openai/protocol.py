@@ -343,6 +343,8 @@ class PDRoutingFields(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For PD disagg -- the decode worker prefills this request itself
+    disagg_local_prefill: bool = False
 
     def pd_routing_kwargs(self) -> Dict[str, Any]:
         return {name: getattr(self, name) for name in PDRoutingFields.model_fields}

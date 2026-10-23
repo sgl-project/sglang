@@ -369,6 +369,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 ),
                 running_batch=SimpleNamespace(reqs=[]),
                 waiting_queue=[],
+                disagg_decode_prebuilt_queue=None,
+                chunked_req=None,
                 last_batch=None,
                 sliding_window_size=8 if hybrid_swa else None,
                 enable_hisparse=False,

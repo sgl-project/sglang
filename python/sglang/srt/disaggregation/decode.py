@@ -1423,6 +1423,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             }
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
+            running_loras.update(
+                req.lora_id for req in self.scheduler.disagg_decode_prebuilt_queue or ()
+            )
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -2006,6 +2009,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             len(self.scheduler.running_batch.reqs)
             + sum(not r.host_staged for r in self.transfer_queue.queue)
             + len(self.scheduler.waiting_queue)
+            + len(self.scheduler.disagg_decode_prebuilt_queue or ())
             + extra_reserved_reqs
         )
 
@@ -2093,6 +2097,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 allocatable_tokens -= full_required
 
         allocatable_tokens -= hicache_reserved_tokens
+        # A local chunked prefill keeps its remaining chunks' pages.
+        if (chunked_req := self.scheduler.chunked_req) is not None:
+            allocatable_tokens -= (
+                len(chunked_req.full_untruncated_fill_ids) - chunked_req.extend_end
+            )
         return allocatable_tokens
 
     def _swa_tail_allocatable_token_budget(
@@ -3051,6 +3060,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    # Requests whose KV arrived from a prefill server. Set only when this decode
+    # server also prefills locally; otherwise they wait in waiting_queue.
+    disagg_decode_prebuilt_queue: Optional[List[Req]] = None
+
+    def get_disagg_decode_prebuilt_reqs(self: Scheduler) -> List[Req]:
+        if self.disagg_decode_prebuilt_queue is None:
+            return self.waiting_queue
+        return self.disagg_decode_prebuilt_queue
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -3072,7 +3090,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -3119,7 +3137,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -3171,13 +3189,16 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch = self.get_new_prebuilt_batch(
+            running_batch, self._num_local_prefill_reqs_joining(last_batch)
+        )
         if new_prebuilt_batch:
-            assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
@@ -3189,6 +3210,11 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+
+        if self.disagg_decode_prebuilt_queue is not None:
+            # Local prefill runs through the aggregated scheduling path, which
+            # also merges the last prefill batch and schedules decode.
+            return self.get_next_batch_to_run(running_batch, last_batch)
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -3202,10 +3228,25 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _num_local_prefill_reqs_joining(
+        self: Scheduler, last_batch: Optional[ScheduleBatch]
+    ) -> int:
+        """Local prefill requests that join the running batch later in this step."""
+        joining = set()
+        if (
+            last_batch is not None
+            and last_batch.forward_mode.is_extend()
+            and self.disagg_decode_prebuilt_queue is not None
+        ):
+            joining.update(last_batch.reqs)
+        if self.chunked_req is not None:
+            joining.add(self.chunked_req)
+        return len(joining)
+
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        batch = self._get_new_prebuilt_batch(running_batch, num_joining_reqs)
         if batch is None:
             return None
         # Verify after host restore and before process_prebuilt caches any KV.
@@ -3271,7 +3312,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -3279,24 +3320,25 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if len(self.waiting_queue) == 0:
+        prebuilt_reqs = self.get_disagg_decode_prebuilt_reqs()
+        if len(prebuilt_reqs) == 0:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, running_batch)
+            self.policy.calc_priority(prebuilt_reqs, running_batch)
 
-        curr_batch_size = running_batch.batch_size()
+        curr_batch_size = running_batch.batch_size() + num_joining_reqs
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
+        # pop req from the prebuilt queue
         can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        remaining_reqs: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        for i in range(len(prebuilt_reqs)):
+            req = prebuilt_reqs[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
@@ -3315,9 +3357,9 @@ class SchedulerDisaggregationDecodeMixin:
                 if req.kv.kv_committed_len is not None:
                     req.extend_end = req.kv.kv_committed_len
             else:
-                waiting_queue.append(req)
+                remaining_reqs.append(req)
 
-        self.waiting_queue = waiting_queue
+        prebuilt_reqs[:] = remaining_reqs
         if len(can_run_list) == 0:
             return None
 
@@ -3366,7 +3408,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
+        self.get_disagg_decode_prebuilt_reqs().extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -3388,7 +3430,7 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            self.get_disagg_decode_prebuilt_reqs().extend(transferred_reqs)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()

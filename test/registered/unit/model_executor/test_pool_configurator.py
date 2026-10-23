@@ -84,6 +84,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    disaggregation_decode_enable_local_prefill=False,
     enable_unified_memory=False,
     enable_hisparse=False,
     hisparse_host_to_device_ratio=1,
@@ -153,6 +154,9 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        disaggregation_decode_enable_local_prefill=(
+            disaggregation_decode_enable_local_prefill
+        ),
         enable_unified_memory=enable_unified_memory,
         enable_hisparse=enable_hisparse,
         hisparse_config=(
@@ -768,6 +772,36 @@ class TestHybridSWAConfigurator(CustomTestCase):
 
         # disagg decode drops the prefill term: per req = 4 + 1 + 4 + 1 = 10.
         self.assertEqual(config.swa_max_total_num_tokens, 100)
+        self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_swa_request_cap_keeps_prefill_for_decode_local_prefill(self):
+        available = 10_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            disable_radix_cache=True,
+            chunked_prefill_size=1000,
+            sliding_window_size=4,
+            page_size=1,
+            max_running_requests=10,
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_local_prefill=True,
+            disable_overlap_schedule=False,  # overlap -> 2 chunks in flight
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        # The decode cap (10 per req) plus 2 * chunk(1000) + page(1).
+        self.assertEqual(config.swa_max_total_num_tokens, 100 + 2001)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
     def test_swa_request_cap_prefill_holds_window_plus_chunk(self):

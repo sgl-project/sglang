@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     post_capture_kv_sizing_planned,
     resolved_view,
     resolving_view,
+    runs_prefill_of,
     use_mla_backend,
 )
 from sglang.srt.environ import envs
@@ -301,6 +302,10 @@ def handle_gpu_memory_settings(server_args: Any):
                 )
                 draft_tokens = cfg.speculative_num_draft_tokens or 1
                 activation_tokens = max(running_requests * draft_tokens, 2048)
+                if cfg.disaggregation_decode_enable_local_prefill:
+                    activation_tokens = max(
+                        activation_tokens, cfg.chunked_prefill_size or 0
+                    )
             elif cfg.chunked_prefill_size > 0:
                 activation_tokens = max(cfg.chunked_prefill_size, 2048)
             else:
@@ -377,10 +382,7 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         if decode_cuda_graph_config.max_bs > 300:
             reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 1.5
 
-    if (
-        cfg.disaggregation_mode != "decode"
-        and prefill_cuda_graph_config.backend != Backend.DISABLED
-    ):
+    if runs_prefill_of(cfg) and prefill_cuda_graph_config.backend != Backend.DISABLED:
         if not use_mla_backend(server_args):
             # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
             reserved_mem += len(prefill_cuda_graph_config.bs) * 8

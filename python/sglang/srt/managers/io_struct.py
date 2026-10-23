@@ -303,6 +303,8 @@ class GenerateReqInput:
     data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For PD disagg — the decode worker prefills this request itself
+    disagg_local_prefill: bool = False
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -1032,6 +1034,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            disagg_local_prefill=self.disagg_local_prefill,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
@@ -1177,6 +1180,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # See GenerateReqInput.disagg_local_prefill.
+    disagg_local_prefill: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
