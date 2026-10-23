@@ -12,6 +12,9 @@ into one pass while reproducing both aten bf16 rounding boundaries:
 once more.  ``tl.sigmoid`` lowers to the same fp32 sigmoid aten uses, which
 makes the replication exact (verified ``torch.equal`` on 1M random bf16
 values); callers still verify the first call and fall back on mismatch.
+
+On XPU the packed form dispatches to ``sgl_kernel.silu_and_mul`` instead, which
+is bit-exact against the same eager pair.
 """
 
 from __future__ import annotations
@@ -61,6 +64,21 @@ def _packed_silu_mul_kernel(
     tl.store(out_ptr + row * D + cols, s * b, mask=mask)
 
 
+def can_use_fused_packed_silu_mul(x: torch.Tensor) -> bool:
+    if not (
+        x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and x.stride(-1) == 1
+        and x.shape[-1] % 2 == 0
+        and x.numel() > 0
+    ):
+        return False
+    if x.is_cuda:
+        return x.stride(-2) >= x.shape[-1] and x.stride(0) == x.shape[1] * x.stride(1)
+    # The XPU kernel copies a strided input first, which makes it slower than eager.
+    return x.device.type == "xpu" and x.is_contiguous()
+
+
 def _fake_silu_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(a)
 
@@ -100,18 +118,13 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 @replay_launches
 def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:
-    """Bit-exact SwiGLU over a contiguous packed ``[..., 2 * D]`` input."""
-    if not (
-        (x.is_cuda or x.is_xpu)
-        and x.dtype is torch.bfloat16
-        and x.dim() == 3
-        and x.stride(-1) == 1
-        and x.stride(-2) >= x.shape[-1]
-        and x.stride(0) == x.shape[1] * x.stride(1)
-        and x.shape[-1] % 2 == 0
-        and x.numel() > 0
-    ):
+    """Bit-exact SwiGLU over a packed ``[..., 2 * D]`` input."""
+    if not can_use_fused_packed_silu_mul(x):
         raise RuntimeError("unsupported input for packed fused SiLU-mul")
+    if not x.is_cuda:
+        from sgl_kernel import silu_and_mul
+
+        return silu_and_mul(x)
     hidden = x.shape[-1] // 2
     rows = x.numel() // x.shape[-1]
     row_stride = x.stride(-2)
