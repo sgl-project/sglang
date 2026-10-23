@@ -92,6 +92,48 @@ def _try_aiter_gdn_decode(**kw):
         return None
 
 
+def _try_aiter_gdn_packed_decode(
+    *,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_v_heads: int,
+    head_v_dim: int,
+):
+    """Split the packed decode batch into the AITER recurrence's q/k/v views."""
+    if _aiter_gdn_decode_varlen() is None:
+        return None
+    # mixed_qkv is [B, q_dim + k_dim + v_dim] with q_dim == k_dim;
+    # ssm_states is [num_slots, HV, V, K].
+    B = mixed_qkv.shape[0]
+    head_k_dim = ssm_states.shape[-1]
+    v_dim = num_v_heads * head_v_dim
+    qk_dim = (mixed_qkv.shape[-1] - v_dim) // 2
+    num_k_heads = qk_dim // head_k_dim
+    q, k, v = torch.split(mixed_qkv, [qk_dim, qk_dim, v_dim], dim=-1)
+    return _try_aiter_gdn_decode(
+        q=q.view(1, B, num_k_heads, head_k_dim),
+        k=k.view(1, B, num_k_heads, head_k_dim),
+        v=v.view(1, B, num_v_heads, head_v_dim),
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=ssm_states,
+        state_indices=cache_indices,
+        cu_seqlens=query_start_loc,
+        scale=scale,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    )
+
+
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
@@ -108,6 +150,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         scale: float,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
         **kwargs,
@@ -124,6 +167,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             scale: attention scale factor (typically head_k_dim ** -0.5).
             ssm_states: [num_slots, HV, V, K] full state pool.
             cache_indices: [B] per-request state slot indices.
+            query_start_loc: [B + 1] token offsets (one token per request).
             num_v_heads: number of value heads (after TP sharding).
             head_v_dim: dimension per value head.
 
@@ -172,6 +216,24 @@ class TritonGDNKernel(LinearAttnKernelBase):
             )
             return out.transpose(0, 1)
 
+        # The GDN backend sends every Triton decode here rather than to
+        # decode(), so the AITER decode hook has to live on this path.
+        aiter_out = _try_aiter_gdn_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+        )
+        if aiter_out is not None:
+            return aiter_out
+
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -204,22 +266,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        out = _try_aiter_gdn_decode(
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            state=ssm_states,
-            state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
-        if out is not None:
-            return out
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

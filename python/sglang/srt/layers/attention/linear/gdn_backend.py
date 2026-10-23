@@ -813,6 +813,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 scale=layer.head_k_dim**-0.5,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 replayssm_d=replayssm_d,
