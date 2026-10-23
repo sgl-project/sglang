@@ -241,14 +241,16 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = worker_context.Process(
                 target=bootstrap_http_server_process,
-                args=(server_args_payload,),
+                args=(server_args_payload, tuple(p.pid for p in processes)),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
         else:
             try:
-                launch_http_server_only(server_args)
+                launch_http_server_only(
+                    server_args, worker_pids=tuple(p.pid for p in processes)
+                )
             finally:
                 shutdown_scheduler_processes(server_args, processes)
 
@@ -467,7 +469,9 @@ def launch_pool_disagg_server(
             server_args.scheduler_port,
         )
         try:
-            launch_http_server_only(server_args)
+            launch_http_server_only(
+                server_args, worker_pids=tuple(p.pid for p in all_processes)
+            )
         finally:
             diffusion_server.stop()
             shutdown_scheduler_processes(
@@ -477,12 +481,12 @@ def launch_pool_disagg_server(
     return all_processes
 
 
-def launch_http_server_only(server_args):
+def launch_http_server_only(server_args, *, worker_pids: tuple[int, ...] = ()):
     init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
-    app = create_app(server_args)
+    app = create_app(server_args, worker_pids=worker_pids)
     uvicorn.run(
         app,
         use_colors=True,

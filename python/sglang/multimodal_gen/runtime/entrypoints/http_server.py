@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
 import httpx
+import psutil
 import torch
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -189,6 +190,20 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
+    for worker in request.app.state.worker_processes:
+        try:
+            # is_running also detects PID reuse; an unreaped child is still a zombie
+            if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            pass
+        return orjson_response(
+            {
+                "status": "unhealthy",
+                "error": "Scheduler worker exited; restart the server.",
+            },
+            status_code=503,
+        )
     return {"status": "ok"}
 
 
@@ -427,12 +442,13 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
-def create_app(server_args: ServerArgs):
+def create_app(server_args: ServerArgs, *, worker_pids: tuple[int, ...] = ()):
     """
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled_kwargs())
+    app.state.worker_processes = [psutil.Process(pid) for pid in worker_pids]
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)

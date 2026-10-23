@@ -169,7 +169,8 @@ def test_server_load_clock_excludes_warmup(
     monkeypatch.setattr(launcher.mp, "get_context", Mock(return_value=worker_context))
     monkeypatch.setattr(launcher, "shutdown_scheduler_processes", Mock())
 
-    def warmup(args):
+    def warmup(args, *, worker_pids):
+        assert len(worker_pids) == workers
         clock[0] += warmup_seconds * 1_000_000_000
 
     monkeypatch.setattr(launcher, "launch_http_server_only", warmup)
