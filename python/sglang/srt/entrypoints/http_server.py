@@ -1807,7 +1807,7 @@ async def continue_generation(
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def checkpoint_prepare(mode: Literal["abort", "retract"] = "abort"):
     """Pause generation with `mode` and release the KV cache for an external
-    process checkpoint. Returns once started; poll /checkpoint/status."""
+    process checkpoint. Returns once started. Poll /checkpoint/status."""
     out = await _global_state.tokenizer_manager.checkpoint_prepare(mode)
     return _checkpoint_response(out)
 

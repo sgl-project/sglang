@@ -894,7 +894,7 @@ class TokenizerControlMixin:
 
     async def checkpoint_state(self: TokenizerManager) -> CheckpointReqOutput:
         """The process checkpoint state of every DP rank, and whether prepare
-        would be refused; see scheduler_components/checkpoint_lifecycle.py."""
+        would be refused. See scheduler_components/checkpoint_manager.py."""
         self.auto_create_handle_loop()
         return await self._call_checkpoint(CheckpointReqType.STATE)
 
@@ -902,7 +902,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, mode: Literal["abort", "retract"]
     ) -> CheckpointReqOutput:
         """Pause generation as /pause_generation does, then release the KV
-        cache once the scheduler drains; clients see a paused server."""
+        cache once the scheduler drains. Clients see a paused server."""
         self.auto_create_handle_loop()
         async with self.checkpoint_lock:
             out = await self._call_checkpoint(CheckpointReqType.STATE)
@@ -930,8 +930,8 @@ class TokenizerControlMixin:
         async with self.checkpoint_lock:
             before = await self._call_checkpoint(CheckpointReqType.STATE)
             out = await self._call_checkpoint(CheckpointReqType.RESUME)
-            # Continue only the pause this cycle started, not a later user
-            # pause; with DP ranks resumed by an earlier call, `before` is mixed.
+            # Continue only the pause this cycle started, not a later user pause.
+            # With DP ranks resumed by an earlier call, `before` is mixed.
             if (
                 before.state != CheckpointState.RUNNING
                 and out.state == CheckpointState.RUNNING
@@ -945,20 +945,8 @@ class TokenizerControlMixin:
         results = await self.checkpoint_communicator(
             CheckpointReqInput(req_type=req_type)
         )
-        # DP ranks move independently: failed if any failed, otherwise the state
-        # all share or the transition in progress.
-        states = {r.state for r in results}
-        if CheckpointState.FAILED in states:
-            state = CheckpointState.FAILED
-        elif len(states) == 1:
-            state = states.pop()
-        elif CheckpointState.PREPARING in states:
-            state = CheckpointState.PREPARING
-        else:
-            state = CheckpointState.RESUMING
-        refused = [r for r in results if not r.success]
-        message = next((r.message for r in refused or results if r.message), "")
-        return CheckpointReqOutput(success=not refused, message=message, state=state)
+        # DP ranks move independently.
+        return CheckpointReqOutput.merge(results)
 
     async def _refuse_continue_during_checkpoint(self: TokenizerManager) -> None:
         # Continuing while the KV cache is released would schedule requests
