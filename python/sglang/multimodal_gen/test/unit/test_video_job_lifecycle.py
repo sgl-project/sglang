@@ -1,7 +1,9 @@
 import asyncio
 import os
+import shutil
 import tempfile
 import threading
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,6 +114,75 @@ def test_cancelled_preparation_finishes_before_request_cleanup(monkeypatch, tmp_
     asyncio.run(run_test())
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("failure", ["sampling", "prepare", "cleanup"])
+def test_rejected_video_request_cleans_only_owned_resources(
+    monkeypatch, tmp_path, persistent, failure
+):
+    app = _request_app(monkeypatch, tmp_path)
+    inputs, outputs = tmp_path / "inputs", tmp_path / "outputs"
+    if persistent:
+        inputs.mkdir()
+        outputs.mkdir()
+        (inputs / "keep").write_bytes(b"input")
+        (outputs / "keep").write_bytes(b"output")
+        monkeypatch.setattr(
+            video_api,
+            "get_global_server_args",
+            lambda: SimpleNamespace(
+                input_save_path=str(inputs),
+                output_path=str(outputs),
+                served_model_name="test",
+            ),
+        )
+    cleaned = []
+
+    class Sampling:
+        def prepare_video_request_for_queue(self, batch):
+            (Path(batch.output_path) / "prepared.bin").write_bytes(b"prepared")
+            raise ValueError("invalid preparation")
+
+        def cleanup_video_request(self, batch):
+            prepared = Path(batch.output_path) / "prepared.bin"
+            cleaned.append(prepared.read_bytes())
+            prepared.unlink()
+            if failure == "cleanup":
+                raise RuntimeError("cleanup failure")
+
+    sampling = Sampling()
+
+    def build_sampling(_request_id, req):
+        if failure == "sampling":
+            raise RuntimeError("sampling failure")
+        sampling.output_path = req.output_path
+        return sampling
+
+    monkeypatch.setattr(video_api, "_build_video_sampling_params", build_sampling)
+    monkeypatch.setattr(
+        video_api,
+        "prepare_request",
+        lambda **_: SimpleNamespace(
+            sampling_params=sampling, output_path=sampling.output_path
+        ),
+    )
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.post("/v1/videos", json={"prompt": "test"})
+        assert response.status_code == (500 if failure == "sampling" else 400)
+        assert cleaned == ([] if failure == "sampling" else [b"prepared"])
+        assert not list(tmp_path.glob("sglang*"))
+        assert not video_api._VIDEO_JOB_TASKS
+        if persistent:
+            assert (inputs / "keep").read_bytes() == b"input"
+            assert (outputs / "keep").read_bytes() == b"output"
+
+    asyncio.run(run_test())
+
+
 def test_video_job_registry_holds_task_until_completion():
     async def run_test():
         started = asyncio.Event()
@@ -200,10 +271,15 @@ def _run_dispatch(monkeypatch, tmp_path, *, output_persistent, upload):
 
     async def run_test():
         await video_api.VIDEO_STORE.upsert("job-id", {"id": "job-id"})
+        resources = AsyncExitStack()
+        if not output_persistent:
+            resources.callback(shutil.rmtree, output_dir, ignore_errors=True)
+        batch = _FakeBatch()
+        resources.push_async_callback(video_api._cleanup_video_request, batch)
         await video_api._dispatch_job_async(
             "job-id",
-            _FakeBatch(),
-            temp_dirs=[] if output_persistent else [str(output_dir)],
+            batch,
+            resources=resources,
             output_persistent=output_persistent,
         )
         return await video_api.VIDEO_STORE.pop("job-id")
