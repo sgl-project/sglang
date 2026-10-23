@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Central request router for disaggregated diffusion pipelines."""
 
+import base64
 import json
 import logging
+import os
 import pickle
 import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 import zmq
 from transformers import AutoProcessor
 from zmq.utils.monitor import recv_monitor_message
 
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
+    DispatchPolicy,
     PoolDispatcher,
+    create_dispatch_policy,
 )
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
@@ -112,6 +118,8 @@ class _EncoderTTAEntry:
 
 @dataclass
 class _TransferRequestState:
+    sender_role: RoleType = RoleType.ENCODER
+    receiver_role: RoleType = RoleType.DENOISER
     sender_session_id: str = ""
     sender_pool_ptr: int = 0
     sender_slot_offset: int = 0
@@ -138,6 +146,19 @@ class _RoleTTAEntry:
     transfer_state: _TransferRequestState | None = None
 
 
+class _RolePool(msgspec.Struct):
+    endpoints: list[str]
+    result_endpoint: str
+    free_slots: list[int]
+    peers: dict[int, dict]
+    queue: deque
+    policy: DispatchPolicy
+    waiting: RequestState
+    running: RequestState
+    done: RequestState
+    pushes: list = []
+
+
 class DiffusionServer:
     """Global pipeline orchestrator for N:M:K disaggregated diffusion.
 
@@ -161,14 +182,33 @@ class DiffusionServer:
         p2p_mode: bool = True,
         server_args=None,
         glm_distributed_mode_enabled: bool = False,
+        prompt_encoder_work_endpoints: list[str] | None = None,
+        image_encoder_work_endpoints: list[str] | None = None,
+        prompt_encoder_result_endpoint: str | None = None,
+        image_encoder_result_endpoint: str | None = None,
     ):
+        split_encoding = bool(
+            prompt_encoder_work_endpoints or image_encoder_work_endpoints
+        )
+        if split_encoding:
+            if encoder_work_endpoints or glm_distributed_mode_enabled:
+                raise ValueError(
+                    "Split encoders cannot be combined with --encoder-urls or GLM distributed mode"
+                )
+            if not all(
+                (
+                    prompt_encoder_work_endpoints,
+                    image_encoder_work_endpoints,
+                    prompt_encoder_result_endpoint,
+                    image_encoder_result_endpoint,
+                )
+            ):
+                raise ValueError(
+                    "Split encoding requires both prompt and image encoder pools and result endpoints"
+                )
+            encoder_work_endpoints = prompt_encoder_work_endpoints
+            encoder_result_endpoint = prompt_encoder_result_endpoint
         self._frontend_endpoint = frontend_endpoint
-        self._encoder_work_endpoints = encoder_work_endpoints
-        self._denoiser_work_endpoints = denoiser_work_endpoints
-        self._decoder_work_endpoints = decoder_work_endpoints
-        self._encoder_result_endpoint = encoder_result_endpoint
-        self._denoiser_result_endpoint = denoiser_result_endpoint
-        self._decoder_result_endpoint = decoder_result_endpoint
 
         self._num_encoders = len(encoder_work_endpoints)
         self._num_denoisers = len(denoiser_work_endpoints)
@@ -237,16 +277,64 @@ class DiffusionServer:
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
 
-        # work_endpoint -> index lookup tables, built from the --*-urls args
-        self._encoder_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(encoder_work_endpoints)
+        # Split encoding adds one hop to the existing bounded transfer pipeline.
+        self._input_role = (
+            RoleType.PROMPT_ENCODER if split_encoding else RoleType.ENCODER
+        )
+        self._pools = {
+            self._input_role: _RolePool(
+                encoder_work_endpoints,
+                encoder_result_endpoint,
+                self._encoder_free_slots,
+                self._encoder_peers,
+                self._encoder_tta,
+                self._dispatcher.encoder_policy,
+                RequestState.ENCODER_WAITING,
+                RequestState.ENCODER_RUNNING,
+                RequestState.ENCODER_DONE,
+            ),
+            RoleType.DENOISER: _RolePool(
+                denoiser_work_endpoints,
+                denoiser_result_endpoint,
+                self._denoiser_free_slots,
+                self._denoiser_peers,
+                self._denoiser_tta,
+                self._dispatcher.denoiser_policy,
+                RequestState.DENOISING_WAITING,
+                RequestState.DENOISING_RUNNING,
+                RequestState.DENOISING_DONE,
+            ),
+            RoleType.DECODER: _RolePool(
+                decoder_work_endpoints,
+                decoder_result_endpoint,
+                self._decoder_free_slots,
+                self._decoder_peers,
+                self._decoder_tta,
+                self._dispatcher.decoder_policy,
+                RequestState.DECODER_WAITING,
+                RequestState.DECODER_RUNNING,
+                RequestState.DONE,
+            ),
         }
-        self._denoiser_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(denoiser_work_endpoints)
-        }
-        self._decoder_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(decoder_work_endpoints)
-        }
+        if split_encoding:
+            self._pools[RoleType.IMAGE_ENCODER] = _RolePool(
+                image_encoder_work_endpoints,
+                image_encoder_result_endpoint,
+                [encoder_capacity] * len(image_encoder_work_endpoints),
+                {},
+                deque(),
+                create_dispatch_policy(
+                    dispatch_policy_name, len(image_encoder_work_endpoints)
+                ),
+                RequestState.IMAGE_ENCODER_WAITING,
+                RequestState.IMAGE_ENCODER_RUNNING,
+                RequestState.IMAGE_ENCODER_DONE,
+            )
+        self._role_order = [self._input_role]
+        if split_encoding:
+            self._role_order.append(RoleType.IMAGE_ENCODER)
+        self._role_order.extend((RoleType.DENOISER, RoleType.DECODER))
+        self._assignments: dict[str, dict[RoleType, int]] = {}
 
     @property
     def tracker(self) -> RequestTracker:
@@ -323,16 +411,26 @@ class DiffusionServer:
             same_port=True,
         )
 
-        encoder_pushes: list[zmq.Socket] = []
-        for i, ep in enumerate(self._encoder_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
-            encoder_pushes.append(sock)
+        poller = zmq.Poller()
+        poller.register(frontend, zmq.POLLIN)
+        result_roles = {}
+        all_sockets = [frontend]
+        for role, pool in self._pools.items():
+            for endpoint in pool.endpoints:
+                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
+                pool.pushes.append(sock)
+            result, _ = get_zmq_socket(
+                self._context, zmq.PULL, pool.result_endpoint, bind=True, same_port=True
+            )
+            poller.register(result, zmq.POLLIN)
+            result_roles[result] = role
+            all_sockets.extend([result, *pool.pushes])
 
-        denoiser_pushes: list[zmq.Socket] = []
+        self._encoder_pushes = self._pools[self._input_role].pushes
+        self._denoiser_pushes = self._pools[RoleType.DENOISER].pushes
+        self._decoder_pushes = self._pools[RoleType.DECODER].pushes
         denoiser_monitors: list[zmq.Socket] = []
-        for i, ep in enumerate(self._denoiser_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
-            denoiser_pushes.append(sock)
+        for sock in self._denoiser_pushes:
             if self._glm_distributed_state is not None:
                 denoiser_monitors.append(
                     sock.get_monitor_socket(
@@ -340,55 +438,13 @@ class DiffusionServer:
                     )
                 )
 
-        decoder_pushes: list[zmq.Socket] = []
-        for i, ep in enumerate(self._decoder_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
-            decoder_pushes.append(sock)
-
-        encoder_result_pull, _ = get_zmq_socket(
-            self._context,
-            zmq.PULL,
-            self._encoder_result_endpoint,
-            bind=True,
-            same_port=True,
-        )
-        denoiser_result_pull, _ = get_zmq_socket(
-            self._context,
-            zmq.PULL,
-            self._denoiser_result_endpoint,
-            bind=True,
-            same_port=True,
-        )
-        decoder_result_pull, _ = get_zmq_socket(
-            self._context,
-            zmq.PULL,
-            self._decoder_result_endpoint,
-            bind=True,
-            same_port=True,
-        )
-
-        poller = zmq.Poller()
-        poller.register(frontend, zmq.POLLIN)
-        poller.register(encoder_result_pull, zmq.POLLIN)
-        poller.register(denoiser_result_pull, zmq.POLLIN)
-        poller.register(decoder_result_pull, zmq.POLLIN)
         for monitor in denoiser_monitors:
             poller.register(monitor, zmq.POLLIN)
-
-        self._encoder_pushes = encoder_pushes
-        self._denoiser_pushes = denoiser_pushes
-        self._decoder_pushes = decoder_pushes
         self._frontend = frontend
 
         self._ready.set()
 
-        all_sockets = (
-            [frontend, encoder_result_pull, denoiser_result_pull, decoder_result_pull]
-            + encoder_pushes
-            + denoiser_pushes
-            + decoder_pushes
-            + denoiser_monitors
-        )
+        all_sockets.extend(denoiser_monitors)
 
         try:
             while self._running:
@@ -399,14 +455,9 @@ class DiffusionServer:
                 if frontend in events:
                     self._handle_client_request(frontend)
 
-                if encoder_result_pull in events:
-                    self._handle_role_result(encoder_result_pull, RoleType.ENCODER)
-
-                if denoiser_result_pull in events:
-                    self._handle_role_result(denoiser_result_pull, RoleType.DENOISER)
-
-                if decoder_result_pull in events:
-                    self._handle_role_result(decoder_result_pull, RoleType.DECODER)
+                for result_pull, role in result_roles.items():
+                    if result_pull in events:
+                        self._handle_role_result(result_pull, role)
 
                 for worker_idx, monitor in enumerate(denoiser_monitors):
                     if monitor in events:
@@ -547,6 +598,28 @@ class DiffusionServer:
                 _GlmDistributedRequest(request_id, req, now)
             )
             return
+
+        if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
+            # HTTP uploads belong to the head's filesystem, not the GPU workers'.
+            paths = (
+                req.image_path
+                if isinstance(req.image_path, (list, tuple))
+                else [req.image_path]
+            )
+            try:
+                req.image_path = [
+                    "data:application/octet-stream;base64,"
+                    + base64.b64encode(Path(path).read_bytes()).decode("ascii")
+                    if isinstance(path, str) and os.path.isfile(path)
+                    else path
+                    for path in paths
+                ]
+                payload = pickle.dumps(reqs)
+            except OSError as error:
+                self._complete_with_error(
+                    request_id, f"Cannot read reference image: {error}"
+                )
+                return
 
         self._encoder_tta.append(
             _EncoderTTAEntry(
@@ -805,9 +878,10 @@ class DiffusionServer:
             return
 
         logger.debug("DiffusionServer: decoder result %s", request_id)
-        record = self._tracker.get(request_id)
-        if record and record.decoder_instance is not None:
-            self._decoder_free_slots[record.decoder_instance] += 1
+        self._release_assignment(request_id, RoleType.DECODER)
+        self._assignments.pop(request_id, None)
+        p2p = self._transfer_state.get(request_id)
+        self._recycle_prealloc_slot(p2p, RoleType.DECODER)
 
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
 
@@ -858,6 +932,7 @@ class DiffusionServer:
         self, request_id: str, payload: bytes, encoder_idx: int
     ) -> None:
         self._encoder_free_slots[encoder_idx] -= 1
+        self._assignments.setdefault(request_id, {})[self._input_role] = encoder_idx
 
         try:
             self._tracker.transition(
@@ -880,8 +955,8 @@ class DiffusionServer:
 
     def _drain_all_queues(self) -> None:
         self._drain_encoder_tta()
-        self._drain_denoiser_tta()
-        self._drain_decoder_tta()
+        for role in self._role_order[1:]:
+            self._drain_transfer_queue(role)
 
     def _drain_encoder_tta(self) -> None:
         while self._encoder_tta:
@@ -891,30 +966,21 @@ class DiffusionServer:
             if idx is None:
                 break
             entry = self._encoder_tta.popleft()
+            if self._tracker.get(entry.request_id) is None:
+                continue
             self._dispatch_to_encoder(entry.request_id, entry.payload, idx)
 
-    def _drain_denoiser_tta(self) -> None:
-        while self._denoiser_tta:
-            idx = self._dispatcher.select_denoiser_with_capacity(
-                self._denoiser_free_slots
-            )
+    def _drain_transfer_queue(self, role: RoleType) -> None:
+        pool = self._pools[role]
+        while pool.queue:
+            idx = pool.policy.select_with_capacity(pool.free_slots)
             if idx is None:
                 break
-            entry = self._denoiser_tta.popleft()
+            entry = pool.queue.popleft()
+            if self._tracker.get(entry.request_id) is None:
+                continue
             self._transfer_dispatch_to_receiver(
-                entry.request_id, entry.transfer_state, idx, RoleType.DENOISER
-            )
-
-    def _drain_decoder_tta(self) -> None:
-        while self._decoder_tta:
-            idx = self._dispatcher.select_decoder_with_capacity(
-                self._decoder_free_slots
-            )
-            if idx is None:
-                break
-            entry = self._decoder_tta.popleft()
-            self._transfer_dispatch_to_receiver(
-                entry.request_id, entry.transfer_state, idx, RoleType.DECODER
+                entry.request_id, entry.transfer_state, idx, role
             )
 
     def _extract_request_id(self, frames: list) -> str | None:
@@ -926,6 +992,11 @@ class DiffusionServer:
 
     def _complete_with_error(self, request_id: str, error_msg: str) -> None:
         logger.error("DiffusionServer: %s — %s", request_id, error_msg)
+
+        for role in list(self._assignments.get(request_id, {})):
+            self._release_assignment(request_id, role)
+        self._assignments.pop(request_id, None)
+        self._transfer_state.pop(request_id, None)
 
         try:
             self._tracker.transition(request_id, RequestState.FAILED, error=error_msg)
@@ -969,15 +1040,10 @@ class DiffusionServer:
 
         if timed_out:
             timed_set = set(timed_out)
-            self._encoder_tta = deque(
-                e for e in self._encoder_tta if e.request_id not in timed_set
-            )
-            self._denoiser_tta = deque(
-                e for e in self._denoiser_tta if e.request_id not in timed_set
-            )
-            self._decoder_tta = deque(
-                e for e in self._decoder_tta if e.request_id not in timed_set
-            )
+            for pool in self._pools.values():
+                remaining = [e for e in pool.queue if e.request_id not in timed_set]
+                pool.queue.clear()
+                pool.queue.extend(remaining)
             if self._glm_distributed_state is not None:
                 state = self._glm_distributed_state
                 state.pending_ar_requests = deque(
@@ -999,6 +1065,10 @@ class DiffusionServer:
                             self._denoiser_free_slots[request.worker_idx] = 1
 
     def _free_slot_for_record(self, record) -> None:
+        if self._glm_distributed_state is None:
+            for role in list(self._assignments.get(record.request_id, {})):
+                self._release_assignment(record.request_id, role)
+            return
         if (
             record.state in (RequestState.ENCODER_RUNNING, RequestState.ENCODER_DONE)
             and record.encoder_instance is not None
@@ -1016,6 +1086,12 @@ class DiffusionServer:
         ):
             self._decoder_free_slots[record.decoder_instance] += 1
 
+    def _release_assignment(self, request_id: str, role: RoleType) -> None:
+        assignments = self._assignments.get(request_id, {})
+        index = assignments.pop(role, None)
+        if index is not None:
+            self._pools[role].free_slots[index] += 1
+
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
             msg = decode_transfer_msg(frames)
@@ -1028,11 +1104,11 @@ class DiffusionServer:
         if msg_type == TransferMsgType.REGISTER:
             self._handle_transfer_register(msg)
         elif msg_type == TransferMsgType.STAGED:
-            self._handle_transfer_staged(msg)
+            self._handle_transfer_staged(msg, role)
         elif msg_type == TransferMsgType.ALLOCATED:
-            self._handle_transfer_allocated(msg)
+            self._handle_transfer_allocated(msg, role)
         elif msg_type == TransferMsgType.PUSHED:
-            self._handle_transfer_pushed(msg)
+            self._handle_transfer_pushed(msg, role)
         elif msg_type == TransferMsgType.DONE:
             self._handle_transfer_done(msg, role)
         else:
@@ -1049,20 +1125,15 @@ class DiffusionServer:
             return
 
         work_endpoint = msg.get("work_endpoint", "")
-        if role == RoleType.ENCODER:
-            endpoint_to_idx = self._encoder_endpoint_to_idx
-            peers = self._encoder_peers
-        elif role == RoleType.DENOISER:
-            endpoint_to_idx = self._denoiser_endpoint_to_idx
-            peers = self._denoiser_peers
-        elif role == RoleType.DECODER:
-            endpoint_to_idx = self._decoder_endpoint_to_idx
-            peers = self._decoder_peers
-        else:
+        pool = self._pools.get(role)
+        if pool is None:
             logger.warning(
                 "DiffusionServer transfer: unsupported role in register: %s", role
             )
             return
+
+        endpoint_to_idx = {ep: i for i, ep in enumerate(pool.endpoints)}
+        peers = pool.peers
 
         idx = endpoint_to_idx.get(work_endpoint)
         if idx is None:
@@ -1100,34 +1171,43 @@ class DiffusionServer:
             len(prealloc),
         )
 
-    def _handle_transfer_staged(self, msg: dict) -> None:
+    def _handle_transfer_staged(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
-        logger.debug("DiffusionServer transfer: encoder staged %s", request_id)
+        assignments = self._assignments.get(request_id, {})
         record = self._tracker.get(request_id)
-        encoder_idx = record.encoder_instance if record else 0
+        if (
+            role not in assignments
+            or record is None
+            or record.state != self._pools[role].running
+        ):
+            # Ignore late results after timeout/failure, without returning a slot twice.
+            return
+        old_transfer = self._transfer_state.get(request_id)
+        if old_transfer is not None:
+            self._recycle_prealloc_slot(old_transfer, role)
+        next_role = self._role_order[self._role_order.index(role) + 1]
+        if role == RoleType.PROMPT_ENCODER and not msg.get("scalar_fields", {}).get(
+            "image_path"
+        ):
+            next_role = RoleType.DENOISER
 
         p2p = _TransferRequestState(
+            sender_role=role,
+            receiver_role=next_role,
             sender_session_id=msg.get("session_id", ""),
             sender_pool_ptr=msg.get("pool_ptr", 0),
             sender_slot_offset=msg.get("slot_offset", 0),
             data_size=msg.get("data_size", 0),
             manifest=msg.get("manifest", {}),
             scalar_fields=msg.get("scalar_fields", {}),
-            sender_instance=encoder_idx,
+            sender_instance=assignments[role],
         )
         self._transfer_state[request_id] = p2p
 
-        # Encoder slot freed later in _handle_transfer_pushed after RDMA completes
-        try:
-            self._tracker.transition(request_id, RequestState.ENCODER_DONE)
-        except ValueError:
-            pass
-
-        try:
-            self._tracker.transition(request_id, RequestState.DENOISING_WAITING)
-        except ValueError:
-            pass
-        self._denoiser_tta.append(
+        # The sender retains its slot until the transfer completes.
+        self._tracker.transition(request_id, self._pools[role].done)
+        self._tracker.transition(request_id, self._pools[next_role].waiting)
+        self._pools[next_role].queue.append(
             _RoleTTAEntry(request_id=request_id, transfer_state=p2p)
         )
 
@@ -1204,56 +1284,38 @@ class DiffusionServer:
         receiver_idx: int,
         role: RoleType,
     ) -> None:
-        if role == RoleType.DENOISER:
-            free_slots = self._denoiser_free_slots
-            peers = self._denoiser_peers
-            sender_pushes = self._encoder_pushes
-            receiver_pushes = self._denoiser_pushes
-            source_role = "encoder"
-            running_state = RequestState.DENOISING_RUNNING
-        elif role == RoleType.DECODER:
-            free_slots = self._decoder_free_slots
-            peers = self._decoder_peers
-            sender_pushes = self._denoiser_pushes
-            receiver_pushes = self._decoder_pushes
-            source_role = "denoiser"
-            running_state = RequestState.DECODER_RUNNING
-        else:
-            raise ValueError(f"Invalid transfer receiver role: {role}")
-
-        free_slots[receiver_idx] -= 1
+        pool = self._pools[role]
+        pool.free_slots[receiver_idx] -= 1
+        self._assignments.setdefault(request_id, {})[role] = receiver_idx
+        p2p.receiver_role = role
         p2p.receiver_instance = receiver_idx
-
-        try:
-            self._tracker.transition(
-                request_id,
-                running_state,
-                **{f"{role.value}_instance": receiver_idx},
-            )
-        except ValueError:
-            pass
-
-        peer_info = peers.get(receiver_idx, {})
+        instance = (
+            {f"{role.value}_instance": receiver_idx}
+            if role in (RoleType.DENOISER, RoleType.DECODER)
+            else {}
+        )
+        self._tracker.transition(request_id, pool.running, **instance)
+        peer_info = pool.peers.get(receiver_idx, {})
         if not self._try_fast_path_push(
             request_id=request_id,
             p2p=p2p,
             receiver_peer_info=peer_info,
-            sender_pushes=sender_pushes,
+            sender_pushes=self._pools[p2p.sender_role].pushes,
             receiver_role_label=role.value,
             receiver_idx=receiver_idx,
         ):
             self._send_slow_path_alloc(
                 request_id=request_id,
                 p2p=p2p,
-                receiver_pushes=receiver_pushes,
+                receiver_pushes=pool.pushes,
                 receiver_idx=receiver_idx,
-                source_role=source_role,
+                source_role=p2p.sender_role.value,
             )
 
-    def _handle_transfer_allocated(self, msg: dict) -> None:
+    def _handle_transfer_allocated(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         p2p = self._transfer_state.get(request_id)
-        if p2p is None:
+        if p2p is None or role != p2p.receiver_role:
             logger.warning(
                 "DiffusionServer transfer: no state for allocated %s", request_id
             )
@@ -1271,46 +1333,24 @@ class DiffusionServer:
             transfer_size=p2p.data_size,
         )
 
-        sender_idx = p2p.sender_instance
-        record = self._tracker.get(request_id)
-        if record and record.state in (
-            RequestState.DECODER_RUNNING,
-            RequestState.DECODER_WAITING,
-        ):
-            self._denoiser_pushes[sender_idx].send_multipart(
-                encode_transfer_msg(push_msg)
-            )
-        else:
-            self._encoder_pushes[sender_idx].send_multipart(
-                encode_transfer_msg(push_msg)
-            )
+        self._pools[p2p.sender_role].pushes[p2p.sender_instance].send_multipart(
+            encode_transfer_msg(push_msg)
+        )
 
-    def _handle_transfer_pushed(self, msg: dict) -> None:
+    def _handle_transfer_pushed(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         logger.debug("DiffusionServer transfer: pushed %s", request_id)
         p2p = self._transfer_state.get(request_id)
-        if p2p is None:
+        if p2p is None or role != p2p.sender_role:
             logger.warning(
                 "DiffusionServer transfer: no state for pushed %s", request_id
             )
             return
 
-        # Use record state (not sender_idx) to determine sender role,
-        # because encoder and denoiser can share the same instance index.
-        record = self._tracker.get(request_id)
-        if record and record.state in (
-            RequestState.DENOISING_RUNNING,
-            RequestState.DENOISING_WAITING,
-            RequestState.DENOISING_DONE,
-        ):
-            if record.encoder_instance is not None:
-                self._encoder_free_slots[record.encoder_instance] += 1
-        elif record and record.state in (
-            RequestState.DECODER_RUNNING,
-            RequestState.DECODER_WAITING,
-        ):
-            if record.denoiser_instance is not None:
-                self._denoiser_free_slots[record.denoiser_instance] += 1
+        if role not in self._assignments.get(request_id, {}):
+            return
+
+        self._release_assignment(request_id, p2p.sender_role)
 
         scalar_fields = dict(p2p.scalar_fields) if p2p.scalar_fields else {}
         if p2p.prealloc_slot_id is not None:
@@ -1322,22 +1362,9 @@ class DiffusionServer:
             scalar_fields=scalar_fields,
         )
 
-        receiver_idx = p2p.receiver_instance
-        record = self._tracker.get(request_id)
-        if record and record.state in (
-            RequestState.DENOISING_RUNNING,
-            RequestState.DENOISING_WAITING,
-        ):
-            self._denoiser_pushes[receiver_idx].send_multipart(
-                encode_transfer_msg(ready_msg)
-            )
-        elif record and record.state in (
-            RequestState.DECODER_RUNNING,
-            RequestState.DECODER_WAITING,
-        ):
-            self._decoder_pushes[receiver_idx].send_multipart(
-                encode_transfer_msg(ready_msg)
-            )
+        self._pools[p2p.receiver_role].pushes[p2p.receiver_instance].send_multipart(
+            encode_transfer_msg(ready_msg)
+        )
 
         logger.debug(
             "DiffusionServer transfer: notified receiver for %s (data ready)",
@@ -1349,13 +1376,9 @@ class DiffusionServer:
     ) -> None:
         if p2p is None or p2p.prealloc_slot_id is None:
             return
-        receiver_idx = p2p.receiver_instance
-        if role == RoleType.DENOISER:
-            peer_info = self._denoiser_peers.get(receiver_idx, {})
-        elif role == RoleType.DECODER:
-            peer_info = self._decoder_peers.get(receiver_idx, {})
-        else:
+        if role not in self._pools:
             return
+        peer_info = self._pools[role].peers.get(p2p.receiver_instance, {})
         free_list = peer_info.get("free_preallocated_slots", [])
         free_list.append(
             {
@@ -1377,6 +1400,11 @@ class DiffusionServer:
         error = msg.get("error")
         p2p = self._transfer_state.get(request_id)
 
+        if role == RoleType.IMAGE_ENCODER and error:
+            self._recycle_prealloc_slot(p2p, role)
+            self._complete_with_error(request_id, f"Image encoder error: {error}")
+            return
+
         if role == RoleType.DENOISER:
             record = self._tracker.get(request_id)
 
@@ -1384,8 +1412,6 @@ class DiffusionServer:
                 self._recycle_prealloc_slot(p2p, RoleType.DENOISER)
 
             if error:
-                if record and record.denoiser_instance is not None:
-                    self._denoiser_free_slots[record.denoiser_instance] += 1
                 self._complete_with_error(request_id, f"Denoiser error: {error}")
                 return
 
@@ -1403,6 +1429,8 @@ class DiffusionServer:
                 p2p.manifest = msg.get("manifest", {})
                 p2p.scalar_fields = msg.get("scalar_fields", {})
                 p2p.sender_instance = record.denoiser_instance if record else 0
+                p2p.sender_role = RoleType.DENOISER
+                p2p.receiver_role = RoleType.DECODER
 
                 try:
                     self._tracker.transition(request_id, RequestState.DECODER_WAITING)
@@ -1412,16 +1440,14 @@ class DiffusionServer:
                     _RoleTTAEntry(request_id=request_id, transfer_state=p2p)
                 )
             else:
-                if record and record.denoiser_instance is not None:
-                    self._denoiser_free_slots[record.denoiser_instance] += 1
+                self._release_assignment(request_id, role)
 
         elif role == RoleType.DECODER:
             if p2p is not None:
                 self._recycle_prealloc_slot(p2p, RoleType.DECODER)
 
             record = self._tracker.get(request_id)
-            if record and record.decoder_instance is not None:
-                self._decoder_free_slots[record.decoder_instance] += 1
+            self._release_assignment(request_id, role)
 
             if error:
                 self._complete_with_error(request_id, f"Decoder error: {error}")
@@ -1434,6 +1460,7 @@ class DiffusionServer:
                 self._transfer_return_to_client_from_msg(request_id, msg)
 
             self._transfer_state.pop(request_id, None)
+            self._assignments.pop(request_id, None)
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:
         with self._lock:
@@ -1466,6 +1493,15 @@ class DiffusionServer:
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,
+            "worker_pools": {
+                role.value: {
+                    "instances": len(pool.endpoints),
+                    "free_slots": list(pool.free_slots),
+                    "queue_depth": len(pool.queue),
+                    "registered_peers": len(pool.peers),
+                }
+                for role, pool in self._pools.items()
+            },
             "pending_requests": pending_count,
             "dispatch_policy": type(self._dispatcher.encoder_policy).__name__,
             "encoder_free_slots": list(self._encoder_free_slots),

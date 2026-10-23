@@ -38,8 +38,8 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    tokens, each token stored on exactly one rank.
 
 The real NCCL MLA/MHA/MTP gathers over 2 GPUs live in
-``test_page_interleave_gather_multi_gpu.py``. DSA indexer and latent KV
-coverage over 2 and 4 GPUs lives in ``test_page_interleave_indexer_multi_gpu.py``.
+``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
+coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
 import shutil
