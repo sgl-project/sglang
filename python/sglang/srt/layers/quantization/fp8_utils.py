@@ -1558,9 +1558,20 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
-        # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
+        # consumes fp32 scales; for m > 2 write them straight into DeepGEMM's
+        # MN-major, TMA-aligned layout so it does not transpose them per GEMM.
+        # Measured on H200: at m <= 2 the GEMM is up to ~1.5 us slower depending on
+        # where the scale buffer lands, so m <= 2 keeps the row-major path.
+        m, k = input_2d.shape
+        output_s = None
+        if m > 2:
+            # fp32 buffer; the kernel still writes UE8M0 (power-of-two) values.
+            num_groups, aligned_m = k // block_size[1], ceil_align(m, 4)
+            output_s = torch.empty(
+                num_groups * aligned_m, device=input_2d.device, dtype=torch.float32
+            ).as_strided((m, num_groups), (1, aligned_m))
         q_input, x_scale = sglang_per_token_group_quant_fp8(
-            input_2d, block_size[1], scale_ue8m0=True
+            input_2d, block_size[1], scale_ue8m0=True, output_s=output_s
         )
     elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
