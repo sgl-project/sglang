@@ -1,10 +1,12 @@
 """CPU contracts for indexed HiCache IO; native NIXL is a separate integration gate."""
 
+import copy
 import ctypes
 import json
 import mmap
 import types
 import unittest
+from array import array
 from contextlib import ExitStack
 from enum import Enum
 from queue import Queue
@@ -15,6 +17,7 @@ import msgspec
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -26,6 +29,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     StorageOperation,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
 from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
@@ -36,6 +40,13 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     storage_namespace,
 )
 from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
+from sglang.srt.mem_cache.utils import (
+    compute_node_event_hash_values,
+    get_event_hash_str,
+    get_hash_str,
+    get_storage_hash_str,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -130,6 +141,44 @@ class _CopyTransport:
 
     def discard_hint(self, request_id):
         del self.hints[request_id]
+
+
+class _StrictPeerTransport(_CopyTransport):
+    """Native-style hint membership at the external dependency boundary."""
+
+    def __init__(self, layouts, peers):
+        super().__init__(layouts)
+        self.peers, self.reads = peers, []
+
+    def _authorized(self, request_id):
+        hint = self.hints.get(request_id)
+        if hint is None:
+            return {}
+        payload = hint["actions"][0]["payload"]
+        allowed = set(payload["block_hashes"])
+        return {
+            key: data
+            for key, data in self.peers.get(
+                payload["source_control_endpoint"], {}
+            ).items()
+            if int(key[:16], 16) in allowed
+        }
+
+    def query(self, keys, request_id=None):
+        available = self._authorized(request_id)
+        return [
+            (_QueryStatus.FETCHABLE if key in available else _QueryStatus.MISS, None)
+            for key in keys
+        ]
+
+    def deliver(self, blocks, request_id=None):
+        self.reads.append(tuple(blocks))
+        prior = self.storage
+        try:
+            self.storage = self._authorized(request_id)
+            return super().deliver(blocks, request_id)
+        finally:
+            self.storage = prior
 
 
 class _BoundedCopyTransport(_CopyTransport):
@@ -229,6 +278,342 @@ class TestKVCRStorage(CustomTestCase):
         self.assertEqual(
             self.backend.batch_get_v1(self.keys[:1], torch.arange(12, 14)), [False]
         )
+
+    def test_cache_salt_isolates_v2_kv_indexer_and_mamba_bytes(self):
+        """Removing the namespace seed must expose a cross-tenant L3 hit here."""
+        self.backend = KVCRStore(self.config, self.pool)
+        pools = {PoolName.KV: self.pool}
+        for name, sizes in ((PoolName.INDEXER, (5,)), (PoolName.MAMBA, (9, 3))):
+            pools[name] = _HostPool(sizes=sizes)
+            self.backend.register_mem_host_pool_v2(pools[name], name)
+        self.backend._namespace = storage_namespace(self.config, self.backend._layouts)
+        self.transport = self.backend._runner = _CopyTransport(self.backend._layouts)
+
+        def keys(salt):
+            return get_storage_hash_str(
+                RadixKey(array("q", range(1, 9)), cache_salt=salt), page_size=2
+            )
+
+        def transfers(hashes, destination=False):
+            return [
+                PoolTransfer(
+                    name,
+                    host_indices=(
+                        torch.arange(2, 4) if destination else torch.arange(2)
+                    )
+                    if name == PoolName.MAMBA
+                    else (torch.arange(8, 16) if destination else torch.arange(8)),
+                    keys=hashes[-1:] if name == PoolName.MAMBA else hashes,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES
+                    if name == PoolName.MAMBA
+                    else PoolHitPolicy.ALL_PAGES,
+                )
+                for name in pools
+            ]
+
+        a, b = keys("tenant-a"), keys("tenant-b")
+        self.assertTrue(set(a).isdisjoint(b))
+        for number, pool in enumerate(pools.values()):
+            for component, buffer in enumerate(pool.buffers):
+                for page in range(1 if list(pools)[number] == PoolName.MAMBA else 4):
+                    buffer[page].fill_(31 + 7 * number + component + page)
+        written = self.backend.batch_set_v2(transfers(a))
+        self.assertTrue(all(all(flags) for flags in written.values()))
+        positive = self.backend.batch_exists_v2(a, transfers(a)[1:])
+        self.assertEqual(positive.kv_hit_pages, 4)
+        self.assertEqual(positive.restorable_prefix_pages, [4])
+        negative = self.backend.batch_exists_v2(b, transfers(b)[1:])
+        self.assertEqual(negative.kv_hit_pages, 0)
+        self.assertFalse(negative.restorable_prefix_pages)
+        missed = self.backend.batch_get_v2(transfers(b, destination=True))
+        self.assertFalse(any(any(flags) for flags in missed.values()))
+        for name, pool in pools.items():
+            for buffer in pool.buffers:
+                self.assertFalse(
+                    torch.count_nonzero(
+                        buffer[1:2] if name == PoolName.MAMBA else buffer[4:8]
+                    )
+                )
+        restored = self.backend.batch_get_v2(transfers(a, destination=True))
+        self.assertTrue(all(all(flags) for flags in restored.values()))
+        for name, pool in pools.items():
+            for buffer in pool.buffers:
+                self.assertTrue(
+                    torch.equal(buffer[0:1], buffer[1:2])
+                    if name == PoolName.MAMBA
+                    else torch.equal(buffer[:4], buffer[4:8])
+                )
+
+    def test_storage_controller_keeps_salt_in_lookup_and_prefix_continuation(self):
+        """List-converting a RadixKey at the storage boundary must fail closed."""
+        a = RadixKey(array("q", range(1, 9)), cache_salt="tenant-a")
+        b = RadixKey(array("q", range(1, 9)), cache_salt="tenant-b")
+        hashes = get_storage_hash_str(a, page_size=2)
+        self.assertEqual(self.backend.batch_set_v1(hashes, torch.arange(8)), [True] * 4)
+        for controller_type in (HiCacheController, HybridCacheController):
+            controller = controller_type.__new__(controller_type)
+            controller.page_size, controller.storage_backend = 2, self.backend
+            for key, expected in ((a, 8), (b, 0)):
+                operation = StorageOperation(None, key)
+                operation.assume_stored = False
+                self.assertEqual(controller._storage_hit_query(operation)[1], expected)
+            head = get_storage_hash_str(a[:4], page_size=2)
+            tail = StorageOperation(None, a[4:], last_hash=head[-1], prefix_keys=head)
+            tail.assume_stored = False
+            found, count = controller._storage_hit_query(tail)
+            self.assertEqual(found, hashes[2:])
+            self.assertEqual(count, 4)
+
+    def test_storage_salt_namespaces_preserve_legacy_and_avoid_join_collisions(self):
+        """Tenant/adapter tuple framing must not collapse distinct identities."""
+        tokens = array("q", range(1, 9))
+        plain = get_storage_hash_str(RadixKey(tokens), page_size=2)
+        self.assertEqual(plain, get_hash_str(tokens, page_size=2))
+        self.assertEqual(
+            plain, get_storage_hash_str(RadixKey(tokens, cache_salt=""), page_size=2)
+        )
+        identities = (
+            (None, "tenant-a"),
+            (None, "tenant-b"),
+            (None, "租户-α"),
+            ("a", "bc"),
+            ("ab", "c"),
+            ("adapter-a", "tenant-a"),
+        )
+        chains = [
+            get_storage_hash_str(
+                RadixKey(tokens, extra_key=extra, cache_salt=salt), page_size=2
+            )
+            for extra, salt in identities
+        ]
+        for page in range(len(plain)):
+            self.assertEqual(
+                len({plain[page], *(chain[page] for chain in chains)}), 1 + len(chains)
+            )
+
+    def test_peer_binding_matches_event_chain_with_prefix_and_bigram(self):
+        for salt, adapter in (("tenant-a", None), ("租户-α", "adapter"), (None, "a")):
+            for bigram in (False, True):
+                with self.subTest(salt=salt, adapter=adapter, bigram=bigram):
+                    key = RadixKey(
+                        array("q", range(1, 10 if bigram else 9)),
+                        extra_key=adapter,
+                        cache_salt=salt,
+                        is_bigram=bigram,
+                    )
+                    storage = get_storage_hash_str(key, page_size=2)
+                    parent = SimpleNamespace(
+                        parent=None,
+                        key=key[:4],
+                        hash_value=storage[:2],
+                        event_hash_value=None,
+                    )
+                    child = SimpleNamespace(
+                        parent=parent,
+                        key=key[4:],
+                        hash_value=storage[2:],
+                        event_hash_value=None,
+                    )
+                    events = get_event_hash_str(key, page_size=2)
+                    self.assertEqual(
+                        compute_node_event_hash_values(child, 2), events[2:]
+                    )
+                    mapping = storage_key_to_event_hashes(
+                        key[4:], 2, list(key.raw_token_ids()[:4]), storage[1]
+                    )
+                    self.assertEqual(
+                        mapping,
+                        dict(zip(storage[2:], (int(h[:16], 16) for h in events[2:]))),
+                    )
+                    self.assertEqual(
+                        storage_key_to_event_hashes(key[4:], 2, last_hash=storage[1]),
+                        {},
+                    )
+                    self.assertEqual(
+                        storage_key_to_event_hashes(key[4:], 2, [1, 2, 3], storage[1]),
+                        {},
+                    )
+                    self.assertEqual(
+                        storage_key_to_event_hashes(
+                            key[4:], 2, [1, 2, 3, 4], "00" * 32
+                        ),
+                        {},
+                    )
+        for salt in (None, ""):
+            self.assertIsNone(
+                storage_key_to_event_hashes(
+                    RadixKey(array("q", range(8)), cache_salt=salt), 2
+                )
+            )
+
+    def test_peer_hint_translates_only_bound_requested_pages(self):
+        key = RadixKey(array("q", range(8)), cache_salt="tenant-a")
+        mapping = storage_key_to_event_hashes(key, 2)
+        pages = list(mapping)
+        hint = {
+            "protocol_version": "0.1",
+            "actions": [
+                {
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        "source_control_endpoint": "tcp://peer:32100",
+                        "block_hashes": list(mapping.values())[:2],
+                    },
+                }
+            ],
+        }
+        saved = copy.deepcopy(hint)
+        info = HiCacheStorageExtraInfo(
+            extra_info={"kv_hints": hint, "storage_key_to_event_hash": mapping}
+        )
+        physical = [block_key(h, "0" * 64, "kv") for h in pages]
+        translated = peer_hint(info, 1, physical)
+        payload = translated["actions"][0]["payload"]
+        self.assertEqual(payload["source_control_endpoint"], "tcp://peer:32101")
+        self.assertEqual(payload["block_hashes"], [int(h[:16], 16) for h in pages[:2]])
+        self.assertEqual(hint, saved)
+        other = get_storage_hash_str(
+            RadixKey(array("q", range(8)), cache_salt="tenant-b"), page_size=2
+        )
+        self.assertIsNone(
+            peer_hint(info, 0, [block_key(h, "0" * 64, "kv") for h in other])
+        )
+        for invalid in ({}, [], {pages[0]: True}, {pages[0]: -1}):
+            info.extra_info["storage_key_to_event_hash"] = invalid
+            self.assertIsNone(peer_hint(info, 0, physical))
+
+    def test_salted_peer_prefetch_restores_kv_indexer_and_kda_bytes(self):
+        """Separate owners, strict advertised membership, actual continuation bytes."""
+        self.backend = KVCRStore(self.config, self.pool)
+        source_pools = {PoolName.KV: self.pool}
+        for name, sizes in ((PoolName.INDEXER, (5,)), (PoolName.MAMBA, (9, 3))):
+            source_pools[name] = _HostPool(sizes=sizes)
+            self.backend.register_mem_host_pool_v2(source_pools[name], name)
+        self.backend._namespace = storage_namespace(self.config, self.backend._layouts)
+        source = self.backend._runner = _CopyTransport(self.backend._layouts)
+        key = RadixKey(array("q", range(8)), cache_salt="tenant-a")
+        hashes = get_storage_hash_str(key, page_size=2)
+
+        def transfers(pools):
+            return [
+                PoolTransfer(
+                    name,
+                    host_indices=torch.arange(2 if name == PoolName.MAMBA else 8),
+                    keys=hashes[-1:] if name == PoolName.MAMBA else hashes,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES
+                    if name == PoolName.MAMBA
+                    else PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=PoolName.KV if name == PoolName.INDEXER else None,
+                )
+                for name in pools
+            ]
+
+        for number, pool in enumerate(source_pools.values()):
+            for component, buffer in enumerate(pool.buffers):
+                for page in range(1 if pool is source_pools[PoolName.MAMBA] else 4):
+                    buffer[page].fill_(31 + 7 * number + component + page)
+        self.assertTrue(
+            all(
+                all(flags)
+                for flags in self.backend.batch_set_v2(transfers(source_pools)).values()
+            )
+        )
+        destination_pools = {
+            name: _HostPool(sizes=tuple(b.shape[1] for b in pool.buffers))
+            for name, pool in source_pools.items()
+        }
+        reader = KVCRStore(self.config, destination_pools[PoolName.KV])
+        for name, pool in destination_pools.items():
+            if name != PoolName.KV:
+                reader.register_mem_host_pool_v2(pool, name)
+        reader._namespace = storage_namespace(self.config, reader._layouts)
+        transport = reader._runner = _StrictPeerTransport(
+            reader._layouts, {"tcp://peer:32100": source.storage}
+        )
+        reader.prefetch_batch_pages = 2
+        c = HybridCacheController.__new__(HybridCacheController)
+        c.page_size, c.storage_backend = 2, reader
+        c.page_get_func = c._page_get_zero_copy
+        c.pp_prefetch_command_group = None
+        c.prefetch_queue, c.prefetch_sync_queue = Queue(), Queue()
+        c.mem_pool_host = SimpleNamespace(entry_map={})
+        hint = {
+            "protocol_version": "0.1",
+            "actions": [
+                {
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        "source_control_endpoint": "tcp://peer:32100",
+                        "block_hashes": [
+                            int(h[:16], 16)
+                            for h in get_event_hash_str(key, page_size=2)
+                        ],
+                    },
+                }
+            ],
+        }
+        operation = c.submit_prefetch(
+            CacheRequestHandle("peer", 0),
+            key,
+            None,
+            None,
+            [],
+            transfers(destination_pools)[1:],
+            kv_hints=hint,
+        ).operation
+        self.assertIs(c.prefetch_queue.get_nowait(), operation)
+        operation.hash_value, count = c._storage_hit_query(operation)
+        self.assertEqual(count, 8)
+        operation.host_indices = torch.arange(8)
+        self.assertEqual(HiCacheController._page_transfer(c, operation), 4)
+        c._page_transfer_sidecar(operation, 4)
+        self.assertEqual(c.prefetch_sync_queue.get_nowait().completed_tokens, 4)
+        self.assertEqual(c.prefetch_sync_queue.get_nowait().completed_tokens, 8)
+        self.assertEqual(
+            c.prefetch_sync_queue.get_nowait().pool_hits[PoolName.MAMBA], 1
+        )
+        for name, pool in source_pools.items():
+            for expected, actual in zip(pool.buffers, destination_pools[name].buffers):
+                self.assertTrue(
+                    torch.equal(
+                        expected[: 1 if name == PoolName.MAMBA else 4],
+                        actual[: 1 if name == PoolName.MAMBA else 4],
+                    )
+                )
+        self.assertFalse(transport.storage)  # All bytes came from the other owner.
+        self.assertFalse(transport.hints)  # No request authorization leaked.
+        other = RadixKey(array("q", range(8)), cache_salt="tenant-b")
+        denied = c.submit_prefetch(
+            CacheRequestHandle("other", 0), other, None, None, [], None, kv_hints=hint
+        ).operation
+        self.assertEqual(c._storage_hit_query(denied)[1], 0)
+        before = {
+            name: [buffer.clone() for buffer in pool.buffers]
+            for name, pool in destination_pools.items()
+        }
+        foreign_hashes = get_storage_hash_str(other, page_size=2)
+        foreign_transfers = transfers(destination_pools)
+        for transfer in foreign_transfers:
+            transfer.keys = (
+                foreign_hashes[-1:]
+                if transfer.name == PoolName.MAMBA
+                else foreign_hashes
+            )
+        missed = reader.batch_get_v2(
+            foreign_transfers,
+            extra_info=HiCacheStorageExtraInfo(
+                extra_info={
+                    "kv_hints": hint,
+                    "storage_key_to_event_hash": denied.storage_key_to_event_hash,
+                }
+            ),
+        )
+        self.assertFalse(any(any(flags) for flags in missed.values()))
+        for name, pool in destination_pools.items():
+            for prior, actual in zip(before[name], pool.buffers):
+                self.assertTrue(torch.equal(prior, actual))
 
     def test_invalid_startup_budget_is_rejected_before_registration(self):
         """An invalid optional deadline must not reach native registration."""

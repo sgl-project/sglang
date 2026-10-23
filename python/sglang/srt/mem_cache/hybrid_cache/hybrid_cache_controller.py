@@ -46,6 +46,10 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+from sglang.srt.mem_cache.storage_key_binding import (
+    storage_key_to_event_hashes,
+    storage_operation_extra_info,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
 
@@ -89,6 +93,7 @@ class PPPrefetchTicket:
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
     kv_hints: Any = None
+    storage_key_to_event_hash: Optional[dict[str, int]] = None
 
 
 class PPPrefetchDecision(Enum):
@@ -137,9 +142,16 @@ class StorageOperation(BaseStorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         super().__init__(
-            host_indices, token_ids, last_hash, hash_value, prefix_keys, kv_hints
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
@@ -155,6 +167,7 @@ class PrefetchOperation(StorageOperation):
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -176,6 +189,7 @@ class PrefetchOperation(StorageOperation):
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
@@ -1036,6 +1050,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
         kv_hints=None,
+        storage_key_to_event_hash: Optional[dict[str, int]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1045,6 +1060,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=storage_key_to_event_hash,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1074,6 +1090,13 @@ class HybridCacheController(BaseHiCacheController):
         assume_stored: bool = False,
         kv_hints=None,
     ) -> PrefetchSubmission:
+        key_binding = (
+            storage_key_to_event_hashes(
+                prefetch_key, self.page_size, matched_prefix_tokens, last_hash
+            )
+            if kv_hints is not None
+            else None
+        )
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
                 operation=self.prefetch(
@@ -1084,6 +1107,7 @@ class HybridCacheController(BaseHiCacheController):
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
                     kv_hints=kv_hints,
+                    storage_key_to_event_hash=key_binding,
                 )
             )
 
@@ -1093,6 +1117,7 @@ class HybridCacheController(BaseHiCacheController):
         rid = handle.rid
         ticket = PPPrefetchTicket(
             kv_hints=kv_hints,
+            storage_key_to_event_hash=key_binding,
             handle=handle,
             prefetch_key=RadixKey(
                 array("q", prefetch_key.token_ids),
@@ -1115,6 +1140,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=key_binding,
         )
 
         # Every rank queries and allocates in ticket order on the worker.
@@ -1290,6 +1316,7 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             kv_hints=ticket.kv_hints,
+                            storage_key_to_event_hash=ticket.storage_key_to_event_hash,
                             prefix_keys=ticket.prefix_keys,
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
@@ -1384,6 +1411,13 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if (
+            operation.kv_hints is not None
+            and getattr(operation, "storage_key_to_event_hash", None) is None
+        ):
+            operation.storage_key_to_event_hash = storage_key_to_event_hashes(
+                operation.token_ids, self.page_size, last_hash=operation.last_hash
+            )
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -1400,7 +1434,7 @@ class HybridCacheController(BaseHiCacheController):
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={"kv_hints": operation.kv_hints},
+            extra_info=storage_operation_extra_info(operation),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1569,7 +1603,7 @@ class HybridCacheController(BaseHiCacheController):
                     sidecar_hashes,
                     transfers_nonkv,
                 ):
-                    extra_info.extra_info = {"kv_hints": operation.kv_hints}
+                    extra_info.extra_info = storage_operation_extra_info(operation)
                     results.update(
                         self.storage_backend.batch_get_v2(
                             transfers, extra_info=extra_info

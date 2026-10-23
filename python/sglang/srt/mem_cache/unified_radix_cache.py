@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -2000,6 +2001,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         kv_hints=None,
+        matched_prefix_tokens: Optional[list[int]] = None,
     ) -> int:
         """Probe L3 with the request namespace."""
         if (
@@ -2024,6 +2026,13 @@ class UnifiedRadixCache(BasePrefixCache):
             last_hash,
             prefix_keys,
             kv_hints=kv_hints,
+            storage_key_to_event_hash=(
+                storage_key_to_event_hashes(
+                    prefetch_key, self.page_size, matched_prefix_tokens, last_hash
+                )
+                if kv_hints is not None
+                else None
+            ),
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
