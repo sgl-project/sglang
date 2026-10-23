@@ -1570,6 +1570,7 @@ class SchedulerDisaggMixin:
     ) -> None:
         """Run local preparation, DiT, and VAE, then return decoded pixels."""
         req.save_output = False
+        req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             if (
