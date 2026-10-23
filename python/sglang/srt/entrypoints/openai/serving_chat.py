@@ -530,6 +530,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools.extend(message.tools)
         return tools
 
+    def _serialize_tools(self, tools: list[Tool]) -> list[dict[str, Any]]:
+        """Serialize tools in the format expected by the chat encoder."""
+        serialized_tools = []
+        for tool in tools:
+            if self.chat_encoding_spec == "dsv41":
+                serialized_tool = chat_encoding.dsv41_tool_payload(tool)
+            elif self.chat_encoding_spec == "kimi_k3":
+                serialized_tool = tool.model_dump(exclude_unset=True, by_alias=True)
+            else:
+                serialized_tool = tool.model_dump()
+            serialized_tools.append(serialized_tool)
+        return serialized_tools
+
     def _prepare_kimi_k3_messages(
         self,
         messages: list[dict[str, Any]],
@@ -663,19 +676,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                 )
 
-            request_tools = (
-                [
-                    tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in request.tools
-                ]
-                if request.tools
-                else None
-            )
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
-                tools=request_tools,
+                tools=tools,
                 return_dict=False,
                 **template_kwargs,
             )
@@ -1334,9 +1339,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
@@ -1347,12 +1352,14 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    item
                     for item in request.tools or []
                     if item.function.name == request.tool_choice.function.name
                 ] or None
             elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
+                tools = request.tools
+            if tools:
+                tools = self._serialize_tools(tools)
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
@@ -1548,21 +1555,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
-            request_tools = request.tools if tools else None
+            request_tools = tools
+            render_response_format = (
+                request.response_format is not None
+                and request.response_format.type == "json_schema"
+            )
 
-            # An empty system message hosts the request tools; dsv41 renders a
-            # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request_tools or not is_dsv41):
+            # An empty system message hosts the request tools and response_format;
+            # dsv41 renders a system token for it, so it only gets one when needed.
+            if messages[0]["role"] != "system" and (
+                request_tools or render_response_format or not is_dsv41
+            ):
                 messages.insert(0, {"role": "system", "content": ""})
+            if render_response_format:
+                dpsk_response_format = request.response_format.model_dump(
+                    exclude_unset=True, by_alias=True
+                )
+                messages[0]["response_format"] = dpsk_response_format.get(
+                    "json_schema", {}
+                ).get("schema")
             if request_tools:
-                messages[0]["tools"] = [
-                    (
-                        chat_encoding.dsv41_tool_payload(tool)
-                        if is_dsv41
-                        else tool.model_dump()
-                    )
-                    for tool in request_tools
-                ]
+                messages[0]["tools"] = request_tools
 
             # Default encoding (dsv4/dsv41/dsv32)
             if self.chat_encoding_spec == "dsv4":

@@ -1539,10 +1539,20 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
-    def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
+    def test_tool_choice_filters_tools_across_encodings(self):
+        """Every prompt encoder must honor the selected request tools."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat._dsv4_reasoning_effort_profile = "preview"
+        template = _compile_jinja_template(
+            "{% for tool in tools or [] %}{{ tool.function.name }} {% endfor %}"
+        )
+
+        def apply_template(messages, *, tools, tokenize, **kwargs):
+            prompt = template.render(messages=messages, tools=tools)
+            return list(prompt.encode()) if tokenize else prompt
+
+        self.tm.tokenizer.apply_chat_template.side_effect = apply_template
         tool = {
             "type": "function",
             "function": {
@@ -1550,9 +1560,35 @@ class ServingChatTestCase(CustomTestCase):
                 "parameters": {"type": "object"},
             },
         }
+        other_tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }
 
-        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
-            for tool_choice, expects_tools in (("none", False), ("auto", True)):
+        for chat_encoding_spec in (None, *_ALL_CHAT_ENCODING_SPECS):
+            self.chat._encoding_adapter = (
+                InklingChatEncodingAdapter(
+                    tokenizer=Mock(encode=lambda text, **kwargs: list(text.encode()))
+                )
+                if chat_encoding_spec == "inkling"
+                else None
+            )
+            for tool_choice, expected_names in (
+                ("none", set()),
+                ("auto", {"calculator", "get_weather"}),
+                ("required", {"calculator", "get_weather"}),
+                (
+                    {"type": "function", "function": {"name": "calculator"}},
+                    {"calculator"},
+                ),
+                (
+                    {"type": "function", "function": {"name": "get_weather"}},
+                    {"get_weather"},
+                ),
+            ):
                 with self.subTest(
                     chat_encoding_spec=chat_encoding_spec,
                     tool_choice=tool_choice,
@@ -1562,14 +1598,21 @@ class ServingChatTestCase(CustomTestCase):
                     request = ChatCompletionRequest(
                         model="x",
                         messages=[{"role": "user", "content": "Solve 100 / 7."}],
-                        tools=[tool],
+                        tools=[tool, other_tool],
                         tool_choice=tool_choice,
                     )
 
-                    self.chat._process_messages(request, is_multimodal=False)
+                    result = self.chat._process_messages(request, is_multimodal=False)
 
-                    prompt = self.tm.tokenizer.encode.call_args.args[0]
-                    self.assertEqual("calculator" in prompt, expects_tools)
+                    if chat_encoding_spec in ("kimi_k3", "inkling"):
+                        prompt = bytes(
+                            token for token in result.prompt_ids if token < 256
+                        ).decode()
+                    else:
+                        prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    for name in ("calculator", "get_weather"):
+                        self.assertEqual(name in prompt, name in expected_names)
+                    self.assertEqual(len(request.tools), 2)
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
