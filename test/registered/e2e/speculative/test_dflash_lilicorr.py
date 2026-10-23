@@ -17,7 +17,7 @@ register_cuda_ci(
     est_time=300,
     stage="extra-b",
     runner_config="4-gpu-h100",
-    disabled="no LiLiCorr draft checkpoint is published yet",
+    disabled="the Qwen3-8B LiLiCorr draft checkpoint is not published",
 )
 
 # The setUpClass skip covers `/rerun-test` and direct runs, which ignore `disabled=`.
@@ -42,7 +42,7 @@ class TestLiLiCorrServer(CustomTestCase, GSM8KMixin, SpecDecodingMixin):
     def setUpClass(cls):
         if cls.draft_model == UNPUBLISHED:
             raise unittest.SkipTest(
-                "no LiLiCorr draft checkpoint is published yet; set DRAFT_MODEL and drop "
+                "the Qwen3-8B LiLiCorr draft checkpoint is not published; set DRAFT_MODEL and drop "
                 "the disabled= argument on register_cuda_ci in the same change"
             )
         cls.base_url = DEFAULT_URL_FOR_TEST

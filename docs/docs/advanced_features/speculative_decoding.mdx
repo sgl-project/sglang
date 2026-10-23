@@ -626,15 +626,25 @@ A DFlash drafter is trained on per-position marginals rather than on the joint b
 
 LiLiCorr is **not a separate `--speculative-algorithm`**: it is a property of the draft checkpoint, the same way the DFlash candidate selector is. Serve it with `--speculative-algorithm DFLASH` and a checkpoint whose config declares `architectures: ["LiLiCorrDraftModel"]` and carries the `lilicorr_*` geometry fields inside `dflash_config`. The head is then built, loaded and folded into the draft CUDA graph automatically.
 
-No LiLiCorr drafter is published yet, so the draft path below is a placeholder.
+For NVIDIA CUDA on Linux, you can pair the published Nemotron Bolt NVFP4 GGUF drafter with its 24GB target. This example uses one GPU and a 4K context. Set `HF_TOKEN` if the repositories require authentication.
 
 ```bash Command
 python3 -m sglang.launch_server \
-    --model Qwen/Qwen3-8B \
-    --attention-backend fa3 \
+    --model-path nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB \
+    --trust-remote-code \
+    --tp-size 1 \
+    --context-length 4096 \
+    --max-running-requests 4 \
+    --max-total-tokens 8192 \
+    --max-mamba-cache-size 32 \
+    --mem-fraction-static 0.6 \
     --speculative-algorithm DFLASH \
-    --speculative-draft-model-path <your-lilicorr-draft-model>
+    --speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF \
+    --speculative-dflash-block-size 8 \
+    --speculative-draft-attention-backend triton
 ```
+
+You can also pass a local `.gguf` file as the draft path. The GGUF loader supports NVFP4 weights with 16-bit activations and dense F32 or BF16 tensors. It repacks the NVFP4 weights at load time without dequantizing them. NVFP4A16 LiLiCorr heads use Marlin and currently require tensor parallelism 1. This drafter uses attention sinks; the example selects Triton for draft attention because it supports them.
 
 **Use a backend that opts out of the host `seq_lens` mirror.** `AttentionBackend.needs_cpu_seq_lens` defaults to `True`; `fa3`, `triton`, `trtllm_mha`, `trtllm_mla`, `flashmla` and `dsa` set it `False`, while `FlashInferAttnBackend` inherits the default. Under a backend that does not opt out the worker publishes `seq_lens_cpu` every step, which is a device-to-host sync per block. The flag is OR-ed over the target and draft runners, so both have to opt out. This is a property of DFlash decoding rather than of LiLiCorr, but it dominates the throughput of a 16-slot block. Backends also differ in attention numerics, so acceptance measured on different backends does not belong in one table.
 

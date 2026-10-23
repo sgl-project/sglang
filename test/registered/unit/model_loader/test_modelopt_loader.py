@@ -369,6 +369,7 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
     def test_unquantized_modelopt_fp4_preserves_modelopt_workflows(self):
         model_config = SimpleNamespace(
             quantization="modelopt_fp4",
+            hf_config=PretrainedConfig(),
             _is_already_quantized=lambda: False,
         )
 

@@ -77,13 +77,14 @@ def _print_truncated_samples(result):
         print(f"sgl-eval truncated sample: {json.dumps(preview)}", flush=True)
 
 
-def run_sgl_eval(args):
+def run_sgl_eval(args, *, prompt_yaml: Path | None = None):
+    """Run a benchmark, optionally using a custom math prompt YAML."""
     # math_verify uses SIGALRM, which requires the process's main thread.
     if threading.current_thread() is not threading.main_thread():
         with ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context("spawn")
         ) as executor:
-            return executor.submit(run_sgl_eval, args).result()
+            return executor.submit(run_sgl_eval, args, prompt_yaml=prompt_yaml).result()
 
     from sgl_eval.predictions import PredictionsWriter
     from sgl_eval.registry import get
@@ -164,6 +165,7 @@ def run_sgl_eval(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     repeats = getattr(args, "repeat", None) or spec.default_n_repeats
     writer = PredictionsWriter(out_dir, repeats, spec.pred_schema)
+    prompt_kwargs = {"prompt_yaml": prompt_yaml} if prompt_yaml is not None else {}
     try:
         result = spec.run(
             sampler=sampler,
@@ -173,6 +175,7 @@ def run_sgl_eval(args):
             num_threads=getattr(args, "num_threads", None) or spec.default_num_threads,
             predictions_writer=writer,
             load_examples=None,
+            **prompt_kwargs,
         )
     finally:
         writer.close()
@@ -203,6 +206,16 @@ def run_sgl_eval(args):
                 "n_repeats": result.n_repeats,
                 "latency_seconds": result.latency,
                 "output_throughput_tps": result.output_throughput,
+                **(
+                    {
+                        "prompt": {
+                            "path": str(prompt_yaml),
+                            "yaml": prompt_yaml.read_text(),
+                        }
+                    }
+                    if prompt_yaml is not None
+                    else {}
+                ),
             },
             indent=2,
         )
