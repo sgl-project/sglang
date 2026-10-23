@@ -203,11 +203,11 @@ class TestPrefillAdder(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
         )
 
-    def test_beam_reservation_admission_and_resume_budget(self):
+    def test_trie_beam_admission_and_running_budget(self):
         req = self.create_mock_req("beam", priority=0, max_new_tokens=3)
         req.full_untruncated_fill_ids = list(range(2))
         req.last_node = MagicMock()
-        req.beam_group = BeamGroup(beam_width=4, max_new_tokens=3)
+        req.beam_group = BeamGroup(beam_width=4, max_new_tokens=3, device_history=True)
         self.mock_tree_cache.supports_mamba.return_value = False
         for available, expected in (
             (11, AddReqResult.NO_TOKEN),
@@ -225,14 +225,14 @@ class TestPrefillAdder(CustomTestCase):
                 if expected is AddReqResult.CONTINUE:
                     self.assertEqual(adder.memory_budget.total_offset, 11)
 
-        req.beam_group.kv_reserved = True
+        # Once running, the group's remaining decode slots stay in the budget.
         self.mock_token_allocator.available_size.return_value = 100
-        resumed = self.create_adder(
-            self.create_running_batch(),
-            beam_kv_reserved_tokens=req.beam_group.remaining_kv_reservation(),
-        )
-        self.assertEqual(resumed.rem_total_tokens, 92)
-        self.assertEqual(resumed._decode_token_budget_for_admission(req, 3), 0)
+        running = self.create_adder(self.create_running_batch([req]))
+        self.assertEqual(running.rem_total_tokens, 92)
+
+        # A generic beam group keeps the request's own estimate.
+        req.beam_group = BeamGroup(beam_width=4, max_new_tokens=3)
+        self.assertEqual(running._decode_token_budget_for_admission(req, 3), 3)
 
     def test_normal_chunked_prefill_preserves_decode_budget_timing(self):
         self.mock_tree_cache.supports_mamba.return_value = False
@@ -258,15 +258,16 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIs(result, expected_result)
                 self.assertEqual(adder.memory_budget.total_offset, expected_offset)
 
-    def test_priority_preemption_skips_reserved_beam_groups(self):
+    def test_priority_preemption_skips_beam_groups(self):
         beam_req = self.create_mock_req("beam", priority=0, max_new_tokens=3)
-        beam_req.beam_group = BeamGroup(beam_width=4, max_new_tokens=3)
-        beam_req.beam_group.kv_reserved = True
+        beam_req.beam_group = BeamGroup(
+            beam_width=4, max_new_tokens=3, device_history=True
+        )
         normal_req = self.create_mock_req("normal", priority=0, max_new_tokens=10)
         running_batch = self.create_running_batch([beam_req, normal_req])
         self.scheduling_order(schedule_low_priority_values_first=False)
         self.mock_token_allocator.available_size.return_value = 20
-        adder = self.create_adder(running_batch, beam_kv_reserved_tokens=8)
+        adder = self.create_adder(running_batch)
         new_req = self.create_mock_req("new", priority=1, max_new_tokens=5)
         self.assertTrue(adder.preempt_to_schedule(new_req))
         self.assertEqual(adder.preempt_list, [normal_req])

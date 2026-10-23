@@ -599,7 +599,6 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        beam_kv_reserved_tokens: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -628,7 +627,6 @@ class PrefillAdder:
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
-        self.memory_budget.total_offset += beam_kv_reserved_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -758,7 +756,7 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         beam_budget = self._beam_decode_token_budget(req)
         if beam_budget is not None:
-            return 0 if req.beam_group.kv_reserved else beam_budget
+            return beam_budget
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
         return (
@@ -774,13 +772,11 @@ class PrefillAdder:
         group = req.beam_group
         if group is None or group.retired:
             return None
-        return group.remaining_kv_reservation()
+        return group.decode_slot_budget()
 
     def _decode_token_budget_for_admission(self, req: Req, normal_budget: int) -> int:
         beam_budget = self._beam_decode_token_budget(req)
-        if beam_budget is not None:
-            return 0 if req.beam_group.kv_reserved else beam_budget
-        return normal_budget
+        return normal_budget if beam_budget is None else beam_budget
 
     @property
     def rem_total_tokens(self):
@@ -1232,9 +1228,10 @@ class PrefillAdder:
         )
         if not fits:
             return AddReqResult.NO_TOKEN
+        beam_budget = self._beam_decode_token_budget(req)
         if (
-            paged_input + self._decode_token_budget_for_admission(req, 0)
-            > self.rem_total_tokens
+            beam_budget is not None
+            and paged_input + beam_budget > self.rem_total_tokens
         ):
             return AddReqResult.NO_TOKEN
 

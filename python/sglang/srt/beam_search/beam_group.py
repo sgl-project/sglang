@@ -117,7 +117,6 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
-        self.kv_reserved = False
 
     @property
     def num_member_rows(self) -> int:
@@ -135,8 +134,11 @@ class BeamGroup:
         held = self.beam_width * (end - start) - self.slots_freed
         return held - (end - start)
 
-    def remaining_kv_reservation(self) -> int:
-        """Unallocated decode slots needed to finish without retracting."""
+    def decode_slot_budget(self) -> Optional[int]:
+        """Unallocated decode slots needed to finish, for fixed-length (trie)
+        groups that never stop early; None defers to the generic estimate."""
+        if not self.device_history:
+            return None
         generated_floor = max(self.num_committed, 1)
         remaining_steps = max(self.max_new_tokens - generated_floor, 0)
         return self.beam_width * remaining_steps

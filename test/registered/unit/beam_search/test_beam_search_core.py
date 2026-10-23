@@ -220,16 +220,17 @@ class TestBeamGroup(CustomTestCase):
         defaults.update(kwargs)
         return BeamGroup(**defaults)
 
-    def test_remaining_kv_reservation_tracks_committed_steps(self):
-        group = self._make_group(beam_width=4, max_new_tokens=3)
+    def test_decode_slot_budget_tracks_committed_steps(self):
+        self.assertIsNone(self._make_group().decode_slot_budget())
+        group = self._make_group(beam_width=4, max_new_tokens=3, device_history=True)
 
-        self.assertEqual(group.remaining_kv_reservation(), 8)
+        self.assertEqual(group.decode_slot_budget(), 8)
         group.num_committed = 1
-        self.assertEqual(group.remaining_kv_reservation(), 8)
+        self.assertEqual(group.decode_slot_budget(), 8)
         group.num_committed = 2
-        self.assertEqual(group.remaining_kv_reservation(), 4)
+        self.assertEqual(group.decode_slot_budget(), 4)
         group.num_committed = 3
-        self.assertEqual(group.remaining_kv_reservation(), 0)
+        self.assertEqual(group.decode_slot_budget(), 0)
 
     def test_device_history_matches_backpointer_history(self):
         groups = [

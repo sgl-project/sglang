@@ -4126,7 +4126,6 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            beam_kv_reserved_tokens=self.beam_coordinator.reserved_kv_tokens(),
         )
 
         if self.chunked_req is not None:
@@ -4266,7 +4265,6 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
             return None, running_batch
-        self.beam_coordinator.reserve_kv_for(can_run_list)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
