@@ -875,12 +875,12 @@ class ModelConfig:
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
-        self.beam_trie_config = (
-            None
-            if self.is_draft_model
-            else discover_trie_output_head_config(
-                self.hf_config, self.model_path, self.vocab_size, revision
-            )
+        self.beam_trie_config = discover_trie_output_head_config(
+            self.hf_config,
+            self.model_path,
+            self.vocab_size,
+            revision,
+            is_draft_model=self.is_draft_model,
         )
 
         # Update hybrid model

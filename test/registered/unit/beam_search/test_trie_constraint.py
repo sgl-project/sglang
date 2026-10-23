@@ -296,14 +296,27 @@ class TestBeamTrieConstraint(CustomTestCase):
         self._write_artifact(model_root / "nested")
         declared = PretrainedConfig(**{TRIE_OUTPUT_HEAD_CONFIG_KEY: True})
         with self.assertRaises(OSError):
-            discover_trie_output_head_config(declared, str(model_root), 30)
+            discover_trie_output_head_config(
+                declared, str(model_root), 30, is_draft_model=False
+            )
         self._write_artifact(model_root)
         self.assertIsNone(
-            discover_trie_output_head_config(PretrainedConfig(), str(model_root), 30)
+            discover_trie_output_head_config(
+                PretrainedConfig(), str(model_root), 30, is_draft_model=False
+            )
         )
         with self.assertRaisesRegex(ValueError, "exceeds the model vocabulary"):
-            discover_trie_output_head_config(declared, str(model_root), 21)
-        config = discover_trie_output_head_config(declared, str(model_root), 30)
+            discover_trie_output_head_config(
+                declared, str(model_root), 21, is_draft_model=False
+            )
+        self.assertIsNone(
+            discover_trie_output_head_config(
+                declared, str(model_root), 30, is_draft_model=True
+            )
+        )
+        config = discover_trie_output_head_config(
+            declared, str(model_root), 30, is_draft_model=False
+        )
         self.assertIsNotNone(config)
         self.assertEqual(config.token_start, 10)
         self.assertEqual(
