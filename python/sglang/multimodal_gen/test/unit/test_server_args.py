@@ -1232,6 +1232,8 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         memory_gb=80,
         available_memory_gb=None,
         dit_parameter_count=None,
+        checkpoint_sizes=None,
+        is_cuda=True,
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1252,6 +1254,10 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 ),
             ),
             patch(
+                "sglang.multimodal_gen.runtime.server_args.auto_tune.checkpoint_component_sizes",
+                return_value=checkpoint_sizes,
+            ),
+            patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
@@ -1261,7 +1267,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-                return_value=True,
+                return_value=is_cuda,
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
@@ -2107,6 +2113,101 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             ["text_encoder", "image_encoder"],
         )
 
+    def _zimage_turbo(
+        self, *, memory_gb=141, available_memory_gb=139, checkpoint_sizes=None, **kwargs
+    ):
+        return self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=memory_gb,
+            available_memory_gb=available_memory_gb,
+            checkpoint_sizes=checkpoint_sizes,
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image-Turbo",
+                "performance_mode": "auto",
+                **kwargs,
+            },
+        )
+
+    # (parameters, stored bytes) of Tongyi-MAI/Z-Image-Turbo: the DiT is stored in
+    # fp32 (22.9 GiB) and served in bf16, 19.3 GiB per GPU in all
+    ZIMAGE_TURBO_SIZES = {
+        "transformer": (6_154_908_736, 24_619_634_944),
+        "text_encoder": (4_022_468_096, 8_044_936_192),
+        "vae": (83_819_683, 335_278_732),
+    }
+
+    def _residency(self, args):
+        return {
+            name: args.residency_mode(name)
+            for name in ("transformer", "text_encoder", "image_encoder", "vae")
+        }
+
+    def test_auto_keeps_every_component_resident_when_weights_fit_twice(self):
+        args = self._zimage_turbo(checkpoint_sizes=self.ZIMAGE_TURBO_SIZES)
+
+        self.assertIsNone(args.layerwise_offload_components)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+    def test_auto_tier_sizes_weights_in_their_serving_precision(self):
+        # fits twice in 45 GiB at bf16; the fp32-stored bytes would not
+        args = self._zimage_turbo(
+            memory_gb=48,
+            available_memory_gb=45,
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+        )
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+    def test_auto_tier_leaves_consumer_gpus_on_their_policy(self):
+        for memory_gb, available_gb in ((32, 31), (24, 23)):
+            with self.subTest(memory_gb=memory_gb):
+                sized = self._zimage_turbo(
+                    memory_gb=memory_gb,
+                    available_memory_gb=available_gb,
+                    checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+                )
+                unsized = self._zimage_turbo(
+                    memory_gb=memory_gb, available_memory_gb=available_gb
+                )
+                self.assertEqual(self._residency(sized), self._residency(unsized))
+                self.assertNotEqual(sized.residency_mode("text_encoder"), RESIDENT)
+
+    def test_auto_tier_skips_batching_shared_memory_and_unsized_checkpoints(self):
+        unsized = self._zimage_turbo()
+        self.assertEqual(unsized.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+        batching = self._zimage_turbo(
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES, batching_max_size=2
+        )
+        self.assertEqual(batching.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+        with patch.object(
+            current_platform, "device_shares_host_memory", return_value=True
+        ):
+            shared = self._zimage_turbo(checkpoint_sizes=self.ZIMAGE_TURBO_SIZES)
+        self.assertEqual(shared.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_auto_tier_replaces_whole_component_offload_off_cuda(self):
+        # off CUDA auto has no layerwise defaults and offloads the encoder whole
+        unsized = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=192,
+            available_memory_gb=190,
+            is_cuda=False,
+            kwargs={"model_path": "Tongyi-MAI/Z-Image-Turbo"},
+        )
+        sized = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            memory_gb=192,
+            available_memory_gb=190,
+            checkpoint_sizes=self.ZIMAGE_TURBO_SIZES,
+            is_cuda=False,
+            kwargs={"model_path": "Tongyi-MAI/Z-Image-Turbo"},
+        )
+
+        self.assertTrue(unsized.text_encoder_cpu_offload)
+        self.assertFalse(sized.text_encoder_cpu_offload)
+        self.assertEqual(set(self._residency(sized).values()), {RESIDENT})
+
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(
             LingBotWorldCausalDMDConfig(),
@@ -2214,6 +2315,45 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     args.layerwise_offload_components,
                     ["dit", "text_encoder", "image_encoder", "vae"],
                 )
+
+    def test_auto_wan2_2_a14b_keeps_both_experts_resident_above_120gb(self):
+        for pipeline_config, model_path in (
+            (Wan2_2_T2V_A14B_Config(), "Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
+            (Wan2_2_I2V_A14B_Config(), "Wan-AI/Wan2.2-I2V-A14B-Diffusers"),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=141,
+                    available_memory_gb=139,
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+
+                self.assertFalse(args.dit_cpu_offload)
+                self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+                self.assertEqual(args.residency_mode("transformer_2"), RESIDENT)
+                self.assertEqual(args.residency_mode("vae"), RESIDENT)
+                self.assertEqual(
+                    args.layerwise_offload_components,
+                    ["text_encoder", "image_encoder"],
+                )
+
+                # two 14B experts plus T5 fit twice over: the encoder joins them
+                rich = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    memory_gb=288,
+                    available_memory_gb=280,
+                    checkpoint_sizes={
+                        "transformer": (14_288_901_184, 57_155_604_736),
+                        "transformer_2": (14_288_901_184, 57_155_604_736),
+                        "text_encoder": (5_680_910_336, 22_723_641_344),
+                        "vae": (126_892_531, 507_570_124),
+                    },
+                    kwargs={"model_path": model_path, "performance_mode": "auto"},
+                )
+                self.assertIsNone(rich.layerwise_offload_components)
+                self.assertEqual(rich.residency_mode("text_encoder"), RESIDENT)
+                self.assertEqual(rich.residency_mode("transformer_2"), RESIDENT)
 
     def test_auto_wan2_1_14b_keeps_dit_resident_on_h100(self):
         for pipeline_config, model_path in (
