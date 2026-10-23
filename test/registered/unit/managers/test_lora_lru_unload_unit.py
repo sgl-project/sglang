@@ -12,9 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-"""``--max-loaded-loras`` eviction in the tokenizer manager. Unloading the
-wrong adapter, a pinned one, or none at all leaves the registry and the ranks
-disagreeing about which adapters are resident, with no error."""
+"""LoRA unloads in the tokenizer manager. Evicting the wrong adapter, a pinned
+one, or none at all leaves the registry and the ranks disagreeing about which
+adapters are resident, with no error; an unload that reaches the ranks while a
+request still holds the adapter frees weights that request is reading."""
 
 import asyncio
 import unittest
@@ -44,11 +45,13 @@ class _Ranks:
     def __init__(self):
         self.adapters = {}
         self.unloaded = []
+        self.unloaded_ids = []
 
     async def __call__(self, obj):
         if isinstance(obj, UnloadLoRAAdapterReqInput):
             del self.adapters[obj.lora_name]
             self.unloaded.append(obj.lora_name)
+            self.unloaded_ids.append(obj.lora_id)
         else:
             self.adapters[obj.lora_name] = getattr(obj, "lora_path", "__tensor__")
         return [LoRAUpdateOutput(success=True, loaded_adapters=dict(self.adapters))]
@@ -126,6 +129,48 @@ class TestLoRALRUUnload(CustomTestCase):
             self.assertTrue(result.success, result.error_message)
             self.assertEqual(ranks.unloaded, ["b"])
             self.assertEqual(set(manager.lora_registry.get_all_adapters()), {"a", "c"})
+
+        self._run(scenario)
+
+    def test_unload_waits_for_active_requests(self):
+        """The unload parks until the last request holding the adapter releases
+        it, then sends the ranks the ID that request acquired."""
+
+        async def scenario(from_tensors):
+            ranks = _Ranks()
+            manager = _manager(ranks)
+            registry = manager.lora_registry
+            self.assertTrue((await _load(manager, "a", from_tensors)).success)
+            lora_id = await registry.acquire("a")
+
+            waiting = asyncio.Event()
+            wait_for_unload = registry.wait_for_unload
+
+            async def spy(waited_id):
+                waiting.set()
+                await wait_for_unload(waited_id)
+
+            registry.wait_for_unload = spy
+            unload = asyncio.create_task(
+                manager.unload_lora_adapter(UnloadLoRAAdapterReqInput(lora_name="a"))
+            )
+            # Resume once the unload starts waiting or, if it never waits, ends.
+            await asyncio.wait(
+                {unload, asyncio.create_task(waiting.wait())},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self.assertTrue(waiting.is_set(), "the unload never waited")
+            # The fan-out stub never yields, so an unload that did not block on
+            # the request would have finished before this coroutine resumed.
+            self.assertFalse(unload.done())
+            self.assertEqual(ranks.unloaded_ids, [])
+
+            await registry.release(lora_id)
+            result = await unload
+
+            self.assertTrue(result.success, result.error_message)
+            self.assertEqual(ranks.unloaded_ids, [lora_id])
+            self.assertEqual(manager.pending_lora_unloads, {})
 
         self._run(scenario)
 
