@@ -35,7 +35,7 @@ class TestPixtralProcessor(CustomTestCase):
         processor._wrap_tensor_for_cuda_ipc = MagicMock(side_effect=proxies)
 
         feature = torch.arange(8).reshape(2, 4)
-        image_sizes = torch.tensor([[10, 20], [30, 40]])
+        image_sizes = torch.tensor([[56, 28], [84, 28]])
         bundled_item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=feature,
@@ -106,11 +106,34 @@ class TestPixtralProcessor(CustomTestCase):
             modality=Modality.IMAGE,
             feature=torch.arange(8).reshape(2, 4),
             offsets=[(0, 0), (1, 1)],
+            model_specific_data={"image_sizes": torch.tensor([[56, 28], [84, 28]])},
         )
         images = [Image.new("RGB", (28, 56)), Image.new("RGB", (28, 84))]
 
         with self.assertRaisesRegex(ValueError, "patch rows"):
             processor._finalize_mm_items([item], images=images)
+
+    def test_rows_follow_processor_longest_edge(self):
+        """Rows come from the resized image, not from vision_config.image_size."""
+        processor = self._make_processor()
+        processor.image_size = 1540
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[object(), object()]
+        )
+        # longest_edge=1120 resizes each 1540x1540 page to 1120x1120: 40 rows.
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.arange(8).reshape(2, 4),
+            offsets=[(row, row) for row in range(80)],
+            model_specific_data={
+                "image_sizes": torch.tensor([[1120, 1120], [1120, 1120]])
+            },
+        )
+        images = [Image.new("RGB", (1540, 1540))] * 2
+
+        items = processor._finalize_mm_items([item], images=images)
+
+        self.assertEqual([len(item.offsets) for item in items], [40, 40])
 
 
 if __name__ == "__main__":
