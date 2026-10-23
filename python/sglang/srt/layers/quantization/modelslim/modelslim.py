@@ -28,9 +28,6 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
-from sglang.srt.layers.quantization.modelslim.schemes.modelslim_w8a8_int8 import (
-    ModelSlimW8A8SInt8,
-)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -331,7 +328,7 @@ class ModelSlimConfig(QuantizationConfig):
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
             ("W8A8", ModelSlimW8A8Int8),
-            ("W8A8S", ModelSlimW8A8SInt8),
+            ("W8A8S", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
             ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
@@ -470,12 +467,8 @@ class ModelSlimConfig(QuantizationConfig):
             ]
 
             is_skipped = None
-            shard_schemes = set()
             for shard_prefix in shard_prefixes:
                 shard_prefix = self._resolve_quant_prefix(shard_prefix)
-                shard_schemes.add(
-                    self.quant_description.get(shard_prefix + ".weight", "")
-                )
                 is_shard_skipped = (
                     self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
@@ -488,10 +481,6 @@ class ModelSlimConfig(QuantizationConfig):
                         "are quantized. All shards of fused layers "
                         "to have the same precision."
                     )
-            if len(shard_schemes) != 1:
-                raise ValueError(
-                    f"Inconsistent ModelSlim schemes for fused layer {prefix}"
-                )
         else:
             prefix = self._resolve_quant_prefix(prefix)
             is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"

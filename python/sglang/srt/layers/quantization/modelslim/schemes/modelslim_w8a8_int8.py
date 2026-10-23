@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearSche
 
 
 class ModelSlimW8A8Int8(ModelSlimLinearScheme):
-    is_sparse = False
+    """Static/dynamic INT8, including uncompressed W8A8S via dense kernels."""
 
     def __init__(
         self,
@@ -30,7 +30,11 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         self.is_dynamic = (
             self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
         )
+        self.has_weight_scale = prefix + ".weight_scale" in quant_config
+        self.has_weight_offset = prefix + ".weight_offset" in quant_config
         if self.is_dynamic:
+            if not self.has_weight_scale:
+                raise ValueError(f"W8A8_DYNAMIC requires weight_scale for {prefix}")
             self.kernel = NPUW8A8Int8DynamicLinearMethod()
         else:
             self.kernel = NPUW8A8Int8LinearMethod()
@@ -58,7 +62,7 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        if not self.is_sparse:
+        if self.has_weight_scale:
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
                 output_dim=0,
@@ -66,6 +70,7 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
             )
             layer.register_parameter("weight_scale", weight_scale)
 
+        if self.has_weight_offset:
             weight_offset = ChannelQuantScaleParameter(
                 data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
                 output_dim=0,
@@ -118,53 +123,3 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.kernel.apply(layer, x, bias)
-
-
-class ModelSlimW8A8SInt8(ModelSlimW8A8Int8):
-    """Uncompressed sparse weights stored as dense INT8 matrices.
-
-    Zeros in the exported matrix are evaluated by the ordinary static INT8
-    kernel. This does not support the compressed W8A8SC storage format or
-    provide sparse-kernel acceleration.
-    """
-
-    is_sparse = True
-
-    def __init__(self, quant_config: Dict[str, any], prefix: str):
-        if quant_config.get(prefix + ".weight") != "W8A8S":
-            raise ValueError(f"Expected W8A8S weights for {prefix}")
-        for suffix in ("input_scale", "input_offset", "quant_bias", "deq_scale"):
-            if quant_config.get(f"{prefix}.{suffix}") != "W8A8S":
-                raise ValueError(f"Missing W8A8S description for {prefix}.{suffix}")
-        super().__init__(quant_config, prefix)
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        # The supported export uses encoded int64 deq_scale for FP16 output;
-        # loading it into a BF16/FP32 scale would reinterpret its meaning.
-        if params_dtype != torch.float16:
-            raise ValueError("W8A8S INT64 deq_scale export requires float16 dtype")
-        super().create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-
-    def process_weights_after_loading(self, layer: torch.nn.Module):
-        if layer.weight.dtype != torch.int8 or layer.weight.ndim != 2:
-            raise ValueError("W8A8S requires an uncompressed 2D INT8 weight")
-        if layer.deq_scale.dtype != torch.int64:
-            raise ValueError("W8A8S requires an encoded INT64 deq_scale")
-        super().process_weights_after_loading(layer)
