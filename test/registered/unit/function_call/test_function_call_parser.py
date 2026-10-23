@@ -3872,6 +3872,236 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                 self.assertTrue(self._accepts(grammar, text))
 
 
+class _Spelled(str):
+    """A marker written with ordinary tokens rather than its control token."""
+
+
+class TestGlmControlTokenIds(unittest.TestCase):
+    """glm45 reasoning + glm47 tool calls over GLM-5.3 output token ids."""
+
+    TOOLS = [
+        Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            ),
+        )
+    ]
+    CALL = ["<tool_call>", "get_weather", "<arg_key>", "city", "</arg_key>"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = _shared_tokenizer("zai-org/GLM-5.3")
+
+    def _ids(self, parts):
+        ids = []
+        for part in parts:
+            if isinstance(part, _Spelled):
+                spelled = self._encode(part[0]) + self._encode(part[1:])
+                self.assertNotIn(self.tokenizer.convert_tokens_to_ids(part), spelled)
+                ids += spelled
+            elif part.startswith("<") and part.endswith(">"):
+                ids.append(self.tokenizer.convert_tokens_to_ids(part))
+            else:
+                ids += self._encode(part)
+        return ids
+
+    def _encode(self, text):
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _chunks(self, ids, step, skip_special_tokens):
+        """(ids, text) per chunk, with text that ends in an incomplete
+        character held back as the detokenizer does."""
+        sent = ""
+        for start in range(0, len(ids), step):
+            end = min(start + step, len(ids))
+            text = self.tokenizer.decode(
+                ids[:end], skip_special_tokens=skip_special_tokens
+            )
+            if end < len(ids):
+                text = text.rstrip("\ufffd")
+            yield ids[start:end], text[len(sent) :]
+            sent = text
+
+    def _parse(
+        self,
+        ids,
+        *,
+        step=None,
+        stream_reasoning=True,
+        with_ids=True,
+        skip_special_tokens=True,
+    ):
+        reasoning_parser = ReasoningParser(
+            "glm45",
+            stream_reasoning=stream_reasoning,
+            force_reasoning=True,
+            tokenizer=self.tokenizer,
+        )
+        tool_parser = FunctionCallParser(self.TOOLS, "glm47", tokenizer=self.tokenizer)
+        if step is None:
+            text = self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+            reasoning, content = reasoning_parser.parse_non_stream(
+                text, output_ids=ids if with_ids else None
+            )
+            content, calls = tool_parser.parse_non_stream(
+                content, output_ids=reasoning_parser.take_content_output_ids()
+            )
+            return (
+                reasoning,
+                content,
+                [(c.name, json.loads(c.parameters)) for c in calls],
+            )
+
+        reasoning, content, names, args = "", "", {}, {}
+        chunks = list(self._chunks(ids, step, skip_special_tokens))
+        for i, (chunk_ids, text) in enumerate(chunks):
+            if with_ids:
+                reasoning_parser.observe_stream_output_ids(chunk_ids, cumulative=False)
+            r, n = reasoning_parser.parse_stream_chunk(text)
+            if i == len(chunks) - 1:
+                end_r, end_n = reasoning_parser.parse_stream_end()
+                r, n = r + end_r, n + end_n
+            reasoning += r
+            tool_parser.observe_output_ids(reasoning_parser.take_content_output_ids())
+            n, calls = tool_parser.parse_stream_chunk(n)
+            if i == len(chunks) - 1:
+                end_n, end_calls = tool_parser.parse_stream_end()
+                n, calls = n + end_n, calls + end_calls
+            content += n
+            for call in calls:
+                names[call.tool_index] = names.get(call.tool_index, "") + (
+                    call.name or ""
+                )
+                args[call.tool_index] = args.get(call.tool_index, "") + call.parameters
+        calls = [(names[i], json.loads(args[i])) for i in sorted(names)]
+        return reasoning, content.strip(), calls
+
+    def _assert_parses(self, parts, expected, skip_special_tokens=True):
+        ids = self._ids(parts)
+        kwargs = {"skip_special_tokens": skip_special_tokens}
+        self.assertEqual(self._parse(ids, **kwargs), expected)
+        for step in (1, 2, 3, 7):
+            for stream_reasoning in (True, False):
+                with self.subTest(step=step, stream_reasoning=stream_reasoning):
+                    got = self._parse(
+                        ids, step=step, stream_reasoning=stream_reasoning, **kwargs
+                    )
+                    self.assertEqual(got, expected)
+
+    def test_spelled_markers_are_text(self):
+        """Only control tokens delimit; spelled markers stay text wherever they
+        fall, for every chunking, streamed or not."""
+        cases = [
+            (
+                [
+                    "Split on ",
+                    _Spelled("</think>"),
+                    " or ",
+                    _Spelled("<tool_call>"),
+                    ".",
+                    "</think>",
+                    "Write ",
+                    _Spelled("<tool_call>"),
+                    "f",
+                    _Spelled("<arg_key>"),
+                    "k",
+                    _Spelled("</arg_key>"),
+                    _Spelled("</tool_call>"),
+                    " to call.",
+                ],
+                (
+                    "Split on </think> or <tool_call>.",
+                    "Write <tool_call>f<arg_key>k</arg_key></tool_call> to call.",
+                    [],
+                ),
+            ),
+            (
+                ["Plan.", "</think>", "Calling."]
+                + self.CALL
+                + ["<arg_value>", "a", _Spelled("</arg_value>"), "b"]
+                + [_Spelled("<tool_call>"), "</arg_value>", "</tool_call>"],
+                (
+                    "Plan.",
+                    "Calling.",
+                    [("get_weather", {"city": "a</arg_value>b<tool_call>"})],
+                ),
+            ),
+            (
+                [
+                    "龘",
+                    _Spelled("</think>"),
+                    "🦜",
+                    "</think>",
+                    "🦜",
+                    _Spelled("</think>"),
+                ],
+                ("龘</think>🦜", "🦜</think>", []),
+            ),
+        ]
+        for parts, expected in cases:
+            with self.subTest(expected=expected):
+                self._assert_parses(parts, expected)
+
+    def test_tool_call_token_inside_reasoning(self):
+        """A <tool_call> token GLM writes while reasoning is part of the
+        reasoning when </think> follows: streaming used to end reasoning there
+        and stream the quoted text as a call. Without </think> it starts the call."""
+        quoted = self.CALL + ["<arg_value>", "x", "</arg_value>", "</tool_call>"]
+        self._assert_parses(
+            ["See "] + quoted + [" here.", "</think>", "Done."],
+            (
+                "See <tool_call>get_weather<arg_key>city</arg_key>"
+                "<arg_value>x</arg_value></tool_call> here.",
+                "Done.",
+                [],
+            ),
+        )
+        self._assert_parses(
+            ["Look it up."] + quoted,
+            ("Look it up.", "", [("get_weather", {"city": "x"})]),
+        )
+
+    def test_special_token_kept_in_the_text(self):
+        """Serving keeps special tokens in the text of tool-call requests; a
+        special token GLM writes mid-output used to stop id matching for the
+        rest of the output, turning a later spelled tag into a marker."""
+        self._assert_parses(
+            ["Plan.", "<|assistant|>", "<tool_call>", "get_weather"]
+            + ["<arg_key>", "city", "</arg_key>", "<arg_value>", "a"]
+            + [_Spelled("</arg_value>"), "b", "</arg_value>", "</tool_call>"],
+            ("Plan.<|assistant|>", "", [("get_weather", {"city": "a</arg_value>b"})]),
+            skip_special_tokens=False,
+        )
+
+    def test_undeclared_call_is_dropped_when_streaming(self):
+        self._assert_parses(
+            ["Plan.", "</think>", "<tool_call>", "lookup", "</tool_call>", "Done."],
+            ("Plan.", "Done.", []),
+        )
+
+    def test_without_output_ids_markers_match_as_text(self):
+        ids = self._ids(["a ", _Spelled("</think>"), "b", "</think>", "c"])
+        expected = ("a ", "b</think>c", [])
+        self.assertEqual(self._parse(ids, with_ids=False), expected)
+        self.assertEqual(self._parse(ids, step=1, with_ids=False), expected)
+
+    def test_text_that_disagrees_with_the_ids_matches_as_text(self):
+        reasoning_parser = ReasoningParser(
+            "glm45", force_reasoning=True, tokenizer=self.tokenizer
+        )
+        ids = self._ids(["a", "</think>", "b"])
+        self.assertEqual(
+            reasoning_parser.parse_non_stream("x</think>y", output_ids=ids),
+            ("x", "y"),
+        )
+        self.assertIsNone(reasoning_parser.take_content_output_ids())
+
+
 class TestLing3Detector(unittest.TestCase):
     def setUp(self):
         self.tools = [

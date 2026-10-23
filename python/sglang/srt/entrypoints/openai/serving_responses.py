@@ -1058,6 +1058,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 custom_names,
                 require_reasoning=require_reasoning,
+                output_ids=output_ids,
             )
 
         output_items = []
@@ -1098,11 +1099,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         custom_names: set[str],
         *,
         require_reasoning: bool,
+        output_ids: Optional[list[int]] = None,
     ) -> tuple[
         Optional[str],
         Any,
         list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]],
     ]:
+        content_output_ids = output_ids
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1120,7 +1123,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and request.tool_choice != "none"
                 ),
             )
-            reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            reasoning_content, content = reasoning_parser.parse_non_stream(
+                final_output, output_ids=output_ids
+            )
+            content_output_ids = reasoning_parser.take_content_output_ids()
         else:
             reasoning_content = None
             content = final_output
@@ -1146,6 +1152,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
+            parser.observe_output_ids(content_output_ids)
             if should_try_native and parser.has_tool_call(content):
                 try:
                     content, call_info_list = parser.parse_non_stream(content)
@@ -2420,6 +2427,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         delta = text[stream_offset:]
                         stream_offset = len(text)
+                    # Every chunk's ids, even one whose text is still held back.
+                    if reasoning_parser_obj is not None:
+                        reasoning_parser_obj.observe_stream_output_ids(
+                            chunk.get("output_ids"), cumulative=not incremental
+                        )
+                    elif tool_parser is not None and not isinstance(
+                        tool_parser, JsonArrayParser
+                    ):
+                        tool_parser.observe_stream_output_ids(
+                            chunk.get("output_ids"), cumulative=not incremental
+                        )
                     if not delta and finish_reason is None:
                         continue
                     # finish_reason is sticky, so it would otherwise re-flush.
@@ -2444,6 +2462,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ) + end_reasoning
                             if end_normal:
                                 delta = (delta or "") + end_normal
+                        if tool_parser is not None and not isinstance(
+                            tool_parser, JsonArrayParser
+                        ):
+                            tool_parser.observe_output_ids(
+                                reasoning_parser_obj.take_content_output_ids()
+                            )
                     else:
                         reasoning_chunk = None
 

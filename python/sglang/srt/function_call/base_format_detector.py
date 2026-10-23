@@ -25,12 +25,16 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
+from sglang.srt.parser.control_token_stream import ControlTokenStream
 
 logger = logging.getLogger(__name__)
 
 
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
+
+    # Set by detectors that match their markers by token id.
+    _control: Optional[ControlTokenStream] = None
 
     def __init__(self):
         # Streaming state management
@@ -55,6 +59,24 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
+
+    @property
+    def wants_output_ids(self) -> bool:
+        """Whether ``observe_output_ids`` can change how this detector parses."""
+        return self._control is not None
+
+    def observe_output_ids(self, token_ids: List[int]) -> None:
+        """Take the token ids generated since the last call, before the text
+        they decode to is parsed."""
+        if self._control is not None:
+            self._control.feed(token_ids)
+
+    def _marker_view(self, text: str) -> str:
+        """The string searched for markers in ``text``, the end of the text
+        parsed so far; equal in length, so its indices slice ``text``."""
+        if self._control is None:
+            return text
+        return self._control.view(text)
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
