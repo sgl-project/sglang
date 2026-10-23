@@ -299,7 +299,12 @@ def test_layout_admission_rejects_conversion_and_unsupported_pairs():
     assert fi.identify_layout(nv, "flashinfer_trtllm") == fi.identify_layout(
         nv, "flashinfer_trtllm_routed"
     )
-    assert fi.identify_layout(nv, "flashinfer_cutedsl").quant_mode == "w4a4"
+    assert fi.identify_layout(nv, "flashinfer_cutedsl") == fi.FlashInferLayout(
+        "nvfp4", "cutedsl", True, "w4a4", True
+    )
+    assert fi.identify_layout(nv, "flashinfer_megamoe") == fi.FlashInferLayout(
+        "nvfp4", "megamoe", True, "w4a4", False
+    )
     nv._cutedsl_wrapper.quant_mode = "w4a16"
     assert fi.identify_layout(nv, "flashinfer_cutedsl").quant_mode == "w4a16"
     nv.quant_config.is_checkpoint_nvfp4_serialized = False
@@ -320,6 +325,35 @@ def test_layout_admission_rejects_conversion_and_unsupported_pairs():
         fi.identify_layout(layer("Fp8MoEMethod"), "flashinfer_trtllm")
 
 
+@pytest.mark.parametrize(
+    "fmt,backend",
+    [
+        ("nvfp4", "unknown"),
+        ("unknown", "trtllm"),
+        ("bf16", "cutedsl"),
+        ("bf16", "megamoe"),
+        ("fp8-block128-ue8m0", "cutedsl"),
+        ("fp8-block128-ue8m0", "megamoe"),
+        ("mxfp8", "cutedsl"),
+        ("mxfp4", "cutedsl"),
+    ],
+)
+def test_unsupported_layouts_cannot_bypass_admission(fmt, backend):
+    # Down and non-gated projections skip interleaving, but must still reject
+    # unsupported layouts before reading or constructing live tensor views.
+    for projection, gated in (("up", True), ("down", True), ("up", False)):
+        with pytest.raises(ValueError, match="unsupported"):
+            fi.expert_destinations(
+                SimpleNamespace(),
+                fi.FlashInferLayout(fmt, backend, gated),
+                0,
+                projection,
+                "weight",
+                (128, 64),
+                "U8",
+            )
+
+
 def test_nonalias_scale_image_and_incorrect_geometry_fail_closed():
     layer = SimpleNamespace(
         w2_weight=torch.zeros((1, 128, 32), dtype=torch.uint8),
@@ -336,6 +370,9 @@ def test_nonalias_scale_image_and_incorrect_geometry_fail_closed():
         fi.expert_destinations(
             layer, layout, 0, "down", "weight_scale", (129, 4), "F8_E4M3"
         )
+    layer.w2_weight = torch.zeros((1, 128), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="packed weight geometry"):
+        fi.expert_destinations(layer, layout, 0, "down", "weight", (128, 1), "U8")
 
 
 def shuffled_rows(value):
@@ -423,6 +460,8 @@ def test_factored_destinations_match_loader_permutations(fmt, backend, group, up
     layer = SimpleNamespace(
         w13_weight=actual.unsqueeze(0), quant_method=SimpleNamespace()
     )
+    if fmt == "mxfp4":
+        layer.quant_method = type("Mxfp4FlashinferTrtllmMoEMethod", (), {})()
     if scales is not None:
         scale_name = {
             "nvfp4": "w13_weight_scale",

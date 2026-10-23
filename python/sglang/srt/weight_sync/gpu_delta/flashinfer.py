@@ -42,20 +42,25 @@ class DestinationSegment:
 
 def _backend(backend):
     backend = backend.value if isinstance(backend, Enum) else backend
-    return {
-        "flashinfer_trtllm": "trtllm",
-        "flashinfer_trtllm_routed": "trtllm",
-        "flashinfer_mxfp4": "trtllm",
-        "flashinfer_cutedsl": "cutedsl",
-        "flashinfer_megamoe": "megamoe",
-    }.get(backend, backend)
+    if backend in {
+        "trtllm",
+        "flashinfer_trtllm",
+        "flashinfer_trtllm_routed",
+        "flashinfer_mxfp4",
+    }:
+        resolved = "trtllm"
+    elif backend in {"cutedsl", "flashinfer_cutedsl"}:
+        resolved = "cutedsl"
+    elif backend in {"megamoe", "flashinfer_megamoe"}:
+        resolved = "megamoe"
+    else:
+        raise ValueError(f"unsupported FlashInfer expert backend: {backend}")
+    return resolved
 
 
 def identify_layout(layer, backend):
     """Identify an existing inference path; do not select or construct one."""
     backend = _backend(backend)
-    if backend not in {"trtllm", "cutedsl", "megamoe"}:
-        raise ValueError(f"unsupported FlashInfer expert backend: {backend}")
     method = layer.quant_method
     if method.runner is not None and _backend(method.runner.runner_backend) != backend:
         raise ValueError("FlashInfer selection does not match the live expert runner")
@@ -64,14 +69,15 @@ def identify_layout(layer, backend):
     if name == "UnquantizedFusedMoEMethod":
         if backend != "trtllm" or not method.use_flashinfer_trtllm_moe:
             raise ValueError("no native FlashInfer BF16 expert path for this backend")
-        return FlashInferLayout(
+        layout = FlashInferLayout(
             "bf16", backend, gated, up_first=method.load_up_proj_weight_first
         )
-    if name == "ModelOptNvFp4FusedMoEMethod":
+    elif name == "ModelOptNvFp4FusedMoEMethod":
         if not method.quant_config.is_checkpoint_nvfp4_serialized:
             raise ValueError("GPU delta does not admit on-load NVFP4 quantization")
-        mode = "w4a4"
-        if backend == "cutedsl":
+        if backend == "trtllm":
+            layout = FlashInferLayout("nvfp4", backend, gated, "w4a4", up_first=False)
+        elif backend == "cutedsl":
             if not method._is_cutedsl_v2_standard:
                 raise ValueError("GPU delta requires the standard CuTe DSL layout")
             if layer._cutedsl_wrapper is None:
@@ -79,40 +85,47 @@ def identify_layout(layer, backend):
             mode = layer._cutedsl_wrapper.quant_mode
             if mode not in {"w4a4", "w4a16"}:
                 raise ValueError(f"unsupported CuTe DSL quant mode: {mode}")
-        return FlashInferLayout(
-            "nvfp4", backend, gated, mode, up_first=backend == "cutedsl"
-        )
-    if name == "Mxfp4FlashinferTrtllmMoEMethod":
+            layout = FlashInferLayout("nvfp4", backend, gated, mode, up_first=True)
+        elif backend == "megamoe":
+            layout = FlashInferLayout("nvfp4", backend, gated, "w4a4", up_first=False)
+        else:
+            raise ValueError(f"unsupported NVFP4 expert backend: {backend}")
+    elif name == "Mxfp4FlashinferTrtllmMoEMethod":
         if backend != "trtllm" or method._fp8.dequant_fp4_to_fp8:
             raise ValueError("MXFP4 TRTLLM requires native packed expert weights")
-        return FlashInferLayout("mxfp4", backend, gated, up_first=True)
-    if name == "Mxfp4MoEMethod":
+        layout = FlashInferLayout("mxfp4", backend, gated, up_first=True)
+    elif name == "Mxfp4MoEMethod":
         if backend != "trtllm" or method._fi_kernel != "trtllm_sm100":
             raise ValueError("unsupported native MXFP4 FlashInfer expert path")
-        return FlashInferLayout("mxfp4", backend, gated, up_first=True)
-    if name != "Fp8MoEMethod":
+        layout = FlashInferLayout("mxfp4", backend, gated, up_first=True)
+    elif name == "Fp8MoEMethod":
+        if backend == "cutedsl":
+            raise ValueError("ordinary CuTe DSL MoE has no native FP8/MXFP4 path")
+        if method.dequant_fp4_to_fp8 or method.convert_mxfp8_to_block:
+            raise ValueError("GPU delta does not admit weight requantization")
+        config = method.quant_config
+        if method.use_mxfp8:
+            if not config.is_checkpoint_fp8_serialized:
+                raise ValueError("GPU delta requires serialized MXFP8 weights")
+            layout = FlashInferLayout("mxfp8", backend, gated)
+        elif method.is_fp4_expert:
+            if backend != "megamoe":
+                raise ValueError("native FP4 TRTLLM experts require its MXFP4 method")
+            layout = FlashInferLayout("mxfp4", backend, gated)
+        elif (
+            backend == "trtllm"
+            and config.scale_fmt == "ue8m0"
+            and config.weight_block_size == [128, 128]
+            and config.is_checkpoint_fp8_serialized
+        ):
+            layout = FlashInferLayout("fp8-block128-ue8m0", backend, gated)
+        else:
+            raise ValueError(
+                "unsupported FlashInfer expert format; native UE8M0 is required"
+            )
+    else:
         raise ValueError(f"unsupported FlashInfer expert quantization: {name}")
-    if backend == "cutedsl":
-        raise ValueError("ordinary CuTe DSL MoE has no native FP8/MXFP4 path")
-    if method.dequant_fp4_to_fp8 or method.convert_mxfp8_to_block:
-        raise ValueError("GPU delta does not admit weight requantization")
-    config = method.quant_config
-    if method.use_mxfp8:
-        if not config.is_checkpoint_fp8_serialized:
-            raise ValueError("GPU delta requires serialized MXFP8 weights")
-        return FlashInferLayout("mxfp8", backend, gated)
-    if method.is_fp4_expert:
-        if backend != "megamoe":
-            raise ValueError("native FP4 TRTLLM experts require its MXFP4 method")
-        return FlashInferLayout("mxfp4", backend, gated)
-    if (
-        backend == "trtllm"
-        and config.scale_fmt == "ue8m0"
-        and config.weight_block_size == [128, 128]
-        and config.is_checkpoint_fp8_serialized
-    ):
-        return FlashInferLayout("fp8-block128-ue8m0", backend, gated)
-    raise ValueError("unsupported FlashInfer expert format; native UE8M0 is required")
+    return layout
 
 
 def _bytes(tensor):
@@ -233,16 +246,39 @@ def _factored_segments(
 
 
 def _scale_parameter(layer, stem, layout):
-    if (
-        layout.format == "nvfp4"
-        or type(layer.quant_method).__name__ == "Mxfp4MoEMethod"
-    ):
-        return getattr(layer, f"{stem}_weight_scale")
-    if layout.format == "mxfp4":
-        # TRTLLM and MegaMoE retain checkpoint scales separately from the
-        # shuffled inference image. Delta updates target the live consumer.
-        return getattr(layer, f"{stem}_weight_scale_inv_shuffled")
-    return getattr(layer, f"{stem}_weight_scale_inv")
+    if layout.backend == "trtllm":
+        if layout.format == "nvfp4":
+            suffix = "weight_scale"
+        elif layout.format == "mxfp4":
+            method = type(layer.quant_method).__name__
+            if method == "Mxfp4MoEMethod":
+                suffix = "weight_scale"
+            elif method == "Mxfp4FlashinferTrtllmMoEMethod":
+                suffix = "weight_scale_inv_shuffled"
+            else:
+                raise ValueError(f"unsupported TRTLLM MXFP4 method: {method}")
+        elif layout.format in {"mxfp8", "fp8-block128-ue8m0"}:
+            suffix = "weight_scale_inv"
+        else:
+            raise ValueError(f"unsupported TRTLLM scale format: {layout.format}")
+    elif layout.backend == "cutedsl":
+        if layout.format == "nvfp4":
+            suffix = "weight_scale"
+        else:
+            raise ValueError(f"unsupported CuTe DSL scale format: {layout.format}")
+    elif layout.backend == "megamoe":
+        if layout.format == "nvfp4":
+            suffix = "weight_scale"
+        elif layout.format == "mxfp4":
+            # Retain checkpoint scales separately; target the shuffled consumer.
+            suffix = "weight_scale_inv_shuffled"
+        elif layout.format == "mxfp8":
+            suffix = "weight_scale_inv"
+        else:
+            raise ValueError(f"unsupported MegaMoE scale format: {layout.format}")
+    else:
+        raise ValueError(f"unsupported FlashInfer expert backend: {layout.backend}")
+    return getattr(layer, f"{stem}_{suffix}")
 
 
 def _weight_image(layer, stem, expert, layout):
@@ -250,28 +286,70 @@ def _weight_image(layer, stem, expert, layout):
     if layout.format == "bf16":
         if image.dtype != torch.bfloat16 or image.ndim != 3 or image.shape[-1] != 64:
             raise ValueError("unexpected TRTLLM BF16 blocked weight geometry")
-        return image, image.shape[1], image.shape[0] * 128
-    if image.ndim != 2 or image.element_size() != 1:
+    elif image.ndim != 2 or image.element_size() != 1:
         raise ValueError("unexpected FlashInfer packed weight geometry")
-    if layout.backend == "megamoe":
-        # NVFP4 retains the transpose as a view; MXFP8 materializes it.
+
+    if layout.backend == "trtllm":
+        if layout.format == "bf16":
+            rows, cols = image.shape[1], image.shape[0] * 128
+        elif layout.format in {"nvfp4", "mxfp4", "mxfp8", "fp8-block128-ue8m0"}:
+            rows, cols = image.shape[0], image.shape[1]
+        else:
+            raise ValueError(f"unsupported TRTLLM weight format: {layout.format}")
+    elif layout.backend == "cutedsl":
         if layout.format == "nvfp4":
+            rows, cols = image.shape[0], image.shape[1]
+        else:
+            raise ValueError(f"unsupported CuTe DSL weight format: {layout.format}")
+    elif layout.backend == "megamoe":
+        if layout.format == "nvfp4":
+            # NVFP4 retains the transpose as a view; recover physical packed rows.
             image = image.transpose(0, 1)
-            return image, image.shape[0], image.shape[1]
-        if layout.format == "mxfp8":
-            return image, image.shape[1], image.shape[0]
-    return image, image.shape[0], image.shape[1]
+            rows, cols = image.shape[0], image.shape[1]
+        elif layout.format == "mxfp8":
+            # MXFP8 materializes the transpose; its physical rows are K-major.
+            rows, cols = image.shape[1], image.shape[0]
+        elif layout.format == "mxfp4":
+            rows, cols = image.shape[0], image.shape[1]
+        else:
+            raise ValueError(f"unsupported MegaMoE weight format: {layout.format}")
+    else:
+        raise ValueError(f"unsupported FlashInfer expert backend: {layout.backend}")
+    return image, rows, cols
 
 
 def _mapping(layout, projection):
-    if projection == "down" or not layout.gated:
-        return 0, 0, layout.backend == "trtllm"
-    half = int((projection == "up") != layout.up_first)
-    if layout.backend == "megamoe":
-        group = {"nvfp4": 16, "mxfp8": 32, "mxfp4": 8}[layout.format]
+    if layout.backend == "trtllm":
+        if layout.format in {"bf16", "nvfp4", "mxfp4", "mxfp8"}:
+            group, shuffle = 1, True
+        elif layout.format == "fp8-block128-ue8m0":
+            # Block-128 projections use plain halves, handled separately below.
+            group, shuffle = 0, False
+        else:
+            raise ValueError(f"unsupported TRTLLM expert format: {layout.format}")
+    elif layout.backend == "cutedsl":
+        if layout.format == "nvfp4":
+            # Standard W4A4/W4A16: Up64, Gate64, Up64, Gate64, ...
+            group, shuffle = 64, False
+        else:
+            raise ValueError(f"unsupported CuTe DSL expert format: {layout.format}")
+    elif layout.backend == "megamoe":
+        if layout.format == "nvfp4":
+            # NVFP4 MegaMoE: Gate16, Up16, Gate16, Up16, ...
+            group, shuffle = 16, False
+        elif layout.format == "mxfp8":
+            group, shuffle = 32, False
+        elif layout.format == "mxfp4":
+            group, shuffle = 8, False
+        else:
+            raise ValueError(f"unsupported MegaMoE expert format: {layout.format}")
     else:
-        group = 1 if layout.backend == "trtllm" else 64
-    return group, half, layout.backend == "trtllm"
+        raise ValueError(f"unsupported FlashInfer expert backend: {layout.backend}")
+    if projection == "down" or not layout.gated:
+        group, half = 0, 0
+    else:
+        half = int((projection == "up") != layout.up_first)
+    return group, half, shuffle
 
 
 def expert_scale_target(layer, layout, local_expert, projection, canonical_shape):
@@ -331,6 +409,7 @@ def expert_destinations(
         raise ValueError(
             "expert byte layout requires a nonempty matrix and local expert"
         )
+    group, half, shuffle = _mapping(layout, projection)
     rows, cols = canonical_shape
     stem = "w2" if projection == "down" else "w13"
     if (
@@ -352,7 +431,6 @@ def expert_destinations(
         padded_rows, padded_cols = primary.shape
         if padded_rows % 128 or padded_cols % 4 or cols > padded_cols:
             raise ValueError("unexpected CuTe DSL block-scale padding geometry")
-        group, half, shuffle = _mapping(layout, projection)
         max_rows = padded_rows // 2 if group else padded_rows
         if rows > max_rows:
             raise ValueError(
@@ -363,98 +441,177 @@ def expert_destinations(
             row = _row_map(row, group, half, shuffle)
             return row // 128 * padded_cols * 128 + row % 32 * 16 + row % 128 // 32 * 4
 
-        return _factored_segments(images, rows, cols, 1, scale_row_offset, 4, 1, 512)
-    weight, physical_rows, physical_cols = _weight_image(
-        layer, stem, local_expert, layout
-    )
-    if not weight.is_contiguous():
-        raise ValueError("unexpected noncontiguous FlashInfer physical storage")
-    half_rows = physical_rows // (2 if layout.gated and projection != "down" else 1)
-    if rows > half_rows:
-        raise ValueError("canonical projection exceeds FlashInfer row storage")
-    if layout.format == "fp8-block128-ue8m0":
-        if suffix != "weight" or canonical_dtype != "F8_E4M3":
-            raise ValueError("block-128 scales require complete-value expansion")
-        start = half_rows if layout.gated and projection == "up" else 0
-        if cols > physical_cols:
-            raise ValueError("canonical weight exceeds FlashInfer column storage")
-        return (
-            DestinationSegment(
-                ((0, rows), (0, cols)), (_bytes(weight[start : start + rows, :cols]),)
-            ),
+        segments = _factored_segments(
+            images, rows, cols, 1, scale_row_offset, 4, 1, 512
         )
-    group, half, shuffle = _mapping(layout, projection)
-    if group and half_rows % group:
-        raise ValueError("invalid FlashInfer gate/up group alignment")
-    if shuffle and physical_rows % 32:
-        raise ValueError("TRTLLM weight row shuffle requires a multiple of 32")
-    mapped = lambda row: _row_map(row, group, half, shuffle)
-    if suffix == "weight":
-        dtype = {"bf16": "BF16", "nvfp4": "U8", "mxfp4": "U8", "mxfp8": "F8_E4M3"}[
-            layout.format
-        ]
-        if canonical_dtype != dtype:
-            raise ValueError(f"{layout.format} weights require canonical {dtype}")
-        element_size = 2 if layout.format == "bf16" else 1
-        if cols * element_size > physical_cols:
-            raise ValueError("canonical weight exceeds FlashInfer column storage")
-        if layout.format == "bf16":
-            row_offset = lambda row: mapped(row) * 128
-            block, stride, block_stride = 128, 1, physical_rows * 128
-        elif layout.backend == "megamoe" and layout.format == "mxfp8":
-            row_offset = mapped
-            block, stride, block_stride = 1, physical_rows, physical_rows
+    else:
+        weight, physical_rows, physical_cols = _weight_image(
+            layer, stem, local_expert, layout
+        )
+        if not weight.is_contiguous():
+            raise ValueError("unexpected noncontiguous FlashInfer physical storage")
+        half_rows = physical_rows // (2 if layout.gated and projection != "down" else 1)
+        if rows > half_rows:
+            raise ValueError("canonical projection exceeds FlashInfer row storage")
+        if group and half_rows % group:
+            raise ValueError("invalid FlashInfer gate/up group alignment")
+        if shuffle and physical_rows % 32:
+            raise ValueError("TRTLLM weight row shuffle requires a multiple of 32")
+        mapped = lambda row: _row_map(row, group, half, shuffle)
+        if layout.format == "fp8-block128-ue8m0":
+            if suffix != "weight" or canonical_dtype != "F8_E4M3":
+                raise ValueError("block-128 scales require complete-value expansion")
+            start = half_rows if layout.gated and projection == "up" else 0
+            if cols > physical_cols:
+                raise ValueError("canonical weight exceeds FlashInfer column storage")
+            segments = (
+                DestinationSegment(
+                    ((0, rows), (0, cols)),
+                    (_bytes(weight[start : start + rows, :cols]),),
+                ),
+            )
+        elif suffix == "weight":
+            if layout.format == "bf16":
+                dtype = "BF16"
+            elif layout.format in {"nvfp4", "mxfp4"}:
+                dtype = "U8"
+            elif layout.format == "mxfp8":
+                dtype = "F8_E4M3"
+            else:
+                raise ValueError(
+                    f"unsupported FlashInfer weight format: {layout.format}"
+                )
+            if canonical_dtype != dtype:
+                raise ValueError(f"{layout.format} weights require canonical {dtype}")
+            element_size = 2 if layout.format == "bf16" else 1
+            if cols * element_size > physical_cols:
+                raise ValueError("canonical weight exceeds FlashInfer column storage")
+            if layout.backend == "trtllm":
+                if layout.format == "bf16":
+                    row_offset = lambda row: mapped(row) * 128
+                    block, stride, block_stride = 128, 1, physical_rows * 128
+                elif layout.format in {"nvfp4", "mxfp4", "mxfp8"}:
+                    row_offset = lambda row: mapped(row) * physical_cols
+                    block, stride, block_stride = 1, 1, 1
+                else:
+                    raise ValueError(
+                        f"unsupported TRTLLM weight format: {layout.format}"
+                    )
+            elif layout.backend == "cutedsl":
+                if layout.format == "nvfp4":
+                    row_offset = lambda row: mapped(row) * physical_cols
+                    block, stride, block_stride = 1, 1, 1
+                else:
+                    raise ValueError(
+                        f"unsupported CuTe DSL weight format: {layout.format}"
+                    )
+            elif layout.backend == "megamoe":
+                if layout.format == "mxfp8":
+                    row_offset = mapped
+                    block, stride, block_stride = 1, physical_rows, physical_rows
+                elif layout.format in {"nvfp4", "mxfp4"}:
+                    row_offset = lambda row: mapped(row) * physical_cols
+                    block, stride, block_stride = 1, 1, 1
+                else:
+                    raise ValueError(
+                        f"unsupported MegaMoE weight format: {layout.format}"
+                    )
+            else:
+                raise ValueError(
+                    f"unsupported FlashInfer expert backend: {layout.backend}"
+                )
+            segments = _factored_segments(
+                [weight],
+                rows,
+                cols,
+                element_size,
+                row_offset,
+                block,
+                stride,
+                block_stride,
+            )
+        elif suffix == "weight_scale":
+            if layout.format == "nvfp4":
+                dtype, scale_divisor = "F8_E4M3", 8
+            elif layout.format == "mxfp4":
+                dtype, scale_divisor = "U8", 16
+            elif layout.format == "mxfp8":
+                dtype, scale_divisor = "U8", 32
+            else:
+                raise ValueError(
+                    f"unsupported FlashInfer block-scale format: {layout.format}"
+                )
+            if canonical_dtype != dtype:
+                raise ValueError(
+                    f"{layout.format} block scales require canonical {dtype}"
+                )
+            if physical_cols % scale_divisor:
+                raise ValueError("weight columns do not cover complete scale groups")
+            scale_cols = physical_cols // scale_divisor
+            if cols > scale_cols:
+                raise ValueError("canonical scales exceed FlashInfer column storage")
+            images = [_scale_parameter(layer, stem, layout)[local_expert]]
+            if layout.backend == "megamoe" and layout.format == "mxfp4":
+                # DeepGEMM packs four UE8M0 bytes per int32 in MN-major storage;
+                # MegaMoE then transposes each [4,32] row group for UTCCP.
+                scale = images[0]
+                if (
+                    scale.dtype != torch.int32
+                    or scale.ndim != 2
+                    or tuple(scale.shape) != (physical_rows, (scale_cols + 3) // 4)
+                    or scale.stride() != (1, physical_rows)
+                    or physical_rows % 128
+                ):
+                    raise ValueError("unexpected DeepGEMM packed UE8M0 scale geometry")
+
+                def row_offset(row):
+                    row = mapped(row)
+                    return (row // 128 * 128 + row % 32 * 4 + row % 128 // 32) * 4
+
+                segments = _factored_segments(
+                    [scale.transpose(0, 1)],
+                    rows,
+                    cols,
+                    1,
+                    row_offset,
+                    4,
+                    1,
+                    physical_rows * 4,
+                )
+            elif (
+                layout.backend == "trtllm"
+                and layout.format in {"nvfp4", "mxfp4", "mxfp8"}
+            ) or (layout.backend == "megamoe" and layout.format in {"nvfp4", "mxfp8"}):
+                padded_rows = (physical_rows + 127) // 128 * 128
+                padded_cols = (scale_cols + 3) // 4 * 4
+                for image in images:
+                    if (
+                        image.element_size() != 1
+                        or not image.is_contiguous()
+                        or image.numel() != padded_rows * padded_cols
+                    ):
+                        raise ValueError(
+                            "unexpected FlashInfer block-scale padding geometry"
+                        )
+
+                def row_offset(row):
+                    row = mapped(row)
+                    return (
+                        row // 128 * padded_cols * 128
+                        + row % 32 * 16
+                        + row % 128 // 32 * 4
+                    )
+
+                segments = _factored_segments(
+                    images, rows, cols, 1, row_offset, 4, 1, 512
+                )
+            else:
+                raise ValueError(
+                    f"unsupported FlashInfer scale layout: {layout.backend}/{layout.format}"
+                )
         else:
-            row_offset = lambda row: mapped(row) * physical_cols
-            block, stride, block_stride = 1, 1, 1
-        return _factored_segments(
-            [weight], rows, cols, element_size, row_offset, block, stride, block_stride
-        )
-    dtype = "F8_E4M3" if layout.format == "nvfp4" else "U8"
-    if suffix != "weight_scale" or canonical_dtype != dtype or layout.format == "bf16":
-        raise ValueError(f"{layout.format} block scales require canonical {dtype}")
-    scale_divisor = {"nvfp4": 8, "mxfp4": 16, "mxfp8": 32}[layout.format]
-    if physical_cols % scale_divisor:
-        raise ValueError("weight columns do not cover complete scale groups")
-    scale_cols = physical_cols // scale_divisor
-    if cols > scale_cols:
-        raise ValueError("canonical scales exceed FlashInfer column storage")
-    images = [_scale_parameter(layer, stem, layout)[local_expert]]
-    if layout.backend == "megamoe" and layout.format == "mxfp4":
-        # DeepGEMM packs four UE8M0 bytes per int32 in MN-major storage;
-        # MegaMoE then transposes each [4,32] row group for UTCCP.
-        scale = images[0]
-        if (
-            scale.dtype != torch.int32
-            or scale.ndim != 2
-            or tuple(scale.shape) != (physical_rows, (scale_cols + 3) // 4)
-            or scale.stride() != (1, physical_rows)
-            or physical_rows % 128
-        ):
-            raise ValueError("unexpected DeepGEMM packed UE8M0 scale geometry")
-
-        def row_offset(row):
-            row = mapped(row)
-            return (row // 128 * 128 + row % 32 * 4 + row % 128 // 32) * 4
-
-        return _factored_segments(
-            [scale.transpose(0, 1)], rows, cols, 1, row_offset, 4, 1, physical_rows * 4
-        )
-    padded_rows = (physical_rows + 127) // 128 * 128
-    padded_cols = (scale_cols + 3) // 4 * 4
-    for image in images:
-        if (
-            image.element_size() != 1
-            or not image.is_contiguous()
-            or image.numel() != padded_rows * padded_cols
-        ):
-            raise ValueError("unexpected FlashInfer block-scale padding geometry")
-
-    def row_offset(row):
-        row = mapped(row)
-        return row // 128 * padded_cols * 128 + row % 32 * 16 + row % 128 // 32 * 4
-
-    return _factored_segments(images, rows, cols, 1, row_offset, 4, 1, 512)
+            raise ValueError(f"unsupported FlashInfer expert suffix: {suffix}")
+    return segments
 
 
 def consumer_objects(layer, layout):
@@ -486,6 +643,8 @@ def consumer_objects(layer, layout):
             )
         )
     if layout.backend == "cutedsl":
+        if layout.format != "nvfp4":
+            raise ValueError(f"unsupported CuTe DSL consumer format: {layout.format}")
         objects.extend(
             (
                 layer._cutedsl_wrapper,
@@ -505,6 +664,8 @@ def consumer_objects(layer, layout):
             )
         )
     elif layout.backend == "megamoe":
+        if layout.format not in {"nvfp4", "mxfp4", "mxfp8"}:
+            raise ValueError(f"unsupported MegaMoE consumer format: {layout.format}")
         mega = layer._flashinfer_megamoe_layer
         if mega is None:
             raise ValueError("FlashInfer MegaMoE must be warmed before admission")
@@ -527,20 +688,37 @@ def consumer_objects(layer, layout):
                     layer._flashinfer_megamoe_input_norm_const,
                 )
             )
-    elif layout.format == "nvfp4":
-        # Activation-dependent optional tensors; absence is itself captured.
-        objects.extend(
-            getattr(layer, name, None)
-            for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit", "g1_scale_c")
-        )
-    elif layout.format in {"mxfp8", "fp8-block128-ue8m0"}:
-        objects.extend(
-            (
-                layer._flashinfer_trtllm_gemm1_alpha,
-                layer._flashinfer_trtllm_gemm1_beta,
-                layer._flashinfer_trtllm_gemm1_clamp_limit,
+    elif layout.backend == "trtllm":
+        if layout.format == "nvfp4":
+            # Activation-dependent optional tensors; absence is itself captured.
+            objects.extend(
+                getattr(layer, name, None)
+                for name in (
+                    "gemm1_alpha",
+                    "gemm1_beta",
+                    "gemm1_clamp_limit",
+                    "g1_scale_c",
+                )
             )
-        )
-    elif type(method).__name__ == "Mxfp4FlashinferTrtllmMoEMethod":
-        objects.append(layer._gemm1_clamp_limit_tensor)
+        elif layout.format in {"mxfp8", "fp8-block128-ue8m0"}:
+            objects.extend(
+                (
+                    layer._flashinfer_trtllm_gemm1_alpha,
+                    layer._flashinfer_trtllm_gemm1_beta,
+                    layer._flashinfer_trtllm_gemm1_clamp_limit,
+                )
+            )
+        elif layout.format == "mxfp4":
+            if type(method).__name__ == "Mxfp4FlashinferTrtllmMoEMethod":
+                objects.append(layer._gemm1_clamp_limit_tensor)
+            elif type(method).__name__ == "Mxfp4MoEMethod":
+                pass
+            else:
+                raise ValueError("unsupported TRTLLM MXFP4 consumer")
+        elif layout.format == "bf16":
+            pass
+        else:
+            raise ValueError(f"unsupported TRTLLM consumer format: {layout.format}")
+    else:
+        raise ValueError(f"unsupported FlashInfer expert backend: {layout.backend}")
     return tuple(objects)

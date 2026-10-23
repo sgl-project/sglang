@@ -641,6 +641,7 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
         method.prefix = "delta_test"
         method._intermediate_size_unpadded = intermediate
         method._weights_in_kernel_layout = False
+        layer.quant_method = method
         layer.register_buffer("_mxfp4_w13_restore_rows", None, persistent=False)
         layer.register_buffer("_mxfp4_w2_restore_rows", None, persistent=False)
         method.process_weights_after_loading(layer)
